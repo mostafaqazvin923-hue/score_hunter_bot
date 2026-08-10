@@ -3,7 +3,7 @@
     "price": 1878.0134502537426,
     "time": 1786377222,
     "last_alert": 0,
-    "last_checked_candle": 1786363200,
+    "last_checked_candle": 1786377600,
     "last_signal_day": "2026-08-10",
     "last_signal": {
       "direction": "SHORT",
@@ -17,13 +17,21 @@
     "price": 75.87775392030363,
     "time": 1786377222,
     "last_alert": 0,
-    "last_checked_candle": 1786363200
+    "last_checked_candle": 1786377600,
+    "last_signal_day": "2026-08-10",
+    "last_signal": {
+      "direction": "LONG",
+      "score": 5,
+      "price": 76.19
+    },
+    "signal_candle": 1786377600,
+    "signal_time": 1786392404
   },
   "XRP": {
     "price": 1.0220175008542913,
     "time": 1786377222,
     "last_alert": 0,
-    "last_checked_candle": 1786363200,
+    "last_checked_candle": 1786377600,
     "last_signal_day": "2026-08-10",
     "last_signal": {
       "direction": "SHORT",
