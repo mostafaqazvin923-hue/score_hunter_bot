@@ -1,19 +1,10 @@
 import os
 import json
 import time
-import subprocess
 import requests
-
-# =========================
-# Telegram
-# =========================
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = "2090120004"
-
-# =========================
-# CoinMarketCap
-# =========================
 
 CMC_URL = "https://pro-api.coinmarketcap.com/public-api/v1/simple/price"
 
@@ -24,18 +15,10 @@ COINS = {
     "APT": 21794,
 }
 
-# هشدار در حرکت 1 درصدی
 THRESHOLD = 1.0
-
-# جلوگیری از هشدار تکراری برای همان ارز
 COOLDOWN = 30 * 60
-
 STATE_FILE = "state.json"
 
-
-# =========================
-# State
-# =========================
 
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -44,8 +27,7 @@ def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception as e:
-        print("State load error:", e)
+    except Exception:
         return {}
 
 
@@ -54,34 +36,21 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
-# =========================
-# Telegram
-# =========================
-
 def send_telegram(message):
-
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
-    try:
-        response = requests.post(
-            url,
-            data={
-                "chat_id": CHAT_ID,
-                "text": message
-            },
-            timeout=20
-        )
+    response = requests.post(
+        url,
+        data={
+            "chat_id": CHAT_ID,
+            "text": message
+        },
+        timeout=20
+    )
 
-        print("Telegram status:", response.status_code)
-        print("Telegram response:", response.text)
+    print("Telegram:", response.status_code)
+    print(response.text)
 
-    except Exception as e:
-        print("Telegram error:", e)
-
-
-# =========================
-# Get prices
-# =========================
 
 def get_prices():
 
@@ -96,18 +65,16 @@ def get_prices():
         timeout=20
     )
 
-    print("CoinMarketCap status:", response.status_code)
+    print("CoinMarketCap:", response.status_code)
 
     response.raise_for_status()
 
-    result = response.json()
-
-    data = result["data"]
+    data = response.json()["data"]
 
     prices = {}
 
-    # CoinMarketCap در این endpoint
-    # data را به صورت LIST برمی‌گرداند.
+    # مهم:
+    # CoinMarketCap اینجا LIST برمی‌گرداند
     for item in data:
 
         coin_id = int(item["id"])
@@ -121,65 +88,11 @@ def get_prices():
     return prices
 
 
-# =========================
-# Save state to GitHub
-# =========================
-
-def commit_state():
-
-    try:
-
-        subprocess.run(
-            ["git", "config", "user.name", "Score Hunter Bot"],
-            check=True
-        )
-
-        subprocess.run(
-            ["git", "config", "user.email", "score-hunter-bot@users.noreply.github.com"],
-            check=True
-        )
-
-        subprocess.run(
-            ["git", "add", STATE_FILE],
-            check=True
-        )
-
-        result = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"]
-        )
-
-        # اگر تغییری وجود نداشته باشد
-        if result.returncode == 0:
-            print("No state changes to commit.")
-            return
-
-        subprocess.run(
-            ["git", "commit", "-m", "Update price state"],
-            check=True
-        )
-
-        subprocess.run(
-            ["git", "push"],
-            check=True
-        )
-
-        print("✅ State saved to GitHub.")
-
-    except Exception as e:
-
-        print("State commit error:", e)
-
-
-# =========================
-# Main
-# =========================
-
 def main():
 
     print("🟢 SCORE HUNTER SCANNING")
 
     state = load_state()
-
     prices = get_prices()
 
     now = int(time.time())
@@ -187,10 +100,6 @@ def main():
     for symbol, price in prices.items():
 
         print(f"{symbol}: {price}")
-
-        # -------------------------
-        # First run
-        # -------------------------
 
         if symbol not in state:
 
@@ -200,64 +109,52 @@ def main():
                 "last_alert": 0
             }
 
-            print(f"{symbol}: first price saved.")
+            print(f"{symbol}: first price saved")
             continue
 
         old_price = float(state[symbol]["price"])
 
-        old_time = int(state[symbol].get("time", now))
+        change = ((price - old_price) / old_price) * 100
+
+        print(
+            f"{symbol}: "
+            f"{old_price} -> {price} "
+            f"CHANGE: {change:+.2f}%"
+        )
 
         last_alert = int(
             state[symbol].get("last_alert", 0)
         )
 
-        # -------------------------
-        # Percentage movement
-        # -------------------------
-
-        change = ((price - old_price) / old_price) * 100
-
-        elapsed = now - old_time
-
-        print(
-            f"{symbol} | "
-            f"Old: {old_price} | "
-            f"New: {price} | "
-            f"Change: {change:+.2f}% | "
-            f"Elapsed: {elapsed}s"
-        )
-
-        # -------------------------
-        # Alert
-        # -------------------------
-
         if abs(change) >= THRESHOLD:
 
             if now - last_alert >= COOLDOWN:
 
-                if change >= THRESHOLD:
-
+                if change > 0:
                     direction = "🟢 LONG"
-
                 else:
-
                     direction = "🔴 SHORT"
 
                 message = (
-                    "🚨 SCORE HUNTER ALERT 🚨\n\n"
+                    "🚨 SCORE HUNTER 🚨\n\n"
                     f"💰 {symbol}\n"
                     f"📊 {direction}\n"
                     f"💵 Price: {price:.8f}\n"
-                    f"📈 Movement: {change:+.2f}%\n"
-                    f"⏱️ Period: {elapsed // 60} min\n\n"
-                    "⚠️ Signal only — manage risk."
+                    f"📈 Move: {change:+.2f}%\n\n"
+                    "⚠️ Manage risk."
                 )
 
                 send_telegram(message)
 
                 state[symbol]["last_alert"] = now
 
-            else:
+        state[symbol]["price"] = price
+        state[symbol]["time"] = now
 
-                print(
-                    f"{
+    save_state(state)
+
+    print("✅ Scan completed.")
+
+
+if __name__ == "__main__":
+    main()
