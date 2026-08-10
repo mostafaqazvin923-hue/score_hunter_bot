@@ -1,10 +1,10 @@
 import requests
 
-url = "https://api.coingecko.com/api/v3/simple/price"
+url = "https://pro-api.coinmarketcap.com/public-api/v1/simple/price"
 
 params = {
-    "ids": "ethereum,solana,ripple,aptos",
-    "vs_currencies": "usd"
+    "ids": "52,1027,5426,21794",
+    "convert": "USD"
 }
 
 response = requests.get(url, params=params, timeout=20)
