@@ -101,7 +101,7 @@ def get_4h_data():
             "volume": float(row[6])
         })
 
-    # آخرین کندل هنوز ممکن است در حال تشکیل باشد.
+    # آخرین کندل ممکن است هنوز در حال تشکیل باشد.
     # فقط کندل بسته‌شده را استفاده می‌کنیم.
     if len(candles) > 1:
         candles = candles[:-1]
@@ -191,14 +191,14 @@ def atr(highs, lows, closes, period=14):
 
         true_ranges.append(tr)
 
-    return (
-        sum(true_ranges[-period:])
-        / period
-    )
+    return sum(
+        true_ranges[-period:]
+    ) / period
 
 
 def calculate_signal(candles):
     if len(candles) < 210:
+        print("Not enough candles.")
         return None
 
     opens = [c["open"] for c in candles]
@@ -207,10 +207,12 @@ def calculate_signal(candles):
     closes = [c["close"] for c in candles]
     volumes = [c["volume"] for c in candles]
 
-    close = closes[-1]
+    # آخرین کندل بسته‌شده
     open_price = opens[-1]
     high = highs[-1]
     low = lows[-1]
+    close = closes[-1]
+    volume = volumes[-1]
 
     ema20 = ema(closes, 20)
     ema50 = ema(closes, 50)
@@ -240,9 +242,13 @@ def calculate_signal(candles):
             current_atr
         ]
     ):
+        print("Indicator calculation failed.")
         return None
 
+    # =========================
     # TREND
+    # =========================
+
     long_trend = (
         close > ema200
         and ema20 > ema50
@@ -253,7 +259,10 @@ def calculate_signal(candles):
         and ema20 < ema50
     )
 
+    # =========================
     # RSI
+    # =========================
+
     long_rsi = (
         current_rsi > 50
         and current_rsi < 72
@@ -266,17 +275,26 @@ def calculate_signal(candles):
         and current_rsi < previous_rsi
     )
 
+    # =========================
     # VOLUME
+    # =========================
+
     volume_ok = volume >= volume_ma
 
+    # =========================
     # MARKET STRUCTURE
+    # =========================
+
     recent_high = max(highs[-7:-1])
     recent_low = min(lows[-7:-1])
 
     bull_break = close > recent_high
     bear_break = close < recent_low
 
+    # =========================
     # EMA PULLBACK
+    # =========================
+
     long_pullback = (
         low <= ema20
         and close > ema20
@@ -287,7 +305,10 @@ def calculate_signal(candles):
         and close < ema20
     )
 
-    # CANDLE
+    # =========================
+    # CANDLE CONFIRMATION
+    # =========================
+
     candle_range = high - low
 
     bull_candle = (
@@ -308,12 +329,18 @@ def calculate_signal(candles):
         ) >= 0.40
     )
 
+    # =========================
     # VOLATILITY
+    # =========================
+
     volatility_ok = (
         current_atr / close
     ) >= 0.002
 
+    # =========================
     # SCORE
+    # =========================
+
     long_score = (
         int(long_trend)
         + int(long_rsi)
@@ -335,7 +362,7 @@ def calculate_signal(candles):
     )
 
     print()
-    print("===== ETHUSDT 4H SCORE =====")
+    print("========== ETHUSDT 4H ==========")
     print(f"Close: {close:.4f}")
     print(f"RSI: {current_rsi:.2f}")
     print(f"EMA20: {ema20:.4f}")
@@ -345,7 +372,7 @@ def calculate_signal(candles):
     print(f"Volume OK: {volume_ok}")
     print(f"LONG SCORE: {long_score}/7")
     print(f"SHORT SCORE: {short_score}/7")
-    print("============================")
+    print("================================")
     print()
 
     if long_score >= REQUIRED_SCORE:
@@ -383,7 +410,7 @@ def main():
         f"{latest_candle_time}"
     )
 
-    # اگر همان کندل قبلی است، دوباره سیگنال نمی‌سازیم.
+    # فقط در صورت تشکیل کندل 4H جدید بررسی کن.
     if previous_candle_time == latest_candle_time:
         print("No new closed 4H candle.")
         print("⏳ Waiting for next 4H candle.")
@@ -419,6 +446,7 @@ def main():
     entry = signal["price"]
 
     if direction == "LONG":
+
         tp = entry * (
             1 + TP_PERCENT / 100
         )
@@ -440,6 +468,7 @@ def main():
         )
 
     else:
+
         tp = entry * (
             1 - TP_PERCENT / 100
         )
@@ -464,6 +493,9 @@ def main():
 
     state["last_signal_day"] = today
     state["last_signal"] = signal
+    state["signal_time"] = int(
+        datetime.now(timezone.utc).timestamp()
+    )
 
     save_state(state)
 
