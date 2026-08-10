@@ -8,7 +8,7 @@ CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SYMBOLS = ["ETHUSDT", "SOLUSDT", "XRPUSDT", "APTUSDT"]
 
 TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
+BYBIT_URL = "https://api.bybit.com/v5/market/kline"
 
 
 def send_message(text):
@@ -27,20 +27,26 @@ def send_message(text):
 
 def get_candle(symbol):
     params = {
+        "category": "linear",
         "symbol": symbol,
-        "interval": "5m",
-        "limit": 1
+        "interval": "5",
+        "limit": "1"
     }
 
     response = requests.get(
-        BINANCE_URL,
+        BYBIT_URL,
         params=params,
         timeout=10
     )
 
     response.raise_for_status()
 
-    candles = response.json()
+    data = response.json()
+
+    if data.get("retCode") != 0:
+        raise Exception(data.get("retMsg", "Bybit API error"))
+
+    candles = data["result"]["list"]
 
     if not candles:
         return None
@@ -92,11 +98,11 @@ def check_symbol(symbol):
         "🚨 SCORE HUNTER ALERT\n\n"
         f"{direction}\n"
         f"Symbol: {symbol}\n"
-        f"Entry reference: {current_price}\n"
+        f"Price: {current_price}\n"
         f"5m Open: {open_price}\n"
         f"Move: {change:+.2f}%\n"
         f"Candle: {candle_time}\n\n"
-        "⚠️ این هشدار فقط شناسایی حرکت ۱٪ است و سیگنال قطعی معامله نیست."
+        "⚠️ این هشدار فقط شناسایی حرکت ۱٪ است."
     )
 
     send_message(message)
