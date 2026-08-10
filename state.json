@@ -2,17 +2,36 @@
   "ETH": {
     "price": 1878.0134502537426,
     "time": 1786377222,
-    "last_alert": 0
+    "last_alert": 0,
+    "last_checked_candle": 1786363200,
+    "last_signal_day": "2026-08-10",
+    "last_signal": {
+      "direction": "SHORT",
+      "score": 6,
+      "price": 1877.17
+    },
+    "signal_candle": 1786363200,
+    "signal_time": 1786379900
   },
   "SOL": {
     "price": 75.87775392030363,
     "time": 1786377222,
-    "last_alert": 0
+    "last_alert": 0,
+    "last_checked_candle": 1786363200
   },
   "XRP": {
     "price": 1.0220175008542913,
     "time": 1786377222,
-    "last_alert": 0
+    "last_alert": 0,
+    "last_checked_candle": 1786363200,
+    "last_signal_day": "2026-08-10",
+    "last_signal": {
+      "direction": "SHORT",
+      "score": 5,
+      "price": 1.02322
+    },
+    "signal_candle": 1786363200,
+    "signal_time": 1786379901
   },
   "APT": {
     "price": 0.5893844159660164,
