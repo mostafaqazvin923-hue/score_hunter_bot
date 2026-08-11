@@ -4,17 +4,33 @@ import time
 import requests
 
 # ============================================================
-# SCORE HUNTER 4H
-# DATA SOURCE: LBANK
-# COINS: BTC / ETH / SOL / XRP
-# STRATEGY: 7 FACTORS - MIN SCORE 5/7
-# TP: 1% | SL: 0.5%
+# SCORE HUNTER 4H - LBANK
+# BTC / ETH / SOL / XRP
+#
+# 7 FACTORS:
+# 1 Trend
+# 2 RSI
+# 3 Volume
+# 4 Breakout
+# 5 Pullback
+# 6 Candle confirmation
+# 7 Volatility
+#
+# NEW:
+# - Strong signal filter
+# - Entry window
+# - Signal expiration
+# - ATR + market structure SL
+# - Risk/Reward TP
+# - Trade result tracking
+# - Duplicate protection
 # ============================================================
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "2090120004")
 
 LBANK_KLINE_URL = "https://api.lbkex.com/v2/kline.do"
+LBANK_TICKER_URL = "https://api.lbkex.com/v2/ticker.do"
 
 COINS = {
     "BTC": "btc_usdt",
@@ -26,11 +42,28 @@ COINS = {
 TIMEFRAME = "hour4"
 CANDLE_LIMIT = 250
 
+# Minimum score
 REQUIRED_SCORE = 5
 
-TP_PERCENT = 1.0
-SL_PERCENT = 0.50
+# Entry must be close enough to the signal price
+ENTRY_MAX_DISTANCE = 0.003
+# 0.003 = 0.30%
 
+# ATR stop-loss
+ATR_MULTIPLIER = 1.2
+
+# Minimum distance from entry to structural stop
+MIN_SL_PERCENT = 0.004
+# 0.4%
+
+# Maximum allowed SL distance
+MAX_SL_PERCENT = 0.025
+# 2.5%
+
+# Risk / Reward
+RISK_REWARD = 1.8
+
+# State file
 STATE_FILE = "state.json"
 
 
@@ -52,7 +85,11 @@ def send_telegram(message):
     )
 
     print("Telegram:", response.status_code)
-    print(response.text)
+
+    if response.status_code != 200:
+        print(response.text)
+
+    return response.ok
 
 
 # ============================================================
@@ -62,42 +99,63 @@ def send_telegram(message):
 def load_state():
 
     if not os.path.exists(STATE_FILE):
-        return {}
+        return {
+            "last_signals": {},
+            "active_trades": {},
+            "completed_trades": [],
+        }
 
     try:
 
         with open(
             STATE_FILE,
             "r",
-            encoding="utf-8"
+            encoding="utf-8",
         ) as f:
 
-            return json.load(f)
+            state = json.load(f)
+
+        state.setdefault("last_signals", {})
+        state.setdefault("active_trades", {})
+        state.setdefault("completed_trades", [])
+
+        return state
 
     except Exception as e:
 
         print("State load error:", e)
 
-        return {}
+        return {
+            "last_signals": {},
+            "active_trades": {},
+            "completed_trades": [],
+        }
 
 
 def save_state(state):
 
+    temp_file = STATE_FILE + ".tmp"
+
     with open(
-        STATE_FILE,
+        temp_file,
         "w",
-        encoding="utf-8"
+        encoding="utf-8",
     ) as f:
 
         json.dump(
             state,
             f,
-            indent=2
+            indent=2,
         )
+
+    os.replace(
+        temp_file,
+        STATE_FILE,
+    )
 
 
 # ============================================================
-# LBANK 4H DATA
+# LBANK KLINE
 # ============================================================
 
 def get_4h_candles(symbol):
@@ -106,13 +164,16 @@ def get_4h_candles(symbol):
         f"Getting {symbol} 4H candles from LBank..."
     )
 
-    # LBank requires a TIME parameter.
-    # We request enough history to calculate EMA200.
     now = int(time.time())
 
     start_time = (
         now
-        - (CANDLE_LIMIT * 4 * 60 * 60)
+        - (
+            CANDLE_LIMIT
+            * 4
+            * 60
+            * 60
+        )
     )
 
     response = requests.get(
@@ -126,7 +187,10 @@ def get_4h_candles(symbol):
         timeout=20,
     )
 
-    print("LBank:", response.status_code)
+    print(
+        "LBank:",
+        response.status_code,
+    )
 
     response.raise_for_status()
 
@@ -142,13 +206,13 @@ def get_4h_candles(symbol):
 
     raw_data = result.get(
         "data",
-        []
+        [],
     )
 
     if not raw_data:
 
         raise RuntimeError(
-            f"No candle data returned for {symbol}"
+            f"No candle data for {symbol}"
         )
 
     candles = []
@@ -182,7 +246,69 @@ def get_4h_candles(symbol):
 
 
 # ============================================================
-# CLOSED CANDLES ONLY
+# CURRENT PRICE
+# ============================================================
+
+def get_current_price(symbol):
+
+    response = requests.get(
+        LBANK_TICKER_URL,
+        params={
+            "symbol": symbol,
+        },
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if str(
+        result.get("result")
+    ).lower() != "true":
+
+        raise RuntimeError(
+            f"LBank ticker error: {result}"
+        )
+
+    data = result.get(
+        "data",
+        [],
+    )
+
+    if not data:
+        raise RuntimeError(
+            f"No ticker data for {symbol}"
+        )
+
+    ticker = data[0]
+
+    ticker_data = ticker.get(
+        "ticker",
+        ticker,
+    )
+
+    price = ticker_data.get(
+        "latest"
+    )
+
+    if price is None:
+
+        price = ticker_data.get(
+            "last"
+        )
+
+    if price is None:
+
+        raise RuntimeError(
+            f"Could not find current price: {result}"
+        )
+
+    return float(price)
+
+
+# ============================================================
+# CLOSED CANDLES
 # ============================================================
 
 def get_closed_candles(candles):
@@ -193,8 +319,7 @@ def get_closed_candles(candles):
             "Not enough candles."
         )
 
-    # The latest candle can still be forming.
-    # We don't use it for signals.
+    # Ignore the currently forming candle.
     return candles[:-1]
 
 
@@ -243,7 +368,7 @@ def ema_series(values, period):
 
 def rsi_series(
     closes,
-    period=14
+    period=14,
 ):
 
     if len(closes) <= period:
@@ -254,7 +379,7 @@ def rsi_series(
 
     for i in range(
         1,
-        len(closes)
+        len(closes),
     ):
 
         change = (
@@ -303,7 +428,7 @@ def rsi_series(
 
     for i in range(
         period,
-        len(gains)
+        len(gains),
     ):
 
         avg_gain = (
@@ -352,7 +477,7 @@ def rsi_series(
 
 def atr_series(
     candles,
-    period=14
+    period=14,
 ):
 
     if len(candles) <= period:
@@ -362,7 +487,7 @@ def atr_series(
 
     for i in range(
         1,
-        len(candles)
+        len(candles),
     ):
 
         high = candles[i]["high"]
@@ -420,7 +545,7 @@ def atr_series(
 
 
 # ============================================================
-# SIGNAL
+# SIGNAL CALCULATION
 # ============================================================
 
 def calculate_signal(candles):
@@ -440,27 +565,27 @@ def calculate_signal(candles):
 
     ema20 = ema_series(
         closes,
-        20
+        20,
     )
 
     ema50 = ema_series(
         closes,
-        50
+        50,
     )
 
     ema200 = ema_series(
         closes,
-        200
+        200,
     )
 
     rsi_values = rsi_series(
         closes,
-        14
+        14,
     )
 
     atr_values = atr_series(
         candles,
-        14
+        14,
     )
 
     i = len(candles) - 1
@@ -536,7 +661,7 @@ def calculate_signal(candles):
     )
 
     # ========================================================
-    # 4. MARKET STRUCTURE
+    # 4. BREAKOUT
     # ========================================================
 
     recent_high = max(
@@ -558,7 +683,7 @@ def calculate_signal(candles):
     )
 
     # ========================================================
-    # 5. EMA PULLBACK
+    # 5. PULLBACK
     # ========================================================
 
     long_pullback = (
@@ -575,9 +700,7 @@ def calculate_signal(candles):
     # 6. CANDLE CONFIRMATION
     # ========================================================
 
-    candle_range = (
-        high - low
-    )
+    candle_range = high - low
 
     if candle_range > 0:
 
@@ -596,13 +719,11 @@ def calculate_signal(candles):
 
     bull_candle = (
         close > open_price
-        and candle_range > 0
         and bull_ratio >= 0.40
     )
 
     bear_candle = (
         close < open_price
-        and candle_range > 0
         and bear_ratio >= 0.40
     )
 
@@ -639,26 +760,439 @@ def calculate_signal(candles):
     )
 
     # ========================================================
-    # FINAL SIGNAL
+    # STRONG SIGNAL FILTER
+    #
+    # Trend + Pullback + Candle are mandatory.
     # ========================================================
 
-    if long_score >= REQUIRED_SCORE:
+    if (
+        long_score >= REQUIRED_SCORE
+        and long_trend
+        and long_pullback
+        and bull_candle
+    ):
 
         return {
             "direction": "LONG",
             "score": long_score,
             "entry": close,
+            "atr": atr,
+            "structure_low": recent_low,
+            "structure_high": recent_high,
+            "candle_time": current["time"],
         }
 
-    if short_score >= REQUIRED_SCORE:
+    if (
+        short_score >= REQUIRED_SCORE
+        and short_trend
+        and short_pullback
+        and bear_candle
+    ):
 
         return {
             "direction": "SHORT",
             "score": short_score,
             "entry": close,
+            "atr": atr,
+            "structure_low": recent_low,
+            "structure_high": recent_high,
+            "candle_time": current["time"],
         }
 
     return None
+
+
+# ============================================================
+# SIGNAL STRENGTH
+# ============================================================
+
+def signal_strength(score):
+
+    if score >= 7:
+        return "🔥 VERY STRONG"
+
+    if score >= 6:
+        return "💪 STRONG"
+
+    return "🟡 NORMAL"
+
+
+# ============================================================
+# CALCULATE SL / TP
+# ============================================================
+
+def calculate_risk_levels(signal):
+
+    direction = signal["direction"]
+    entry = signal["entry"]
+    atr = signal["atr"]
+
+    structure_low = signal["structure_low"]
+    structure_high = signal["structure_high"]
+
+    if direction == "LONG":
+
+        atr_sl = (
+            entry
+            - (
+                ATR_MULTIPLIER
+                * atr
+            )
+        )
+
+        structure_sl = (
+            structure_low
+            - (
+                0.15
+                * atr
+            )
+        )
+
+        # Use the wider protective stop
+        sl = min(
+            atr_sl,
+            structure_sl,
+        )
+
+        risk = entry - sl
+
+        min_risk = (
+            entry
+            * MIN_SL_PERCENT
+        )
+
+        max_risk = (
+            entry
+            * MAX_SL_PERCENT
+        )
+
+        risk = max(
+            risk,
+            min_risk,
+        )
+
+        risk = min(
+            risk,
+            max_risk,
+        )
+
+        sl = entry - risk
+
+        tp = (
+            entry
+            + (
+                risk
+                * RISK_REWARD
+            )
+        )
+
+    else:
+
+        atr_sl = (
+            entry
+            + (
+                ATR_MULTIPLIER
+                * atr
+            )
+        )
+
+        structure_sl = (
+            structure_high
+            + (
+                0.15
+                * atr
+            )
+        )
+
+        sl = max(
+            atr_sl,
+            structure_sl,
+        )
+
+        risk = sl - entry
+
+        min_risk = (
+            entry
+            * MIN_SL_PERCENT
+        )
+
+        max_risk = (
+            entry
+            * MAX_SL_PERCENT
+        )
+
+        risk = max(
+            risk,
+            min_risk,
+        )
+
+        risk = min(
+            risk,
+            max_risk,
+        )
+
+        sl = entry + risk
+
+        tp = (
+            entry
+            - (
+                risk
+                * RISK_REWARD
+            )
+        )
+
+    return {
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "risk_percent": (
+            abs(entry - sl)
+            / entry
+            * 100
+        ),
+        "rr": RISK_REWARD,
+    }
+
+
+# ============================================================
+# ENTRY WINDOW
+# ============================================================
+
+def entry_is_valid(
+    entry,
+    current_price,
+):
+
+    distance = (
+        abs(
+            current_price
+            - entry
+        )
+        / entry
+    )
+
+    return (
+        distance
+        <= ENTRY_MAX_DISTANCE
+    )
+
+
+# ============================================================
+# CHECK ACTIVE TRADES
+# ============================================================
+
+def check_active_trades(
+    state,
+):
+
+    active = state.get(
+        "active_trades",
+        {},
+    )
+
+    if not active:
+        return
+
+    finished = []
+
+    for trade_id, trade in list(
+        active.items()
+    ):
+
+        symbol = trade["symbol"]
+        direction = trade["direction"]
+        entry = trade["entry"]
+        tp = trade["tp"]
+        sl = trade["sl"]
+
+        try:
+
+            current_price = get_current_price(
+                trade["lbank_symbol"]
+            )
+
+        except Exception as e:
+
+            print(
+                f"{symbol}: "
+                f"price check error: {e}"
+            )
+
+            continue
+
+        result = None
+
+        if direction == "LONG":
+
+            if current_price >= tp:
+                result = "TP"
+
+            elif current_price <= sl:
+                result = "SL"
+
+        else:
+
+            if current_price <= tp:
+                result = "TP"
+
+            elif current_price >= sl:
+                result = "SL"
+
+        if result is None:
+            continue
+
+        if result == "TP":
+
+            pnl_percent = (
+                abs(tp - entry)
+                / entry
+                * 100
+            )
+
+        else:
+
+            pnl_percent = -(
+                abs(sl - entry)
+                / entry
+                * 100
+            )
+
+        trade["result"] = result
+        trade["exit_price"] = current_price
+        trade["pnl_percent"] = pnl_percent
+        trade["closed_at"] = int(
+            time.time()
+        )
+
+        state.setdefault(
+            "completed_trades",
+            [],
+        ).append(trade)
+
+        finished.append(
+            (
+                trade_id,
+                trade,
+            )
+        )
+
+        emoji = (
+            "✅"
+            if result == "TP"
+            else "❌"
+        )
+
+        message = (
+            f"{emoji} SCORE HUNTER "
+            f"TRADE CLOSED\n\n"
+            f"💰 {symbol}USDT\n"
+            f"📊 {direction}\n"
+            f"⭐ Score: "
+            f"{trade['score']}/7\n"
+            f"📌 Result: {result}\n"
+            f"💵 Entry: {entry:.8f}\n"
+            f"🏁 Exit: "
+            f"{current_price:.8f}\n"
+            f"📈 P/L: "
+            f"{pnl_percent:+.2f}%\n\n"
+            f"⏱ Timeframe: 4H\n"
+            f"🏦 Data: LBank"
+        )
+
+        send_telegram(message)
+
+    for trade_id, _ in finished:
+
+        del active[trade_id]
+
+    state["active_trades"] = active
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+def get_statistics(state):
+
+    trades = state.get(
+        "completed_trades",
+        [],
+    )
+
+    if not trades:
+        return None
+
+    total = len(trades)
+
+    wins = sum(
+        1
+        for t in trades
+        if t.get("result") == "TP"
+    )
+
+    losses = sum(
+        1
+        for t in trades
+        if t.get("result") == "SL"
+    )
+
+    decided = wins + losses
+
+    win_rate = (
+        wins / decided * 100
+        if decided
+        else 0
+    )
+
+    total_pnl = sum(
+        t.get(
+            "pnl_percent",
+            0,
+        )
+        for t in trades
+    )
+
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "pnl": total_pnl,
+    }
+
+
+# ============================================================
+# SEND STATISTICS
+# ============================================================
+
+def send_statistics_if_needed(
+    state,
+):
+
+    stats = get_statistics(state)
+
+    if not stats:
+        return
+
+    # Only report every 10 completed trades
+    if stats["total"] % 10 != 0:
+        return
+
+    message = (
+        "📊 SCORE HUNTER STATISTICS\n\n"
+        f"📌 Closed trades: "
+        f"{stats['total']}\n"
+        f"✅ TP: {stats['wins']}\n"
+        f"❌ SL: {stats['losses']}\n"
+        f"🎯 Win rate: "
+        f"{stats['win_rate']:.1f}%\n"
+        f"📈 Total P/L: "
+        f"{stats['pnl']:+.2f}%\n\n"
+        "⏱ Timeframe: 4H\n"
+        "🏦 Data: LBank"
+    )
+
+    send_telegram(message)
 
 
 # ============================================================
@@ -668,10 +1202,41 @@ def calculate_signal(candles):
 def main():
 
     print(
-        "🟢 SCORE HUNTER 4H - LBANK SCANNING"
+        "🟢 SCORE HUNTER 4H - LBANK"
+    )
+
+    print(
+        "🛡 Advanced filters enabled"
+    )
+
+    print(
+        f"Entry window: "
+        f"{ENTRY_MAX_DISTANCE * 100:.2f}%"
+    )
+
+    print(
+        f"ATR SL multiplier: "
+        f"{ATR_MULTIPLIER}"
+    )
+
+    print(
+        f"Risk/Reward: "
+        f"1:{RISK_REWARD}"
     )
 
     state = load_state()
+
+    # --------------------------------------------------------
+    # First check existing active trades
+    # --------------------------------------------------------
+
+    check_active_trades(
+        state
+    )
+
+    # --------------------------------------------------------
+    # Scan new signals
+    # --------------------------------------------------------
 
     for symbol, lbank_symbol in COINS.items():
 
@@ -708,7 +1273,8 @@ def main():
             if signal is None:
 
                 print(
-                    f"{symbol}: no signal"
+                    f"{symbol}: "
+                    f"no valid signal"
                 )
 
                 continue
@@ -725,139 +1291,264 @@ def main():
                 signal["entry"]
             )
 
-            # =================================================
-            # DUPLICATE PROTECTION
-            # =================================================
-
-            signal_id = (
-                f"{latest['time']}_{direction}"
+            candle_time = (
+                signal["candle_time"]
             )
 
-            previous_signal = (
-                state
-                .get(symbol, {})
-                .get("last_signal")
+            strength = signal_strength(
+                score
             )
 
-            if previous_signal == signal_id:
+            # ------------------------------------------------
+            # Current market price
+            # ------------------------------------------------
+
+            current_price = (
+                get_current_price(
+                    lbank_symbol
+                )
+            )
+
+            distance = (
+                abs(
+                    current_price
+                    - entry
+                )
+                / entry
+                * 100
+            )
+
+            print(
+                f"{symbol}: "
+                f"signal={direction} "
+                f"score={score}/7 "
+                f"entry={entry} "
+                f"current={current_price} "
+                f"distance={distance:.3f}%"
+            )
+
+            # ------------------------------------------------
+            # ENTRY WINDOW
+            # ------------------------------------------------
+
+            if not entry_is_valid(
+                entry,
+                current_price,
+            ):
 
                 print(
-                    f"{symbol}: signal "
-                    f"already sent"
+                    f"{symbol}: "
+                    f"signal expired - "
+                    f"price too far from entry"
                 )
 
                 continue
 
-            # =================================================
-            # TP / SL
-            # =================================================
+            # ------------------------------------------------
+            # Duplicate protection
+            # ------------------------------------------------
+
+            signal_id = (
+                f"{symbol}_"
+                f"{candle_time}_"
+                f"{direction}"
+            )
+
+            previous_id = (
+                state
+                .get(
+                    "last_signals",
+                    {}
+                )
+                .get(symbol)
+            )
+
+            if previous_id == signal_id:
+
+                print(
+                    f"{symbol}: "
+                    f"signal already sent"
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Do not open another trade
+            # while one is active
+            # ------------------------------------------------
+
+            existing_trade = None
+
+            for trade in (
+                state
+                .get(
+                    "active_trades",
+                    {}
+                )
+                .values()
+            ):
+
+                if trade["symbol"] == symbol:
+
+                    existing_trade = trade
+                    break
+
+            if existing_trade:
+
+                print(
+                    f"{symbol}: "
+                    f"active trade exists"
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Risk levels
+            # ------------------------------------------------
+
+            levels = (
+                calculate_risk_levels(
+                    signal
+                )
+            )
+
+            sl = levels["sl"]
+            tp = levels["tp"]
+            risk_percent = (
+                levels["risk_percent"]
+            )
+
+            # ------------------------------------------------
+            # Trade ID
+            # ------------------------------------------------
+
+            trade_id = signal_id
+
+            # ------------------------------------------------
+            # Save active trade
+            # ------------------------------------------------
+
+            trade = {
+                "trade_id": trade_id,
+                "symbol": symbol,
+                "lbank_symbol": lbank_symbol,
+                "direction": direction,
+                "score": score,
+                "strength": strength,
+                "entry": entry,
+                "current_price_at_signal": current_price,
+                "tp": tp,
+                "sl": sl,
+                "risk_percent": risk_percent,
+                "rr": RISK_REWARD,
+                "candle_time": candle_time,
+                "created_at": int(
+                    time.time()
+                ),
+                "status": "ACTIVE",
+            }
+
+            state.setdefault(
+                "active_trades",
+                {},
+            )[trade_id] = trade
+
+            state.setdefault(
+                "last_signals",
+                {},
+            )[symbol] = signal_id
+
+            save_state(state)
+
+            # ------------------------------------------------
+            # Telegram
+            # ------------------------------------------------
 
             if direction == "LONG":
-
-                tp = (
-                    entry
-                    * (
-                        1
-                        + TP_PERCENT
-                        / 100
-                    )
-                )
-
-                sl = (
-                    entry
-                    * (
-                        1
-                        - SL_PERCENT
-                        / 100
-                    )
-                )
 
                 direction_text = (
                     "🟢 LONG"
                 )
 
-                tp_text = (
-                    f"+{TP_PERCENT:.0f}%"
+                tp_percent = (
+                    (tp - entry)
+                    / entry
+                    * 100
                 )
 
-                sl_text = (
-                    f"-{SL_PERCENT:.1f}%"
+                sl_percent = (
+                    (sl - entry)
+                    / entry
+                    * 100
                 )
 
             else:
-
-                tp = (
-                    entry
-                    * (
-                        1
-                        - TP_PERCENT
-                        / 100
-                    )
-                )
-
-                sl = (
-                    entry
-                    * (
-                        1
-                        + SL_PERCENT
-                        / 100
-                    )
-                )
 
                 direction_text = (
                     "🔴 SHORT"
                 )
 
-                tp_text = (
-                    f"-{TP_PERCENT:.0f}%"
+                tp_percent = (
+                    (entry - tp)
+                    / entry
+                    * 100
                 )
 
-                sl_text = (
-                    f"+{SL_PERCENT:.1f}%"
+                sl_percent = (
+                    (entry - sl)
+                    / entry
+                    * 100
                 )
-
-            # =================================================
-            # TELEGRAM
-            # =================================================
 
             message = (
                 "🚨 SCORE HUNTER 4H 🚨\n\n"
                 f"💰 {symbol}USDT\n"
                 f"📊 {direction_text}\n"
-                f"⭐ Score: {score}/7\n"
-                f"💵 Entry: {entry:.8f}\n"
-                f"🎯 TP: {tp:.8f} "
-                f"({tp_text})\n"
-                f"🛑 SL: {sl:.8f} "
-                f"({sl_text})\n\n"
+                f"{strength}\n"
+                f"⭐ Score: {score}/7\n\n"
+                f"💵 Entry: "
+                f"{entry:.8f}\n"
+                f"📍 Current: "
+                f"{current_price:.8f}\n"
+                f"📏 Distance: "
+                f"{distance:.2f}%\n\n"
+                f"🎯 TP: "
+                f"{tp:.8f} "
+                f"(+{tp_percent:.2f}% "
+                f"target)\n"
+                f"🛑 SL: "
+                f"{sl:.8f} "
+                f"(-{sl_percent:.2f}% "
+                f"risk)\n\n"
+                f"⚖️ R:R: "
+                f"1:{RISK_REWARD}\n"
+                f"📐 Risk: "
+                f"{risk_percent:.2f}%\n\n"
                 "⏱ Timeframe: 4H\n"
                 "🏦 Data: LBank\n"
+                "🔒 Entry window: ±0.30%\n"
                 "⚠️ Manage risk."
             )
 
-            send_telegram(message)
-
-            # =================================================
-            # SAVE
-            # =================================================
-
-            state[symbol] = {
-                "last_signal": signal_id,
-                "last_signal_time": latest["time"],
-                "direction": direction,
-                "score": score,
-                "entry": entry,
-                "tp": tp,
-                "sl": sl,
-            }
-
-            save_state(state)
-
-            print(
-                f"{symbol}: "
-                f"{direction} "
-                f"Score {score}/7 SENT"
+            sent = send_telegram(
+                message
             )
+
+            if sent:
+
+                print(
+                    f"{symbol}: "
+                    f"{direction} "
+                    f"Score {score}/7 "
+                    f"SENT"
+                )
+
+            else:
+
+                print(
+                    f"{symbol}: "
+                    f"Telegram failed"
+                )
 
         except Exception as e:
 
@@ -865,7 +1556,19 @@ def main():
                 f"{symbol}: ERROR: {e}"
             )
 
+    # --------------------------------------------------------
+    # Save state
+    # --------------------------------------------------------
+
     save_state(state)
+
+    # --------------------------------------------------------
+    # Statistics
+    # --------------------------------------------------------
+
+    send_statistics_if_needed(
+        state
+    )
 
     print(
         "\n✅ LBank 4H scan completed."
