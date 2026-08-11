@@ -3,7 +3,7 @@
     "price": 1878.0134502537426,
     "time": 1786377222,
     "last_alert": 0,
-    "last_checked_candle": 1786392000,
+    "last_checked_candle": 1786406400,
     "last_signal_day": "2026-08-10",
     "last_signal": {
       "direction": "SHORT",
@@ -17,7 +17,7 @@
     "price": 75.87775392030363,
     "time": 1786377222,
     "last_alert": 0,
-    "last_checked_candle": 1786392000,
+    "last_checked_candle": 1786406400,
     "last_signal_day": "2026-08-10",
     "last_signal": {
       "direction": "LONG",
@@ -31,7 +31,7 @@
     "price": 1.0220175008542913,
     "time": 1786377222,
     "last_alert": 0,
-    "last_checked_candle": 1786392000,
+    "last_checked_candle": 1786406400,
     "last_signal_day": "2026-08-11",
     "last_signal": {
       "direction": "SHORT",
