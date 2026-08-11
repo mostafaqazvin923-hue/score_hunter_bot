@@ -8,7 +8,7 @@ import requests
 # DATA SOURCE: LBANK
 # COINS: BTC / ETH / SOL / XRP
 # STRATEGY: 7 FACTORS - MIN SCORE 5/7
-# TP: +1%   SL: 0.5%
+# TP: 1% | SL: 0.5%
 # ============================================================
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -33,11 +33,13 @@ SL_PERCENT = 0.50
 
 STATE_FILE = "state.json"
 
+
 # ============================================================
 # TELEGRAM
 # ============================================================
 
 def send_telegram(message):
+
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
     response = requests.post(
@@ -58,29 +60,60 @@ def send_telegram(message):
 # ============================================================
 
 def load_state():
+
     if not os.path.exists(STATE_FILE):
         return {}
 
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             return json.load(f)
 
     except Exception as e:
+
         print("State load error:", e)
+
         return {}
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+
+    with open(
+        STATE_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            state,
+            f,
+            indent=2
+        )
 
 
 # ============================================================
-# LBANK DATA
+# LBANK 4H DATA
 # ============================================================
 
 def get_4h_candles(symbol):
-    print(f"Getting {symbol} 4H candles from LBank...")
+
+    print(
+        f"Getting {symbol} 4H candles from LBank..."
+    )
+
+    # LBank requires a TIME parameter.
+    # We request enough history to calculate EMA200.
+    now = int(time.time())
+
+    start_time = (
+        now
+        - (CANDLE_LIMIT * 4 * 60 * 60)
+    )
 
     response = requests.get(
         LBANK_KLINE_URL,
@@ -88,6 +121,7 @@ def get_4h_candles(symbol):
             "symbol": symbol,
             "size": CANDLE_LIMIT,
             "type": TIMEFRAME,
+            "time": start_time,
         },
         timeout=20,
     )
@@ -98,14 +132,21 @@ def get_4h_candles(symbol):
 
     result = response.json()
 
-    if str(result.get("result")).lower() != "true":
+    if str(
+        result.get("result")
+    ).lower() != "true":
+
         raise RuntimeError(
             f"LBank API error: {result}"
         )
 
-    raw_data = result.get("data", [])
+    raw_data = result.get(
+        "data",
+        []
+    )
 
     if not raw_data:
+
         raise RuntimeError(
             f"No candle data returned for {symbol}"
         )
@@ -113,47 +154,47 @@ def get_4h_candles(symbol):
     candles = []
 
     for item in raw_data:
+
         if len(item) < 6:
             continue
 
-        candles.append({
-            "time": int(item[0]),
-            "open": float(item[1]),
-            "high": float(item[2]),
-            "low": float(item[3]),
-            "close": float(item[4]),
-            "volume": float(item[5]),
-        })
+        candles.append(
+            {
+                "time": int(item[0]),
+                "open": float(item[1]),
+                "high": float(item[2]),
+                "low": float(item[3]),
+                "close": float(item[4]),
+                "volume": float(item[5]),
+            }
+        )
 
-    candles.sort(key=lambda x: x["time"])
+    candles.sort(
+        key=lambda x: x["time"]
+    )
 
     print(
-        f"{symbol}: received {len(candles)} candles"
+        f"{symbol}: received "
+        f"{len(candles)} candles"
     )
 
     return candles
 
 
 # ============================================================
-# REMOVE CURRENT OPEN CANDLE
+# CLOSED CANDLES ONLY
 # ============================================================
 
 def get_closed_candles(candles):
-    """
-    LBank returns the current/latest candle too.
-
-    We only want CLOSED 4H candles.
-
-    The safest approach here is to remove the
-    newest candle and use the candle before it
-    as the latest confirmed candle.
-    """
 
     if len(candles) < 3:
+
         raise RuntimeError(
             "Not enough candles."
         )
 
+    # The latest candle can still be forming.
+    # We don't use it for signals.
     return candles[:-1]
 
 
@@ -161,43 +202,36 @@ def get_closed_candles(candles):
 # EMA
 # ============================================================
 
-def ema(values, period):
-    if len(values) < period:
-        return None
-
-    multiplier = 2 / (period + 1)
-
-    result = sum(values[:period]) / period
-
-    for price in values[period:]:
-        result = (
-            (price - result) * multiplier
-            + result
-        )
-
-    return result
-
-
 def ema_series(values, period):
+
     if len(values) < period:
         return []
 
     multiplier = 2 / (period + 1)
 
-    first = sum(values[:period]) / period
+    first = (
+        sum(values[:period])
+        / period
+    )
 
-    result = [None] * (period - 1)
+    result = [None] * (
+        period - 1
+    )
+
     result.append(first)
 
     previous = first
 
     for price in values[period:]:
+
         current = (
-            (price - previous) * multiplier
+            (price - previous)
+            * multiplier
             + previous
         )
 
         result.append(current)
+
         previous = current
 
     return result
@@ -207,49 +241,104 @@ def ema_series(values, period):
 # RSI
 # ============================================================
 
-def rsi_series(closes, period=14):
+def rsi_series(
+    closes,
+    period=14
+):
+
     if len(closes) <= period:
         return []
 
     gains = []
     losses = []
 
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i - 1]
+    for i in range(
+        1,
+        len(closes)
+    ):
 
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+        change = (
+            closes[i]
+            - closes[i - 1]
+        )
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+        gains.append(
+            max(change, 0)
+        )
+
+        losses.append(
+            max(-change, 0)
+        )
+
+    avg_gain = (
+        sum(gains[:period])
+        / period
+    )
+
+    avg_loss = (
+        sum(losses[:period])
+        / period
+    )
 
     result = [None] * period
 
     if avg_loss == 0:
+
         result.append(100.0)
+
     else:
-        rs = avg_gain / avg_loss
-        result.append(
-            100 - (100 / (1 + rs))
+
+        rs = (
+            avg_gain
+            / avg_loss
         )
 
-    for i in range(period, len(gains)):
+        result.append(
+            100
+            - (
+                100
+                / (1 + rs)
+            )
+        )
+
+    for i in range(
+        period,
+        len(gains)
+    ):
+
         avg_gain = (
-            (avg_gain * (period - 1))
+            (
+                avg_gain
+                * (period - 1)
+            )
             + gains[i]
         ) / period
 
         avg_loss = (
-            (avg_loss * (period - 1))
+            (
+                avg_loss
+                * (period - 1)
+            )
             + losses[i]
         ) / period
 
         if avg_loss == 0:
+
             value = 100.0
+
         else:
-            rs = avg_gain / avg_loss
-            value = 100 - (
-                100 / (1 + rs)
+
+            rs = (
+                avg_gain
+                / avg_loss
+            )
+
+            value = (
+                100
+                - (
+                    100
+                    / (1 + rs)
+                )
             )
 
         result.append(value)
@@ -258,36 +347,41 @@ def rsi_series(closes, period=14):
 
 
 # ============================================================
-# SMA
-# ============================================================
-
-def sma(values, period):
-    if len(values) < period:
-        return None
-
-    return sum(values[-period:]) / period
-
-
-# ============================================================
 # ATR
 # ============================================================
 
-def atr_series(candles, period=14):
+def atr_series(
+    candles,
+    period=14
+):
+
     if len(candles) <= period:
         return []
 
     true_ranges = []
 
-    for i in range(1, len(candles)):
+    for i in range(
+        1,
+        len(candles)
+    ):
 
         high = candles[i]["high"]
         low = candles[i]["low"]
-        previous_close = candles[i - 1]["close"]
+
+        previous_close = (
+            candles[i - 1]["close"]
+        )
 
         tr = max(
             high - low,
-            abs(high - previous_close),
-            abs(low - previous_close),
+            abs(
+                high
+                - previous_close
+            ),
+            abs(
+                low
+                - previous_close
+            ),
         )
 
         true_ranges.append(tr)
@@ -296,29 +390,37 @@ def atr_series(candles, period=14):
         return []
 
     first_atr = (
-        sum(true_ranges[:period])
+        sum(
+            true_ranges[:period]
+        )
         / period
     )
 
     result = [None] * period
+
     result.append(first_atr)
 
     previous = first_atr
 
     for tr in true_ranges[period:]:
+
         current = (
-            (previous * (period - 1))
+            (
+                previous
+                * (period - 1)
+            )
             + tr
         ) / period
 
         result.append(current)
+
         previous = current
 
     return result
 
 
 # ============================================================
-# SIGNAL CALCULATION
+# SIGNAL
 # ============================================================
 
 def calculate_signal(candles):
@@ -327,26 +429,26 @@ def calculate_signal(candles):
         return None
 
     closes = [
-        candle["close"]
-        for candle in candles
+        c["close"]
+        for c in candles
     ]
 
     volumes = [
-        candle["volume"]
-        for candle in candles
+        c["volume"]
+        for c in candles
     ]
 
-    ema20_series = ema_series(
+    ema20 = ema_series(
         closes,
         20
     )
 
-    ema50_series = ema_series(
+    ema50 = ema_series(
         closes,
         50
     )
 
-    ema200_series = ema_series(
+    ema200 = ema_series(
         closes,
         200
     )
@@ -361,11 +463,9 @@ def calculate_signal(candles):
         14
     )
 
-    # Latest CLOSED candle
     i = len(candles) - 1
 
     current = candles[i]
-    previous = candles[i - 1]
 
     close = current["close"]
     open_price = current["open"]
@@ -373,9 +473,9 @@ def calculate_signal(candles):
     low = current["low"]
     volume = current["volume"]
 
-    ema20 = ema20_series[i]
-    ema50 = ema50_series[i]
-    ema200 = ema200_series[i]
+    e20 = ema20[i]
+    e50 = ema50[i]
+    e200 = ema200[i]
 
     rsi = rsi_values[-1]
     previous_rsi = rsi_values[-2]
@@ -383,9 +483,9 @@ def calculate_signal(candles):
     atr = atr_values[-1]
 
     if (
-        ema20 is None
-        or ema50 is None
-        or ema200 is None
+        e20 is None
+        or e50 is None
+        or e200 is None
         or rsi is None
         or previous_rsi is None
         or atr is None
@@ -397,13 +497,13 @@ def calculate_signal(candles):
     # ========================================================
 
     long_trend = (
-        close > ema200
-        and ema20 > ema50
+        close > e200
+        and e20 > e50
     )
 
     short_trend = (
-        close < ema200
-        and ema20 < ema50
+        close < e200
+        and e20 < e50
     )
 
     # ========================================================
@@ -426,76 +526,84 @@ def calculate_signal(candles):
     # 3. VOLUME
     # ========================================================
 
-    if len(volumes) >= 20:
-        volume_ma = sum(
-            volumes[-20:]
-        ) / 20
-    else:
-        volume_ma = 0
+    volume_ma = (
+        sum(volumes[-20:])
+        / 20
+    )
 
-    volume_ok = volume >= volume_ma
+    volume_ok = (
+        volume >= volume_ma
+    )
 
     # ========================================================
     # 4. MARKET STRUCTURE
     # ========================================================
 
     recent_high = max(
-        candle["high"]
-        for candle in candles[-7:-1]
+        c["high"]
+        for c in candles[-7:-1]
     )
 
     recent_low = min(
-        candle["low"]
-        for candle in candles[-7:-1]
+        c["low"]
+        for c in candles[-7:-1]
     )
 
-    bull_break = close > recent_high
-    bear_break = close < recent_low
+    bull_break = (
+        close > recent_high
+    )
+
+    bear_break = (
+        close < recent_low
+    )
 
     # ========================================================
     # 5. EMA PULLBACK
     # ========================================================
 
     long_pullback = (
-        low <= ema20
-        and close > ema20
+        low <= e20
+        and close > e20
     )
 
     short_pullback = (
-        high >= ema20
-        and close < ema20
+        high >= e20
+        and close < e20
     )
 
     # ========================================================
     # 6. CANDLE CONFIRMATION
     # ========================================================
 
-    candle_range = high - low
+    candle_range = (
+        high - low
+    )
 
     if candle_range > 0:
 
-        bull_body_ratio = (
+        bull_ratio = (
             close - open_price
         ) / candle_range
 
-        bear_body_ratio = (
+        bear_ratio = (
             open_price - close
         ) / candle_range
 
     else:
-        bull_body_ratio = 0
-        bear_body_ratio = 0
+
+        bull_ratio = 0
+        bear_ratio = 0
 
     bull_candle = (
         close > open_price
         and candle_range > 0
-        and bull_body_ratio >= 0.40
+        and bull_ratio >= 0.40
     )
 
     bear_candle = (
         close < open_price
         and candle_range > 0
-        and bear_body_ratio >= 0.40
+        and bear_ratio >= 0.40
     )
 
     # ========================================================
@@ -534,23 +642,23 @@ def calculate_signal(candles):
     # FINAL SIGNAL
     # ========================================================
 
-    signal = None
-
     if long_score >= REQUIRED_SCORE:
-        signal = {
+
+        return {
             "direction": "LONG",
             "score": long_score,
             "entry": close,
         }
 
-    elif short_score >= REQUIRED_SCORE:
-        signal = {
+    if short_score >= REQUIRED_SCORE:
+
+        return {
             "direction": "SHORT",
             "score": short_score,
             "entry": close,
         }
 
-    return signal
+    return None
 
 
 # ============================================================
@@ -577,21 +685,20 @@ def main():
                 lbank_symbol
             )
 
-            closed_candles = get_closed_candles(
-                candles
+            closed_candles = (
+                get_closed_candles(
+                    candles
+                )
             )
 
-            if not closed_candles:
-                print(
-                    f"{symbol}: no closed candles"
-                )
-                continue
-
-            latest = closed_candles[-1]
+            latest = (
+                closed_candles[-1]
+            )
 
             print(
                 f"{symbol}: latest closed "
-                f"4H candle = {latest['time']}"
+                f"4H candle: "
+                f"{latest['time']}"
             )
 
             signal = calculate_signal(
@@ -606,13 +713,25 @@ def main():
 
                 continue
 
-            direction = signal["direction"]
-            score = signal["score"]
-            entry = signal["entry"]
+            direction = (
+                signal["direction"]
+            )
+
+            score = (
+                signal["score"]
+            )
+
+            entry = (
+                signal["entry"]
+            )
 
             # =================================================
             # DUPLICATE PROTECTION
             # =================================================
+
+            signal_id = (
+                f"{latest['time']}_{direction}"
+            )
 
             previous_signal = (
                 state
@@ -620,16 +739,11 @@ def main():
                 .get("last_signal")
             )
 
-            candle_time = latest["time"]
-
-            signal_id = (
-                f"{candle_time}_{direction}"
-            )
-
             if previous_signal == signal_id:
 
                 print(
-                    f"{symbol}: signal already sent"
+                    f"{symbol}: signal "
+                    f"already sent"
                 )
 
                 continue
@@ -640,30 +754,70 @@ def main():
 
             if direction == "LONG":
 
-                tp = entry * (
-                    1 + TP_PERCENT / 100
+                tp = (
+                    entry
+                    * (
+                        1
+                        + TP_PERCENT
+                        / 100
+                    )
                 )
 
-                sl = entry * (
-                    1 - SL_PERCENT / 100
+                sl = (
+                    entry
+                    * (
+                        1
+                        - SL_PERCENT
+                        / 100
+                    )
                 )
 
-                direction_text = "🟢 LONG"
+                direction_text = (
+                    "🟢 LONG"
+                )
+
+                tp_text = (
+                    f"+{TP_PERCENT:.0f}%"
+                )
+
+                sl_text = (
+                    f"-{SL_PERCENT:.1f}%"
+                )
 
             else:
 
-                tp = entry * (
-                    1 - TP_PERCENT / 100
+                tp = (
+                    entry
+                    * (
+                        1
+                        - TP_PERCENT
+                        / 100
+                    )
                 )
 
-                sl = entry * (
-                    1 + SL_PERCENT / 100
+                sl = (
+                    entry
+                    * (
+                        1
+                        + SL_PERCENT
+                        / 100
+                    )
                 )
 
-                direction_text = "🔴 SHORT"
+                direction_text = (
+                    "🔴 SHORT"
+                )
+
+                tp_text = (
+                    f"-{TP_PERCENT:.0f}%"
+                )
+
+                sl_text = (
+                    f"+{SL_PERCENT:.1f}%"
+                )
 
             # =================================================
-            # TELEGRAM MESSAGE
+            # TELEGRAM
             # =================================================
 
             message = (
@@ -673,11 +827,9 @@ def main():
                 f"⭐ Score: {score}/7\n"
                 f"💵 Entry: {entry:.8f}\n"
                 f"🎯 TP: {tp:.8f} "
-                f"({('+' if direction == 'LONG' else '-')}"
-                f"{TP_PERCENT:.0f}%)\n"
+                f"({tp_text})\n"
                 f"🛑 SL: {sl:.8f} "
-                f"({('-' if direction == 'LONG' else '+')}"
-                f"{SL_PERCENT:.1f}%)\n\n"
+                f"({sl_text})\n\n"
                 "⏱ Timeframe: 4H\n"
                 "🏦 Data: LBank\n"
                 "⚠️ Manage risk."
@@ -686,12 +838,12 @@ def main():
             send_telegram(message)
 
             # =================================================
-            # SAVE SIGNAL
+            # SAVE
             # =================================================
 
             state[symbol] = {
                 "last_signal": signal_id,
-                "last_signal_time": candle_time,
+                "last_signal_time": latest["time"],
                 "direction": direction,
                 "score": score,
                 "entry": entry,
@@ -702,7 +854,8 @@ def main():
             save_state(state)
 
             print(
-                f"{symbol}: {direction} "
+                f"{symbol}: "
+                f"{direction} "
                 f"Score {score}/7 SENT"
             )
 
