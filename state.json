@@ -14,18 +14,13 @@
     "signal_time": 1786379900
   },
   "SOL": {
-    "price": 75.87775392030363,
-    "time": 1786377222,
-    "last_alert": 0,
-    "last_checked_candle": 1786435200,
-    "last_signal_day": "2026-08-11",
-    "last_signal": {
-      "direction": "LONG",
-      "score": 5,
-      "price": 76.23
-    },
-    "signal_candle": 1786435200,
-    "signal_time": 1786459645
+    "last_signal": "1786435200_LONG",
+    "last_signal_time": 1786435200,
+    "direction": "LONG",
+    "score": 6,
+    "entry": 76.23,
+    "tp": 76.9923,
+    "sl": 75.84885
   },
   "XRP": {
     "price": 1.0220175008542913,
