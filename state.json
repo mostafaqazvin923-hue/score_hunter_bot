@@ -48,5 +48,8 @@
     "score": 6,
     "price": 1877.17
   },
-  "signal_time": 1786378968
+  "signal_time": 1786378968,
+  "last_signals": {},
+  "active_trades": {},
+  "completed_trades": []
 }
