@@ -5,7 +5,7 @@ import requests
 from statistics import mean
 
 # ============================================================
-# SCORE HUNTER PRO v5 DEBUG
+# SCORE HUNTER PRO v6 CLOSED-CANDLE
 # 4H MARKET STRUCTURE + PRICE ACTION + LIQUIDITY
 # 1H ENTRY CONFIRMATION
 #
@@ -214,9 +214,19 @@ def get_current_price(symbol):
 
 
 def closed_candles(candles):
+    """
+    Return only fully closed candles.
+    The last LBank candle is treated as forming and is NEVER
+    used by the signal engine.
+    """
     if len(candles) < 5:
         raise RuntimeError("Not enough candles")
-    return candles[:-1]
+
+    closed = candles[:-1]
+    if not closed:
+        raise RuntimeError("No closed candles available")
+
+    return closed
 
 
 # ============================================================
@@ -1054,7 +1064,7 @@ def check_active_trades(state):
         emoji = "✅" if result == "TP" else "❌"
 
         message = (
-            f"{emoji} SCORE HUNTER PRO v5 DEBUG\n\n"
+            f"{emoji} SCORE HUNTER PRO v6 CLOSED-CANDLE\n\n"
             f"TRADE CLOSED\n\n"
             f"💰 {trade['symbol']}USDT\n"
             f"📊 {direction}\n"
@@ -1104,7 +1114,8 @@ def statistics(state):
 # ============================================================
 
 def main():
-    print("🟢 SCORE HUNTER PRO v5 DEBUG")
+    print("🟢 SCORE HUNTER PRO v6 CLOSED-CANDLE")
+    print("🔒 CLOSED CANDLE MODE: forming candle is ignored")
     print("🧠 MARKET STRUCTURE + PRICE ACTION + LIQUIDITY")
     print("📊 Main structure: 4H")
     print("📱 Entry confirmation: 1H")
@@ -1248,7 +1259,7 @@ def main():
                 sl_move = (entry - sl) / entry * 100.0
 
             message = (
-                "🚨 SCORE HUNTER PRO v5 DEBUG 🚨\n\n"
+                "🚨 SCORE HUNTER PRO v6 CLOSED-CANDLE 🚨\n\n"
                 f"💰 {symbol}USDT\n"
                 f"📊 {direction_text}\n"
                 f"{strength}\n\n"
@@ -1290,7 +1301,7 @@ def main():
     stats = statistics(state)
     if stats and stats["total"] % 10 == 0:
         message = (
-            "📊 SCORE HUNTER PRO v5 DEBUG\n\n"
+            "📊 SCORE HUNTER PRO v6 CLOSED-CANDLE\n\n"
             "STATISTICS\n\n"
             f"📌 Closed trades: {stats['total']}\n"
             f"✅ TP: {stats['wins']}\n"
@@ -1300,7 +1311,7 @@ def main():
         )
         send_telegram(message)
 
-    print("\n✅ SCORE HUNTER PRO v5 DEBUG scan completed.")
+    print("\n✅ SCORE HUNTER PRO v6 CLOSED-CANDLE scan completed.")
 
 
 if __name__ == "__main__":
