@@ -5,7 +5,7 @@ import requests
 from statistics import mean
 
 # ============================================================
-# SCORE HUNTER PRO v4
+# SCORE HUNTER PRO v5 DEBUG
 # 4H MARKET STRUCTURE + PRICE ACTION + LIQUIDITY
 # 1H ENTRY CONFIRMATION
 #
@@ -1054,7 +1054,7 @@ def check_active_trades(state):
         emoji = "✅" if result == "TP" else "❌"
 
         message = (
-            f"{emoji} SCORE HUNTER PRO v4\n\n"
+            f"{emoji} SCORE HUNTER PRO v5 DEBUG\n\n"
             f"TRADE CLOSED\n\n"
             f"💰 {trade['symbol']}USDT\n"
             f"📊 {direction}\n"
@@ -1104,7 +1104,7 @@ def statistics(state):
 # ============================================================
 
 def main():
-    print("🟢 SCORE HUNTER PRO v4")
+    print("🟢 SCORE HUNTER PRO v5 DEBUG")
     print("🧠 MARKET STRUCTURE + PRICE ACTION + LIQUIDITY")
     print("📊 Main structure: 4H")
     print("📱 Entry confirmation: 1H")
@@ -1248,7 +1248,7 @@ def main():
                 sl_move = (entry - sl) / entry * 100.0
 
             message = (
-                "🚨 SCORE HUNTER PRO v4 🚨\n\n"
+                "🚨 SCORE HUNTER PRO v5 DEBUG 🚨\n\n"
                 f"💰 {symbol}USDT\n"
                 f"📊 {direction_text}\n"
                 f"{strength}\n\n"
@@ -1290,7 +1290,7 @@ def main():
     stats = statistics(state)
     if stats and stats["total"] % 10 == 0:
         message = (
-            "📊 SCORE HUNTER PRO v4\n\n"
+            "📊 SCORE HUNTER PRO v5 DEBUG\n\n"
             "STATISTICS\n\n"
             f"📌 Closed trades: {stats['total']}\n"
             f"✅ TP: {stats['wins']}\n"
@@ -1300,7 +1300,7 @@ def main():
         )
         send_telegram(message)
 
-    print("\n✅ SCORE HUNTER PRO v4 scan completed.")
+    print("\n✅ SCORE HUNTER PRO v5 DEBUG scan completed.")
 
 
 if __name__ == "__main__":
