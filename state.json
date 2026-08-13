@@ -52,5 +52,8 @@
   "last_signals": {},
   "active_trades": {},
   "completed_trades": [],
-  "last_processed_4h": {}
+  "last_processed_4h": {
+    "BTC": 1786564800,
+    "XRP": 1786564800
+  }
 }
