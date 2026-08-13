@@ -88,7 +88,15 @@ def get_4h_data(symbol):
 
     print(f"\nGetting {symbol} 4H candles from LBank...")
 
-    now_ts = int(datetime.now(timezone.utc).timestamp())
+    # LBank documents candle timestamps in seconds, but this normalizer
+    # also safely handles a millisecond timestamp if the live API returns one.
+    def normalize_timestamp(value):
+        ts = int(float(value))
+        if ts > 10_000_000_000:   # milliseconds
+            ts //= 1000
+        return ts
+
+    local_now_ts = int(datetime.now(timezone.utc).timestamp())
 
     response = requests.get(
         LBANK_URL,
@@ -96,7 +104,7 @@ def get_4h_data(symbol):
             "symbol": pair,
             "size": CANDLE_LIMIT,
             "type": INTERVAL,
-            "time": now_ts
+            "time": local_now_ts
         },
         timeout=20
     )
@@ -118,18 +126,25 @@ def get_4h_data(symbol):
             f"{symbol}: no candle data returned"
         )
 
+    # Prefer LBank's own server timestamp when available.
+    server_now_raw = payload.get("ts")
+    if server_now_raw is not None:
+        now_ts = normalize_timestamp(server_now_raw)
+    else:
+        now_ts = local_now_ts
+
     candles = []
 
     for row in raw_candles:
         if len(row) < 6:
             continue
 
-        candle_time = int(row[0])
+        candle_time = normalize_timestamp(row[0])
 
-        # CRITICAL:
-        # LBank timestamps represent the candle start.
-        # A 4H candle is usable only after its full 4 hours have elapsed.
-        # Therefore the currently forming candle is NEVER analysed.
+        # CRITICAL CLOSED-CANDLE GATE:
+        # row[0] is the candle START time.
+        # A 4H candle is usable only after 14,400 seconds have elapsed.
+        # This works whether the live API timestamp is seconds or ms.
         if candle_time + CANDLE_SECONDS > now_ts:
             continue
 
@@ -141,6 +156,20 @@ def get_4h_data(symbol):
             "close": float(row[4]),
             "volume": float(row[5])
         })
+
+    # Defensive fallback: if every candle was rejected, print timestamp
+    # diagnostics instead of silently reporting "0 closed candles".
+    if not candles:
+        sample = raw_candles[-1][0] if raw_candles else None
+        normalized_sample = (
+            normalize_timestamp(sample)
+            if sample is not None else None
+        )
+        raise RuntimeError(
+            f"{symbol}: 0 closed candles. "
+            f"server_now={now_ts}, raw_latest={sample}, "
+            f"normalized_latest={normalized_sample}"
+        )
 
     candles.sort(key=lambda x: x["time"])
 
@@ -554,7 +583,10 @@ def main():
         "forming 4H candle is ignored"
     )
     print(
-        "📊 Source: LBank public V2 Kline API"
+        "📊 Source: LBank public V2 Kline API (/v2/kline.do)"
+    )
+    print(
+        "🕐 Timestamp normalization: seconds + milliseconds supported"
     )
     print(
         "⏱ Timeframe: 4H"
