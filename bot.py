@@ -1027,20 +1027,16 @@ def signal_expired(candle_time):
 
 def entry_valid(entry, current, atr_value=None):
     """
-    Validate whether the current price is still reasonably close to the
-    setup entry. The window adapts to volatility but is never wider than
-    ENTRY_WINDOW.
+    Validate distance from the original setup entry.
+
+    ENTRY_WINDOW is the explicit user-facing safety ceiling. Do not silently
+    replace it with a smaller ATR window: ATR is used later for SL/RR.
     """
     if entry <= 0 or current <= 0:
         return False, 0.0, ENTRY_WINDOW
 
     distance = abs(current - entry) / entry
-
-    if atr_value is not None and atr_value > 0:
-        atr_window = (atr_value / entry) * 0.50
-        allowed = min(ENTRY_WINDOW, max(0.0030, atr_window))
-    else:
-        allowed = ENTRY_WINDOW
+    allowed = ENTRY_WINDOW
 
     return distance <= allowed, distance, allowed
 
