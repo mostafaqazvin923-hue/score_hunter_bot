@@ -1,623 +1,392 @@
 import os
-import json
 import time
+import math
 import requests
+from datetime import datetime, timezone
 
 # ============================================================
-# SCORE HUNTER 4H
-# DATA SOURCE: LBANK
-# COINS: BTC / ETH / SOL / XRP
-# STRATEGY: 7 FACTORS - MIN SCORE 5/7
-# TP: 1% | SL: 0.5%
+# SCORE HUNTER PRO - BINANCE FUTURES
+# Exact Python recreation of the supplied TradingView Pine logic
+#
+# Market: Binance USDⓈ-M Futures
+# Symbols: ETHUSDT, SOLUSDT, XRPUSDT, APTUSDT
+# Timeframe: 4H
+# Signal: CLOSED CANDLE ONLY
+# Minimum score: 5/7
 # ============================================================
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "2090120004")
+BINANCE_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+TELEGRAM_URL = "https://api.telegram.org/bot{}/sendMessage"
 
-LBANK_KLINE_URL = "https://api.lbkex.com/v2/kline.do"
-
-COINS = {
-    "BTC": "btc_usdt",
-    "ETH": "eth_usdt",
-    "SOL": "sol_usdt",
-    "XRP": "xrp_usdt",
-}
-
-TIMEFRAME = "hour4"
-CANDLE_LIMIT = 250
-
+SYMBOLS = ["ETHUSDT", "SOLUSDT", "XRPUSDT", "APTUSDT"]
+INTERVAL = "4h"
 REQUIRED_SCORE = 5
 
-TP_PERCENT = 1.0
-SL_PERCENT = 0.50
+# Optional Telegram configuration.
+# Set these environment variables before running:
+# TELEGRAM_BOT_TOKEN=...
+# TELEGRAM_CHAT_ID=...
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-STATE_FILE = "state.json"
+POLL_SECONDS = 30
+REQUEST_TIMEOUT = 15
+KLINE_LIMIT = 300
+
+# Keep the last processed CLOSED candle per symbol.
+last_processed_close_time = {symbol: None for symbol in SYMBOLS}
 
 
 # ============================================================
-# TELEGRAM
+# HTTP
 # ============================================================
 
-def send_telegram(message):
+session = requests.Session()
+session.headers.update({"User-Agent": "ScoreHunterPro/1.0"})
 
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
-    response = requests.post(
-        url,
-        data={
-            "chat_id": CHAT_ID,
-            "text": message,
-        },
-        timeout=20,
+def get_klines(symbol, limit=KLINE_LIMIT):
+    params = {
+        "symbol": symbol,
+        "interval": INTERVAL,
+        "limit": limit,
+    }
+
+    response = session.get(
+        BINANCE_KLINES_URL,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
     )
-
-    print("Telegram:", response.status_code)
-    print(response.text)
-
-
-# ============================================================
-# STATE
-# ============================================================
-
-def load_state():
-
-    if not os.path.exists(STATE_FILE):
-        return {}
-
-    try:
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            return json.load(f)
-
-    except Exception as e:
-
-        print("State load error:", e)
-
-        return {}
-
-
-def save_state(state):
-
-    with open(
-        STATE_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            state,
-            f,
-            indent=2
-        )
-
-
-# ============================================================
-# LBANK 4H DATA
-# ============================================================
-
-def get_4h_candles(symbol):
-
-    print(
-        f"Getting {symbol} 4H candles from LBank..."
-    )
-
-    # LBank requires a TIME parameter.
-    # We request enough history to calculate EMA200.
-    now = int(time.time())
-
-    start_time = (
-        now
-        - (CANDLE_LIMIT * 4 * 60 * 60)
-    )
-
-    response = requests.get(
-        LBANK_KLINE_URL,
-        params={
-            "symbol": symbol,
-            "size": CANDLE_LIMIT,
-            "type": TIMEFRAME,
-            "time": start_time,
-        },
-        timeout=20,
-    )
-
-    print("LBank:", response.status_code)
-
     response.raise_for_status()
 
-    result = response.json()
+    data = response.json()
 
-    if str(
-        result.get("result")
-    ).lower() != "true":
+    if not isinstance(data, list) or len(data) < 220:
+        raise RuntimeError(f"{symbol}: insufficient Binance Futures kline data")
 
-        raise RuntimeError(
-            f"LBank API error: {result}"
-        )
+    return data
 
-    raw_data = result.get(
-        "data",
-        []
-    )
 
-    if not raw_data:
+# ============================================================
+# EXACT-STYLE INDICATOR HELPERS
+# ============================================================
 
-        raise RuntimeError(
-            f"No candle data returned for {symbol}"
-        )
+def sma(values, length):
+    out = [None] * len(values)
 
-    candles = []
+    if len(values) < length:
+        return out
 
-    for item in raw_data:
+    running = sum(values[:length])
+    out[length - 1] = running / length
 
-        if len(item) < 6:
+    for i in range(length, len(values)):
+        running += values[i] - values[i - length]
+        out[i] = running / length
+
+    return out
+
+
+def ema(values, length):
+    """
+    TradingView ta.ema-style recursive EMA.
+    Seed = SMA(length), then:
+        EMA = alpha * source + (1-alpha) * EMA[1]
+    """
+    out = [None] * len(values)
+
+    if len(values) < length:
+        return out
+
+    seed = sum(values[:length]) / length
+    out[length - 1] = seed
+
+    alpha = 2.0 / (length + 1.0)
+
+    for i in range(length, len(values)):
+        out[i] = alpha * values[i] + (1.0 - alpha) * out[i - 1]
+
+    return out
+
+
+def rma(values, length):
+    """
+    TradingView ta.rma-style Wilder moving average.
+    Seed = SMA(length), then:
+        RMA = (previous_RMA*(length-1) + source) / length
+    """
+    out = [None] * len(values)
+
+    if len(values) < length:
+        return out
+
+    seed = sum(values[:length]) / length
+    out[length - 1] = seed
+
+    alpha = 1.0 / length
+
+    for i in range(length, len(values)):
+        out[i] = alpha * values[i] + (1.0 - alpha) * out[i - 1]
+
+    return out
+
+
+def pine_rsi(closes, length=14):
+    """
+    Recreation of TradingView ta.rsi(close, 14):
+      up   = RMA(max(change, 0), length)
+      down = RMA(max(-change, 0), length)
+      RSI  = 100 - 100/(1 + up/down)
+
+    The first change is zero because Pine's change() is na and
+    the RMA warm-up is represented consistently here.
+    """
+    if len(closes) < length + 1:
+        return [None] * len(closes)
+
+    changes = [0.0]
+    for i in range(1, len(closes)):
+        changes.append(closes[i] - closes[i - 1])
+
+    gains = [max(x, 0.0) for x in changes]
+    losses = [max(-x, 0.0) for x in changes]
+
+    avg_gain = rma(gains, length)
+    avg_loss = rma(losses, length)
+
+    out = [None] * len(closes)
+
+    for i in range(len(closes)):
+        if avg_gain[i] is None or avg_loss[i] is None:
             continue
 
-        candles.append(
-            {
-                "time": int(item[0]),
-                "open": float(item[1]),
-                "high": float(item[2]),
-                "low": float(item[3]),
-                "close": float(item[4]),
-                "volume": float(item[5]),
-            }
-        )
+        if avg_loss[i] == 0:
+            # TradingView RSI becomes 100 when average loss is zero
+            out[i] = 100.0
+        else:
+            rs = avg_gain[i] / avg_loss[i]
+            out[i] = 100.0 - (100.0 / (1.0 + rs))
 
-    candles.sort(
-        key=lambda x: x["time"]
-    )
+    return out
 
-    print(
-        f"{symbol}: received "
-        f"{len(candles)} candles"
-    )
+
+def true_ranges(highs, lows, closes):
+    tr = [None] * len(closes)
+
+    for i in range(len(closes)):
+        if i == 0:
+            # Pine ta.tr(true) uses high-low when there is no previous close.
+            tr[i] = highs[i] - lows[i]
+        else:
+            tr[i] = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+
+    return tr
+
+
+def pine_atr(highs, lows, closes, length=14):
+    tr = true_ranges(highs, lows, closes)
+    return rma(tr, length)
+
+
+def highest_previous(highs, length=6):
+    """
+    Exact conceptual equivalent of:
+        ta.highest(high, 6)[1]
+
+    At candle i, this returns the highest high among candles
+    i-6 ... i-1, excluding the current candle.
+    """
+    out = [None] * len(highs)
+
+    for i in range(length, len(highs)):
+        out[i] = max(highs[i - length:i])
+
+    return out
+
+
+def lowest_previous(lows, length=6):
+    """
+    Exact conceptual equivalent of:
+        ta.lowest(low, 6)[1]
+    """
+    out = [None] * len(lows)
+
+    for i in range(length, len(lows)):
+        out[i] = min(lows[i - length:i])
+
+    return out
+
+
+# ============================================================
+# DATA PARSING
+# ============================================================
+
+def parse_klines(raw):
+    candles = []
+
+    for row in raw:
+        candles.append({
+            "open_time": int(row[0]),
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+            "volume": float(row[5]),
+            "close_time": int(row[6]),
+        })
 
     return candles
 
 
-# ============================================================
-# CLOSED CANDLES ONLY
-# ============================================================
-
-def get_closed_candles(candles):
-
-    if len(candles) < 3:
-
-        raise RuntimeError(
-            "Not enough candles."
-        )
-
-    # The latest candle can still be forming.
-    # We don't use it for signals.
-    return candles[:-1]
-
-
-# ============================================================
-# EMA
-# ============================================================
-
-def ema_series(values, period):
-
-    if len(values) < period:
-        return []
-
-    multiplier = 2 / (period + 1)
-
-    first = (
-        sum(values[:period])
-        / period
-    )
-
-    result = [None] * (
-        period - 1
-    )
-
-    result.append(first)
-
-    previous = first
-
-    for price in values[period:]:
-
-        current = (
-            (price - previous)
-            * multiplier
-            + previous
-        )
-
-        result.append(current)
-
-        previous = current
-
-    return result
-
-
-# ============================================================
-# RSI
-# ============================================================
-
-def rsi_series(
-    closes,
-    period=14
-):
-
-    if len(closes) <= period:
-        return []
-
-    gains = []
-    losses = []
-
-    for i in range(
-        1,
-        len(closes)
-    ):
-
-        change = (
-            closes[i]
-            - closes[i - 1]
-        )
-
-        gains.append(
-            max(change, 0)
-        )
-
-        losses.append(
-            max(-change, 0)
-        )
-
-    avg_gain = (
-        sum(gains[:period])
-        / period
-    )
-
-    avg_loss = (
-        sum(losses[:period])
-        / period
-    )
-
-    result = [None] * period
-
-    if avg_loss == 0:
-
-        result.append(100.0)
-
-    else:
-
-        rs = (
-            avg_gain
-            / avg_loss
-        )
-
-        result.append(
-            100
-            - (
-                100
-                / (1 + rs)
-            )
-        )
-
-    for i in range(
-        period,
-        len(gains)
-    ):
-
-        avg_gain = (
-            (
-                avg_gain
-                * (period - 1)
-            )
-            + gains[i]
-        ) / period
-
-        avg_loss = (
-            (
-                avg_loss
-                * (period - 1)
-            )
-            + losses[i]
-        ) / period
-
-        if avg_loss == 0:
-
-            value = 100.0
-
-        else:
-
-            rs = (
-                avg_gain
-                / avg_loss
-            )
-
-            value = (
-                100
-                - (
-                    100
-                    / (1 + rs)
-                )
-            )
-
-        result.append(value)
-
-    return result
-
-
-# ============================================================
-# ATR
-# ============================================================
-
-def atr_series(
-    candles,
-    period=14
-):
-
-    if len(candles) <= period:
-        return []
-
-    true_ranges = []
-
-    for i in range(
-        1,
-        len(candles)
-    ):
-
-        high = candles[i]["high"]
-        low = candles[i]["low"]
-
-        previous_close = (
-            candles[i - 1]["close"]
-        )
-
-        tr = max(
-            high - low,
-            abs(
-                high
-                - previous_close
-            ),
-            abs(
-                low
-                - previous_close
-            ),
-        )
-
-        true_ranges.append(tr)
-
-    if len(true_ranges) < period:
-        return []
-
-    first_atr = (
-        sum(
-            true_ranges[:period]
-        )
-        / period
-    )
-
-    result = [None] * period
-
-    result.append(first_atr)
-
-    previous = first_atr
-
-    for tr in true_ranges[period:]:
-
-        current = (
-            (
-                previous
-                * (period - 1)
-            )
-            + tr
-        ) / period
-
-        result.append(current)
-
-        previous = current
-
-    return result
-
-
-# ============================================================
-# SIGNAL
-# ============================================================
-
-def calculate_signal(candles):
-
-    if len(candles) < 210:
-        return None
-
-    closes = [
-        c["close"]
-        for c in candles
+def get_closed_candles(symbol):
+    """
+    Binance normally returns the currently forming candle as the last row.
+    We explicitly remove it.
+
+    This is the core CLOSED CANDLE LOCK:
+    only candles whose close_time <= current UTC time are evaluated.
+    """
+    raw = get_klines(symbol)
+    candles = parse_klines(raw)
+
+    now_ms = int(time.time() * 1000)
+
+    closed = [
+        c for c in candles
+        if c["close_time"] <= now_ms
     ]
 
-    volumes = [
-        c["volume"]
-        for c in candles
-    ]
+    if len(closed) < 220:
+        raise RuntimeError(f"{symbol}: not enough CLOSED candles")
 
-    ema20 = ema_series(
-        closes,
-        20
-    )
+    return closed
 
-    ema50 = ema_series(
-        closes,
-        50
-    )
 
-    ema200 = ema_series(
-        closes,
-        200
-    )
+# ============================================================
+# SIGNAL ENGINE
+# ============================================================
 
-    rsi_values = rsi_series(
-        closes,
-        14
-    )
+def calculate_signal(symbol, candles):
+    opens = [c["open"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    closes = [c["close"] for c in candles]
+    volumes = [c["volume"] for c in candles]
 
-    atr_values = atr_series(
-        candles,
-        14
-    )
+    ema20 = ema(closes, 20)
+    ema50 = ema(closes, 50)
+    ema200 = ema(closes, 200)
 
+    rsi = pine_rsi(closes, 14)
+    vol_ma = sma(volumes, 20)
+    atr = pine_atr(highs, lows, closes, 14)
+
+    recent_high = highest_previous(highs, 6)
+    recent_low = lowest_previous(lows, 6)
+
+    # The last element is guaranteed to be a CLOSED candle.
     i = len(candles) - 1
 
-    current = candles[i]
+    required = [
+        ema20[i], ema50[i], ema200[i],
+        rsi[i], vol_ma[i], atr[i],
+        recent_high[i], recent_low[i]
+    ]
 
-    close = current["close"]
-    open_price = current["open"]
-    high = current["high"]
-    low = current["low"]
-    volume = current["volume"]
-
-    e20 = ema20[i]
-    e50 = ema50[i]
-    e200 = ema200[i]
-
-    rsi = rsi_values[-1]
-    previous_rsi = rsi_values[-2]
-
-    atr = atr_values[-1]
-
-    if (
-        e20 is None
-        or e50 is None
-        or e200 is None
-        or rsi is None
-        or previous_rsi is None
-        or atr is None
-    ):
+    if any(x is None for x in required):
         return None
 
-    # ========================================================
-    # 1. TREND
-    # ========================================================
+    close = closes[i]
+    open_ = opens[i]
+    high = highs[i]
+    low = lows[i]
+    volume = volumes[i]
 
+    # --------------------------------------------------------
+    # Pine:
+    # longTrend = close > ema200 and ema20 > ema50
+    # shortTrend = close < ema200 and ema20 < ema50
+    # --------------------------------------------------------
     long_trend = (
-        close > e200
-        and e20 > e50
+        close > ema200[i]
+        and ema20[i] > ema50[i]
     )
 
     short_trend = (
-        close < e200
-        and e20 < e50
+        close < ema200[i]
+        and ema20[i] < ema50[i]
     )
 
-    # ========================================================
-    # 2. RSI
-    # ========================================================
-
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
     long_rsi = (
-        rsi > 50
-        and rsi < 72
-        and rsi > previous_rsi
+        rsi[i] > 50
+        and rsi[i] < 72
+        and rsi[i] > rsi[i - 1]
     )
 
     short_rsi = (
-        rsi < 50
-        and rsi > 28
-        and rsi < previous_rsi
+        rsi[i] < 50
+        and rsi[i] > 28
+        and rsi[i] < rsi[i - 1]
     )
 
-    # ========================================================
-    # 3. VOLUME
-    # ========================================================
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+    volume_ok = volume >= vol_ma[i]
 
-    volume_ma = (
-        sum(volumes[-20:])
-        / 20
-    )
+    # --------------------------------------------------------
+    # MARKET STRUCTURE
+    # --------------------------------------------------------
+    bull_break = close > recent_high[i]
+    bear_break = close < recent_low[i]
 
-    volume_ok = (
-        volume >= volume_ma
-    )
-
-    # ========================================================
-    # 4. MARKET STRUCTURE
-    # ========================================================
-
-    recent_high = max(
-        c["high"]
-        for c in candles[-7:-1]
-    )
-
-    recent_low = min(
-        c["low"]
-        for c in candles[-7:-1]
-    )
-
-    bull_break = (
-        close > recent_high
-    )
-
-    bear_break = (
-        close < recent_low
-    )
-
-    # ========================================================
-    # 5. EMA PULLBACK
-    # ========================================================
-
+    # --------------------------------------------------------
+    # EMA PULLBACK
+    # --------------------------------------------------------
     long_pullback = (
-        low <= e20
-        and close > e20
+        low <= ema20[i]
+        and close > ema20[i]
     )
 
     short_pullback = (
-        high >= e20
-        and close < e20
+        high >= ema20[i]
+        and close < ema20[i]
     )
 
-    # ========================================================
-    # 6. CANDLE CONFIRMATION
-    # ========================================================
-
-    candle_range = (
-        high - low
-    )
+    # --------------------------------------------------------
+    # CANDLE CONFIRMATION
+    # --------------------------------------------------------
+    candle_range = high - low
 
     if candle_range > 0:
+        bull_candle = (
+            close > open_
+            and ((close - open_) / candle_range) >= 0.40
+        )
 
-        bull_ratio = (
-            close - open_price
-        ) / candle_range
-
-        bear_ratio = (
-            open_price - close
-        ) / candle_range
-
+        bear_candle = (
+            close < open_
+            and ((open_ - close) / candle_range) >= 0.40
+        )
     else:
+        bull_candle = False
+        bear_candle = False
 
-        bull_ratio = 0
-        bear_ratio = 0
+    # --------------------------------------------------------
+    # VOLATILITY
+    # --------------------------------------------------------
+    volatility_ok = (atr[i] / close) >= 0.002
 
-    bull_candle = (
-        close > open_price
-        and candle_range > 0
-        and bull_ratio >= 0.40
-    )
-
-    bear_candle = (
-        close < open_price
-        and candle_range > 0
-        and bear_ratio >= 0.40
-    )
-
-    # ========================================================
-    # 7. VOLATILITY
-    # ========================================================
-
-    volatility_ok = (
-        atr / close >= 0.002
-    )
-
-    # ========================================================
+    # --------------------------------------------------------
     # SCORE
-    # ========================================================
-
+    # --------------------------------------------------------
     long_score = (
         int(long_trend)
         + int(long_rsi)
@@ -638,238 +407,199 @@ def calculate_signal(candles):
         + int(volatility_ok)
     )
 
-    # ========================================================
-    # FINAL SIGNAL
-    # ========================================================
+    long_signal = long_score >= REQUIRED_SCORE
+    short_signal = short_score >= REQUIRED_SCORE
 
-    if long_score >= REQUIRED_SCORE:
+    close_time = candles[i]["close_time"]
 
-        return {
-            "direction": "LONG",
-            "score": long_score,
-            "entry": close,
-        }
-
-    if short_score >= REQUIRED_SCORE:
-
-        return {
-            "direction": "SHORT",
-            "score": short_score,
-            "entry": close,
-        }
-
-    return None
+    return {
+        "symbol": symbol,
+        "candle_open_time": candles[i]["open_time"],
+        "candle_close_time": close_time,
+        "close": close,
+        "ema20": ema20[i],
+        "ema50": ema50[i],
+        "ema200": ema200[i],
+        "rsi": rsi[i],
+        "volume": volume,
+        "volume_ma": vol_ma[i],
+        "atr": atr[i],
+        "recent_high": recent_high[i],
+        "recent_low": recent_low[i],
+        "long_score": long_score,
+        "short_score": short_score,
+        "long_signal": long_signal,
+        "short_signal": short_signal,
+        "conditions": {
+            "longTrend": long_trend,
+            "longRSI": long_rsi,
+            "volumeOK": volume_ok,
+            "bullBreak": bull_break,
+            "longPullback": long_pullback,
+            "bullCandle": bull_candle,
+            "volatilityOK": volatility_ok,
+            "shortTrend": short_trend,
+            "shortRSI": short_rsi,
+            "bearBreak": bear_break,
+            "shortPullback": short_pullback,
+            "bearCandle": bear_candle,
+        },
+    }
 
 
 # ============================================================
-# MAIN
+# TELEGRAM
 # ============================================================
 
-def main():
+def send_telegram(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("\n[TELEGRAM NOT CONFIGURED]")
+        print(text)
+        return False
 
-    print(
-        "🟢 SCORE HUNTER 4H - LBANK SCANNING"
+    url = TELEGRAM_URL.format(TELEGRAM_BOT_TOKEN)
+
+    response = session.post(
+        url,
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+        },
+        timeout=REQUEST_TIMEOUT,
     )
 
-    state = load_state()
+    response.raise_for_status()
+    return True
 
-    for symbol, lbank_symbol in COINS.items():
 
-        print(
-            f"\n========== {symbol} =========="
-        )
+def format_price(value):
+    if value >= 1000:
+        return f"{value:.2f}"
+    if value >= 1:
+        return f"{value:.4f}"
+    return f"{value:.6f}"
 
-        try:
 
-            candles = get_4h_candles(
-                lbank_symbol
-            )
+def build_signal_message(result, direction):
+    symbol = result["symbol"]
+    entry = result["close"]
 
-            closed_candles = (
-                get_closed_candles(
-                    candles
-                )
-            )
+    if direction == "LONG":
+        tp = entry * 1.01
+        sl = entry * 0.995
+        score = result["long_score"]
+        emoji = "🟢"
+    else:
+        tp = entry * 0.99
+        sl = entry * 1.005
+        score = result["short_score"]
+        emoji = "🔴"
 
-            latest = (
-                closed_candles[-1]
-            )
+    close_dt = datetime.fromtimestamp(
+        result["candle_close_time"] / 1000,
+        tz=timezone.utc,
+    )
 
-            print(
-                f"{symbol}: latest closed "
-                f"4H candle: "
-                f"{latest['time']}"
-            )
+    return (
+        f"{emoji} SCORE HUNTER PRO\n\n"
+        f"{symbol} {direction}\n"
+        f"⏱ 4H CLOSED CANDLE\n"
+        f"📊 Score: {score}/7\n\n"
+        f"Entry: {format_price(entry)}\n"
+        f"TP: {format_price(tp)} ({'+1%' if direction == 'LONG' else '-1%'})\n"
+        f"SL: {format_price(sl)} ({'-0.5%' if direction == 'LONG' else '+0.5%'})\n\n"
+        f"RSI: {result['rsi']:.2f}\n"
+        f"EMA20: {format_price(result['ema20'])}\n"
+        f"EMA50: {format_price(result['ema50'])}\n"
+        f"EMA200: {format_price(result['ema200'])}\n\n"
+        f"Closed: {close_dt.strftime('%Y-%m-%d %H:%M UTC')}"
+    )
 
-            signal = calculate_signal(
-                closed_candles
-            )
 
-            if signal is None:
+# ============================================================
+# DIAGNOSTICS
+# ============================================================
 
-                print(
-                    f"{symbol}: no signal"
-                )
+def print_result(result):
+    print(
+        f"{result['symbol']} | "
+        f"close={format_price(result['close'])} | "
+        f"RSI={result['rsi']:.2f} | "
+        f"LONG={result['long_score']}/7 | "
+        f"SHORT={result['short_score']}/7"
+    )
 
-                continue
 
-            direction = (
-                signal["direction"]
-            )
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
-            score = (
-                signal["score"]
-            )
+def process_symbol(symbol):
+    try:
+        candles = get_closed_candles(symbol)
 
-            entry = (
-                signal["entry"]
-            )
+        result = calculate_signal(symbol, candles)
 
-            # =================================================
-            # DUPLICATE PROTECTION
-            # =================================================
+        if result is None:
+            print(f"{symbol}: indicator warm-up/incomplete")
+            return
 
-            signal_id = (
-                f"{latest['time']}_{direction}"
-            )
+        print_result(result)
 
-            previous_signal = (
-                state
-                .get(symbol, {})
-                .get("last_signal")
-            )
+        close_time = result["candle_close_time"]
 
-            if previous_signal == signal_id:
+        # Process each CLOSED candle exactly once.
+        if last_processed_close_time[symbol] == close_time:
+            return
 
-                print(
-                    f"{symbol}: signal "
-                    f"already sent"
-                )
+        # Mark this closed candle as processed before sending.
+        # This prevents duplicate Telegram messages after a restart/poll.
+        last_processed_close_time[symbol] = close_time
 
-                continue
-
-            # =================================================
-            # TP / SL
-            # =================================================
-
-            if direction == "LONG":
-
-                tp = (
-                    entry
-                    * (
-                        1
-                        + TP_PERCENT
-                        / 100
-                    )
-                )
-
-                sl = (
-                    entry
-                    * (
-                        1
-                        - SL_PERCENT
-                        / 100
-                    )
-                )
-
-                direction_text = (
-                    "🟢 LONG"
-                )
-
-                tp_text = (
-                    f"+{TP_PERCENT:.0f}%"
-                )
-
-                sl_text = (
-                    f"-{SL_PERCENT:.1f}%"
-                )
-
-            else:
-
-                tp = (
-                    entry
-                    * (
-                        1
-                        - TP_PERCENT
-                        / 100
-                    )
-                )
-
-                sl = (
-                    entry
-                    * (
-                        1
-                        + SL_PERCENT
-                        / 100
-                    )
-                )
-
-                direction_text = (
-                    "🔴 SHORT"
-                )
-
-                tp_text = (
-                    f"-{TP_PERCENT:.0f}%"
-                )
-
-                sl_text = (
-                    f"+{SL_PERCENT:.1f}%"
-                )
-
-            # =================================================
-            # TELEGRAM
-            # =================================================
-
-            message = (
-                "🚨 SCORE HUNTER 4H 🚨\n\n"
-                f"💰 {symbol}USDT\n"
-                f"📊 {direction_text}\n"
-                f"⭐ Score: {score}/7\n"
-                f"💵 Entry: {entry:.8f}\n"
-                f"🎯 TP: {tp:.8f} "
-                f"({tp_text})\n"
-                f"🛑 SL: {sl:.8f} "
-                f"({sl_text})\n\n"
-                "⏱ Timeframe: 4H\n"
-                "🏦 Data: LBank\n"
-                "⚠️ Manage risk."
-            )
-
+        if result["long_signal"]:
+            message = build_signal_message(result, "LONG")
+            print("\n" + message + "\n")
             send_telegram(message)
 
-            # =================================================
-            # SAVE
-            # =================================================
+        if result["short_signal"]:
+            message = build_signal_message(result, "SHORT")
+            print("\n" + message + "\n")
+            send_telegram(message)
 
-            state[symbol] = {
-                "last_signal": signal_id,
-                "last_signal_time": latest["time"],
-                "direction": direction,
-                "score": score,
-                "entry": entry,
-                "tp": tp,
-                "sl": sl,
-            }
+    except requests.RequestException as e:
+        print(f"{symbol}: Binance/API error: {e}")
 
-            save_state(state)
+    except Exception as e:
+        print(f"{symbol}: ERROR: {e}")
 
-            print(
-                f"{symbol}: "
-                f"{direction} "
-                f"Score {score}/7 SENT"
-            )
 
-        except Exception as e:
+def main():
+    print("=" * 64)
+    print("🟢 SCORE HUNTER PRO - BINANCE FUTURES")
+    print("🔒 CLOSED CANDLE MODE")
+    print("📊 SOURCE: Binance USDⓈ-M Futures")
+    print("⏱ TIMEFRAME: 4H")
+    print("🪙 SYMBOLS: ETH / SOL / XRP / APT")
+    print("🎯 MINIMUM SCORE: 5/7")
+    print("=" * 64)
 
-            print(
-                f"{symbol}: ERROR: {e}"
-            )
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        print("📲 Telegram: CONFIGURED")
+    else:
+        print("📲 Telegram: NOT CONFIGURED (signals will print to console)")
 
-    save_state(state)
+    print()
 
-    print(
-        "\n✅ LBank 4H scan completed."
-    )
+    while True:
+        cycle_start = time.time()
+
+        for symbol in SYMBOLS:
+            process_symbol(symbol)
+
+        elapsed = time.time() - cycle_start
+        sleep_for = max(1, POLL_SECONDS - elapsed)
+
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
