@@ -5,7 +5,7 @@ import requests
 from statistics import mean
 
 # ============================================================
-# SCORE HUNTER PRO v6 CLOSED-CANDLE
+# SCORE HUNTER PRO v7 BALANCED
 # 4H MARKET STRUCTURE + PRICE ACTION + LIQUIDITY
 # 1H ENTRY CONFIRMATION
 #
@@ -46,7 +46,7 @@ BOS_LOOKBACK = 30
 LIQUIDITY_LOOKBACK = 40
 
 # Signal quality
-MIN_4H_SCORE = 6
+MIN_4H_SCORE = 5
 MIN_1H_SCORE = 2
 
 # Entry/risk
@@ -58,7 +58,7 @@ MAX_SL_PERCENT = 0.0250
 MIN_RR = 1.20
 
 # Signal age
-EXPIRATION_HOURS = 8
+EXPIRATION_HOURS = 999999
 
 # Structure buffers
 ATR_LEVEL_BUFFER = 0.15
@@ -96,6 +96,7 @@ def empty_state():
         "last_signals": {},
         "active_trades": {},
         "completed_trades": [],
+        "last_processed_4h": {},
     }
 
 
@@ -110,6 +111,7 @@ def load_state():
         state.setdefault("last_signals", {})
         state.setdefault("active_trades", {})
         state.setdefault("completed_trades", [])
+        state.setdefault("last_processed_4h", {})
         return state
 
     except Exception as exc:
@@ -731,9 +733,22 @@ def analyze_4h(candles):
     # Direction selection
     # --------------------------------------------------------
 
-    if long_score >= MIN_4H_SCORE and long_score > short_score:
+    long_event = bos["bull"] or choch["bull"] or sweep["bull"] or long_pullback
+    short_event = bos["bear"] or choch["bear"] or sweep["bear"] or short_pullback
+
+    if (
+        long_score >= MIN_4H_SCORE
+        and long_score > short_score
+        and long_event
+        and current["close"] > e20[i]
+    ):
         direction = "LONG"
-    elif short_score >= MIN_4H_SCORE and short_score > long_score:
+    elif (
+        short_score >= MIN_4H_SCORE
+        and short_score > long_score
+        and short_event
+        and current["close"] < e20[i]
+    ):
         direction = "SHORT"
     else:
         return None, "NO_DIRECTION"
@@ -743,15 +758,17 @@ def analyze_4h(candles):
     # over-filtering seen in v3.
     if structure["state"] == "RANGE":
         directional_event = (
-            bos["bull"]
-            or bos["bear"]
-            or choch["bull"]
-            or choch["bear"]
-            or sweep["bull"]
-            or sweep["bear"]
+            bos["bull"] or bos["bear"] or
+            choch["bull"] or choch["bear"] or
+            sweep["bull"] or sweep["bear"]
         )
-        if not directional_event:
-            return None, "STRUCTURE_RANGE_NO_EVENT"
+        momentum_alignment = (
+            (direction == "LONG" and current["close"] > e20[i] and current_rsi > 52)
+            or
+            (direction == "SHORT" and current["close"] < e20[i] and current_rsi < 48)
+        )
+        if not directional_event and not momentum_alignment:
+            return None, "RANGE_WITHOUT_MOMENTUM"
 
     # Prevent contradictory structure.
     if direction == "LONG":
@@ -1064,7 +1081,7 @@ def check_active_trades(state):
         emoji = "✅" if result == "TP" else "❌"
 
         message = (
-            f"{emoji} SCORE HUNTER PRO v6 CLOSED-CANDLE\n\n"
+            f"{emoji} SCORE HUNTER PRO v7 BALANCED\n\n"
             f"TRADE CLOSED\n\n"
             f"💰 {trade['symbol']}USDT\n"
             f"📊 {direction}\n"
@@ -1114,7 +1131,7 @@ def statistics(state):
 # ============================================================
 
 def main():
-    print("🟢 SCORE HUNTER PRO v6 CLOSED-CANDLE")
+    print("🟢 SCORE HUNTER PRO v7 BALANCED")
     print("🔒 CLOSED CANDLE MODE: forming candle is ignored")
     print("🧠 MARKET STRUCTURE + PRICE ACTION + LIQUIDITY")
     print("📊 Main structure: 4H")
@@ -1153,9 +1170,12 @@ def main():
                 print(f"{symbol}: ❌ {status}")
                 continue
 
-            if signal_expired(signal["candle_time"]):
-                print(f"{symbol}: ❌ SIGNAL_EXPIRED")
+            last_processed = state.setdefault("last_processed_4h", {}).get(symbol)
+            if last_processed == signal["candle_time"]:
+                print(f"{symbol}: ❌ SAME_CLOSED_4H_ALREADY_PROCESSED")
                 continue
+
+            state["last_processed_4h"][symbol] = signal["candle_time"]
 
             direction = signal["direction"]
             score4 = signal["score"]
@@ -1259,7 +1279,7 @@ def main():
                 sl_move = (entry - sl) / entry * 100.0
 
             message = (
-                "🚨 SCORE HUNTER PRO v6 CLOSED-CANDLE 🚨\n\n"
+                "🚨 SCORE HUNTER PRO v7 BALANCED 🚨\n\n"
                 f"💰 {symbol}USDT\n"
                 f"📊 {direction_text}\n"
                 f"{strength}\n\n"
@@ -1301,7 +1321,7 @@ def main():
     stats = statistics(state)
     if stats and stats["total"] % 10 == 0:
         message = (
-            "📊 SCORE HUNTER PRO v6 CLOSED-CANDLE\n\n"
+            "📊 SCORE HUNTER PRO v7 BALANCED\n\n"
             "STATISTICS\n\n"
             f"📌 Closed trades: {stats['total']}\n"
             f"✅ TP: {stats['wins']}\n"
@@ -1311,7 +1331,7 @@ def main():
         )
         send_telegram(message)
 
-    print("\n✅ SCORE HUNTER PRO v6 CLOSED-CANDLE scan completed.")
+    print("\n✅ SCORE HUNTER PRO v7 BALANCED scan completed.")
 
 
 if __name__ == "__main__":
