@@ -18,7 +18,7 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "2090120004")
 
 KLINE_URL = "https://api.lbkex.com/v2/kline.do"
-TICKER_URL = "https://api.lbkex.com/FINAL/ticker.do"
+TICKER_URL = "https://api.lbkex.com/v2/ticker.do"
 
 COINS = {
     "BTC": "btc_usdt",
@@ -606,8 +606,6 @@ def support_levels(candles, entry):
 # ============================================================
 
 def analyze_4h(candles):
-    # FINAL SAFETY: never analyze the currently forming candle.
-    candles = closed_candles(candles)
 
     if len(candles) < 250:
         return None, "NOT_ENOUGH_DATA"
@@ -806,8 +804,6 @@ def analyze_4h(candles):
 # ============================================================
 
 def analyze_1h(candles, direction):
-    # FINAL SAFETY: never analyze the currently forming candle.
-    candles = closed_candles(candles)
 
     if len(candles) < 250:
         return {"valid": False, "score": 0, "reason": "NOT_ENOUGH_DATA"}
@@ -1148,7 +1144,7 @@ def main():
     print(f"🔒 Entry window: {ENTRY_WINDOW * 100:.2f}%")
     print(f"🛑 ATR multiplier: {ATR_MULTIPLIER}")
     print(f"⚖️ Minimum R:R: 1:{MIN_RR}")
-    print(f"⏳ Expiration: {EXPIRATION_HOURS}h")
+    print("⏳ Signal age gate: OFF (latest closed candle + duplicate protection)")
 
     state = load_state()
 
@@ -1172,10 +1168,6 @@ def main():
 
             if signal is None:
                 print(f"{symbol}: ❌ {status}")
-                continue
-
-            if signal_expired(signal["candle_time"]):
-                print(f"{symbol}: ❌ SIGNAL_EXPIRED")
                 continue
 
             direction = signal["direction"]
@@ -1213,6 +1205,13 @@ def main():
             if not entry_valid(entry, current):
                 print(f"{symbol}: ❌ ENTRY_TOO_FAR")
                 continue
+
+            # The setup is confirmed on the latest closed candles, but the
+            # executable entry is the current market price. This prevents
+            # stale TP/SL levels when price has moved inside the entry window.
+            signal = dict(signal)
+            signal["entry"] = current
+            entry = current
 
             if has_active_coin(state, symbol):
                 print(f"{symbol}: ❌ ACTIVE_TRADE_EXISTS")
