@@ -51,5 +51,6 @@
   "signal_time": 1786378968,
   "last_signals": {},
   "active_trades": {},
-  "completed_trades": []
+  "completed_trades": [],
+  "last_processed_4h": {}
 }
