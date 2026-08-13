@@ -18,7 +18,7 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "2090120004")
 
 KLINE_URL = "https://api.lbkex.com/v2/kline.do"
-TICKER_URL = "https://api.lbkex.com/v2/kline.do"
+TICKER_URL = "https://api.lbkex.com/v2/ticker/24hr.do"
 
 COINS = {
     "BTC": "btc_usdt",
@@ -209,15 +209,17 @@ def get_current_price(symbol):
     if not data:
         raise RuntimeError(f"No ticker data for {symbol}")
 
-    ticker = data[0]
-    ticker_data = ticker.get("ticker", ticker)
+    # LBank v2 /ticker/24hr.do returns:
+    # data: [{"symbol": "...", "ticker": {"latest": "..."}}]
+    ticker = data[0] if isinstance(data, list) else data
+    ticker_data = ticker.get("ticker", ticker) if isinstance(ticker, dict) else {}
 
     price = ticker_data.get("latest")
     if price is None:
         price = ticker_data.get("last")
 
     if price is None:
-        raise RuntimeError(f"Price not found: {result}")
+        raise RuntimeError(f"Price not found in ticker response: {result}")
 
     return float(price)
 
