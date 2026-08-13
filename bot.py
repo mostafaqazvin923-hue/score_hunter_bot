@@ -47,18 +47,18 @@ LIQUIDITY_LOOKBACK = 40
 
 # Signal quality
 MIN_4H_SCORE = 4
-MIN_1H_SCORE = 2
+MIN_1H_SCORE = 1
 
 # Entry/risk
 TP_PERCENT = 0.0100
-ENTRY_WINDOW = 0.0075  # adaptive maximum initial distance: 0.75%
+ENTRY_WINDOW = 0.0075  # hard safety ceiling: 0.75%
 ATR_MULTIPLIER = 1.20
 MIN_SL_PERCENT = 0.0040
 MAX_SL_PERCENT = 0.0250
 MIN_RR = 1.20
 
 # Signal age
-EXPIRATION_HOURS = 12
+EXPIRATION_HOURS = 12  # informational/trade-management only; never blocks fresh signal creation
 
 # Structure buffers
 ATR_LEVEL_BUFFER = 0.15
@@ -69,6 +69,15 @@ STATE_FILE = "state.json"
 # ============================================================
 # TELEGRAM
 # ============================================================
+
+def latest_closed(candles):
+    """Return the last fully closed candle from a raw LBank series."""
+    closed = closed_candles(candles)
+    if not closed:
+        raise RuntimeError("No closed candle available")
+    return closed[-1]
+
+
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
