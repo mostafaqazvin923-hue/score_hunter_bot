@@ -17,8 +17,8 @@ from statistics import mean
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "2090120004")
 
-KLINE_URL = "https://api.lbkex.com/v2/kline.do"
-TICKER_URL = "https://api.lbkex.com/v2/ticker.do"
+KLINE_URL = "https://api.lbkex.com/v2/\1"
+TICKER_URL = "https://api.lbkex.com/v2/\1"
 
 COINS = {
     "BTC": "btc_usdt",
@@ -51,7 +51,7 @@ MIN_1H_SCORE = 1
 
 # Entry/risk
 TP_PERCENT = 0.0100
-ENTRY_WINDOW = 0.0075  # hard safety ceiling: 0.75%
+ENTRY_WINDOW = 0.0100  # absolute safety ceiling: 1.00%
 ATR_MULTIPLIER = 1.20
 MIN_SL_PERCENT = 0.0040
 MAX_SL_PERCENT = 0.0250
@@ -979,6 +979,15 @@ def calculate_levels(signal):
     if risk <= 0:
         return {"valid": False, "reason": "INVALID_RISK"}
 
+    # With a fixed TP, RR imposes a hard maximum acceptable risk.
+    max_risk_for_rr = reward / MIN_RR
+
+    if risk > max_risk_for_rr:
+        return {
+            "valid": False,
+            "reason": f"RR_TOO_LOW_1:{reward / risk:.2f}"
+        }
+
     rr = reward / risk
 
     if rr < MIN_RR:
@@ -1014,11 +1023,24 @@ def signal_expired(candle_time):
     return age > EXPIRATION_HOURS
 
 
-def entry_valid(entry, current):
-    if entry <= 0:
-        return False
+def entry_valid(entry, current, atr_value=None):
+    """
+    Validate whether the current price is still reasonably close to the
+    setup entry. The window adapts to volatility but is never wider than
+    ENTRY_WINDOW.
+    """
+    if entry <= 0 or current <= 0:
+        return False, 0.0, ENTRY_WINDOW
 
-    return abs(current - entry) / entry <= ENTRY_WINDOW
+    distance = abs(current - entry) / entry
+
+    if atr_value is not None and atr_value > 0:
+        atr_window = (atr_value / entry) * 0.50
+        allowed = min(ENTRY_WINDOW, max(0.0030, atr_window))
+    else:
+        allowed = ENTRY_WINDOW
+
+    return distance <= allowed, distance, allowed
 
 
 def signal_strength(score4, score1):
@@ -1191,7 +1213,9 @@ def main():
             if not confirmation["valid"]:
                 print(
                     f"{symbol}: ❌ 1H_CONFIRMATION_FAILED "
-                    f"({confirmation['score']})"
+                    f"({confirmation['score']}) "
+                    f"reasons={','.join(confirmation.get('reasons', [])) or 'none'} "
+                    f"RSI={confirmation.get('rsi', 0):.2f}"
                 )
                 continue
 
@@ -1211,8 +1235,16 @@ def main():
                 f"distance={distance * 100:.3f}%"
             )
 
-            if not entry_valid(entry, current):
-                print(f"{symbol}: ❌ ENTRY_TOO_FAR")
+            entry_ok, distance, allowed_window = entry_valid(
+                entry, current, signal.get("atr")
+            )
+
+            if not entry_ok:
+                print(
+                    f"{symbol}: ❌ ENTRY_TOO_FAR "
+                    f"distance={distance * 100:.3f}% "
+                    f"allowed={allowed_window * 100:.3f}%"
+                )
                 continue
 
             # The setup is confirmed on the latest closed candles, but the
