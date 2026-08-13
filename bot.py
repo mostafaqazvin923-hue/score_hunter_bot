@@ -5,7 +5,7 @@ import requests
 from statistics import mean
 
 # ============================================================
-# SCORE HUNTER PRO v7 BALANCED
+# SCORE HUNTER PRO v8 ADAPTIVE
 # 4H MARKET STRUCTURE + PRICE ACTION + LIQUIDITY
 # 1H ENTRY CONFIRMATION
 #
@@ -46,7 +46,7 @@ BOS_LOOKBACK = 30
 LIQUIDITY_LOOKBACK = 40
 
 # Signal quality
-MIN_4H_SCORE = 5
+MIN_4H_SCORE = 4
 MIN_1H_SCORE = 2
 
 # Entry/risk
@@ -58,7 +58,7 @@ MAX_SL_PERCENT = 0.0250
 MIN_RR = 1.20
 
 # Signal age
-EXPIRATION_HOURS = 999999
+EXPIRATION_HOURS = 12
 
 # Structure buffers
 ATR_LEVEL_BUFFER = 0.15
@@ -733,25 +733,39 @@ def analyze_4h(candles):
     # Direction selection
     # --------------------------------------------------------
 
-    long_event = bos["bull"] or choch["bull"] or sweep["bull"] or long_pullback
-    short_event = bos["bear"] or choch["bear"] or sweep["bear"] or short_pullback
+    # 4H is the directional engine, not the entry trigger.
+    # Do NOT require a fresh BOS/CHoCH/sweep on the exact signal candle;
+    # those events are confirmations and can legitimately be absent while
+    # trend + momentum are already aligned. The 1H layer remains responsible
+    # for entry confirmation.
+    long_trend = current["close"] > e200[i] and e20[i] > e50[i]
+    short_trend = current["close"] < e200[i] and e20[i] < e50[i]
 
-    if (
-        long_score >= MIN_4H_SCORE
-        and long_score > short_score
-        and long_event
-        and current["close"] > e20[i]
-    ):
+    long_momentum = (
+        current["close"] > e20[i]
+        or (current_rsi > 52 and current_rsi >= previous_rsi)
+        or bos["bull"] or choch["bull"] or sweep["bull"] or long_pullback
+    )
+    short_momentum = (
+        current["close"] < e20[i]
+        or (current_rsi < 48 and current_rsi <= previous_rsi)
+        or bos["bear"] or choch["bear"] or sweep["bear"] or short_pullback
+    )
+
+    if long_score >= MIN_4H_SCORE and long_score > short_score and long_trend and long_momentum:
         direction = "LONG"
-    elif (
-        short_score >= MIN_4H_SCORE
-        and short_score > long_score
-        and short_event
-        and current["close"] < e20[i]
-    ):
+    elif short_score >= MIN_4H_SCORE and short_score > long_score and short_trend and short_momentum:
         direction = "SHORT"
     else:
-        return None, "NO_DIRECTION"
+        # Adaptive fallback: when the score is tied because volume/volatility
+        # contribute equally to both sides, use the dominant EMA trend plus
+        # RSI position to choose direction, but never against the EMA trend.
+        if long_trend and current_rsi >= 52 and long_score >= MIN_4H_SCORE - 1:
+            direction = "LONG"
+        elif short_trend and current_rsi <= 48 and short_score >= MIN_4H_SCORE - 1:
+            direction = "SHORT"
+        else:
+            return None, "NO_DIRECTION"
 
     # A range is not automatically rejected if momentum has
     # a clean directional break/sweep. This prevents the
@@ -1081,7 +1095,7 @@ def check_active_trades(state):
         emoji = "✅" if result == "TP" else "❌"
 
         message = (
-            f"{emoji} SCORE HUNTER PRO v7 BALANCED\n\n"
+            f"{emoji} SCORE HUNTER PRO v8 ADAPTIVE\n\n"
             f"TRADE CLOSED\n\n"
             f"💰 {trade['symbol']}USDT\n"
             f"📊 {direction}\n"
@@ -1131,7 +1145,7 @@ def statistics(state):
 # ============================================================
 
 def main():
-    print("🟢 SCORE HUNTER PRO v7 BALANCED")
+    print("🟢 SCORE HUNTER PRO v8 ADAPTIVE")
     print("🔒 CLOSED CANDLE MODE: forming candle is ignored")
     print("🧠 MARKET STRUCTURE + PRICE ACTION + LIQUIDITY")
     print("📊 Main structure: 4H")
@@ -1167,7 +1181,22 @@ def main():
             signal, status = analyze_4h(candles4)
 
             if signal is None:
-                print(f"{symbol}: ❌ {status}")
+                # Explain why a market was rejected without changing the
+                # signal decision itself.
+                try:
+                    closes_dbg = [c["close"] for c in candles4]
+                    e20_dbg = ema(closes_dbg, EMA_FAST)[-1]
+                    e50_dbg = ema(closes_dbg, EMA_MID)[-1]
+                    e200_dbg = ema(closes_dbg, EMA_SLOW)[-1]
+                    rsi_dbg = rsi(closes_dbg, RSI_PERIOD)[-1]
+                    print(
+                        f"{symbol}: ❌ {status} | "
+                        f"close={latest['close']:.8f} "
+                        f"EMA20={e20_dbg:.8f} EMA50={e50_dbg:.8f} "
+                        f"EMA200={e200_dbg:.8f} RSI={rsi_dbg:.2f}"
+                    )
+                except Exception:
+                    print(f"{symbol}: ❌ {status}")
                 continue
 
             last_processed = state.setdefault("last_processed_4h", {}).get(symbol)
@@ -1279,7 +1308,7 @@ def main():
                 sl_move = (entry - sl) / entry * 100.0
 
             message = (
-                "🚨 SCORE HUNTER PRO v7 BALANCED 🚨\n\n"
+                "🚨 SCORE HUNTER PRO v8 ADAPTIVE 🚨\n\n"
                 f"💰 {symbol}USDT\n"
                 f"📊 {direction_text}\n"
                 f"{strength}\n\n"
@@ -1321,7 +1350,7 @@ def main():
     stats = statistics(state)
     if stats and stats["total"] % 10 == 0:
         message = (
-            "📊 SCORE HUNTER PRO v7 BALANCED\n\n"
+            "📊 SCORE HUNTER PRO v8 ADAPTIVE\n\n"
             "STATISTICS\n\n"
             f"📌 Closed trades: {stats['total']}\n"
             f"✅ TP: {stats['wins']}\n"
@@ -1331,7 +1360,7 @@ def main():
         )
         send_telegram(message)
 
-    print("\n✅ SCORE HUNTER PRO v7 BALANCED scan completed.")
+    print("\n✅ SCORE HUNTER PRO v8 ADAPTIVE scan completed.")
 
 
 if __name__ == "__main__":
