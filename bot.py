@@ -17,7 +17,7 @@ from statistics import mean
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "2090120004")
 
-KLINE_URL = "https://api.lbkex.com/FINAL/kline.do"
+KLINE_URL = "https://api.lbkex.com/v2/kline.do"
 TICKER_URL = "https://api.lbkex.com/FINAL/ticker.do"
 
 COINS = {
