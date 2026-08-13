@@ -14,13 +14,13 @@
     "signal_time": 1786379900
   },
   "SOL": {
-    "last_signal": "1786435200_LONG",
-    "last_signal_time": 1786435200,
+    "last_signal": "1786579200_LONG",
+    "last_signal_time": 1786579200,
     "direction": "LONG",
-    "score": 6,
-    "entry": 76.23,
-    "tp": 76.9923,
-    "sl": 75.84885
+    "score": 5,
+    "entry": 76.25,
+    "tp": 77.0125,
+    "sl": 75.86875
   },
   "XRP": {
     "price": 1.0220175008542913,
