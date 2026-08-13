@@ -1,29 +1,33 @@
 import os
 import json
-import time
 import requests
 from datetime import datetime, timezone
 
 
 # ============================================================
-# SCORE HUNTER 4H
-# DATA SOURCE: BINANCE USDⓈ-M FUTURES
-# COINS: ETH / SOL / XRP / APT
+# SCORE HUNTER PRO
+# BINANCE USDⓈ-M FUTURES
+#
+# COINS:
+# ETH / SOL / XRP / APT
+#
+# TIMEFRAME:
+# 4H
 #
 # PINE LOGIC:
-# EMA 20 / 50 / 200
-# RSI 14
-# VOLUME SMA 20
-# HIGHEST / LOWEST 6 PREVIOUS CANDLES
-# EMA20 PULLBACK
-# CANDLE CONFIRMATION
-# ATR 14
-# MIN SCORE 5/7
+# EMA20 / EMA50 / EMA200
+# RSI14
+# Volume SMA20
+# Highest/Lowest 6 previous candles
+# EMA20 Pullback
+# Candle Confirmation
+# ATR14
 #
-# CLOSED CANDLE ONLY
-#
+# MIN SCORE: 5/7
 # TP: 1%
 # SL: 0.5%
+#
+# CLOSED CANDLE ONLY
 # ============================================================
 
 
@@ -40,20 +44,45 @@ CHAT_ID = os.environ.get(
 
 
 # ============================================================
-# BINANCE USD-M FUTURES
+# BINANCE FUTURES ENDPOINTS
+#
+# We try multiple official Futures REST hosts.
+# This is useful when one Binance gateway returns 451.
 # ============================================================
 
-BINANCE_KLINE_URL = (
-    "https://fapi.binance.com/fapi/v1/klines"
-)
+BINANCE_FUTURES_BASES = [
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+    "https://fapi4.binance.com",
+]
 
-BINANCE_TIME_URL = (
-    "https://fapi.binance.com/fapi/v1/time"
-)
+
+KLINE_PATH = "/fapi/v1/klines"
+TIME_PATH = "/fapi/v1/time"
 
 
 # ============================================================
-# COINS
+# REQUEST SETTINGS
+# ============================================================
+
+REQUEST_TIMEOUT = 20
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/126.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
+
+
+# ============================================================
+# SYMBOLS
 # ============================================================
 
 COINS = {
@@ -70,9 +99,6 @@ COINS = {
 
 INTERVAL = "4h"
 
-# Binance allows much more than this.
-# More history = closer indicator initialization
-# to TradingView.
 CANDLE_LIMIT = 1000
 
 REQUIRED_SCORE = 5
@@ -100,7 +126,7 @@ def send_telegram(message):
             "chat_id": CHAT_ID,
             "text": message,
         },
-        timeout=20,
+        timeout=REQUEST_TIMEOUT,
     )
 
     print(
@@ -162,19 +188,131 @@ def save_state(state):
 
 
 # ============================================================
+# BINANCE REQUEST HELPER
+# ============================================================
+
+def binance_get(path, params=None):
+
+    last_error = None
+
+    for base in BINANCE_FUTURES_BASES:
+
+        url = (
+            base
+            +
+            path
+        )
+
+        print(
+            f"Trying Binance endpoint: "
+            f"{base}"
+        )
+
+        try:
+
+            response = requests.get(
+                url,
+                params=params,
+                headers=HEADERS,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            print(
+                f"HTTP {response.status_code}"
+            )
+
+            # ------------------------------------------------
+            # SUCCESS
+            # ------------------------------------------------
+
+            if response.status_code == 200:
+
+                return response.json()
+
+            # ------------------------------------------------
+            # GEO / ACCESS BLOCK
+            # ------------------------------------------------
+
+            if response.status_code == 451:
+
+                print(
+                    f"451 from {base} "
+                    f"→ trying next endpoint..."
+                )
+
+                last_error = RuntimeError(
+                    f"HTTP 451 from {base}"
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # RATE LIMIT
+            # ------------------------------------------------
+
+            if response.status_code in (
+                418,
+                429,
+            ):
+
+                print(
+                    f"Rate limit "
+                    f"from {base}"
+                )
+
+                last_error = RuntimeError(
+                    f"HTTP {response.status_code}"
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # OTHER ERROR
+            # ------------------------------------------------
+
+            try:
+
+                error_body = (
+                    response.json()
+                )
+
+            except Exception:
+
+                error_body = (
+                    response.text
+                )
+
+            last_error = RuntimeError(
+                f"Binance HTTP "
+                f"{response.status_code}: "
+                f"{error_body}"
+            )
+
+        except Exception as e:
+
+            print(
+                f"Connection error "
+                f"on {base}: {e}"
+            )
+
+            last_error = e
+
+    raise RuntimeError(
+        "ALL BINANCE FUTURES "
+        "ENDPOINTS FAILED.\n"
+        f"Last error: {last_error}"
+    )
+
+
+# ============================================================
 # BINANCE SERVER TIME
 # ============================================================
 
 def get_binance_server_time():
 
-    response = requests.get(
-        BINANCE_TIME_URL,
-        timeout=20,
+    data = binance_get(
+        TIME_PATH
     )
-
-    response.raise_for_status()
-
-    data = response.json()
 
     return int(
         data["serverTime"]
@@ -182,34 +320,25 @@ def get_binance_server_time():
 
 
 # ============================================================
-# BINANCE 4H CANDLES
+# GET BINANCE FUTURES KLINES
 # ============================================================
 
 def get_4h_candles(symbol):
 
     print(
-        f"Getting {symbol} 4H candles "
-        f"from Binance Futures..."
+        f"Getting {symbol} "
+        f"4H candles from "
+        f"Binance USDⓈ-M Futures..."
     )
 
-    response = requests.get(
-        BINANCE_KLINE_URL,
+    raw_data = binance_get(
+        KLINE_PATH,
         params={
             "symbol": symbol,
             "interval": INTERVAL,
             "limit": CANDLE_LIMIT,
-        },
-        timeout=20,
+        }
     )
-
-    print(
-        "Binance:",
-        response.status_code
-    )
-
-    response.raise_for_status()
-
-    raw_data = response.json()
 
     if not isinstance(
         raw_data,
@@ -217,7 +346,7 @@ def get_4h_candles(symbol):
     ):
 
         raise RuntimeError(
-            f"Binance API error: "
+            f"Unexpected Binance response: "
             f"{raw_data}"
         )
 
@@ -225,12 +354,11 @@ def get_4h_candles(symbol):
 
     for item in raw_data:
 
-        if len(item) < 6:
+        if len(item) < 7:
             continue
 
         candles.append(
             {
-                # Binance kline open time
                 "time": int(item[0]),
 
                 "open": float(item[1]),
@@ -239,7 +367,6 @@ def get_4h_candles(symbol):
                 "close": float(item[4]),
                 "volume": float(item[5]),
 
-                # Binance kline close time
                 "close_time": int(item[6]),
             }
         )
@@ -247,6 +374,13 @@ def get_4h_candles(symbol):
     candles.sort(
         key=lambda x: x["time"]
     )
+
+    if not candles:
+
+        raise RuntimeError(
+            f"No candles returned "
+            f"for {symbol}"
+        )
 
     print(
         f"{symbol}: received "
@@ -276,15 +410,21 @@ def get_closed_candles(candles):
 
     for candle in candles:
 
-        # Binance closeTime is inclusive.
-        if candle["close_time"] < server_time:
+        if (
+            candle["close_time"]
+            <
+            server_time
+        ):
 
-            closed.append(candle)
+            closed.append(
+                candle
+            )
 
     if len(closed) < 210:
 
         raise RuntimeError(
-            "Not enough CLOSED candles."
+            "Not enough CLOSED "
+            "candles."
         )
 
     return closed
@@ -292,14 +432,6 @@ def get_closed_candles(candles):
 
 # ============================================================
 # EMA
-#
-# Pine:
-# ta.ema(source, length)
-#
-# Seed:
-# SMA(length)
-# Then:
-# EMA = alpha * price + (1-alpha) * previous EMA
 # ============================================================
 
 def ema_series(
@@ -316,9 +448,10 @@ def ema_series(
         (period + 1.0)
     )
 
-    first_ema = (
+    first = (
         sum(values[:period])
-        / period
+        /
+        period
     )
 
     result = [None] * (
@@ -326,10 +459,10 @@ def ema_series(
     )
 
     result.append(
-        first_ema
+        first
     )
 
-    previous = first_ema
+    previous = first
 
     for price in values[period:]:
 
@@ -351,12 +484,6 @@ def ema_series(
 
 # ============================================================
 # RSI
-#
-# Pine:
-# ta.rsi(close, 14)
-#
-# TradingView RSI uses Wilder's RMA
-# for average gain/loss.
 # ============================================================
 
 def rsi_series(
@@ -396,12 +523,14 @@ def rsi_series(
 
     avg_gain = (
         sum(gains[:period])
-        / period
+        /
+        period
     )
 
     avg_loss = (
         sum(losses[:period])
-        / period
+        /
+        period
     )
 
     result = [None] * period
@@ -443,7 +572,8 @@ def rsi_series(
             )
             +
             gains[i]
-        ) / period
+        )
+        / period
 
         avg_loss = (
             (
@@ -453,7 +583,8 @@ def rsi_series(
             )
             +
             losses[i]
-        ) / period
+        )
+        / period
 
         if avg_loss == 0:
 
@@ -486,9 +617,6 @@ def rsi_series(
 
 # ============================================================
 # SMA
-#
-# Pine:
-# ta.sma(volume, 20)
 # ============================================================
 
 def sma_series(
@@ -504,31 +632,38 @@ def sma_series(
         period - 1
     )
 
+    running_sum = sum(
+        values[:period]
+    )
+
+    result.append(
+        running_sum / period
+    )
+
     for i in range(
-        period - 1,
+        period,
         len(values)
     ):
 
-        window = values[
-            i - period + 1:
-            i + 1
-        ]
+        running_sum += (
+            values[i]
+        )
+
+        running_sum -= (
+            values[
+                i - period
+            ]
+        )
 
         result.append(
-            sum(window)
-            / period
+            running_sum / period
         )
 
     return result
 
 
 # ============================================================
-# ATR
-#
-# Pine:
-# ta.atr(14)
-#
-# TradingView ATR = RMA(True Range, 14)
+# ATR / RMA
 # ============================================================
 
 def atr_series(
@@ -547,8 +682,13 @@ def atr_series(
         len(candles)
     ):
 
-        high = candles[i]["high"]
-        low = candles[i]["low"]
+        high = (
+            candles[i]["high"]
+        )
+
+        low = (
+            candles[i]["low"]
+        )
 
         previous_close = (
             candles[i - 1]["close"]
@@ -614,9 +754,7 @@ def atr_series(
 
 
 # ============================================================
-# SIGNAL CALCULATION
-#
-# THIS IS THE PYTHON VERSION OF THE PINE SCRIPT
+# SIGNAL
 # ============================================================
 
 def calculate_signal(
@@ -626,10 +764,6 @@ def calculate_signal(
     if len(candles) < 210:
 
         return None
-
-    # --------------------------------------------------------
-    # SERIES
-    # --------------------------------------------------------
 
     closes = [
         c["close"]
@@ -670,10 +804,6 @@ def calculate_signal(
         candles,
         14
     )
-
-    # --------------------------------------------------------
-    # LAST CLOSED CANDLE
-    # --------------------------------------------------------
 
     i = len(candles) - 1
 
@@ -721,15 +851,7 @@ def calculate_signal(
         return None
 
     # ========================================================
-    # 1. TREND
-    #
-    # Pine:
-    #
-    # longTrend =
-    # close > ema200 and ema20 > ema50
-    #
-    # shortTrend =
-    # close < ema200 and ema20 < ema50
+    # 1 TREND
     # ========================================================
 
     long_trend = (
@@ -745,7 +867,7 @@ def calculate_signal(
     )
 
     # ========================================================
-    # 2. RSI
+    # 2 RSI
     # ========================================================
 
     long_rsi = (
@@ -765,10 +887,7 @@ def calculate_signal(
     )
 
     # ========================================================
-    # 3. VOLUME
-    #
-    # Pine:
-    # volume >= ta.sma(volume, 20)
+    # 3 VOLUME
     # ========================================================
 
     volume_ok = (
@@ -778,22 +897,14 @@ def calculate_signal(
     )
 
     # ========================================================
-    # 4. MARKET STRUCTURE
+    # 4 MARKET STRUCTURE
     #
     # Pine:
     #
-    # recentHigh = ta.highest(high, 6)[1]
+    # ta.highest(high, 6)[1]
     #
-    # Meaning:
-    # highest HIGH of the previous 6 candles,
-    # excluding the current candle.
-    #
-    # recentLow = ta.lowest(low, 6)[1]
+    # Previous 6 candles only.
     # ========================================================
-
-    if len(candles) < 7:
-
-        return None
 
     previous_6 = candles[
         -7:-1
@@ -818,7 +929,7 @@ def calculate_signal(
     )
 
     # ========================================================
-    # 5. EMA PULLBACK
+    # 5 EMA PULLBACK
     # ========================================================
 
     long_pullback = (
@@ -834,7 +945,7 @@ def calculate_signal(
     )
 
     # ========================================================
-    # 6. CANDLE CONFIRMATION
+    # 6 CANDLE
     # ========================================================
 
     candle_range = (
@@ -873,7 +984,7 @@ def calculate_signal(
     )
 
     # ========================================================
-    # 7. VOLATILITY
+    # 7 VOLATILITY
     # ========================================================
 
     volatility_ok = (
@@ -921,45 +1032,71 @@ def calculate_signal(
     # ========================================================
 
     print(
-        f"Close={close}"
+        f"Close       : {close}"
     )
 
     print(
-        f"EMA20={e20} | "
-        f"EMA50={e50} | "
-        f"EMA200={e200}"
+        f"EMA20       : {e20}"
     )
 
     print(
-        f"RSI={rsi:.4f} | "
-        f"PrevRSI={previous_rsi:.4f}"
+        f"EMA50       : {e50}"
     )
 
     print(
-        f"Volume={current['volume']} | "
-        f"VolumeMA20={vol_ma}"
+        f"EMA200      : {e200}"
     )
 
     print(
-        f"RecentHigh={recent_high} | "
-        f"RecentLow={recent_low}"
+        f"RSI         : {rsi:.6f}"
     )
 
     print(
-        f"ATR={atr} | "
-        f"ATR/Close={atr / close:.6f}"
+        f"Previous RSI: {previous_rsi:.6f}"
     )
 
     print(
-        f"LONG SCORE = {long_score}/7"
+        f"Volume      : "
+        f"{current['volume']}"
     )
 
     print(
-        f"SHORT SCORE = {short_score}/7"
+        f"Volume MA20 : "
+        f"{vol_ma}"
+    )
+
+    print(
+        f"Recent High : "
+        f"{recent_high}"
+    )
+
+    print(
+        f"Recent Low  : "
+        f"{recent_low}"
+    )
+
+    print(
+        f"ATR         : "
+        f"{atr}"
+    )
+
+    print(
+        f"ATR/Close   : "
+        f"{atr / close:.8f}"
+    )
+
+    print(
+        f"LONG SCORE  : "
+        f"{long_score}/7"
+    )
+
+    print(
+        f"SHORT SCORE : "
+        f"{short_score}/7"
     )
 
     # ========================================================
-    # FINAL SIGNAL
+    # FINAL
     # ========================================================
 
     if long_score >= REQUIRED_SCORE:
@@ -984,39 +1121,36 @@ def calculate_signal(
 
 
 # ============================================================
-# FORMAT PRICE
+# PRICE FORMAT
 # ============================================================
 
 def format_price(price):
 
     if price >= 1000:
-
         return f"{price:.2f}"
 
     if price >= 100:
-
         return f"{price:.3f}"
 
     if price >= 10:
-
         return f"{price:.4f}"
 
     if price >= 1:
-
         return f"{price:.5f}"
 
     if price >= 0.1:
-
         return f"{price:.6f}"
 
     return f"{price:.8f}"
 
 
 # ============================================================
-# FORMAT CANDLE TIME
+# TIME FORMAT
 # ============================================================
 
-def format_candle_time(timestamp_ms):
+def format_candle_time(
+    timestamp_ms
+):
 
     dt = datetime.fromtimestamp(
         timestamp_ms / 1000,
@@ -1064,7 +1198,7 @@ def main():
         try:
 
             # ------------------------------------------------
-            # GET DATA
+            # GET CANDLES
             # ------------------------------------------------
 
             candles = get_4h_candles(
@@ -1072,7 +1206,7 @@ def main():
             )
 
             # ------------------------------------------------
-            # CLOSED CANDLES ONLY
+            # CLOSED ONLY
             # ------------------------------------------------
 
             closed_candles = (
@@ -1086,8 +1220,8 @@ def main():
             )
 
             print(
-                f"{symbol}: latest CLOSED "
-                f"4H candle:"
+                f"{symbol}: latest "
+                f"CLOSED 4H candle:"
             )
 
             print(
@@ -1097,7 +1231,7 @@ def main():
             )
 
             # ------------------------------------------------
-            # CALCULATE SIGNAL
+            # SIGNAL
             # ------------------------------------------------
 
             signal = calculate_signal(
@@ -1150,8 +1284,8 @@ def main():
             ):
 
                 print(
-                    f"{symbol}: signal "
-                    f"already sent."
+                    f"{symbol}: "
+                    f"signal already sent"
                 )
 
                 continue
@@ -1229,7 +1363,7 @@ def main():
                 )
 
             # ------------------------------------------------
-            # TELEGRAM MESSAGE
+            # TELEGRAM
             # ------------------------------------------------
 
             message = (
@@ -1239,8 +1373,7 @@ def main():
 
                 f"📊 {direction_text}\n"
 
-                f"⭐ Score: "
-                f"{score}/7\n"
+                f"⭐ Score: {score}/7\n"
 
                 f"💵 Entry: "
                 f"{format_price(entry)}\n"
@@ -1269,16 +1402,12 @@ def main():
                 "⚠️ Manage risk."
             )
 
-            # ------------------------------------------------
-            # SEND
-            # ------------------------------------------------
-
             send_telegram(
                 message
             )
 
             # ------------------------------------------------
-            # SAVE STATE
+            # SAVE
             # ------------------------------------------------
 
             state[symbol] = {
@@ -1338,5 +1467,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
