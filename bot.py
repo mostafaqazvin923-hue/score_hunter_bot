@@ -4,12 +4,10 @@ import time
 import requests
 
 # ============================================================
-# SCORE HUNTER 4H
+# SCORE HUNTER 4H - TRADINGVIEW MATCH
 # DATA SOURCE: LBANK
 # COINS: BTC / ETH / SOL / XRP
-# STRATEGY: 7 FACTORS - MIN SCORE 5/7
-# TP: 1% | SL: 0.5%
-# CLOSED CANDLE ONLY
+# CLOSED 4H CANDLE ONLY
 # ============================================================
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -34,6 +32,8 @@ SL_PERCENT = 0.50
 
 STATE_FILE = "state.json"
 
+FOUR_HOURS = 4 * 60 * 60
+
 
 # ============================================================
 # TELEGRAM
@@ -55,6 +55,12 @@ def send_telegram(message):
     print("Telegram:", response.status_code)
     print(response.text)
 
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Telegram error: {response.status_code} "
+            f"{response.text}"
+        )
+
 
 # ============================================================
 # STATE
@@ -70,7 +76,7 @@ def load_state():
         with open(
             STATE_FILE,
             "r",
-            encoding="utf-8"
+            encoding="utf-8",
         ) as f:
 
             return json.load(f)
@@ -78,6 +84,7 @@ def load_state():
     except Exception as e:
 
         print("State load error:", e)
+
         return {}
 
 
@@ -86,13 +93,13 @@ def save_state(state):
     with open(
         STATE_FILE,
         "w",
-        encoding="utf-8"
+        encoding="utf-8",
     ) as f:
 
         json.dump(
             state,
             f,
-            indent=2
+            indent=2,
         )
 
 
@@ -110,7 +117,10 @@ def get_4h_candles(symbol):
 
     start_time = (
         now
-        - (CANDLE_LIMIT * 4 * 60 * 60)
+        - (
+            CANDLE_LIMIT
+            * FOUR_HOURS
+        )
     )
 
     response = requests.get(
@@ -124,7 +134,10 @@ def get_4h_candles(symbol):
         timeout=20,
     )
 
-    print("LBank:", response.status_code)
+    print(
+        "LBank:",
+        response.status_code,
+    )
 
     response.raise_for_status()
 
@@ -140,13 +153,14 @@ def get_4h_candles(symbol):
 
     raw_data = result.get(
         "data",
-        []
+        [],
     )
 
     if not raw_data:
 
         raise RuntimeError(
-            f"No candle data returned for {symbol}"
+            f"No candle data returned "
+            f"for {symbol}"
         )
 
     candles = []
@@ -191,29 +205,62 @@ def get_closed_candles(candles):
             "Not enough candles."
         )
 
-    # آخرین کندل ممکن است هنوز در حال تشکیل باشد.
-    # بنابراین برای سیگنال استفاده نمی‌شود.
-    return candles[:-1]
+    now = int(time.time())
+
+    closed = []
+
+    for candle in candles:
+
+        candle_start = candle["time"]
+
+        candle_end = (
+            candle_start
+            + FOUR_HOURS
+        )
+
+        # IMPORTANT:
+        # Only candles whose full 4H period
+        # has already finished are accepted.
+
+        if candle_end <= now:
+
+            closed.append(candle)
+
+    if len(closed) < 210:
+
+        raise RuntimeError(
+            "Not enough fully closed "
+            "4H candles."
+        )
+
+    return closed
 
 
 # ============================================================
 # EMA
 # ============================================================
 
-def ema_series(values, period):
+def ema_series(
+    values,
+    period,
+):
 
     if len(values) < period:
         return []
 
-    multiplier = 2 / (period + 1)
+    multiplier = (
+        2.0
+        / (period + 1.0)
+    )
+
+    result = (
+        [None]
+        * (period - 1)
+    )
 
     first = (
         sum(values[:period])
         / period
-    )
-
-    result = [None] * (
-        period - 1
     )
 
     result.append(first)
@@ -223,7 +270,10 @@ def ema_series(values, period):
     for price in values[period:]:
 
         current = (
-            (price - previous)
+            (
+                price
+                - previous
+            )
             * multiplier
             + previous
         )
@@ -236,12 +286,12 @@ def ema_series(values, period):
 
 
 # ============================================================
-# RSI
+# RSI - WILDER
 # ============================================================
 
 def rsi_series(
     closes,
-    period=14
+    period=14,
 ):
 
     if len(closes) <= period:
@@ -252,7 +302,7 @@ def rsi_series(
 
     for i in range(
         1,
-        len(closes)
+        len(closes),
     ):
 
         change = (
@@ -261,11 +311,11 @@ def rsi_series(
         )
 
         gains.append(
-            max(change, 0)
+            max(change, 0.0)
         )
 
         losses.append(
-            max(-change, 0)
+            max(-change, 0.0)
         )
 
     avg_gain = (
@@ -292,16 +342,19 @@ def rsi_series(
         )
 
         result.append(
-            100
+            100.0
             - (
-                100
-                / (1 + rs)
+                100.0
+                / (1.0 + rs)
             )
         )
 
+    # Wilder RMA
+    # Matches TradingView ta.rsi()
+
     for i in range(
         period,
-        len(gains)
+        len(gains),
     ):
 
         avg_gain = (
@@ -332,10 +385,10 @@ def rsi_series(
             )
 
             value = (
-                100
+                100.0
                 - (
-                    100
-                    / (1 + rs)
+                    100.0
+                    / (1.0 + rs)
                 )
             )
 
@@ -345,12 +398,12 @@ def rsi_series(
 
 
 # ============================================================
-# ATR
+# ATR - WILDER
 # ============================================================
 
 def atr_series(
     candles,
-    period=14
+    period=14,
 ):
 
     if len(candles) <= period:
@@ -360,10 +413,11 @@ def atr_series(
 
     for i in range(
         1,
-        len(candles)
+        len(candles),
     ):
 
         high = candles[i]["high"]
+
         low = candles[i]["low"]
 
         previous_close = (
@@ -400,6 +454,9 @@ def atr_series(
 
     previous = first_atr
 
+    # Wilder RMA
+    # Matches TradingView ta.atr()
+
     for tr in true_ranges[period:]:
 
         current = (
@@ -418,7 +475,25 @@ def atr_series(
 
 
 # ============================================================
-# SIGNAL
+# SMA
+# ============================================================
+
+def sma(
+    values,
+    period,
+):
+
+    if len(values) < period:
+        return None
+
+    return (
+        sum(values[-period:])
+        / period
+    )
+
+
+# ============================================================
+# SIGNAL CALCULATION
 # ============================================================
 
 def calculate_signal(candles):
@@ -438,27 +513,27 @@ def calculate_signal(candles):
 
     ema20 = ema_series(
         closes,
-        20
+        20,
     )
 
     ema50 = ema_series(
         closes,
-        50
+        50,
     )
 
     ema200 = ema_series(
         closes,
-        200
+        200,
     )
 
     rsi_values = rsi_series(
         closes,
-        14
+        14,
     )
 
     atr_values = atr_series(
         candles,
-        14
+        14,
     )
 
     i = len(candles) - 1
@@ -476,7 +551,10 @@ def calculate_signal(candles):
     e200 = ema200[i]
 
     rsi = rsi_values[-1]
-    previous_rsi = rsi_values[-2]
+
+    previous_rsi = (
+        rsi_values[-2]
+    )
 
     atr = atr_values[-1]
 
@@ -525,27 +603,39 @@ def calculate_signal(candles):
     # 3. VOLUME
     # ========================================================
 
-    volume_ma = (
-        sum(volumes[-20:])
-        / 20
+    volume_ma = sma(
+        volumes,
+        20,
     )
 
     volume_ok = (
-        volume >= volume_ma
+        volume_ma is not None
+        and volume >= volume_ma
     )
 
     # ========================================================
     # 4. MARKET STRUCTURE
     # ========================================================
 
+    # TradingView:
+    #
+    # ta.highest(high, 6)[1]
+    #
+    # means highest high of the
+    # six candles BEFORE current candle.
+
+    previous_six = candles[
+        i - 6:i
+    ]
+
     recent_high = max(
         c["high"]
-        for c in candles[-7:-1]
+        for c in previous_six
     )
 
     recent_low = min(
         c["low"]
-        for c in candles[-7:-1]
+        for c in previous_six
     )
 
     bull_break = (
@@ -590,8 +680,8 @@ def calculate_signal(candles):
 
     else:
 
-        bull_ratio = 0
-        bear_ratio = 0
+        bull_ratio = 0.0
+        bear_ratio = 0.0
 
     bull_candle = (
         close > open_price
@@ -610,7 +700,10 @@ def calculate_signal(candles):
     # ========================================================
 
     volatility_ok = (
-        atr / close >= 0.002
+        close > 0
+        and (
+            atr / close
+        ) >= 0.002
     )
 
     # ========================================================
@@ -638,8 +731,39 @@ def calculate_signal(candles):
     )
 
     # ========================================================
+    # DEBUG
+    # ========================================================
+
+    print(
+        "  LONG:"
+        f" trend={int(long_trend)}"
+        f" rsi={int(long_rsi)}"
+        f" volume={int(volume_ok)}"
+        f" break={int(bull_break)}"
+        f" pullback={int(long_pullback)}"
+        f" candle={int(bull_candle)}"
+        f" volatility={int(volatility_ok)}"
+        f" => {long_score}/7"
+    )
+
+    print(
+        "  SHORT:"
+        f" trend={int(short_trend)}"
+        f" rsi={int(short_rsi)}"
+        f" volume={int(volume_ok)}"
+        f" break={int(bear_break)}"
+        f" pullback={int(short_pullback)}"
+        f" candle={int(bear_candle)}"
+        f" volatility={int(volatility_ok)}"
+        f" => {short_score}/7"
+    )
+
+    # ========================================================
     # FINAL SIGNAL
     # ========================================================
+
+    # Same order as Pine Script:
+    # LONG is checked first.
 
     if long_score >= REQUIRED_SCORE:
 
@@ -647,6 +771,7 @@ def calculate_signal(candles):
             "direction": "LONG",
             "score": long_score,
             "entry": close,
+            "candle_time": current["time"],
         }
 
     if short_score >= REQUIRED_SCORE:
@@ -655,6 +780,7 @@ def calculate_signal(candles):
             "direction": "SHORT",
             "score": short_score,
             "entry": close,
+            "candle_time": current["time"],
         }
 
     return None
@@ -667,11 +793,13 @@ def calculate_signal(candles):
 def main():
 
     print(
-        "🟢 SCORE HUNTER 4H - LBANK SCANNING"
+        "🟢 SCORE HUNTER 4H - "
+        "TRADINGVIEW MATCH"
     )
 
     print(
-        "🕯 CLOSED CANDLE ONLY - NO MID-CANDLE SIGNAL"
+        "🕯 CLOSED CANDLE ONLY - "
+        "NO MID-CANDLE SIGNAL"
     )
 
     print(
@@ -680,6 +808,18 @@ def main():
 
     print(
         "⏱ Timeframe: 4H"
+    )
+
+    print(
+        "⭐ Minimum Score: 5/7"
+    )
+
+    print(
+        "🎯 TP: 1%"
+    )
+
+    print(
+        "🛑 SL: 0.5%"
     )
 
     state = load_state()
@@ -692,13 +832,17 @@ def main():
 
         try:
 
+            # ------------------------------------------------
+            # GET DATA
+            # ------------------------------------------------
+
             candles = get_4h_candles(
                 lbank_symbol
             )
 
-            # =================================================
-            # فقط کندل‌های کاملاً بسته‌شده
-            # =================================================
+            # ------------------------------------------------
+            # CLOSED CANDLES ONLY
+            # ------------------------------------------------
 
             closed_candles = (
                 get_closed_candles(
@@ -715,6 +859,10 @@ def main():
                 f"4H candle: "
                 f"{latest['time']}"
             )
+
+            # ------------------------------------------------
+            # CALCULATE SIGNAL
+            # ------------------------------------------------
 
             signal = calculate_signal(
                 closed_candles
@@ -740,12 +888,13 @@ def main():
                 signal["entry"]
             )
 
-            # =================================================
+            # ------------------------------------------------
             # DUPLICATE PROTECTION
-            # =================================================
+            # ------------------------------------------------
 
             signal_id = (
-                f"{latest['time']}_{direction}"
+                f"{latest['time']}_"
+                f"{direction}"
             )
 
             previous_signal = (
@@ -754,18 +903,21 @@ def main():
                 .get("last_signal")
             )
 
-            if previous_signal == signal_id:
+            if (
+                previous_signal
+                == signal_id
+            ):
 
                 print(
-                    f"{symbol}: signal "
-                    f"already sent"
+                    f"{symbol}: "
+                    f"signal already sent"
                 )
 
                 continue
 
-            # =================================================
+            # ------------------------------------------------
             # TP / SL
-            # =================================================
+            # ------------------------------------------------
 
             if direction == "LONG":
 
@@ -792,7 +944,7 @@ def main():
                 )
 
                 tp_text = (
-                    f"+{TP_PERCENT:.0f}%"
+                    f"+{TP_PERCENT:.1f}%"
                 )
 
                 sl_text = (
@@ -824,16 +976,16 @@ def main():
                 )
 
                 tp_text = (
-                    f"-{TP_PERCENT:.0f}%"
+                    f"-{TP_PERCENT:.1f}%"
                 )
 
                 sl_text = (
                     f"+{SL_PERCENT:.1f}%"
                 )
 
-            # =================================================
+            # ------------------------------------------------
             # TELEGRAM
-            # =================================================
+            # ------------------------------------------------
 
             message = (
                 "🚨 SCORE HUNTER 4H 🚨\n\n"
@@ -851,15 +1003,19 @@ def main():
                 "⚠️ Manage risk."
             )
 
-            send_telegram(message)
+            send_telegram(
+                message
+            )
 
-            # =================================================
-            # SAVE
-            # =================================================
+            # ------------------------------------------------
+            # SAVE STATE
+            # ------------------------------------------------
 
             state[symbol] = {
                 "last_signal": signal_id,
-                "last_signal_time": latest["time"],
+                "last_signal_time": (
+                    latest["time"]
+                ),
                 "direction": direction,
                 "score": score,
                 "entry": entry,
@@ -878,7 +1034,8 @@ def main():
         except Exception as e:
 
             print(
-                f"{symbol}: ERROR: {e}"
+                f"{symbol}: "
+                f"ERROR: {e}"
             )
 
     save_state(state)
@@ -887,6 +1044,10 @@ def main():
         "\n✅ LBank 4H scan completed."
     )
 
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     main()
