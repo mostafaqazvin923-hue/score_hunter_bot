@@ -55,5 +55,14 @@
   "last_processed_4h": {
     "BTC": 1786564800,
     "XRP": 1786564800
+  },
+  "BTC": {
+    "last_signal": "1786622400_SHORT",
+    "last_signal_time": 1786622400,
+    "direction": "SHORT",
+    "score": 5,
+    "entry": 63419.59,
+    "tp": 62785.3941,
+    "sl": 63736.68794999999
   }
 }
