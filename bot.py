@@ -14,6 +14,10 @@ REQUIRED_SCORE = 5
 TP_PERCENT = 1.0
 SL_PERCENT = 0.50
 
+# Fixed-TP market-space filter
+TP_SPACE_LOOKBACK = 20
+TP_SPACE_BUFFER_PERCENT = 0.10
+
 COINS = {
     "ETH": "ETHUSDT",
     "SOL": "SOLUSDT",
@@ -139,6 +143,25 @@ def atr(highs, lows, closes, period=14):
 
     return sum(true_ranges[-period:]) / period
 
+def has_tp_space(candles, direction, entry):
+    # Check recent opposing structure before allowing the fixed 1% TP.
+    if len(candles) < TP_SPACE_LOOKBACK + 2:
+        return False
+
+    # Exclude the current signal candle.
+    lookback = candles[-(TP_SPACE_LOOKBACK + 1):-1]
+    buffer = TP_SPACE_BUFFER_PERCENT / 100.0
+
+    if direction == "LONG":
+        tp = entry * (1 + TP_PERCENT / 100.0)
+        resistance = max(c["high"] for c in lookback)
+        return resistance >= tp * (1 + buffer)
+
+    tp = entry * (1 - TP_PERCENT / 100.0)
+    support = min(c["low"] for c in lookback)
+    return support <= tp * (1 - buffer)
+
+
 def calculate_signal(candles, symbol):
     if len(candles) < 210:
         return None
@@ -248,10 +271,24 @@ def calculate_signal(candles, symbol):
     print("====================")
 
     if long_score >= REQUIRED_SCORE:
+        if not has_tp_space(candles, "LONG", close):
+            print(
+                f"{symbol}: LONG rejected - insufficient space for "
+                f"{TP_PERCENT}% TP"
+            )
+            return None
+
         return {"direction": "LONG", "score": long_score, "price": close}
 
     if short_score >= REQUIRED_SCORE:
-        return {"direction": "SHORT", "score": short_score, "price": close}
+        if not has_tp_space(candles, "SHORT", close):
+            print(
+                f"{symbol}: SHORT rejected - insufficient space for "
+                f"{TP_PERCENT}% TP"
+            )
+            return None
+
+        return {"direction": "SHORT", "score": short_score}
 
     return None
 
@@ -300,6 +337,7 @@ def main():
     print(f"⭐ Minimum Score: {REQUIRED_SCORE}/7")
     print(f"🎯 TP: {TP_PERCENT}%")
     print(f"🛑 SL: {SL_PERCENT}%")
+    print(f"📐 TP SPACE FILTER: ON | lookback={TP_SPACE_LOOKBACK} | buffer={TP_SPACE_BUFFER_PERCENT}%")
 
     state = load_state()
 
