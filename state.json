@@ -71,6 +71,23 @@
     "score": 5,
     "entry": 63419.59,
     "tp": 62785.3941,
-    "sl": 63736.68794999999
+    "sl": 63736.68794999999,
+    "last_checked_candle": 1786766400
+  },
+  "ADA": {
+    "last_checked_candle": 1786766400
+  },
+  "LINK": {
+    "last_checked_candle": 1786766400
+  },
+  "DOGE": {
+    "last_checked_candle": 1786766400,
+    "last_signal": {
+      "direction": "SHORT",
+      "score": 5,
+      "price": 0.07008
+    },
+    "signal_candle": 1786766400,
+    "signal_time": 1786786613
   }
 }
