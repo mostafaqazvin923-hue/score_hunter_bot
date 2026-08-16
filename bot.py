@@ -55,6 +55,125 @@ def send_telegram(message):
     print(r.text)
     r.raise_for_status()
 
+def get_current_price(pair):
+    """Get the latest live price from Kraken Ticker."""
+    r = requests.get(
+        TICKER_URL,
+        params={"pair": pair},
+        timeout=20,
+    )
+    r.raise_for_status()
+    payload = r.json()
+
+    if payload.get("error"):
+        raise RuntimeError(payload["error"])
+
+    result = payload.get("result", {})
+    if not result:
+        raise RuntimeError(f"No ticker data returned for {pair}")
+
+    key = next(iter(result))
+    ticker = result[key]
+
+    # Kraken's 'c' field is the last traded price.
+    last_price = ticker.get("c", [None])[0]
+    if last_price is None:
+        raise RuntimeError(f"No last price in ticker for {pair}")
+
+    return float(last_price)
+
+
+def monitor_open_trades(state):
+    """
+    Check all previously sent signals against the live Kraken price.
+    Each trade gets exactly one final result notification.
+    """
+    for symbol, coin_state in state.items():
+        signal = coin_state.get("last_signal")
+        if not signal:
+            continue
+
+        # Already finalized.
+        if coin_state.get("trade_result"):
+            continue
+
+        pair = COINS.get(symbol)
+        if not pair:
+            continue
+
+        try:
+            price = get_current_price(pair)
+            direction = signal["direction"]
+            entry = float(signal["entry"])
+
+            if direction == "LONG":
+                tp = entry * (1 + TP_PERCENT / 100)
+                sl = entry * (1 - SL_PERCENT / 100)
+
+                if price >= tp:
+                    result = "TP"
+                    result_price = price
+                elif price <= sl:
+                    result = "SL"
+                    result_price = price
+                else:
+                    continue
+
+            else:
+                tp = entry * (1 - TP_PERCENT / 100)
+                sl = entry * (1 + SL_PERCENT / 100)
+
+                if price <= tp:
+                    result = "TP"
+                    result_price = price
+                elif price >= sl:
+                    result = "SL"
+                    result_price = price
+                else:
+                    continue
+
+            if result == "TP":
+                emoji = "✅"
+                title = "TAKE PROFIT HIT"
+                pnl_text = "+1.0%"
+            else:
+                emoji = "🛑"
+                title = "STOP LOSS HIT"
+                pnl_text = "-0.5%"
+
+            message = (
+                f"{emoji} SCORE HUNTER RESULT\n\n"
+                f"💰 {symbol}USDT\n"
+                f"📊 {direction}\n"
+                f"🏁 {title}\n"
+                f"💵 Entry: {entry:.8f}\n"
+                f"📍 Price: {result_price:.8f}\n"
+                f"📈 Result: {pnl_text}\n\n"
+                "⏱ Timeframe: 4H / 1H\n"
+                "🕯 Closed candle signal"
+            )
+
+            send_telegram(message)
+
+            coin_state["trade_result"] = result
+            coin_state["trade_result_price"] = result_price
+            coin_state["trade_result_time"] = int(
+                datetime.now(timezone.utc).timestamp()
+            )
+            state[symbol] = coin_state
+            save_state(state)
+
+            print(
+                f"🏁 {symbol}: {direction} "
+                f"{result} HIT at {result_price:.8f}"
+            )
+
+        except Exception as e:
+            print(
+                f"⚠️ {symbol} TP/SL monitor error: "
+                f"{type(e).__name__}: {e}"
+            )
+
 def get_ohlc(pair, interval):
     r = requests.get(
         KRAKEN_URL,
@@ -374,6 +493,7 @@ def main():
     state = load_state()
 
     # TP/SL is monitored independently of new-candle checks.
+    print("📡 LIVE TP/SL MONITOR: ON")
     monitor_open_trades(state)
 
     for symbol, pair in COINS.items():
