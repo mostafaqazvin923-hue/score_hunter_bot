@@ -8,7 +8,8 @@
     "last_signal": {
       "direction": "SHORT",
       "score": 6,
-      "price": 1877.17
+      "price": 1877.17,
+      "entry": 1877.17
     },
     "signal_candle": 1786363200,
     "signal_time": 1786379900,
@@ -18,7 +19,8 @@
     "last_signal": {
       "direction": "SHORT",
       "score": 5,
-      "price": 75.78
+      "price": 75.78,
+      "entry": 75.78
     },
     "last_signal_time": 1786636800,
     "direction": "LONG",
@@ -51,7 +53,6 @@
     "last_signal_id": "1786867200_SHORT"
   },
   "BTC": {
-    "last_signal": "1786622400_SHORT",
     "last_signal_time": 1786622400,
     "direction": "SHORT",
     "score": 5,
@@ -84,7 +85,8 @@
     "last_signal": {
       "direction": "SHORT",
       "score": 5,
-      "price": 0.07008
+      "price": 0.07008,
+      "entry": 0.07008
     },
     "signal_candle": 1786766400,
     "signal_time": 1786786613,
