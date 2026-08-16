@@ -17,6 +17,13 @@ SL_PERCENT = 0.50
 # Fixed-TP market-space filter
 TP_SPACE_LOOKBACK = 20
 TP_SPACE_BUFFER_PERCENT = 0.10
+ENTRY_INTERVAL = 60
+STRUCTURE_LOOKBACK = 20
+VOLUME_MULTIPLIER = 1.20
+SWEEP_LOOKBACK = 10
+RETEST_TOLERANCE_PERCENT = 0.20
+RANGE_EMA_GAP_PERCENT = 0.15
+MIN_ADVANCED_SCORE = 8
 
 COINS = {
     "ETH": "ETHUSDT",
@@ -162,135 +169,123 @@ def has_tp_space(candles, direction, entry):
     return support <= tp * (1 - buffer)
 
 
+def ema_series(values, period):
+    if len(values) < period: return []
+    m=2.0/(period+1); v=sum(values[:period])/period
+    out=[None]*(period-1)+[v]
+    for x in values[period:]:
+        v=(x-v)*m+v; out.append(v)
+    return out
+
+def rsi_series(values, period=14):
+    if len(values)<=period: return []
+    gains=[]; losses=[]
+    for i in range(1,len(values)):
+        d=values[i]-values[i-1]; gains.append(max(d,0)); losses.append(max(-d,0))
+    ag=sum(gains[:period])/period; al=sum(losses[:period])/period
+    out=[None]*period
+    out.append(100.0 if al==0 else 100-100/(1+ag/al))
+    for i in range(period,len(gains)):
+        ag=(ag*(period-1)+gains[i])/period; al=(al*(period-1)+losses[i])/period
+        out.append(100.0 if al==0 else 100-100/(1+ag/al))
+    return out
+
+def atr_series(candles, period=14):
+    if len(candles)<=period: return []
+    tr=[]
+    for i in range(1,len(candles)):
+        h,l,pc=candles[i]['high'],candles[i]['low'],candles[i-1]['close']
+        tr.append(max(h-l,abs(h-pc),abs(l-pc)))
+    first=sum(tr[:period])/period; out=[None]*period+[first]; v=first
+    for x in tr[period:]: v=(v*(period-1)+x)/period; out.append(v)
+    return out
+
+def get_1h_data(symbol):
+    print(f"Getting {symbol} 1H confirmation candles...")
+    r=requests.get(KRAKEN_URL,params={'pair':COINS[symbol],'interval':ENTRY_INTERVAL},timeout=20)
+    print(f"{symbol} Kraken 1H:",r.status_code); r.raise_for_status()
+    payload=r.json()
+    if payload.get('error'): raise RuntimeError(f"{symbol} Kraken 1H API error: {payload['error']}")
+    result=payload.get('result',{}); key=next((k for k in result if k!='last'),None)
+    if key is None: raise RuntimeError(f"{symbol}: no 1H candle data")
+    candles=[{'time':int(x[0]),'open':float(x[1]),'high':float(x[2]),'low':float(x[3]),'close':float(x[4]),'volume':float(x[6])} for x in result[key]]
+    candles.sort(key=lambda x:x['time'])
+    if len(candles)>1: candles=candles[:-1]
+    if len(candles)<210: raise RuntimeError(f"{symbol}: only {len(candles)} closed 1H candles")
+    print(f"{symbol}: {len(candles)} closed 1H candles")
+    return candles
+
+def market_structure_4h(candles):
+    closes=[c['close'] for c in candles]
+    e20,e50,e200=(ema_series(closes,p)[-1] for p in (20,50,200))
+    recent=candles[-STRUCTURE_LOOKBACK:]; prior=candles[-2*STRUCTURE_LOOKBACK:-STRUCTURE_LOOKBACK]
+    rh=max(c['high'] for c in recent); rl=min(c['low'] for c in recent)
+    ph=max(c['high'] for c in prior); pl=min(c['low'] for c in prior); close=closes[-1]
+    bull=close>e200 and e20>e50 and rh>=ph and rl>=pl
+    bear=close<e200 and e20<e50 and rh<=ph and rl<=pl
+    return 'LONG' if bull and not bear else 'SHORT' if bear and not bull else 'NONE'
+
+def bos_event(candles,direction):
+    cur=candles[-1]; recent=candles[-7:-1]; prior=candles[-13:-7]
+    rh=max(c['high'] for c in recent); rl=min(c['low'] for c in recent)
+    ph=max(c['high'] for c in prior); pl=min(c['low'] for c in prior)
+    return (cur['close']>rh and cur['close']>cur['open']) if direction=='LONG' else (cur['close']<rl and cur['close']<cur['open']) or (cur['close']<pl and cur['close']<cur['open'])
+
+def liquidity_sweep(candles,direction):
+    w=candles[-(SWEEP_LOOKBACK+1):-1]; cur=candles[-1]
+    if direction=='LONG':
+        level=min(c['low'] for c in w); return cur['low']<level and cur['close']>level
+    level=max(c['high'] for c in w); return cur['high']>level and cur['close']<level
+
+def retest_confirmation(candles,direction):
+    cur=candles[-1]; w=candles[-8:-2]
+    if direction=='LONG':
+        level=max(c['high'] for c in w); tol=level*RETEST_TOLERANCE_PERCENT/100
+        return cur['low']<=level+tol and cur['close']>level
+    level=min(c['low'] for c in w); tol=level*RETEST_TOLERANCE_PERCENT/100
+    return cur['high']>=level-tol and cur['close']<level
+
+def candle_confirmation(c,direction):
+    rng=c['high']-c['low']
+    if rng<=0:return False
+    body=abs(c['close']-c['open'])/rng
+    return (c['close']>c['open'] and body>=0.50) if direction=='LONG' else (c['close']<c['open'] and body>=0.50)
+
+def volume_confirmation(candles):
+    avg=sum(c['volume'] for c in candles[-21:-1])/20
+    return candles[-1]['volume']>=avg*VOLUME_MULTIPLIER
+
+def range_market(candles):
+    closes=[c['close'] for c in candles]; e20=ema_series(closes,20)[-1]; e50=ema_series(closes,50)[-1]; e200=ema_series(closes,200)[-1]
+    p=closes[-1]; return abs(e20-e50)/p*100<RANGE_EMA_GAP_PERCENT and abs(e50-e200)/p*100<RANGE_EMA_GAP_PERCENT
+
+def has_tp_space(candles,direction,entry):
+    w=candles[-(TP_SPACE_LOOKBACK+1):-1]; b=TP_SPACE_BUFFER_PERCENT/100
+    if direction=='LONG': return max(c['high'] for c in w)>=entry*(1+TP_PERCENT/100)*(1+b)
+    return min(c['low'] for c in w)<=entry*(1-TP_PERCENT/100)*(1-b)
+
 def calculate_signal(candles, symbol):
-    if len(candles) < 210:
-        return None
-
-    opens = [c["open"] for c in candles]
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
-    closes = [c["close"] for c in candles]
-    volumes = [c["volume"] for c in candles]
-
-    open_price = opens[-1]
-    high = highs[-1]
-    low = lows[-1]
-    close = closes[-1]
-    volume = volumes[-1]
-
-    ema20 = ema(closes, 20)
-    ema50 = ema(closes, 50)
-    ema200 = ema(closes, 200)
-    current_rsi = rsi(closes, 14)
-    previous_rsi = rsi(closes[:-1], 14)
-    volume_ma = sma(volumes, 20)
-    current_atr = atr(highs, lows, closes, 14)
-
-    if any(x is None for x in [
-        ema20, ema50, ema200, current_rsi,
-        previous_rsi, volume_ma, current_atr
-    ]):
-        print(f"{symbol}: indicator calculation failed")
-        return None
-
-    long_trend = close > ema200 and ema20 > ema50
-    short_trend = close < ema200 and ema20 < ema50
-
-    long_rsi = (
-        current_rsi > 50
-        and current_rsi < 72
-        and current_rsi > previous_rsi
-    )
-    short_rsi = (
-        current_rsi < 50
-        and current_rsi > 28
-        and current_rsi < previous_rsi
-    )
-
-    volume_ok = volume >= volume_ma
-
-    recent_high = max(highs[-7:-1])
-    recent_low = min(lows[-7:-1])
-    bull_break = close > recent_high
-    bear_break = close < recent_low
-
-    long_pullback = low <= ema20 and close > ema20
-    short_pullback = high >= ema20 and close < ema20
-
-    candle_range = high - low
-    if candle_range > 0:
-        bull_body_ratio = (close - open_price) / candle_range
-        bear_body_ratio = (open_price - close) / candle_range
-    else:
-        bull_body_ratio = 0.0
-        bear_body_ratio = 0.0
-
-    bull_candle = (
-        close > open_price
-        and candle_range > 0
-        and bull_body_ratio >= 0.40
-    )
-    bear_candle = (
-        close < open_price
-        and candle_range > 0
-        and bear_body_ratio >= 0.40
-    )
-
-    volatility_ok = (current_atr / close) >= 0.002
-
-    long_score = (
-        int(long_trend)
-        + int(long_rsi)
-        + int(volume_ok)
-        + int(bull_break)
-        + int(long_pullback)
-        + int(bull_candle)
-        + int(volatility_ok)
-    )
-
-    short_score = (
-        int(short_trend)
-        + int(short_rsi)
-        + int(volume_ok)
-        + int(bear_break)
-        + int(short_pullback)
-        + int(bear_candle)
-        + int(volatility_ok)
-    )
-
-    print(f"\n===== {symbol} 4H =====")
-    print(f"Price: {close:.8f}")
-    print(f"RSI: {current_rsi:.2f}")
-    print(f"EMA20: {ema20:.8f}")
-    print(f"EMA50: {ema50:.8f}")
-    print(f"EMA200: {ema200:.8f}")
-    print(f"ATR: {current_atr:.8f}")
-    print(f"Volume OK: {volume_ok}")
-    print(f"LONG SCORE: {long_score}/7")
-    print(f"SHORT SCORE: {short_score}/7")
-    print("====================")
-
-    if long_score >= REQUIRED_SCORE:
-        if not has_tp_space(candles, "LONG", close):
-            print(
-                f"{symbol}: LONG rejected - insufficient space for "
-                f"{TP_PERCENT}% TP"
-            )
-            return None
-
-        return {"direction": "LONG", "score": long_score, "price": close}
-
-    if short_score >= REQUIRED_SCORE:
-        if not has_tp_space(candles, "SHORT", close):
-            print(
-                f"{symbol}: SHORT rejected - insufficient space for "
-                f"{TP_PERCENT}% TP"
-            )
-            return None
-
-        return {"direction": "SHORT", "score": short_score}
-
-    return None
+    if len(candles)<210:return None
+    one=get_1h_data(symbol); closes4=[c['close'] for c in candles]; r4=rsi_series(closes4); a4=atr_series(candles)
+    closes1=[c['close'] for c in one]; e20=ema_series(closes1,20)[-1]; e50=ema_series(closes1,50)[-1]; e200=ema_series(closes1,200)[-1]; r1=rsi_series(closes1)
+    structure=market_structure_4h(candles); vol=volume_confirmation(candles); rng=range_market(candles); volat=a4[-1]/closes4[-1]>=0.002
+    results={}
+    for d in ('LONG','SHORT'):
+        trend=(structure==d and ((closes1[-1]>e200 and e20>e50) if d=='LONG' else (closes1[-1]<e200 and e20<e50)))
+        rsiok=(r4[-1]>50 and r4[-1]<72 and r4[-1]>r4[-2]) if d=='LONG' else (r4[-1]<50 and r4[-1]>28 and r4[-1]<r4[-2])
+        bos=bos_event(one,d); sweep=liquidity_sweep(one,d); retest=retest_confirmation(one,d); candle=candle_confirmation(one[-1],d)
+        score=2*int(trend)+2*int(bos)+int(rsiok)+int(vol)+int(sweep)+int(retest)+int(candle)+int(volat)
+        results[d]=(score,trend,rsiok,vol,bos,sweep,retest,candle,volat)
+    print(f"\n===== {symbol} ADVANCED 4H/1H =====\n4H Structure: {structure}\n4H RSI: {r4[-1]:.2f}\nVolume >= {VOLUME_MULTIPLIER}x MA: {vol}\nRange market: {rng}")
+    for d,x in results.items(): print(f"{d}: score={x[0]}/11 trend={int(x[1])} rsi={int(x[2])} volume={int(x[3])} BOS={int(x[4])} sweep={int(x[5])} retest={int(x[6])} candle={int(x[7])} volatility={int(x[8])}")
+    if rng:return None
+    candidates=[]
+    for d,x in results.items():
+        if x[0]>=MIN_ADVANCED_SCORE and x[1] and x[4] and x[6]:
+            entry=one[-1]['close']
+            if has_tp_space(one,d,entry): candidates.append({'direction':d,'score':x[0],'price':entry})
+            else: print(f"{symbol}: {d} rejected - insufficient TP space")
+    return max(candidates,key=lambda x:x['score']) if candidates else None
 
 def create_message(symbol, signal):
     direction = signal["direction"]
@@ -329,12 +324,14 @@ def create_message(symbol, signal):
     )
 
 def main():
-    print("🟢 SCORE HUNTER 4H MULTI-COIN SCANNING")
+    print("🟢 SCORE HUNTER PRO ADVANCED 4H/1H")
+    print("🔎 BOS + LIQUIDITY SWEEP + RETEST + CANDLE CONFIRMATION")
+    print(f"⭐ Advanced minimum score: {MIN_ADVANCED_SCORE}/11")
     print("🕯 CLOSED CANDLE ONLY - NO MID-CANDLE SIGNAL")
     print("♾️ DAILY SIGNAL LIMIT: DISABLED")
     print("📊 Coins: " + " / ".join(COINS.keys()))
     print("⏱ Timeframe: 4H")
-    print(f"⭐ Minimum Score: {REQUIRED_SCORE}/7")
+    print(f"⭐ Legacy score threshold retained: {REQUIRED_SCORE}/7")
     print(f"🎯 TP: {TP_PERCENT}%")
     print(f"🛑 SL: {SL_PERCENT}%")
     print(f"📐 TP SPACE FILTER: ON | lookback={TP_SPACE_LOOKBACK} | buffer={TP_SPACE_BUFFER_PERCENT}%")
