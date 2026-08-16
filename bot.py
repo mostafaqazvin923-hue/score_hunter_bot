@@ -27,42 +27,66 @@ TP_PERCENT = 1.0
 SL_PERCENT = 0.50
 TP_BUFFER_PERCENT = 0.10
 
-# 4H is directional context; 1H is the actual trigger.
 MIN_4H_QUALITY = 3
 MIN_1H_CONFIRMATION = 3
+
 
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {}
+
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            raw = json.load(f)
+    except Exception as e:
+        print(f"⚠️ state.json load error: {type(e).__name__}: {e}")
         return {}
 
+    # Keep only valid per-coin dictionaries.
+    # Old/malformed top-level metadata entries are ignored.
+    state = {}
+    if isinstance(raw, dict):
+        for symbol in COINS:
+            value = raw.get(symbol)
+            if isinstance(value, dict):
+                state[symbol] = value
+
+    return state
+
+
 def save_state(state):
+    clean = {}
+    for symbol in COINS:
+        value = state.get(symbol)
+        if isinstance(value, dict):
+            clean[symbol] = value
+
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+        json.dump(clean, f, indent=2)
+
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
     r = requests.post(
         url,
         data={"chat_id": CHAT_ID, "text": message},
         timeout=20,
     )
+
     print("Telegram:", r.status_code)
     print(r.text)
     r.raise_for_status()
 
+
 def get_current_price(pair):
-    """Get the latest live price from Kraken Ticker."""
     r = requests.get(
         TICKER_URL,
         params={"pair": pair},
         timeout=20,
     )
     r.raise_for_status()
+
     payload = r.json()
 
     if payload.get("error"):
@@ -75,7 +99,6 @@ def get_current_price(pair):
     key = next(iter(result))
     ticker = result[key]
 
-    # Kraken's 'c' field is the last traded price.
     last_price = ticker.get("c", [None])[0]
     if last_price is None:
         raise RuntimeError(f"No last price in ticker for {pair}")
@@ -85,23 +108,44 @@ def get_current_price(pair):
 
 def monitor_open_trades(state):
     """
-    Check only valid per-coin trade dictionaries.
-    Compatible with older state.json files and ignores malformed entries.
-    Each finalized trade is notified once.
+    Check currently active signals once per workflow run.
+
+    Important:
+    This intentionally does NOT run continuously.
+    GitHub Actions starts the script periodically. At the beginning
+    of every run, all active trades are checked. If TP or SL is hit,
+    exactly one Telegram result is sent and that trade is marked closed.
     """
+
+    print("📡 TP/SL RESULT CHECK: ON")
+
+    changed = False
+
     for symbol, coin_state in list(state.items()):
+
         if not isinstance(coin_state, dict):
-            print(
-                f"⚠️ {symbol}: invalid state entry ignored "
-                f"({type(coin_state).__name__})"
-            )
             continue
 
         signal = coin_state.get("last_signal")
+
         if not isinstance(signal, dict):
             continue
 
-        if coin_state.get("trade_result"):
+        # Already finalized.
+        if coin_state.get("trade_result") in ("TP", "SL"):
+            continue
+
+        direction = signal.get("direction")
+        entry_raw = signal.get("entry")
+
+        if direction not in ("LONG", "SHORT") or entry_raw is None:
+            print(f"⚠️ {symbol}: invalid active signal state ignored.")
+            continue
+
+        try:
+            entry = float(entry_raw)
+        except (TypeError, ValueError):
+            print(f"⚠️ {symbol}: invalid entry ignored.")
             continue
 
         pair = COINS.get(symbol)
@@ -109,17 +153,6 @@ def monitor_open_trades(state):
             continue
 
         try:
-            direction = signal.get("direction")
-            entry = signal.get("entry", signal.get("price"))
-
-            if direction not in ("LONG", "SHORT") or entry is None:
-                print(
-                    f"⚠️ {symbol}: incomplete open-trade state; "
-                    "skipping TP/SL check."
-                )
-                continue
-
-            entry = float(entry)
             price = get_current_price(pair)
 
             if direction == "LONG":
@@ -128,40 +161,58 @@ def monitor_open_trades(state):
 
                 if price >= tp:
                     result = "TP"
+                    result_emoji = "✅"
+                    result_title = "TAKE PROFIT HIT"
+                    pnl_text = f"+{TP_PERCENT:.1f}%"
+
                 elif price <= sl:
                     result = "SL"
+                    result_emoji = "🛑"
+                    result_title = "STOP LOSS HIT"
+                    pnl_text = f"-{SL_PERCENT:.1f}%"
+
                 else:
+                    print(
+                        f"📊 {symbol}: active LONG | "
+                        f"price={price:.8f} | "
+                        f"TP={tp:.8f} | SL={sl:.8f}"
+                    )
                     continue
+
             else:
                 tp = entry * (1 - TP_PERCENT / 100)
                 sl = entry * (1 + SL_PERCENT / 100)
 
                 if price <= tp:
                     result = "TP"
+                    result_emoji = "✅"
+                    result_title = "TAKE PROFIT HIT"
+                    pnl_text = f"+{TP_PERCENT:.1f}%"
+
                 elif price >= sl:
                     result = "SL"
+                    result_emoji = "🛑"
+                    result_title = "STOP LOSS HIT"
+                    pnl_text = f"-{SL_PERCENT:.1f}%"
+
                 else:
+                    print(
+                        f"📊 {symbol}: active SHORT | "
+                        f"price={price:.8f} | "
+                        f"TP={tp:.8f} | SL={sl:.8f}"
+                    )
                     continue
 
-            if result == "TP":
-                emoji = "✅"
-                title = "TAKE PROFIT HIT"
-                pnl_text = "+1.0%"
-            else:
-                emoji = "🛑"
-                title = "STOP LOSS HIT"
-                pnl_text = "-0.5%"
-
             message = (
-                f"{emoji} SCORE HUNTER RESULT\n\n"
+                f"{result_emoji} SCORE HUNTER RESULT\n\n"
                 f"💰 {symbol}USDT\n"
                 f"📊 {direction}\n"
-                f"🏁 {title}\n"
+                f"🏁 {result_title}\n"
                 f"💵 Entry: {entry:.8f}\n"
-                f"📍 Price: {price:.8f}\n"
+                f"📍 Hit Price: {price:.8f}\n"
                 f"📈 Result: {pnl_text}\n\n"
                 "⏱ Timeframe: 4H / 1H\n"
-                "🕯 Closed candle signal"
+                "🕯 Signal based on closed candle"
             )
 
             send_telegram(message)
@@ -171,19 +222,24 @@ def monitor_open_trades(state):
             coin_state["trade_result_time"] = int(
                 datetime.now(timezone.utc).timestamp()
             )
+
+            # Keep the signal itself for history, but mark it closed.
             state[symbol] = coin_state
-            save_state(state)
+            changed = True
 
             print(
-                f"🏁 {symbol}: {direction} "
-                f"{result} HIT at {price:.8f}"
+                f"🏁 {symbol}: {direction} {result} HIT "
+                f"at {price:.8f}"
             )
 
         except Exception as e:
             print(
-                f"⚠️ {symbol} TP/SL monitor error: "
+                f"⚠️ {symbol} TP/SL check error: "
                 f"{type(e).__name__}: {e}"
             )
+
+    if changed:
+        save_state(state)
 
 
 def get_ohlc(pair, interval):
@@ -193,16 +249,20 @@ def get_ohlc(pair, interval):
         timeout=20,
     )
     r.raise_for_status()
+
     payload = r.json()
+
     if payload.get("error"):
         raise RuntimeError(payload["error"])
 
     result = payload.get("result", {})
     key = next((k for k in result if k != "last"), None)
+
     if key is None:
         raise RuntimeError("No OHLC data returned")
 
     candles = []
+
     for row in result[key]:
         candles.append({
             "time": int(row[0]),
@@ -215,59 +275,88 @@ def get_ohlc(pair, interval):
 
     candles.sort(key=lambda x: x["time"])
 
-    # Kraken's final row may still be forming.
+    # Kraken's final OHLC row may still be forming.
     if len(candles) > 1:
         candles = candles[:-1]
 
     return candles
 
+
 def ema(values, period):
     if len(values) < period:
         return None
-    v = sum(values[:period]) / period
-    m = 2.0 / (period + 1)
+
+    value = sum(values[:period]) / period
+    multiplier = 2.0 / (period + 1)
+
     for x in values[period:]:
-        v = (x - v) * m + v
-    return v
+        value = (x - value) * multiplier + value
+
+    return value
+
 
 def sma(values, period):
     if len(values) < period:
         return None
+
     return sum(values[-period:]) / period
+
 
 def rsi(values, period=14):
     if len(values) <= period:
         return None
-    gains, losses = [], []
+
+    gains = []
+    losses = []
+
     for i in range(1, len(values)):
         d = values[i] - values[i - 1]
         gains.append(max(d, 0))
         losses.append(max(-d, 0))
 
-    ag = sum(gains[:period]) / period
-    al = sum(losses[:period]) / period
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
 
     for i in range(period, len(gains)):
-        ag = (ag * (period - 1) + gains[i]) / period
-        al = (al * (period - 1) + losses[i]) / period
+        avg_gain = (
+            avg_gain * (period - 1) + gains[i]
+        ) / period
 
-    if al == 0:
+        avg_loss = (
+            avg_loss * (period - 1) + losses[i]
+        ) / period
+
+    if avg_loss == 0:
         return 100.0
-    rs = ag / al
+
+    rs = avg_gain / avg_loss
+
     return 100.0 - 100.0 / (1.0 + rs)
+
 
 def atr(candles, period=14):
     if len(candles) <= period:
         return None
+
     trs = []
+
     for i in range(1, len(candles)):
-        h, l = candles[i]["high"], candles[i]["low"]
-        pc = candles[i - 1]["close"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+        previous_close = candles[i - 1]["close"]
+
+        trs.append(
+            max(
+                high - low,
+                abs(high - previous_close),
+                abs(low - previous_close),
+            )
+        )
+
     return sum(trs[-period:]) / period
 
+
 def robust_structure(candles, lookback=30):
-    """Less brittle 4H structure: EMA alignment + recent HH/LL bias."""
     if len(candles) < 220:
         return "NONE"
 
@@ -278,62 +367,99 @@ def robust_structure(candles, lookback=30):
     e20 = ema(closes, 20)
     e50 = ema(closes, 50)
     e200 = ema(closes, 200)
+
     if None in (e20, e50, e200):
         return "NONE"
 
     price = closes[-1]
-    recent_h = max(highs[-lookback:])
-    previous_h = max(highs[-2 * lookback:-lookback])
-    recent_l = min(lows[-lookback:])
-    previous_l = min(lows[-2 * lookback:-lookback])
+
+    recent_high = max(highs[-lookback:])
+    previous_high = max(
+        highs[-2 * lookback:-lookback]
+    )
+
+    recent_low = min(lows[-lookback:])
+    previous_low = min(
+        lows[-2 * lookback:-lookback]
+    )
 
     bullish = price > e200 and e20 > e50
     bearish = price < e200 and e20 < e50
 
-    hh = recent_h > previous_h
-    hl = recent_l > previous_l
-    lh = recent_h < previous_h
-    ll = recent_l < previous_l
+    hh = recent_high > previous_high
+    hl = recent_low > previous_low
 
-    long_votes = int(bullish) + int(hh) + int(hl)
-    short_votes = int(bearish) + int(lh) + int(ll)
+    lh = recent_high < previous_high
+    ll = recent_low < previous_low
+
+    long_votes = (
+        int(bullish)
+        + int(hh)
+        + int(hl)
+    )
+
+    short_votes = (
+        int(bearish)
+        + int(lh)
+        + int(ll)
+    )
 
     if long_votes >= 2 and long_votes > short_votes:
         return "LONG"
+
     if short_votes >= 2 and short_votes > long_votes:
         return "SHORT"
+
     return "NONE"
+
 
 def structure_quality_4h(candles, direction):
     closes = [c["close"] for c in candles]
     volumes = [c["volume"] for c in candles]
+
     price = closes[-1]
 
     e20 = ema(closes, 20)
     e50 = ema(closes, 50)
     e200 = ema(closes, 200)
-    rv = rsi(closes, 14)
-    va = sma(volumes, 20)
-    a = atr(candles, 14)
 
-    if None in (e20, e50, e200, rv, va, a):
+    rv = rsi(closes, 14)
+    volume_average = sma(volumes, 20)
+    average_true_range = atr(candles, 14)
+
+    if None in (
+        e20,
+        e50,
+        e200,
+        rv,
+        volume_average,
+        average_true_range,
+    ):
         return 0, {}
 
-    trend = (
-        price > e200 and e20 > e50
-        if direction == "LONG"
-        else price < e200 and e20 < e50
+    if direction == "LONG":
+        trend = (
+            price > e200
+            and e20 > e50
+        )
+
+        rsi_ok = 45 <= rv <= 72
+
+    else:
+        trend = (
+            price < e200
+            and e20 < e50
+        )
+
+        rsi_ok = 28 <= rv <= 55
+
+    volume_ok = (
+        volumes[-1] >= 1.05 * volume_average
     )
 
-    rsi_ok = (
-        45 <= rv <= 72
-        if direction == "LONG"
-        else 28 <= rv <= 55
+    volatility_ok = (
+        average_true_range / price >= 0.0015
     )
-
-    volume_ok = volumes[-1] >= 1.05 * va
-
-    volatility_ok = a / price >= 0.0015
 
     score = (
         int(trend)
@@ -341,12 +467,14 @@ def structure_quality_4h(candles, direction):
         + int(volume_ok)
         + int(volatility_ok)
     )
+
     return score, {
         "trend": trend,
         "rsi": rv,
         "volume": volume_ok,
         "volatility": volatility_ok,
     }
+
 
 def one_hour_confirmation(candles, direction):
     if len(candles) < 80:
@@ -359,59 +487,93 @@ def one_hour_confirmation(candles, direction):
     volumes = [c["volume"] for c in candles]
 
     price = closes[-1]
+
     e20 = ema(closes, 20)
     e50 = ema(closes, 50)
-    rv = rsi(closes, 14)
-    va = sma(volumes, 20)
-    a = atr(candles, 14)
 
-    if None in (e20, e50, rv, va, a):
+    rv = rsi(closes, 14)
+    volume_average = sma(volumes, 20)
+    average_true_range = atr(candles, 14)
+
+    if None in (
+        e20,
+        e50,
+        rv,
+        volume_average,
+        average_true_range,
+    ):
         return 0, {}
 
-    trend = (
-        price > e20 and e20 > e50
-        if direction == "LONG"
-        else price < e20 and e20 < e50
-    )
+    if direction == "LONG":
+        trend = (
+            price > e20
+            and e20 > e50
+        )
+    else:
+        trend = (
+            price < e20
+            and e20 < e50
+        )
 
-    # BOS uses the immediately preceding 6 closed candles.
     recent_high = max(highs[-7:-1])
     recent_low = min(lows[-7:-1])
-    bos = (
-        price > recent_high
-        if direction == "LONG"
-        else price < recent_low
-    )
 
-    # Liquidity sweep: wick through a recent extreme, then close back
-    # on the intended side of that level.
+    if direction == "LONG":
+        bos = price > recent_high
+    else:
+        bos = price < recent_low
+
     sweep_high = max(highs[-12:-1])
     sweep_low = min(lows[-12:-1])
-    sweep = (
-        lows[-1] < sweep_low and price > sweep_low
-        if direction == "LONG"
-        else highs[-1] > sweep_high and price < sweep_high
-    )
 
-    # Retest of EMA20 with close back in directional side.
-    retest = (
-        lows[-1] <= e20 and price > e20
-        if direction == "LONG"
-        else highs[-1] >= e20 and price < e20
-    )
+    if direction == "LONG":
+        sweep = (
+            lows[-1] < sweep_low
+            and price > sweep_low
+        )
+    else:
+        sweep = (
+            highs[-1] > sweep_high
+            and price < sweep_high
+        )
 
-    rng = highs[-1] - lows[-1]
+    if direction == "LONG":
+        retest = (
+            lows[-1] <= e20
+            and price > e20
+        )
+    else:
+        retest = (
+            highs[-1] >= e20
+            and price < e20
+        )
+
+    candle_range = highs[-1] - lows[-1]
+
     body_ratio = (
-        abs(closes[-1] - opens[-1]) / rng if rng > 0 else 0
-    )
-    candle = (
-        closes[-1] > opens[-1] and body_ratio >= 0.40
-        if direction == "LONG"
-        else closes[-1] < opens[-1] and body_ratio >= 0.40
+        abs(closes[-1] - opens[-1]) / candle_range
+        if candle_range > 0
+        else 0
     )
 
-    volume = volumes[-1] >= 1.05 * va
-    volatility = a / price >= 0.001
+    if direction == "LONG":
+        candle = (
+            closes[-1] > opens[-1]
+            and body_ratio >= 0.40
+        )
+    else:
+        candle = (
+            closes[-1] < opens[-1]
+            and body_ratio >= 0.40
+        )
+
+    volume = (
+        volumes[-1] >= 1.05 * volume_average
+    )
+
+    volatility = (
+        average_true_range / price >= 0.001
+    )
 
     score = sum([
         int(trend),
@@ -433,8 +595,8 @@ def one_hour_confirmation(candles, direction):
         "rsi": rv,
     }
 
+
 def tp_space_ok(candles, direction, entry):
-    """Reject only when a nearby opposing level actually blocks the 1% TP."""
     if len(candles) < 35:
         return False, None
 
@@ -445,32 +607,75 @@ def tp_space_ok(candles, direction, entry):
     )
 
     buffer = TP_BUFFER_PERCENT / 100
-    highs = [c["high"] for c in candles[-30:]]
-    lows = [c["low"] for c in candles[-30:]]
+
+    highs = [
+        c["high"]
+        for c in candles[-30:]
+    ]
+
+    lows = [
+        c["low"]
+        for c in candles[-30:]
+    ]
 
     if direction == "LONG":
-        blockers = [h for h in highs if h > entry and h < target]
-        nearest = min(blockers) if blockers else None
-        if nearest is not None and nearest >= target * (1 - buffer):
+        blockers = [
+            h for h in highs
+            if h > entry and h < target
+        ]
+
+        nearest = (
+            min(blockers)
+            if blockers
+            else None
+        )
+
+        if (
+            nearest is not None
+            and nearest >= target * (1 - buffer)
+        ):
             return False, nearest
+
     else:
-        blockers = [l for l in lows if l < entry and l > target]
-        nearest = max(blockers) if blockers else None
-        if nearest is not None and nearest <= target * (1 + buffer):
+        blockers = [
+            l for l in lows
+            if l < entry and l > target
+        ]
+
+        nearest = (
+            max(blockers)
+            if blockers
+            else None
+        )
+
+        if (
+            nearest is not None
+            and nearest <= target * (1 + buffer)
+        ):
             return False, nearest
 
     return True, None
 
-def create_message(symbol, direction, entry, score4, score1):
+
+def create_message(
+    symbol,
+    direction,
+    entry,
+    score4,
+    score1,
+):
     if direction == "LONG":
         tp = entry * (1 + TP_PERCENT / 100)
         sl = entry * (1 - SL_PERCENT / 100)
+
         side = "🟢 LONG"
         tp_text = f"+{TP_PERCENT:.1f}%"
         sl_text = f"-{SL_PERCENT:.1f}%"
+
     else:
         tp = entry * (1 - TP_PERCENT / 100)
         sl = entry * (1 + SL_PERCENT / 100)
+
         side = "🔴 SHORT"
         tp_text = f"-{TP_PERCENT:.1f}%"
         sl_text = f"+{SL_PERCENT:.1f}%"
@@ -490,26 +695,45 @@ def create_message(symbol, direction, entry, score4, score1):
         "⚠️ Manage risk."
     )
 
+
 def main():
     print("🟢 SCORE HUNTER PRO v3 ROBUST 4H/1H")
     print("🔎 ROBUST 4H STRUCTURE + TRUE 1H TRIGGER")
     print(f"⭐ Minimum 4H quality: {MIN_4H_QUALITY}/4")
-    print(f"⭐ Minimum 1H confirmation: {MIN_1H_CONFIRMATION}/6")
+    print(
+        f"⭐ Minimum 1H confirmation: "
+        f"{MIN_1H_CONFIRMATION}/6"
+    )
     print("🕯 CLOSED CANDLE ONLY - NO MID-CANDLE SIGNAL")
     print("♾️ DAILY SIGNAL LIMIT: DISABLED")
-    print("📊 Coins: ETH / SOL / XRP / BTC / ADA / LINK / DOGE")
-    print("⏱ Main structure: 4H | Entry confirmation: 1H")
-    print("🎯 TP: 1.0% | 🛑 SL: 0.5%")
-    print("📐 TP SPACE FILTER: ON")
+    print(
+        "📊 Coins: "
+        "ETH / SOL / XRP / BTC / ADA / LINK / DOGE"
+    )
+    print(
+        "⏱ Main structure: 4H | "
+        "Entry confirmation: 1H"
+    )
+    print(
+        f"🎯 TP: {TP_PERCENT:.1f}% | "
+        f"🛑 SL: {SL_PERCENT:.1f}%"
+    )
+    print(
+        f"📐 TP SPACE FILTER: ON | "
+        f"lookback=30 | buffer={TP_BUFFER_PERCENT:.1f}%"
+    )
 
     state = load_state()
 
-    # TP/SL is monitored independently of new-candle checks.
-    print("📡 LIVE TP/SL MONITOR: ON")
+    # IMPORTANT:
+    # This checks active trades automatically at the beginning
+    # of every GitHub Actions run. It does not require manual
+    # checking of every coin.
     monitor_open_trades(state)
 
     for symbol, pair in COINS.items():
         print(f"\n========== {symbol} ==========")
+
         try:
             c4 = get_ohlc(pair, INTERVAL_4H)
             c1 = get_ohlc(pair, INTERVAL_1H)
@@ -518,95 +742,189 @@ def main():
                 print(f"{symbol}: insufficient data")
                 continue
 
-            latest1 = c1[-1]
-            candle_id = latest1["time"]
-            print(f"{symbol} latest CLOSED 1H: {candle_id}")
+            candle_id = c1[-1]["time"]
 
-            # Only scan once per newly closed 1H candle.
+            print(
+                f"{symbol} latest CLOSED 1H: "
+                f"{candle_id}"
+            )
+
             coin_state = state.get(symbol, {})
-            if coin_state.get("last_checked_1h") == candle_id:
-                print(f"{symbol}: No new 1H candle.")
+
+            if not isinstance(coin_state, dict):
+                coin_state = {}
+
+            # Only scan a coin once for each newly closed 1H candle.
+            if (
+                coin_state.get("last_checked_1h")
+                == candle_id
+            ):
+                print(
+                    f"{symbol}: No new 1H candle."
+                )
                 continue
 
             coin_state["last_checked_1h"] = candle_id
 
             structure = robust_structure(c4)
-            print(f"{symbol} 4H Structure: {structure}")
 
-            directions = [structure] if structure in ("LONG", "SHORT") else []
+            print(
+                f"{symbol} 4H Structure: "
+                f"{structure}"
+            )
 
-            signal_sent = False
-
-            for direction in directions:
-                q4, details4 = structure_quality_4h(c4, direction)
+            if structure not in ("LONG", "SHORT"):
                 print(
-                    f"{symbol} {direction} 4H quality: "
-                    f"{q4}/4 | trend={int(details4.get('trend', False))} "
-                    f"rsi={details4.get('rsi', 0):.2f} "
-                    f"volume={int(details4.get('volume', False))} "
-                    f"volatility={int(details4.get('volatility', False))}"
+                    f"{symbol}: No valid 4H structure."
                 )
-
-                if q4 < MIN_4H_QUALITY:
-                    print(f"{symbol}: rejected - 4H quality")
-                    continue
-
-                q1, details1 = one_hour_confirmation(c1, direction)
-                print(
-                    f"{symbol} {direction} 1H confirmation: {q1}/6 "
-                    f"| trend={int(details1.get('trend', False))} "
-                    f"bos={int(details1.get('bos', False))} "
-                    f"sweep={int(details1.get('sweep', False))} "
-                    f"retest={int(details1.get('retest', False))} "
-                    f"candle={int(details1.get('candle', False))} "
-                    f"volume={int(details1.get('volume', False))}"
-                )
-
-                if q1 < MIN_1H_CONFIRMATION:
-                    print(f"{symbol}: rejected - 1H confirmation")
-                    continue
-
-                entry = c1[-1]["close"]
-                space_ok, blocker = tp_space_ok(c4, direction, entry)
-                if not space_ok:
-                    print(
-                        f"{symbol}: rejected - TP space blocked "
-                        f"by nearby level {blocker}"
-                    )
-                    continue
-
-                signal_id = f"{candle_id}_{direction}"
-                if coin_state.get("last_signal_id") == signal_id:
-                    print(f"{symbol}: duplicate signal")
-                    continue
-
-                msg = create_message(
-                    symbol, direction, entry, q4, q1
-                )
-                send_telegram(msg)
-
-                coin_state.update({
-                    "last_signal_id": signal_id,
-                    "last_signal": {
-                        "direction": direction,
-                        "score_4h": q4,
-                        "score_1h": q1,
-                        "entry": entry,
-                        "candle_1h": candle_id,
-                    },
-                })
                 state[symbol] = coin_state
                 save_state(state)
+                continue
 
-                print(f"🚨 {symbol}: {direction} SIGNAL SENT")
-                signal_sent = True
-                break
+            direction = structure
 
-            if not signal_sent:
-                print(f"{symbol}: No valid 4H/1H signal.")
+            q4, details4 = (
+                structure_quality_4h(
+                    c4,
+                    direction,
+                )
+            )
+
+            print(
+                f"{symbol} {direction} 4H quality: "
+                f"{q4}/4 | "
+                f"trend={int(details4.get('trend', False))} "
+                f"rsi={details4.get('rsi', 0):.2f} "
+                f"volume={int(details4.get('volume', False))} "
+                f"volatility={int(details4.get('volatility', False))}"
+            )
+
+            if q4 < MIN_4H_QUALITY:
+                print(
+                    f"{symbol}: rejected - "
+                    f"4H quality"
+                )
+                state[symbol] = coin_state
+                save_state(state)
+                continue
+
+            q1, details1 = (
+                one_hour_confirmation(
+                    c1,
+                    direction,
+                )
+            )
+
+            print(
+                f"{symbol} {direction} "
+                f"1H confirmation: {q1}/6 | "
+                f"trend={int(details1.get('trend', False))} "
+                f"bos={int(details1.get('bos', False))} "
+                f"sweep={int(details1.get('sweep', False))} "
+                f"retest={int(details1.get('retest', False))} "
+                f"candle={int(details1.get('candle', False))} "
+                f"volume={int(details1.get('volume', False))}"
+            )
+
+            if q1 < MIN_1H_CONFIRMATION:
+                print(
+                    f"{symbol}: rejected - "
+                    f"1H confirmation"
+                )
+                state[symbol] = coin_state
+                save_state(state)
+                continue
+
+            entry = c1[-1]["close"]
+
+            space_ok, blocker = (
+                tp_space_ok(
+                    c4,
+                    direction,
+                    entry,
+                )
+            )
+
+            if not space_ok:
+                print(
+                    f"{symbol}: rejected - "
+                    f"TP space blocked by "
+                    f"nearby level {blocker}"
+                )
+                state[symbol] = coin_state
+                save_state(state)
+                continue
+
+            signal_id = (
+                f"{candle_id}_{direction}"
+            )
+
+            if (
+                coin_state.get("last_signal_id")
+                == signal_id
+            ):
+                print(
+                    f"{symbol}: duplicate signal"
+                )
+                state[symbol] = coin_state
+                save_state(state)
+                continue
+
+            # Do not issue another signal while a previous
+            # signal for this coin is still active.
+            previous_signal = (
+                coin_state.get("last_signal")
+            )
+
+            previous_result = (
+                coin_state.get("trade_result")
+            )
+
+            if (
+                isinstance(previous_signal, dict)
+                and previous_result not in ("TP", "SL")
+            ):
+                print(
+                    f"{symbol}: active previous "
+                    f"trade exists - no new signal."
+                )
+                state[symbol] = coin_state
+                save_state(state)
+                continue
+
+            message = create_message(
+                symbol,
+                direction,
+                entry,
+                q4,
+                q1,
+            )
+
+            send_telegram(message)
+
+            # New active trade.
+            coin_state = {
+                "last_checked_1h": candle_id,
+                "last_signal_id": signal_id,
+                "last_signal": {
+                    "direction": direction,
+                    "score_4h": q4,
+                    "score_1h": q1,
+                    "entry": entry,
+                    "candle_1h": candle_id,
+                },
+                "trade_result": None,
+                "trade_result_price": None,
+                "trade_result_time": None,
+            }
 
             state[symbol] = coin_state
             save_state(state)
+
+            print(
+                f"🚨 {symbol}: "
+                f"{direction} SIGNAL SENT"
+            )
 
         except Exception as e:
             print(
@@ -616,7 +934,12 @@ def main():
             continue
 
     save_state(state)
-    print("\n✅ SCORE HUNTER PRO v3 SCAN COMPLETED")
+
+    print(
+        "\n✅ SCORE HUNTER PRO v3 "
+        "SCAN COMPLETED"
+    )
+
 
 if __name__ == "__main__":
     main()
