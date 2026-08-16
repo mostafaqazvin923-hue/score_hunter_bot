@@ -13,7 +13,7 @@
     },
     "signal_candle": 1786363200,
     "signal_time": 1786379900,
-    "last_checked_1h": 1786867200
+    "last_checked_1h": 1786870800
   },
   "SOL": {
     "last_signal": {
@@ -32,7 +32,7 @@
     "last_signal_day": "2026-08-14",
     "signal_candle": 1786665600,
     "signal_time": 1786688500,
-    "last_checked_1h": 1786867200
+    "last_checked_1h": 1786870800
   },
   "XRP": {
     "price": 1.0220175008542913,
@@ -49,22 +49,26 @@
     },
     "signal_candle": 1786392000,
     "signal_time": 1786406457,
-    "last_checked_1h": 1786867200,
+    "last_checked_1h": 1786870800,
     "last_signal_id": "1786867200_SHORT"
   },
   "BTC": {
-    "last_signal_time": 1786622400,
-    "direction": "SHORT",
-    "score": 5,
-    "entry": 63419.59,
-    "tp": 62785.3941,
-    "sl": 63736.68794999999,
-    "last_checked_candle": 1786852800,
-    "last_checked_1h": 1786867200
+    "last_checked_1h": 1786870800,
+    "last_signal_id": "1786870800_SHORT",
+    "last_signal": {
+      "direction": "SHORT",
+      "score_4h": 3,
+      "score_1h": 4,
+      "entry": 63001.4,
+      "candle_1h": 1786870800
+    },
+    "trade_result": null,
+    "trade_result_price": null,
+    "trade_result_time": null
   },
   "ADA": {
     "last_checked_candle": 1786852800,
-    "last_checked_1h": 1786867200
+    "last_checked_1h": 1786870800
   },
   "LINK": {
     "last_checked_candle": 1786852800,
@@ -77,7 +81,7 @@
     },
     "signal_candle": 1786809600,
     "signal_time": 1786826962,
-    "last_checked_1h": 1786867200,
+    "last_checked_1h": 1786870800,
     "last_signal_id": "1786863600_LONG"
   },
   "DOGE": {
@@ -90,6 +94,6 @@
     },
     "signal_candle": 1786766400,
     "signal_time": 1786786613,
-    "last_checked_1h": 1786867200
+    "last_checked_1h": 1786870800
   }
 }
