@@ -50,26 +50,6 @@
     "last_checked_1h": 1786867200,
     "last_signal_id": "1786867200_SHORT"
   },
-  "APT": {
-    "price": 0.5893844159660164,
-    "time": 1786377222,
-    "last_alert": 0
-  },
-  "last_checked_candle": 1786363200,
-  "last_signal_day": "2026-08-10",
-  "last_signal": {
-    "direction": "SHORT",
-    "score": 6,
-    "price": 1877.17
-  },
-  "signal_time": 1786378968,
-  "last_signals": {},
-  "active_trades": {},
-  "completed_trades": [],
-  "last_processed_4h": {
-    "BTC": 1786564800,
-    "XRP": 1786564800
-  },
   "BTC": {
     "last_signal": "1786622400_SHORT",
     "last_signal_time": 1786622400,
@@ -109,14 +89,5 @@
     "signal_candle": 1786766400,
     "signal_time": 1786786613,
     "last_checked_1h": 1786867200
-  },
-  "last_processed_1h": {
-    "ETH": 1786863600,
-    "SOL": 1786863600,
-    "XRP": 1786863600,
-    "BTC": 1786863600,
-    "ADA": 1786863600,
-    "LINK": 1786863600,
-    "DOGE": 1786863600
   }
 }
