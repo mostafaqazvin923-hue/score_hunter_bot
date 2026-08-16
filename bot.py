@@ -42,17 +42,43 @@ def load_state():
         print(f"⚠️ state.json load error: {type(e).__name__}: {e}")
         return {}
 
-    # Keep only valid per-coin dictionaries.
-    # Old/malformed top-level metadata entries are ignored.
     state = {}
-    if isinstance(raw, dict):
-        for symbol in COINS:
-            value = raw.get(symbol)
-            if isinstance(value, dict):
-                state[symbol] = value
+    if not isinstance(raw, dict):
+        return state
+
+    for symbol in COINS:
+        value = raw.get(symbol)
+        if not isinstance(value, dict):
+            continue
+
+        signal = value.get("last_signal")
+        if signal is not None and not isinstance(signal, dict):
+            value.pop("last_signal", None)
+            value.pop("trade_result", None)
+            value.pop("trade_result_price", None)
+            value.pop("trade_result_time", None)
+            signal = None
+
+        if isinstance(signal, dict):
+            direction = signal.get("direction")
+            entry = signal.get("entry", signal.get("price"))
+            try:
+                entry = float(entry)
+            except (TypeError, ValueError):
+                entry = None
+
+            if direction not in ("LONG", "SHORT") or entry is None:
+                value.pop("last_signal", None)
+                value.pop("trade_result", None)
+                value.pop("trade_result_price", None)
+                value.pop("trade_result_time", None)
+            else:
+                signal["entry"] = entry
+                value["last_signal"] = signal
+
+        state[symbol] = value
 
     return state
-
 
 def save_state(state):
     clean = {}
@@ -224,6 +250,7 @@ def monitor_open_trades(state):
             )
 
             # Keep the signal itself for history, but mark it closed.
+            coin_state.pop("last_signal", None)
             state[symbol] = coin_state
             changed = True
 
