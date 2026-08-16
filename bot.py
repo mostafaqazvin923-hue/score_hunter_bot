@@ -7,6 +7,7 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
+TICKER_URL = "https://api.kraken.com/0/public/Ticker"
 STATE_FILE = "state.json"
 
 INTERVAL_4H = 240
@@ -371,6 +372,9 @@ def main():
     print("📐 TP SPACE FILTER: ON")
 
     state = load_state()
+
+    # TP/SL is monitored independently of new-candle checks.
+    monitor_open_trades(state)
 
     for symbol, pair in COINS.items():
         print(f"\n========== {symbol} ==========")
