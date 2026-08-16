@@ -3,7 +3,7 @@
     "price": 1878.0134502537426,
     "time": 1786377222,
     "last_alert": 0,
-    "last_checked_candle": 1786881600,
+    "last_checked_candle": 1786896000,
     "last_signal_day": "2026-08-10",
     "last_signal": {
       "direction": "SHORT",
@@ -28,7 +28,7 @@
     "entry": 76.18,
     "tp": 76.9418,
     "sl": 75.79910000000001,
-    "last_checked_candle": 1786881600,
+    "last_checked_candle": 1786896000,
     "last_signal_day": "2026-08-14",
     "signal_candle": 1786665600,
     "signal_time": 1786688500,
@@ -38,7 +38,7 @@
     "price": 1.0220175008542913,
     "time": 1786377222,
     "last_alert": 0,
-    "last_checked_candle": 1786881600,
+    "last_checked_candle": 1786896000,
     "last_signal_day": "2026-08-11",
     "last_signal": {
       "direction": "SHORT",
@@ -65,7 +65,7 @@
     "trade_result": null,
     "trade_result_price": null,
     "trade_result_time": null,
-    "last_checked_candle": 1786881600
+    "last_checked_candle": 1786896000
   },
   "ADA": {
     "last_checked_1h": 1786888800,
@@ -80,24 +80,22 @@
     "trade_result": null,
     "trade_result_price": null,
     "trade_result_time": null,
-    "last_checked_candle": 1786881600
+    "last_checked_candle": 1786896000
   },
   "LINK": {
-    "last_checked_candle": 1786881600,
+    "last_checked_candle": 1786896000,
     "last_signal": {
       "direction": "LONG",
-      "score_4h": 4,
-      "score_1h": 3,
-      "entry": 9.35821,
-      "candle_1h": 1786863600
+      "score": 5,
+      "price": 9.4597
     },
-    "signal_candle": 1786809600,
-    "signal_time": 1786826962,
+    "signal_candle": 1786896000,
+    "signal_time": 1786913143,
     "last_checked_1h": 1786888800,
     "last_signal_id": "1786863600_LONG"
   },
   "DOGE": {
-    "last_checked_candle": 1786881600,
+    "last_checked_candle": 1786896000,
     "last_signal": {
       "direction": "SHORT",
       "score": 5,
