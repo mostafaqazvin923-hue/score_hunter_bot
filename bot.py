@@ -85,15 +85,22 @@ def get_current_price(pair):
 
 def monitor_open_trades(state):
     """
-    Check all previously sent signals against the live Kraken price.
-    Each trade gets exactly one final result notification.
+    Check only valid per-coin trade dictionaries.
+    Compatible with older state.json files and ignores malformed entries.
+    Each finalized trade is notified once.
     """
-    for symbol, coin_state in state.items():
-        signal = coin_state.get("last_signal")
-        if not signal:
+    for symbol, coin_state in list(state.items()):
+        if not isinstance(coin_state, dict):
+            print(
+                f"⚠️ {symbol}: invalid state entry ignored "
+                f"({type(coin_state).__name__})"
+            )
             continue
 
-        # Already finalized.
+        signal = coin_state.get("last_signal")
+        if not isinstance(signal, dict):
+            continue
+
         if coin_state.get("trade_result"):
             continue
 
@@ -102,9 +109,18 @@ def monitor_open_trades(state):
             continue
 
         try:
+            direction = signal.get("direction")
+            entry = signal.get("entry", signal.get("price"))
+
+            if direction not in ("LONG", "SHORT") or entry is None:
+                print(
+                    f"⚠️ {symbol}: incomplete open-trade state; "
+                    "skipping TP/SL check."
+                )
+                continue
+
+            entry = float(entry)
             price = get_current_price(pair)
-            direction = signal["direction"]
-            entry = float(signal["entry"])
 
             if direction == "LONG":
                 tp = entry * (1 + TP_PERCENT / 100)
@@ -112,23 +128,18 @@ def monitor_open_trades(state):
 
                 if price >= tp:
                     result = "TP"
-                    result_price = price
                 elif price <= sl:
                     result = "SL"
-                    result_price = price
                 else:
                     continue
-
             else:
                 tp = entry * (1 - TP_PERCENT / 100)
                 sl = entry * (1 + SL_PERCENT / 100)
 
                 if price <= tp:
                     result = "TP"
-                    result_price = price
                 elif price >= sl:
                     result = "SL"
-                    result_price = price
                 else:
                     continue
 
@@ -147,7 +158,7 @@ def monitor_open_trades(state):
                 f"📊 {direction}\n"
                 f"🏁 {title}\n"
                 f"💵 Entry: {entry:.8f}\n"
-                f"📍 Price: {result_price:.8f}\n"
+                f"📍 Price: {price:.8f}\n"
                 f"📈 Result: {pnl_text}\n\n"
                 "⏱ Timeframe: 4H / 1H\n"
                 "🕯 Closed candle signal"
@@ -156,7 +167,7 @@ def monitor_open_trades(state):
             send_telegram(message)
 
             coin_state["trade_result"] = result
-            coin_state["trade_result_price"] = result_price
+            coin_state["trade_result_price"] = price
             coin_state["trade_result_time"] = int(
                 datetime.now(timezone.utc).timestamp()
             )
@@ -165,7 +176,7 @@ def monitor_open_trades(state):
 
             print(
                 f"🏁 {symbol}: {direction} "
-                f"{result} HIT at {result_price:.8f}"
+                f"{result} HIT at {price:.8f}"
             )
 
         except Exception as e:
@@ -173,6 +184,7 @@ def monitor_open_trades(state):
                 f"⚠️ {symbol} TP/SL monitor error: "
                 f"{type(e).__name__}: {e}"
             )
+
 
 def get_ohlc(pair, interval):
     r = requests.get(
