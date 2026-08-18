@@ -371,12 +371,17 @@ def calculate_signal(candles, symbol):
 
     atr_percent = (current_atr / close) * 100.0
 
-    long_tp, long_sl, _, _ = get_risk_levels(
-        "LONG", close, current_atr
-    )
-    short_tp, short_sl, _, _ = get_risk_levels(
-        "SHORT", close, current_atr
-    )
+    # Calculate Smart TP/SL BEFORE printing or using them below.
+    # A = full 2 ATR target with clear structure space.
+    # B = TP placed just before recent resistance/support, with at least 1.2 ATR room.
+    # C = less than 1.2 ATR usable room -> no signal.
+    long_levels = get_smart_tp(candles, "LONG", close, current_atr)
+    short_levels = get_smart_tp(candles, "SHORT", close, current_atr)
+
+    long_tp = long_levels[0] if long_levels else None
+    long_sl = long_levels[1] if long_levels else None
+    short_tp = short_levels[0] if short_levels else None
+    short_sl = short_levels[1] if short_levels else None
 
     print(f"\n===== {symbol} 4H =====")
     print(f"Price: {close:.8f}")
@@ -470,7 +475,7 @@ def main():
     print(
         f"🛑 SL: {SL_ATR_MULTIPLIER} ATR"
     )
-    print("⚖️ Risk/Reward: 1:2")
+    print("⚖️ Risk/Reward: 1:2 base | B setup = structure-based TP")
     print("🧠 SMART TP: ON | 2 ATR base + support/resistance")
     print(f"🟡 B SETUP: minimum usable TP space = 1.2 ATR | buffer={TP_SPACE_BUFFER_PERCENT}%")
     print("🔴 C SETUP: DISABLED (NO SIGNAL)")
