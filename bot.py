@@ -10,18 +10,13 @@ KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
 STATE_FILE = "state.json"
 
 INTERVAL = 240
-
-# SIGNAL SETTINGS
+CANDLE_SECONDS = INTERVAL * 60
 REQUIRED_SCORE = 5
-
-# ATR-BASED RISK MANAGEMENT
 SL_ATR_MULTIPLIER = 1.0
 TP_ATR_MULTIPLIER = 2.0
-
-# Fixed-TP market-space filter
-# Uses the actual ATR-based TP distance.
 TP_SPACE_LOOKBACK = 20
 TP_SPACE_BUFFER_PERCENT = 0.10
+MIN_B_SETUP_ATR = 1.20
 
 COINS = {
     "ETH": "ETHUSDT",
@@ -34,28 +29,32 @@ COINS = {
 }
 
 
+def utc_text(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"⚠️ state.json could not be read: {e}")
         return {}
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_FILE)
 
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    response = requests.post(
-        url,
-        data={"chat_id": CHAT_ID, "text": message},
-        timeout=20,
-    )
+    response = requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=20)
     print("Telegram:", response.status_code)
     print(response.text)
     response.raise_for_status()
@@ -63,119 +62,96 @@ def send_telegram(message):
 
 def get_4h_data(symbol):
     print(f"\nGetting {symbol} 4H candles...")
-
     response = requests.get(
         KRAKEN_URL,
         params={"pair": COINS[symbol], "interval": INTERVAL},
         timeout=20,
     )
-
     print(f"{symbol} Kraken:", response.status_code)
     response.raise_for_status()
-
     payload = response.json()
 
     if payload.get("error"):
-        raise RuntimeError(
-            f"{symbol} Kraken API error: {payload['error']}"
-        )
+        raise RuntimeError(f"{symbol} Kraken API error: {payload['error']}")
 
     result = payload.get("result", {})
     pair_key = next((key for key in result if key != "last"), None)
-
     if pair_key is None:
         raise RuntimeError(f"{symbol}: no candle data returned")
 
     candles = []
+    for row in result.get(pair_key, []):
+        if len(row) < 7:
+            continue
+        try:
+            candles.append({
+                "time": int(float(row[0])),
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[6]),
+            })
+        except (TypeError, ValueError):
+            continue
 
-    for row in result[pair_key]:
-        candles.append({
-            "time": int(row[0]),
-            "open": float(row[1]),
-            "high": float(row[2]),
-            "low": float(row[3]),
-            "close": float(row[4]),
-            "volume": float(row[6]),
-        })
+    if not candles:
+        raise RuntimeError(f"{symbol}: no valid candles parsed")
 
-    # Keep ONLY candles that are actually closed according to UTC time.
-    # Do not blindly drop the last Kraken row: Kraken can sometimes return
-    # the most recently completed candle as its last row.
+    candles.sort(key=lambda c: c["time"])
+    unique = {c["time"]: c for c in candles}
+    candles = [unique[t] for t in sorted(unique)]
+
     now_ts = int(datetime.now(timezone.utc).timestamp())
-    candle_seconds = INTERVAL * 60
+    print(f"{symbol}: current UTC: {utc_text(now_ts)}")
+    print(f"{symbol}: Kraken newest row UTC: {utc_text(candles[-1]['time'])}")
 
-    candles = [
-        candle
-        for candle in candles
-        if candle["time"] + candle_seconds <= now_ts
-    ]
+    # A candle is considered closed only after its complete 4H interval has elapsed.
+    closed = [c for c in candles if c["time"] + CANDLE_SECONDS <= now_ts]
+    if not closed:
+        raise RuntimeError(f"{symbol}: no fully closed 4H candle available")
 
-    print(
-        f"{symbol}: current UTC: "
-        f"{datetime.fromtimestamp(now_ts, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
-    )
+    latest = closed[-1]
+    print(f"{symbol}: newest CLOSED 4H candle UTC: {utc_text(latest['time'])}")
+    print(f"{symbol}: {len(closed)} closed 4H candles")
 
-    if candles:
-        print(
-            f"{symbol}: newest closed candle UTC: "
-            f"{datetime.fromtimestamp(candles[-1]['time'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
-        )
+    if len(closed) < 210:
+        raise RuntimeError(f"{symbol}: only {len(closed)} closed candles available")
 
-    if len(candles) < 210:
-        raise RuntimeError(
-            f"{symbol}: only {len(candles)} candles available"
-        )
-
-    print(f"{symbol}: {len(candles)} closed 4H candles")
-    return candles
+    return closed
 
 
 def ema(values, period):
     if len(values) < period:
         return None
-
     value = sum(values[:period]) / period
     multiplier = 2.0 / (period + 1)
-
     for price in values[period:]:
         value = (price - value) * multiplier + value
-
     return value
 
 
 def sma(values, period):
     if len(values) < period:
         return None
-
     return sum(values[-period:]) / period
 
 
 def rsi(values, period=14):
     if len(values) <= period:
         return None
-
-    gains = []
-    losses = []
-
+    gains, losses = [], []
     for i in range(1, len(values)):
         change = values[i] - values[i - 1]
         gains.append(max(change, 0))
         losses.append(max(-change, 0))
-
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-
     for i in range(period, len(gains)):
-        avg_gain = (
-            (avg_gain * (period - 1) + gains[i]) / period
-        )
-        avg_loss = (
-            (avg_loss * (period - 1) + losses[i]) / period
-        )
-
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
     if avg_loss == 0:
         return 100.0
-
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
@@ -183,52 +159,31 @@ def rsi(values, period=14):
 def atr(highs, lows, closes, period=14):
     if len(closes) <= period:
         return None
-
-    true_ranges = []
-
+    trs = []
     for i in range(1, len(closes)):
-        true_ranges.append(
-            max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i - 1]),
-                abs(lows[i] - closes[i - 1]),
-            )
-        )
-
-    return sum(true_ranges[-period:]) / period
+        trs.append(max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        ))
+    return sum(trs[-period:]) / period
 
 
 def get_risk_levels(direction, entry, current_atr):
-    """
-    1 ATR stop / 2 ATR target.
-    Risk-reward remains 1:2.
-    """
-
     sl_distance = current_atr * SL_ATR_MULTIPLIER
     tp_distance = current_atr * TP_ATR_MULTIPLIER
-
     if direction == "LONG":
-        tp = entry + tp_distance
-        sl = entry - sl_distance
-    else:
-        tp = entry - tp_distance
-        sl = entry + sl_distance
-
-    return tp, sl, tp_distance, sl_distance
+        return entry + tp_distance, entry - sl_distance, tp_distance, sl_distance
+    return entry - tp_distance, entry + sl_distance, tp_distance, sl_distance
 
 
 def get_smart_tp(candles, direction, entry, current_atr):
-    """Smart TP using 2 ATR base + recent market structure.
-    A: full 2 ATR target has room.
-    B: structure blocks 2 ATR, but >=1.2 ATR room exists; TP is placed just before structure.
-    C: <1.2 ATR room -> no signal.
-    """
     if len(candles) < TP_SPACE_LOOKBACK + 2:
         return None
 
     lookback = candles[-(TP_SPACE_LOOKBACK + 1):-1]
     full_tp, sl, tp_distance, sl_distance = get_risk_levels(direction, entry, current_atr)
-    min_distance = current_atr * 1.20
+    min_distance = current_atr * MIN_B_SETUP_ATR
     buffer = entry * (TP_SPACE_BUFFER_PERCENT / 100.0)
 
     if direction == "LONG":
@@ -261,127 +216,49 @@ def calculate_signal(candles, symbol):
     closes = [c["close"] for c in candles]
     volumes = [c["volume"] for c in candles]
 
-    # candles[-1] is the latest CLOSED 4H candle.
-    open_price = opens[-1]
-    high = highs[-1]
-    low = lows[-1]
-    close = closes[-1]
-    volume = volumes[-1]
+    open_price, high, low, close, volume = opens[-1], highs[-1], lows[-1], closes[-1], volumes[-1]
+    ema20, ema50, ema200 = ema(closes, 20), ema(closes, 50), ema(closes, 200)
+    current_rsi, previous_rsi = rsi(closes, 14), rsi(closes[:-1], 14)
+    volume_ma, current_atr = sma(volumes, 20), atr(highs, lows, closes, 14)
 
-    ema20 = ema(closes, 20)
-    ema50 = ema(closes, 50)
-    ema200 = ema(closes, 200)
-
-    current_rsi = rsi(closes, 14)
-    previous_rsi = rsi(closes[:-1], 14)
-
-    volume_ma = sma(volumes, 20)
-    current_atr = atr(highs, lows, closes, 14)
-
-    if any(
-        x is None
-        for x in [
-            ema20,
-            ema50,
-            ema200,
-            current_rsi,
-            previous_rsi,
-            volume_ma,
-            current_atr,
-        ]
-    ):
+    if any(x is None for x in [ema20, ema50, ema200, current_rsi, previous_rsi, volume_ma, current_atr]):
         print(f"{symbol}: indicator calculation failed")
         return None
 
-    # CONDITION 1 - TREND
     long_trend = close > ema200 and ema20 > ema50
     short_trend = close < ema200 and ema20 < ema50
-
-    # CONDITION 2 - RSI
-    long_rsi = (
-        current_rsi > 50
-        and current_rsi < 72
-        and current_rsi > previous_rsi
-    )
-
-    short_rsi = (
-        current_rsi < 50
-        and current_rsi > 28
-        and current_rsi < previous_rsi
-    )
-
-    # CONDITION 3 - VOLUME
+    long_rsi = current_rsi > 50 and current_rsi < 72 and current_rsi > previous_rsi
+    short_rsi = current_rsi < 50 and current_rsi > 28 and current_rsi < previous_rsi
     volume_ok = volume >= volume_ma
-
-    # CONDITION 4 - BREAKOUT
     recent_high = max(highs[-7:-1])
     recent_low = min(lows[-7:-1])
-
-    bull_break = close > recent_high
-    bear_break = close < recent_low
-
-    # CONDITION 5 - PULLBACK
+    bull_break, bear_break = close > recent_high, close < recent_low
     long_pullback = low <= ema20 and close > ema20
     short_pullback = high >= ema20 and close < ema20
 
-    # CONDITION 6 - CANDLE QUALITY
     candle_range = high - low
-
     if candle_range > 0:
         bull_body_ratio = (close - open_price) / candle_range
         bear_body_ratio = (open_price - close) / candle_range
     else:
-        bull_body_ratio = 0.0
-        bear_body_ratio = 0.0
+        bull_body_ratio = bear_body_ratio = 0.0
 
-    bull_candle = (
-        close > open_price
-        and candle_range > 0
-        and bull_body_ratio >= 0.40
-    )
-
-    bear_candle = (
-        close < open_price
-        and candle_range > 0
-        and bear_body_ratio >= 0.40
-    )
-
-    # CONDITION 7 - VOLATILITY
+    bull_candle = close > open_price and candle_range > 0 and bull_body_ratio >= 0.40
+    bear_candle = close < open_price and candle_range > 0 and bear_body_ratio >= 0.40
     volatility_ok = (current_atr / close) >= 0.002
 
-    long_score = (
-        int(long_trend)
-        + int(long_rsi)
-        + int(volume_ok)
-        + int(bull_break)
-        + int(long_pullback)
-        + int(bull_candle)
-        + int(volatility_ok)
-    )
-
-    short_score = (
-        int(short_trend)
-        + int(short_rsi)
-        + int(volume_ok)
-        + int(bear_break)
-        + int(short_pullback)
-        + int(bear_candle)
-        + int(volatility_ok)
-    )
+    long_score = sum([
+        int(long_trend), int(long_rsi), int(volume_ok), int(bull_break),
+        int(long_pullback), int(bull_candle), int(volatility_ok)
+    ])
+    short_score = sum([
+        int(short_trend), int(short_rsi), int(volume_ok), int(bear_break),
+        int(short_pullback), int(bear_candle), int(volatility_ok)
+    ])
 
     atr_percent = (current_atr / close) * 100.0
-
-    # Calculate Smart TP/SL BEFORE printing or using them below.
-    # A = full 2 ATR target with clear structure space.
-    # B = TP placed just before recent resistance/support, with at least 1.2 ATR room.
-    # C = less than 1.2 ATR usable room -> no signal.
     long_levels = get_smart_tp(candles, "LONG", close, current_atr)
     short_levels = get_smart_tp(candles, "SHORT", close, current_atr)
-
-    long_tp = long_levels[0] if long_levels else None
-    long_sl = long_levels[1] if long_levels else None
-    short_tp = short_levels[0] if short_levels else None
-    short_sl = short_levels[1] if short_levels else None
 
     print(f"\n===== {symbol} 4H =====")
     print(f"Price: {close:.8f}")
@@ -393,32 +270,37 @@ def calculate_signal(candles, symbol):
     print(f"Volume OK: {volume_ok}")
     print(f"LONG SCORE: {long_score}/7")
     print(f"SHORT SCORE: {short_score}/7")
+
     if long_levels:
-        print(f"LONG TP/SL: {long_tp:.8f} / {long_sl:.8f} | Quality: {long_levels[4]} | Resistance: {long_levels[5]:.8f}")
+        print(f"LONG TP/SL: {long_levels[0]:.8f} / {long_levels[1]:.8f} | Quality: {long_levels[4]} | Resistance: {long_levels[5]:.8f}")
     else:
         print("LONG TP/SL: REJECTED (< 1.2 ATR usable room)")
+
     if short_levels:
-        print(f"SHORT TP/SL: {short_tp:.8f} / {short_sl:.8f} | Quality: {short_levels[4]} | Support: {short_levels[5]:.8f}")
+        print(f"SHORT TP/SL: {short_levels[0]:.8f} / {short_levels[1]:.8f} | Quality: {short_levels[4]} | Support: {short_levels[5]:.8f}")
     else:
         print("SHORT TP/SL: REJECTED (< 1.2 ATR usable room)")
+
     print("====================")
 
-    # A = full 2 ATR TP. B = structure-aware TP with >=1.2 ATR room. C = no signal.
     if long_score >= REQUIRED_SCORE and long_levels:
-        return {"direction": "LONG", "score": long_score, "price": close, "atr": current_atr,
-                "tp": long_levels[0], "sl": long_levels[1], "tp_distance": long_levels[2],
-                "sl_distance": long_levels[3], "quality": long_levels[4], "structure": long_levels[5]}
+        return {
+            "direction": "LONG", "score": long_score, "price": close, "atr": current_atr,
+            "tp": long_levels[0], "sl": long_levels[1], "tp_distance": long_levels[2],
+            "sl_distance": long_levels[3], "quality": long_levels[4], "structure": long_levels[5]
+        }
 
     if short_score >= REQUIRED_SCORE and short_levels:
-        return {"direction": "SHORT", "score": short_score, "price": close, "atr": current_atr,
-                "tp": short_levels[0], "sl": short_levels[1], "tp_distance": short_levels[2],
-                "sl_distance": short_levels[3], "quality": short_levels[4], "structure": short_levels[5]}
+        return {
+            "direction": "SHORT", "score": short_score, "price": close, "atr": current_atr,
+            "tp": short_levels[0], "sl": short_levels[1], "tp_distance": short_levels[2],
+            "sl_distance": short_levels[3], "quality": short_levels[4], "structure": short_levels[5]
+        }
 
     if long_score >= REQUIRED_SCORE:
         print(f"{symbol}: LONG rejected - less than 1.2 ATR usable TP space")
     if short_score >= REQUIRED_SCORE:
         print(f"{symbol}: SHORT rejected - less than 1.2 ATR usable TP space")
-
     return None
 
 
@@ -427,15 +309,10 @@ def create_message(symbol, signal):
     score = signal["score"]
     entry = signal["price"]
     atr_value = signal["atr"]
-    tp = signal["tp"]
-    sl = signal["sl"]
-    quality = signal["quality"]
-    structure = signal["structure"]
-    tp_distance = signal["tp_distance"]
-    sl_distance = signal["sl_distance"]
-
-    tp_percent = (tp_distance / entry) * 100.0
-    sl_percent = (sl_distance / entry) * 100.0
+    tp, sl = signal["tp"], signal["sl"]
+    quality, structure = signal["quality"], signal["structure"]
+    tp_percent = (signal["tp_distance"] / entry) * 100.0
+    sl_percent = (signal["sl_distance"] / entry) * 100.0
 
     if direction == "LONG":
         direction_text = "📊 🟢 LONG"
@@ -469,81 +346,54 @@ def main():
     print("📊 Coins: " + " / ".join(COINS.keys()))
     print("⏱ Timeframe: 4H")
     print(f"⭐ Minimum Score: {REQUIRED_SCORE}/7")
-    print(
-        f"🎯 TP: {TP_ATR_MULTIPLIER} ATR"
-    )
-    print(
-        f"🛑 SL: {SL_ATR_MULTIPLIER} ATR"
-    )
+    print(f"🎯 TP: {TP_ATR_MULTIPLIER} ATR")
+    print(f"🛑 SL: {SL_ATR_MULTIPLIER} ATR")
     print("⚖️ Risk/Reward: 1:2 base | B setup = structure-based TP")
     print("🧠 SMART TP: ON | 2 ATR base + support/resistance")
-    print(f"🟡 B SETUP: minimum usable TP space = 1.2 ATR | buffer={TP_SPACE_BUFFER_PERCENT}%")
+    print(f"🟡 B SETUP: minimum usable TP space = {MIN_B_SETUP_ATR} ATR | buffer={TP_SPACE_BUFFER_PERCENT}%")
     print("🔴 C SETUP: DISABLED (NO SIGNAL)")
 
     state = load_state()
 
     for symbol in COINS:
         print(f"\n\n========== {symbol} ==========")
-
         try:
             candles = get_4h_data(symbol)
-
             latest_candle_time = candles[-1]["time"]
-
             coin_state = state.get(symbol, {})
-            previous_candle_time = coin_state.get(
-                "last_checked_candle"
-            )
+            previous_candle_time = coin_state.get("last_checked_candle")
 
-            print(
-                f"{symbol} latest CLOSED 4H candle: "
-                f"{latest_candle_time}"
-            )
+            print(f"{symbol} latest CLOSED 4H candle: {latest_candle_time} ({utc_text(latest_candle_time)})")
 
             if previous_candle_time == latest_candle_time:
                 print(f"{symbol}: No new 4H candle.")
                 continue
 
-            coin_state["last_checked_candle"] = (
-                latest_candle_time
-            )
-
-            signal = calculate_signal(
-                candles,
-                symbol,
-            )
-
-            if signal is None:
-                print(f"{symbol}: No valid signal.")
-                state[symbol] = coin_state
-                save_state(state)
-                continue
-
-            message = create_message(
-                symbol,
-                signal,
-            )
-
-            send_telegram(message)
-
-            coin_state["last_signal"] = signal
-            coin_state["signal_candle"] = (
-                latest_candle_time
-            )
-            coin_state["signal_time"] = int(
-                datetime.now(timezone.utc).timestamp()
-            )
-
+            # Store the exact closed candle that has been evaluated.
+            # This prevents duplicate processing of the same 4H candle.
+            coin_state["last_checked_candle"] = latest_candle_time
+            coin_state["last_checked_candle_utc"] = utc_text(latest_candle_time)
             state[symbol] = coin_state
             save_state(state)
 
+            signal = calculate_signal(candles, symbol)
+
+            if signal is None:
+                print(f"{symbol}: No valid signal.")
+                continue
+
+            send_telegram(create_message(symbol, signal))
+
+            coin_state["last_signal"] = signal
+            coin_state["signal_candle"] = latest_candle_time
+            coin_state["signal_candle_utc"] = utc_text(latest_candle_time)
+            coin_state["signal_time"] = int(datetime.now(timezone.utc).timestamp())
+            state[symbol] = coin_state
+            save_state(state)
             print(f"🚨 {symbol}: SIGNAL SENT")
 
         except Exception as e:
-            print(
-                f"❌ {symbol} ERROR: "
-                f"{type(e).__name__}: {e}"
-            )
+            print(f"❌ {symbol} ERROR: {type(e).__name__}: {e}")
             continue
 
     save_state(state)
