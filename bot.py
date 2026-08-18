@@ -98,9 +98,28 @@ def get_4h_data(symbol):
             "volume": float(row[6]),
         })
 
-    # Ignore the currently forming candle.
-    if len(candles) > 1:
-        candles = candles[:-1]
+    # Keep ONLY candles that are actually closed according to UTC time.
+    # Do not blindly drop the last Kraken row: Kraken can sometimes return
+    # the most recently completed candle as its last row.
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    candle_seconds = INTERVAL * 60
+
+    candles = [
+        candle
+        for candle in candles
+        if candle["time"] + candle_seconds <= now_ts
+    ]
+
+    print(
+        f"{symbol}: current UTC: "
+        f"{datetime.fromtimestamp(now_ts, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    if candles:
+        print(
+            f"{symbol}: newest closed candle UTC: "
+            f"{datetime.fromtimestamp(candles[-1]['time'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 
     if len(candles) < 210:
         raise RuntimeError(
