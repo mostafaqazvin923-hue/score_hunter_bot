@@ -198,32 +198,38 @@ def get_risk_levels(direction, entry, current_atr):
     return tp, sl, tp_distance, sl_distance
 
 
-def has_tp_space(candles, direction, entry, current_atr):
+def get_smart_tp(candles, direction, entry, current_atr):
+    """Smart TP using 2 ATR base + recent market structure.
+    A: full 2 ATR target has room.
+    B: structure blocks 2 ATR, but >=1.2 ATR room exists; TP is placed just before structure.
+    C: <1.2 ATR room -> no signal.
     """
-    Check whether recent opposing structure leaves enough room
-    for the actual ATR-based TP.
-
-    The current signal candle is excluded.
-    """
-
     if len(candles) < TP_SPACE_LOOKBACK + 2:
-        return False
+        return None
 
     lookback = candles[-(TP_SPACE_LOOKBACK + 1):-1]
-    tp, _, tp_distance, _ = get_risk_levels(
-        direction,
-        entry,
-        current_atr,
-    )
-
-    buffer = TP_SPACE_BUFFER_PERCENT / 100.0
+    full_tp, sl, tp_distance, sl_distance = get_risk_levels(direction, entry, current_atr)
+    min_distance = current_atr * 1.20
+    buffer = entry * (TP_SPACE_BUFFER_PERCENT / 100.0)
 
     if direction == "LONG":
         resistance = max(c["high"] for c in lookback)
-        return resistance >= tp + (tp_distance * buffer)
+        if resistance >= full_tp + buffer:
+            return full_tp, sl, tp_distance, sl_distance, "A", resistance
+        smart_tp = resistance - buffer
+        smart_distance = smart_tp - entry
+        if smart_distance >= min_distance:
+            return smart_tp, sl, smart_distance, sl_distance, "B", resistance
+        return None
 
     support = min(c["low"] for c in lookback)
-    return support <= tp - (tp_distance * buffer)
+    if support <= full_tp - buffer:
+        return full_tp, sl, tp_distance, sl_distance, "A", support
+    smart_tp = support + buffer
+    smart_distance = entry - smart_tp
+    if smart_distance >= min_distance:
+        return smart_tp, sl, smart_distance, sl_distance, "B", support
+    return None
 
 
 def calculate_signal(candles, symbol):
@@ -363,50 +369,31 @@ def calculate_signal(candles, symbol):
     print(f"Volume OK: {volume_ok}")
     print(f"LONG SCORE: {long_score}/7")
     print(f"SHORT SCORE: {short_score}/7")
-    print(f"LONG TP/SL: {long_tp:.8f} / {long_sl:.8f}")
-    print(f"SHORT TP/SL: {short_tp:.8f} / {short_sl:.8f}")
+    if long_levels:
+        print(f"LONG TP/SL: {long_tp:.8f} / {long_sl:.8f} | Quality: {long_levels[4]} | Resistance: {long_levels[5]:.8f}")
+    else:
+        print("LONG TP/SL: REJECTED (< 1.2 ATR usable room)")
+    if short_levels:
+        print(f"SHORT TP/SL: {short_tp:.8f} / {short_sl:.8f} | Quality: {short_levels[4]} | Support: {short_levels[5]:.8f}")
+    else:
+        print("SHORT TP/SL: REJECTED (< 1.2 ATR usable room)")
     print("====================")
 
-    # Only 6/7 or 7/7.
+    # A = full 2 ATR TP. B = structure-aware TP with >=1.2 ATR room. C = no signal.
+    if long_score >= REQUIRED_SCORE and long_levels:
+        return {"direction": "LONG", "score": long_score, "price": close, "atr": current_atr,
+                "tp": long_levels[0], "sl": long_levels[1], "tp_distance": long_levels[2],
+                "sl_distance": long_levels[3], "quality": long_levels[4], "structure": long_levels[5]}
+
+    if short_score >= REQUIRED_SCORE and short_levels:
+        return {"direction": "SHORT", "score": short_score, "price": close, "atr": current_atr,
+                "tp": short_levels[0], "sl": short_levels[1], "tp_distance": short_levels[2],
+                "sl_distance": short_levels[3], "quality": short_levels[4], "structure": short_levels[5]}
+
     if long_score >= REQUIRED_SCORE:
-        if not has_tp_space(
-            candles,
-            "LONG",
-            close,
-            current_atr,
-        ):
-            print(
-                f"{symbol}: LONG rejected - "
-                f"insufficient space for ATR TP"
-            )
-            return None
-
-        return {
-            "direction": "LONG",
-            "score": long_score,
-            "price": close,
-            "atr": current_atr,
-        }
-
+        print(f"{symbol}: LONG rejected - less than 1.2 ATR usable TP space")
     if short_score >= REQUIRED_SCORE:
-        if not has_tp_space(
-            candles,
-            "SHORT",
-            close,
-            current_atr,
-        ):
-            print(
-                f"{symbol}: SHORT rejected - "
-                f"insufficient space for ATR TP"
-            )
-            return None
-
-        return {
-            "direction": "SHORT",
-            "score": short_score,
-            "price": close,
-            "atr": current_atr,
-        }
+        print(f"{symbol}: SHORT rejected - less than 1.2 ATR usable TP space")
 
     return None
 
@@ -415,13 +402,13 @@ def create_message(symbol, signal):
     direction = signal["direction"]
     score = signal["score"]
     entry = signal["price"]
-    current_atr = signal["atr"]
-
-    tp, sl, tp_distance, sl_distance = get_risk_levels(
-        direction,
-        entry,
-        current_atr,
-    )
+    atr_value = signal["atr"]
+    tp = signal["tp"]
+    sl = signal["sl"]
+    quality = signal["quality"]
+    structure = signal["structure"]
+    tp_distance = signal["tp_distance"]
+    sl_distance = signal["sl_distance"]
 
     tp_percent = (tp_distance / entry) * 100.0
     sl_percent = (sl_distance / entry) * 100.0
@@ -430,24 +417,23 @@ def create_message(symbol, signal):
         direction_text = "📊 🟢 LONG"
         tp_text = f"🎯 TP: {tp:.8f} (+{tp_percent:.2f}%)"
         sl_text = f"🛑 SL: {sl:.8f} (-{sl_percent:.2f}%)"
+        structure_text = f"📈 Resistance: {structure:.8f}"
     else:
         direction_text = "📊 🔴 SHORT"
         tp_text = f"🎯 TP: {tp:.8f} (-{tp_percent:.2f}%)"
         sl_text = f"🛑 SL: {sl:.8f} (+{sl_percent:.2f}%)"
+        structure_text = f"📉 Support: {structure:.8f}"
 
     return (
         "🚨 SCORE HUNTER 4H 🚨\n\n"
-        f"💰 {symbol}USDT\n"
-        f"{direction_text}\n"
-        f"⭐ Score: {score}/7\n"
-        f"💵 Entry: {entry:.8f}\n"
-        f"{tp_text}\n"
-        f"{sl_text}\n\n"
-        "⏱ Timeframe: 4H\n"
-        "🕯 Closed candle confirmation\n"
-        f"📐 ATR: {current_atr:.8f}\n"
-        "⚖️ Risk/Reward: 1:2\n"
-        "⚠️ Manage risk."
+        f"💰 {symbol}USDT\n{direction_text}\n"
+        f"⭐ Score: {score}/7\n🏆 Setup Quality: {quality}\n"
+        f"💵 Entry: {entry:.8f}\n{tp_text}\n{sl_text}\n"
+        f"{structure_text}\n\n"
+        "⏱ Timeframe: 4H\n🕯 Closed candle confirmation\n"
+        f"📐 ATR: {atr_value:.8f}\n"
+        "🧠 Smart TP: ATR + Market Structure\n"
+        "🔴 C setup disabled\n⚠️ Manage risk."
     )
 
 
@@ -466,11 +452,9 @@ def main():
         f"🛑 SL: {SL_ATR_MULTIPLIER} ATR"
     )
     print("⚖️ Risk/Reward: 1:2")
-    print(
-        f"📐 TP SPACE FILTER: ON | "
-        f"lookback={TP_SPACE_LOOKBACK} | "
-        f"buffer={TP_SPACE_BUFFER_PERCENT}%"
-    )
+    print("🧠 SMART TP: ON | 2 ATR base + support/resistance")
+    print(f"🟡 B SETUP: minimum usable TP space = 1.2 ATR | buffer={TP_SPACE_BUFFER_PERCENT}%")
+    print("🔴 C SETUP: DISABLED (NO SIGNAL)")
 
     state = load_state()
 
