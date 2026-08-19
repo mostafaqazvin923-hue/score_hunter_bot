@@ -14,7 +14,8 @@
     "signal_candle": 1786363200,
     "signal_time": 1786379900,
     "last_checked_1h": 1786888800,
-    "last_checked_candle_utc": "2026-08-19 00:00:00"
+    "last_checked_candle_utc": "2026-08-19 00:00:00",
+    "last_checked_1h_candle": 1787151600
   },
   "SOL": {
     "last_signal": {
@@ -34,7 +35,8 @@
     "signal_candle": 1786665600,
     "signal_time": 1786688500,
     "last_checked_1h": 1786888800,
-    "last_checked_candle_utc": "2026-08-19 00:00:00"
+    "last_checked_candle_utc": "2026-08-19 00:00:00",
+    "last_checked_1h_candle": 1787151600
   },
   "XRP": {
     "price": 1.0220175008542913,
@@ -59,7 +61,8 @@
     "last_checked_1h": 1786888800,
     "last_signal_id": "1786867200_SHORT",
     "last_checked_candle_utc": "2026-08-19 00:00:00",
-    "signal_candle_utc": "2026-08-19 00:00:00"
+    "signal_candle_utc": "2026-08-19 00:00:00",
+    "last_checked_1h_candle": 1787151600
   },
   "BTC": {
     "last_checked_1h": 1786888800,
@@ -75,7 +78,8 @@
     "trade_result_price": null,
     "trade_result_time": null,
     "last_checked_candle": 1787126400,
-    "last_checked_candle_utc": "2026-08-19 00:00:00"
+    "last_checked_candle_utc": "2026-08-19 00:00:00",
+    "last_checked_1h_candle": 1787151600
   },
   "ADA": {
     "last_checked_1h": 1786888800,
@@ -91,7 +95,8 @@
     "trade_result_price": null,
     "trade_result_time": null,
     "last_checked_candle": 1787126400,
-    "last_checked_candle_utc": "2026-08-19 00:00:00"
+    "last_checked_candle_utc": "2026-08-19 00:00:00",
+    "last_checked_1h_candle": 1787151600
   },
   "LINK": {
     "last_checked_candle": 1787126400,
@@ -104,7 +109,8 @@
     "signal_time": 1786913143,
     "last_checked_1h": 1786888800,
     "last_signal_id": "1786863600_LONG",
-    "last_checked_candle_utc": "2026-08-19 00:00:00"
+    "last_checked_candle_utc": "2026-08-19 00:00:00",
+    "last_checked_1h_candle": 1787151600
   },
   "DOGE": {
     "last_checked_candle": 1787126400,
@@ -124,6 +130,7 @@
     "signal_time": 1787115895,
     "last_checked_1h": 1786888800,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
-    "signal_candle_utc": "2026-08-19 00:00:00"
+    "signal_candle_utc": "2026-08-19 00:00:00",
+    "last_checked_1h_candle": 1787151600
   }
 }
