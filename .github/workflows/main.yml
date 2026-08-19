@@ -2,8 +2,14 @@ name: Score Hunter Bot
 
 on:
   workflow_dispatch:
+
   schedule:
-    - cron: "*/5 * * * *"
+    # Run once every hour, around minute 5
+    - cron: "5 * * * *"
+
+concurrency:
+  group: score-hunter-bot
+  cancel-in-progress: false
 
 permissions:
   contents: write
