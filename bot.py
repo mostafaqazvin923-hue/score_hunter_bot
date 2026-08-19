@@ -18,6 +18,14 @@ MIN_STRUCTURE_SPACE_ATR = 0.25
 MIN_CANDLE_BODY_RATIO = 0.50
 MAX_OPPOSITE_WICK_RATIO = 0.30
 
+# Pullback Entry Filter (1H)
+# Do not chase extended price after a strong move. The latest closed 1H
+# candle must confirm a recent pullback toward EMA20, and price must remain
+# reasonably close to EMA20/EMA50.
+PULLBACK_LOOKBACK = 3
+MAX_ENTRY_DISTANCE_EMA20_ATR = 0.75
+MAX_ENTRY_DISTANCE_EMA50_ATR = 1.50
+
 # ATR-BASED RISK MANAGEMENT
 SL_ATR_MULTIPLIER = 1.0
 TP_ATR_MULTIPLIER = 2.0
@@ -219,6 +227,46 @@ def has_structure_space(candles, direction, entry, current_atr, lookback=20):
     return (entry - support >= min_space) and (support <= tp - tp_distance * buffer)
 
 
+def has_pullback_entry(candles, direction, entry, ema20, ema50, current_atr, lookback=PULLBACK_LOOKBACK):
+    """
+    Dedicated 1H pullback gate.
+
+    LONG:
+      - A recent closed 1H candle (including the latest) must touch/retest EMA20.
+      - Latest close must be back above EMA20.
+      - Entry cannot be too far above EMA20 or EMA50.
+
+    SHORT is the exact mirror image.
+    """
+    if len(candles) < lookback + 2 or current_atr <= 0:
+        return False
+
+    recent = candles[-lookback:]
+    touched_ema20 = any(c["low"] <= ema20 for c in recent) if direction == "LONG" else any(c["high"] >= ema20 for c in recent)
+
+    if direction == "LONG":
+        confirmation = candles[-1]["close"] > ema20
+        distance_ema20 = (entry - ema20) / current_atr
+        distance_ema50 = (entry - ema50) / current_atr
+        return (
+            touched_ema20
+            and confirmation
+            and distance_ema20 <= MAX_ENTRY_DISTANCE_EMA20_ATR
+            and distance_ema50 <= MAX_ENTRY_DISTANCE_EMA50_ATR
+        )
+
+    touched_ema20 = any(c["high"] >= ema20 for c in recent)
+    confirmation = candles[-1]["close"] < ema20
+    distance_ema20 = (ema20 - entry) / current_atr
+    distance_ema50 = (ema50 - entry) / current_atr
+    return (
+        touched_ema20
+        and confirmation
+        and distance_ema20 <= MAX_ENTRY_DISTANCE_EMA20_ATR
+        and distance_ema50 <= MAX_ENTRY_DISTANCE_EMA50_ATR
+    )
+
+
 def get_4h_trend(candles, symbol):
     if len(candles) < 210:
         return None
@@ -320,16 +368,22 @@ def calculate_signal(candles_1h, candles_4h, symbol):
     print("====================")
 
     if trend_4h == "LONG" and long_score >= REQUIRED_SCORE:
+        if not has_pullback_entry(candles_1h, "LONG", close, ema20, ema50, current_atr):
+            print(f"{symbol}: LONG rejected - no valid 1H pullback/retest entry")
+            return None
         if not has_structure_space(candles_1h, "LONG", close, current_atr):
             print(f"{symbol}: LONG rejected - insufficient 1H structure space")
             return None
         return {"direction":"LONG", "score":long_score, "price":close, "atr":current_atr, "htf":"4H LONG", "entry_tf":"1H"}
 
     if trend_4h == "SHORT" and short_score >= REQUIRED_SCORE:
+        if not has_pullback_entry(candles_1h, "SHORT", close, ema20, ema50, current_atr):
+            print(f"{symbol}: SHORT rejected - no valid 1H pullback/retest entry")
+            return None
         if not has_structure_space(candles_1h, "SHORT", close, current_atr):
             print(f"{symbol}: SHORT rejected - insufficient 1H structure space")
             return None
-        return {"direction":"SHORT", "score":short_score, "price":close, "atr":current_atr, "htf":"4H SHORT", "entry_tf":"1H"}
+        return {"direction":"SHORT", "score":short_score,"price":close,"atr":current_atr,"htf":"4H SHORT","entry_tf":"1H"}
 
     return None
 
@@ -361,6 +415,7 @@ def create_message(symbol, signal):
             f"📐 1H ATR: {current_atr:.8f}\n"
             "🧠 4H Trend Filter: EMA50/EMA200 + slope\n"
             "📏 1H Structure Space: 0.25 ATR\n"
+            "🧲 1H Pullback + EMA20/50 Entry Filter\n"
             "⚖️ Risk/Reward: 1:2\n"
             "⚠️ Manage risk.")
 
@@ -378,6 +433,7 @@ def main():
     print(f"📏 1H Structure Space: {MIN_STRUCTURE_SPACE_ATR:.2f} ATR")
     print(f"🕯 1H Candle Filter: body >= {MIN_CANDLE_BODY_RATIO:.0%}, opposite wick <= {MAX_OPPOSITE_WICK_RATIO:.0%}")
     print("📐 TP SPACE FILTER: ON | lookback=20 | buffer=0.1%")
+    print(f"🧲 1H PULLBACK FILTER: last {PULLBACK_LOOKBACK} candles | EMA20 distance <= {MAX_ENTRY_DISTANCE_EMA20_ATR:.2f} ATR | EMA50 distance <= {MAX_ENTRY_DISTANCE_EMA50_ATR:.2f} ATR")
 
     state = load_state()
     for symbol in COINS:
