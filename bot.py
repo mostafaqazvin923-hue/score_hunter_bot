@@ -4,9 +4,18 @@ import requests
 from datetime import datetime, timezone
 
 # ============================================================
-# SCORE HUNTER PRO v3
+# SCORE HUNTER PRO v4
 # 4H MAIN TREND + 1H ENTRY
 # CLOSED CANDLES ONLY
+#
+# v4:
+# - Minimum Score = 4/7
+# - Important Confirmations = 3/3
+# - Entry requires PULLBACK or BREAKOUT
+# - RSI >70 does NOT reject LONG
+# - Volume = BONUS ONLY
+# - TP = 2 ATR
+# - SL = 1 ATR
 # ============================================================
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -15,38 +24,23 @@ CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
 STATE_FILE = "state.json"
 
-# ============================================================
-# TIMEFRAMES
-# ============================================================
-
 INTERVAL_4H = 240
 INTERVAL_1H = 60
-
-# ============================================================
-# ENTRY RULES
-# ============================================================
 
 MINIMUM_SCORE = 4
 MIN_IMPORTANT_CONFIRMATIONS = 3
 
-# ============================================================
-# ATR RISK MANAGEMENT
-# ============================================================
-
 ATR_PERIOD = 14
+
 SL_ATR_MULTIPLIER = 1.0
 TP_ATR_MULTIPLIER = 2.0
-
-# ============================================================
-# TP SPACE FILTER
-# ============================================================
 
 TP_SPACE_LOOKBACK = 20
 TP_SPACE_BUFFER_PERCENT = 0.10
 
-# ============================================================
-# COINS
-# ============================================================
+# Pullback / Breakout settings
+PULLBACK_EMA_DISTANCE_ATR = 0.35
+BREAKOUT_LOOKBACK = 6
 
 COINS = {
     "ETH": "ETHUSDT",
@@ -90,19 +84,18 @@ def send_telegram(message):
         url,
         data={
             "chat_id": CHAT_ID,
-            "text": message,
+            "text": message
         },
-        timeout=20,
+        timeout=20
     )
 
     print("Telegram:", response.status_code)
-    print(response.text)
 
     response.raise_for_status()
 
 
 # ============================================================
-# MARKET DATA
+# KRAKEN DATA
 # ============================================================
 
 def get_ohlc(symbol, interval):
@@ -111,21 +104,21 @@ def get_ohlc(symbol, interval):
         KRAKEN_URL,
         params={
             "pair": COINS[symbol],
-            "interval": interval,
+            "interval": interval
         },
-        timeout=20,
+        timeout=20
     )
 
     response.raise_for_status()
 
-    payload = response.json()
+    data = response.json()
 
-    if payload.get("error"):
+    if data.get("error"):
         raise RuntimeError(
-            f"{symbol} Kraken API error: {payload['error']}"
+            f"{symbol} Kraken API error: {data['error']}"
         )
 
-    result = payload.get("result", {})
+    result = data.get("result", {})
 
     pair_key = next(
         (key for key in result if key != "last"),
@@ -147,15 +140,12 @@ def get_ohlc(symbol, interval):
             "high": float(row[2]),
             "low": float(row[3]),
             "close": float(row[4]),
-            "volume": float(row[6]),
+            "volume": float(row[6])
         })
 
-    # ========================================================
     # IMPORTANT:
-    # Remove currently forming candle.
-    # Only CLOSED candles are used.
-    # ========================================================
-
+    # Kraken returns the currently forming candle.
+    # Remove it so ONLY CLOSED candles are used.
     if len(candles) > 1:
         candles = candles[:-1]
 
@@ -170,10 +160,9 @@ def get_4h_data(symbol):
     )
 
     if len(candles) < 210:
-
         raise RuntimeError(
-            f"{symbol}: only "
-            f"{len(candles)} closed 4H candles available"
+            f"{symbol}: only {len(candles)} "
+            f"closed 4H candles available"
         )
 
     print(
@@ -192,10 +181,9 @@ def get_1h_data(symbol):
     )
 
     if len(candles) < 210:
-
         raise RuntimeError(
-            f"{symbol}: only "
-            f"{len(candles)} closed 1H candles available"
+            f"{symbol}: only {len(candles)} "
+            f"closed 1H candles available"
         )
 
     print(
@@ -207,7 +195,7 @@ def get_1h_data(symbol):
 
 
 # ============================================================
-# EMA
+# INDICATORS
 # ============================================================
 
 def ema(values, period):
@@ -224,17 +212,12 @@ def ema(values, period):
     for price in values[period:]:
 
         value = (
-            (price - value)
-            * multiplier
+            (price - value) * multiplier
             + value
         )
 
     return value
 
-
-# ============================================================
-# SMA
-# ============================================================
 
 def sma(values, period):
 
@@ -245,10 +228,6 @@ def sma(values, period):
         values[-period:]
     ) / period
 
-
-# ============================================================
-# RSI
-# ============================================================
 
 def rsi(values, period=14):
 
@@ -290,8 +269,7 @@ def rsi(values, period=14):
 
         avg_gain = (
             (
-                avg_gain
-                * (period - 1)
+                avg_gain * (period - 1)
                 + gains[i]
             )
             / period
@@ -299,8 +277,7 @@ def rsi(values, period=14):
 
         avg_loss = (
             (
-                avg_loss
-                * (period - 1)
+                avg_loss * (period - 1)
                 + losses[i]
             )
             / period
@@ -311,18 +288,10 @@ def rsi(values, period=14):
 
     rs = avg_gain / avg_loss
 
-    return (
-        100.0
-        - (
-            100.0
-            / (1.0 + rs)
-        )
+    return 100.0 - (
+        100.0 / (1.0 + rs)
     )
 
-
-# ============================================================
-# ATR
-# ============================================================
 
 def atr(
     highs,
@@ -338,32 +307,28 @@ def atr(
 
     for i in range(1, len(closes)):
 
-        true_ranges.append(
-            max(
-                highs[i] - lows[i],
-
-                abs(
-                    highs[i]
-                    - closes[i - 1]
-                ),
-
-                abs(
-                    lows[i]
-                    - closes[i - 1]
-                ),
+        tr = max(
+            highs[i] - lows[i],
+            abs(
+                highs[i]
+                - closes[i - 1]
+            ),
+            abs(
+                lows[i]
+                - closes[i - 1]
             )
         )
 
+        true_ranges.append(tr)
+
     return (
-        sum(
-            true_ranges[-period:]
-        )
+        sum(true_ranges[-period:])
         / period
     )
 
 
 # ============================================================
-# 4H MAIN TREND
+# 4H TREND
 # ============================================================
 
 def get_4h_direction(candles):
@@ -391,7 +356,7 @@ def get_4h_direction(candles):
     info = {
         "ema20": ema20,
         "ema50": ema50,
-        "ema200": ema200,
+        "ema200": ema200
     }
 
     if any(
@@ -402,37 +367,27 @@ def get_4h_direction(candles):
 
     close = closes[-1]
 
-    # ========================================================
-    # 4H BULLISH
-    # ========================================================
-
+    # MAIN LONG TREND
     if (
         close > ema200
-        and ema20 > ema50 > ema200
+        and ema20 > ema50
+        and ema50 > ema200
     ):
-
         return "LONG", info
 
-    # ========================================================
-    # 4H BEARISH
-    # ========================================================
-
+    # MAIN SHORT TREND
     if (
         close < ema200
-        and ema20 < ema50 < ema200
+        and ema20 < ema50
+        and ema50 < ema200
     ):
-
         return "SHORT", info
-
-    # ========================================================
-    # NO CLEAR TREND
-    # ========================================================
 
     return None, info
 
 
 # ============================================================
-# ATR TP / SL
+# TP / SL
 # ============================================================
 
 def get_risk_levels(
@@ -499,7 +454,6 @@ def has_tp_space(
     ):
         return False, None
 
-    # Exclude current signal candle
     lookback = candles[
         -(TP_SPACE_LOOKBACK + 1):-1
     ]
@@ -518,16 +472,16 @@ def has_tp_space(
         / 100.0
     )
 
-    # ========================================================
-    # LONG
-    # ========================================================
-
     if direction == "LONG":
 
         blockers = [
             c["high"]
             for c in lookback
-            if entry < c["high"] < tp
+            if (
+                entry
+                < c["high"]
+                < tp
+            )
         ]
 
         nearest = (
@@ -540,37 +494,179 @@ def has_tp_space(
             return True, None
 
         return (
-            nearest < tp - buffer,
             nearest
+            < tp - buffer
+        ), nearest
+
+    else:
+
+        blockers = [
+            c["low"]
+            for c in lookback
+            if (
+                tp
+                < c["low"]
+                < entry
+            )
+        ]
+
+        nearest = (
+            max(blockers)
+            if blockers
+            else None
         )
 
-    # ========================================================
-    # SHORT
-    # ========================================================
+        if nearest is None:
+            return True, None
 
-    blockers = [
-        c["low"]
-        for c in lookback
-        if tp < c["low"] < entry
-    ]
+        return (
+            nearest
+            > tp + buffer
+        ), nearest
 
-    nearest = (
-        max(blockers)
-        if blockers
-        else None
+
+# ============================================================
+# v4 ENTRY SETUP
+# ============================================================
+
+def get_entry_setup(
+    candles,
+    direction,
+    current_atr,
+    ema20
+):
+
+    """
+    v4 requires ONE of:
+
+    A) Pullback + reaction from EMA20
+
+    OR
+
+    B) Breakout of recent 1H structure
+
+    Volume is NOT mandatory.
+    """
+
+    if len(candles) < max(
+        BREAKOUT_LOOKBACK + 2,
+        25
+    ):
+        return (
+            False,
+            False,
+            False
+        )
+
+    c = candles[-1]
+    previous = candles[-2]
+
+    close = c["close"]
+    high = c["high"]
+    low = c["low"]
+
+    # --------------------------------------------------------
+    # PULLBACK
+    # --------------------------------------------------------
+
+    distance = (
+        current_atr
+        * PULLBACK_EMA_DISTANCE_ATR
     )
 
-    if nearest is None:
-        return True, None
+    if direction == "LONG":
+
+        pullback_test = (
+            low
+            <= ema20 + distance
+            and
+            low
+            >= ema20 - distance
+        )
+
+        bullish_reaction = (
+            close > ema20
+            and
+            close > c["open"]
+            and
+            close >= previous["close"]
+        )
+
+        pullback = (
+            pullback_test
+            and
+            bullish_reaction
+        )
+
+    else:
+
+        pullback_test = (
+            high
+            >= ema20 - distance
+            and
+            high
+            <= ema20 + distance
+        )
+
+        bearish_reaction = (
+            close < ema20
+            and
+            close < c["open"]
+            and
+            close <= previous["close"]
+        )
+
+        pullback = (
+            pullback_test
+            and
+            bearish_reaction
+        )
+
+    # --------------------------------------------------------
+    # BREAKOUT
+    # --------------------------------------------------------
+
+    structure = candles[
+        -(BREAKOUT_LOOKBACK + 1):-1
+    ]
+
+    recent_high = max(
+        x["high"]
+        for x in structure
+    )
+
+    recent_low = min(
+        x["low"]
+        for x in structure
+    )
+
+    if direction == "LONG":
+
+        breakout = (
+            close > recent_high
+        )
+
+    else:
+
+        breakout = (
+            close < recent_low
+        )
+
+    entry_setup = (
+        pullback
+        or
+        breakout
+    )
 
     return (
-        nearest > tp + buffer,
-        nearest
+        entry_setup,
+        pullback,
+        breakout
     )
 
 
 # ============================================================
-# 1H ENTRY
+# 1H SIGNAL
 # ============================================================
 
 def calculate_1h_signal(
@@ -608,10 +704,6 @@ def calculate_1h_signal(
     high = highs[-1]
     low = lows[-1]
     close = closes[-1]
-
-    # ========================================================
-    # INDICATORS
-    # ========================================================
 
     ema20 = ema(
         closes,
@@ -655,18 +747,20 @@ def calculate_1h_signal(
         ATR_PERIOD
     )
 
+    required = [
+        ema20,
+        ema50,
+        ema200,
+        previous_ema20,
+        current_rsi,
+        previous_rsi,
+        volume_ma,
+        current_atr
+    ]
+
     if any(
         x is None
-        for x in [
-            ema20,
-            ema50,
-            ema200,
-            previous_ema20,
-            current_rsi,
-            previous_rsi,
-            volume_ma,
-            current_atr
-        ]
+        for x in required
     ):
         return None
 
@@ -679,14 +773,16 @@ def calculate_1h_signal(
 
         trend_confirmation = (
             close > ema200
-            and ema20 > ema50
+            and
+            ema20 > ema50
         )
 
     else:
 
         trend_confirmation = (
             close < ema200
-            and ema20 < ema50
+            and
+            ema20 < ema50
         )
 
     # ========================================================
@@ -698,21 +794,25 @@ def calculate_1h_signal(
 
         momentum_confirmation = (
             close > closes[-2]
-            and ema20 >= previous_ema20
-            and current_rsi >= previous_rsi
+            and
+            ema20 >= previous_ema20
+            and
+            current_rsi >= previous_rsi
         )
 
     else:
 
         momentum_confirmation = (
             close < closes[-2]
-            and ema20 <= previous_ema20
-            and current_rsi <= previous_rsi
+            and
+            ema20 <= previous_ema20
+            and
+            current_rsi <= previous_rsi
         )
 
     # ========================================================
     # IMPORTANT CONFIRMATION 3
-    # MARKET STRUCTURE
+    # STRUCTURE
     # ========================================================
 
     recent_high = max(
@@ -727,15 +827,13 @@ def calculate_1h_signal(
 
         structure_confirmation = (
             close > recent_high
-
-            or (
-
+            or
+            (
                 close > ema20
-
-                and close > closes[-2]
-
-                and highs[-1] >= highs[-2]
-
+                and
+                close > closes[-2]
+                and
+                highs[-1] >= highs[-2]
             )
         )
 
@@ -743,15 +841,13 @@ def calculate_1h_signal(
 
         structure_confirmation = (
             close < recent_low
-
-            or (
-
+            or
+            (
                 close < ema20
-
-                and close < closes[-2]
-
-                and lows[-1] <= lows[-2]
-
+                and
+                close < closes[-2]
+                and
+                lows[-1] <= lows[-2]
             )
         )
 
@@ -759,22 +855,23 @@ def calculate_1h_signal(
     # SCORE 4
     # RSI REGIME
     #
-    # RSI > 70 DOES NOT REJECT LONG
-    # RSI < 30 DOES NOT REJECT SHORT
+    # RSI >70 DOES NOT REJECT LONG
     # ========================================================
 
     if direction == "LONG":
 
         rsi_confirmation = (
             current_rsi >= 50
-            and current_rsi > previous_rsi
+            and
+            current_rsi > previous_rsi
         )
 
     else:
 
         rsi_confirmation = (
             current_rsi <= 50
-            and current_rsi < previous_rsi
+            and
+            current_rsi < previous_rsi
         )
 
     # ========================================================
@@ -789,32 +886,32 @@ def calculate_1h_signal(
     if candle_range > 0:
 
         bull_body_ratio = (
-            (close - open_price)
-            / candle_range
-        )
+            close - open_price
+        ) / candle_range
 
         bear_body_ratio = (
-            (open_price - close)
-            / candle_range
-        )
+            open_price - close
+        ) / candle_range
 
     else:
 
-        bull_body_ratio = 0.0
-        bear_body_ratio = 0.0
+        bull_body_ratio = 0
+        bear_body_ratio = 0
 
     if direction == "LONG":
 
         candle_confirmation = (
             close > open_price
-            and bull_body_ratio >= 0.35
+            and
+            bull_body_ratio >= 0.35
         )
 
     else:
 
         candle_confirmation = (
             close < open_price
-            and bear_body_ratio >= 0.35
+            and
+            bear_body_ratio >= 0.35
         )
 
     # ========================================================
@@ -826,19 +923,21 @@ def calculate_1h_signal(
 
         ema_confirmation = (
             close > ema20
-            and ema20 > ema50
+            and
+            ema20 > ema50
         )
 
     else:
 
         ema_confirmation = (
             close < ema20
-            and ema20 < ema50
+            and
+            ema20 < ema50
         )
 
     # ========================================================
     # SCORE 7
-    # VOLUME = BONUS ONLY
+    # VOLUME BONUS ONLY
     # ========================================================
 
     volume_bonus = (
@@ -847,84 +946,50 @@ def calculate_1h_signal(
     )
 
     # ========================================================
-    # PULLBACK
-    #
-    # OPTIONAL
-    # NOT A GATE
+    # v4 ENTRY GATE
     # ========================================================
 
-    if direction == "LONG":
-
-        pullback_present = (
-            low <= ema20
-            and close > ema20
-        )
-
-    else:
-
-        pullback_present = (
-            high >= ema20
-            and close < ema20
-        )
+    (
+        entry_setup,
+        pullback,
+        breakout
+    ) = get_entry_setup(
+        candles,
+        direction,
+        current_atr,
+        ema20
+    )
 
     # ========================================================
-    # FINAL SCORE
+    # SCORE
     # ========================================================
 
     score = (
-
-        int(
-            trend_confirmation
-        )
-
-        + int(
-            momentum_confirmation
-        )
-
-        + int(
-            structure_confirmation
-        )
-
-        + int(
-            rsi_confirmation
-        )
-
-        + int(
-            candle_confirmation
-        )
-
-        + int(
-            ema_confirmation
-        )
-
-        + int(
-            volume_bonus
-        )
-
+        int(trend_confirmation)
+        +
+        int(momentum_confirmation)
+        +
+        int(structure_confirmation)
+        +
+        int(rsi_confirmation)
+        +
+        int(candle_confirmation)
+        +
+        int(ema_confirmation)
+        +
+        int(volume_bonus)
     )
-
-    # ========================================================
-    # IMPORTANT CONFIRMATIONS
-    # ========================================================
 
     important_confirmations = (
-
-        int(
-            trend_confirmation
-        )
-
-        + int(
-            momentum_confirmation
-        )
-
-        + int(
-            structure_confirmation
-        )
-
+        int(trend_confirmation)
+        +
+        int(momentum_confirmation)
+        +
+        int(structure_confirmation)
     )
 
     # ========================================================
-    # ATR
+    # TP / SL
     # ========================================================
 
     tp, sl, tp_distance, sl_distance = (
@@ -951,7 +1016,7 @@ def calculate_1h_signal(
     # ========================================================
 
     print(
-        f"\n===== {symbol} 1H ENTRY ====="
+        f"\n===== {symbol} 1H ENTRY v4 ====="
     )
 
     print(
@@ -976,6 +1041,10 @@ def calculate_1h_signal(
 
     print(
         f"EMA200: {ema200:.8f}"
+    )
+
+    print(
+        f"ATR: {current_atr:.8f}"
     )
 
     print(
@@ -1010,8 +1079,18 @@ def calculate_1h_signal(
     )
 
     print(
-        f"Pullback present: "
-        f"{pullback_present}"
+        f"Pullback setup: "
+        f"{pullback}"
+    )
+
+    print(
+        f"Breakout setup: "
+        f"{breakout}"
+    )
+
+    print(
+        f"ENTRY SETUP: "
+        f"{entry_setup}"
     )
 
     print(
@@ -1024,7 +1103,7 @@ def calculate_1h_signal(
     )
 
     print(
-        f"TP/SL: "
+        f"LONG/SHORT TP/SL: "
         f"{tp:.8f} / {sl:.8f}"
     )
 
@@ -1044,8 +1123,8 @@ def calculate_1h_signal(
     )
 
     # ========================================================
-    # ENTRY GATE 1
-    # SCORE >= 4
+    # FILTER 1
+    # SCORE
     # ========================================================
 
     if score < MINIMUM_SCORE:
@@ -1059,8 +1138,8 @@ def calculate_1h_signal(
         return None
 
     # ========================================================
-    # ENTRY GATE 2
-    # 3 IMPORTANT CONFIRMATIONS
+    # FILTER 2
+    # IMPORTANT CONFIRMATIONS
     # ========================================================
 
     if (
@@ -1070,14 +1149,29 @@ def calculate_1h_signal(
 
         print(
             f"{symbol}: rejected - "
-            f"only {important_confirmations}/3 "
+            f"only "
+            f"{important_confirmations}/3 "
             f"important confirmations"
         )
 
         return None
 
     # ========================================================
-    # ENTRY GATE 3
+    # FILTER 3
+    # PULLBACK OR BREAKOUT
+    # ========================================================
+
+    if not entry_setup:
+
+        print(
+            f"{symbol}: rejected - "
+            f"no Pullback/Breakout setup"
+        )
+
+        return None
+
+    # ========================================================
+    # FILTER 4
     # TP SPACE
     # ========================================================
 
@@ -1085,39 +1179,25 @@ def calculate_1h_signal(
 
         print(
             f"{symbol}: rejected - "
-            f"insufficient space for 2 ATR TP"
+            f"insufficient space "
+            f"for 2 ATR TP"
         )
 
         return None
 
-    # ========================================================
-    # VALID SIGNAL
-    # ========================================================
-
     return {
-
         "direction": direction,
-
         "score": score,
-
         "important_confirmations":
             important_confirmations,
-
         "price": close,
-
         "atr": current_atr,
-
         "rsi": current_rsi,
-
-        "volume_bonus":
-            volume_bonus,
-
-        "pullback_present":
-            pullback_present,
-
+        "volume_bonus": volume_bonus,
+        "pullback": pullback,
+        "breakout": breakout,
         "candle_time":
             candles[-1]["time"]
-
     }
 
 
@@ -1142,8 +1222,7 @@ def calculate_signal(
     )
 
     print(
-        f"\n===== {symbol} "
-        f"4H DIRECTION ====="
+        f"\n===== {symbol} 4H DIRECTION ====="
     )
 
     print(
@@ -1175,10 +1254,6 @@ def calculate_signal(
         "=============================="
     )
 
-    # ========================================================
-    # NO CLEAR 4H TREND = NO TRADE
-    # ========================================================
-
     if direction is None:
 
         print(
@@ -1187,10 +1262,6 @@ def calculate_signal(
         )
 
         return None
-
-    # ========================================================
-    # 1H ENTRY
-    # ========================================================
 
     return calculate_1h_signal(
         candles_1h,
@@ -1220,24 +1291,27 @@ def create_message(
         signal["atr"]
     )
 
-    tp, sl, tp_distance, sl_distance = (
-        get_risk_levels(
-            direction,
-            entry,
-            current_atr
-        )
+    (
+        tp,
+        sl,
+        tp_distance,
+        sl_distance
+    ) = get_risk_levels(
+        direction,
+        entry,
+        current_atr
     )
 
     tp_percent = (
         tp_distance
         / entry
-        * 100.0
+        * 100
     )
 
     sl_percent = (
         sl_distance
         / entry
-        * 100.0
+        * 100
     )
 
     if direction == "LONG":
@@ -1272,21 +1346,34 @@ def create_message(
             f"(+{sl_percent:.2f}%)"
         )
 
-    volume_text = (
-        "✅ Bonus"
-        if signal["volume_bonus"]
-        else "➖ No bonus"
-    )
+    if signal["volume_bonus"]:
 
-    pullback_text = (
-        "✅ Present"
-        if signal["pullback_present"]
-        else "➖ Not required"
-    )
+        volume_text = "✅ Bonus"
+
+    else:
+
+        volume_text = "➖ No bonus"
+
+    if signal["pullback"]:
+
+        setup_text = (
+            "↩️ Entry Setup: PULLBACK"
+        )
+
+    elif signal["breakout"]:
+
+        setup_text = (
+            "🚀 Entry Setup: BREAKOUT"
+        )
+
+    else:
+
+        setup_text = (
+            "❌ Entry Setup: NONE"
+        )
 
     return (
-
-        "🚨 SCORE HUNTER PRO v3 🚨\n\n"
+        "🚨 SCORE HUNTER PRO v4 🚨\n\n"
 
         f"💰 {symbol}USDT\n"
 
@@ -1313,18 +1400,19 @@ def create_message(
 
         "🚫 No mid-candle signal\n"
 
+        f"{setup_text}\n"
+
         f"📊 Volume: "
         f"{volume_text}\n"
 
-        f"↩️ Pullback: "
-        f"{pullback_text}\n"
+        "📈 RSI >70: "
+        "NOT automatic rejection\n"
 
         "📐 TP: 2 ATR | SL: 1 ATR\n"
 
         "⚖️ Risk/Reward: 1:2\n"
 
         "⚠️ Manage risk."
-
     )
 
 
@@ -1335,7 +1423,7 @@ def create_message(
 def main():
 
     print(
-        "\n🟢 SCORE HUNTER PRO v3"
+        "\n🟢 SCORE HUNTER PRO v4"
     )
 
     print(
@@ -1371,7 +1459,8 @@ def main():
     )
 
     print(
-        "↩️ Pullback: OPTIONAL"
+        "↩️ Entry: "
+        "PULLBACK OR BREAKOUT"
     )
 
     print(
@@ -1398,8 +1487,7 @@ def main():
     print(
         f"📐 TP SPACE FILTER: ON | "
         f"lookback={TP_SPACE_LOOKBACK} | "
-        f"buffer="
-        f"{TP_SPACE_BUFFER_PERCENT}%"
+        f"buffer={TP_SPACE_BUFFER_PERCENT}%"
     )
 
     state = load_state()
@@ -1408,21 +1496,18 @@ def main():
 
         print(
             f"\n\n========== "
-            f"{symbol} =========="
+            f"{symbol} "
+            f"=========="
         )
 
         try:
 
             candles_4h = (
-                get_4h_data(
-                    symbol
-                )
+                get_4h_data(symbol)
             )
 
             candles_1h = (
-                get_1h_data(
-                    symbol
-                )
+                get_1h_data(symbol)
             )
 
             latest_4h_time = (
@@ -1447,21 +1532,19 @@ def main():
             )
 
             print(
-                f"{symbol} latest "
-                f"CLOSED 4H candle: "
+                f"{symbol} latest CLOSED "
+                f"4H candle: "
                 f"{latest_4h_time}"
             )
 
             print(
-                f"{symbol} latest "
-                f"CLOSED 1H candle: "
+                f"{symbol} latest CLOSED "
+                f"1H candle: "
                 f"{latest_1h_time}"
             )
 
-            # =================================================
-            # ONLY SCAN A NEW CLOSED 1H CANDLE
-            # =================================================
-
+            # Prevent repeated analysis
+            # of the same closed candle.
             if (
                 previous_1h_time
                 == latest_1h_time
@@ -1469,18 +1552,16 @@ def main():
 
                 print(
                     f"{symbol}: "
-                    f"No new closed 1H candle."
+                    f"No new closed "
+                    f"1H candle."
                 )
 
                 continue
 
+            # Mark candle as checked
             coin_state[
                 "last_checked_1h_candle"
             ] = latest_1h_time
-
-            # =================================================
-            # CALCULATE SIGNAL
-            # =================================================
 
             signal = calculate_signal(
                 candles_4h,
@@ -1492,22 +1573,16 @@ def main():
 
                 print(
                     f"{symbol}: "
-                    f"No valid 1H entry."
+                    f"No valid signal."
                 )
 
                 state[symbol] = (
                     coin_state
                 )
 
-                save_state(
-                    state
-                )
+                save_state(state)
 
                 continue
-
-            # =================================================
-            # SEND TELEGRAM
-            # =================================================
 
             message = (
                 create_message(
@@ -1519,10 +1594,6 @@ def main():
             send_telegram(
                 message
             )
-
-            # =================================================
-            # SAVE SIGNAL
-            # =================================================
 
             coin_state[
                 "last_signal"
@@ -1544,9 +1615,7 @@ def main():
                 coin_state
             )
 
-            save_state(
-                state
-            )
+            save_state(state)
 
             print(
                 f"🚨 {symbol}: "
@@ -1557,15 +1626,12 @@ def main():
 
             print(
                 f"❌ {symbol} ERROR: "
-                f"{type(e).__name__}: "
-                f"{e}"
+                f"{type(e).__name__}: {e}"
             )
 
             continue
 
-    save_state(
-        state
-    )
+    save_state(state)
 
     print(
         "\n✅ ALL COINS SCANNED"
