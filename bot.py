@@ -5,19 +5,19 @@ from datetime import datetime, timezone
 
 
 # ============================================================
-# SCORE HUNTER PRO v6
+# SCORE HUNTER PRO v7
 #
 # 4H TREND
 # +
-# 1H PULLBACK
+# 1H PULLBACK OR BREAKOUT
 # +
-# ADX TREND STRENGTH
+# ADX
 # +
-# MARKET STRUCTURE BREAK
+# MARKET STRUCTURE
+# +
+# CLOSED CANDLE ONLY
 # +
 # ATR RISK MANAGEMENT
-#
-# CLOSED CANDLES ONLY
 # ============================================================
 
 
@@ -45,7 +45,7 @@ INTERVAL_1H = 60
 
 
 # ============================================================
-# SYMBOLS
+# COINS
 # ============================================================
 
 COINS = {
@@ -60,32 +60,36 @@ COINS = {
 
 
 # ============================================================
-# INDICATOR SETTINGS
+# INDICATORS
 # ============================================================
 
-EMA_FAST = 20
-EMA_MID = 50
-EMA_SLOW = 200
-
-ADX_PERIOD = 14
-ADX_MIN = 20.0
+EMA20 = 20
+EMA50 = 50
+EMA200 = 200
 
 RSI_PERIOD = 14
-
 ATR_PERIOD = 14
+ADX_PERIOD = 14
 
-# Pullback must have happened recently
+ADX_MIN = 20.0
+
+# Recent pullback search
 PULLBACK_LOOKBACK = 8
 
-# Market structure
-STRUCTURE_LOOKBACK = 3
+# Structure breakout
+STRUCTURE_LOOKBACK = 5
 
-# SL / TP
-SL_ATR_MULTIPLIER = 1.5
-TP_ATR_MULTIPLIER = 2.5
+# Price proximity to EMA
+EMA_PULLBACK_ATR = 1.0
 
-# Minimum TP space
-MIN_RR = 1.50
+# Risk
+SL_ATR = 1.5
+
+# Reward
+TP_R_MULTIPLE = 2.0
+
+# Minimum RR
+MIN_RR = 1.5
 
 
 # ============================================================
@@ -112,7 +116,10 @@ def load_state():
 
     except Exception as e:
 
-        print(f"⚠️ State load error: {e}")
+        print(
+            f"⚠️ State load error: {e}"
+        )
+
         return {}
 
 
@@ -155,7 +162,7 @@ def send_telegram(message):
 
 
 # ============================================================
-# KRAKEN DATA
+# KRAKEN OHLC
 # ============================================================
 
 def get_ohlc(symbol, interval):
@@ -183,9 +190,9 @@ def get_ohlc(symbol, interval):
 
     pair_key = next(
         (
-            key
-            for key in result
-            if key != "last"
+            k
+            for k in result
+            if k != "last"
         ),
         None
     )
@@ -208,15 +215,7 @@ def get_ohlc(symbol, interval):
             "volume": float(row[6])
         })
 
-    # --------------------------------------------------------
-    # IMPORTANT
-    #
-    # Kraken normally returns the currently forming candle
-    # as the final candle.
-    #
-    # Remove it.
-    # --------------------------------------------------------
-
+    # Remove currently forming candle.
     if len(candles) > 1:
         candles = candles[:-1]
 
@@ -227,12 +226,12 @@ def get_ohlc(symbol, interval):
 # EMA
 # ============================================================
 
-def calculate_ema(values, period):
+def ema(values, period):
 
     if len(values) < period:
         return None
 
-    ema = (
+    result = (
         sum(values[:period])
         / period
     )
@@ -244,23 +243,20 @@ def calculate_ema(values, period):
 
     for value in values[period:]:
 
-        ema = (
-            (value - ema)
+        result = (
+            (value - result)
             * multiplier
-            + ema
+            + result
         )
 
-    return ema
+    return result
 
 
 # ============================================================
 # ATR
 # ============================================================
 
-def calculate_atr(
-    candles,
-    period=14
-):
+def atr(candles, period=14):
 
     if len(candles) < period + 1:
         return None
@@ -293,9 +289,6 @@ def calculate_atr(
 
         trs.append(tr)
 
-    if len(trs) < period:
-        return None
-
     return (
         sum(trs[-period:])
         / period
@@ -306,10 +299,7 @@ def calculate_atr(
 # RSI
 # ============================================================
 
-def calculate_rsi(
-    candles,
-    period=14
-):
+def rsi(candles, period=14):
 
     if len(candles) < period + 1:
         return None
@@ -376,7 +366,7 @@ def calculate_rsi(
     if avg_loss == 0:
         return 100.0
 
-    rs = (
+    rs_value = (
         avg_gain
         / avg_loss
     )
@@ -385,7 +375,7 @@ def calculate_rsi(
         100
         - (
             100
-            / (1 + rs)
+            / (1 + rs_value)
         )
     )
 
@@ -394,107 +384,104 @@ def calculate_rsi(
 # ADX
 # ============================================================
 
-def calculate_adx(
-    candles,
-    period=14
-):
+def adx(candles, period=14):
 
     if len(candles) < (
         period * 2 + 5
     ):
         return None
 
-    highs = [
-        c["high"]
-        for c in candles
-    ]
-
-    lows = [
-        c["low"]
-        for c in candles
-    ]
-
-    closes = [
-        c["close"]
-        for c in candles
-    ]
-
-    tr_values = []
-    plus_dm = []
-    minus_dm = []
+    tr_list = []
+    plus_dm_list = []
+    minus_dm_list = []
 
     for i in range(
         1,
         len(candles)
     ):
 
-        high = highs[i]
-        low = lows[i]
+        current = candles[i]
+        previous = candles[i - 1]
 
-        prev_high = highs[i - 1]
-        prev_low = lows[i - 1]
-        prev_close = closes[i - 1]
+        high = current["high"]
+        low = current["low"]
+
+        previous_high = (
+            previous["high"]
+        )
+
+        previous_low = (
+            previous["low"]
+        )
+
+        previous_close = (
+            previous["close"]
+        )
 
         tr = max(
             high - low,
             abs(
-                high - prev_close
+                high
+                - previous_close
             ),
             abs(
-                low - prev_close
+                low
+                - previous_close
             )
         )
 
         up_move = (
             high
-            - prev_high
+            - previous_high
         )
 
         down_move = (
-            prev_low
+            previous_low
             - low
         )
 
-        if (
-            up_move > down_move
-            and up_move > 0
-        ):
-            pdm = up_move
-        else:
-            pdm = 0.0
+        plus_dm = (
+            up_move
+            if (
+                up_move > down_move
+                and up_move > 0
+            )
+            else 0.0
+        )
 
-        if (
-            down_move > up_move
-            and down_move > 0
-        ):
-            mdm = down_move
-        else:
-            mdm = 0.0
+        minus_dm = (
+            down_move
+            if (
+                down_move > up_move
+                and down_move > 0
+            )
+            else 0.0
+        )
 
-        tr_values.append(tr)
-        plus_dm.append(pdm)
-        minus_dm.append(mdm)
+        tr_list.append(tr)
+        plus_dm_list.append(plus_dm)
+        minus_dm_list.append(minus_dm)
 
-    if len(tr_values) < period * 2:
+    if len(tr_list) < period * 2:
         return None
 
-    atr = (
+    atr_value = (
         sum(
-            tr_values[:period]
+            tr_list[:period]
         )
         / period
     )
 
-    plus = (
+    plus_value = (
         sum(
-            plus_dm[:period]
+            plus_dm_list[:period]
         )
         / period
     )
 
-    minus = (
+    minus_value = (
         sum(
-            minus_dm[:period]
+            minus_dm_list[:period]
         )
         / period
     )
@@ -503,46 +490,49 @@ def calculate_adx(
 
     for i in range(
         period,
-        len(tr_values)
+        len(tr_list)
     ):
 
-        atr = (
+        atr_value = (
             (
-                atr * (period - 1)
-                + tr_values[i]
+                atr_value
+                * (period - 1)
+                + tr_list[i]
             )
             / period
         )
 
-        plus = (
+        plus_value = (
             (
-                plus * (period - 1)
-                + plus_dm[i]
+                plus_value
+                * (period - 1)
+                + plus_dm_list[i]
             )
             / period
         )
 
-        minus = (
+        minus_value = (
             (
-                minus * (period - 1)
-                + minus_dm[i]
+                minus_value
+                * (period - 1)
+                + minus_dm_list[i]
             )
             / period
         )
 
-        if atr == 0:
+        if atr_value == 0:
             continue
 
         plus_di = (
             100
-            * plus
-            / atr
+            * plus_value
+            / atr_value
         )
 
         minus_di = (
             100
-            * minus
-            / atr
+            * minus_value
+            / atr_value
         )
 
         denominator = (
@@ -551,8 +541,11 @@ def calculate_adx(
         )
 
         if denominator == 0:
-            dx = 0
+
+            dx = 0.0
+
         else:
+
             dx = (
                 100
                 * abs(
@@ -567,7 +560,7 @@ def calculate_adx(
     if len(dx_values) < period:
         return None
 
-    adx = (
+    adx_value = (
         sum(
             dx_values[:period]
         )
@@ -576,77 +569,71 @@ def calculate_adx(
 
     for value in dx_values[period:]:
 
-        adx = (
+        adx_value = (
             (
-                adx * (period - 1)
+                adx_value
+                * (period - 1)
                 + value
             )
             / period
         )
 
-    return adx
+    return adx_value
 
 
 # ============================================================
 # 4H TREND
 # ============================================================
 
-def get_4h_trend(candles):
+def get_4h_direction(candles):
 
     closes = [
         c["close"]
         for c in candles
     ]
 
-    ema20 = calculate_ema(
-        closes,
-        EMA_FAST
-    )
-
-    ema50 = calculate_ema(
-        closes,
-        EMA_MID
-    )
-
-    ema200 = calculate_ema(
-        closes,
-        EMA_SLOW
-    )
-
     close = closes[-1]
 
+    ema20_value = ema(
+        closes,
+        EMA20
+    )
+
+    ema50_value = ema(
+        closes,
+        EMA50
+    )
+
+    ema200_value = ema(
+        closes,
+        EMA200
+    )
+
     if (
-        ema20 is None
-        or ema50 is None
-        or ema200 is None
+        ema20_value is None
+        or ema50_value is None
+        or ema200_value is None
     ):
+
         return None, {}
 
-    # --------------------------------------------------------
-    # STRONG LONG TREND
-    # --------------------------------------------------------
-
-    long_trend = (
-        close > ema200
-        and ema20 > ema50
-        and ema50 > ema200
+    long_condition = (
+        close > ema200_value
+        and ema20_value > ema50_value
+        and ema50_value > ema200_value
     )
 
-    # --------------------------------------------------------
-    # STRONG SHORT TREND
-    # --------------------------------------------------------
-
-    short_trend = (
-        close < ema200
-        and ema20 < ema50
-        and ema50 < ema200
+    short_condition = (
+        close < ema200_value
+        and ema20_value < ema50_value
+        and ema50_value < ema200_value
     )
 
-    if long_trend:
+    if long_condition:
 
         direction = "LONG"
 
-    elif short_trend:
+    elif short_condition:
 
         direction = "SHORT"
 
@@ -656,10 +643,28 @@ def get_4h_trend(candles):
 
     return direction, {
         "close": close,
-        "ema20": ema20,
-        "ema50": ema50,
-        "ema200": ema200
+        "ema20": ema20_value,
+        "ema50": ema50_value,
+        "ema200": ema200_value
     }
+
+
+# ============================================================
+# 1H EMA VALUES
+# ============================================================
+
+def get_1h_emas(candles):
+
+    closes = [
+        c["close"]
+        for c in candles
+    ]
+
+    return (
+        ema(closes, EMA20),
+        ema(closes, EMA50),
+        ema(closes, EMA200)
+    )
 
 
 # ============================================================
@@ -668,14 +673,18 @@ def get_4h_trend(candles):
 
 def detect_pullback(
     candles,
-    direction
+    direction,
+    atr_value
 ):
 
+    if atr_value is None:
+        return False
+
     if len(candles) < (
-        PULLBACK_LOOKBACK
-        + EMA_MID
+        EMA50
+        + PULLBACK_LOOKBACK
     ):
-        return False, None
+        return False
 
     recent = candles[
         -PULLBACK_LOOKBACK:
@@ -686,13 +695,9 @@ def detect_pullback(
         for c in candles
     ]
 
-    ema20_series = []
-
-    ema50_series = []
-
-    # --------------------------------------------------------
-    # Build EMA values for recent candles
-    # --------------------------------------------------------
+    # We don't require the final candle to touch EMA.
+    # A recent candle during the setup window may have
+    # reached the EMA zone.
 
     for i in range(
         len(candles)
@@ -702,135 +707,78 @@ def detect_pullback(
 
         partial = closes[:i + 1]
 
-        ema20 = calculate_ema(
+        ema20_value = ema(
             partial,
-            EMA_FAST
+            EMA20
         )
 
-        ema50 = calculate_ema(
+        ema50_value = ema(
             partial,
-            EMA_MID
+            EMA50
         )
 
-        ema20_series.append(
-            ema20
-        )
-
-        ema50_series.append(
-            ema50
-        )
-
-    # --------------------------------------------------------
-    # LONG PULLBACK
-    #
-    # Price must have touched/reached EMA20 or EMA50
-    # during the recent pullback.
-    # --------------------------------------------------------
-
-    if direction == "LONG":
-
-        touched = False
-        touch_index = None
-
-        for i, candle in enumerate(
-            recent
+        if (
+            ema20_value is None
+            or ema50_value is None
         ):
+            continue
 
-            ema20 = (
-                ema20_series[i]
-            )
+        candle = candles[i]
 
-            ema50 = (
-                ema50_series[i]
-            )
+        if direction == "LONG":
 
-            if (
-                ema20 is None
-                or ema50 is None
-            ):
-                continue
-
-            lower_zone = min(
-                ema20,
-                ema50
-            )
-
-            upper_zone = max(
-                ema20,
-                ema50
-            )
-
-            if (
+            distance20 = abs(
                 candle["low"]
-                <= upper_zone
-                and
-                candle["high"]
-                >= lower_zone
-            ):
-
-                touched = True
-                touch_index = i
-
-        return touched, touch_index
-
-    # --------------------------------------------------------
-    # SHORT PULLBACK
-    # --------------------------------------------------------
-
-    if direction == "SHORT":
-
-        touched = False
-        touch_index = None
-
-        for i, candle in enumerate(
-            recent
-        ):
-
-            ema20 = (
-                ema20_series[i]
+                - ema20_value
             )
 
-            ema50 = (
-                ema50_series[i]
-            )
-
-            if (
-                ema20 is None
-                or ema50 is None
-            ):
-                continue
-
-            lower_zone = min(
-                ema20,
-                ema50
-            )
-
-            upper_zone = max(
-                ema20,
-                ema50
-            )
-
-            if (
-                candle["high"]
-                >= lower_zone
-                and
+            distance50 = abs(
                 candle["low"]
-                <= upper_zone
-            ):
+                - ema50_value
+            )
 
-                touched = True
-                touch_index = i
+            touched = (
+                candle["low"]
+                <= ema20_value
+                + atr_value
+                * EMA_PULLBACK_ATR
+                or
+                candle["low"]
+                <= ema50_value
+                + atr_value
+                * EMA_PULLBACK_ATR
+            )
 
-        return touched, touch_index
+            if touched:
 
-    return False, None
+                return True
+
+        elif direction == "SHORT":
+
+            touched = (
+                candle["high"]
+                >= ema20_value
+                - atr_value
+                * EMA_PULLBACK_ATR
+                or
+                candle["high"]
+                >= ema50_value
+                - atr_value
+                * EMA_PULLBACK_ATR
+            )
+
+            if touched:
+
+                return True
+
+    return False
 
 
 # ============================================================
-# MARKET STRUCTURE
+# STRUCTURE BREAK
 # ============================================================
 
-def detect_structure_break(
+def detect_breakout(
     candles,
     direction
 ):
@@ -843,45 +791,44 @@ def detect_structure_break(
     current = candles[-1]
 
     previous = candles[
-        -(STRUCTURE_LOOKBACK + 1):-1
+        -STRUCTURE_LOOKBACK - 1:-1
     ]
 
     if direction == "LONG":
 
-        structure_high = max(
+        resistance = max(
             c["high"]
             for c in previous
         )
 
-        # Current CLOSED candle must break
-        # recent structure high.
+        # Closed candle must close above structure.
 
         if (
             current["close"]
-            > structure_high
+            > resistance
         ):
 
-            return True, structure_high
+            return True, resistance
 
-    if direction == "SHORT":
+    elif direction == "SHORT":
 
-        structure_low = min(
+        support = min(
             c["low"]
             for c in previous
         )
 
         if (
             current["close"]
-            < structure_low
+            < support
         ):
 
-            return True, structure_low
+            return True, support
 
     return False, None
 
 
 # ============================================================
-# CANDLE QUALITY
+# CANDLE CONFIRMATION
 # ============================================================
 
 def candle_confirmation(
@@ -909,7 +856,7 @@ def candle_confirmation(
 
     if direction == "LONG":
 
-        close_position = (
+        close_location = (
             candle["close"]
             - candle["low"]
         ) / candle_range
@@ -918,12 +865,12 @@ def candle_confirmation(
             candle["close"]
             > candle["open"]
             and body_ratio >= 0.45
-            and close_position >= 0.65
+            and close_location >= 0.60
         )
 
     if direction == "SHORT":
 
-        close_position = (
+        close_location = (
             candle["high"]
             - candle["close"]
         ) / candle_range
@@ -932,7 +879,39 @@ def candle_confirmation(
             candle["close"]
             < candle["open"]
             and body_ratio >= 0.45
-            and close_position >= 0.65
+            and close_location >= 0.60
+        )
+
+    return False
+
+
+# ============================================================
+# MOMENTUM
+# ============================================================
+
+def momentum_confirmation(
+    candles,
+    direction
+):
+
+    if len(candles) < 4:
+        return False
+
+    current = candles[-1]
+    previous = candles[-2]
+
+    if direction == "LONG":
+
+        return (
+            current["close"]
+            > previous["close"]
+        )
+
+    if direction == "SHORT":
+
+        return (
+            current["close"]
+            < previous["close"]
         )
 
     return False
@@ -943,52 +922,47 @@ def candle_confirmation(
 # ============================================================
 
 def rsi_confirmation(
-    rsi,
+    rsi_value,
     direction
 ):
 
-    if rsi is None:
+    if rsi_value is None:
         return False
 
-    # --------------------------------------------------------
-    # RSI is NOT used as:
-    #
-    # RSI > 70 = reject LONG
-    #
-    # Instead we want momentum to support the direction.
-    # --------------------------------------------------------
+    # RSI > 70 is NOT an automatic rejection.
+    # We only reject extreme exhaustion.
 
     if direction == "LONG":
 
         return (
-            50 <= rsi <= 78
+            50
+            <= rsi_value
+            <= 85
         )
 
     if direction == "SHORT":
 
         return (
-            22 <= rsi <= 50
+            15
+            <= rsi_value
+            <= 50
         )
 
     return False
 
 
 # ============================================================
-# ATR LEVELS
+# RISK LEVELS
 # ============================================================
 
-def calculate_levels(
+def calculate_risk_levels(
     candles,
     direction,
     entry,
-    atr
+    atr_value
 ):
 
-    # --------------------------------------------------------
-    # Structure-based SL
-    # --------------------------------------------------------
-
-    recent = candles[-5:]
+    recent = candles[-6:]
 
     recent_low = min(
         c["low"]
@@ -1002,27 +976,28 @@ def calculate_levels(
 
     if direction == "LONG":
 
-        atr_sl = (
+        atr_stop = (
             entry
             - (
-                atr
-                * SL_ATR_MULTIPLIER
+                atr_value
+                * SL_ATR
             )
         )
 
-        structure_sl = (
+        structure_stop = (
             recent_low
             - (
-                atr * 0.15
+                atr_value
+                * 0.10
             )
         )
 
-        # Use the tighter reasonable stop
-        # while ensuring it is below entry.
+        # Keep the stop below entry while avoiding
+        # an unnecessarily huge distance.
 
         sl = max(
-            atr_sl,
-            structure_sl
+            atr_stop,
+            structure_stop
         )
 
         risk = (
@@ -1032,32 +1007,31 @@ def calculate_levels(
 
         tp = (
             entry
-            + (
-                risk
-                * 2.0
-            )
+            + risk
+            * TP_R_MULTIPLE
         )
 
     else:
 
-        atr_sl = (
+        atr_stop = (
             entry
             + (
-                atr
-                * SL_ATR_MULTIPLIER
+                atr_value
+                * SL_ATR
             )
         )
 
-        structure_sl = (
+        structure_stop = (
             recent_high
             + (
-                atr * 0.15
+                atr_value
+                * 0.10
             )
         )
 
         sl = min(
-            atr_sl,
-            structure_sl
+            atr_stop,
+            structure_stop
         )
 
         risk = (
@@ -1067,33 +1041,33 @@ def calculate_levels(
 
         tp = (
             entry
-            - (
-                risk
-                * 2.0
-            )
+            - risk
+            * TP_R_MULTIPLE
         )
 
     return tp, sl, risk
 
 
 # ============================================================
-# MAIN ENTRY ANALYSIS
+# ENTRY ANALYSIS
 # ============================================================
 
-def analyze_entry(
+def analyze(
     symbol,
     candles_4h,
     candles_1h
 ):
 
     direction, trend = (
-        get_4h_trend(
+        get_4h_direction(
             candles_4h
         )
     )
 
     print(
-        f"\n===== {symbol} 4H TREND ====="
+        f"\n===== "
+        f"{symbol} 4H DIRECTION "
+        f"====="
     )
 
     print(
@@ -1129,7 +1103,7 @@ def analyze_entry(
 
         print(
             f"{symbol}: "
-            f"4H trend unclear"
+            f"4H trend unclear."
         )
 
         return None
@@ -1138,63 +1112,81 @@ def analyze_entry(
 
     entry = current["close"]
 
-    atr = calculate_atr(
+    atr_value = atr(
         candles_1h,
         ATR_PERIOD
     )
 
-    adx = calculate_adx(
-        candles_1h,
-        ADX_PERIOD
-    )
-
-    rsi = calculate_rsi(
+    rsi_value = rsi(
         candles_1h,
         RSI_PERIOD
     )
 
+    adx_value = adx(
+        candles_1h,
+        ADX_PERIOD
+    )
+
+    if (
+        atr_value is None
+        or rsi_value is None
+        or adx_value is None
+    ):
+
+        print(
+            f"{symbol}: "
+            f"Indicators unavailable."
+        )
+
+        return None
+
     # --------------------------------------------------------
-    # PULLBACK
+    # 1H EMA
     # --------------------------------------------------------
 
-    pullback, pullback_index = (
-        detect_pullback(
+    ema20_value, ema50_value, ema200_value = (
+        get_1h_emas(
+            candles_1h
+        )
+    )
+
+    # --------------------------------------------------------
+    # Pullback
+    # --------------------------------------------------------
+
+    pullback = detect_pullback(
+        candles_1h,
+        direction,
+        atr_value
+    )
+
+    # --------------------------------------------------------
+    # Breakout
+    # --------------------------------------------------------
+
+    breakout, structure_level = (
+        detect_breakout(
             candles_1h,
             direction
         )
     )
 
     # --------------------------------------------------------
-    # STRUCTURE BREAK
+    # Candle
     # --------------------------------------------------------
 
-    structure_break, structure_level = (
-        detect_structure_break(
-            candles_1h,
-            direction
-        )
+    candle_ok = candle_confirmation(
+        current,
+        direction
     )
 
     # --------------------------------------------------------
-    # CANDLE CONFIRMATION
+    # Momentum
     # --------------------------------------------------------
 
-    candle_ok = (
-        candle_confirmation(
-            current,
-            direction
-        )
-    )
-
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    rsi_ok = (
-        rsi_confirmation(
-            rsi,
-            direction
-        )
+    momentum_ok = momentum_confirmation(
+        candles_1h,
+        direction
     )
 
     # --------------------------------------------------------
@@ -1202,41 +1194,78 @@ def analyze_entry(
     # --------------------------------------------------------
 
     adx_ok = (
-        adx is not None
-        and adx >= ADX_MIN
+        adx_value
+        >= ADX_MIN
+    )
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    rsi_ok = rsi_confirmation(
+        rsi_value,
+        direction
+    )
+
+    # --------------------------------------------------------
+    # 1H EMA alignment
+    # --------------------------------------------------------
+
+    if direction == "LONG":
+
+        ema_alignment = (
+            entry > ema20_value
+            and ema20_value
+            > ema50_value
+        )
+
+    else:
+
+        ema_alignment = (
+            entry < ema20_value
+            and ema20_value
+            < ema50_value
+        )
+
+    print(
+        f"\n===== "
+        f"{symbol} 1H SETUP v7 "
+        f"====="
     )
 
     print(
-        f"\n===== {symbol} 1H SETUP v6 ====="
+        f"Direction: "
+        f"{direction}"
     )
 
     print(
-        f"Direction: {direction}"
-    )
-
-    print(
-        f"Entry: {entry:.8f}"
+        f"Entry: "
+        f"{entry:.8f}"
     )
 
     print(
         f"RSI: "
-        f"{rsi:.2f}"
-        if rsi is not None
-        else "RSI: None"
+        f"{rsi_value:.2f}"
     )
 
     print(
         f"ADX: "
-        f"{adx:.2f}"
-        if adx is not None
-        else "ADX: None"
+        f"{adx_value:.2f}"
     )
 
     print(
         f"ATR: "
-        f"{atr:.8f}"
-        if atr is not None
-        else "ATR: None"
+        f"{atr_value:.8f}"
+    )
+
+    print(
+        f"EMA20: "
+        f"{ema20_value:.8f}"
+    )
+
+    print(
+        f"EMA50: "
+        f"{ema50_value:.8f}"
     )
 
     print(
@@ -1245,8 +1274,8 @@ def analyze_entry(
     )
 
     print(
-        f"Structure Break: "
-        f"{structure_break}"
+        f"Breakout: "
+        f"{breakout}"
     )
 
     print(
@@ -1260,84 +1289,116 @@ def analyze_entry(
     )
 
     print(
+        f"Momentum: "
+        f"{momentum_ok}"
+    )
+
+    print(
         f"Candle Quality: "
         f"{candle_ok}"
     )
 
-    if (
-        atr is None
-        or adx is None
-    ):
-
-        print(
-            f"{symbol}: "
-            f"Indicators unavailable"
-        )
-
-        return None
+    print(
+        f"EMA Alignment: "
+        f"{ema_alignment}"
+    )
 
     # ========================================================
-    # IMPORTANT ENTRY LOGIC
+    # SETUP A
     #
-    # We require:
+    # PULLBACK CONTINUATION
     #
-    # 1. Pullback
-    # 2. Structure break
-    #
-    # AND at least ONE of:
-    #
-    # 3. ADX confirmation
-    # 4. RSI confirmation
-    # 5. Candle confirmation
-    #
-    # This prevents a raw breakout from generating signals.
+    # Pullback
+    # +
+    # ADX
+    # +
+    # EMA alignment
+    # +
+    # candle OR momentum
     # ========================================================
 
-    confirmations = sum([
-        bool(adx_ok),
-        bool(rsi_ok),
-        bool(candle_ok)
-    ])
-
-    entry_setup = (
+    pullback_setup = (
         pullback
-        and
-        structure_break
-        and
-        confirmations >= 1
+        and adx_ok
+        and ema_alignment
+        and (
+            candle_ok
+            or momentum_ok
+        )
+    )
+
+    # ========================================================
+    # SETUP B
+    #
+    # MOMENTUM BREAKOUT
+    #
+    # Breakout
+    # +
+    # ADX
+    # +
+    # candle confirmation
+    #
+    # EMA alignment is NOT mandatory here because a strong
+    # breakout can temporarily extend away from EMA20.
+    # ========================================================
+
+    breakout_setup = (
+        breakout
+        and adx_ok
+        and candle_ok
+    )
+
+    # ========================================================
+    # FINAL SETUP
+    #
+    # PULLBACK OR BREAKOUT
+    # ========================================================
+
+    if pullback_setup:
+
+        setup_type = "PULLBACK"
+
+    elif breakout_setup:
+
+        setup_type = "BREAKOUT"
+
+    else:
+
+        setup_type = None
+
+    print(
+        f"Pullback Setup: "
+        f"{pullback_setup}"
     )
 
     print(
-        f"Secondary confirmations: "
-        f"{confirmations}/3"
+        f"Breakout Setup: "
+        f"{breakout_setup}"
     )
 
     print(
-        f"ENTRY SETUP: "
-        f"{entry_setup}"
+        f"FINAL SETUP: "
+        f"{setup_type}"
     )
 
-    if not entry_setup:
+    if setup_type is None:
 
         print(
             f"{symbol}: "
-            f"No valid pullback + "
-            f"structure setup."
+            f"No valid setup."
         )
 
         return None
 
-    # ========================================================
-    # RISK LEVELS
-    # ========================================================
+    # --------------------------------------------------------
+    # Risk
+    # --------------------------------------------------------
 
-    tp, sl, risk = (
-        calculate_levels(
-            candles_1h,
-            direction,
-            entry,
-            atr
-        )
+    tp, sl, risk = calculate_risk_levels(
+        candles_1h,
+        direction,
+        entry,
+        atr_value
     )
 
     if risk <= 0:
@@ -1359,24 +1420,19 @@ def analyze_entry(
     )
 
     print(
-        f"Entry: {entry:.8f}"
+        f"TP: "
+        f"{tp:.8f}"
     )
 
     print(
-        f"SL: {sl:.8f}"
+        f"SL: "
+        f"{sl:.8f}"
     )
 
     print(
-        f"TP: {tp:.8f}"
+        f"R/R: "
+        f"1:{rr:.2f}"
     )
-
-    print(
-        f"Risk/Reward: 1:{rr:.2f}"
-    )
-
-    # --------------------------------------------------------
-    # Minimum RR
-    # --------------------------------------------------------
 
     if rr < MIN_RR:
 
@@ -1387,32 +1443,28 @@ def analyze_entry(
 
         return None
 
-    # --------------------------------------------------------
-    # Return signal
-    # --------------------------------------------------------
-
     return {
         "direction": direction,
+        "setup_type": setup_type,
         "entry": entry,
         "tp": tp,
         "sl": sl,
-        "atr": atr,
-        "adx": adx,
-        "rsi": rsi,
-        "pullback": pullback,
-        "structure_break": structure_break,
-        "structure_level": structure_level,
-        "secondary_confirmations": confirmations,
+        "risk": risk,
         "rr": rr,
+        "atr": atr_value,
+        "adx": adx_value,
+        "rsi": rsi_value,
+        "pullback": pullback,
+        "breakout": breakout,
         "candle_time": current["time"]
     }
 
 
 # ============================================================
-# TELEGRAM ENTRY MESSAGE
+# TELEGRAM MESSAGE
 # ============================================================
 
-def create_entry_message(
+def signal_message(
     symbol,
     signal
 ):
@@ -1423,7 +1475,7 @@ def create_entry_message(
 
     if direction == "LONG":
 
-        side = "🟢 LONG"
+        emoji = "🟢 LONG"
 
         tp_percent = (
             (
@@ -1457,7 +1509,7 @@ def create_entry_message(
 
     else:
 
-        side = "🔴 SHORT"
+        emoji = "🔴 SHORT"
 
         tp_percent = (
             (
@@ -1490,13 +1542,14 @@ def create_entry_message(
         )
 
     return (
-        "🚨 SCORE HUNTER PRO v6 🚨\n\n"
+        "🚨 SCORE HUNTER PRO v7 🚨\n\n"
 
         f"💰 {symbol}USDT\n"
 
-        f"📊 {side}\n\n"
+        f"📊 {emoji}\n\n"
 
-        "🧠 TREND + PULLBACK SETUP\n\n"
+        f"🧠 SETUP: "
+        f"{signal['setup_type']}\n\n"
 
         f"💵 Entry: "
         f"{signal['entry']:.8f}\n"
@@ -1509,28 +1562,30 @@ def create_entry_message(
 
         "🧭 4H: Main trend\n"
 
-        "↩️ 1H: Pullback confirmed\n"
+        "⏱ 1H: Entry confirmation\n"
 
-        "📐 Structure: Break confirmed\n"
+        f"↩️ Pullback: "
+        f"{'✅' if signal['pullback'] else '➖'}\n"
+
+        f"🚀 Breakout: "
+        f"{'✅' if signal['breakout'] else '➖'}\n"
 
         f"📊 ADX: "
         f"{signal['adx']:.2f}\n"
 
         f"📈 RSI: "
-        f"{signal['rsi']:.2f}\n"
-
-        f"🧠 Secondary confirmations: "
-        f"{signal['secondary_confirmations']}/3\n\n"
+        f"{signal['rsi']:.2f}\n\n"
 
         "🕯 Closed 1H candle only\n"
 
-        "🚫 No mid-candle signal\n\n"
+        "🚫 No mid-candle signal\n"
 
-        "🛑 SL: Structure + ATR\n"
+        "📊 Volume: Not required\n\n"
 
-        "🎯 TP: 2R\n"
+        f"🎯 TP: 2R\n"
 
-        f"⚖️ R/R: 1:{signal['rr']:.2f}\n\n"
+        f"⚖️ Risk/Reward: "
+        f"1:{signal['rr']:.2f}\n\n"
 
         "⚠️ Manage risk."
     )
@@ -1540,7 +1595,7 @@ def create_entry_message(
 # POSITION MANAGEMENT
 # ============================================================
 
-def manage_position(
+def check_position(
     candles,
     position
 ):
@@ -1549,16 +1604,12 @@ def manage_position(
         position["direction"]
     )
 
-    latest = candles[-1]
+    candle = candles[-1]
 
-    close = latest["close"]
+    close = candle["close"]
 
     tp = position["tp"]
     sl = position["sl"]
-
-    # --------------------------------------------------------
-    # CLOSED CANDLE EXIT
-    # --------------------------------------------------------
 
     if direction == "LONG":
 
@@ -1570,7 +1621,7 @@ def manage_position(
 
             return "TP", tp
 
-    elif direction == "SHORT":
+    else:
 
         if close >= sl:
 
@@ -1590,12 +1641,7 @@ def manage_position(
 def main():
 
     print(
-        "\n🟢 SCORE HUNTER PRO v6"
-    )
-
-    print(
-        "🧠 TREND + PULLBACK + "
-        "MARKET STRUCTURE"
+        "\n🟢 SCORE HUNTER PRO v7"
     )
 
     print(
@@ -1607,19 +1653,20 @@ def main():
     )
 
     print(
-        "↩️ PULLBACK REQUIRED"
+        "↩️ PULLBACK OR BREAKOUT"
     )
 
     print(
-        "📐 MARKET STRUCTURE BREAK REQUIRED"
-    )
-
-    print(
-        f"📊 ADX MINIMUM: {ADX_MIN}"
+        "📊 ADX MINIMUM: "
+        f"{ADX_MIN}"
     )
 
     print(
         "📈 RSI: CONFIRMATION ONLY"
+    )
+
+    print(
+        "🚫 RSI >70 NOT automatic rejection"
     )
 
     print(
@@ -1628,7 +1675,7 @@ def main():
 
     print(
         f"🛑 SL: "
-        f"{SL_ATR_MULTIPLIER} ATR + structure"
+        f"{SL_ATR} ATR / structure"
     )
 
     print(
@@ -1636,12 +1683,12 @@ def main():
     )
 
     print(
-        "⚖️ MINIMUM R/R: "
+        f"⚖️ MINIMUM RR: "
         f"1:{MIN_RR}"
     )
 
     print(
-        "🚫 NO SCORE SYSTEM"
+        "🚫 NO OLD SCORE SYSTEM"
     )
 
     print(
@@ -1686,7 +1733,7 @@ def main():
 
                 print(
                     f"{symbol}: "
-                    f"Not enough 4H data"
+                    f"Not enough 4H candles."
                 )
 
                 continue
@@ -1695,7 +1742,7 @@ def main():
 
                 print(
                     f"{symbol}: "
-                    f"Not enough 1H data"
+                    f"Not enough 1H candles."
                 )
 
                 continue
@@ -1725,15 +1772,15 @@ def main():
                 {}
             )
 
-            # =================================================
-            # NEW CLOSED CANDLE CHECK
-            # =================================================
-
             last_checked = (
                 coin_state.get(
                     "last_checked_1h"
                 )
             )
+
+            # ------------------------------------------------
+            # Only scan once per new CLOSED 1H candle.
+            # ------------------------------------------------
 
             if last_checked == latest_1h:
 
@@ -1749,7 +1796,7 @@ def main():
             ] = latest_1h
 
             # =================================================
-            # OPEN POSITION
+            # EXISTING POSITION
             # =================================================
 
             position = (
@@ -1762,13 +1809,12 @@ def main():
 
                 print(
                     f"{symbol}: "
-                    f"Existing "
-                    f"{position['direction']} "
-                    f"position."
+                    f"Existing position: "
+                    f"{position['direction']}"
                 )
 
                 result, level = (
-                    manage_position(
+                    check_position(
                         candles_1h,
                         position
                     )
@@ -1778,7 +1824,7 @@ def main():
 
                     print(
                         f"{symbol}: "
-                        f"Position still active."
+                        f"Position active."
                     )
 
                     state[symbol] = (
@@ -1792,22 +1838,24 @@ def main():
                 if result == "TP":
 
                     message = (
-                        "🎯 SCORE HUNTER PRO v6\n\n"
+                        "🎯 SCORE HUNTER PRO v7\n\n"
                         f"💰 {symbol}USDT\n"
                         f"📊 {position['direction']}\n\n"
                         "✅ TAKE PROFIT REACHED\n\n"
-                        f"Price: {level:.8f}\n"
+                        f"Closed price: "
+                        f"{level:.8f}\n"
                         "🕯 Closed 1H candle."
                     )
 
                 else:
 
                     message = (
-                        "🛑 SCORE HUNTER PRO v6\n\n"
+                        "🛑 SCORE HUNTER PRO v7\n\n"
                         f"💰 {symbol}USDT\n"
                         f"📊 {position['direction']}\n\n"
                         "❌ STOP LOSS REACHED\n\n"
-                        f"Price: {level:.8f}\n"
+                        f"Closed price: "
+                        f"{level:.8f}\n"
                         "🕯 Closed 1H candle."
                     )
 
@@ -1828,10 +1876,10 @@ def main():
                 continue
 
             # =================================================
-            # FIND NEW ENTRY
+            # NEW SIGNAL
             # =================================================
 
-            signal = analyze_entry(
+            signal = analyze(
                 symbol,
                 candles_4h,
                 candles_1h
@@ -1852,30 +1900,28 @@ def main():
 
                 continue
 
-            # =================================================
-            # SEND SIGNAL
-            # =================================================
-
-            message = (
-                create_entry_message(
-                    symbol,
-                    signal
-                )
+            message = signal_message(
+                symbol,
+                signal
             )
 
             send_telegram(
                 message
             )
 
-            # =================================================
-            # SAVE POSITION
-            # =================================================
+            # ------------------------------------------------
+            # Save position
+            # ------------------------------------------------
 
             coin_state[
                 "position"
             ] = {
+
                 "direction":
                     signal["direction"],
+
+                "setup_type":
+                    signal["setup_type"],
 
                 "entry":
                     signal["entry"],
@@ -1895,15 +1941,8 @@ def main():
                 "rsi":
                     signal["rsi"],
 
-                "structure_level":
-                    signal[
-                        "structure_level"
-                    ],
-
                 "entry_candle":
-                    signal[
-                        "candle_time"
-                    ]
+                    signal["candle_time"]
             }
 
             coin_state[
