@@ -22,9 +22,9 @@ MAX_OPPOSITE_WICK_RATIO = 0.30
 # Do not chase extended price after a strong move. The latest closed 1H
 # candle must confirm a recent pullback toward EMA20, and price must remain
 # reasonably close to EMA20/EMA50.
-PULLBACK_LOOKBACK = 3
-MAX_ENTRY_DISTANCE_EMA20_ATR = 0.75
-MAX_ENTRY_DISTANCE_EMA50_ATR = 1.50
+PULLBACK_LOOKBACK = 6
+MAX_ENTRY_DISTANCE_EMA20_ATR = 1.25
+MAX_ENTRY_DISTANCE_EMA50_ATR = 2.00
 
 # ATR-BASED RISK MANAGEMENT
 SL_ATR_MULTIPLIER = 1.0
@@ -345,8 +345,10 @@ def calculate_signal(candles_1h, candles_4h, symbol):
 
     volatility_ok = (current_atr / close) >= 0.002
 
-    long_score = sum([int(long_trend), int(long_rsi), int(volume_ok), int(bull_break), int(long_pullback), int(bull_candle), int(volatility_ok)])
-    short_score = sum([int(short_trend), int(short_rsi), int(volume_ok), int(bear_break), int(short_pullback), int(bear_candle), int(volatility_ok)])
+    # Volume is a confirmation bonus only; it no longer blocks a setup.
+    # Keep the core score at 7 components without requiring high volume.
+    long_score = sum([int(long_trend), int(long_rsi), int(bull_break), int(long_pullback), int(bull_candle), int(volatility_ok), int(close > ema20)])
+    short_score = sum([int(short_trend), int(short_rsi), int(bear_break), int(short_pullback), int(bear_candle), int(volatility_ok), int(close < ema20)])
 
     atr_percent = current_atr / close * 100.0
     long_tp, long_sl, _, _ = get_risk_levels("LONG", close, current_atr)
@@ -360,7 +362,7 @@ def calculate_signal(candles_1h, candles_4h, symbol):
     print(f"1H EMA50: {ema50:.8f}")
     print(f"1H EMA200: {ema200:.8f}")
     print(f"1H ATR: {current_atr:.8f} ({atr_percent:.3f}%)")
-    print(f"1H Volume OK: {volume_ok}")
+    print(f"1H Volume: {volume_ok} (bonus only)")
     print(f"LONG SCORE: {long_score}/7")
     print(f"SHORT SCORE: {short_score}/7")
     print(f"LONG TP/SL: {long_tp:.8f} / {long_sl:.8f}")
@@ -434,6 +436,7 @@ def main():
     print(f"🕯 1H Candle Filter: body >= {MIN_CANDLE_BODY_RATIO:.0%}, opposite wick <= {MAX_OPPOSITE_WICK_RATIO:.0%}")
     print("📐 TP SPACE FILTER: ON | lookback=20 | buffer=0.1%")
     print(f"🧲 1H PULLBACK FILTER: last {PULLBACK_LOOKBACK} candles | EMA20 distance <= {MAX_ENTRY_DISTANCE_EMA20_ATR:.2f} ATR | EMA50 distance <= {MAX_ENTRY_DISTANCE_EMA50_ATR:.2f} ATR")
+    print("📊 VOLUME: bonus only - NOT a hard entry filter")
 
     state = load_state()
     for symbol in COINS:
