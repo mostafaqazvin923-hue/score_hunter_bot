@@ -15,7 +15,7 @@
     "signal_time": 1786379900,
     "last_checked_1h": 1786888800,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
-    "last_checked_1h_candle": 1787209200
+    "last_checked_1h_candle": 1787216400
   },
   "SOL": {
     "last_signal": {
@@ -41,7 +41,7 @@
     "signal_time": 1787213179,
     "last_checked_1h": 1786888800,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
-    "last_checked_1h_candle": 1787209200,
+    "last_checked_1h_candle": 1787216400,
     "signal_candle_1h": 1787209200
   },
   "XRP": {
@@ -68,24 +68,30 @@
     "last_signal_id": "1786867200_SHORT",
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "signal_candle_utc": "2026-08-19 00:00:00",
-    "last_checked_1h_candle": 1787209200
+    "last_checked_1h_candle": 1787216400
   },
   "BTC": {
     "last_checked_1h": 1786888800,
     "last_signal_id": "1786870800_SHORT",
     "last_signal": {
-      "direction": "SHORT",
-      "score_4h": 3,
-      "score_1h": 4,
-      "entry": 63001.4,
-      "candle_1h": 1786870800
+      "direction": "LONG",
+      "score": 6,
+      "important_confirmations": 3,
+      "price": 71796.7,
+      "atr": 675.2285714285712,
+      "rsi": 83.67451663612756,
+      "volume_bonus": true,
+      "pullback_present": false,
+      "candle_time": 1787216400
     },
     "trade_result": null,
     "trade_result_price": null,
     "trade_result_time": null,
     "last_checked_candle": 1787126400,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
-    "last_checked_1h_candle": 1787209200
+    "last_checked_1h_candle": 1787216400,
+    "signal_candle_1h": 1787216400,
+    "signal_time": 1787220950
   },
   "ADA": {
     "last_checked_1h": 1786888800,
@@ -102,7 +108,7 @@
     "trade_result_time": null,
     "last_checked_candle": 1787126400,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
-    "last_checked_1h_candle": 1787209200
+    "last_checked_1h_candle": 1787216400
   },
   "LINK": {
     "last_checked_candle": 1787126400,
@@ -116,7 +122,7 @@
     "last_checked_1h": 1786888800,
     "last_signal_id": "1786863600_LONG",
     "last_checked_candle_utc": "2026-08-19 00:00:00",
-    "last_checked_1h_candle": 1787209200
+    "last_checked_1h_candle": 1787216400
   },
   "DOGE": {
     "last_checked_candle": 1787126400,
@@ -137,6 +143,6 @@
     "last_checked_1h": 1786888800,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "signal_candle_utc": "2026-08-19 00:00:00",
-    "last_checked_1h_candle": 1787209200
+    "last_checked_1h_candle": 1787216400
   }
 }
