@@ -13,7 +13,7 @@
     },
     "signal_candle": 1786363200,
     "signal_time": 1787349398,
-    "last_checked_1h": 1787349600,
+    "last_checked_1h": 1787364000,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
     "position": {
@@ -50,7 +50,7 @@
     "last_signal_day": "2026-08-14",
     "signal_candle": 1786665600,
     "signal_time": 1787356527,
-    "last_checked_1h": 1787349600,
+    "last_checked_1h": 1787364000,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
     "signal_candle_1h": 1787209200,
@@ -86,25 +86,15 @@
     },
     "signal_candle": 1787097600,
     "signal_time": 1787321246,
-    "last_checked_1h": 1787349600,
+    "last_checked_1h": 1787364000,
     "last_signal_id": "1786867200_SHORT",
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "signal_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
-    "position": {
-      "direction": "LONG",
-      "setup_type": "PULLBACK",
-      "entry": 1.41978,
-      "tp": 1.5378257142857141,
-      "sl": 1.360757142857143,
-      "atr": 0.039348571428571434,
-      "adx": 58.317227880533856,
-      "rsi": 71.53925108906549,
-      "entry_candle": 1787317200
-    }
+    "position": null
   },
   "BTC": {
-    "last_checked_1h": 1787349600,
+    "last_checked_1h": 1787364000,
     "last_signal_id": "1786870800_SHORT",
     "last_signal": {
       "direction": "LONG",
@@ -138,7 +128,7 @@
     }
   },
   "ADA": {
-    "last_checked_1h": 1787349600,
+    "last_checked_1h": 1787364000,
     "last_signal_id": "1786874400_SHORT",
     "last_signal": {
       "direction": "SHORT",
@@ -153,17 +143,7 @@
     "last_checked_candle": 1787126400,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
-    "position": {
-      "direction": "LONG",
-      "setup_type": "PULLBACK",
-      "entry": 0.21792,
-      "tp": 0.23344199999999998,
-      "sl": 0.210159,
-      "atr": 0.005174,
-      "adx": 50.48864659248799,
-      "rsi": 69.56304614096105,
-      "entry_candle": 1787317200
-    },
+    "position": null,
     "signal_time": 1787321248
   },
   "LINK": {
@@ -181,7 +161,7 @@
     },
     "signal_candle": 1786896000,
     "signal_time": 1787321248,
-    "last_checked_1h": 1787349600,
+    "last_checked_1h": 1787364000,
     "last_signal_id": "1786863600_LONG",
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
@@ -204,7 +184,7 @@
     },
     "signal_candle": 1787097600,
     "signal_time": 1787353011,
-    "last_checked_1h": 1787349600,
+    "last_checked_1h": 1787364000,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "signal_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
