@@ -2,24 +2,35 @@ import requests
 from datetime import datetime, timezone
 
 # ============================================================
-# SCORE HUNTER PRO v8.1
+# SCORE HUNTER PRO v8.2
 # LONG ONLY BACKTEST
 #
 # 4H TREND + 1H ENTRY
 # LONG ONLY
-# BREAKOUT + REVERSAL ONLY
+# BREAKOUT + STRICT REVERSAL
 # NO PULLBACK
 # CLOSED CANDLE ONLY
 # NO LOOK-AHEAD
 # ADX >= 20
 # RSI CONFIRMATION
+# STRONG BREAKOUT CANDLE
+# REGIME FILTER
 # SL = 1.5 ATR / STRUCTURE
 # MAX SL = 3.5 ATR
 # TP = 2R
 # ENTRY CANDLE EXCLUDED FROM TP/SL
 # TP + SL SAME CANDLE = SL
 # NO OVERLAPPING POSITIONS
+#
+# v8.2 CHANGES:
+# - STRICTER REVERSAL
+# - 4H REGIME FILTER
+# - 1H EMA TRANSITION REQUIRED FOR REVERSAL
+# - BREAKOUT MUST HAVE REAL STRUCTURE BREAK
+# - WEAK BREAKOUTS FILTERED
+# - NO LOOK-AHEAD
 # ============================================================
+
 
 KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
 
@@ -28,6 +39,7 @@ INTERVAL_1H = 60
 
 SECONDS_1H = 3600
 SECONDS_4H = 14400
+
 
 COINS = {
     "ETH": "ETHUSDT",
@@ -38,6 +50,11 @@ COINS = {
     "LINK": "LINKUSDT",
     "DOGE": "DOGEUSDT",
 }
+
+
+# ============================================================
+# INDICATORS
+# ============================================================
 
 EMA20 = 20
 EMA50 = 50
@@ -50,7 +67,7 @@ ADX_PERIOD = 14
 ADX_MIN = 20.0
 
 STRUCTURE_LOOKBACK = 5
-REVERSAL_LOOKBACK = 6
+REVERSAL_LOOKBACK = 8
 
 SL_ATR = 1.50
 STRUCTURE_BUFFER_ATR = 0.10
@@ -59,13 +76,38 @@ MAX_SL_ATR = 3.50
 TP_R_MULTIPLE = 2.0
 MIN_RR = 1.50
 
-# Strong breakout requirements
+
+# ============================================================
+# BREAKOUT FILTERS
+# ============================================================
+
 MIN_BODY_RATIO = 0.55
 MIN_CLOSE_LOCATION = 0.70
 
+# Breakout must exceed structure by at least this fraction
+# of ATR. Prevents tiny fake breaks.
+MIN_BREAKOUT_ATR = 0.10
+
+# Do not enter if candle is excessively extended.
+MAX_ENTRY_EXTENSION_ATR = 2.50
+
+
+# ============================================================
+# REVERSAL FILTERS
+# ============================================================
+
+# Minimum EMA separation after reversal.
+MIN_EMA_SEPARATION_ATR = 0.05
+
+# Reversal candle must break prior structure
+# by at least this ATR.
+MIN_REVERSAL_BREAK_ATR = 0.10
+
+
 SESSION = requests.Session()
+
 SESSION.headers.update({
-    "User-Agent": "ScoreHunterPro-v8.1-Backtester/1.0"
+    "User-Agent": "ScoreHunterPro-v8.2-Backtester/1.0"
 })
 
 
@@ -158,6 +200,7 @@ def ema(values, period):
     multiplier = 2.0 / (period + 1)
 
     for price in values[period:]:
+
         value = (
             (price - value)
             * multiplier
@@ -322,12 +365,21 @@ def adx(candles, period=14):
 
         tr = max(
             high - low,
-            abs(high - prev_close),
-            abs(low - prev_close)
+            abs(
+                high - prev_close
+            ),
+            abs(
+                low - prev_close
+            )
         )
 
-        up_move = high - prev_high
-        down_move = prev_low - low
+        up_move = (
+            high - prev_high
+        )
+
+        down_move = (
+            prev_low - low
+        )
 
         plus_dm = (
             up_move
@@ -418,8 +470,11 @@ def adx(candles, period=14):
         )
 
         if denominator <= 0:
+
             dx = 0.0
+
         else:
+
             dx = (
                 100.0
                 * abs(
@@ -457,7 +512,7 @@ def adx(candles, period=14):
 
 def get_4h_direction(candles):
 
-    if len(candles) < EMA200:
+    if len(candles) < EMA200 + 5:
         return None
 
     closes = [
@@ -467,9 +522,20 @@ def get_4h_direction(candles):
 
     close = closes[-1]
 
-    e20 = ema(closes, EMA20)
-    e50 = ema(closes, EMA50)
-    e200 = ema(closes, EMA200)
+    e20 = ema(
+        closes,
+        EMA20
+    )
+
+    e50 = ema(
+        closes,
+        EMA50
+    )
+
+    e200 = ema(
+        closes,
+        EMA200
+    )
 
     if (
         e20 is None
@@ -496,7 +562,95 @@ def get_4h_direction(candles):
 
 
 # ============================================================
-# CLOSED 4H DATA AVAILABLE AT 1H ENTRY
+# 4H TREND STRENGTH
+# ============================================================
+
+def get_4h_regime(candles):
+
+    if len(candles) < EMA200 + 10:
+        return None
+
+    closes = [
+        c["close"]
+        for c in candles
+    ]
+
+    e20 = ema(
+        closes,
+        EMA20
+    )
+
+    e50 = ema(
+        closes,
+        EMA50
+    )
+
+    e200 = ema(
+        closes,
+        EMA200
+    )
+
+    if (
+        e20 is None
+        or e50 is None
+        or e200 is None
+    ):
+        return None
+
+    current = closes[-1]
+
+    distance_20_50 = (
+        abs(e20 - e50)
+        / current
+    )
+
+    distance_50_200 = (
+        abs(e50 - e200)
+        / current
+    )
+
+    if (
+        current > e200
+        and e20 > e50
+        and e50 > e200
+    ):
+
+        return {
+            "direction": "LONG",
+            "ema20": e20,
+            "ema50": e50,
+            "ema200": e200,
+            "distance_20_50": distance_20_50,
+            "distance_50_200": distance_50_200
+        }
+
+    if (
+        current < e200
+        and e20 < e50
+        and e50 < e200
+    ):
+
+        return {
+            "direction": "SHORT",
+            "ema20": e20,
+            "ema50": e50,
+            "ema200": e200,
+            "distance_20_50": distance_20_50,
+            "distance_50_200": distance_50_200
+        }
+
+    return {
+        "direction": None,
+        "ema20": e20,
+        "ema50": e50,
+        "ema200": e200,
+        "distance_20_50": distance_20_50,
+        "distance_50_200": distance_50_200
+    }
+
+
+# ============================================================
+# CLOSED 4H DATA AVAILABLE AT ENTRY
 # ============================================================
 
 def get_closed_4h_for_entry(
@@ -521,12 +675,58 @@ def get_closed_4h_for_entry(
 
 
 # ============================================================
+# EMA ALIGNMENT
+# ============================================================
+
+def get_1h_emas(candles):
+
+    if len(candles) < EMA200:
+        return None
+
+    closes = [
+        c["close"]
+        for c in candles
+    ]
+
+    e20 = ema(
+        closes,
+        EMA20
+    )
+
+    e50 = ema(
+        closes,
+        EMA50
+    )
+
+    e200 = ema(
+        closes,
+        EMA200
+    )
+
+    if (
+        e20 is None
+        or e50 is None
+        or e200 is None
+    ):
+        return None
+
+    return {
+        "ema20": e20,
+        "ema50": e50,
+        "ema200": e200
+    }
+
+
+# ============================================================
 # BREAKOUT
 # ============================================================
 
-def detect_breakout_long(candles):
+def detect_breakout_long(
+    candles,
+    atr_value
+):
 
-    if len(candles) < STRUCTURE_LOOKBACK + 2:
+    if len(candles) < STRUCTURE_LOOKBACK + 3:
         return False, None
 
     current = candles[-1]
@@ -540,8 +740,19 @@ def detect_breakout_long(candles):
         for c in previous
     )
 
-    # Must close above structure.
-    if current["close"] <= resistance:
+    # --------------------------------------------------------
+    # REAL STRUCTURE BREAK
+    # --------------------------------------------------------
+
+    minimum_break = (
+        atr_value
+        * MIN_BREAKOUT_ATR
+    )
+
+    if (
+        current["close"]
+        <= resistance + minimum_break
+    ):
         return False, None
 
     candle_range = (
@@ -577,61 +788,61 @@ def detect_breakout_long(candles):
     if close_location < MIN_CLOSE_LOCATION:
         return False, None
 
-    # Momentum confirmation.
-    if len(candles) >= 2:
-        if (
-            current["close"]
-            <= candles[-2]["close"]
-        ):
-            return False, None
+    # Current close must beat previous close.
+    if (
+        current["close"]
+        <= candles[-2]["close"]
+    ):
+        return False, None
+
+    # --------------------------------------------------------
+    # EXTENSION FILTER
+    # --------------------------------------------------------
+
+    extension = (
+        current["close"]
+        - resistance
+    ) / atr_value
+
+    if extension > MAX_ENTRY_EXTENSION_ATR:
+        return False, None
 
     return True, resistance
 
 
 # ============================================================
-# LONG REVERSAL
-#
-# This allows a LONG after a previous 4H SHORT trend,
-# but only after a confirmed bullish structure transition.
+# STRICT REVERSAL
 # ============================================================
 
-def detect_reversal_long(
+def detect_strict_reversal_long(
     candles,
     trend_direction,
+    atr_value,
     adx_value,
     rsi_value
 ):
 
+    # Reversal is ONLY allowed when the 4H regime
+    # was bearish / non-long.
     if trend_direction != "SHORT":
         return None
 
-    required = max(
-        60,
-        REVERSAL_LOOKBACK + 12
-    )
-
-    if len(candles) < required:
+    if len(candles) < max(
+        80,
+        REVERSAL_LOOKBACK + 20
+    ):
         return None
 
     current = candles[-1]
+    previous_candle = candles[-2]
 
-    previous = candles[
-        -REVERSAL_LOOKBACK - 1:-1
-    ]
+    # --------------------------------------------------------
+    # CURRENT CANDLE
+    # --------------------------------------------------------
 
-    resistance = max(
-        c["high"]
-        for c in previous
-    )
-
-    if current["close"] <= resistance:
-        return None
-
-    # Current candle bullish.
     if current["close"] <= current["open"]:
         return None
 
-    # Body strength.
     candle_range = (
         current["high"]
         - current["low"]
@@ -659,23 +870,92 @@ def detect_reversal_long(
     if close_location < MIN_CLOSE_LOCATION:
         return None
 
-    closes = [
-        c["close"]
-        for c in candles
-    ]
+    # --------------------------------------------------------
+    # PREVIOUS CANDLE
+    #
+    # Require previous candle to also show bullish pressure.
+    # --------------------------------------------------------
 
-    e20 = ema(closes, EMA20)
-    e50 = ema(closes, EMA50)
-
-    if e20 is None or e50 is None:
+    if (
+        previous_candle["close"]
+        <= previous_candle["open"]
+    ):
         return None
 
-    # EMA transition.
+    # --------------------------------------------------------
+    # STRUCTURE BREAK
+    # --------------------------------------------------------
+
+    previous_structure = candles[
+        -REVERSAL_LOOKBACK - 1:-1
+    ]
+
+    resistance = max(
+        c["high"]
+        for c in previous_structure
+    )
+
+    minimum_break = (
+        atr_value
+        * MIN_REVERSAL_BREAK_ATR
+    )
+
+    if (
+        current["close"]
+        <= resistance + minimum_break
+    ):
+        return None
+
+    # --------------------------------------------------------
+    # 1H EMA TRANSITION
+    # --------------------------------------------------------
+
+    ema_data = get_1h_emas(
+        candles
+    )
+
+    if ema_data is None:
+        return None
+
+    e20 = ema_data["ema20"]
+    e50 = ema_data["ema50"]
+    e200 = ema_data["ema200"]
+
+    # Must recover above EMA50.
+    if current["close"] <= e50:
+        return None
+
+    # Must also be above EMA20.
+    if current["close"] <= e20:
+        return None
+
+    # EMA20 must cross above EMA50.
     if e20 <= e50:
         return None
 
-    if current["close"] <= e50:
+    # Do not allow a reversal when price is still
+    # under the 1H EMA200.
+    if current["close"] <= e200:
         return None
+
+    # --------------------------------------------------------
+    # EMA SEPARATION
+    # --------------------------------------------------------
+
+    ema_separation = (
+        abs(e20 - e50)
+        / current["close"]
+    )
+
+    if (
+        ema_separation
+        < MIN_EMA_SEPARATION_ATR
+    ):
+        return None
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
 
     if adx_value < ADX_MIN:
         return None
@@ -683,16 +963,19 @@ def detect_reversal_long(
     if rsi_value < 50:
         return None
 
-    # Previous candle should also support bullish transition.
-    if len(candles) >= 2:
+    # RSI excessively high at reversal = avoid chasing.
+    if rsi_value > 82:
+        return None
 
-        previous_candle = candles[-2]
+    # --------------------------------------------------------
+    # PREVIOUS CLOSE
+    # --------------------------------------------------------
 
-        if (
-            previous_candle["close"]
-            <= previous_candle["open"]
-        ):
-            return None
+    if (
+        current["close"]
+        <= previous_candle["close"]
+    ):
+        return None
 
     return {
         "structure_level": resistance
@@ -705,7 +988,11 @@ def detect_reversal_long(
 
 def ema_alignment_long(candles):
 
-    if len(candles) < EMA200:
+    ema_data = get_1h_emas(
+        candles
+    )
+
+    if ema_data is None:
         return False
 
     closes = [
@@ -713,18 +1000,11 @@ def ema_alignment_long(candles):
         for c in candles
     ]
 
-    e20 = ema(closes, EMA20)
-    e50 = ema(closes, EMA50)
-    e200 = ema(closes, EMA200)
-
-    if (
-        e20 is None
-        or e50 is None
-        or e200 is None
-    ):
-        return False
-
     current_close = closes[-1]
+
+    e20 = ema_data["ema20"]
+    e50 = ema_data["ema50"]
+    e200 = ema_data["ema200"]
 
     return (
         current_close > e200
@@ -734,32 +1014,35 @@ def ema_alignment_long(candles):
 
 
 # ============================================================
-# RSI LONG CONFIRMATION
+# RSI CONFIRMATION
 # ============================================================
 
-def rsi_confirmation_long(rsi_value):
+def rsi_confirmation_long(
+    rsi_value
+):
 
     if rsi_value is None:
         return False
 
-    # RSI > 70 is NOT automatically rejected.
     return (
         50 <= rsi_value <= 85
     )
 
 
 # ============================================================
-# LONG STOP / TARGET
+# LONG LEVELS
 # ============================================================
 
 def calculate_long_levels(
     candles,
     entry,
-    atr_value,
-    setup
+    atr_value
 ):
 
-    if atr_value is None or atr_value <= 0:
+    if (
+        atr_value is None
+        or atr_value <= 0
+    ):
         return None
 
     recent = candles[
@@ -774,18 +1057,20 @@ def calculate_long_levels(
         for c in recent
     )
 
+    # ATR stop.
     atr_stop = (
         entry
         - atr_value * SL_ATR
     )
 
+    # Structure stop.
     structure_stop = (
         recent_low
         - atr_value
         * STRUCTURE_BUFFER_ATR
     )
 
-    # Use the safer / wider stop.
+    # Wider / safer stop.
     sl = min(
         atr_stop,
         structure_stop
@@ -844,22 +1129,37 @@ def analyze_at_index(
     candles_1h
 ):
 
-    if len(candles_1h) < EMA200 + 10:
+    if len(candles_1h) < EMA200 + 20:
         return None
 
-    if len(candles_4h) < EMA200:
+    if len(candles_4h) < EMA200 + 5:
         return None
 
     current = candles_1h[-1]
 
     entry = current["close"]
 
-    trend_direction = get_4h_direction(
+    # --------------------------------------------------------
+    # 4H REGIME
+    # --------------------------------------------------------
+
+    regime = get_4h_regime(
         candles_4h
+    )
+
+    if regime is None:
+        return None
+
+    trend_direction = (
+        regime["direction"]
     )
 
     if trend_direction is None:
         return None
+
+    # --------------------------------------------------------
+    # 1H INDICATORS
+    # --------------------------------------------------------
 
     atr_value = atr(
         candles_1h,
@@ -883,59 +1183,70 @@ def analyze_at_index(
     ):
         return None
 
+    # ADX.
     if adx_value < ADX_MIN:
         return None
 
+    # RSI.
     if not rsi_confirmation_long(
         rsi_value
     ):
         return None
 
-    # --------------------------------------------------------
-    # REVERSAL
-    # --------------------------------------------------------
+    setup = None
 
-    reversal = detect_reversal_long(
-        candles_1h,
-        trend_direction,
-        adx_value,
-        rsi_value
-    )
+    # ========================================================
+    # BREAKOUT
+    # ========================================================
 
-    if reversal is not None:
-
-        setup = "REVERSAL"
-
-    else:
-
-        # ----------------------------------------------------
-        # NORMAL LONG
-        #
-        # Must already have 4H LONG trend.
-        # ----------------------------------------------------
-
-        if trend_direction != "LONG":
-            return None
+    if trend_direction == "LONG":
 
         if not ema_alignment_long(
             candles_1h
         ):
             return None
 
-        breakout, level = detect_breakout_long(
-            candles_1h
+        breakout, level = (
+            detect_breakout_long(
+                candles_1h,
+                atr_value
+            )
         )
 
-        if not breakout:
-            return None
+        if breakout:
+            setup = "BREAKOUT"
 
-        setup = "BREAKOUT"
+    # ========================================================
+    # STRICT REVERSAL
+    # ========================================================
+
+    elif trend_direction == "SHORT":
+
+        reversal = (
+            detect_strict_reversal_long(
+                candles_1h,
+                trend_direction,
+                atr_value,
+                adx_value,
+                rsi_value
+            )
+        )
+
+        if reversal is not None:
+            setup = "REVERSAL"
+
+    # No setup.
+    if setup is None:
+        return None
+
+    # ========================================================
+    # LEVELS
+    # ========================================================
 
     levels = calculate_long_levels(
         candles_1h,
         entry,
-        atr_value,
-        setup
+        atr_value
     )
 
     if levels is None:
@@ -971,8 +1282,7 @@ def check_trade_result(
     tp = signal["tp"]
     sl = signal["sl"]
 
-    # IMPORTANT:
-    # Start from NEXT candle.
+    # Entry candle is ALWAYS excluded.
     for i in range(
         entry_index + 1,
         len(candles)
@@ -990,8 +1300,10 @@ def check_trade_result(
             <= sl
         )
 
+        # Conservative:
+        # if both happen inside same candle,
+        # SL is assumed first.
         if hit_tp and hit_sl:
-            # Conservative assumption.
             return "SL", i
 
         if hit_sl:
@@ -1015,15 +1327,17 @@ def backtest_coin(
 
     trades = []
 
-    i = EMA200 + 10
+    i = EMA200 + 20
 
     while i < len(candles_1h):
 
         entry_candle = candles_1h[i]
 
-        usable_4h = get_closed_4h_for_entry(
-            candles_4h,
-            entry_candle
+        usable_4h = (
+            get_closed_4h_for_entry(
+                candles_4h,
+                entry_candle
+            )
         )
 
         if len(usable_4h) < EMA200:
@@ -1049,7 +1363,8 @@ def backtest_coin(
             )
         )
 
-        # Still open at end.
+        # Trade is still open at the end.
+        # Do NOT count it.
         if result is None:
             break
 
@@ -1058,11 +1373,17 @@ def backtest_coin(
         ]
 
         if result == "TP":
-            r_result = TP_R_MULTIPLE
+
+            r_result = (
+                TP_R_MULTIPLE
+            )
+
         else:
+
             r_result = -1.0
 
         trades.append({
+
             "symbol":
                 symbol,
 
@@ -1122,6 +1443,7 @@ def backtest_coin(
 def calculate_stats(trades):
 
     if not trades:
+
         return {
             "total": 0,
             "wins": 0,
@@ -1173,11 +1495,14 @@ def calculate_stats(trades):
     )
 
     if gross_loss > 0:
+
         profit_factor = (
             gross_profit
             / gross_loss
         )
+
     else:
+
         profit_factor = float("inf")
 
     average_r = (
@@ -1249,7 +1574,7 @@ def calculate_stats(trades):
 
 
 # ============================================================
-# TIME / PRICE
+# TIME
 # ============================================================
 
 def utc_time(timestamp):
@@ -1261,6 +1586,10 @@ def utc_time(timestamp):
         "%Y-%m-%d %H:%M"
     )
 
+
+# ============================================================
+# PRICE FORMAT
+# ============================================================
 
 def fmt_price(price):
 
@@ -1281,15 +1610,15 @@ def main():
 
     print()
     print("=" * 110)
-    print(" SCORE HUNTER PRO v8.1")
-    print(" LONG ONLY - BREAKOUT + REVERSAL")
+    print(" SCORE HUNTER PRO v8.2")
+    print(" LONG ONLY - BREAKOUT + STRICT REVERSAL")
     print("=" * 110)
 
     print()
     print("Rules:")
     print("4H Trend + 1H Entry")
     print("LONG ONLY")
-    print("BREAKOUT + REVERSAL ONLY")
+    print("BREAKOUT + STRICT REVERSAL")
     print("NO PULLBACK")
     print("Closed 4H only")
     print("Closed 1H only")
@@ -1297,6 +1626,10 @@ def main():
     print("ADX >= 20")
     print("RSI confirmation")
     print("Strong breakout candle")
+    print("Real structure break")
+    print("4H regime filter")
+    print("Strict reversal confirmation")
+    print("1H EMA transition for reversal")
     print("SL = 1.5 ATR / Structure")
     print("Maximum SL = 3.5 ATR")
     print("TP = 2R")
@@ -1306,12 +1639,12 @@ def main():
 
     all_trades = []
 
-    data_ranges = {}
-
     for symbol in COINS:
 
         print()
-        print(f"Downloading {symbol}...")
+        print(
+            f"Downloading {symbol}..."
+        )
 
         candles_4h = get_ohlc(
             symbol,
@@ -1330,6 +1663,7 @@ def main():
         )
 
         if candles_4h:
+
             print(
                 f"{symbol}: 4H range = "
                 f"{utc_time(candles_4h[0]['time'])}"
@@ -1338,17 +1672,13 @@ def main():
             )
 
         if candles_1h:
+
             print(
                 f"{symbol}: 1H range = "
                 f"{utc_time(candles_1h[0]['time'])}"
                 f" -> "
                 f"{utc_time(candles_1h[-1]['time'])}"
             )
-
-        data_ranges[symbol] = (
-            candles_4h,
-            candles_1h
-        )
 
         trades = backtest_coin(
             symbol,
@@ -1375,8 +1705,8 @@ def main():
 
     print()
     print("=" * 110)
-    print("SCORE HUNTER PRO v8.1")
-    print("LONG ONLY - BREAKOUT + REVERSAL")
+    print("SCORE HUNTER PRO v8.2")
+    print("LONG ONLY - BREAKOUT + STRICT REVERSAL")
     print("=" * 110)
 
     print(
@@ -1448,7 +1778,8 @@ def main():
     for symbol in COINS:
 
         coin_trades = [
-            t for t in all_trades
+            t
+            for t in all_trades
             if t["symbol"] == symbol
         ]
 
@@ -1464,6 +1795,13 @@ def main():
             coin_trades
         )
 
+        pf = s["profit_factor"]
+
+        if pf == float("inf"):
+            pf_text = "INF"
+        else:
+            pf_text = f"{pf:.2f}"
+
         print(
             f"{symbol:5s} | "
             f"Trades: {s['total']:3d} | "
@@ -1471,7 +1809,7 @@ def main():
             f"L: {s['losses']:3d} | "
             f"WR: {s['win_rate']:6.2f}% | "
             f"R: {s['net_r']:+7.2f} | "
-            f"PF: {s['profit_factor']:.2f}"
+            f"PF: {pf_text}"
         )
 
     # ========================================================
@@ -1489,7 +1827,8 @@ def main():
     ]:
 
         setup_trades = [
-            t for t in all_trades
+            t
+            for t in all_trades
             if t["setup"] == setup
         ]
 
@@ -1500,6 +1839,13 @@ def main():
             setup_trades
         )
 
+        pf = s["profit_factor"]
+
+        if pf == float("inf"):
+            pf_text = "INF"
+        else:
+            pf_text = f"{pf:.2f}"
+
         print(
             f"{setup:10s} | "
             f"Trades: {s['total']:3d} | "
@@ -1507,7 +1853,7 @@ def main():
             f"L: {s['losses']:3d} | "
             f"WR: {s['win_rate']:6.2f}% | "
             f"R: {s['net_r']:+7.2f} | "
-            f"PF: {s['profit_factor']:.2f}"
+            f"PF: {pf_text}"
         )
 
     # ========================================================
