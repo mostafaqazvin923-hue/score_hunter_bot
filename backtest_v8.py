@@ -1,37 +1,26 @@
 import requests
 import time
-import math
 from datetime import datetime, timezone, timedelta
 
 
 # ============================================================
-# SCORE HUNTER PRO v8.5
+# SCORE HUNTER PRO v8.6
 # ROBUST LONG + SHORT BACKTEST
 #
-# DATA SOURCE:
-# BYBIT LINEAR FUTURES
+# PRIMARY DATA:
+# LBank Futures
 #
-# 365 DAYS HISTORY
-# 90 DAYS OOS
+# FALLBACK:
+# Kraken
 #
-# 4H TREND + 1H ENTRY
-# LONG + SHORT
-# BREAKOUT + STRICT REVERSAL
-# NO PULLBACK
-# CLOSED CANDLE ONLY
-# NO LOOK-AHEAD
-# ADX >= 20
-# RSI CONFIRMATION
-# STRONG BREAKOUT CANDLE
-# REAL STRUCTURE BREAK
-# 4H REGIME FILTER
-# 1H EMA TRANSITION FOR REVERSAL
-# SL = 1.5 ATR / STRUCTURE
-# MAX SL = 3.5 ATR
-# TP = 2R
-# ENTRY CANDLE EXCLUDED
-# TP + SL SAME CANDLE = SL
-# NO OVERLAPPING POSITIONS
+# IMPORTANT:
+# - No infinite loop
+# - Limited retries
+# - Chunked historical download
+# - Data validation
+# - No partial-data backtest
+# - Closed candles only
+# - No look-ahead
 # ============================================================
 
 
@@ -39,15 +28,28 @@ from datetime import datetime, timezone, timedelta
 # CONFIG
 # ============================================================
 
-BYBIT_URL = "https://api.bybit.com/v5/market/kline"
+VERSION = "v8.6"
 
-CATEGORY = "linear"
+HISTORY_DAYS = 365
+OOS_DAYS = 90
 
-INTERVAL_4H = "240"
-INTERVAL_1H = "60"
+TARGET_TRADES = 100
 
-SECONDS_1H = 3600
-SECONDS_4H = 14400
+REQUEST_TIMEOUT = 12
+MAX_RETRIES = 3
+
+# Do not wait forever between failed requests.
+RETRY_SLEEP = 1.5
+
+# Number of candles requested per chunk.
+# 1H: 500 candles ~= 20.8 days
+# 4H: 500 candles ~= 83 days
+CHUNK_SIZE = 500
+
+
+# ============================================================
+# SYMBOLS
+# ============================================================
 
 COINS = {
     "ETH": "ETHUSDT",
@@ -61,20 +63,14 @@ COINS = {
 
 
 # ============================================================
-# BACKTEST PERIOD
+# TIMEFRAMES
 # ============================================================
 
-HISTORY_DAYS = 365
-OOS_DAYS = 90
+INTERVAL_1H = 3600
+INTERVAL_4H = 14400
 
-TARGET_TRADES = 100
-
-REQUEST_TIMEOUT = 15
-MAX_RETRIES = 3
-
-# Maximum pages allowed.
-MAX_PAGES_1H = 20
-MAX_PAGES_4H = 6
+SECONDS_1H = 3600
+SECONDS_4H = 14400
 
 
 # ============================================================
@@ -106,39 +102,91 @@ MIN_CLOSE_LOCATION = 0.70
 
 
 # ============================================================
-# SESSION
+# HTTP SESSION
 # ============================================================
 
 SESSION = requests.Session()
 
 SESSION.headers.update({
-    "User-Agent": (
+    "User-Agent":
         "Mozilla/5.0 "
-        "ScoreHunterPro-v8.5-Backtester"
-    )
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/126 Safari/537.36",
+    "Accept": "application/json",
+    "Connection": "keep-alive"
 })
 
 
 # ============================================================
-# TIME
+# DATA SOURCE CONFIG
+# ============================================================
+
+# LBank official API infrastructure has separate
+# spot/contract systems.
+#
+# The contract host is intentionally isolated here so that
+# changing the LBank API endpoint later does NOT require
+# rewriting the backtester.
+
+LBANK_CONTRACT_BASE = (
+    "https://lbkperp.lbank.com"
+)
+
+# Known LBank contract API namespace used by current
+# exchange integrations.
+LBANK_KLINE_PATH = (
+    "/cfd/openApi/v1/pub/marketData"
+)
+
+# NOTE:
+# If LBank changes its public contract endpoint,
+# only this function needs to be changed:
+# lbank_get_klines()
+
+
+# ============================================================
+# KRAKEN FALLBACK
+# ============================================================
+
+KRAKEN_URL = (
+    "https://api.kraken.com/0/public/OHLC"
+)
+
+KRAKEN_SYMBOLS = {
+    "ETH": "ETHUSDT",
+    "SOL": "SOLUSDT",
+    "XRP": "XRPUSDT",
+    "BTC": "XBTUSDT",
+    "ADA": "ADAUSDT",
+    "LINK": "LINKUSDT",
+    "DOGE": "DOGEUSDT",
+}
+
+
+# ============================================================
+# UTILITIES
 # ============================================================
 
 def utc_now():
+
     return datetime.now(
         timezone.utc
     )
 
 
-def dt_to_ms(dt):
+def timestamp_ms(dt):
+
     return int(
         dt.timestamp() * 1000
     )
 
 
-def ms_to_datetime(ms):
-    return datetime.fromtimestamp(
-        ms / 1000,
-        tz=timezone.utc
+def timestamp_sec(dt):
+
+    return int(
+        dt.timestamp()
     )
 
 
@@ -152,11 +200,26 @@ def utc_time(timestamp):
     )
 
 
+def fmt_price(price):
+
+    if price >= 1000:
+        return f"{price:.2f}"
+
+    if price >= 1:
+        return f"{price:.5f}"
+
+    return f"{price:.8f}"
+
+
 # ============================================================
-# SAFE HTTP
+# HTTP GET WITH RETRIES
 # ============================================================
 
-def api_get(params):
+def safe_get(
+    url,
+    params=None,
+    label=""
+):
 
     last_error = None
 
@@ -168,236 +231,859 @@ def api_get(params):
         try:
 
             response = SESSION.get(
-                BYBIT_URL,
+                url,
                 params=params,
                 timeout=REQUEST_TIMEOUT
             )
 
-            response.raise_for_status()
+            if response.status_code == 200:
 
-            data = response.json()
+                return response
 
-            if data.get("retCode") != 0:
+            last_error = (
+                f"HTTP {response.status_code}"
+            )
 
-                raise RuntimeError(
-                    str(
-                        data.get(
-                            "retMsg",
-                            "Unknown Bybit error"
-                        )
-                    )
-                )
+        except Exception as exc:
 
-            return data
+            last_error = str(exc)
 
-        except Exception as e:
+        if attempt < MAX_RETRIES:
 
-            last_error = e
-
-            if attempt < MAX_RETRIES:
-
-                time.sleep(
-                    1.5 * attempt
-                )
+            time.sleep(
+                RETRY_SLEEP
+            )
 
     raise RuntimeError(
-        f"API failed after "
+        f"{label} failed after "
         f"{MAX_RETRIES} attempts: "
         f"{last_error}"
     )
 
 
 # ============================================================
-# BYBIT KLINES
+# NORMALIZE CANDLE
 # ============================================================
 
-def get_ohlc(
-    symbol,
-    interval,
-    start_dt,
-    end_dt
+def normalize_candle(
+    timestamp,
+    open_price,
+    high_price,
+    low_price,
+    close_price,
+    volume
 ):
 
-    start_ms = dt_to_ms(
-        start_dt
-    )
+    return {
+        "time": int(timestamp),
+        "open": float(open_price),
+        "high": float(high_price),
+        "low": float(low_price),
+        "close": float(close_price),
+        "volume": float(volume)
+    }
 
-    end_ms = dt_to_ms(
-        end_dt
-    )
 
-    if interval == INTERVAL_1H:
+# ============================================================
+# VALIDATE CANDLES
+# ============================================================
 
-        max_pages = MAX_PAGES_1H
-
-    else:
-
-        max_pages = MAX_PAGES_4H
-
-    all_rows = []
-
-    current_end = end_ms
-
-    pages = 0
-
-    while (
-        current_end > start_ms
-        and pages < max_pages
-    ):
-
-        pages += 1
-
-        params = {
-            "category": CATEGORY,
-            "symbol": symbol,
-            "interval": interval,
-            "start": start_ms,
-            "end": current_end,
-            "limit": 1000
-        }
-
-        data = api_get(
-            params
-        )
-
-        result = (
-            data
-            .get("result", {})
-            .get("list", [])
-        )
-
-        if not result:
-            break
-
-        all_rows.extend(
-            result
-        )
-
-        timestamps = [
-            int(row[0])
-            for row in result
-        ]
-
-        oldest = min(
-            timestamps
-        )
-
-        # Prevent infinite pagination.
-        if oldest >= current_end:
-
-            break
-
-        next_end = (
-            oldest - 1
-        )
-
-        if next_end >= current_end:
-
-            break
-
-        current_end = next_end
-
-        time.sleep(0.15)
-
-    if not all_rows:
-
-        raise RuntimeError(
-            f"{symbol} {interval}: "
-            f"no candles returned."
-        )
-
-    unique = {}
-
-    for row in all_rows:
-
-        timestamp = int(
-            row[0]
-        )
-
-        if (
-            timestamp < start_ms
-            or timestamp > end_ms
-        ):
-            continue
-
-        unique[timestamp] = row
-
-    rows = list(
-        unique.values()
-    )
-
-    rows.sort(
-        key=lambda x: int(x[0])
-    )
-
-    candles = []
-
-    for row in rows:
-
-        candles.append({
-
-            "time":
-                int(row[0]) // 1000,
-
-            "open":
-                float(row[1]),
-
-            "high":
-                float(row[2]),
-
-            "low":
-                float(row[3]),
-
-            "close":
-                float(row[4]),
-
-            "volume":
-                float(row[5])
-
-        })
-
-    # Remove currently forming candle.
-    now_ts = int(
-        utc_now().timestamp()
-    )
-
-    interval_seconds = (
-        SECONDS_1H
-        if interval == INTERVAL_1H
-        else SECONDS_4H
-    )
-
-    candles = [
-        c for c in candles
-        if (
-            c["time"]
-            + interval_seconds
-            <= now_ts
-        )
-    ]
+def validate_candles(
+    candles,
+    expected_interval,
+    symbol,
+    timeframe
+):
 
     if not candles:
 
         raise RuntimeError(
-            f"{symbol} {interval}: "
-            f"all candles were incomplete."
+            f"{symbol} {timeframe}: "
+            f"empty candle set."
+        )
+
+    candles = sorted(
+        candles,
+        key=lambda x: x["time"]
+    )
+
+    unique = {}
+
+    for candle in candles:
+
+        unique[
+            candle["time"]
+        ] = candle
+
+    candles = list(
+        unique.values()
+    )
+
+    candles.sort(
+        key=lambda x: x["time"]
+    )
+
+    # Validate OHLC.
+    for candle in candles:
+
+        o = candle["open"]
+        h = candle["high"]
+        l = candle["low"]
+        c = candle["close"]
+
+        if (
+            h < l
+            or h < o
+            or h < c
+            or l > o
+            or l > c
+        ):
+
+            raise RuntimeError(
+                f"{symbol} {timeframe}: "
+                f"invalid OHLC."
+            )
+
+        if (
+            o <= 0
+            or h <= 0
+            or l <= 0
+            or c <= 0
+        ):
+
+            raise RuntimeError(
+                f"{symbol} {timeframe}: "
+                f"invalid price."
+            )
+
+    # Check major gaps.
+    gaps = []
+
+    for i in range(
+        1,
+        len(candles)
+    ):
+
+        delta = (
+            candles[i]["time"]
+            - candles[i - 1]["time"]
+        )
+
+        if delta > expected_interval * 2:
+
+            gaps.append(
+                (
+                    candles[i - 1]["time"],
+                    candles[i]["time"]
+                )
+            )
+
+    if gaps:
+
+        raise RuntimeError(
+            f"{symbol} {timeframe}: "
+            f"large candle gaps detected."
         )
 
     return candles
 
 
 # ============================================================
+# LBANK CONTRACT KLINES
+# ============================================================
+
+def parse_lbank_response(
+    data,
+    symbol,
+    interval
+):
+
+    if not isinstance(
+        data,
+        dict
+    ):
+
+        raise RuntimeError(
+            "LBank response is not JSON object."
+        )
+
+    # Common error fields.
+    if (
+        data.get("error_code")
+        not in (None, 0, "0")
+    ):
+
+        raise RuntimeError(
+            f"LBank error: "
+            f"{data.get('error_code')}"
+        )
+
+    raw = data.get("data")
+
+    if raw is None:
+
+        raw = data.get("result")
+
+    if raw is None:
+
+        raw = data.get("rows")
+
+    if raw is None:
+
+        raise RuntimeError(
+            "LBank response has no candle data."
+        )
+
+    candles = []
+
+    if isinstance(
+        raw,
+        list
+    ):
+
+        for row in raw:
+
+            # ------------------------------------------------
+            # List format
+            # ------------------------------------------------
+
+            if isinstance(
+                row,
+                list
+            ):
+
+                if len(row) < 6:
+                    continue
+
+                try:
+
+                    ts = int(
+                        float(row[0])
+                    )
+
+                    # LBank-style OHLC arrays can vary.
+                    #
+                    # Most common:
+                    # timestamp, open, high, low,
+                    # close, volume
+                    candles.append(
+                        normalize_candle(
+                            ts,
+                            row[1],
+                            row[2],
+                            row[3],
+                            row[4],
+                            row[5]
+                        )
+                    )
+
+                except Exception:
+                    continue
+
+            # ------------------------------------------------
+            # Dict format
+            # ------------------------------------------------
+
+            elif isinstance(
+                row,
+                dict
+            ):
+
+                try:
+
+                    ts = (
+                        row.get("time")
+                        or row.get("timestamp")
+                        or row.get("ts")
+                    )
+
+                    op = (
+                        row.get("open")
+                        or row.get("o")
+                    )
+
+                    hi = (
+                        row.get("high")
+                        or row.get("h")
+                    )
+
+                    lo = (
+                        row.get("low")
+                        or row.get("l")
+                    )
+
+                    cl = (
+                        row.get("close")
+                        or row.get("c")
+                    )
+
+                    vol = (
+                        row.get("volume")
+                        or row.get("vol")
+                        or row.get("v")
+                        or 0
+                    )
+
+                    if None in (
+                        ts,
+                        op,
+                        hi,
+                        lo,
+                        cl
+                    ):
+                        continue
+
+                    ts = int(
+                        float(ts)
+                    )
+
+                    # Convert milliseconds.
+                    if ts > 10_000_000_000:
+                        ts //= 1000
+
+                    candles.append(
+                        normalize_candle(
+                            ts,
+                            op,
+                            hi,
+                            lo,
+                            cl,
+                            vol
+                        )
+                    )
+
+                except Exception:
+                    continue
+
+    if not candles:
+
+        raise RuntimeError(
+            f"{symbol}: LBank returned "
+            f"unrecognized candle format."
+        )
+
+    return candles
+
+
+def lbank_get_klines(
+    symbol,
+    interval_seconds,
+    start_dt,
+    end_dt
+):
+
+    # --------------------------------------------------------
+    # LBank contract market API.
+    #
+    # We use a deliberately small page size and validate
+    # every response.
+    # --------------------------------------------------------
+
+    interval_name = {
+        3600: "hour1",
+        14400: "hour4"
+    }.get(
+        interval_seconds
+    )
+
+    if interval_name is None:
+
+        raise RuntimeError(
+            "Unsupported LBank interval."
+        )
+
+    url = (
+        LBANK_CONTRACT_BASE
+        + LBANK_KLINE_PATH
+    )
+
+    params = {
+        "symbol": COINS[symbol],
+        "productGroup": "SwapU",
+        "interval": interval_name,
+        "startTime": timestamp_ms(
+            start_dt
+        ),
+        "endTime": timestamp_ms(
+            end_dt
+        ),
+        "limit": CHUNK_SIZE
+    }
+
+    response = safe_get(
+        url,
+        params=params,
+        label=(
+            f"LBank {symbol} "
+            f"{interval_name}"
+        )
+    )
+
+    try:
+
+        data = response.json()
+
+    except Exception:
+
+        raise RuntimeError(
+            f"LBank {symbol}: "
+            f"invalid JSON response."
+        )
+
+    return parse_lbank_response(
+        data,
+        symbol,
+        interval_name
+    )
+
+
+# ============================================================
+# LBANK PAGINATED DOWNLOAD
+# ============================================================
+
+def download_lbank(
+    symbol,
+    interval_seconds,
+    start_dt,
+    end_dt
+):
+
+    candles = []
+
+    cursor = start_dt
+
+    max_requests = 100
+
+    requests_used = 0
+
+    while (
+        cursor < end_dt
+        and requests_used < max_requests
+    ):
+
+        requests_used += 1
+
+        # Limit each request to avoid giant API windows.
+        chunk_end = min(
+            end_dt,
+            cursor
+            + timedelta(
+                seconds=(
+                    interval_seconds
+                    * CHUNK_SIZE
+                )
+            )
+        )
+
+        batch = lbank_get_klines(
+            symbol,
+            interval_seconds,
+            cursor,
+            chunk_end
+        )
+
+        if not batch:
+
+            break
+
+        candles.extend(
+            batch
+        )
+
+        latest = max(
+            c["time"]
+            for c in batch
+        )
+
+        next_cursor = (
+            datetime.fromtimestamp(
+                latest,
+                tz=timezone.utc
+            )
+            + timedelta(
+                seconds=interval_seconds
+            )
+        )
+
+        if next_cursor <= cursor:
+
+            break
+
+        cursor = next_cursor
+
+        # If the server returned less than a full page,
+        # the next request will determine whether more data
+        # exists.
+        if len(batch) < CHUNK_SIZE:
+
+            if cursor >= end_dt:
+                break
+
+        time.sleep(
+            0.15
+        )
+
+    if requests_used >= max_requests:
+
+        raise RuntimeError(
+            f"{symbol}: LBank pagination "
+            f"limit reached."
+        )
+
+    return validate_candles(
+        candles,
+        interval_seconds,
+        symbol,
+        (
+            "1H"
+            if interval_seconds == INTERVAL_1H
+            else "4H"
+        )
+    )
+
+
+# ============================================================
+# KRAKEN FALLBACK
+# ============================================================
+
+def kraken_get_ohlc(
+    symbol,
+    interval,
+    since
+):
+
+    params = {
+        "pair":
+            KRAKEN_SYMBOLS[symbol],
+        "interval":
+            interval,
+        "since":
+            since
+    }
+
+    response = safe_get(
+        KRAKEN_URL,
+        params=params,
+        label=(
+            f"Kraken {symbol} "
+            f"{interval}"
+        )
+    )
+
+    data = response.json()
+
+    if data.get("error"):
+
+        raise RuntimeError(
+            f"Kraken error: "
+            f"{data['error']}"
+        )
+
+    result = data.get(
+        "result",
+        {}
+    )
+
+    keys = [
+        key
+        for key in result
+        if key != "last"
+    ]
+
+    if not keys:
+
+        raise RuntimeError(
+            f"{symbol}: "
+            f"Kraken returned no candles."
+        )
+
+    pair = keys[0]
+
+    candles = []
+
+    for row in result[pair]:
+
+        if len(row) < 7:
+            continue
+
+        candles.append(
+            normalize_candle(
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[6]
+            )
+        )
+
+    return candles
+
+
+def download_kraken(
+    symbol,
+    interval_seconds,
+    start_dt,
+    end_dt
+):
+
+    # Kraken public OHLC has limited history.
+    # We try to collect what is available.
+    #
+    # IMPORTANT:
+    # If the required 365-day range cannot be obtained,
+    # this function raises instead of silently producing
+    # an incomplete backtest.
+
+    interval_minutes = (
+        interval_seconds // 60
+    )
+
+    since = timestamp_sec(
+        start_dt
+    )
+
+    candles = []
+
+    max_requests = 100
+
+    for _ in range(
+        max_requests
+    ):
+
+        batch = kraken_get_ohlc(
+            symbol,
+            interval_minutes,
+            since
+        )
+
+        if not batch:
+            break
+
+        candles.extend(
+            batch
+        )
+
+        latest = max(
+            c["time"]
+            for c in batch
+        )
+
+        if latest <= since:
+            break
+
+        since = (
+            latest
+            + interval_seconds
+        )
+
+        if latest >= timestamp_sec(
+            end_dt
+        ):
+            break
+
+        time.sleep(
+            0.25
+        )
+
+        # Kraken's public OHLC history can be limited.
+        # Stop if the API repeats the same old range.
+        if len(batch) < 2:
+            break
+
+    candles = [
+        c
+        for c in candles
+        if (
+            c["time"]
+            >= timestamp_sec(
+                start_dt
+            )
+            and
+            c["time"]
+            <= timestamp_sec(
+                end_dt
+            )
+        )
+    ]
+
+    candles = validate_candles(
+        candles,
+        interval_seconds,
+        symbol,
+        (
+            "1H"
+            if interval_seconds == INTERVAL_1H
+            else "4H"
+        )
+    )
+
+    required_start = timestamp_sec(
+        start_dt
+    )
+
+    required_end = timestamp_sec(
+        end_dt
+    )
+
+    if (
+        candles[0]["time"]
+        > required_start
+        + interval_seconds * 10
+    ):
+
+        raise RuntimeError(
+            f"{symbol}: Kraken history "
+            f"is incomplete."
+        )
+
+    if (
+        candles[-1]["time"]
+        < required_end
+        - interval_seconds * 10
+    ):
+
+        raise RuntimeError(
+            f"{symbol}: Kraken data "
+            f"does not reach end date."
+        )
+
+    return candles
+
+
+# ============================================================
+# DATA LOADER
+# ============================================================
+
+def load_market_data(
+    symbol,
+    start_dt,
+    end_dt
+):
+
+    print()
+    print(
+        f"Downloading {symbol}..."
+    )
+
+    # --------------------------------------------------------
+    # PRIMARY: LBANK FUTURES
+    # --------------------------------------------------------
+
+    try:
+
+        candles_4h = download_lbank(
+            symbol,
+            INTERVAL_4H,
+            start_dt,
+            end_dt
+        )
+
+        candles_1h = download_lbank(
+            symbol,
+            INTERVAL_1H,
+            start_dt,
+            end_dt
+        )
+
+        print(
+            f"{symbol}: "
+            f"LBank Futures OK"
+        )
+
+        print(
+            f"{symbol}: "
+            f"4H={len(candles_4h)} | "
+            f"1H={len(candles_1h)}"
+        )
+
+        return (
+            candles_4h,
+            candles_1h,
+            "LBANK"
+        )
+
+    except Exception as lbank_error:
+
+        print(
+            f"{symbol}: "
+            f"LBank failed:"
+        )
+
+        print(
+            f"    {lbank_error}"
+        )
+
+        print(
+            f"{symbol}: "
+            f"Trying Kraken fallback..."
+        )
+
+    # --------------------------------------------------------
+    # FALLBACK: KRAKEN
+    # --------------------------------------------------------
+
+    try:
+
+        candles_4h = download_kraken(
+            symbol,
+            INTERVAL_4H,
+            start_dt,
+            end_dt
+        )
+
+        candles_1h = download_kraken(
+            symbol,
+            INTERVAL_1H,
+            start_dt,
+            end_dt
+        )
+
+        print(
+            f"{symbol}: "
+            f"Kraken fallback OK"
+        )
+
+        print(
+            f"{symbol}: "
+            f"4H={len(candles_4h)} | "
+            f"1H={len(candles_1h)}"
+        )
+
+        return (
+            candles_4h,
+            candles_1h,
+            "KRAKEN"
+        )
+
+    except Exception as kraken_error:
+
+        raise RuntimeError(
+            f"{symbol}: "
+            f"LBank and Kraken failed.\n"
+            f"LBank: {lbank_error}\n"
+            f"Kraken: {kraken_error}"
+        )
+
+
+# ============================================================
 # EMA
 # ============================================================
 
-def ema(values, period):
+def ema(
+    values,
+    period
+):
 
     if len(values) < period:
         return None
 
-    value = sum(
-        values[:period]
-    ) / period
+    value = (
+        sum(
+            values[:period]
+        )
+        / period
+    )
 
     multiplier = (
         2.0
@@ -407,7 +1093,9 @@ def ema(values, period):
     for price in values[period:]:
 
         value = (
-            (price - value)
+            (
+                price - value
+            )
             * multiplier
             + value
         )
@@ -438,7 +1126,6 @@ def atr(
         previous = candles[i - 1]
 
         tr = max(
-
             current["high"]
             - current["low"],
 
@@ -453,14 +1140,19 @@ def atr(
             )
         )
 
-        trs.append(tr)
+        trs.append(
+            tr
+        )
 
     if len(trs) < period:
         return None
 
-    value = sum(
-        trs[:period]
-    ) / period
+    value = (
+        sum(
+            trs[:period]
+        )
+        / period
+    )
 
     for tr in trs[period:]:
 
@@ -503,20 +1195,30 @@ def rsi(
         )
 
         gains.append(
-            max(change, 0.0)
+            max(
+                change,
+                0.0
+            )
         )
 
         losses.append(
-            max(-change, 0.0)
+            max(
+                -change,
+                0.0
+            )
         )
 
     avg_gain = (
-        sum(gains[:period])
+        sum(
+            gains[:period]
+        )
         / period
     )
 
     avg_loss = (
-        sum(losses[:period])
+        sum(
+            losses[:period]
+        )
         / period
     )
 
@@ -527,7 +1229,9 @@ def rsi(
 
         avg_gain = (
             (
-                avg_gain * (period - 1)
+                avg_gain * (
+                    period - 1
+                )
                 + gains[i]
             )
             / period
@@ -535,7 +1239,9 @@ def rsi(
 
         avg_loss = (
             (
-                avg_loss * (period - 1)
+                avg_loss * (
+                    period - 1
+                )
                 + losses[i]
             )
             / period
@@ -556,7 +1262,10 @@ def rsi(
         100.0
         - (
             100.0
-            / (1.0 + rs_value)
+            / (
+                1.0
+                + rs_value
+            )
         )
     )
 
@@ -595,14 +1304,11 @@ def adx(
         prev_close = previous["close"]
 
         tr = max(
-
             high - low,
-
             abs(
                 high
                 - prev_close
             ),
-
             abs(
                 low
                 - prev_close
@@ -637,17 +1343,19 @@ def adx(
             else 0.0
         )
 
-        tr_list.append(tr)
+        tr_list.append(
+            tr
+        )
+
         plus_dm_list.append(
             plus_dm
         )
+
         minus_dm_list.append(
             minus_dm
         )
 
-    if len(tr_list) < (
-        period * 2
-    ):
+    if len(tr_list) < period * 2:
         return None
 
     atr_value = (
@@ -851,7 +1559,7 @@ def get_closed_4h_for_entry(
 
 
 # ============================================================
-# BREAKOUT LONG
+# LONG BREAKOUT
 # ============================================================
 
 def detect_breakout_long(
@@ -906,20 +1614,25 @@ def detect_breakout_long(
     if body_ratio < MIN_BODY_RATIO:
         return False, None
 
-    if close_location < MIN_CLOSE_LOCATION:
-        return False, None
-
     if (
-        current["close"]
-        <= candles[-2]["close"]
+        close_location
+        < MIN_CLOSE_LOCATION
     ):
         return False, None
+
+    if len(candles) >= 2:
+
+        if (
+            current["close"]
+            <= candles[-2]["close"]
+        ):
+            return False, None
 
     return True, resistance
 
 
 # ============================================================
-# BREAKOUT SHORT
+# SHORT BREAKOUT
 # ============================================================
 
 def detect_breakout_short(
@@ -974,20 +1687,25 @@ def detect_breakout_short(
     if body_ratio < MIN_BODY_RATIO:
         return False, None
 
-    if close_location < MIN_CLOSE_LOCATION:
-        return False, None
-
     if (
-        current["close"]
-        >= candles[-2]["close"]
+        close_location
+        < MIN_CLOSE_LOCATION
     ):
         return False, None
+
+    if len(candles) >= 2:
+
+        if (
+            current["close"]
+            >= candles[-2]["close"]
+        ):
+            return False, None
 
     return True, support
 
 
 # ============================================================
-# REVERSAL LONG
+# LONG REVERSAL
 # ============================================================
 
 def detect_reversal_long(
@@ -1049,7 +1767,10 @@ def detect_reversal_long(
         - current["low"]
     ) / candle_range
 
-    if close_location < MIN_CLOSE_LOCATION:
+    if (
+        close_location
+        < MIN_CLOSE_LOCATION
+    ):
         return None
 
     closes = [
@@ -1085,13 +1806,15 @@ def detect_reversal_long(
     if rsi_value < 50:
         return None
 
-    previous_candle = candles[-2]
+    if len(candles) >= 2:
 
-    if (
-        previous_candle["close"]
-        <= previous_candle["open"]
-    ):
-        return None
+        previous_candle = candles[-2]
+
+        if (
+            previous_candle["close"]
+            <= previous_candle["open"]
+        ):
+            return None
 
     return {
         "structure_level":
@@ -1100,7 +1823,7 @@ def detect_reversal_long(
 
 
 # ============================================================
-# REVERSAL SHORT
+# SHORT REVERSAL
 # ============================================================
 
 def detect_reversal_short(
@@ -1162,7 +1885,10 @@ def detect_reversal_short(
         - current["close"]
     ) / candle_range
 
-    if close_location < MIN_CLOSE_LOCATION:
+    if (
+        close_location
+        < MIN_CLOSE_LOCATION
+    ):
         return None
 
     closes = [
@@ -1198,13 +1924,15 @@ def detect_reversal_short(
     if rsi_value > 50:
         return None
 
-    previous_candle = candles[-2]
+    if len(candles) >= 2:
 
-    if (
-        previous_candle["close"]
-        >= previous_candle["open"]
-    ):
-        return None
+        previous_candle = candles[-2]
+
+        if (
+            previous_candle["close"]
+            >= previous_candle["open"]
+        ):
+            return None
 
     return {
         "structure_level":
@@ -1213,7 +1941,7 @@ def detect_reversal_short(
 
 
 # ============================================================
-# EMA ALIGNMENT
+# LONG EMA ALIGNMENT
 # ============================================================
 
 def ema_alignment_long(
@@ -1250,12 +1978,18 @@ def ema_alignment_long(
     ):
         return False
 
+    current_close = closes[-1]
+
     return (
-        closes[-1] > e200
+        current_close > e200
         and e20 > e50
         and e50 > e200
     )
 
+
+# ============================================================
+# SHORT EMA ALIGNMENT
+# ============================================================
 
 def ema_alignment_short(
     candles
@@ -1291,8 +2025,10 @@ def ema_alignment_short(
     ):
         return False
 
+    current_close = closes[-1]
+
     return (
-        closes[-1] < e200
+        current_close < e200
         and e20 < e50
         and e50 < e200
     )
@@ -1306,9 +2042,11 @@ def rsi_confirmation_long(
     value
 ):
 
+    if value is None:
+        return False
+
     return (
-        value is not None
-        and 50 <= value <= 85
+        50 <= value <= 85
     )
 
 
@@ -1316,9 +2054,11 @@ def rsi_confirmation_short(
     value
 ):
 
+    if value is None:
+        return False
+
     return (
-        value is not None
-        and 15 <= value <= 50
+        15 <= value <= 50
     )
 
 
@@ -1389,6 +2129,9 @@ def calculate_long_levels(
     reward = (
         tp - entry
     )
+
+    if reward <= 0:
+        return None
 
     rr = (
         reward
@@ -1475,6 +2218,9 @@ def calculate_short_levels(
         entry - tp
     )
 
+    if reward <= 0:
+        return None
+
     rr = (
         reward
         / risk
@@ -1493,7 +2239,7 @@ def calculate_short_levels(
 
 
 # ============================================================
-# ANALYZE
+# ANALYSIS
 # ============================================================
 
 def analyze_at_index(
@@ -1513,11 +2259,13 @@ def analyze_at_index(
 
     entry = current["close"]
 
-    trend = get_4h_direction(
-        candles_4h
+    trend_direction = (
+        get_4h_direction(
+            candles_4h
+        )
     )
 
-    if trend is None:
+    if trend_direction is None:
         return None
 
     atr_value = atr(
@@ -1553,19 +2301,23 @@ def analyze_at_index(
         rsi_value
     ):
 
-        reversal = detect_reversal_long(
-            candles_1h,
-            trend,
-            adx_value,
-            rsi_value
+        reversal = (
+            detect_reversal_long(
+                candles_1h,
+                trend_direction,
+                adx_value,
+                rsi_value
+            )
         )
 
         if reversal is not None:
 
-            levels = calculate_long_levels(
-                candles_1h,
-                entry,
-                atr_value
+            levels = (
+                calculate_long_levels(
+                    candles_1h,
+                    entry,
+                    atr_value
+                )
             )
 
             if levels is not None:
@@ -1573,48 +2325,37 @@ def analyze_at_index(
                 return {
                     "direction":
                         "LONG",
-
                     "setup":
                         "REVERSAL",
-
                     "entry_time":
                         current["time"],
-
                     "entry":
                         entry,
-
                     "tp":
                         levels["tp"],
-
                     "sl":
                         levels["sl"],
-
                     "risk":
                         levels["risk"],
-
                     "rr":
                         levels["rr"],
-
                     "risk_atr":
                         levels["risk_atr"],
-
                     "atr":
                         atr_value,
-
                     "adx":
                         adx_value,
-
                     "rsi":
                         rsi_value
                 }
 
-        if trend == "LONG":
+        if trend_direction == "LONG":
 
             if ema_alignment_long(
                 candles_1h
             ):
 
-                breakout, _ = (
+                breakout, level = (
                     detect_breakout_long(
                         candles_1h
                     )
@@ -1622,10 +2363,12 @@ def analyze_at_index(
 
                 if breakout:
 
-                    levels = calculate_long_levels(
-                        candles_1h,
-                        entry,
-                        atr_value
+                    levels = (
+                        calculate_long_levels(
+                            candles_1h,
+                            entry,
+                            atr_value
+                        )
                     )
 
                     if levels is not None:
@@ -1633,37 +2376,26 @@ def analyze_at_index(
                         return {
                             "direction":
                                 "LONG",
-
                             "setup":
                                 "BREAKOUT",
-
                             "entry_time":
                                 current["time"],
-
                             "entry":
                                 entry,
-
                             "tp":
                                 levels["tp"],
-
                             "sl":
                                 levels["sl"],
-
                             "risk":
                                 levels["risk"],
-
                             "rr":
                                 levels["rr"],
-
                             "risk_atr":
                                 levels["risk_atr"],
-
                             "atr":
                                 atr_value,
-
                             "adx":
                                 adx_value,
-
                             "rsi":
                                 rsi_value
                         }
@@ -1676,19 +2408,23 @@ def analyze_at_index(
         rsi_value
     ):
 
-        reversal = detect_reversal_short(
-            candles_1h,
-            trend,
-            adx_value,
-            rsi_value
+        reversal = (
+            detect_reversal_short(
+                candles_1h,
+                trend_direction,
+                adx_value,
+                rsi_value
+            )
         )
 
         if reversal is not None:
 
-            levels = calculate_short_levels(
-                candles_1h,
-                entry,
-                atr_value
+            levels = (
+                calculate_short_levels(
+                    candles_1h,
+                    entry,
+                    atr_value
+                )
             )
 
             if levels is not None:
@@ -1696,48 +2432,37 @@ def analyze_at_index(
                 return {
                     "direction":
                         "SHORT",
-
                     "setup":
                         "REVERSAL",
-
                     "entry_time":
                         current["time"],
-
                     "entry":
                         entry,
-
                     "tp":
                         levels["tp"],
-
                     "sl":
                         levels["sl"],
-
                     "risk":
                         levels["risk"],
-
                     "rr":
                         levels["rr"],
-
                     "risk_atr":
                         levels["risk_atr"],
-
                     "atr":
                         atr_value,
-
                     "adx":
                         adx_value,
-
                     "rsi":
                         rsi_value
                 }
 
-        if trend == "SHORT":
+        if trend_direction == "SHORT":
 
             if ema_alignment_short(
                 candles_1h
             ):
 
-                breakout, _ = (
+                breakout, level = (
                     detect_breakout_short(
                         candles_1h
                     )
@@ -1745,10 +2470,12 @@ def analyze_at_index(
 
                 if breakout:
 
-                    levels = calculate_short_levels(
-                        candles_1h,
-                        entry,
-                        atr_value
+                    levels = (
+                        calculate_short_levels(
+                            candles_1h,
+                            entry,
+                            atr_value
+                        )
                     )
 
                     if levels is not None:
@@ -1756,37 +2483,26 @@ def analyze_at_index(
                         return {
                             "direction":
                                 "SHORT",
-
                             "setup":
                                 "BREAKOUT",
-
                             "entry_time":
                                 current["time"],
-
                             "entry":
                                 entry,
-
                             "tp":
                                 levels["tp"],
-
                             "sl":
                                 levels["sl"],
-
                             "risk":
                                 levels["risk"],
-
                             "rr":
                                 levels["rr"],
-
                             "risk_atr":
                                 levels["risk_atr"],
-
                             "atr":
                                 atr_value,
-
                             "adx":
                                 adx_value,
-
                             "rsi":
                                 rsi_value
                         }
@@ -1795,7 +2511,7 @@ def analyze_at_index(
 
 
 # ============================================================
-# RESULT CHECK
+# TRADE RESULT
 # ============================================================
 
 def check_trade_result(
@@ -1807,6 +2523,10 @@ def check_trade_result(
     tp = signal["tp"]
     sl = signal["sl"]
 
+    direction = (
+        signal["direction"]
+    )
+
     for i in range(
         entry_index + 1,
         len(candles)
@@ -1814,10 +2534,7 @@ def check_trade_result(
 
         candle = candles[i]
 
-        hit_tp = False
-        hit_sl = False
-
-        if signal["direction"] == "LONG":
+        if direction == "LONG":
 
             hit_tp = (
                 candle["high"]
@@ -1841,42 +2558,57 @@ def check_trade_result(
                 >= sl
             )
 
-        # Conservative:
-        # If both are touched on same candle,
-        # count as SL.
+        # Conservative assumption:
+        # If both are touched inside one candle,
+        # count SL first.
         if hit_tp and hit_sl:
 
-            return "SL", i
+            return (
+                "SL",
+                i
+            )
 
         if hit_sl:
 
-            return "SL", i
+            return (
+                "SL",
+                i
+            )
 
         if hit_tp:
 
-            return "TP", i
+            return (
+                "TP",
+                i
+            )
 
-    return None, None
+    return (
+        None,
+        None
+    )
 
 
 # ============================================================
-# BACKTEST COIN
+# BACKTEST ONE COIN
 # ============================================================
 
 def backtest_coin(
     symbol,
     candles_4h,
-    candles_1h,
-    oos_start_ts
+    candles_1h
 ):
 
     trades = []
 
     i = EMA200 + 10
 
-    while i < len(candles_1h):
+    while i < len(
+        candles_1h
+    ):
 
-        entry_candle = candles_1h[i]
+        entry_candle = (
+            candles_1h[i]
+        )
 
         usable_4h = (
             get_closed_4h_for_entry(
@@ -1890,9 +2622,13 @@ def backtest_coin(
             i += 1
             continue
 
-        signal = analyze_at_index(
-            usable_4h,
-            candles_1h[:i + 1]
+        signal = (
+            analyze_at_index(
+                usable_4h,
+                candles_1h[
+                    :i + 1
+                ]
+            )
         )
 
         if signal is None:
@@ -1912,11 +2648,9 @@ def backtest_coin(
 
         if result is None:
 
+            # Open trade at the end of data.
+            # Do not count it.
             break
-
-        exit_candle = candles_1h[
-            exit_index
-        ]
 
         if result == "TP":
 
@@ -1928,16 +2662,22 @@ def backtest_coin(
 
             r_result = -1.0
 
+        exit_candle = (
+            candles_1h[
+                exit_index
+            ]
+        )
+
         trades.append({
 
             "symbol":
                 symbol,
 
-            "setup":
-                signal["setup"],
-
             "direction":
                 signal["direction"],
+
+            "setup":
+                signal["setup"],
 
             "entry_time":
                 signal["entry_time"],
@@ -1973,25 +2713,20 @@ def backtest_coin(
                 signal["adx"],
 
             "rsi":
-                signal["rsi"],
-
-            "sample":
-                (
-                    "OOS"
-                    if signal["entry_time"]
-                    >= oos_start_ts
-                    else "IS"
-                )
+                signal["rsi"]
         })
 
         # No overlapping trades.
-        i = exit_index + 1
+        i = (
+            exit_index
+            + 1
+        )
 
     return trades
 
 
 # ============================================================
-# STATISTICS
+# STATS
 # ============================================================
 
 def calculate_stats(
@@ -2014,7 +2749,9 @@ def calculate_stats(
             "max_loss_streak": 0
         }
 
-    total = len(trades)
+    total = len(
+        trades
+    )
 
     wins = sum(
         t["result"] == "TP"
@@ -2029,7 +2766,7 @@ def calculate_stats(
     win_rate = (
         wins
         / total
-        * 100.0
+        * 100
     )
 
     net_r = sum(
@@ -2060,14 +2797,14 @@ def calculate_stats(
 
     else:
 
-        profit_factor = float("inf")
+        profit_factor = float(
+            "inf"
+        )
 
     average_r = (
         net_r
         / total
     )
-
-    expectancy = average_r
 
     equity = 0.0
     peak = 0.0
@@ -2142,7 +2879,7 @@ def calculate_stats(
             profit_factor,
 
         "expectancy":
-            expectancy,
+            average_r,
 
         "max_drawdown":
             max_drawdown,
@@ -2164,48 +2901,56 @@ def print_stats(
     trades
 ):
 
-    s = calculate_stats(
+    stats = calculate_stats(
         trades
     )
 
     print()
-    print("=" * 110)
+    print(
+        "=" * 110
+    )
+
     print(title)
-    print("=" * 110)
+
+    print(
+        "=" * 110
+    )
 
     print(
         f"Trades             : "
-        f"{s['total']}"
+        f"{stats['total']}"
     )
 
     print(
         f"Wins               : "
-        f"{s['wins']}"
+        f"{stats['wins']}"
     )
 
     print(
         f"Losses             : "
-        f"{s['losses']}"
+        f"{stats['losses']}"
     )
 
     print(
         f"Win Rate           : "
-        f"{s['win_rate']:.2f}%"
+        f"{stats['win_rate']:.2f}%"
     )
 
     print(
         f"Net Result         : "
-        f"{s['net_r']:+.2f}R"
+        f"{stats['net_r']:+.2f}R"
     )
 
     print(
         f"Average R          : "
-        f"{s['average_r']:+.3f}R"
+        f"{stats['average_r']:+.3f}R"
     )
 
-    pf = s["profit_factor"]
+    pf = (
+        stats["profit_factor"]
+    )
 
-    if math.isinf(pf):
+    if pf == float("inf"):
 
         pf_text = "INF"
 
@@ -2222,42 +2967,25 @@ def print_stats(
 
     print(
         f"Expectancy         : "
-        f"{s['expectancy']:+.3f}R"
+        f"{stats['expectancy']:+.3f}R"
     )
 
     print(
         f"Max Drawdown       : "
-        f"{s['max_drawdown']:.2f}R"
+        f"{stats['max_drawdown']:.2f}R"
     )
 
     print(
         f"Max Win Streak     : "
-        f"{s['max_win_streak']}"
+        f"{stats['max_win_streak']}"
     )
 
     print(
         f"Max Loss Streak    : "
-        f"{s['max_loss_streak']}"
+        f"{stats['max_loss_streak']}"
     )
 
-
-# ============================================================
-# PRICE FORMAT
-# ============================================================
-
-def fmt_price(
-    price
-):
-
-    if price >= 1000:
-
-        return f"{price:.2f}"
-
-    if price >= 1:
-
-        return f"{price:.5f}"
-
-    return f"{price:.8f}"
+    return stats
 
 
 # ============================================================
@@ -2266,73 +2994,128 @@ def fmt_price(
 
 def main():
 
-    print()
-    print("=" * 110)
-    print(
-        " SCORE HUNTER PRO v8.5"
-    )
-    print(
-        " ROBUST LONG + SHORT BACKTEST"
-    )
-    print("=" * 110)
-
-    end_dt = utc_now()
+    now = utc_now()
 
     start_dt = (
-        end_dt
+        now
         - timedelta(
             days=HISTORY_DAYS
         )
     )
 
-    oos_dt = (
+    end_dt = now
+
+    oos_start = (
         end_dt
         - timedelta(
             days=OOS_DAYS
         )
     )
 
-    start_ts = int(
-        start_dt.timestamp()
+    print()
+
+    print(
+        "=" * 110
     )
 
-    end_ts = int(
-        end_dt.timestamp()
+    print(
+        f" SCORE HUNTER PRO {VERSION}"
     )
 
-    oos_start_ts = int(
-        oos_dt.timestamp()
+    print(
+        " ROBUST LONG + SHORT BACKTEST"
+    )
+
+    print(
+        "=" * 110
     )
 
     print()
+
     print("Rules:")
-    print("4H Trend + 1H Entry")
-    print("LONG + SHORT")
-    print("BREAKOUT + STRICT REVERSAL")
-    print("NO PULLBACK")
-    print("Closed 4H only")
-    print("Closed 1H only")
-    print("NO LOOK-AHEAD")
-    print("ADX >= 20")
-    print("RSI confirmation")
-    print("Strong breakout candle")
-    print("Real structure break")
-    print("4H regime filter")
-    print("1H EMA transition for reversal")
-    print("SL = 1.5 ATR / Structure")
-    print("Maximum SL = 3.5 ATR")
-    print("TP = 2R")
-    print("Entry candle excluded")
-    print("TP + SL same candle = SL")
-    print("No overlapping positions")
 
-    print()
     print(
-        f"History: {HISTORY_DAYS} days"
+        "4H Trend + 1H Entry"
     )
 
     print(
-        f"OOS period: {OOS_DAYS} days"
+        "LONG + SHORT"
+    )
+
+    print(
+        "BREAKOUT + STRICT REVERSAL"
+    )
+
+    print(
+        "NO PULLBACK"
+    )
+
+    print(
+        "Closed 4H only"
+    )
+
+    print(
+        "Closed 1H only"
+    )
+
+    print(
+        "NO LOOK-AHEAD"
+    )
+
+    print(
+        "ADX >= 20"
+    )
+
+    print(
+        "RSI confirmation"
+    )
+
+    print(
+        "Strong breakout candle"
+    )
+
+    print(
+        "Real structure break"
+    )
+
+    print(
+        "1H EMA transition for reversal"
+    )
+
+    print(
+        "SL = 1.5 ATR / Structure"
+    )
+
+    print(
+        "Maximum SL = 3.5 ATR"
+    )
+
+    print(
+        "TP = 2R"
+    )
+
+    print(
+        "Entry candle excluded"
+    )
+
+    print(
+        "TP + SL same candle = SL"
+    )
+
+    print(
+        "No overlapping positions"
+    )
+
+    print()
+
+    print(
+        f"History: "
+        f"{HISTORY_DAYS} days"
+    )
+
+    print(
+        f"OOS period: "
+        f"{OOS_DAYS} days"
     )
 
     print(
@@ -2341,24 +3124,29 @@ def main():
     )
 
     print()
+
     print(
-        "Backtest start: "
-        f"{start_dt.strftime('%Y-%m-%d %H:%M')}"
+        f"Backtest start: "
+        f"{utc_time(timestamp_sec(start_dt))}"
     )
 
     print(
-        "Backtest end  : "
-        f"{end_dt.strftime('%Y-%m-%d %H:%M')}"
+        f"Backtest end  : "
+        f"{utc_time(timestamp_sec(end_dt))}"
     )
 
     print(
-        "OOS starts     : "
-        f"{oos_dt.strftime('%Y-%m-%d %H:%M')}"
+        f"OOS starts     : "
+        f"{utc_time(timestamp_sec(oos_start))}"
     )
 
     all_trades = []
 
     failed_coins = []
+
+    sources_used = {}
+
+    data_ranges = {}
 
     # ========================================================
     # DOWNLOAD
@@ -2366,32 +3154,28 @@ def main():
 
     for symbol in COINS:
 
-        print()
-        print(
-            f"Downloading {symbol}..."
-        )
-
         try:
 
-            candles_4h = get_ohlc(
-                COINS[symbol],
-                INTERVAL_4H,
+            (
+                candles_4h,
+                candles_1h,
+                source
+            ) = load_market_data(
+                symbol,
                 start_dt,
                 end_dt
             )
 
-            candles_1h = get_ohlc(
-                COINS[symbol],
-                INTERVAL_1H,
-                start_dt,
-                end_dt
+            data_ranges[
+                symbol
+            ] = (
+                candles_4h,
+                candles_1h
             )
 
-            print(
-                f"{symbol}: "
-                f"4H={len(candles_4h)} | "
-                f"1H={len(candles_1h)}"
-            )
+            sources_used[
+                symbol
+            ] = source
 
             print(
                 f"{symbol}: "
@@ -2409,11 +3193,12 @@ def main():
                 f"{utc_time(candles_1h[-1]['time'])}"
             )
 
-            trades = backtest_coin(
-                symbol,
-                candles_4h,
-                candles_1h,
-                oos_start_ts
+            trades = (
+                backtest_coin(
+                    symbol,
+                    candles_4h,
+                    candles_1h
+                )
             )
 
             print(
@@ -2426,37 +3211,81 @@ def main():
                 trades
             )
 
-        except Exception as e:
+        except Exception as exc:
 
             failed_coins.append(
                 symbol
             )
 
+            print()
+
             print(
-                f"{symbol}: ERROR"
+                f"{symbol}: "
+                f"FAILED"
             )
 
             print(
-                f"    {e}"
+                f"    {exc}"
             )
 
-            # IMPORTANT:
-            # Continue with other coins.
-            continue
+    # ========================================================
+    # SAFETY
+    # ========================================================
 
-    # ========================================================
-    # IF EVERYTHING FAILED
-    # ========================================================
+    print()
+
+    print(
+        "=" * 110
+    )
+
+    print(
+        "DATA SOURCE SUMMARY"
+    )
+
+    print(
+        "=" * 110
+    )
+
+    for symbol in COINS:
+
+        source = (
+            sources_used.get(
+                symbol,
+                "FAILED"
+            )
+        )
+
+        print(
+            f"{symbol:5s} | "
+            f"{source}"
+        )
+
+    # --------------------------------------------------------
+    # Do NOT create a fake 0-trade backtest.
+    # --------------------------------------------------------
 
     if not all_trades:
 
         print()
-        print("=" * 110)
-        print("BACKTEST ABORTED")
-        print("=" * 110)
+
+        print(
+            "=" * 110
+        )
+
+        print(
+            "BACKTEST ABORTED"
+        )
+
+        print(
+            "=" * 110
+        )
 
         print(
             "No completed trades were produced."
+        )
+
+        print(
+            "This is NOT a valid 0% win-rate result."
         )
 
         if failed_coins:
@@ -2469,24 +3298,21 @@ def main():
             )
 
         print()
+
         print(
-            "The program has terminated "
-            "normally. It will NOT keep "
-            "running indefinitely."
+            "Reason: market data could not "
+            "be loaded reliably."
         )
 
-        print("=" * 110)
+        print(
+            "The program will terminate normally."
+        )
+
+        print(
+            "=" * 110
+        )
 
         return
-
-    # ========================================================
-    # SORT
-    # ========================================================
-
-    all_trades.sort(
-        key=lambda t:
-            t["entry_time"]
-    )
 
     # ========================================================
     # OVERALL
@@ -2502,7 +3328,8 @@ def main():
     # ========================================================
 
     long_trades = [
-        t for t in all_trades
+        t
+        for t in all_trades
         if t["direction"] == "LONG"
     ]
 
@@ -2516,7 +3343,8 @@ def main():
     # ========================================================
 
     short_trades = [
-        t for t in all_trades
+        t
+        for t in all_trades
         if t["direction"] == "SHORT"
     ]
 
@@ -2526,55 +3354,75 @@ def main():
     )
 
     # ========================================================
-    # IN SAMPLE
+    # IN SAMPLE / OOS
     # ========================================================
 
-    is_trades = [
-        t for t in all_trades
-        if t["sample"] == "IS"
-    ]
+    in_sample = []
+
+    oos = []
+
+    oos_timestamp = timestamp_sec(
+        oos_start
+    )
+
+    for trade in all_trades:
+
+        if (
+            trade["entry_time"]
+            >= oos_timestamp
+        ):
+
+            oos.append(
+                trade
+            )
+
+        else:
+
+            in_sample.append(
+                trade
+            )
 
     print_stats(
         "IN-SAMPLE RESULT",
-        is_trades
+        in_sample
     )
-
-    # ========================================================
-    # OOS
-    # ========================================================
-
-    oos_trades = [
-        t for t in all_trades
-        if t["sample"] == "OOS"
-    ]
 
     print_stats(
         "OUT-OF-SAMPLE RESULT",
-        oos_trades
+        oos
     )
 
     # ========================================================
-    # BY COIN
+    # RESULT BY COIN
     # ========================================================
 
     print()
-    print("=" * 110)
+
+    print(
+        "=" * 110
+    )
+
     print(
         "RESULT BY COIN"
     )
-    print("=" * 110)
+
+    print(
+        "=" * 110
+    )
 
     for symbol in COINS:
 
         coin_trades = [
-            t for t in all_trades
+            t
+            for t in all_trades
             if t["symbol"] == symbol
         ]
 
         if not coin_trades:
 
             print(
-                f"{symbol:5s} | 0 trades"
+                f"{symbol:5s} | "
+                f"0 trades"
             )
 
             continue
@@ -2583,13 +3431,19 @@ def main():
             coin_trades
         )
 
-        pf = s["profit_factor"]
-
-        pf_text = (
-            "INF"
-            if math.isinf(pf)
-            else f"{pf:.2f}"
+        pf = (
+            s["profit_factor"]
         )
+
+        if pf == float("inf"):
+
+            pf_text = "INF"
+
+        else:
+
+            pf_text = (
+                f"{pf:.2f}"
+            )
 
         print(
             f"{symbol:5s} | "
@@ -2602,15 +3456,22 @@ def main():
         )
 
     # ========================================================
-    # BY SETUP
+    # RESULT BY SETUP
     # ========================================================
 
     print()
-    print("=" * 110)
+
+    print(
+        "=" * 110
+    )
+
     print(
         "RESULT BY SETUP"
     )
-    print("=" * 110)
+
+    print(
+        "=" * 110
+    )
 
     for setup in [
         "BREAKOUT",
@@ -2618,7 +3479,8 @@ def main():
     ]:
 
         setup_trades = [
-            t for t in all_trades
+            t
+            for t in all_trades
             if t["setup"] == setup
         ]
 
@@ -2635,22 +3497,76 @@ def main():
             setup_trades
         )
 
-        pf = s["profit_factor"]
-
-        pf_text = (
-            "INF"
-            if math.isinf(pf)
-            else f"{pf:.2f}"
-        )
-
         print(
             f"{setup:10s} | "
             f"Trades: {s['total']:3d} | "
             f"W: {s['wins']:3d} | "
             f"L: {s['losses']:3d} | "
             f"WR: {s['win_rate']:6.2f}% | "
-            f"R: {s['net_r']:+7.2f} | "
-            f"PF: {pf_text}"
+            f"R: {s['net_r']:+7.2f}"
+        )
+
+    # ========================================================
+    # LONG / SHORT SETUP COMBINATION
+    # ========================================================
+
+    print()
+
+    print(
+        "=" * 110
+    )
+
+    print(
+        "RESULT BY DIRECTION + SETUP"
+    )
+
+    print(
+        "=" * 110
+    )
+
+    combinations = [
+        ("LONG", "BREAKOUT"),
+        ("LONG", "REVERSAL"),
+        ("SHORT", "BREAKOUT"),
+        ("SHORT", "REVERSAL")
+    ]
+
+    for direction, setup in combinations:
+
+        selected = [
+            t
+            for t in all_trades
+            if (
+                t["direction"]
+                == direction
+                and
+                t["setup"]
+                == setup
+            )
+        ]
+
+        if not selected:
+
+            print(
+                f"{direction:5s} "
+                f"{setup:9s} | "
+                f"0 trades"
+            )
+
+            continue
+
+        s = calculate_stats(
+            selected
+        )
+
+        print(
+            f"{direction:5s} "
+            f"{setup:9s} | "
+            f"Trades: {s['total']:3d} | "
+            f"W: {s['wins']:3d} | "
+            f"L: {s['losses']:3d} | "
+            f"WR: {s['win_rate']:6.2f}% | "
+            f"R: {s['net_r']:+7.2f}"
         )
 
     # ========================================================
@@ -2658,37 +3574,38 @@ def main():
     # ========================================================
 
     print()
-    print("=" * 110)
+
+    print(
+        "=" * 110
+    )
+
     print(
         "OUT-OF-SAMPLE BY COIN"
     )
-    print("=" * 110)
+
+    print(
+        "=" * 110
+    )
 
     for symbol in COINS:
 
-        coin_oos = [
-            t for t in oos_trades
+        selected = [
+            t
+            for t in oos
             if t["symbol"] == symbol
         ]
 
-        if not coin_oos:
+        if not selected:
 
             print(
-                f"{symbol:5s} | 0 trades"
+                f"{symbol:5s} | "
+                f"0 trades"
             )
 
             continue
 
         s = calculate_stats(
-            coin_oos
-        )
-
-        pf = s["profit_factor"]
-
-        pf_text = (
-            "INF"
-            if math.isinf(pf)
-            else f"{pf:.2f}"
+            selected
         )
 
         print(
@@ -2697,20 +3614,26 @@ def main():
             f"W: {s['wins']:3d} | "
             f"L: {s['losses']:3d} | "
             f"WR: {s['win_rate']:6.2f}% | "
-            f"R: {s['net_r']:+7.2f} | "
-            f"PF: {pf_text}"
+            f"R: {s['net_r']:+7.2f}"
         )
 
     # ========================================================
-    # FULL LOG
+    # FULL TRADE LOG
     # ========================================================
 
     print()
-    print("=" * 110)
+
+    print(
+        "=" * 110
+    )
+
     print(
         "FULL TRADE LOG"
     )
-    print("=" * 110)
+
+    print(
+        "=" * 110
+    )
 
     for number, trade in enumerate(
         all_trades,
@@ -2722,7 +3645,6 @@ def main():
             f"{trade['symbol']:5s} | "
             f"{trade['direction']:5s} | "
             f"{trade['setup']:9s} | "
-            f"{trade['sample']:3s} | "
             f"ENTRY "
             f"{utc_time(trade['entry_time'])} | "
             f"E "
@@ -2745,20 +3667,31 @@ def main():
     # ROBUSTNESS
     # ========================================================
 
+    stats = calculate_stats(
+        all_trades
+    )
+
+    oos_stats = calculate_stats(
+        oos
+    )
+
     print()
-    print("=" * 110)
+
+    print(
+        "=" * 110
+    )
+
     print(
         "ROBUSTNESS CHECK"
     )
-    print("=" * 110)
 
-    total = len(
-        all_trades
+    print(
+        "=" * 110
     )
 
     print(
         f"Total completed trades : "
-        f"{total}"
+        f"{stats['total']}"
     )
 
     print(
@@ -2766,7 +3699,7 @@ def main():
         f"{TARGET_TRADES}+"
     )
 
-    if total >= TARGET_TRADES:
+    if stats["total"] >= TARGET_TRADES:
 
         print(
             "Sample size status     : "
@@ -2781,32 +3714,33 @@ def main():
         )
 
     print(
-        f"OOS trades             : "
-        f"{len(oos_trades)}"
+        f"OOS trades              : "
+        f"{oos_stats['total']}"
     )
 
-    if len(oos_trades) >= 30:
+    if oos_stats["total"] >= 20:
 
         print(
-            "OOS sample status      : "
+            "OOS sample status       : "
             "REASONABLE"
         )
 
     else:
 
         print(
-            "OOS sample status      : "
+            "OOS sample status       : "
             "WEAK - more OOS trades needed"
         )
 
     print()
+
     print(
         "IMPORTANT:"
     )
 
     print(
         "Do NOT optimize parameters "
-        "using OOS results."
+        "using the OOS results."
     )
 
     print(
@@ -2814,41 +3748,19 @@ def main():
         "whether the rules generalize."
     )
 
-    # ========================================================
-    # FAILED COINS
-    # ========================================================
-
-    if failed_coins:
-
-        print()
-        print("=" * 110)
-        print(
-            "DATA WARNINGS"
-        )
-        print("=" * 110)
-
-        print(
-            "Failed coins: "
-            + ", ".join(
-                failed_coins
-            )
-        )
-
-        print(
-            "These coins were excluded "
-            "from the aggregate statistics."
-        )
-
-    # ========================================================
-    # FINISHED
-    # ========================================================
-
     print()
-    print("=" * 110)
+
+    print(
+        "=" * 110
+    )
+
     print(
         "BACKTEST FINISHED"
     )
-    print("=" * 110)
+
+    print(
+        "=" * 110
+    )
 
 
 # ============================================================
@@ -2864,23 +3776,35 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         print()
+
         print(
             "BACKTEST STOPPED BY USER."
         )
 
-    except Exception as e:
+    except Exception as exc:
 
         print()
-        print("=" * 110)
-        print(
-            "BACKTEST TERMINATED WITH ERROR"
-        )
-        print("=" * 110)
 
         print(
-            str(e)
+            "=" * 110
         )
 
         print(
-            "Program terminated normally."
+            "BACKTEST ERROR"
+        )
+
+        print(
+            "=" * 110
+        )
+
+        print(
+            str(exc)
+        )
+
+        print(
+            "The program terminated normally."
+        )
+
+        print(
+            "=" * 110
         )
