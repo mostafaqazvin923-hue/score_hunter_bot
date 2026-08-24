@@ -4,29 +4,33 @@ from datetime import datetime, timezone, timedelta
 
 
 # ============================================================
-# SCORE HUNTER PRO v8.13
+# SCORE HUNTER PRO v8.14
 #
 # 4H TREND + 1H ENTRY
 # REAL 365-DAY HISTORICAL BACKTEST
 #
-# DATA ENGINE REBUILD
+# DATA ENGINE v8.14 REBUILD
 #
-# IMPORTANT FIXES:
+# FIXES:
 #   1. LBank timestamp = SECONDS
 #   2. Forward pagination
-#   3. Adaptive pagination count
-#   4. No artificial 10/5 page limitation
-#   5. Repeated-page protection
-#   6. Zero-progress protection
-#   7. Exact timestamp deduplication
-#   8. Forming candle removal
-#   9. Strict historical coverage validation
-#  10. Warmup separated from strategy period
-#  11. Closed 4H only
-#  12. Closed 1H only
-#  13. No look-ahead
-#  14. No fake fallback
-#  15. Failed data != 0% strategy result
+#   3. 2000 candles/page
+#   4. Adaptive page count
+#   5. No artificial 10/5 page limitation
+#   6. Repeated cursor protection
+#   7. Repeated-page protection
+#   8. Zero-progress protection
+#   9. Exact timestamp deduplication
+#  10. Forming candle removal BEFORE validation
+#  11. Validation uses LAST CLOSED candle
+#  12. Warmup separated from strategy period
+#  13. Strict historical coverage validation
+#  14. Detailed data diagnostics
+#  15. No fake fallback
+#  16. Failed data != 0% strategy result
+#  17. No look-ahead
+#  18. Closed 4H only
+#  19. Closed 1H only
 #
 # STRATEGY:
 #   4H TREND + 1H ENTRY
@@ -66,10 +70,11 @@ COINS = {
 HISTORY_DAYS = 365
 OOS_DAYS = 90
 
-# Warmup is deliberately larger than before.
-# 200 x 4H candles ≈ 33 days.
-# Therefore 10 days is NOT enough for true 4H EMA200.
-# We download 60 days before strategy start.
+# 60 days warmup.
+#
+# NOTE:
+# EMA200 on 4H needs about 33.3 days of candles.
+# 60 days gives enough historical context before strategy start.
 WARMUP_DAYS = 60
 
 
@@ -110,17 +115,15 @@ MAX_RETRIES = 3
 LBANK_MAX_SIZE = 2000
 
 # Safety only.
-# This is NOT the old fixed 10/5 limit.
+# This is NOT used as a normal pagination limit.
 MAX_PAGES_HARD = 100
 
 
 # ============================================================
-# LBANK ENDPOINTS
+# LBANK
 # ============================================================
 
-LBANK_URL = (
-    "https://api.lbkex.com/v2/kline.do"
-)
+LBANK_URL = "https://api.lbkex.com/v2/kline.do"
 
 
 # ============================================================
@@ -204,7 +207,7 @@ def safe_get(
             last_error = exc
 
             print(
-                f"      request retry "
+                f"      REQUEST RETRY "
                 f"{attempt}/{retries}: "
                 f"{exc}"
             )
@@ -215,6 +218,7 @@ def safe_get(
                     float(attempt)
                 )
 
+
     raise RuntimeError(
         f"API failed after {retries} attempts: "
         f"{last_error}"
@@ -222,7 +226,7 @@ def safe_get(
 
 
 # ============================================================
-# NORMALIZE
+# NORMALIZE CANDLE
 # ============================================================
 
 def normalize_candle(
@@ -252,8 +256,7 @@ def normalize_candle(
         )
 
 
-        # Protection:
-        # seconds vs milliseconds
+        # Protection against milliseconds.
 
         if timestamp_value > 10_000_000_000:
 
@@ -265,11 +268,14 @@ def normalize_candle(
         l = float(low_price)
         c = float(close_price)
 
-        v = (
-            float(volume)
-            if volume is not None
-            else 0.0
-        )
+
+        if volume is None:
+
+            v = 0.0
+
+        else:
+
+            v = float(volume)
 
 
         if (
@@ -278,21 +284,33 @@ def normalize_candle(
             or l <= 0
             or c <= 0
             or h < l
+            or h < o
+            or h < c
+            or l > o
+            or l > c
         ):
 
             return None
 
 
         return {
-            "time": int(
-                timestamp_value
-            ),
+            "time":
+                int(timestamp_value),
 
-            "open": o,
-            "high": h,
-            "low": l,
-            "close": c,
-            "volume": v
+            "open":
+                o,
+
+            "high":
+                h,
+
+            "low":
+                l,
+
+            "close":
+                c,
+
+            "volume":
+                v
         }
 
 
@@ -314,7 +332,9 @@ def deduplicate(
     for candle in candles:
 
         if candle is None:
+
             continue
+
 
         unique[
             candle["time"]
@@ -353,18 +373,20 @@ def parse_lbank_response(
         )
 
 
-    if (
-        data.get("error_code")
-        not in (
-            None,
-            0,
-            "0"
-        )
+    error_code = data.get(
+        "error_code"
+    )
+
+
+    if error_code not in (
+        None,
+        0,
+        "0"
     ):
 
         raise RuntimeError(
             f"LBank error: "
-            f"{data.get('error_code')} "
+            f"{error_code} "
             f"{data.get('msg')}"
         )
 
@@ -423,8 +445,8 @@ def lbank_request_page(
         "type":
             lbank_type,
 
-        # IMPORTANT
-        # timestamp = SECONDS
+        # LBank documentation:
+        # time = timestamp in seconds
         "time":
             int(start_timestamp)
     }
@@ -490,12 +512,16 @@ def lbank_request_page(
             dict
         ):
 
-            t = (
-                row.get("timestamp")
-                if row.get("timestamp")
-                is not None
-                else row.get("time")
+            t = row.get(
+                "timestamp"
             )
+
+
+            if t is None:
+
+                t = row.get(
+                    "time"
+                )
 
 
             if t is None:
@@ -505,44 +531,64 @@ def lbank_request_page(
                 )
 
 
-            o = (
-                row.get("open")
-                if row.get("open")
-                is not None
-                else row.get("o")
+            o = row.get(
+                "open"
             )
 
 
-            h = (
-                row.get("high")
-                if row.get("high")
-                is not None
-                else row.get("h")
+            if o is None:
+
+                o = row.get(
+                    "o"
+                )
+
+
+            h = row.get(
+                "high"
             )
 
 
-            l = (
-                row.get("low")
-                if row.get("low")
-                is not None
-                else row.get("l")
+            if h is None:
+
+                h = row.get(
+                    "h"
+                )
+
+
+            l = row.get(
+                "low"
             )
 
 
-            c = (
-                row.get("close")
-                if row.get("close")
-                is not None
-                else row.get("c")
+            if l is None:
+
+                l = row.get(
+                    "l"
+                )
+
+
+            c = row.get(
+                "close"
             )
 
 
-            v = (
-                row.get("volume")
-                if row.get("volume")
-                is not None
-                else row.get("vol")
+            if c is None:
+
+                c = row.get(
+                    "c"
+                )
+
+
+            v = row.get(
+                "volume"
             )
+
+
+            if v is None:
+
+                v = row.get(
+                    "vol"
+                )
 
 
             candle = normalize_candle(
@@ -578,38 +624,98 @@ def lbank_request_page(
 
 
 # ============================================================
-# GET FULL HISTORY
-#
-# IMPORTANT:
-#
-# We DO NOT assume that one page is enough.
-#
-# We start at requested beginning and move forward:
-#
-# START
-#   ↓
-# PAGE
-#   ↓
-# newest candle
-#   ↓
-# newest + interval
-#   ↓
-# NEXT PAGE
-#
+# REMOVE FORMING CANDLE
 # ============================================================
 
-def get_lbank_klines(
-    symbol,
-    interval,
-    start_dt,
-    end_dt
+def remove_forming_candle(
+    candles,
+    interval
 ):
 
-    start_ts = timestamp_seconds(
-        start_dt
+    if not candles:
+
+        return []
+
+
+    now_ts = timestamp_seconds(
+        utc_now()
     )
 
-    end_ts = timestamp_seconds(
+
+    interval_seconds = (
+        interval * 60
+    )
+
+
+    closed = []
+
+
+    for candle in candles:
+
+        candle_open = (
+            candle["time"]
+        )
+
+        candle_close = (
+            candle_open
+            + interval_seconds
+        )
+
+
+        # A candle is closed only if
+        # its END is <= current time.
+
+        if candle_close <= now_ts:
+
+            closed.append(
+                candle
+            )
+
+
+    return deduplicate(
+        closed
+    )
+
+
+# ============================================================
+# LAST CLOSED CANDLE END
+# ============================================================
+
+def last_closed_candle_open_time(
+    now_ts,
+    interval_seconds
+):
+
+    # Find the most recent candle whose
+    # complete interval has ended.
+    #
+    # This intentionally does NOT use
+    # the current forming candle.
+
+    last_open = (
+        (
+            now_ts
+            // interval_seconds
+        )
+        * interval_seconds
+    ) - interval_seconds
+
+
+    return int(
+        last_open
+    )
+
+
+# ============================================================
+# EXPECTED CLOSED RANGE
+# ============================================================
+
+def expected_closed_end(
+    end_dt,
+    interval
+):
+
+    requested_end_ts = timestamp_seconds(
         end_dt
     )
 
@@ -619,27 +725,87 @@ def get_lbank_klines(
     )
 
 
-    total_seconds = (
-        end_ts
-        - start_ts
+    last_closed_open = (
+        last_closed_candle_open_time(
+            requested_end_ts,
+            interval_seconds
+        )
     )
+
+
+    return last_closed_open
+
+
+# ============================================================
+# GET FULL HISTORY
+# ============================================================
+
+def get_lbank_klines(
+    symbol,
+    interval,
+    start_dt,
+    end_dt
+):
+
+    requested_start_ts = timestamp_seconds(
+        start_dt
+    )
+
+    requested_end_ts = timestamp_seconds(
+        end_dt
+    )
+
+
+    interval_seconds = (
+        interval * 60
+    )
+
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # We NEVER require the forming candle.
+    #
+    # End of valid data = last CLOSED candle.
+    # --------------------------------------------------------
+
+    closed_end_open_ts = (
+        expected_closed_end(
+            end_dt,
+            interval
+        )
+    )
+
+
+    # We need candles whose OPEN time is
+    # between requested start and the last
+    # fully closed candle.
+
+    target_start_ts = (
+        requested_start_ts
+    )
+
+    target_end_ts = (
+        closed_end_open_ts
+    )
+
+
+    if target_end_ts <= target_start_ts:
+
+        raise RuntimeError(
+            "Invalid historical range."
+        )
 
 
     expected_candles = (
-        int(
-            total_seconds
-            / interval_seconds
+        (
+            target_end_ts
+            - target_start_ts
         )
-        + 1
-    )
+        // interval_seconds
+    ) + 1
 
 
-    # Number of pages actually required.
-    #
-    # 365 days:
-    # 1H ≈ 8761 candles -> 5 pages
-    # 4H ≈ 2191 candles -> 2 pages
-    #
     pages_needed = (
         expected_candles
         + LBANK_MAX_SIZE
@@ -649,20 +815,37 @@ def get_lbank_klines(
 
     max_pages = min(
         MAX_PAGES_HARD,
-        pages_needed + 3
+        pages_needed + 5
+    )
+
+
+    timeframe_name = (
+        "1H"
+        if interval == INTERVAL_1H
+        else "4H"
     )
 
 
     print()
     print(
-        f"    {symbol} "
-        f"{'1H' if interval == INTERVAL_1H else '4H'} "
-        f"expected candles: "
+        f"    {symbol} {timeframe_name} "
+        f"EXPECTED CLOSED CANDLES: "
         f"{expected_candles}"
     )
 
+
     print(
-        f"    estimated pages: "
+        f"    {symbol} {timeframe_name} "
+        f"EXPECTED RANGE: "
+        f"{utc_time(target_start_ts)}"
+        f" -> "
+        f"{utc_time(target_end_ts)}"
+    )
+
+
+    print(
+        f"    {symbol} {timeframe_name} "
+        f"ESTIMATED PAGES: "
         f"{pages_needed}"
     )
 
@@ -670,9 +853,15 @@ def get_lbank_klines(
     all_candles = []
 
 
-    cursor = start_ts
+    cursor = (
+        target_start_ts
+    )
+
 
     seen_cursors = set()
+
+    seen_page_signatures = set()
+
 
     previous_newest = None
 
@@ -683,22 +872,20 @@ def get_lbank_klines(
     ):
 
         print(
-            f"    {symbol} "
-            f"{'1H' if interval == INTERVAL_1H else '4H'} "
-            f"page "
-            f"{page_number}/"
-            f"{max_pages}"
+            f"    {symbol} {timeframe_name} "
+            f"PAGE "
+            f"{page_number}/{max_pages}"
         )
 
 
         print(
-            f"      cursor: "
+            f"      REQUEST FROM: "
             f"{utc_time(cursor)}"
         )
 
 
         # ----------------------------------------------------
-        # Repeated cursor protection
+        # Cursor protection
         # ----------------------------------------------------
 
         if cursor in seen_cursors:
@@ -743,14 +930,39 @@ def get_lbank_klines(
         )
 
 
+        # ----------------------------------------------------
+        # Page signature
+        # ----------------------------------------------------
+
+        page_signature = (
+            len(candles),
+            page_oldest,
+            page_newest
+        )
+
+
+        if page_signature in (
+            seen_page_signatures
+        ):
+
+            raise RuntimeError(
+                "Repeated identical LBank page."
+            )
+
+
+        seen_page_signatures.add(
+            page_signature
+        )
+
+
         print(
-            f"      received: "
+            f"      RECEIVED: "
             f"{len(candles)}"
         )
 
 
         print(
-            f"      page range: "
+            f"      PAGE RANGE: "
             f"{utc_time(page_oldest)}"
             f" -> "
             f"{utc_time(page_newest)}"
@@ -758,19 +970,18 @@ def get_lbank_klines(
 
 
         # ----------------------------------------------------
-        # Repeated page protection
+        # Progress protection
         # ----------------------------------------------------
 
         if (
-            previous_newest
-            is not None
+            previous_newest is not None
             and page_newest
             <= previous_newest
         ):
 
             raise RuntimeError(
-                "Pagination returned "
-                "no new historical candles."
+                "Pagination returned no "
+                "newer candles."
             )
 
 
@@ -778,15 +989,20 @@ def get_lbank_klines(
 
 
         # ----------------------------------------------------
-        # Save requested range only
+        # Collect only requested range
         # ----------------------------------------------------
 
         for candle in candles:
 
+            candle_time = (
+                candle["time"]
+            )
+
+
             if (
-                start_ts
-                <= candle["time"]
-                <= end_ts
+                target_start_ts
+                <= candle_time
+                <= target_end_ts
             ):
 
                 all_candles.append(
@@ -795,13 +1011,13 @@ def get_lbank_klines(
 
 
         # ----------------------------------------------------
-        # End reached
+        # Enough data?
         # ----------------------------------------------------
 
-        if page_newest >= end_ts:
+        if page_newest >= target_end_ts:
 
             print(
-                "      END REACHED"
+                "      TARGET END REACHED"
             )
 
             break
@@ -835,9 +1051,9 @@ def get_lbank_klines(
     else:
 
         raise RuntimeError(
-            f"Maximum pagination limit "
-            f"({max_pages}) reached before "
-            f"requested end date."
+            f"Pagination stopped at "
+            f"{max_pages} pages before "
+            f"target end."
         )
 
 
@@ -846,15 +1062,34 @@ def get_lbank_klines(
     )
 
 
+    # --------------------------------------------------------
+    # Final exact filtering
+    # --------------------------------------------------------
+
     result = [
         c
         for c in result
         if (
-            start_ts
+            target_start_ts
             <= c["time"]
-            <= end_ts
+            <= target_end_ts
         )
     ]
+
+
+    # --------------------------------------------------------
+    # Remove forming candle as final safety
+    # --------------------------------------------------------
+
+    result = remove_forming_candle(
+        result,
+        interval
+    )
+
+
+    result = deduplicate(
+        result
+    )
 
 
     if not result:
@@ -868,54 +1103,7 @@ def get_lbank_klines(
 
 
 # ============================================================
-# REMOVE FORMING CANDLE
-# ============================================================
-
-def remove_forming_candle(
-    candles,
-    interval
-):
-
-    if not candles:
-
-        return []
-
-
-    now_ts = timestamp_seconds(
-        utc_now()
-    )
-
-
-    interval_seconds = (
-        interval * 60
-    )
-
-
-    closed = []
-
-
-    for candle in candles:
-
-        candle_close = (
-            candle["time"]
-            + interval_seconds
-        )
-
-
-        if candle_close <= now_ts:
-
-            closed.append(
-                candle
-            )
-
-
-    return deduplicate(
-        closed
-    )
-
-
-# ============================================================
-# COVERAGE
+# COVERAGE REPORT
 # ============================================================
 
 def coverage_report(
@@ -925,17 +1113,46 @@ def coverage_report(
     interval
 ):
 
+    interval_seconds = (
+        interval * 60
+    )
+
+
     if not candles:
 
         return {
-            "valid": False,
-            "coverage": 0.0,
-            "count_ratio": 0.0,
-            "actual_start": None,
-            "actual_end": None,
-            "expected_count": 0,
-            "actual_count": 0,
-            "large_gaps": 0
+            "valid":
+                False,
+
+            "coverage":
+                0.0,
+
+            "count_ratio":
+                0.0,
+
+            "actual_start":
+                None,
+
+            "actual_end":
+                None,
+
+            "expected_start":
+                None,
+
+            "expected_end":
+                None,
+
+            "expected_count":
+                0,
+
+            "actual_count":
+                0,
+
+            "missing_count":
+                0,
+
+            "large_gaps":
+                0
         }
 
 
@@ -944,12 +1161,14 @@ def coverage_report(
     )
 
 
-    required_start = timestamp_seconds(
+    requested_start = timestamp_seconds(
         start_dt
     )
 
-    required_end = timestamp_seconds(
-        end_dt
+
+    expected_end = expected_closed_end(
+        end_dt,
+        interval
     )
 
 
@@ -957,64 +1176,19 @@ def coverage_report(
         candles[0]["time"]
     )
 
+
     actual_end = (
         candles[-1]["time"]
     )
 
 
-    interval_seconds = (
-        interval * 60
-    )
-
-
-    total_required = (
-        required_end
-        - required_start
-    )
-
-
-    if total_required <= 0:
-
-        return {
-            "valid": False,
-            "coverage": 0.0,
-            "count_ratio": 0.0,
-            "actual_start": actual_start,
-            "actual_end": actual_end,
-            "expected_count": 0,
-            "actual_count": len(candles),
-            "large_gaps": 0
-        }
-
-
-    covered = max(
-        0,
-        min(
-            actual_end,
-            required_end
-        )
-        -
-        max(
-            actual_start,
-            required_start
-        )
-    )
-
-
-    coverage = (
-        covered
-        / total_required
-        * 100.0
-    )
-
-
     expected_count = (
-        int(
-            total_required
-            / interval_seconds
+        (
+            expected_end
+            - requested_start
         )
-        + 1
-    )
+        // interval_seconds
+    ) + 1
 
 
     actual_count = len(
@@ -1022,12 +1196,77 @@ def coverage_report(
     )
 
 
-    count_ratio = (
-        actual_count
-        / expected_count
-        * 100.0
+    if expected_count <= 0:
+
+        return {
+            "valid":
+                False,
+
+            "coverage":
+                0.0,
+
+            "count_ratio":
+                0.0,
+
+            "actual_start":
+                actual_start,
+
+            "actual_end":
+                actual_end,
+
+            "expected_start":
+                requested_start,
+
+            "expected_end":
+                expected_end,
+
+            "expected_count":
+                expected_count,
+
+            "actual_count":
+                actual_count,
+
+            "missing_count":
+                0,
+
+            "large_gaps":
+                0
+        }
+
+
+    # --------------------------------------------------------
+    # Count missing timestamps exactly.
+    # --------------------------------------------------------
+
+    timestamp_set = {
+        c["time"]
+        for c in candles
+    }
+
+
+    missing_count = 0
+
+
+    expected_time = (
+        requested_start
     )
 
+
+    while expected_time <= expected_end:
+
+        if expected_time not in timestamp_set:
+
+            missing_count += 1
+
+
+        expected_time += (
+            interval_seconds
+        )
+
+
+    # --------------------------------------------------------
+    # Large gaps
+    # --------------------------------------------------------
 
     large_gaps = 0
 
@@ -1050,20 +1289,52 @@ def coverage_report(
             large_gaps += 1
 
 
-    # One candle boundary tolerance
+    # --------------------------------------------------------
+    # Boundary validation
+    #
+    # One interval tolerance on start.
+    # End MUST reach expected closed candle.
+    # --------------------------------------------------------
 
     start_ok = (
         actual_start
-        <= required_start
-        + interval_seconds
+        <= (
+            requested_start
+            + interval_seconds
+        )
     )
 
 
     end_ok = (
         actual_end
-        >= required_end
-        - interval_seconds
+        >= expected_end
     )
+
+
+    count_ratio = (
+        actual_count
+        / expected_count
+        * 100.0
+    )
+
+
+    # Coverage is based on expected candle
+    # positions rather than wall-clock "now".
+
+    if expected_count > 0:
+
+        coverage = (
+            (
+                expected_count
+                - missing_count
+            )
+            / expected_count
+            * 100.0
+        )
+
+    else:
+
+        coverage = 0.0
 
 
     valid = (
@@ -1072,6 +1343,7 @@ def coverage_report(
         and coverage >= 99.0
         and count_ratio >= 99.0
         and large_gaps == 0
+        and missing_count == 0
     )
 
 
@@ -1091,11 +1363,20 @@ def coverage_report(
         "actual_end":
             actual_end,
 
+        "expected_start":
+            requested_start,
+
+        "expected_end":
+            expected_end,
+
         "expected_count":
             expected_count,
 
         "actual_count":
             actual_count,
+
+        "missing_count":
+            missing_count,
 
         "large_gaps":
             large_gaps
@@ -1114,12 +1395,23 @@ def validate_candles(
 
     if not candles:
 
-        return False
+        return (
+            False,
+            "ZERO CANDLES"
+        )
 
 
     if len(candles) < minimum:
 
-        return False
+        return (
+            False,
+            f"TOO FEW CANDLES: {len(candles)}"
+        )
+
+
+    candles = deduplicate(
+        candles
+    )
 
 
     expected_gap = (
@@ -1127,7 +1419,27 @@ def validate_candles(
     )
 
 
-    bad_gaps = 0
+    duplicate_count = (
+        len(candles)
+        -
+        len(
+            {
+                c["time"]
+                for c in candles
+            }
+        )
+    )
+
+
+    if duplicate_count > 0:
+
+        return (
+            False,
+            f"DUPLICATES: {duplicate_count}"
+        )
+
+
+    bad_gap_count = 0
 
 
     for i in range(
@@ -1141,27 +1453,130 @@ def validate_candles(
         )
 
 
-        if gap > (
-            expected_gap * 10
-        ):
+        if gap <= 0:
 
-            bad_gaps += 1
+            return (
+                False,
+                "NON-INCREASING TIMESTAMPS"
+            )
 
 
-    total_gaps = max(
-        1,
-        len(candles) - 1
+        if gap != expected_gap:
+
+            bad_gap_count += 1
+
+
+    # For a real exchange Kline series,
+    # every candle should be exactly one interval
+    # after the previous candle.
+
+    if bad_gap_count > 0:
+
+        return (
+            False,
+            f"TIMESTAMP GAPS: {bad_gap_count}"
+        )
+
+
+    return (
+        True,
+        "OK"
     )
 
 
-    if bad_gaps > (
-        total_gaps * 0.20
-    ):
+# ============================================================
+# DATA DIAGNOSTIC
+# ============================================================
 
-        return False
+def print_data_diagnostic(
+    symbol,
+    interval_name,
+    report,
+    validation_ok,
+    validation_reason
+):
+
+    print()
+    print(
+        f"    ----- {symbol} "
+        f"{interval_name} DATA DIAGNOSTIC -----"
+    )
 
 
-    return True
+    print(
+        f"    Expected candles : "
+        f"{report['expected_count']}"
+    )
+
+
+    print(
+        f"    Actual candles   : "
+        f"{report['actual_count']}"
+    )
+
+
+    print(
+        f"    Missing candles  : "
+        f"{report['missing_count']}"
+    )
+
+
+    print(
+        f"    Count ratio      : "
+        f"{report['count_ratio']:.4f}%"
+    )
+
+
+    print(
+        f"    Coverage         : "
+        f"{report['coverage']:.4f}%"
+    )
+
+
+    print(
+        f"    Large gaps       : "
+        f"{report['large_gaps']}"
+    )
+
+
+    if report["actual_start"] is not None:
+
+        print(
+            f"    Actual start     : "
+            f"{utc_time(report['actual_start'])}"
+        )
+
+
+        print(
+            f"    Actual end       : "
+            f"{utc_time(report['actual_end'])}"
+        )
+
+
+    if report["expected_start"] is not None:
+
+        print(
+            f"    Expected start   : "
+            f"{utc_time(report['expected_start'])}"
+        )
+
+
+        print(
+            f"    Expected end     : "
+            f"{utc_time(report['expected_end'])}"
+        )
+
+
+    print(
+        f"    Validation       : "
+        f"{'PASS' if validation_ok else 'FAIL'}"
+    )
+
+
+    print(
+        f"    Reason           : "
+        f"{validation_reason}"
+    )
 
 
 # ============================================================
@@ -1184,9 +1599,9 @@ def load_market_data(
 
     try:
 
-        # ----------------------------------------------------
+        # ====================================================
         # 4H
-        # ----------------------------------------------------
+        # ====================================================
 
         candles_4h = get_lbank_klines(
             symbol,
@@ -1196,9 +1611,9 @@ def load_market_data(
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # 1H
-        # ----------------------------------------------------
+        # ====================================================
 
         candles_1h = get_lbank_klines(
             symbol,
@@ -1208,29 +1623,25 @@ def load_market_data(
         )
 
 
-        # ----------------------------------------------------
-        # Remove forming candles
-        # ----------------------------------------------------
+        # ====================================================
+        # Final forming candle protection
+        # ====================================================
 
-        candles_4h = (
-            remove_forming_candle(
-                candles_4h,
-                INTERVAL_4H
-            )
+        candles_4h = remove_forming_candle(
+            candles_4h,
+            INTERVAL_4H
         )
 
 
-        candles_1h = (
-            remove_forming_candle(
-                candles_1h,
-                INTERVAL_1H
-            )
+        candles_1h = remove_forming_candle(
+            candles_1h,
+            INTERVAL_1H
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # Coverage
-        # ----------------------------------------------------
+        # ====================================================
 
         report_4h = coverage_report(
             candles_4h,
@@ -1248,66 +1659,7 @@ def load_market_data(
         )
 
 
-        print()
-        print(
-            f"{symbol} 4H coverage : "
-            f"{report_4h['coverage']:.2f}%"
-        )
-
-
-        print(
-            f"{symbol} 4H count    : "
-            f"{report_4h['count_ratio']:.2f}%"
-        )
-
-
-        print(
-            f"{symbol} 4H gaps     : "
-            f"{report_4h['large_gaps']}"
-        )
-
-
-        print(
-            f"{symbol} 1H coverage : "
-            f"{report_1h['coverage']:.2f}%"
-        )
-
-
-        print(
-            f"{symbol} 1H count    : "
-            f"{report_1h['count_ratio']:.2f}%"
-        )
-
-
-        print(
-            f"{symbol} 1H gaps     : "
-            f"{report_1h['large_gaps']}"
-        )
-
-
-        if report_4h["actual_start"]:
-
-            print(
-                f"{symbol} 4H actual: "
-                f"{utc_time(report_4h['actual_start'])}"
-                f" -> "
-                f"{utc_time(report_4h['actual_end'])}"
-            )
-
-
-        if report_1h["actual_start"]:
-
-            print(
-                f"{symbol} 1H actual: "
-                f"{utc_time(report_1h['actual_start'])}"
-                f" -> "
-                f"{utc_time(report_1h['actual_end'])}"
-            )
-
-
-        valid_4h = (
-            report_4h["valid"]
-            and
+        valid_4h_structure, reason_4h = (
             validate_candles(
                 candles_4h,
                 INTERVAL_4H,
@@ -1316,9 +1668,7 @@ def load_market_data(
         )
 
 
-        valid_1h = (
-            report_1h["valid"]
-            and
+        valid_1h_structure, reason_1h = (
             validate_candles(
                 candles_1h,
                 INTERVAL_1H,
@@ -1326,6 +1676,56 @@ def load_market_data(
             )
         )
 
+
+        valid_4h = (
+            report_4h["valid"]
+            and valid_4h_structure
+        )
+
+
+        valid_1h = (
+            report_1h["valid"]
+            and valid_1h_structure
+        )
+
+
+        print_data_diagnostic(
+            symbol,
+            "4H",
+            report_4h,
+            valid_4h,
+            (
+                "OK"
+                if valid_4h
+                else (
+                    reason_4h
+                    if not valid_4h_structure
+                    else "COVERAGE VALIDATION FAILED"
+                )
+            )
+        )
+
+
+        print_data_diagnostic(
+            symbol,
+            "1H",
+            report_1h,
+            valid_1h,
+            (
+                "OK"
+                if valid_1h
+                else (
+                    reason_1h
+                    if not valid_1h_structure
+                    else "COVERAGE VALIDATION FAILED"
+                )
+            )
+        )
+
+
+        # ====================================================
+        # Strict validation
+        # ====================================================
 
         if (
             valid_4h
@@ -1353,12 +1753,30 @@ def load_market_data(
         )
 
 
+        print(
+            f"    4H: "
+            f"{'PASS' if valid_4h else 'FAIL'}"
+        )
+
+
+        print(
+            f"    1H: "
+            f"{'PASS' if valid_1h else 'FAIL'}"
+        )
+
+
     except Exception as exc:
 
         print()
         print(
             f"{symbol}: "
             f"DATA DOWNLOAD FAILED"
+        )
+
+
+        print(
+            f"    ERROR TYPE: "
+            f"{type(exc).__name__}"
         )
 
 
@@ -3130,7 +3548,6 @@ def check_trade_result(
                 <= sl
             )
 
-
         else:
 
             hit_tp = (
@@ -3145,7 +3562,7 @@ def check_trade_result(
 
 
         # Conservative:
-        # same candle = SL
+        # same candle TP + SL = SL
 
         if hit_tp and hit_sl:
 
@@ -3206,13 +3623,6 @@ def backtest_coin(
     )
 
 
-    # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Start sufficiently after warmup.
-    # We still check actual timestamp.
-    # --------------------------------------------------------
-
     i = 0
 
 
@@ -3232,7 +3642,7 @@ def backtest_coin(
 
 
         # ----------------------------------------------------
-        # Only CLOSED 4H candles available at this entry.
+        # Only closed 4H context.
         # ----------------------------------------------------
 
         usable_4h = (
@@ -3251,7 +3661,7 @@ def backtest_coin(
 
 
         # ----------------------------------------------------
-        # Only candles up to current 1H candle.
+        # Only 1H candles up to current candle.
         # ----------------------------------------------------
 
         usable_1h = (
@@ -3285,9 +3695,6 @@ def backtest_coin(
             )
         )
 
-
-        # Open trade never completed
-        # -> don't count it.
 
         if result is None:
 
@@ -3370,7 +3777,7 @@ def backtest_coin(
 
 
         # ----------------------------------------------------
-        # NO OVERLAPPING POSITIONS
+        # No overlapping positions.
         # ----------------------------------------------------
 
         i = exit_index + 1
@@ -3390,17 +3797,38 @@ def calculate_stats(
     if not trades:
 
         return {
-            "total": 0,
-            "wins": 0,
-            "losses": 0,
-            "win_rate": 0.0,
-            "net_r": 0.0,
-            "average_r": 0.0,
-            "profit_factor": 0.0,
-            "expectancy": 0.0,
-            "max_drawdown": 0.0,
-            "max_win_streak": 0,
-            "max_loss_streak": 0
+            "total":
+                0,
+
+            "wins":
+                0,
+
+            "losses":
+                0,
+
+            "win_rate":
+                0.0,
+
+            "net_r":
+                0.0,
+
+            "average_r":
+                0.0,
+
+            "profit_factor":
+                0.0,
+
+            "expectancy":
+                0.0,
+
+            "max_drawdown":
+                0.0,
+
+            "max_win_streak":
+                0,
+
+            "max_loss_streak":
+                0
         }
 
 
@@ -3514,7 +3942,6 @@ def calculate_stats(
                 current_win
             )
 
-
         else:
 
             current_loss += 1
@@ -3584,7 +4011,7 @@ def fmt_price(
 
 
 # ============================================================
-# PRINT STAT
+# PRINT STATS
 # ============================================================
 
 def print_stats(
@@ -3639,9 +4066,7 @@ def print_stats(
     ]
 
 
-    if pf == float(
-        "inf"
-    ):
+    if pf == float("inf"):
 
         pf_text = "INF"
 
@@ -3689,13 +4114,13 @@ def main():
     print()
     print("=" * 110)
     print(
-        " SCORE HUNTER PRO v8.13"
+        " SCORE HUNTER PRO v8.14"
     )
     print(
         " REAL 365-DAY HISTORICAL BACKTEST"
     )
     print(
-        " LBANK FORWARD PAGINATION"
+        " LBANK VERIFIED DATA ENGINE"
     )
     print("=" * 110)
 
@@ -3724,14 +4149,18 @@ def main():
 
     print()
     print("DATA ENGINE:")
-    print("LBank time parameter = SECONDS")
-    print("Pagination = FORWARD")
+    print("LBank Kline time = SECONDS")
     print("Page size = 2000")
+    print("Forward pagination")
     print("Adaptive page count")
+    print("No artificial 10/5 page limit")
+    print("Exact timestamp deduplication")
+    print("Repeated cursor protection")
     print("Repeated page protection")
     print("Zero-progress protection")
-    print("Current candle = REMOVED")
-    print("Warmup = 60 days")
+    print("Forming candle removed")
+    print("Validation uses LAST CLOSED candle")
+    print("Exact missing-candle detection")
 
 
     # ========================================================
@@ -3797,7 +4226,7 @@ def main():
 
 
     print(
-        "Backtest end: "
+        "Backtest request end: "
         f"{utc_time(timestamp_seconds(end_dt))}"
     )
 
@@ -3818,7 +4247,7 @@ def main():
 
 
     # ========================================================
-    # DOWNLOAD ALL COINS
+    # DOWNLOAD
     # ========================================================
 
     for symbol in COINS:
@@ -4471,7 +4900,7 @@ def main():
     print()
     print("=" * 110)
     print(
-        "SCORE HUNTER PRO v8.13 "
+        "SCORE HUNTER PRO v8.14 "
         "BACKTEST FINISHED"
     )
     print("=" * 110)
