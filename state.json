@@ -13,20 +13,10 @@
     },
     "signal_candle": 1786363200,
     "signal_time": 1787482558,
-    "last_checked_1h": 1787565600,
+    "last_checked_1h": 1787569200,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
-    "position": {
-      "direction": "LONG",
-      "setup_type": "PULLBACK",
-      "entry": 2415.26,
-      "tp": 2475.7807142857146,
-      "sl": 2384.999642857143,
-      "atr": 20.173571428571385,
-      "adx": 26.95120310307323,
-      "rsi": 50.40883938184597,
-      "entry_candle": 1787475600
-    }
+    "position": null
   },
   "SOL": {
     "last_signal": {
@@ -50,7 +40,7 @@
     "last_signal_day": "2026-08-14",
     "signal_candle": 1786665600,
     "signal_time": 1787406299,
-    "last_checked_1h": 1787565600,
+    "last_checked_1h": 1787569200,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
     "signal_candle_1h": 1787209200,
@@ -86,7 +76,7 @@
     },
     "signal_candle": 1787097600,
     "signal_time": 1787406300,
-    "last_checked_1h": 1787565600,
+    "last_checked_1h": 1787569200,
     "last_signal_id": "1786867200_SHORT",
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "signal_candle_utc": "2026-08-19 00:00:00",
@@ -104,7 +94,7 @@
     }
   },
   "BTC": {
-    "last_checked_1h": 1787565600,
+    "last_checked_1h": 1787569200,
     "last_signal_id": "1786870800_SHORT",
     "last_signal": {
       "direction": "LONG",
@@ -128,7 +118,7 @@
     "position": null
   },
   "ADA": {
-    "last_checked_1h": 1787565600,
+    "last_checked_1h": 1787569200,
     "last_signal_id": "1786874400_SHORT",
     "last_signal": {
       "direction": "SHORT",
@@ -161,7 +151,7 @@
     },
     "signal_candle": 1786896000,
     "signal_time": 1787496994,
-    "last_checked_1h": 1787565600,
+    "last_checked_1h": 1787569200,
     "last_signal_id": "1786863600_LONG",
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
@@ -194,7 +184,7 @@
     },
     "signal_candle": 1787097600,
     "signal_time": 1787384844,
-    "last_checked_1h": 1787565600,
+    "last_checked_1h": 1787569200,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "signal_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
