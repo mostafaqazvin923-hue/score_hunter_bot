@@ -4,31 +4,30 @@ from datetime import datetime, timezone, timedelta
 
 
 # ============================================================
-# SCORE HUNTER PRO v8.15
+# SCORE HUNTER PRO v8.16
 #
 # 4H TREND + 1H ENTRY
 # REAL 365-DAY HISTORICAL BACKTEST
 #
-# DATA ENGINE v8.15
+# v8.15 DATA ENGINE PRESERVED
 #
-# FIXES:
-#   1. Closed-candle end boundary fixed
-#   2. Forming candle removed BEFORE coverage validation
-#   3. Coverage measured against CLOSED data only
-#   4. LBank pagination direction auto-detection
-#   5. Forward pagination
-#   6. Reverse pagination fallback
-#   7. Repeated-page protection
-#   8. Zero-progress protection
-#   9. Exact timestamp deduplication
-#  10. Missing isolated candle tolerance
-#  11. Large-gap validation
-#  12. Warmup separated from strategy period
-#  13. Closed 4H only
-#  14. Closed 1H only
-#  15. No look-ahead
-#  16. No fake fallback
-#  17. Detailed data diagnostics
+# v8.16 CHANGES:
+#   1. Full performance statistics
+#   2. Average Win R
+#   3. Average Loss R
+#   4. Gross Profit / Gross Loss
+#   5. Profit Factor
+#   6. Expectancy
+#   7. Max Drawdown in R
+#   8. Max Drawdown in %
+#   9. Largest Win / Loss
+#  10. IS detailed statistics
+#  11. OOS detailed statistics
+#  12. OOS LONG / SHORT
+#  13. OOS BREAKOUT / REVERSAL
+#  14. IS vs OOS comparison
+#  15. Separate DATA VALID from PERFORMANCE VALID
+#  16. Performance verdict
 #
 # STRATEGY:
 #   4H TREND + 1H ENTRY
@@ -47,6 +46,9 @@ from datetime import datetime, timezone, timedelta
 #   ENTRY AT 1H CLOSE
 #   SAME CANDLE TP + SL = SL
 #   NO OVERLAPPING POSITIONS
+#
+# IMPORTANT:
+#   OOS RESULTS ARE NEVER USED FOR OPTIMIZATION.
 # ============================================================
 
 
@@ -103,8 +105,40 @@ MAX_RETRIES = 3
 
 LBANK_MAX_SIZE = 2000
 
-# Absolute safety limit.
 MAX_PAGES_HARD = 100
+
+
+# ============================================================
+# PERFORMANCE SETTINGS v8.16
+# ============================================================
+
+# فقط برای تبدیل R به درصد Drawdown.
+#
+# مثال:
+# اگر 1R = 1% ریسک باشد:
+# +2R = +2%
+# -1R = -1%
+#
+# این مقدار هیچ اثری روی سیگنال یا نتیجه بک‌تست ندارد.
+
+RISK_PER_TRADE_PERCENT = 1.0
+
+
+# Minimum sample requirements
+
+MIN_TOTAL_TRADES = 100
+MIN_OOS_TRADES = 30
+
+
+# OOS performance evaluation thresholds
+#
+# اینها فقط برای Verdict هستند
+# و پارامترهای استراتژی نیستند.
+
+MIN_OOS_NET_R = 0.0
+MIN_OOS_PROFIT_FACTOR = 1.05
+MIN_OOS_WIN_RATE = 35.0
+MAX_OOS_DRAWDOWN_R = 15.0
 
 
 # ============================================================
@@ -249,8 +283,6 @@ def normalize_candle(
             timestamp_value
         )
 
-
-        # Seconds / milliseconds protection
 
         if timestamp_value > 10_000_000_000:
 
@@ -515,7 +547,6 @@ def lbank_request_page(
         "type":
             lbank_type,
 
-        # LBank legacy kline API uses seconds here.
         "time":
             int(cursor)
     }
@@ -577,9 +608,6 @@ def lbank_request_page(
 
 # ============================================================
 # REMOVE FORMING CANDLE
-#
-# IMPORTANT:
-# This is done BEFORE historical coverage.
 # ============================================================
 
 def remove_forming_candle(
@@ -677,11 +705,6 @@ def merge_page(
 
 # ============================================================
 # GET FULL HISTORY
-#
-# This version does NOT assume the API returns candles
-# in ascending order.
-#
-# It detects page direction automatically.
 # ============================================================
 
 def get_lbank_klines(
@@ -704,12 +727,6 @@ def get_lbank_klines(
         interval * 60
     )
 
-
-    # --------------------------------------------------------
-    # Critical fix:
-    #
-    # We only require coverage through the LAST CLOSED candle.
-    # --------------------------------------------------------
 
     now_ts = timestamp_seconds(
         utc_now()
@@ -793,8 +810,7 @@ def get_lbank_klines(
 
 
     # ========================================================
-    # METHOD A
-    # Forward pagination
+    # FORWARD
     # ========================================================
 
     all_candles = []
@@ -883,11 +899,6 @@ def get_lbank_klines(
         )
 
 
-        # ----------------------------------------------------
-        # If API immediately returned future/current data,
-        # forward pagination may not behave as expected.
-        # ----------------------------------------------------
-
         if (
             previous_page_newest is not None
             and page_newest
@@ -940,10 +951,7 @@ def get_lbank_klines(
 
 
     # ========================================================
-    # METHOD B
-    # Reverse / adaptive fallback
-    #
-    # Used if forward pagination failed or didn't cover.
+    # PRELIMINARY COVERAGE
     # ========================================================
 
     preliminary = deduplicate(
@@ -977,6 +985,7 @@ def get_lbank_klines(
         actual_start = preliminary[0]["time"]
         actual_end = preliminary[-1]["time"]
 
+
         covered = max(
             0,
             min(
@@ -990,10 +999,12 @@ def get_lbank_klines(
             )
         )
 
+
         required = (
             effective_end
             - requested_start
         )
+
 
         forward_coverage = (
             covered
@@ -1002,10 +1013,9 @@ def get_lbank_klines(
         )
 
 
-    # --------------------------------------------------------
-    # If forward did not give enough data,
-    # try reverse pagination.
-    # --------------------------------------------------------
+    # ========================================================
+    # REVERSE FALLBACK
+    # ========================================================
 
     if (
         forward_failed
@@ -1217,9 +1227,6 @@ def get_lbank_klines(
 
 # ============================================================
 # COVERAGE REPORT
-#
-# IMPORTANT:
-# Coverage is calculated using CLOSED candles only.
 # ============================================================
 
 def coverage_report(
@@ -1263,11 +1270,6 @@ def coverage_report(
         end_dt
     )
 
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # End is the last CLOSED candle open time.
-    # --------------------------------------------------------
 
     now_ts = timestamp_seconds(
         utc_now()
@@ -1367,10 +1369,6 @@ def coverage_report(
     )
 
 
-    # ========================================================
-    # GAP ANALYSIS
-    # ========================================================
-
     missing_candles = 0
     large_gaps = 0
 
@@ -1406,11 +1404,6 @@ def coverage_report(
             large_gaps += 1
 
 
-    # --------------------------------------------------------
-    # Boundary tolerance:
-    # first/last candle may be off by one candle.
-    # --------------------------------------------------------
-
     start_ok = (
         actual_start
         <= (
@@ -1428,15 +1421,6 @@ def coverage_report(
         )
     )
 
-
-    # --------------------------------------------------------
-    # We allow a tiny amount of missing historical data.
-    #
-    # One isolated missing candle should NOT invalidate
-    # the entire 365-day test.
-    #
-    # Large / systematic gaps still invalidate.
-    # --------------------------------------------------------
 
     missing_ratio = (
         missing_candles
@@ -1533,8 +1517,6 @@ def validate_candles(
 
             severe_gaps += 1
 
-
-    # More than 20% severe gaps is definitely invalid.
 
     total_gaps = max(
         1,
@@ -3685,7 +3667,7 @@ def backtest_coin(
 
 
 # ============================================================
-# STATISTICS
+# STATISTICS v8.16
 # ============================================================
 
 def calculate_stats(
@@ -3701,26 +3683,39 @@ def calculate_stats(
             "win_rate": 0.0,
             "net_r": 0.0,
             "average_r": 0.0,
+            "average_win_r": 0.0,
+            "average_loss_r": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
             "profit_factor": 0.0,
             "expectancy": 0.0,
             "max_drawdown": 0.0,
+            "max_drawdown_percent": 0.0,
             "max_win_streak": 0,
-            "max_loss_streak": 0
+            "max_loss_streak": 0,
+            "largest_win": 0.0,
+            "largest_loss": 0.0,
+            "final_equity_r": 0.0,
+            "peak_equity_r": 0.0
         }
 
 
-    total = len(trades)
+    total = len(
+        trades
+    )
 
 
     wins = sum(
-        t["result"] == "TP"
+        1
         for t in trades
+        if t["result"] == "TP"
     )
 
 
     losses = sum(
-        t["result"] == "SL"
+        1
         for t in trades
+        if t["result"] == "SL"
     )
 
 
@@ -3731,9 +3726,14 @@ def calculate_stats(
     )
 
 
-    net_r = sum(
-        t["R"]
+    r_values = [
+        float(t["R"])
         for t in trades
+    ]
+
+
+    net_r = sum(
+        r_values
     )
 
 
@@ -3743,19 +3743,43 @@ def calculate_stats(
     )
 
 
+    winning_r = [
+        r
+        for r in r_values
+        if r > 0
+    ]
+
+
+    losing_r = [
+        r
+        for r in r_values
+        if r < 0
+    ]
+
+
+    average_win_r = (
+        sum(winning_r)
+        / len(winning_r)
+        if winning_r
+        else 0.0
+    )
+
+
+    average_loss_r = (
+        sum(losing_r)
+        / len(losing_r)
+        if losing_r
+        else 0.0
+    )
+
+
     gross_profit = sum(
-        t["R"]
-        for t in trades
-        if t["R"] > 0
+        winning_r
     )
 
 
     gross_loss = abs(
-        sum(
-            t["R"]
-            for t in trades
-            if t["R"] < 0
-        )
+        sum(losing_r)
     )
 
 
@@ -3766,15 +3790,27 @@ def calculate_stats(
             / gross_loss
         )
 
-    else:
+    elif gross_profit > 0:
 
         profit_factor = float(
             "inf"
         )
 
+    else:
+
+        profit_factor = 0.0
+
+
+    expectancy = average_r
+
+
+    # ========================================================
+    # EQUITY / DRAWDOWN
+    # ========================================================
 
     equity = 0.0
     peak = 0.0
+
     max_drawdown = 0.0
 
     current_win = 0
@@ -3783,10 +3819,18 @@ def calculate_stats(
     max_win = 0
     max_loss = 0
 
+    largest_win = 0.0
+    largest_loss = 0.0
+
 
     for trade in trades:
 
-        equity += trade["R"]
+        r_value = float(
+            trade["R"]
+        )
+
+
+        equity += r_value
 
 
         peak = max(
@@ -3804,6 +3848,18 @@ def calculate_stats(
         max_drawdown = max(
             max_drawdown,
             drawdown
+        )
+
+
+        largest_win = max(
+            largest_win,
+            r_value
+        )
+
+
+        largest_loss = min(
+            largest_loss,
+            r_value
         )
 
 
@@ -3828,7 +3884,14 @@ def calculate_stats(
             )
 
 
+    max_drawdown_percent = (
+        max_drawdown
+        * RISK_PER_TRADE_PERCENT
+    )
+
+
     return {
+
         "total":
             total,
 
@@ -3847,20 +3910,47 @@ def calculate_stats(
         "average_r":
             average_r,
 
+        "average_win_r":
+            average_win_r,
+
+        "average_loss_r":
+            average_loss_r,
+
+        "gross_profit":
+            gross_profit,
+
+        "gross_loss":
+            gross_loss,
+
         "profit_factor":
             profit_factor,
 
         "expectancy":
-            average_r,
+            expectancy,
 
         "max_drawdown":
             max_drawdown,
+
+        "max_drawdown_percent":
+            max_drawdown_percent,
 
         "max_win_streak":
             max_win,
 
         "max_loss_streak":
-            max_loss
+            max_loss,
+
+        "largest_win":
+            largest_win,
+
+        "largest_loss":
+            largest_loss,
+
+        "final_equity_r":
+            equity,
+
+        "peak_equity_r":
+            peak
     }
 
 
@@ -3886,7 +3976,7 @@ def fmt_price(
 
 
 # ============================================================
-# PRINT STAT
+# PRINT STATISTICS
 # ============================================================
 
 def print_stats(
@@ -3898,6 +3988,15 @@ def print_stats(
     print("=" * 110)
     print(title)
     print("=" * 110)
+
+
+    if stats["total"] == 0:
+
+        print(
+            "No completed trades."
+        )
+
+        return
 
 
     print(
@@ -3936,6 +4035,18 @@ def print_stats(
     )
 
 
+    print(
+        f"Average Win        : "
+        f"{stats['average_win_r']:+.3f}R"
+    )
+
+
+    print(
+        f"Average Loss       : "
+        f"{stats['average_loss_r']:+.3f}R"
+    )
+
+
     pf = stats["profit_factor"]
 
 
@@ -3945,7 +4056,7 @@ def print_stats(
 
     else:
 
-        pf_text = f"{pf:.2f}"
+        pf_text = f"{pf:.3f}"
 
 
     print(
@@ -3961,8 +4072,27 @@ def print_stats(
 
 
     print(
+        f"Gross Profit       : "
+        f"{stats['gross_profit']:+.2f}R"
+    )
+
+
+    print(
+        f"Gross Loss         : "
+        f"-{stats['gross_loss']:.2f}R"
+    )
+
+
+    print(
         f"Max Drawdown       : "
         f"{stats['max_drawdown']:.2f}R"
+    )
+
+
+    print(
+        f"Max Drawdown       : "
+        f"{stats['max_drawdown_percent']:.2f}% "
+        f"(1R={RISK_PER_TRADE_PERCENT:.2f}%)"
     )
 
 
@@ -3978,6 +4108,355 @@ def print_stats(
     )
 
 
+    print(
+        f"Largest Win        : "
+        f"{stats['largest_win']:+.2f}R"
+    )
+
+
+    print(
+        f"Largest Loss       : "
+        f"{stats['largest_loss']:+.2f}R"
+    )
+
+
+    print(
+        f"Final Equity       : "
+        f"{stats['final_equity_r']:+.2f}R"
+    )
+
+
+# ============================================================
+# SIMPLE ROW STAT
+# ============================================================
+
+def print_compact_stats(
+    label,
+    stats
+):
+
+    if stats["total"] == 0:
+
+        print(
+            f"{label} | 0 trades"
+        )
+
+        return
+
+
+    pf = stats["profit_factor"]
+
+
+    if pf == float("inf"):
+
+        pf_text = "INF"
+
+    else:
+
+        pf_text = f"{pf:.2f}"
+
+
+    print(
+        f"{label} | "
+        f"Trades: {stats['total']:3d} | "
+        f"W: {stats['wins']:3d} | "
+        f"L: {stats['losses']:3d} | "
+        f"WR: {stats['win_rate']:6.2f}% | "
+        f"R: {stats['net_r']:+8.2f} | "
+        f"PF: {pf_text:>6} | "
+        f"DD: {stats['max_drawdown']:.2f}R"
+    )
+
+
+# ============================================================
+# PERFORMANCE VERDICT
+# ============================================================
+
+def performance_verdict(
+    overall_stats,
+    is_stats,
+    oos_stats
+):
+
+    print()
+    print("=" * 110)
+    print(
+        "PERFORMANCE VERDICT"
+    )
+    print("=" * 110)
+
+
+    total_ok = (
+        overall_stats["total"]
+        >= MIN_TOTAL_TRADES
+    )
+
+
+    oos_sample_ok = (
+        oos_stats["total"]
+        >= MIN_OOS_TRADES
+    )
+
+
+    print(
+        f"Total sample        : "
+        f"{overall_stats['total']}"
+    )
+
+
+    print(
+        f"Required total      : "
+        f"{MIN_TOTAL_TRADES}"
+    )
+
+
+    print(
+        "Total sample status : "
+        f"{'PASS' if total_ok else 'FAIL'}"
+    )
+
+
+    print()
+
+
+    print(
+        f"OOS sample          : "
+        f"{oos_stats['total']}"
+    )
+
+
+    print(
+        f"Required OOS        : "
+        f"{MIN_OOS_TRADES}"
+    )
+
+
+    print(
+        "OOS sample status   : "
+        f"{'PASS' if oos_sample_ok else 'FAIL'}"
+    )
+
+
+    if oos_stats["total"] == 0:
+
+        print()
+        print(
+            "FINAL VERDICT       : "
+            "OOS FAILED"
+        )
+
+        return "OOS FAILED"
+
+
+    pf = oos_stats[
+        "profit_factor"
+    ]
+
+
+    pf_ok = (
+        pf >= MIN_OOS_PROFIT_FACTOR
+        if pf != float("inf")
+        else True
+    )
+
+
+    net_ok = (
+        oos_stats["net_r"]
+        > MIN_OOS_NET_R
+    )
+
+
+    wr_ok = (
+        oos_stats["win_rate"]
+        >= MIN_OOS_WIN_RATE
+    )
+
+
+    dd_ok = (
+        oos_stats["max_drawdown"]
+        <= MAX_OOS_DRAWDOWN_R
+    )
+
+
+    print()
+    print(
+        "OOS PERFORMANCE CHECKS"
+    )
+
+
+    print(
+        f"OOS Win Rate       : "
+        f"{oos_stats['win_rate']:.2f}% "
+        f"-> "
+        f"{'PASS' if wr_ok else 'FAIL'}"
+    )
+
+
+    print(
+        f"OOS Net R          : "
+        f"{oos_stats['net_r']:+.2f}R "
+        f"-> "
+        f"{'PASS' if net_ok else 'FAIL'}"
+    )
+
+
+    if pf == float("inf"):
+
+        pf_display = "INF"
+
+    else:
+
+        pf_display = f"{pf:.3f}"
+
+
+    print(
+        f"OOS Profit Factor  : "
+        f"{pf_display} "
+        f"-> "
+        f"{'PASS' if pf_ok else 'FAIL'}"
+    )
+
+
+    print(
+        f"OOS Max Drawdown   : "
+        f"{oos_stats['max_drawdown']:.2f}R "
+        f"-> "
+        f"{'PASS' if dd_ok else 'FAIL'}"
+    )
+
+
+    print()
+    print(
+        "IS / OOS COMPARISON"
+    )
+
+
+    print(
+        f"IS  Trades         : "
+        f"{is_stats['total']}"
+    )
+
+
+    print(
+        f"OOS Trades         : "
+        f"{oos_stats['total']}"
+    )
+
+
+    print(
+        f"IS  Win Rate       : "
+        f"{is_stats['win_rate']:.2f}%"
+    )
+
+
+    print(
+        f"OOS Win Rate       : "
+        f"{oos_stats['win_rate']:.2f}%"
+    )
+
+
+    print(
+        f"IS  Net R          : "
+        f"{is_stats['net_r']:+.2f}R"
+    )
+
+
+    print(
+        f"OOS Net R          : "
+        f"{oos_stats['net_r']:+.2f}R"
+    )
+
+
+    if is_stats["profit_factor"] == float("inf"):
+
+        is_pf_text = "INF"
+
+    else:
+
+        is_pf_text = (
+            f"{is_stats['profit_factor']:.3f}"
+        )
+
+
+    print(
+        f"IS  Profit Factor  : "
+        f"{is_pf_text}"
+    )
+
+
+    print(
+        f"OOS Profit Factor  : "
+        f"{pf_display}"
+    )
+
+
+    print(
+        f"IS  Max DD         : "
+        f"{is_stats['max_drawdown']:.2f}R"
+    )
+
+
+    print(
+        f"OOS Max DD         : "
+        f"{oos_stats['max_drawdown']:.2f}R"
+    )
+
+
+    # ========================================================
+    # FINAL CLASSIFICATION
+    # ========================================================
+
+    if not total_ok:
+
+        verdict = (
+            "INSUFFICIENT SAMPLE"
+        )
+
+    elif not oos_sample_ok:
+
+        verdict = (
+            "OOS FAILED - SAMPLE TOO SMALL"
+        )
+
+    elif (
+        net_ok
+        and pf_ok
+        and wr_ok
+        and dd_ok
+    ):
+
+        verdict = (
+            "PROFITABLE - OOS PASSED"
+        )
+
+    elif (
+        net_ok
+        and pf_ok
+    ):
+
+        verdict = (
+            "MARGINAL - OOS POSITIVE BUT NEEDS REVIEW"
+        )
+
+    else:
+
+        verdict = (
+            "UNPROFITABLE - OOS FAILED"
+        )
+
+
+    print()
+    print("=" * 110)
+    print(
+        f"FINAL VERDICT       : "
+        f"{verdict}"
+    )
+    print("=" * 110)
+
+
+    return verdict
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -3987,13 +4466,16 @@ def main():
     print()
     print("=" * 110)
     print(
-        " SCORE HUNTER PRO v8.15"
+        " SCORE HUNTER PRO v8.16"
     )
     print(
         " REAL 365-DAY HISTORICAL BACKTEST"
     )
     print(
         " LBANK ROBUST PAGINATION ENGINE"
+    )
+    print(
+        " FULL PERFORMANCE ANALYSIS"
     )
     print("=" * 110)
 
@@ -4033,6 +4515,34 @@ def main():
     print("Isolated missing candle tolerance")
     print("Large-gap detection")
     print("Warmup = 60 days")
+
+
+    print()
+    print("PERFORMANCE ENGINE:")
+    print(
+        f"Risk model           : "
+        f"1R = {RISK_PER_TRADE_PERCENT:.2f}%"
+    )
+    print(
+        f"Minimum total sample : "
+        f"{MIN_TOTAL_TRADES}"
+    )
+    print(
+        f"Minimum OOS sample   : "
+        f"{MIN_OOS_TRADES}"
+    )
+    print(
+        f"Minimum OOS PF       : "
+        f"{MIN_OOS_PROFIT_FACTOR}"
+    )
+    print(
+        f"Minimum OOS WR       : "
+        f"{MIN_OOS_WIN_RATE:.1f}%"
+    )
+    print(
+        f"Maximum OOS DD       : "
+        f"{MAX_OOS_DRAWDOWN_R:.2f}R"
+    )
 
 
     # ========================================================
@@ -4281,14 +4791,14 @@ def main():
     # OVERALL
     # ========================================================
 
-    overall = calculate_stats(
+    overall_stats = calculate_stats(
         all_trades
     )
 
 
     print_stats(
         "OVERALL RESULT",
-        overall
+        overall_stats
     )
 
 
@@ -4303,11 +4813,14 @@ def main():
     ]
 
 
+    long_stats = calculate_stats(
+        long_trades
+    )
+
+
     print_stats(
         "LONG ONLY",
-        calculate_stats(
-            long_trades
-        )
+        long_stats
     )
 
 
@@ -4322,11 +4835,14 @@ def main():
     ]
 
 
+    short_stats = calculate_stats(
+        short_trades
+    )
+
+
     print_stats(
         "SHORT ONLY",
-        calculate_stats(
-            short_trades
-        )
+        short_stats
     )
 
 
@@ -4341,11 +4857,14 @@ def main():
     ]
 
 
+    is_stats = calculate_stats(
+        is_trades
+    )
+
+
     print_stats(
         "IN-SAMPLE RESULT",
-        calculate_stats(
-            is_trades
-        )
+        is_stats
     )
 
 
@@ -4360,10 +4879,51 @@ def main():
     ]
 
 
+    oos_stats = calculate_stats(
+        oos_trades
+    )
+
+
     print_stats(
         "OUT-OF-SAMPLE RESULT",
+        oos_stats
+    )
+
+
+    # ========================================================
+    # OOS LONG
+    # ========================================================
+
+    oos_long = [
+        t
+        for t in oos_trades
+        if t["direction"] == "LONG"
+    ]
+
+
+    print_stats(
+        "OOS LONG",
         calculate_stats(
-            oos_trades
+            oos_long
+        )
+    )
+
+
+    # ========================================================
+    # OOS SHORT
+    # ========================================================
+
+    oos_short = [
+        t
+        for t in oos_trades
+        if t["direction"] == "SHORT"
+    ]
+
+
+    print_stats(
+        "OOS SHORT",
+        calculate_stats(
+            oos_short
         )
     )
 
@@ -4389,39 +4949,14 @@ def main():
         ]
 
 
-        if not coin_trades:
-
-            print(
-                f"{symbol:5s} | "
-                f"0 trades"
-            )
-
-            continue
-
-
-        s = calculate_stats(
+        coin_stats = calculate_stats(
             coin_trades
         )
 
 
-        pf = s["profit_factor"]
-
-
-        pf_text = (
-            "INF"
-            if pf == float("inf")
-            else f"{pf:.2f}"
-        )
-
-
-        print(
-            f"{symbol:5s} | "
-            f"Trades: {s['total']:3d} | "
-            f"W: {s['wins']:3d} | "
-            f"L: {s['losses']:3d} | "
-            f"WR: {s['win_rate']:6.2f}% | "
-            f"R: {s['net_r']:+7.2f} | "
-            f"PF: {pf_text}"
+        print_compact_stats(
+            f"{symbol:5s}",
+            coin_stats
         )
 
 
@@ -4449,39 +4984,11 @@ def main():
         ]
 
 
-        if not setup_trades:
-
-            print(
-                f"{setup:10s} | "
-                f"0 trades"
+        print_compact_stats(
+            f"{setup:10s}",
+            calculate_stats(
+                setup_trades
             )
-
-            continue
-
-
-        s = calculate_stats(
-            setup_trades
-        )
-
-
-        pf = s["profit_factor"]
-
-
-        pf_text = (
-            "INF"
-            if pf == float("inf")
-            else f"{pf:.2f}"
-        )
-
-
-        print(
-            f"{setup:10s} | "
-            f"Trades: {s['total']:3d} | "
-            f"W: {s['wins']:3d} | "
-            f"L: {s['losses']:3d} | "
-            f"WR: {s['win_rate']:6.2f}% | "
-            f"R: {s['net_r']:+7.2f} | "
-            f"PF: {pf_text}"
         )
 
 
@@ -4506,28 +5013,43 @@ def main():
         ]
 
 
-        if not coin_oos:
-
-            print(
-                f"{symbol:5s} | "
-                f"0 trades"
+        print_compact_stats(
+            f"{symbol:5s}",
+            calculate_stats(
+                coin_oos
             )
-
-            continue
-
-
-        s = calculate_stats(
-            coin_oos
         )
 
 
-        print(
-            f"{symbol:5s} | "
-            f"Trades: {s['total']:3d} | "
-            f"W: {s['wins']:3d} | "
-            f"L: {s['losses']:3d} | "
-            f"WR: {s['win_rate']:6.2f}% | "
-            f"R: {s['net_r']:+7.2f}"
+    # ========================================================
+    # OOS BY SETUP
+    # ========================================================
+
+    print()
+    print("=" * 110)
+    print(
+        "OUT-OF-SAMPLE BY SETUP"
+    )
+    print("=" * 110)
+
+
+    for setup in (
+        "BREAKOUT",
+        "REVERSAL"
+    ):
+
+        setup_oos = [
+            t
+            for t in oos_trades
+            if t["setup"] == setup
+        ]
+
+
+        print_compact_stats(
+            f"{setup:10s}",
+            calculate_stats(
+                setup_oos
+            )
         )
 
 
@@ -4592,12 +5114,12 @@ def main():
 
 
     print(
-        "Target sample          : "
-        "100+"
+        f"Target sample          : "
+        f"{MIN_TOTAL_TRADES}+"
     )
 
 
-    if len(all_trades) >= 100:
+    if len(all_trades) >= MIN_TOTAL_TRADES:
 
         print(
             "Sample size status     : "
@@ -4618,7 +5140,7 @@ def main():
     )
 
 
-    if len(oos_trades) >= 30:
+    if len(oos_trades) >= MIN_OOS_TRADES:
 
         print(
             "OOS sample status      : "
@@ -4684,7 +5206,64 @@ def main():
 
 
     # ========================================================
-    # FINAL STATUS
+    # DATA VALIDITY
+    # ========================================================
+
+    print()
+    print("=" * 110)
+    print(
+        "DATA VALIDITY"
+    )
+    print("=" * 110)
+
+
+    if full_count == len(COINS):
+
+        print(
+            "DATA STATUS          : "
+            "VALID"
+        )
+
+
+        print(
+            f"Verified symbols     : "
+            f"{full_count}/{len(COINS)}"
+        )
+
+    elif full_count > 0:
+
+        print(
+            "DATA STATUS          : "
+            "PARTIAL"
+        )
+
+
+        print(
+            f"Verified symbols     : "
+            f"{full_count}/{len(COINS)}"
+        )
+
+    else:
+
+        print(
+            "DATA STATUS          : "
+            "INVALID"
+        )
+
+
+    # ========================================================
+    # PERFORMANCE VERDICT
+    # ========================================================
+
+    verdict = performance_verdict(
+        overall_stats,
+        is_stats,
+        oos_stats
+    )
+
+
+    # ========================================================
+    # FINAL BACKTEST STATUS
     # ========================================================
 
     print()
@@ -4739,13 +5318,25 @@ def main():
     else:
 
         print(
-            "BACKTEST VALID"
+            "DATA VALID"
         )
 
 
         print(
             f"Completed trades: "
             f"{len(all_trades)}"
+        )
+
+
+        print(
+            f"OOS trades: "
+            f"{len(oos_trades)}"
+        )
+
+
+        print(
+            f"PERFORMANCE: "
+            f"{verdict}"
         )
 
 
@@ -4756,7 +5347,7 @@ def main():
     print()
     print("=" * 110)
     print(
-        "SCORE HUNTER PRO v8.15 "
+        "SCORE HUNTER PRO v8.16 "
         "BACKTEST FINISHED"
     )
     print("=" * 110)
