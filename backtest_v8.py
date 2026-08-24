@@ -54,7 +54,7 @@ MAX_RETRIES = 3
 LBANK_MAX_SIZE = 2000
 
 # REALISTIC TRADING COSTS
-FEE_TAKER = 0.0006      # 0.06% Taker Fee
+FEE_TAKER = 0.0006      # 0.06% Taker Fee per trade
 SLIPPAGE_EST = 0.0002   # 0.02% Estimated Slippage
 
 LBANK_URL = "https://api.lbkex.com/v2/kline.do"
@@ -217,9 +217,9 @@ def get_closed_4h_for_entry(candles_4h, entry_candle):
     entry_close_time = entry_candle["time"] + SECONDS_1H
     return [c for c in candles_4h if (c["time"] + SECONDS_4H) <= entry_close_time]
 
-# VOLUME FILTER APPLIED
+# ORIGINAL BREAKOUT LOGIC (NO VOLUME FILTER)
 def detect_breakout_long(candles):
-    if len(candles) < (STRUCTURE_LOOKBACK + 21): return False
+    if len(candles) < (STRUCTURE_LOOKBACK + 1): return False
     cur = candles[-1]
     prev = candles[-STRUCTURE_LOOKBACK - 1:-1]
     res = max(c["high"] for c in prev)
@@ -227,13 +227,10 @@ def detect_breakout_long(candles):
     rng = cur["high"] - cur["low"]
     if rng <= 0: return False
     if (abs(cur["close"] - cur["open"]) / rng) < MIN_BODY_RATIO: return False
-    if ((cur["close"] - cur["low"]) / rng) < MIN_CLOSE_LOCATION: return False
-    
-    vol_sma = sum(c["volume"] for c in candles[-21:-1]) / 20.0
-    return cur["volume"] > vol_sma
+    return ((cur["close"] - cur["low"]) / rng) >= MIN_CLOSE_LOCATION
 
 def detect_breakout_short(candles):
-    if len(candles) < (STRUCTURE_LOOKBACK + 21): return False
+    if len(candles) < (STRUCTURE_LOOKBACK + 1): return False
     cur = candles[-1]
     prev = candles[-STRUCTURE_LOOKBACK - 1:-1]
     sup = min(c["low"] for c in prev)
@@ -241,10 +238,7 @@ def detect_breakout_short(candles):
     rng = cur["high"] - cur["low"]
     if rng <= 0: return False
     if (abs(cur["close"] - cur["open"]) / rng) < MIN_BODY_RATIO: return False
-    if ((cur["high"] - cur["close"]) / rng) < MIN_CLOSE_LOCATION: return False
-    
-    vol_sma = sum(c["volume"] for c in candles[-21:-1]) / 20.0
-    return cur["volume"] > vol_sma
+    return ((cur["high"] - cur["close"]) / rng) >= MIN_CLOSE_LOCATION
 
 def detect_reversal_long(candles, trend, adx_v, rsi_v):
     if trend != "SHORT" or len(candles) < 60: return False
