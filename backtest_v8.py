@@ -4,7 +4,7 @@ from datetime import datetime, timezone, timedelta
 
 
 # ============================================================
-# SCORE HUNTER PRO v8.16
+# SCORE HUNTER PRO v8.17
 #
 # 4H TREND + 1H ENTRY
 # REAL 365-DAY HISTORICAL BACKTEST
@@ -85,20 +85,31 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 
-ADX_MIN = 20.0
+ADX_MIN = 22.0
 
-STRUCTURE_LOOKBACK = 5
+STRUCTURE_LOOKBACK = 8
 REVERSAL_LOOKBACK = 6
 
 SL_ATR = 1.50
 STRUCTURE_BUFFER_ATR = 0.10
 MAX_SL_ATR = 3.50
 
-TP_R_MULTIPLE = 2.0
-MIN_RR = 1.50
+# v8.17 quality filters
+ENABLE_REVERSAL = False
+PULLBACK_LOOKBACK = 8
+PULLBACK_TOUCH_ATR = 0.35
+RSI_LONG_MIN = 52.0
+RSI_LONG_MAX = 72.0
+RSI_SHORT_MIN = 28.0
+RSI_SHORT_MAX = 48.0
+EMA_SLOPE_LOOKBACK = 3
+MIN_4H_TREND_CANDLES = 2
 
-MIN_BODY_RATIO = 0.55
-MIN_CLOSE_LOCATION = 0.70
+TP_R_MULTIPLE = 1.8
+MIN_RR = 1.80
+
+MIN_BODY_RATIO = 0.60
+MIN_CLOSE_LOCATION = 0.75
 
 REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
@@ -2953,7 +2964,7 @@ def calculate_long_levels(
     )
 
 
-    sl = min(
+    sl = max(
         atr_stop,
         structure_stop
     )
@@ -3052,7 +3063,7 @@ def calculate_short_levels(
     )
 
 
-    sl = max(
+    sl = min(
         atr_stop,
         structure_stop
     )
@@ -3105,6 +3116,75 @@ def calculate_short_levels(
 
 
 # ============================================================
+# v8.17 QUALITY FILTERS
+# ============================================================
+
+def ema_value_at(candles, period, end_index):
+    if end_index + 1 < period:
+        return None
+    return ema([c["close"] for c in candles[:end_index + 1]], period)
+
+
+def trend_persistence_4h(candles, direction, count=MIN_4H_TREND_CANDLES):
+    if len(candles) < EMA200 + count:
+        return False
+    for n in range(count):
+        subset = candles[:len(candles) - n]
+        closes = [c["close"] for c in subset]
+        e20 = ema(closes, EMA20)
+        e50 = ema(closes, EMA50)
+        e200 = ema(closes, EMA200)
+        if None in (e20, e50, e200):
+            return False
+        close = closes[-1]
+        if direction == "LONG":
+            if not (close > e200 and e20 > e50 and e50 > e200):
+                return False
+        else:
+            if not (close < e200 and e20 < e50 and e50 < e200):
+                return False
+    return True
+
+
+def ema_slope_ok(candles, direction):
+    if len(candles) < EMA20 + EMA_SLOPE_LOOKBACK:
+        return False
+    closes = [c["close"] for c in candles]
+    now = ema(closes, EMA20)
+    past = ema(closes[:-EMA_SLOPE_LOOKBACK], EMA20)
+    if now is None or past is None:
+        return False
+    return now > past if direction == "LONG" else now < past
+
+
+def detect_pullback_reclaim(candles, direction, atr_value):
+    if atr_value is None or len(candles) < EMA50 + PULLBACK_LOOKBACK + 2:
+        return False
+    current = candles[-1]
+    prior = candles[-PULLBACK_LOOKBACK-1:-1]
+    touched = False
+    for j in range(len(prior)):
+        idx = len(candles) - PULLBACK_LOOKBACK - 1 + j
+        e20 = ema_value_at(candles, EMA20, idx)
+        e50 = ema_value_at(candles, EMA50, idx)
+        if e20 is None or e50 is None:
+            continue
+        c = prior[j]
+        if direction == "LONG":
+            if c["low"] <= e20 + atr_value * PULLBACK_TOUCH_ATR or c["low"] <= e50 + atr_value * PULLBACK_TOUCH_ATR:
+                touched = True
+        else:
+            if c["high"] >= e20 - atr_value * PULLBACK_TOUCH_ATR or c["high"] >= e50 - atr_value * PULLBACK_TOUCH_ATR:
+                touched = True
+    if not touched:
+        return False
+    previous = candles[-2]
+    if direction == "LONG":
+        return current["close"] > current["open"] and current["close"] > previous["high"]
+    return current["close"] < current["open"] and current["close"] < previous["low"]
+
+
+# ============================================================
 # ANALYZE
 # ============================================================
 
@@ -3140,6 +3220,9 @@ def analyze_at_index(
 
         return None
 
+    if not trend_persistence_4h(candles_4h, trend_direction):
+        return None
+
 
     atr_value = atr(
         candles_1h,
@@ -3173,259 +3256,39 @@ def analyze_at_index(
         return None
 
 
-    # ========================================================
-    # LONG BREAKOUT
-    # ========================================================
-
+    # v8.17: trend-continuation pullback/reclaim only.
+    # Counter-trend reversals are disabled for this validation pass.
     if trend_direction == "LONG":
-
-        if ema_alignment_long(
-            candles_1h
-        ):
-
-            if (
-                50
-                <= rsi_value
-                <= 85
-            ):
-
-                if detect_breakout_long(
-                    candles_1h
-                ):
-
-                    levels = calculate_long_levels(
-                        candles_1h,
-                        entry,
-                        atr_value
-                    )
-
-
-                    if levels:
-
-                        return {
-                            "direction":
-                                "LONG",
-
-                            "setup":
-                                "BREAKOUT",
-
-                            "entry_time":
-                                current["time"],
-
-                            "entry":
-                                entry,
-
-                            "tp":
-                                levels["tp"],
-
-                            "sl":
-                                levels["sl"],
-
-                            "risk":
-                                levels["risk"],
-
-                            "rr":
-                                levels["rr"],
-
-                            "risk_atr":
-                                levels["risk_atr"],
-
-                            "atr":
-                                atr_value,
-
-                            "adx":
-                                adx_value,
-
-                            "rsi":
-                                rsi_value
-                        }
-
-
-    # ========================================================
-    # SHORT BREAKOUT
-    # ========================================================
+        ema_ok = ema_alignment_long(candles_1h) and ema_slope_ok(candles_1h, "LONG")
+        rsi_ok = RSI_LONG_MIN <= rsi_value <= RSI_LONG_MAX
+        entry_ok = detect_pullback_reclaim(candles_1h, "LONG", atr_value)
+        if ema_ok and rsi_ok and entry_ok:
+            levels = calculate_long_levels(candles_1h, entry, atr_value)
+            if levels:
+                return {
+                    "direction": "LONG", "setup": "PULLBACK",
+                    "entry_time": current["time"], "entry": entry,
+                    "tp": levels["tp"], "sl": levels["sl"],
+                    "risk": levels["risk"], "rr": levels["rr"],
+                    "risk_atr": levels["risk_atr"], "atr": atr_value,
+                    "adx": adx_value, "rsi": rsi_value
+                }
 
     if trend_direction == "SHORT":
-
-        if ema_alignment_short(
-            candles_1h
-        ):
-
-            if (
-                15
-                <= rsi_value
-                <= 50
-            ):
-
-                if detect_breakout_short(
-                    candles_1h
-                ):
-
-                    levels = calculate_short_levels(
-                        candles_1h,
-                        entry,
-                        atr_value
-                    )
-
-
-                    if levels:
-
-                        return {
-                            "direction":
-                                "SHORT",
-
-                            "setup":
-                                "BREAKOUT",
-
-                            "entry_time":
-                                current["time"],
-
-                            "entry":
-                                entry,
-
-                            "tp":
-                                levels["tp"],
-
-                            "sl":
-                                levels["sl"],
-
-                            "risk":
-                                levels["risk"],
-
-                            "rr":
-                                levels["rr"],
-
-                            "risk_atr":
-                                levels["risk_atr"],
-
-                            "atr":
-                                atr_value,
-
-                            "adx":
-                                adx_value,
-
-                            "rsi":
-                                rsi_value
-                        }
-
-
-    # ========================================================
-    # REVERSAL LONG
-    # ========================================================
-
-    if detect_reversal_long(
-        candles_1h,
-        trend_direction,
-        adx_value,
-        rsi_value
-    ):
-
-        levels = calculate_long_levels(
-            candles_1h,
-            entry,
-            atr_value
-        )
-
-
-        if levels:
-
-            return {
-                "direction":
-                    "LONG",
-
-                "setup":
-                    "REVERSAL",
-
-                "entry_time":
-                    current["time"],
-
-                "entry":
-                    entry,
-
-                "tp":
-                    levels["tp"],
-
-                "sl":
-                    levels["sl"],
-
-                "risk":
-                    levels["risk"],
-
-                "rr":
-                    levels["rr"],
-
-                "risk_atr":
-                    levels["risk_atr"],
-
-                "atr":
-                    atr_value,
-
-                "adx":
-                    adx_value,
-
-                "rsi":
-                    rsi_value
-            }
-
-
-    # ========================================================
-    # REVERSAL SHORT
-    # ========================================================
-
-    if detect_reversal_short(
-        candles_1h,
-        trend_direction,
-        adx_value,
-        rsi_value
-    ):
-
-        levels = calculate_short_levels(
-            candles_1h,
-            entry,
-            atr_value
-        )
-
-
-        if levels:
-
-            return {
-                "direction":
-                    "SHORT",
-
-                "setup":
-                    "REVERSAL",
-
-                "entry_time":
-                    current["time"],
-
-                "entry":
-                    entry,
-
-                "tp":
-                    levels["tp"],
-
-                "sl":
-                    levels["sl"],
-
-                "risk":
-                    levels["risk"],
-
-                "rr":
-                    levels["rr"],
-
-                "risk_atr":
-                    levels["risk_atr"],
-
-                "atr":
-                    atr_value,
-
-                "adx":
-                    adx_value,
-
-                "rsi":
-                    rsi_value
-            }
-
+        ema_ok = ema_alignment_short(candles_1h) and ema_slope_ok(candles_1h, "SHORT")
+        rsi_ok = RSI_SHORT_MIN <= rsi_value <= RSI_SHORT_MAX
+        entry_ok = detect_pullback_reclaim(candles_1h, "SHORT", atr_value)
+        if ema_ok and rsi_ok and entry_ok:
+            levels = calculate_short_levels(candles_1h, entry, atr_value)
+            if levels:
+                return {
+                    "direction": "SHORT", "setup": "PULLBACK",
+                    "entry_time": current["time"], "entry": entry,
+                    "tp": levels["tp"], "sl": levels["sl"],
+                    "risk": levels["risk"], "rr": levels["rr"],
+                    "risk_atr": levels["risk_atr"], "atr": atr_value,
+                    "adx": adx_value, "rsi": rsi_value
+                }
 
     return None
 
@@ -4466,7 +4329,7 @@ def main():
     print()
     print("=" * 110)
     print(
-        " SCORE HUNTER PRO v8.16"
+        " SCORE HUNTER PRO v8.17"
     )
     print(
         " REAL 365-DAY HISTORICAL BACKTEST"
@@ -4484,8 +4347,8 @@ def main():
     print("RULES:")
     print("4H Trend + 1H Entry")
     print("LONG + SHORT")
-    print("BREAKOUT + STRICT REVERSAL")
-    print("NO PULLBACK")
+    print("TREND-CONTINUATION PULLBACK/RECLAIM ONLY")
+    print("PULLBACK + RECLAIM REQUIRED")
     print("Closed 4H only")
     print("Closed 1H only")
     print("NO LOOK-AHEAD")
@@ -4496,7 +4359,7 @@ def main():
     print("1H EMA transition for reversal")
     print("SL = 1.5 ATR / Structure")
     print("Maximum SL = 3.5 ATR")
-    print("TP = 2R")
+    print(f"TP = {TP_R_MULTIPLE:.1f}R")
     print("Entry candle excluded from result")
     print("TP + SL same candle = SL")
     print("No overlapping positions")
@@ -5347,7 +5210,7 @@ def main():
     print()
     print("=" * 110)
     print(
-        "SCORE HUNTER PRO v8.16 "
+        "SCORE HUNTER PRO v8.17 "
         "BACKTEST FINISHED"
     )
     print("=" * 110)
