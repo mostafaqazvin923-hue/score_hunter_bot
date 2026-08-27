@@ -4,15 +4,22 @@ from datetime import datetime, timezone, timedelta
 
 
 # ============================================================
-# SCORE HUNTER PRO v8.17
+# SCORE HUNTER PRO v9.0 HIGH WIN RATE
 #
 # 4H TREND + 1H ENTRY
 # REAL 365-DAY HISTORICAL BACKTEST
 #
 # v8.15 DATA ENGINE PRESERVED
 #
-# v8.16 CHANGES:
-#   1. Full performance statistics
+# v9.0 CHANGES:
+#   1. High-probability continuation entries
+#   2. Reversal setup disabled for this version
+#   3. Dynamic TP selected from market structure + ATR space; target R candidates 0.90-2.00
+#   4. Stronger 4H trend + 1H confirmation filters
+#   5. ADX rising filter
+#   6. Breakout distance + exhaustion filters
+#   7. OOS remains completely untouched
+#   8. Full performance statistics
 #   2. Average Win R
 #   3. Average Loss R
 #   4. Gross Profit / Gross Loss
@@ -49,6 +56,7 @@ from datetime import datetime, timezone, timedelta
 #
 # IMPORTANT:
 #   OOS RESULTS ARE NEVER USED FOR OPTIMIZATION.
+#   TARGET: 65-70% WIN RATE. THIS IS A TEST TARGET, NOT A GUARANTEE.
 # ============================================================
 
 
@@ -85,31 +93,20 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 
-ADX_MIN = 22.0
+ADX_MIN = 25.0
 
 STRUCTURE_LOOKBACK = 8
 REVERSAL_LOOKBACK = 6
 
-SL_ATR = 1.50
-STRUCTURE_BUFFER_ATR = 0.10
-MAX_SL_ATR = 3.50
+SL_ATR = 1.00
+STRUCTURE_BUFFER_ATR = 0.08
+MAX_SL_ATR = 2.00
 
-# v8.17 quality filters
-ENABLE_REVERSAL = False
-PULLBACK_LOOKBACK = 8
-PULLBACK_TOUCH_ATR = 0.35
-RSI_LONG_MIN = 52.0
-RSI_LONG_MAX = 72.0
-RSI_SHORT_MIN = 28.0
-RSI_SHORT_MAX = 48.0
-EMA_SLOPE_LOOKBACK = 3
-MIN_4H_TREND_CANDLES = 2
+TP_R_MULTIPLE = None  # legacy placeholder; TP is dynamic
+MIN_RR = 0.90
 
-TP_R_MULTIPLE = 1.8
-MIN_RR = 1.80
-
-MIN_BODY_RATIO = 0.60
-MIN_CLOSE_LOCATION = 0.75
+MIN_BODY_RATIO = 0.65
+MIN_CLOSE_LOCATION = 0.80
 
 REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
@@ -147,8 +144,8 @@ MIN_OOS_TRADES = 30
 # و پارامترهای استراتژی نیستند.
 
 MIN_OOS_NET_R = 0.0
-MIN_OOS_PROFIT_FACTOR = 1.05
-MIN_OOS_WIN_RATE = 35.0
+MIN_OOS_PROFIT_FACTOR = 1.15
+MIN_OOS_WIN_RATE = 65.0
 MAX_OOS_DRAWDOWN_R = 15.0
 
 
@@ -2356,6 +2353,75 @@ def get_closed_4h_for_entry(
 
 
 # ============================================================
+# v9 HIGH-WIN-RATE FILTERS
+# ============================================================
+
+def get_4h_strength(candles):
+    if len(candles) < EMA200 + 5:
+        return None
+    closes = [c["close"] for c in candles]
+    e20 = ema(closes, EMA20)
+    e50 = ema(closes, EMA50)
+    e200 = ema(closes, EMA200)
+    prev_closes = closes[:-1]
+    pe20 = ema(prev_closes, EMA20)
+    atr4 = atr(candles, ATR_PERIOD)
+    rsi4 = rsi(candles, RSI_PERIOD)
+    if None in (e20, e50, e200, pe20, atr4, rsi4) or atr4 <= 0:
+        return None
+    return {
+        "close": closes[-1], "e20": e20, "e50": e50, "e200": e200,
+        "prev_e20": pe20, "atr": atr4, "rsi": rsi4,
+        "bull_slope": e20 > pe20, "bear_slope": e20 < pe20,
+        "trend_gap": abs(e20 - e50) / atr4,
+    }
+
+
+def adx_is_rising(candles):
+    if len(candles) < ADX_PERIOD * 2 + 8:
+        return False
+    current = adx(candles, ADX_PERIOD)
+    previous = adx(candles[:-1], ADX_PERIOD)
+    return current is not None and previous is not None and current > previous
+
+
+def high_quality_breakout_long(candles, atr_value):
+    if not detect_breakout_long(candles):
+        return False
+    current = candles[-1]
+    previous = candles[-2]
+    resistance = max(c["high"] for c in candles[-STRUCTURE_LOOKBACK-1:-1])
+    rng = current["high"] - current["low"]
+    if rng <= 0:
+        return False
+    if current["close"] - resistance < 0.15 * atr_value:
+        return False
+    if rng > 2.5 * atr_value:
+        return False
+    if previous["close"] <= previous["open"]:
+        return False
+    return True
+
+
+def high_quality_breakout_short(candles, atr_value):
+    if not detect_breakout_short(candles):
+        return False
+    current = candles[-1]
+    previous = candles[-2]
+    support = min(c["low"] for c in candles[-STRUCTURE_LOOKBACK-1:-1])
+    rng = current["high"] - current["low"]
+    if rng <= 0:
+        return False
+    if support - current["close"] < 0.15 * atr_value:
+        return False
+    if rng > 2.5 * atr_value:
+        return False
+    if previous["close"] >= previous["open"]:
+        return False
+    return True
+
+
+# ============================================================
 # BREAKOUT LONG
 # ============================================================
 
@@ -2921,268 +2987,141 @@ def ema_alignment_short(
 # LONG LEVELS
 # ============================================================
 
-def calculate_long_levels(
-    candles,
-    entry,
-    atr_value
-):
+def _nearest_resistance(candles_1h, candles_4h, entry):
+    """Nearest confirmed prior resistance above entry. No look-ahead."""
+    levels = []
+    for c in candles_1h[-49:-1]:
+        if c["high"] > entry:
+            levels.append(c["high"])
+    for c in candles_4h[-21:-1]:
+        if c["high"] > entry:
+            levels.append(c["high"])
+    return min(levels) if levels else None
 
-    if (
-        atr_value is None
-        or atr_value <= 0
-    ):
 
+def _nearest_support(candles_1h, candles_4h, entry):
+    """Nearest confirmed prior support below entry. No look-ahead."""
+    levels = []
+    for c in candles_1h[-49:-1]:
+        if c["low"] < entry:
+            levels.append(c["low"])
+    for c in candles_4h[-21:-1]:
+        if c["low"] < entry:
+            levels.append(c["low"])
+    return max(levels) if levels else None
+
+
+def _select_dynamic_tp(entry, risk, atr_value, direction, candles_1h, candles_4h):
+    """
+    Select TP from market space rather than a fixed R.
+    Candidate R levels are capped by the nearest prior opposing structure
+    with an ATR buffer. The largest feasible candidate is selected.
+    This function only sees candles available at the entry time.
+    """
+    if risk <= 0 or atr_value <= 0:
         return None
 
+    candidates = (0.90, 1.00, 1.20, 1.50, 1.80, 2.00)
+    structure_buffer = atr_value * 0.10
 
-    recent = candles[
-        -STRUCTURE_LOOKBACK - 1:-1
-    ]
-
-
-    if not recent:
-
-        return None
-
-
-    recent_low = min(
-        c["low"]
-        for c in recent
-    )
-
-
-    atr_stop = (
-        entry
-        - atr_value * SL_ATR
-    )
-
-
-    structure_stop = (
-        recent_low
-        - atr_value
-        * STRUCTURE_BUFFER_ATR
-    )
-
-
-    sl = max(
-        atr_stop,
-        structure_stop
-    )
-
-
-    risk = (
-        entry - sl
-    )
-
-
-    if risk <= 0:
-
-        return None
-
-
-    risk_atr = (
-        risk
-        / atr_value
-    )
-
-
-    if risk_atr > MAX_SL_ATR:
-
-        return None
-
-
-    tp = (
-        entry
-        + risk * TP_R_MULTIPLE
-    )
-
-
-    rr = (
-        tp - entry
-    ) / risk
-
-
-    if rr < MIN_RR:
-
-        return None
-
-
-    return {
-        "tp": tp,
-        "sl": sl,
-        "risk": risk,
-        "rr": rr,
-        "risk_atr": risk_atr
-    }
-
-
-# ============================================================
-# SHORT LEVELS
-# ============================================================
-
-def calculate_short_levels(
-    candles,
-    entry,
-    atr_value
-):
-
-    if (
-        atr_value is None
-        or atr_value <= 0
-    ):
-
-        return None
-
-
-    recent = candles[
-        -STRUCTURE_LOOKBACK - 1:-1
-    ]
-
-
-    if not recent:
-
-        return None
-
-
-    recent_high = max(
-        c["high"]
-        for c in recent
-    )
-
-
-    atr_stop = (
-        entry
-        + atr_value * SL_ATR
-    )
-
-
-    structure_stop = (
-        recent_high
-        + atr_value
-        * STRUCTURE_BUFFER_ATR
-    )
-
-
-    sl = min(
-        atr_stop,
-        structure_stop
-    )
-
-
-    risk = (
-        sl - entry
-    )
-
-
-    if risk <= 0:
-
-        return None
-
-
-    risk_atr = (
-        risk
-        / atr_value
-    )
-
-
-    if risk_atr > MAX_SL_ATR:
-
-        return None
-
-
-    tp = (
-        entry
-        - risk * TP_R_MULTIPLE
-    )
-
-
-    rr = (
-        entry - tp
-    ) / risk
-
-
-    if rr < MIN_RR:
-
-        return None
-
-
-    return {
-        "tp": tp,
-        "sl": sl,
-        "risk": risk,
-        "rr": rr,
-        "risk_atr": risk_atr
-    }
-
-
-# ============================================================
-# v8.17 QUALITY FILTERS
-# ============================================================
-
-def ema_value_at(candles, period, end_index):
-    if end_index + 1 < period:
-        return None
-    return ema([c["close"] for c in candles[:end_index + 1]], period)
-
-
-def trend_persistence_4h(candles, direction, count=MIN_4H_TREND_CANDLES):
-    if len(candles) < EMA200 + count:
-        return False
-    for n in range(count):
-        subset = candles[:len(candles) - n]
-        closes = [c["close"] for c in subset]
-        e20 = ema(closes, EMA20)
-        e50 = ema(closes, EMA50)
-        e200 = ema(closes, EMA200)
-        if None in (e20, e50, e200):
-            return False
-        close = closes[-1]
-        if direction == "LONG":
-            if not (close > e200 and e20 > e50 and e50 > e200):
-                return False
-        else:
-            if not (close < e200 and e20 < e50 and e50 < e200):
-                return False
-    return True
-
-
-def ema_slope_ok(candles, direction):
-    if len(candles) < EMA20 + EMA_SLOPE_LOOKBACK:
-        return False
-    closes = [c["close"] for c in candles]
-    now = ema(closes, EMA20)
-    past = ema(closes[:-EMA_SLOPE_LOOKBACK], EMA20)
-    if now is None or past is None:
-        return False
-    return now > past if direction == "LONG" else now < past
-
-
-def detect_pullback_reclaim(candles, direction, atr_value):
-    if atr_value is None or len(candles) < EMA50 + PULLBACK_LOOKBACK + 2:
-        return False
-    current = candles[-1]
-    prior = candles[-PULLBACK_LOOKBACK-1:-1]
-    touched = False
-    for j in range(len(prior)):
-        idx = len(candles) - PULLBACK_LOOKBACK - 1 + j
-        e20 = ema_value_at(candles, EMA20, idx)
-        e50 = ema_value_at(candles, EMA50, idx)
-        if e20 is None or e50 is None:
-            continue
-        c = prior[j]
-        if direction == "LONG":
-            if c["low"] <= e20 + atr_value * PULLBACK_TOUCH_ATR or c["low"] <= e50 + atr_value * PULLBACK_TOUCH_ATR:
-                touched = True
-        else:
-            if c["high"] >= e20 - atr_value * PULLBACK_TOUCH_ATR or c["high"] >= e50 - atr_value * PULLBACK_TOUCH_ATR:
-                touched = True
-    if not touched:
-        return False
-    previous = candles[-2]
     if direction == "LONG":
-        return current["close"] > current["open"] and current["close"] > previous["high"]
-    return current["close"] < current["open"] and current["close"] < previous["low"]
+        resistance = _nearest_resistance(candles_1h, candles_4h, entry)
+        if resistance is None:
+            max_r = 1.20
+        else:
+            usable_distance = resistance - structure_buffer - entry
+            max_r = usable_distance / risk
 
+        feasible = [r for r in candidates if r <= max_r + 1e-12]
+        if not feasible:
+            return None
+        selected_r = max(feasible)
+        tp = entry + risk * selected_r
+        return tp, selected_r, resistance
+
+    support = _nearest_support(candles_1h, candles_4h, entry)
+    if support is None:
+        max_r = 1.20
+    else:
+        usable_distance = entry - (support + structure_buffer)
+        max_r = usable_distance / risk
+
+    feasible = [r for r in candidates if r <= max_r + 1e-12]
+    if not feasible:
+        return None
+    selected_r = max(feasible)
+    tp = entry - risk * selected_r
+    return tp, selected_r, support
+
+
+def calculate_long_levels(candles_1h, candles_4h, entry, atr_value):
+    if atr_value is None or atr_value <= 0:
+        return None
+
+    recent = candles_1h[-STRUCTURE_LOOKBACK - 1:-1]
+    if not recent:
+        return None
+
+    recent_low = min(c["low"] for c in recent)
+    atr_stop = entry - atr_value * SL_ATR
+    structure_stop = recent_low - atr_value * STRUCTURE_BUFFER_ATR
+    sl = min(atr_stop, structure_stop)
+
+    risk = entry - sl
+    if risk <= 0:
+        return None
+
+    risk_atr = risk / atr_value
+    if risk_atr > MAX_SL_ATR:
+        return None
+
+    selected = _select_dynamic_tp(entry, risk, atr_value, "LONG", candles_1h, candles_4h)
+    if selected is None:
+        return None
+    tp, rr, structure_target = selected
+
+    if rr < MIN_RR:
+        return None
+
+    return {
+        "tp": tp, "sl": sl, "risk": risk, "rr": rr,
+        "risk_atr": risk_atr, "structure_target": structure_target
+    }
+
+
+def calculate_short_levels(candles_1h, candles_4h, entry, atr_value):
+    if atr_value is None or atr_value <= 0:
+        return None
+
+    recent = candles_1h[-STRUCTURE_LOOKBACK - 1:-1]
+    if not recent:
+        return None
+
+    recent_high = max(c["high"] for c in recent)
+    atr_stop = entry + atr_value * SL_ATR
+    structure_stop = recent_high + atr_value * STRUCTURE_BUFFER_ATR
+    sl = max(atr_stop, structure_stop)
+
+    risk = sl - entry
+    if risk <= 0:
+        return None
+
+    risk_atr = risk / atr_value
+    if risk_atr > MAX_SL_ATR:
+        return None
+
+    selected = _select_dynamic_tp(entry, risk, atr_value, "SHORT", candles_1h, candles_4h)
+    if selected is None:
+        return None
+    tp, rr, structure_target = selected
+
+    if rr < MIN_RR:
+        return None
+
+    return {
+        "tp": tp, "sl": sl, "risk": risk, "rr": rr,
+        "risk_atr": risk_atr, "structure_target": structure_target
+    }
 
 # ============================================================
 # ANALYZE
@@ -3192,101 +3131,72 @@ def analyze_at_index(
     candles_4h,
     candles_1h
 ):
-
-    if len(candles_1h) < (
-        EMA200 + 10
-    ):
-
+    if len(candles_1h) < EMA200 + 20 or len(candles_4h) < EMA200 + 5:
         return None
-
-
-    if len(candles_4h) < EMA200:
-
-        return None
-
 
     current = candles_1h[-1]
-
-
     entry = current["close"]
+    trend_direction = get_4h_direction(candles_4h)
+    strength = get_4h_strength(candles_4h)
+    atr_value = atr(candles_1h, ATR_PERIOD)
+    rsi_value = rsi(candles_1h, RSI_PERIOD)
+    adx_value = adx(candles_1h, ADX_PERIOD)
 
-
-    trend_direction = get_4h_direction(
-        candles_4h
-    )
-
-
-    if trend_direction is None:
-
+    if trend_direction is None or strength is None:
+        return None
+    if None in (atr_value, rsi_value, adx_value) or atr_value <= 0:
+        return None
+    if adx_value < ADX_MIN or not adx_is_rising(candles_1h):
         return None
 
-    if not trend_persistence_4h(candles_4h, trend_direction):
-        return None
-
-
-    atr_value = atr(
-        candles_1h,
-        ATR_PERIOD
-    )
-
-
-    rsi_value = rsi(
-        candles_1h,
-        RSI_PERIOD
-    )
-
-
-    adx_value = adx(
-        candles_1h,
-        ADX_PERIOD
-    )
-
-
-    if (
-        atr_value is None
-        or rsi_value is None
-        or adx_value is None
-    ):
-
-        return None
-
-
-    if adx_value < ADX_MIN:
-
-        return None
-
-
-    # v8.17: trend-continuation pullback/reclaim only.
-    # Counter-trend reversals are disabled for this validation pass.
+    # v9 intentionally trades continuation only. Reversal is disabled.
     if trend_direction == "LONG":
-        ema_ok = ema_alignment_long(candles_1h) and ema_slope_ok(candles_1h, "LONG")
-        rsi_ok = RSI_LONG_MIN <= rsi_value <= RSI_LONG_MAX
-        entry_ok = detect_pullback_reclaim(candles_1h, "LONG", atr_value)
-        if ema_ok and rsi_ok and entry_ok:
-            levels = calculate_long_levels(candles_1h, entry, atr_value)
+        four_h_ok = (
+            strength["bull_slope"]
+            and strength["trend_gap"] >= 0.20
+            and strength["close"] > strength["e20"]
+            and strength["rsi"] >= 55.0
+        )
+        one_h_ok = (
+            ema_alignment_long(candles_1h)
+            and 55.0 <= rsi_value <= 72.0
+            and high_quality_breakout_long(candles_1h, atr_value)
+        )
+        if four_h_ok and one_h_ok:
+            levels = calculate_long_levels(candles_1h, candles_4h, entry, atr_value)
             if levels:
                 return {
-                    "direction": "LONG", "setup": "PULLBACK",
+                    "direction": "LONG", "setup": "HIGH_WR_BREAKOUT",
                     "entry_time": current["time"], "entry": entry,
                     "tp": levels["tp"], "sl": levels["sl"],
                     "risk": levels["risk"], "rr": levels["rr"],
                     "risk_atr": levels["risk_atr"], "atr": atr_value,
+                    "structure_target": levels["structure_target"],
                     "adx": adx_value, "rsi": rsi_value
                 }
 
     if trend_direction == "SHORT":
-        ema_ok = ema_alignment_short(candles_1h) and ema_slope_ok(candles_1h, "SHORT")
-        rsi_ok = RSI_SHORT_MIN <= rsi_value <= RSI_SHORT_MAX
-        entry_ok = detect_pullback_reclaim(candles_1h, "SHORT", atr_value)
-        if ema_ok and rsi_ok and entry_ok:
-            levels = calculate_short_levels(candles_1h, entry, atr_value)
+        four_h_ok = (
+            strength["bear_slope"]
+            and strength["trend_gap"] >= 0.20
+            and strength["close"] < strength["e20"]
+            and strength["rsi"] <= 45.0
+        )
+        one_h_ok = (
+            ema_alignment_short(candles_1h)
+            and 28.0 <= rsi_value <= 45.0
+            and high_quality_breakout_short(candles_1h, atr_value)
+        )
+        if four_h_ok and one_h_ok:
+            levels = calculate_short_levels(candles_1h, candles_4h, entry, atr_value)
             if levels:
                 return {
-                    "direction": "SHORT", "setup": "PULLBACK",
+                    "direction": "SHORT", "setup": "HIGH_WR_BREAKOUT",
                     "entry_time": current["time"], "entry": entry,
                     "tp": levels["tp"], "sl": levels["sl"],
                     "risk": levels["risk"], "rr": levels["rr"],
                     "risk_atr": levels["risk_atr"], "atr": atr_value,
+                    "structure_target": levels["structure_target"],
                     "adx": adx_value, "rsi": rsi_value
                 }
 
@@ -3459,7 +3369,7 @@ def backtest_coin(
 
         if result == "TP":
 
-            r_result = TP_R_MULTIPLE
+            r_result = float(signal["rr"])
 
         else:
 
@@ -4329,7 +4239,7 @@ def main():
     print()
     print("=" * 110)
     print(
-        " SCORE HUNTER PRO v8.17"
+        " SCORE HUNTER PRO v9.1 DYNAMIC TP"
     )
     print(
         " REAL 365-DAY HISTORICAL BACKTEST"
@@ -4347,19 +4257,19 @@ def main():
     print("RULES:")
     print("4H Trend + 1H Entry")
     print("LONG + SHORT")
-    print("TREND-CONTINUATION PULLBACK/RECLAIM ONLY")
-    print("PULLBACK + RECLAIM REQUIRED")
+    print("HIGH-WIN-RATE BREAKOUT ONLY + DYNAMIC TP")
+    print("NO PULLBACK / NO REVERSAL")
     print("Closed 4H only")
     print("Closed 1H only")
     print("NO LOOK-AHEAD")
-    print("ADX >= 20")
+    print("ADX >= 25 AND RISING")
     print("RSI confirmation")
     print("Strong breakout candle")
     print("Real structure break")
-    print("1H EMA transition for reversal")
-    print("SL = 1.5 ATR / Structure")
-    print("Maximum SL = 3.5 ATR")
-    print(f"TP = {TP_R_MULTIPLE:.1f}R")
+    print("1H EMA alignment + momentum confirmation")
+    print("SL = 1.0 ATR / Structure")
+    print("Maximum SL = 2.0 ATR")
+    print("TP = DYNAMIC 0.90R-2.00R (market structure + ATR space)")
     print("Entry candle excluded from result")
     print("TP + SL same candle = SL")
     print("No overlapping positions")
@@ -4836,8 +4746,7 @@ def main():
 
 
     for setup in (
-        "BREAKOUT",
-        "REVERSAL"
+        "HIGH_WR_BREAKOUT"
     ):
 
         setup_trades = [
@@ -4897,8 +4806,7 @@ def main():
 
 
     for setup in (
-        "BREAKOUT",
-        "REVERSAL"
+        "HIGH_WR_BREAKOUT"
     ):
 
         setup_oos = [
@@ -4954,7 +4862,7 @@ def main():
             f"ADX "
             f"{trade['adx']:.1f} | "
             f"RSI "
-            f"{trade['rsi']:.1f}"
+            f"{trade['rsi']:.1f} | RR {trade['rr']:.2f}"
         )
 
 
@@ -5210,7 +5118,7 @@ def main():
     print()
     print("=" * 110)
     print(
-        "SCORE HUNTER PRO v8.17 "
+        "SCORE HUNTER PRO v8.16 "
         "BACKTEST FINISHED"
     )
     print("=" * 110)
