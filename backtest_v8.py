@@ -4,7 +4,7 @@ from datetime import datetime, timezone, timedelta
 
 
 # ============================================================
-# SCORE HUNTER PRO v9.2 HIGH WIN RATE ADAPTIVE
+# SCORE HUNTER PRO v10.0 SAMPLE EXPANSION
 #
 # 4H TREND + 1H ENTRY
 # REAL 365-DAY HISTORICAL BACKTEST
@@ -15,9 +15,9 @@ from datetime import datetime, timezone, timedelta
 #   1. High-probability continuation entries
 #   2. Reversal setup disabled for this version
 #   3. Dynamic TP selected from market structure + ATR space; target R candidates 0.90-2.00
-#   4. Stronger 4H trend + 1H confirmation filters
-#   5. ADX rising filter
-#   6. Breakout distance + exhaustion filters
+#   4. Balanced 4H trend + 1H confirmation filters
+#   5. ADX rising used as bonus, not mandatory
+#   6. Moderate breakout distance + exhaustion filters
 #   7. OOS remains completely untouched
 #   8. Full performance statistics
 #   2. Average Win R
@@ -109,8 +109,8 @@ DEFAULT_RR = 1.10
 TP_STRUCTURE_BUFFER_ATR = 0.12
 MIN_TP_ATR = 0.85
 
-MIN_BODY_RATIO = 0.45
-MIN_CLOSE_LOCATION = 0.65
+MIN_BODY_RATIO = 0.35
+MIN_CLOSE_LOCATION = 0.55
 
 REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
@@ -2399,9 +2399,9 @@ def high_quality_breakout_long(candles, atr_value):
     if rng <= 0:
         return False
     breakout_distance = current["close"] - resistance
-    if breakout_distance < 0.05 * atr_value:
+    if breakout_distance < 0.02 * atr_value:
         return False
-    if rng > 2.8 * atr_value:
+    if rng > 3.0 * atr_value:
         return False
     return True
 
@@ -2416,9 +2416,9 @@ def high_quality_breakout_short(candles, atr_value):
     if rng <= 0:
         return False
     breakout_distance = support - current["close"]
-    if breakout_distance < 0.05 * atr_value:
+    if breakout_distance < 0.02 * atr_value:
         return False
-    if rng > 2.8 * atr_value:
+    if rng > 3.0 * atr_value:
         return False
     return True
 
@@ -3174,13 +3174,13 @@ def analyze_at_index(candles_4h, candles_1h):
 
     if trend_direction == "LONG":
         ema_ok = ema_alignment_long(candles_1h)
-        rsi_ok = 50.0 <= rsi_value <= 70.0
-        trend_ok = strength["bull_slope"] and strength["trend_gap"] >= 0.10 and strength["close"] > strength["e20"]
+        rsi_ok = 45.0 <= rsi_value <= 75.0
+        trend_ok = strength["bull_slope"] and strength["trend_gap"] >= 0.05 and strength["close"] > strength["e20"]
         breakout_ok = high_quality_breakout_long(candles_1h, atr_value)
         momentum_ok = current["close"] > current["open"] and current["close"] > candles_1h[-2]["close"]
         score = sum([ema_ok, rsi_ok, trend_ok, breakout_ok, momentum_ok, adx_rising])
         # Require the structural trend + breakout core, plus 2 of the remaining confirmations.
-        if trend_ok and breakout_ok and score >= 4:
+        if trend_ok and breakout_ok and score >= 3:
             levels = calculate_long_levels(candles_1h, candles_4h, entry, atr_value)
             if levels:
                 return {
@@ -3195,12 +3195,12 @@ def analyze_at_index(candles_4h, candles_1h):
 
     if trend_direction == "SHORT":
         ema_ok = ema_alignment_short(candles_1h)
-        rsi_ok = 30.0 <= rsi_value <= 50.0
-        trend_ok = strength["bear_slope"] and strength["trend_gap"] >= 0.10 and strength["close"] < strength["e20"]
+        rsi_ok = 25.0 <= rsi_value <= 55.0
+        trend_ok = strength["bear_slope"] and strength["trend_gap"] >= 0.05 and strength["close"] < strength["e20"]
         breakout_ok = high_quality_breakout_short(candles_1h, atr_value)
         momentum_ok = current["close"] < current["open"] and current["close"] < candles_1h[-2]["close"]
         score = sum([ema_ok, rsi_ok, trend_ok, breakout_ok, momentum_ok, adx_rising])
-        if trend_ok and breakout_ok and score >= 4:
+        if trend_ok and breakout_ok and score >= 3:
             levels = calculate_short_levels(candles_1h, candles_4h, entry, atr_value)
             if levels:
                 return {
@@ -4255,7 +4255,7 @@ def main():
     print()
     print("=" * 110)
     print(
-        " SCORE HUNTER PRO v9.2 ADAPTIVE TP"
+        " SCORE HUNTER PRO v10.0 SAMPLE EXPANSION"
     )
     print(
         " REAL 365-DAY HISTORICAL BACKTEST"
@@ -4279,8 +4279,8 @@ def main():
     print("Closed 1H only")
     print("NO LOOK-AHEAD")
     print("ADX >= 20 | RISING = BONUS, NOT MANDATORY")
-    print("RSI confirmation")
-    print("Strong breakout candle")
+    print("RSI confirmation (balanced range)")
+    print("Moderate strong breakout candle")
     print("Real structure break")
     print("1H EMA alignment + momentum confirmation")
     print("SL = 1.0 ATR / Structure")
@@ -4762,7 +4762,7 @@ def main():
 
 
     for setup in (
-        "HIGH_WR_BREAKOUT"
+        "ADAPTIVE_BREAKOUT"
     ):
 
         setup_trades = [
@@ -4822,7 +4822,7 @@ def main():
 
 
     for setup in (
-        "HIGH_WR_BREAKOUT"
+        "ADAPTIVE_BREAKOUT"
     ):
 
         setup_oos = [
@@ -4881,6 +4881,37 @@ def main():
             f"{trade['rsi']:.1f} | RR {trade['rr']:.2f}"
         )
 
+
+    # ========================================================
+    # SIGNAL FREQUENCY / MONTH
+    # ========================================================
+
+    print()
+    print("=" * 110)
+    print("SIGNAL FREQUENCY / MONTH")
+    print("=" * 110)
+
+    monthly = {}
+    for trade in all_trades:
+        dt = datetime.fromtimestamp(int(trade["entry_time"]), tz=timezone.utc)
+        key = dt.strftime("%Y-%m")
+        monthly.setdefault(key, []).append(trade)
+
+    if not monthly:
+        print("No completed trades.")
+    else:
+        for month in sorted(monthly):
+            mt = monthly[month]
+            ms = calculate_stats(mt)
+            print_compact_stats(month, ms)
+
+    print()
+    print("DIRECTION BALANCE")
+    print(f"LONG  : {len(long_trades)} trades")
+    print(f"SHORT : {len(short_trades)} trades")
+    if all_trades:
+        print(f"LONG share  : {len(long_trades) / len(all_trades) * 100:.1f}%")
+        print(f"SHORT share : {len(short_trades) / len(all_trades) * 100:.1f}%")
 
     # ========================================================
     # ROBUSTNESS
@@ -5134,7 +5165,7 @@ def main():
     print()
     print("=" * 110)
     print(
-        "SCORE HUNTER PRO v8.16 "
+        "SCORE HUNTER PRO v10.0 "
         "BACKTEST FINISHED"
     )
     print("=" * 110)
