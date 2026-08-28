@@ -4,14 +4,14 @@ from datetime import datetime, timezone, timedelta
 
 
 # ============================================================
-# SCORE HUNTER PRO v10.0 SAMPLE EXPANSION
+# SCORE HUNTER PRO v11.0 BALANCED SAMPLE EXPANSION
 #
 # 4H TREND + 1H ENTRY
 # REAL 365-DAY HISTORICAL BACKTEST
 #
 # v8.15 DATA ENGINE PRESERVED
 #
-# v9.2 CHANGES:
+# v11 CHANGES:
 #   1. High-probability continuation entries
 #   2. Reversal setup disabled for this version
 #   3. Dynamic TP selected from market structure + ATR space; target R candidates 0.90-2.00
@@ -93,9 +93,9 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 
-ADX_MIN = 20.0
+ADX_MIN = 18.0
 
-STRUCTURE_LOOKBACK = 6
+STRUCTURE_LOOKBACK = 3
 REVERSAL_LOOKBACK = 6
 
 SL_ATR = 1.00
@@ -107,9 +107,9 @@ MIN_RR = 0.90
 MAX_RR = 1.40
 DEFAULT_RR = 1.10
 TP_STRUCTURE_BUFFER_ATR = 0.12
-MIN_TP_ATR = 0.85
+MIN_TP_ATR = 0.80
 
-MIN_BODY_RATIO = 0.35
+MIN_BODY_RATIO = 0.30
 MIN_CLOSE_LOCATION = 0.55
 
 REQUEST_TIMEOUT = 20
@@ -2399,7 +2399,7 @@ def high_quality_breakout_long(candles, atr_value):
     if rng <= 0:
         return False
     breakout_distance = current["close"] - resistance
-    if breakout_distance < 0.02 * atr_value:
+    if breakout_distance < 0.0 * atr_value:
         return False
     if rng > 3.0 * atr_value:
         return False
@@ -2416,7 +2416,7 @@ def high_quality_breakout_short(candles, atr_value):
     if rng <= 0:
         return False
     breakout_distance = support - current["close"]
-    if breakout_distance < 0.02 * atr_value:
+    if breakout_distance < 0.0 * atr_value:
         return False
     if rng > 3.0 * atr_value:
         return False
@@ -3174,12 +3174,14 @@ def analyze_at_index(candles_4h, candles_1h):
 
     if trend_direction == "LONG":
         ema_ok = ema_alignment_long(candles_1h)
-        rsi_ok = 45.0 <= rsi_value <= 75.0
-        trend_ok = strength["bull_slope"] and strength["trend_gap"] >= 0.05 and strength["close"] > strength["e20"]
+        rsi_ok = 42.0 <= rsi_value <= 72.0
+        # Keep the 4H trend core, but do not require the 4H EMA20 slope to rise on
+        # the exact entry candle. That was one of the main causes of under-sampling.
+        trend_ok = strength["trend_gap"] >= 0.03 and strength["close"] > strength["e20"]
         breakout_ok = high_quality_breakout_long(candles_1h, atr_value)
         momentum_ok = current["close"] > current["open"] and current["close"] > candles_1h[-2]["close"]
         score = sum([ema_ok, rsi_ok, trend_ok, breakout_ok, momentum_ok, adx_rising])
-        # Require the structural trend + breakout core, plus 2 of the remaining confirmations.
+        # Core = 4H trend + confirmed 1H breakout. Require one additional confirmation.
         if trend_ok and breakout_ok and score >= 3:
             levels = calculate_long_levels(candles_1h, candles_4h, entry, atr_value)
             if levels:
@@ -3195,8 +3197,8 @@ def analyze_at_index(candles_4h, candles_1h):
 
     if trend_direction == "SHORT":
         ema_ok = ema_alignment_short(candles_1h)
-        rsi_ok = 25.0 <= rsi_value <= 55.0
-        trend_ok = strength["bear_slope"] and strength["trend_gap"] >= 0.05 and strength["close"] < strength["e20"]
+        rsi_ok = 28.0 <= rsi_value <= 58.0
+        trend_ok = strength["trend_gap"] >= 0.03 and strength["close"] < strength["e20"]
         breakout_ok = high_quality_breakout_short(candles_1h, atr_value)
         momentum_ok = current["close"] < current["open"] and current["close"] < candles_1h[-2]["close"]
         score = sum([ema_ok, rsi_ok, trend_ok, breakout_ok, momentum_ok, adx_rising])
@@ -4255,7 +4257,7 @@ def main():
     print()
     print("=" * 110)
     print(
-        " SCORE HUNTER PRO v10.0 SAMPLE EXPANSION"
+        " SCORE HUNTER PRO v11.0 BALANCED SAMPLE EXPANSION"
     )
     print(
         " REAL 365-DAY HISTORICAL BACKTEST"
@@ -4278,7 +4280,7 @@ def main():
     print("Closed 4H only")
     print("Closed 1H only")
     print("NO LOOK-AHEAD")
-    print("ADX >= 20 | RISING = BONUS, NOT MANDATORY")
+    print("ADX >= 18 | RISING = BONUS, NOT MANDATORY")
     print("RSI confirmation (balanced range)")
     print("Moderate strong breakout candle")
     print("Real structure break")
@@ -4761,9 +4763,7 @@ def main():
     print("=" * 110)
 
 
-    for setup in (
-        "ADAPTIVE_BREAKOUT"
-    ):
+    for setup in ["ADAPTIVE_BREAKOUT"]:
 
         setup_trades = [
             t
@@ -4821,9 +4821,7 @@ def main():
     print("=" * 110)
 
 
-    for setup in (
-        "ADAPTIVE_BREAKOUT"
-    ):
+    for setup in ["ADAPTIVE_BREAKOUT"]:
 
         setup_oos = [
             t
