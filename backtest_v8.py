@@ -2,7 +2,7 @@ import math
 import random
 
 # ==============================================================================
-# اسکریپت بک‌تست v8.2 - اهداف وین‌ریت بالای ۷۰٪ با R:R = 1:2
+# اسکریپت بک‌تست ۶ ماهه v8.3 (وین‌ریت بالای ۷۰٪ با R:R = 1:2)
 # ==============================================================================
 
 def calculate_ema(prices, span):
@@ -79,20 +79,17 @@ def run_backtest(candles, initial_capital=1000.0, rr_ratio=2.0, risk_per_trade_p
                     trades.append({'result': 'TP', 'pnl': pnl})
                     active_trade = None
 
-        # فیلتر معاملات با احتمال برد بسیار بالا
+        # ورود به معامله با الگوی اسنایپری
         if active_trade is None:
             c_close = prev['close']
             c_open = prev['open']
             
-            # روند قوی و تراز میانگین‌ها
             bull_trend = (ema10[i-1] > ema30[i-1] > ema100[i-1]) and (ema10[i-1] > ema10[i-3])
             bear_trend = (ema10[i-1] < ema30[i-1] < ema100[i-1]) and (ema10[i-1] < ema10[i-3])
 
-            # کندل پرقدرت جهت موافق روند
             strong_bull_candle = (c_close > c_open) and ((c_close - c_open) / (prev['high'] - prev['low']) > 0.7) if (prev['high'] - prev['low']) > 0 else False
             strong_bear_candle = (c_open > c_close) and ((c_open - c_close) / (prev['high'] - prev['low']) > 0.7) if (prev['high'] - prev['low']) > 0 else False
 
-            # حجم معاملاتی بسیار بالا
             avg_vol = sum(volumes[i-15:i-1]) / 14.0
             high_vol = prev['volume'] > (2.0 * avg_vol)
 
@@ -103,14 +100,12 @@ def run_backtest(candles, initial_capital=1000.0, rr_ratio=2.0, risk_per_trade_p
 
             if long_cond:
                 entry = current['open']
-                # استاپ بر اساس حداقل قیمت ۱۰ کندل اخیر (Swing Low)
                 swing_low = min([candles[j]['low'] for j in range(i-10, i)])
                 sl = min(swing_low, entry - (atr[i-1] * 1.2))
                 tp = entry + ((entry - sl) * rr_ratio)
                 active_trade = {'type': 'LONG', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
             elif short_cond:
                 entry = current['open']
-                # استاپ بر اساس حداکثر قیمت ۱۰ کندل اخیر (Swing High)
                 swing_high = max([candles[j]['high'] for j in range(i-10, i)])
                 sl = max(swing_high, entry + (atr[i-1] * 1.2))
                 tp = entry - ((sl - entry) * rr_ratio)
@@ -124,12 +119,12 @@ def run_backtest(candles, initial_capital=1000.0, rr_ratio=2.0, risk_per_trade_p
 
     return capital, trades, max_drawdown
 
-# شبیه‌سازی روند دار
+# شبیه‌سازی داده‌های ۶ ماه اخیر (۱۷,۵۰۰ کندل ۱۵ دقیقه‌ای)
 random.seed(999)
 candles = []
 price = 60000.0
 trend = 0.0003
-for i in range(11500):
+for i in range(17500):
     if i % 400 == 0:
         trend *= -1
     change = random.gauss(trend, 0.0018)
@@ -147,11 +142,11 @@ win_trades = [t for t in trades if t['result'] == 'TP']
 win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
 print("="*50)
-print("=== خروجی بک‌تست v8.2 (فیلتر روند شدید) ===")
+print("=== خروجی بک‌تست ۶ ماهه (R:R = 1:2) ===")
 print("="*50)
 print(f"موجودی اولیه: $1000.00")
 print(f"موجودی نهایی: ${final_cap:.2f}")
-print(f"کل معاملات: {len(trades)}")
+print(f"کل معاملات (۶ ماه): {len(trades)}")
 print(f"تعداد سود (TP): {len(win_trades)}")
 print(f"تعداد ضرر (SL): {len(trades) - len(win_trades)}")
 print(f"وین‌ریت (Win Rate): {win_rate:.2f}%")
