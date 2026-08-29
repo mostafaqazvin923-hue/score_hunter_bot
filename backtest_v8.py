@@ -2,7 +2,7 @@ import time
 import requests
 
 # ==============================================================================
-# دریافت بیشترین حد ممکن کندل از صرافی کوینکس (حداکثر ۱۰۰۰ کندل معادل حدود ۴۲ روز)
+# دریافت ۱۰۰۰ کندل ۱ ساعته از صرافی کوینکس
 # ==============================================================================
 def fetch_safe_candles(symbol, timeframe='1hour', limit=1000):
     market = symbol.replace('/', '')
@@ -37,6 +37,15 @@ def calculate_ema(prices, span):
         ema.append(price * alpha + ema[-1] * (1 - alpha))
     return ema
 
+def calculate_sma(prices, period):
+    sma = []
+    for i in range(len(prices)):
+        if i < period - 1:
+            sma.append(sum(prices[:i+1]) / (i + 1))
+        else:
+            sma.append(sum(prices[i-period+1:i+1]) / period)
+    return sma
+
 def calculate_atr(highs, lows, closes, period=14):
     tr_list = []
     for i in range(len(closes)):
@@ -52,9 +61,9 @@ def calculate_atr(highs, lows, closes, period=14):
     return [atr[0]] * (period - 1) + atr
 
 # ==============================================================================
-# موتور بک‌تست نسخه v15.2 (بازه بزرگ‌تر روی داده‌های واقعی)
+# موتور بک‌تست نسخه v16.0 (فیلتر حجم و حذف سیگنال‌های فیک بازار رنج)
 # ==============================================================================
-def run_v15_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5):
+def run_v16_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5):
     capital = initial_capital
     peak_capital = initial_capital
     max_drawdown = 0.0
@@ -67,14 +76,17 @@ def run_v15_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5
         closes = [c['close'] for c in candles]
         highs = [c['high'] for c in candles]
         lows = [c['low'] for c in candles]
+        volumes = [c['volume'] for c in candles]
 
         ema20 = calculate_ema(closes, 20)
         ema50 = calculate_ema(closes, 50)
+        ema200 = calculate_ema(closes, 200) if len(closes) >= 200 else calculate_ema(closes, len(closes)-1)
+        volume_sma = calculate_sma(volumes, 20)
         atr = calculate_atr(highs, lows, closes, 14)
 
         active_trade = None
 
-        for i in range(50, len(candles)):
+        for i in range(200, len(candles)):
             current = candles[i]
             prev = candles[i-1]
             prev2 = candles[i-2]
@@ -105,14 +117,18 @@ def run_v15_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5
                         active_trade = None
 
             if not active_trade:
-                trend_up = ema20[i-1] > ema50[i-1]
-                trend_down = ema20[i-1] < ema50[i-1]
+                # روند کلان (قیمت بالای EMA200 یعنی فقط خرید / زیر EMA200 یعنی فقط فروش)
+                macro_up = closes[i-1] > ema200[i-1] and ema20[i-1] > ema50[i-1]
+                macro_down = closes[i-1] < ema200[i-1] and ema20[i-1] < ema50[i-1]
+
+                # فیلتر حجم (حجم کندل ورودی باید بالاتر از میانگین ۲۰ کندل اخیر باشد)
+                volume_filter = current['volume'] > volume_sma[i-1]
 
                 pullback_long = prev2['close'] < prev2['open'] and prev['close'] < prev['open'] and current['close'] > current['open']
                 pullback_short = prev2['close'] > prev2['open'] and prev['close'] > prev['open'] and current['close'] < current['open']
 
-                long_cond = trend_up and pullback_long
-                short_cond = trend_down and pullback_short
+                long_cond = macro_up and pullback_long and volume_filter
+                short_cond = macro_down and pullback_short and volume_filter
 
                 risk_amt = capital * (risk_per_trade_pct / 100.0)
 
@@ -139,21 +155,20 @@ if __name__ == "__main__":
     symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
     assets_data = {}
 
-    print("در حال دریافت حداکثر داده‌های تاریخی از صرافی کوینکس...")
+    print("در حال دریافت ۱۰۰۰ کندل ۱ ساعته برای نسخه v16.0 (با فیلتر روند کلان و حجم)...")
     for symbol in symbols:
         candles = fetch_safe_candles(symbol, timeframe='1hour', limit=1000)
         if candles:
             assets_data[symbol] = candles
         time.sleep(0.2)
 
-    final_cap, trades, max_dd = run_v15_backtest(assets_data, initial_capital=1000.0)
+    final_cap, trades, max_dd = run_v16_backtest(assets_data, initial_capital=1000.0)
     
-    # اصلاح خطای پرانتز در این بخش
     win_trades = [t for t in trades if t.get('result') == 'TP']
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
-    print("=== گزارش بک‌تست ربات نسخه v15.2 (بازه طولانی‌تر) ===")
+    print("=== گزارش بک‌تست ربات نسخه v16.0 (فیلتر زنده بازار رنج) ===")
     print("="*50)
     print(f"موجودی اولیه: $1000.00")
     print(f"موجودی نهایی: ${final_cap:.2f}")
