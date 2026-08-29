@@ -2,13 +2,12 @@ import time
 import requests
 
 # ==============================================================================
-# دریافت کندل‌های تاریخی واقعی از صرافی کوینکس (تنظیم شده با پارامترهای استاندارد v2)
+# دریافت کندل‌های تاریخی واقعی از صرافی کوینکس
 # ==============================================================================
 def fetch_historical_candles_coinex(symbol, timeframe='15min', limit=500):
     market = symbol.replace('/', '')
     url = "https://api.coinex.com/v2/spot/kline"
     
-    # در API صرافی کوینکس پارامتر بازه زمانی به صورت period و با فرمت هایی مثل 15min ارسال می شود
     params = {
         "market": market,
         "limit": limit,
@@ -22,7 +21,6 @@ def fetch_historical_candles_coinex(symbol, timeframe='15min', limit=500):
         if data.get('code') == 0 and data.get('data'):
             candles = []
             for c in data['data']:
-                # سازگاری با ساختار پاسخ صرافی کوینکس (v2)
                 candles.append({
                     'timestamp': int(c.get('created_at', c.get('time', 0))),
                     'open': float(c['open']),
@@ -34,7 +32,6 @@ def fetch_historical_candles_coinex(symbol, timeframe='15min', limit=500):
             candles.sort(key=lambda x: x['timestamp'])
             return candles
         
-        # حالت دوم تست با پارامتر interval اگر period خطا داد
         params_alt = {"market": market, "limit": limit, "interval": timeframe}
         response_alt = requests.get(url, params=params_alt, timeout=10)
         data_alt = response_alt.json()
@@ -199,7 +196,6 @@ if __name__ == "__main__":
 
     print("در حال دانلود داده‌های تاریخی واقعی از صرافی کوینکس...")
     for symbol in symbols:
-        # استفاده از تایم‌فریم استاندارد صرافی مثل 15min
         candles = fetch_historical_candles_coinex(symbol, timeframe='15min', limit=500)
         if candles:
             assets_real_data[symbol] = candles
@@ -209,7 +205,8 @@ if __name__ == "__main__":
     print("\nدر حال اجرای بک‌تست روی داده‌های واقعی کوینکس...")
     final_cap, trades, max_dd = run_real_backtest(assets_real_data, initial_capital=1000.0, rr_ratio=2.0)
 
-    win_trades = [t for t in trades if t.get('result'] == 'TP']
+    # اصلاح خطای پرانتز/براکت در خط زیر:
+    win_trades = [t for t in trades if t.get('result') == 'TP']
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
