@@ -1,62 +1,87 @@
-import pandas as pd
-import numpy as np
-import requests
+import json
+import urllib.request
+import math
+from datetime import datetime
 
 def get_crypto_klines(symbol="SOLUSDT", interval="15m", limit=1000):
-    """دریافت دیتای کندل‌ها از API عمومی"""
+    """دریافت دیتای کندل‌ها از API عمومی بدون نیاز به requests"""
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     try:
-        res = requests.get(url, timeout=10).json()
-        if not isinstance(res, list):
-            return None
-        df = pd.DataFrame(res, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_asset_volume', 'number_of_trades',
-            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-        ])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = df[col].astype(float)
-        return df
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            klines = []
+            for item in data:
+                klines.append({
+                    'timestamp': item[0],
+                    'open': float(item[1]),
+                    'high': float(item[2]),
+                    'low': float(item[3]),
+                    'close': float(item[4]),
+                    'volume': float(item[5])
+                })
+            return klines
     except Exception as e:
         print(f"خطا در دریافت دیتای {symbol}: {e}")
         return None
 
+def calculate_ema(prices, span):
+    """محاسبه EMA"""
+    alpha = 2 / (span + 1)
+    ema = [prices[0]]
+    for p in prices[1:]:
+        ema.append(p * alpha + ema[-1] * (1 - alpha))
+    return ema
+
 def run_multi_timeframe_backtest(symbol="SOLUSDT"):
-    df_15m = get_crypto_klines(symbol=symbol, interval="15m", limit=1000)
-    if df_15m is None or df_15m.empty:
-        print(f"دیتایی برای {symbol} دریافت نشد.")
-        return None
+    klines_15m = get_crypto_klines(symbol=symbol, interval="15m", limit=1000)
+    if not klines_15m or len(klines_15m) < 200:
+        print(f"[{symbol}] دیتای کافی دریافت نشد.")
+        return []
 
-    # ساخت تایم‌فریم ۱ ساعته درون خود کد برای تشخیص روند اصلی
-    df_15m.set_index('timestamp', inplace=True)
-    df_1h = df_15m.resample('1h').agg({
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last'
-    }).dropna()
+    closes = [k['close'] for k in klines_15m]
+    highs = [k['high'] for k in klines_15m]
+    lows = [k['low'] for k in klines_15m]
 
-    # روند ۱ ساعته با EMA 200
-    df_1h['trend_ema'] = df_1h['close'].ewm(span=200, adjust=False).mean()
-    df_15m['htf_trend'] = df_1h['trend_ema'].reindex(df_15m.index, method='ffill')
+    # محاسبه ATR (14)
+    atr = []
+    for i in range(len(klines_15m)):
+        if i == 0:
+            atr.append(highs[0] - lows[0])
+        else:
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i-1]),
+                abs(lows[i] - closes[i-1])
+            )
+            atr.append(tr)
+    
+    # هموارسازی ATR با میانگین متحرک 14 تایی
+    atr_smooth = []
+    for i in range(len(atr)):
+        if i < 14:
+            atr_smooth.append(sum(atr[:i+1]) / (i+1))
+        else:
+            atr_smooth.append(sum(atr[i-13:i+1]) / 14)
 
-    # محاسبات تایم‌فریم ۱۵ دقیقه (ورود و خروج)
-    high_low = df_15m['high'] - df_15m['low']
-    high_close = np.abs(df_15m['high'] - df_15m['close'].shift())
-    low_close = np.abs(df_15m['low'] - df_15m['close'].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    df_15m['atr'] = np.max(ranges, axis=1).rolling(14).mean()
+    # محاسبه RSI (14)
+    rsi = [50.0] * len(closes)
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i-1]
+        gains.append(max(delta, 0))
+        losses.append(max(-delta, 0))
+        if i >= 14:
+            avg_gain = sum(gains[-14:]) / 14
+            avg_loss = sum(losses[-14:]) / 14
+            if avg_loss == 0:
+                rsi[i] = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi[i] = 100.0 - (100.0 / (1.0 + rs))
 
-    df_15m['upper_break'] = df_15m['high'].shift(1).rolling(15).max()
-    df_15m['lower_break'] = df_15m['low'].shift(1).rolling(15).min()
-
-    # RSI
-    delta = df_15m['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df_15m['rsi'] = 100 - (100 / (1 + rs))
+    # شبیه‌سازی روند ۱ ساعته با EMA 200 روی کندل‌های ۱۵ دقیقه (200 * 4 = 800)
+    ema_htf = calculate_ema(closes, 800)
 
     rr_ratio = 1.5
     atr_sl_mult = 1.5
@@ -65,28 +90,28 @@ def run_multi_timeframe_backtest(symbol="SOLUSDT"):
     in_position = False
     pos_type, entry_price, sl, tp = None, 0, 0, 0
 
-    for i in range(200, len(df_15m)):
-        row = df_15m.iloc[i]
-        c_close = row['close']
-        c_high = row['high']
-        c_low = row['low']
-        c_atr = row['atr']
-        htf_ema = row['htf_trend']
+    for i in range(200, len(klines_15m)):
+        c_close = closes[i]
+        c_high = highs[i]
+        c_low = lows[i]
+        c_atr = atr_smooth[i]
+        htf_trend = ema_htf[i]
 
-        if pd.isna(htf_ema) or pd.isna(c_atr):
-            continue
+        # سقف و کف ۱۵ کندل قبلی برای شکست (Breakout)
+        upper_break = max(highs[i-15:i])
+        lower_break = min(lows[i-15:i])
 
         if not in_position:
-            # LONG
-            if (c_close > htf_ema) and (c_close > row['upper_break']) and (row['rsi'] > 50):
+            # سیگنال LONG
+            if (c_close > htf_trend) and (c_close > upper_break) and (rsi[i] > 50):
                 in_position = True
                 pos_type = 'LONG'
                 entry_price = c_close
                 sl = entry_price - (c_atr * atr_sl_mult)
                 tp = entry_price + ((entry_price - sl) * rr_ratio)
 
-            # SHORT
-            elif (c_close < htf_ema) and (c_close < row['lower_break']) and (row['rsi'] < 50):
+            # سیگنال SHORT
+            elif (c_close < htf_trend) and (c_close < lower_break) and (rsi[i] < 50):
                 in_position = True
                 pos_type = 'SHORT'
                 entry_price = c_close
@@ -99,7 +124,7 @@ def run_multi_timeframe_backtest(symbol="SOLUSDT"):
                     trades.append({'symbol': symbol, 'type': 'LONG', 'result': 'LOSS', 'pnl': -1.0})
                     in_position = False
                 elif c_high >= tp:
-                    trades.append({'symbol': symbol, 'type': 'LONG', 'result': 'WIN', 'pnl': rr_ratio})
+                    trades.append({'symbol': symbol, 'type': 'WIN', 'result': 'WIN', 'pnl': rr_ratio})
                     in_position = False
 
             elif pos_type == 'SHORT':
@@ -107,25 +132,23 @@ def run_multi_timeframe_backtest(symbol="SOLUSDT"):
                     trades.append({'symbol': symbol, 'type': 'SHORT', 'result': 'LOSS', 'pnl': -1.0})
                     in_position = False
                 elif c_low <= tp:
-                    trades.append({'symbol': symbol, 'type': 'SHORT', 'result': 'WIN', 'pnl': rr_ratio})
+                    trades.append({'symbol': symbol, 'type': 'WIN', 'result': 'WIN', 'pnl': rr_ratio})
                     in_position = False
 
-    df_results = pd.DataFrame(trades)
-    if df_results.empty:
+    if not trades:
         print(f"[{symbol}] هیچ سیگنالی صادر نشد.")
         return []
 
-    total = len(df_results)
-    wins = len(df_results[df_results['result'] == 'WIN'])
-    losses = len(df_results[df_results['result'] == 'LOSS'])
+    total = len(trades)
+    wins = len([t for t in trades if t['result'] == 'WIN'])
+    losses = total - wins
     win_rate = (wins / total) * 100
-    pnl_r = df_results['pnl'].sum()
+    pnl_r = sum([t['pnl'] for t in trades])
 
     print(f"[{symbol}] تعداد سیگنال: {total} | برد: {wins} | باخت: {losses} | وین‌ریت: {win_rate:.2f}% | سود: {pnl_r:.2f}R")
     return trades
 
 if __name__ == "__main__":
-    # لیست ارزهای مورد نظر شما + ارزهای پرحجم پیشنهادی
     symbols = [
         "BTCUSDT",
         "ETHUSDT",
@@ -139,7 +162,7 @@ if __name__ == "__main__":
         "AVAXUSDT"
     ]
 
-    print("=== شروع بک‌تست روی لیست ارزهای انتخابی ===\n")
+    print("=== شروع بک‌تست بر پایه استاندارد پایتون (بدون وابستگی پکیج) ===\n")
     all_trades = []
 
     for s in symbols:
@@ -147,14 +170,12 @@ if __name__ == "__main__":
         if res:
             all_trades.extend(res)
 
-    # ارائه گزارش کلی از کل ارزها
-    df_all = pd.DataFrame(all_trades)
-    if not df_all.empty:
-        total_all = len(df_all)
-        wins_all = len(df_all[df_all['result'] == 'WIN'])
-        losses_all = len(df_all[df_all['result'] == 'LOSS'])
+    if all_trades:
+        total_all = len(all_trades)
+        wins_all = len([t for t in all_trades if t['result'] == 'WIN'])
+        losses_all = total_all - wins_all
         total_winrate = (wins_all / total_all) * 100
-        total_pnl = df_all['pnl'].sum()
+        total_pnl = sum([t['pnl'] for t in all_trades])
 
         print("\n==========================================")
         print("          نتایج جمع‌بندی کل ارزها          ")
