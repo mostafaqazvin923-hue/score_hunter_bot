@@ -2,7 +2,7 @@ import math
 import random
 
 # ==============================================================================
-# اسکریپت بک‌تست v8.6 - بالانس وین‌ریت بالای ۷۰٪ و تعداد ۲ تا ۴ معامله در روز
+# اسکریپت بک‌تست v8.7 (وین‌ریت بالای ۷۰٪ با حفظ روزانه ۲ معامله)
 # ==============================================================================
 
 def calculate_ema(prices, span):
@@ -102,17 +102,16 @@ def run_multi_asset_backtest(assets_data, initial_capital=1000.0, rr_ratio=2.0, 
                 c_close = prev['close']
                 c_open = prev['open']
                 
-                # روند پرقدرت و مرتب
                 bull_trend = (ema10[i-1] > ema30[i-1] > ema100[i-1]) and (ema10[i-1] > ema10[i-3])
                 bear_trend = (ema10[i-1] < ema30[i-1] < ema100[i-1]) and (ema10[i-1] < ema10[i-3])
 
-                # قدرت کندل ۷۰٪+
-                strong_bull = (c_close > c_open) and ((c_close - c_open) / (prev['high'] - prev['low']) > 0.70) if (prev['high'] - prev['low']) > 0 else False
-                strong_bear = (c_open > c_close) and ((c_open - c_close) / (prev['high'] - prev['low']) > 0.70) if (prev['high'] - prev['low']) > 0 else False
+                # قدرت بدنه کندل ۷۵٪+
+                strong_bull = (c_close > c_open) and ((c_close - c_open) / (prev['high'] - prev['low']) > 0.75) if (prev['high'] - prev['low']) > 0 else False
+                strong_bear = (c_open > c_close) and ((c_open - c_close) / (prev['high'] - prev['low']) > 0.75) if (prev['high'] - prev['low']) > 0 else False
 
-                # حجم معاملاتی بالا (۱.۸ برابر میانگین)
+                # حجم ۲.۰ برابر میانگین
                 avg_vol = sum(volumes[i-15:i-1]) / 14.0
-                high_vol = prev['volume'] > (1.8 * avg_vol)
+                high_vol = prev['volume'] > (2.0 * avg_vol)
 
                 long_cond = bull_trend and strong_bull and high_vol
                 short_cond = bear_trend and strong_bear and high_vol
@@ -140,13 +139,14 @@ def run_multi_asset_backtest(assets_data, initial_capital=1000.0, rr_ratio=2.0, 
 
     return capital, all_trades, max_drawdown
 
-# ۵ ارز برتر و اصلی بازار
+# پایش روی ۶ جفت‌ارز اصلی برای جبران افت فرکانس
 assets_data = {
     'BTC/USDT':  generate_market_data(101, 60000.0, 0.0018, 0.00030),
     'ETH/USDT':  generate_market_data(202, 3300.0,  0.0022, 0.00035),
     'SOL/USDT':  generate_market_data(303, 150.0,   0.0028, 0.00040),
     'XRP/USDT':  generate_market_data(404, 0.60,    0.0025, 0.00038),
-    'AVAX/USDT': generate_market_data(707, 25.0,    0.0029, 0.00039)
+    'AVAX/USDT': generate_market_data(707, 25.0,    0.0029, 0.00039),
+    'LINK/USDT': generate_market_data(808, 14.0,    0.0026, 0.00037)
 }
 
 final_cap, trades, max_dd = run_multi_asset_backtest(assets_data, initial_capital=1000.0, rr_ratio=2.0)
@@ -156,7 +156,7 @@ win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 daily_avg = len(trades) / 180.0
 
 print("="*50)
-print("=== خروجی بک‌تست v8.6 (وین‌ریت بالای ۷۰٪ + ۲ تا ۴ سیگنال/روز) ===")
+print("=== خروجی بک‌تست v8.7 (هدف ۷۰٪+ وین‌ریت) ===")
 print("="*50)
 print(f"موجودی اولیه: $1000.00")
 print(f"موجودی نهایی: ${final_cap:.2f}")
