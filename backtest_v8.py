@@ -31,7 +31,7 @@ def fetch_safe_candles(symbol, timeframe='5min', limit=1000):
         return []
 
 # ==============================================================================
-# توابع محاسباتی اندیکاتورهای استاندارد جهانی
+# توابع محاسباتی دقیق
 # ==============================================================================
 def calculate_ema(prices, span):
     alpha = 2 / (span + 1)
@@ -74,9 +74,9 @@ def calculate_atr(highs, lows, closes, period=14):
     return [atr[0]] * (period - 1) + atr
 
 # ==============================================================================
-# موتور بک‌تست نسخه v10.1 (اصلاح‌شده و بی‌نقص)
+# موتور بک‌تست نسخه v11.0 (مبتنی بر تاییدیه حجم و مومنتوم واقعی)
 # ==============================================================================
-def run_v10_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.0):
+def run_v11_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.0):
     capital = initial_capital
     peak_capital = initial_capital
     max_drawdown = 0.0
@@ -89,15 +89,16 @@ def run_v10_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.0
         closes = [c['close'] for c in candles]
         highs = [c['high'] for c in candles]
         lows = [c['low'] for c in candles]
+        volumes = [c['volume'] for c in candles]
 
+        ema20 = calculate_ema(closes, 20)
         ema50 = calculate_ema(closes, 50)
-        ema200 = calculate_ema(closes, 200) if len(closes) >= 200 else calculate_ema(closes, len(closes)-1)
         rsi = calculate_rsi(closes, 14)
         atr = calculate_atr(highs, lows, closes, 14)
 
         active_trade = None
 
-        for i in range(200, len(candles)):
+        for i in range(50, len(candles)):
             current = candles[i]
             prev = candles[i-1]
 
@@ -110,7 +111,7 @@ def run_v10_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.0
                         all_trades.append(t)
                         active_trade = None
                     elif current['high'] >= t['tp']:
-                        capital += t['risk_amount'] * 1.35
+                        capital += t['risk_amount'] * 1.5
                         t['result'] = 'TP'
                         all_trades.append(t)
                         active_trade = None
@@ -121,29 +122,34 @@ def run_v10_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.0
                         all_trades.append(t)
                         active_trade = None
                     elif current['low'] <= t['tp']:
-                        capital += t['risk_amount'] * 1.35
+                        capital += t['risk_amount'] * 1.5
                         t['result'] = 'TP'
                         all_trades.append(t)
                         active_trade = None
 
             if not active_trade:
-                uptrend = ema50[i-1] > ema200[i-1] and closes[i-1] > ema50[i-1]
-                downtrend = ema50[i-1] < ema200[i-1] and closes[i-1] < ema50[i-1]
+                # فیلتر حجم: حجم کندل فعلی بالاتر از میانگین ۵ کندل قبل باشد (تاییدیه ورود نهنگ‌ها)
+                avg_vol_5 = sum(volumes[i-5:i]) / 5.0
+                volume_confirmed = volumes[i-1] > (avg_vol_5 * 1.2)
 
-                long_cond = uptrend and (40 <= rsi[i-1] <= 52) and (prev['close'] > prev['open'])
-                short_cond = downtrend and (48 <= rsi[i-1] <= 60) and (prev['close'] < prev['open'])
+                # شرایط مومنتوم پرقدرت همراه با تاییدیه روند و RSI متعادل
+                trend_up = ema20[i-1] > ema50[i-1]
+                trend_down = ema20[i-1] < ema50[i-1]
+
+                long_cond = trend_up and volume_confirmed and (45 < rsi[i-1] < 65) and (prev['close'] > prev['open'])
+                short_cond = trend_down and volume_confirmed and (35 < rsi[i-1] < 55) and (prev['close'] < prev['open'])
 
                 risk_amt = capital * (risk_per_trade_pct / 100.0)
 
                 if long_cond:
                     entry = current['open']
-                    sl = entry - (atr[i-1] * 1.0)
-                    tp = entry + ((entry - sl) * 1.35)
+                    sl = entry - (atr[i-1] * 1.2)
+                    tp = entry + ((entry - sl) * 1.5)
                     active_trade = {'asset': asset_name, 'type': 'LONG', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
                 elif short_cond:
                     entry = current['open']
-                    sl = entry + (atr[i-1] * 1.0)
-                    tp = entry - ((sl - entry) * 1.35)
+                    sl = entry + (atr[i-1] * 1.2)
+                    tp = entry - ((sl - entry) * 1.5)
                     active_trade = {'asset': asset_name, 'type': 'SHORT', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
 
             if capital > peak_capital:
@@ -158,21 +164,20 @@ if __name__ == "__main__":
     symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
     assets_data = {}
 
-    print("در حال دریافت داده‌های استاندارد بازار برای ربات نسخه v10.1...")
+    print("در حال دریافت داده‌های مومنتوم و حجم برای ربات نسخه v11.0...")
     for symbol in symbols:
         candles = fetch_safe_candles(symbol, timeframe='5min', limit=1000)
         if candles:
             assets_data[symbol] = candles
         time.sleep(0.2)
 
-    final_cap, trades, max_dd = run_v10_backtest(assets_data, initial_capital=1000.0)
+    final_cap, trades, max_dd = run_v11_backtest(assets_data, initial_capital=1000.0)
     
-    # اصلاح قطعی پرانتز:
     win_trades = [t for t in trades if t.get('result') == 'TP']
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
-    print("=== گزارش بک‌تست ربات اسکالپر v10.1 (استراتژی سازمانی حرفه‌ای) ===")
+    print("=== گزارش بک‌تست ربات اسکالپر v11.0 (مومنتوم و تاییدیه حجم) ===")
     print("="*50)
     print(f"موجودی اولیه: $1000.00")
     print(f"موجودی نهایی: ${final_cap:.2f}")
