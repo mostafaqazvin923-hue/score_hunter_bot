@@ -1,19 +1,26 @@
 import json
 import urllib.request
-import math
 from datetime import datetime
 
-def get_crypto_klines(symbol="SOLUSDT", interval="15m", limit=1000):
-    """دریافت دیتای کندل‌ها از API عمومی بدون نیاز به requests"""
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+def get_crypto_klines(symbol="SOLUSDT", interval="15", limit=1000):
+    """دریافت دیتای کندل‌ها از API بای‌بیت جهت دور زدن تحریم‌های بایننس روی گیت‌هاب"""
+    url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit}"
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode())
+            if data.get('retCode') != 0:
+                print(f"خطا در دیتا {symbol}: {data.get('retMsg')}")
+                return None
+            
+            raw_list = data['result']['list']
+            # بای‌بیت کندل‌ها را از جدید به قدیم می‌دهد، آن‌ها را مرتب می‌کنیم
+            raw_list.reverse()
+            
             klines = []
-            for item in data:
+            for item in raw_list:
                 klines.append({
-                    'timestamp': item[0],
+                    'timestamp': int(item[0]),
                     'open': float(item[1]),
                     'high': float(item[2]),
                     'low': float(item[3]),
@@ -34,7 +41,8 @@ def calculate_ema(prices, span):
     return ema
 
 def run_multi_timeframe_backtest(symbol="SOLUSDT"):
-    klines_15m = get_crypto_klines(symbol=symbol, interval="15m", limit=1000)
+    # دریافت کندل‌های 15 دقیقه از بای‌بیت
+    klines_15m = get_crypto_klines(symbol=symbol, interval="15", limit=1000)
     if not klines_15m or len(klines_15m) < 200:
         print(f"[{symbol}] دیتای کافی دریافت نشد.")
         return []
@@ -56,7 +64,6 @@ def run_multi_timeframe_backtest(symbol="SOLUSDT"):
             )
             atr.append(tr)
     
-    # هموارسازی ATR با میانگین متحرک 14 تایی
     atr_smooth = []
     for i in range(len(atr)):
         if i < 14:
@@ -80,7 +87,7 @@ def run_multi_timeframe_backtest(symbol="SOLUSDT"):
                 rs = avg_gain / avg_loss
                 rsi[i] = 100.0 - (100.0 / (1.0 + rs))
 
-    # شبیه‌سازی روند ۱ ساعته با EMA 200 روی کندل‌های ۱۵ دقیقه (200 * 4 = 800)
+    # شبیه‌سازی روند ۱ ساعته با EMA 200 روی کندل‌های ۱۵ دقیقه
     ema_htf = calculate_ema(closes, 800)
 
     rr_ratio = 1.5
@@ -97,12 +104,11 @@ def run_multi_timeframe_backtest(symbol="SOLUSDT"):
         c_atr = atr_smooth[i]
         htf_trend = ema_htf[i]
 
-        # سقف و کف ۱۵ کندل قبلی برای شکست (Breakout)
         upper_break = max(highs[i-15:i])
         lower_break = min(lows[i-15:i])
 
         if not in_position:
-            # سیگنال LONG
+            # LONG
             if (c_close > htf_trend) and (c_close > upper_break) and (rsi[i] > 50):
                 in_position = True
                 pos_type = 'LONG'
@@ -110,7 +116,7 @@ def run_multi_timeframe_backtest(symbol="SOLUSDT"):
                 sl = entry_price - (c_atr * atr_sl_mult)
                 tp = entry_price + ((entry_price - sl) * rr_ratio)
 
-            # سیگنال SHORT
+            # SHORT
             elif (c_close < htf_trend) and (c_close < lower_break) and (rsi[i] < 50):
                 in_position = True
                 pos_type = 'SHORT'
@@ -124,7 +130,7 @@ def run_multi_timeframe_backtest(symbol="SOLUSDT"):
                     trades.append({'symbol': symbol, 'type': 'LONG', 'result': 'LOSS', 'pnl': -1.0})
                     in_position = False
                 elif c_high >= tp:
-                    trades.append({'symbol': symbol, 'type': 'WIN', 'result': 'WIN', 'pnl': rr_ratio})
+                    trades.append({'symbol': symbol, 'type': 'LONG', 'result': 'WIN', 'pnl': rr_ratio})
                     in_position = False
 
             elif pos_type == 'SHORT':
@@ -132,7 +138,7 @@ def run_multi_timeframe_backtest(symbol="SOLUSDT"):
                     trades.append({'symbol': symbol, 'type': 'SHORT', 'result': 'LOSS', 'pnl': -1.0})
                     in_position = False
                 elif c_low <= tp:
-                    trades.append({'symbol': symbol, 'type': 'WIN', 'result': 'WIN', 'pnl': rr_ratio})
+                    trades.append({'symbol': symbol, 'type': 'SHORT', 'result': 'WIN', 'pnl': rr_ratio})
                     in_position = False
 
     if not trades:
@@ -162,7 +168,7 @@ if __name__ == "__main__":
         "AVAXUSDT"
     ]
 
-    print("=== شروع بک‌تست بر پایه استاندارد پایتون (بدون وابستگی پکیج) ===\n")
+    print("=== شروع بک‌تست بر پایه API بای‌بیت (بدون خطای تحریم) ===\n")
     all_trades = []
 
     for s in symbols:
