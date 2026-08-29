@@ -1,193 +1,154 @@
-import json
-import urllib.request
+import pandas as pd
+import numpy as np
+import datetime
 
-def get_crypto_klines(symbol="BTC-USDT", bar="15m", limit=300):
-    """دریافت کندل‌ها از API عمومی OKX (بدون محدودیت آی‌پی روی GitHub)"""
-    url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={bar}&limit={limit}"
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            res_data = json.loads(response.read().decode())
-            if res_data.get('code') != '0' or 'data' not in res_data:
-                print(f"خطا در دیتا {symbol}: {res_data.get('msg')}")
-                return None
-            
-            raw_list = res_data['data']
-            # OKX دیتا را از جدید به قدیم ارسال می‌کند؛ آن را مرتب می‌کنیم
-            raw_list.reverse()
-            
-            klines = []
-            for item in raw_list:
-                # [ts, o, h, l, c, vol, ...]
-                klines.append({
-                    'timestamp': int(item[0]),
-                    'open': float(item[1]),
-                    'high': float(item[2]),
-                    'low': float(item[3]),
-                    'close': float(item[4]),
-                    'volume': float(item[5])
-                })
-            return klines
-    except Exception as e:
-        print(f"خطا در دریافت دیتای {symbol}: {e}")
-        return None
+# ==============================================================================
+# اسکریپت کامل بک‌تست استراتژی High Win-Rate با نسبت ریسک به ریوارد ۱ به ۲ (R:R = 1:2)
+# ==============================================================================
 
-def calculate_ema(prices, span):
-    alpha = 2 / (span + 1)
-    ema = [prices[0]]
-    for p in prices[1:]:
-        ema.append(p * alpha + ema[-1] * (1 - alpha))
-    return ema
+def calculate_ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
 
-def run_multi_timeframe_backtest(symbol="BTC-USDT"):
-    klines_15m = get_crypto_klines(symbol=symbol, bar="15m", limit=300)
-    if not klines_15m or len(klines_15m) < 100:
-        print(f"[{symbol}] دیتای کافی دریافت نشد.")
-        return []
+def calculate_rma(series, length):
+    return series.ewm(alpha=1.0/length, adjust=False).mean()
 
-    closes = [k['close'] for k in klines_15m]
-    highs = [k['high'] for k in klines_15m]
-    lows = [k['low'] for k in klines_15m]
+def calculate_atr(df, period=14):
+    high_low = df['high'] - df['low']
+    high_cp = (df['high'] - df['close'].shift(1)).abs()
+    low_cp = (df['low'] - df['close'].shift(1)).abs()
+    tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+    return calculate_rma(tr, period)
 
-    # محاسبه ATR (14)
-    atr = []
-    for i in range(len(klines_15m)):
-        if i == 0:
-            atr.append(highs[0] - lows[0])
-        else:
-            tr = max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i-1]),
-                abs(lows[i] - closes[i-1])
-            )
-            atr.append(tr)
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -1 * delta.clip(upper=0)
+    avg_gain = calculate_rma(gain, period)
+    avg_loss = calculate_rma(loss, period)
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+def calculate_adx(df, period=14):
+    up_move = df['high'] - df['high'].shift(1)
+    down_move = df['low'].shift(1) - df['low']
     
-    atr_smooth = []
-    for i in range(len(atr)):
-        if i < 14:
-            atr_smooth.append(sum(atr[:i+1]) / (i+1))
-        else:
-            atr_smooth.append(sum(atr[i-13:i+1]) / 14)
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    
+    high_low = df['high'] - df['low']
+    high_cp = (df['high'] - df['close'].shift(1)).abs()
+    low_cp = (df['low'] - df['close'].shift(1)).abs()
+    tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+    
+    smooth_tr = calculate_rma(pd.Series(tr, index=df.index), period)
+    smooth_plus_dm = calculate_rma(pd.Series(plus_dm, index=df.index), period)
+    smooth_minus_dm = calculate_rma(pd.Series(minus_dm, index=df.index), period)
+    
+    plus_di = 100 * (smooth_plus_dm / smooth_tr.replace(0, np.nan))
+    minus_di = 100 * (smooth_minus_dm / smooth_tr.replace(0, np.nan))
+    
+    di_sum = plus_di + minus_di
+    dx = 100 * (plus_di - minus_di).abs() / di_sum.replace(0, np.nan)
+    adx = calculate_rma(dx.fillna(0), period)
+    return adx.fillna(0)
 
-    # محاسبه RSI (14)
-    rsi = [50.0] * len(closes)
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        delta = closes[i] - closes[i-1]
-        gains.append(max(delta, 0))
-        losses.append(max(-delta, 0))
-        if i >= 14:
-            avg_gain = sum(gains[-14:]) / 14
-            avg_loss = sum(losses[-14:]) / 14
-            if avg_loss == 0:
-                rsi[i] = 100.0
-            else:
-                rs = avg_gain / avg_loss
-                rsi[i] = 100.0 - (100.0 / (1.0 + rs))
-
-    # شبیه‌سازی روند با EMA 100
-    ema_htf = calculate_ema(closes, 100)
-
-    rr_ratio = 1.5
-    atr_sl_mult = 1.5
+def run_backtest(df, symbol="BTC-USDT", rr_ratio=2.0, atr_sl_mult=1.2, initial_capital=1000.0, risk_per_trade_pct=2.0):
+    df = df.copy()
+    df['ema100'] = calculate_ema(df['close'], 100)
+    df['atr'] = calculate_atr(df, 14)
+    df['rsi'] = calculate_rsi(df['close'], 14)
+    df['adx'] = calculate_adx(df, 14)
+    
+    df['avg_vol'] = df['volume'].rolling(20).mean()
+    df['vol_break'] = df['volume'] > (1.2 * df['avg_vol'])
+    
+    candle_range = df['high'] - df['low']
+    body_size = (df['close'] - df['open']).abs()
+    df['strong_candle'] = np.where(candle_range > 0, (body_size / candle_range) > 0.55, False)
+    df['strong_trend'] = df['adx'] > 22
+    
+    df['upper_break'] = df['high'].shift(1).rolling(10).max()
+    df['lower_break'] = df['low'].shift(1).rolling(10).min()
 
     trades = []
-    in_position = False
-    pos_type, entry_price, sl, tp = None, 0, 0, 0
+    active_trade = None
+    capital = initial_capital
+    peak_capital = initial_capital
+    max_drawdown = 0.0
 
-    for i in range(100, len(klines_15m)):
-        c_close = closes[i]
-        c_high = highs[i]
-        c_low = lows[i]
-        c_atr = atr_smooth[i]
-        htf_trend = ema_htf[i]
+    for i in range(101, len(df)):
+        current_candle = df.iloc[i]
+        prev_candle = df.iloc[i-1]
+        
+        # ۱. مدیریت پوزیشن فعال
+        if active_trade is not None:
+            t = active_trade
+            if t['type'] == 'LONG':
+                if current_candle['low'] <= t['sl']:
+                    pnl = -t['risk_amount']
+                    trades.append({'symbol': symbol, 'type': 'LONG', 'entry_time': t['entry_time'], 'exit_time': current_candle['timestamp'], 'entry': t['entry'], 'exit': t['sl'], 'pnl': pnl, 'result': 'SL', 'r_multiple': -1.0})
+                    capital += pnl
+                    active_trade = None
+                elif current_candle['high'] >= t['tp']:
+                    pnl = t['risk_amount'] * rr_ratio
+                    trades.append({'symbol': symbol, 'type': 'LONG', 'entry_time': t['entry_time'], 'exit_time': current_candle['timestamp'], 'entry': t['entry'], 'exit': t['tp'], 'pnl': pnl, 'result': 'TP', 'r_multiple': rr_ratio})
+                    capital += pnl
+                    active_trade = None
+                    
+            elif t['type'] == 'SHORT':
+                if current_candle['high'] >= t['sl']:
+                    pnl = -t['risk_amount']
+                    trades.append({'symbol': symbol, 'type': 'SHORT', 'entry_time': t['entry_time'], 'exit_time': current_candle['timestamp'], 'entry': t['entry'], 'exit': t['sl'], 'pnl': pnl, 'result': 'SL', 'r_multiple': -1.0})
+                    capital += pnl
+                    active_trade = None
+                elif current_candle['low'] <= t['tp']:
+                    pnl = t['risk_amount'] * rr_ratio
+                    trades.append({'symbol': symbol, 'type': 'SHORT', 'entry_time': t['entry_time'], 'exit_time': current_candle['timestamp'], 'entry': t['entry'], 'exit': t['tp'], 'pnl': pnl, 'result': 'TP', 'r_multiple': rr_ratio})
+                    capital += pnl
+                    active_trade = None
 
-        upper_break = max(highs[i-10:i])
-        lower_break = min(lows[i-10:i])
+        # ۲. ورود به پوزیشن جدید
+        if active_trade is None:
+            c_close = prev_candle['close']
+            c_atr = prev_candle['atr']
+            
+            long_cond = (
+                (c_close > prev_candle['ema100']) and
+                (c_close > prev_candle['upper_break']) and
+                (prev_candle['rsi'] > 52) and
+                prev_candle['vol_break'] and
+                prev_candle['strong_candle'] and
+                prev_candle['strong_trend']
+            )
+            
+            short_cond = (
+                (c_close < prev_candle['ema100']) and
+                (c_close < prev_candle['lower_break']) and
+                (prev_candle['rsi'] < 48) and
+                prev_candle['vol_break'] and
+                prev_candle['strong_candle'] and
+                prev_candle['strong_trend']
+            )
+            
+            if long_cond:
+                entry = current_candle['open']
+                sl = entry - (c_atr * atr_sl_mult)
+                tp = entry + ((entry - sl) * rr_ratio)
+                risk_amt = capital * (risk_per_trade_pct / 100.0)
+                active_trade = {'type': 'LONG', 'entry_time': current_candle['timestamp'], 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
+            elif short_cond:
+                entry = current_candle['open']
+                sl = entry + (c_atr * atr_sl_mult)
+                tp = entry - ((sl - entry) * rr_ratio)
+                risk_amt = capital * (risk_per_trade_pct / 100.0)
+                active_trade = {'type': 'SHORT', 'entry_time': current_candle['timestamp'], 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
 
-        if not in_position:
-            # LONG
-            if (c_close > htf_trend) and (c_close > upper_break) and (rsi[i] > 50):
-                in_position = True
-                pos_type = 'LONG'
-                entry_price = c_close
-                sl = entry_price - (c_atr * atr_sl_mult)
-                tp = entry_price + ((entry_price - sl) * rr_ratio)
+        if capital > peak_capital:
+            peak_capital = capital
+        dd = (peak_capital - capital) / peak_capital * 100.0
+        if dd > max_drawdown:
+            max_drawdown = dd
 
-            # SHORT
-            elif (c_close < htf_trend) and (c_close < lower_break) and (rsi[i] < 50):
-                in_position = True
-                pos_type = 'SHORT'
-                entry_price = c_close
-                sl = entry_price + (c_atr * atr_sl_mult)
-                tp = entry_price - ((sl - entry_price) * rr_ratio)
-
-        else:
-            if pos_type == 'LONG':
-                if c_low <= sl:
-                    trades.append({'symbol': symbol, 'type': 'LONG', 'result': 'LOSS', 'pnl': -1.0})
-                    in_position = False
-                elif c_high >= tp:
-                    trades.append({'symbol': symbol, 'type': 'LONG', 'result': 'WIN', 'pnl': rr_ratio})
-                    in_position = False
-
-            elif pos_type == 'SHORT':
-                if c_high >= sl:
-                    trades.append({'symbol': symbol, 'type': 'SHORT', 'result': 'LOSS', 'pnl': -1.0})
-                    in_position = False
-                elif c_low >= tp:
-                    trades.append({'symbol': symbol, 'type': 'SHORT', 'result': 'WIN', 'pnl': rr_ratio})
-                    in_position = False
-
-    if not trades:
-        print(f"[{symbol}] هیچ سیگنالی در این بازه صادر نشد.")
-        return []
-
-    total = len(trades)
-    wins = len([t for t in trades if t['result'] == 'WIN'])
-    losses = total - wins
-    win_rate = (wins / total) * 100
-    pnl_r = sum([t['pnl'] for t in trades])
-
-    print(f"[{symbol}] تعداد سیگنال: {total} | برد: {wins} | باخت: {losses} | وین‌ریت: {win_rate:.2f}% | سود: {pnl_r:.2f}R")
-    return trades
-
-if __name__ == "__main__":
-    # نمادها بر اساس فرمت OKX
-    symbols = [
-        "BTC-USDT",
-        "ETH-USDT",
-        "SOL-USDT",
-        "DOGE-USDT",
-        "DYDX-USDT",
-        "LINK-USDT",
-        "ADA-USDT",
-        "XRP-USDT",
-        "NEAR-USDT",
-        "AVAX-USDT"
-    ]
-
-    print("=== شروع بک‌تست بر پایه API صرافی OKX ===\n")
-    all_trades = []
-
-    for s in symbols:
-        res = run_multi_timeframe_backtest(symbol=s)
-        if res:
-            all_trades.extend(res)
-
-    if all_trades:
-        total_all = len(all_trades)
-        wins_all = len([t for t in all_trades if t['result'] == 'WIN'])
-        losses_all = total_all - wins_all
-        total_winrate = (wins_all / total_all) * 100
-        total_pnl = sum([t['pnl'] for t in all_trades])
-
-        print("\n==========================================")
-        print("          نتایج جمع‌بندی کل ارزها          ")
-        print("==========================================")
-        print(f"مجموع کل سیگنال‌ها: {total_all}")
-        print(f"کل معاملات موفق (WIN): {wins_all}")
-        print(f"کل معاملات ناموفق (LOSS): {losses_all}")
-        print(f"وین‌ریت میانگین کل: {total_winrate:.2f}%")
-        print(f"مجموع سود خالص (بر حسب R): {total_pnl:.2f}R")
-        print("==========================================")
+    trades_df = pd.DataFrame(trades)
+    return capital, trades_df, max_drawdown
