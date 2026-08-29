@@ -2,14 +2,27 @@ import time
 import requests
 
 # ==============================================================================
-# دریافت کندل‌های تاریخی واقعی از API صرافی کوینکس
+# دریافت کندل‌های تاریخی واقعی از API صرافی کوینکس (نسخه اصلاح‌شده v2)
 # ==============================================================================
 def fetch_historical_candles_coinex(symbol, timeframe='15m', limit=500):
     market = symbol.replace('/', '')
-    url = f"https://api.coinex.com/v2/spot/kline?market={market}&limit={limit}&interval={timeframe}"
+    url = "https://api.coinex.com/v2/spot/kline"
+    params = {
+        "market": market,
+        "limit": limit,
+        "period": timeframe  # در API جدید کوینکس ممکن است period یا interval باشد
+    }
+    
+    # تست با پامترهای مختلف در صورت نیاز
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, params={"market": market, "limit": limit, "interval": timeframe}, timeout=10)
         data = response.json()
+        
+        # اگر با interval خطا داد، با period تست می‌کنیم
+        if data.get('code') != 0:
+            response = requests.get(url, params={"market": market, "limit": limit, "period": timeframe}, timeout=10)
+            data = response.json()
+
         if data.get('code') == 0:
             candles = []
             for c in data['data']:
@@ -21,9 +34,9 @@ def fetch_historical_candles_coinex(symbol, timeframe='15m', limit=500):
                     'close': float(c['close']),
                     'volume': float(c['volume'])
                 })
-            # مرتب‌سازی بر اساس زمان (قدیمی‌ترین به جدیدترین)
             candles.sort(key=lambda x: x['timestamp'])
             return candles
+        
         print(f"خطا در دریافت تاریخچه برای {symbol}: {data.get('message')}")
         return []
     except Exception as e:
@@ -86,12 +99,10 @@ def run_real_backtest(assets_data, initial_capital=1000.0, rr_ratio=2.0, risk_pe
 
         active_trade = None
 
-        # حلقه پیمایش روی کندل‌های تاریخی واقعی
         for i in range(100, len(candles)):
             current = candles[i]
             prev = candles[i-1]
 
-            # ۱. بررسی مدیریت پوزیشن‌های فعال (بر اساس High و Low کندل‌های واقعی بعدی)
             if active_trade:
                 t = active_trade
                 if t['type'] == 'LONG':
@@ -121,7 +132,6 @@ def run_real_backtest(assets_data, initial_capital=1000.0, rr_ratio=2.0, risk_pe
                         all_trades.append(t)
                         active_trade = None
 
-            # ۲. بررسی شرایط ورود جدید (منطبق با نسخه v8.7)
             if not active_trade:
                 c_close = prev['close']
                 c_open = prev['open']
@@ -129,11 +139,9 @@ def run_real_backtest(assets_data, initial_capital=1000.0, rr_ratio=2.0, risk_pe
                 bull_trend = (ema10[i-1] > ema30[i-1] > ema100[i-1]) and (ema10[i-1] > ema10[i-3])
                 bear_trend = (ema10[i-1] < ema30[i-1] < ema100[i-1]) and (ema10[i-1] < ema10[i-3])
 
-                # قدرت بدنه کندل ۷۵٪+
                 strong_bull = (c_close > c_open) and ((c_close - c_open) / (prev['high'] - prev['low']) > 0.75) if (prev['high'] - prev['low']) > 0 else False
                 strong_bear = (c_open > c_close) and ((c_open - c_close) / (prev['high'] - prev['low']) > 0.75) if (prev['high'] - prev['low']) > 0 else False
 
-                # حجم ۲.۰ برابر میانگین ۱۴ کندل قبل
                 avg_vol = sum(volumes[i-15:i-1]) / 14.0
                 high_vol = prev['volume'] > (2.0 * avg_vol)
 
