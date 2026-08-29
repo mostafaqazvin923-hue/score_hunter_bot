@@ -2,7 +2,7 @@ import time
 import requests
 
 # ==============================================================================
-# موتور نسخه v9.3 (استراتژی بازگشت به میانگین با وین‌ریت بالا)
+# دریافت کندل‌های استاندارد از صرافی کوینکس
 # ==============================================================================
 def fetch_safe_candles(symbol, timeframe='5min', limit=1000):
     market = symbol.replace('/', '')
@@ -29,6 +29,16 @@ def fetch_safe_candles(symbol, timeframe='5min', limit=1000):
         return []
     except Exception:
         return []
+
+# ==============================================================================
+# توابع محاسباتی اندیکاتورهای استاندارد جهانی
+# ==============================================================================
+def calculate_ema(prices, span):
+    alpha = 2 / (span + 1)
+    ema = [prices[0]]
+    for price in prices[1:]:
+        ema.append(price * alpha + ema[-1] * (1 - alpha))
+    return ema
 
 def calculate_rsi(closes, period=14):
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
@@ -63,27 +73,33 @@ def calculate_atr(highs, lows, closes, period=14):
         atr.append(tr * alpha + atr[-1] * (1 - alpha))
     return [atr[0]] * (period - 1) + atr
 
-def run_v9_3_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.0):
+# ==============================================================================
+# موتور بک‌تست نسخه v10.0 (استراتژی سازمانی و حرفه‌ای با وین‌ریت بالا)
+# ==============================================================================
+def run_v10_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.0):
     capital = initial_capital
     peak_capital = initial_capital
     max_drawdown = 0.0
     all_trades = []
 
     for asset_name, candles in assets_data.items():
-        if len(candles) < 50:
+        if len(candles) < 100:
             continue
 
         closes = [c['close'] for c in candles]
         highs = [c['high'] for c in candles]
         lows = [c['low'] for c in candles]
 
+        ema50 = calculate_ema(closes, 50)
+        ema200 = calculate_ema(closes, 200) if len(closes) >= 200 else calculate_ema(closes, len(closes)-1)
         rsi = calculate_rsi(closes, 14)
         atr = calculate_atr(highs, lows, closes, 14)
 
         active_trade = None
 
-        for i in range(20, len(candles)):
+        for i in range(200, len(candles)):
             current = candles[i]
+            prev = candles[i-1]
 
             if active_trade:
                 t = active_trade
@@ -94,8 +110,8 @@ def run_v9_3_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.
                         all_trades.append(t)
                         active_trade = None
                     elif current['high'] >= t['tp']:
-                        # پاداش بیشتر در وین‌ریت بالا با حد سود بهینه‌تر
-                        capital += t['risk_amount'] * 1.5
+                        # پاداش بهینه با حد سود منطقی برای دستیابی به وین‌ریت بالا
+                        capital += t['risk_amount'] * 1.35
                         t['result'] = 'TP'
                         all_trades.append(t)
                         active_trade = None
@@ -106,27 +122,30 @@ def run_v9_3_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.
                         all_trades.append(t)
                         active_trade = None
                     elif current['low'] <= t['tp']:
-                        capital += t['risk_amount'] * 1.5
+                        capital += t['risk_amount'] * 1.35
                         t['result'] = 'TP'
                         all_trades.append(t)
                         active_trade = None
 
             if not active_trade:
-                # شرایط فوق‌العاده سخت‌گیرانه برای شکار نقاط بازگشت قطعی (RSI شدیداً اشباع)
-                long_cond = rsi[i-1] < 22
-                short_cond = rsi[i-1] > 78
+                # استراتژی سازمانی: ترید صرفاً در جهت روند اصلی با فیلتر دقیق پولبک و RSI
+                uptrend = ema50[i-1] > ema200[i-1] and closes[i-1] > ema50[i-1]
+                downtrend = ema50[i-1] < ema200[i-1] and closes[i-1] < ema50[i-1]
+
+                long_cond = uptrend and (40 <= rsi[i-1] <= 52) and (prev['close'] > prev['open'])
+                short_cond = downtrend and (48 <= rsi[i-1] <= 60) and (prev['close'] < prev['open'])
 
                 risk_amt = capital * (risk_per_trade_pct / 100.0)
 
                 if long_cond:
                     entry = current['open']
-                    sl = entry - (atr[i-1] * 1.5)
-                    tp = entry + (atr[i-1] * 2.2)
+                    sl = entry - (atr[i-1] * 1.0)
+                    tp = entry + ((entry - sl) * 1.35)
                     active_trade = {'asset': asset_name, 'type': 'LONG', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
                 elif short_cond:
                     entry = current['open']
-                    sl = entry + (atr[i-1] * 1.5)
-                    tp = entry - (atr[i-1] * 2.2)
+                    sl = entry + (atr[i-1] * 1.0)
+                    tp = entry - ((sl - entry) * 1.35)
                     active_trade = {'asset': asset_name, 'type': 'SHORT', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
 
             if capital > peak_capital:
@@ -141,20 +160,20 @@ if __name__ == "__main__":
     symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
     assets_data = {}
 
-    print("در حال دریافت داده‌ها برای ربات نسخه v9.3...")
+    print("در حال دریافت داده‌های استاندارد بازار برای ربات نسخه v10.0...")
     for symbol in symbols:
         candles = fetch_safe_candles(symbol, timeframe='5min', limit=1000)
         if candles:
             assets_data[symbol] = candles
         time.sleep(0.2)
 
-    final_cap, trades, max_dd = run_v9_3_backtest(assets_data, initial_capital=1000.0)
+    final_cap, trades, max_dd = run_v10_backtest(assets_data, initial_capital=1000.0)
     
-    win_trades = [t for t in trades if t.get('result') == 'TP']
+    win_trades = [t for t in trades if t.get('result'] == 'TP']
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
-    print("=== گزارش بک‌تست ربات اسکالپر v9.3 (بازگشت به میانگین) ===")
+    print("=== گزارش بک‌تست ربات اسکالپر v10.0 (استراتژی سازمانی حرفه‌ای) ===")
     print("="*50)
     print(f"موجودی اولیه: $1000.00")
     print(f"موجودی نهایی: ${final_cap:.2f}")
