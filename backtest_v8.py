@@ -2,57 +2,50 @@ import time
 import requests
 
 # ==============================================================================
-# دریافت کندل‌های ۵ دقیقه‌ای برای اسکالپ و تعداد سیگنال بالا (v9.0)
+# دریافت تاریخچه کامل‌تر (چندین صفحه کندل ۵ دقیقه‌ای) از کوینکس
 # ==============================================================================
-def fetch_scalp_candles(symbol, timeframe='5min', limit=1000):
+def fetch_full_scalp_candles(symbol, timeframe='5min', total_candles=3000):
     market = symbol.replace('/', '')
     url = "https://api.coinex.com/v2/spot/kline"
-    params = {"market": market, "limit": limit, "period": timeframe}
+    all_candles = []
     
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
-        
-        if data.get('code') == 0 and data.get('data'):
-            candles = []
-            for c in data['data']:
-                candles.append({
-                    'timestamp': int(c.get('created_at', c.get('time', 0))),
-                    'open': float(c['open']),
-                    'high': float(c['high']),
-                    'low': float(c['low']),
-                    'close': float(c['close']),
-                    'volume': float(c['volume'])
-                })
-            candles.sort(key=lambda x: x['timestamp'])
-            return candles
-        
-        params_alt = {"market": market, "limit": limit, "interval": timeframe}
-        response_alt = requests.get(url, params=params_alt, timeout=10)
-        data_alt = response_alt.json()
-        
-        if data_alt.get('code') == 0 and data_alt.get('data'):
-            candles = []
-            for c in data_alt['data']:
-                candles.append({
-                    'timestamp': int(c.get('created_at', c.get('time', 0))),
-                    'open': float(c['open']),
-                    'high': float(c['high']),
-                    'low': float(c['low']),
-                    'close': float(c['close']),
-                    'volume': float(c['volume'])
-                })
-            candles.sort(key=lambda x: x['timestamp'])
-            return candles
-
-        print(f"خطا در دریافت داده برای {symbol}: {data.get('message', 'Unknown error')}")
-        return []
-    except Exception as e:
-        print(f"ارور اتصال: {e}")
-        return []
+    # دریافت مرحله‌ای برای پوشش بازه زمانی بزرگ‌تر
+    limit_per_req = 1000
+    loops = total_candles // limit_per_req
+    
+    for _ in range(loops):
+        params = {"market": market, "limit": limit_per_req, "period": timeframe}
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            data = response.json()
+            if data.get('code') == 0 and data.get('data'):
+                for c in data['data']:
+                    all_candles.append({
+                        'timestamp': int(c.get('created_at', c.get('time', 0))),
+                        'open': float(c['open']),
+                        'high': float(c['high']),
+                        'low': float(c['low']),
+                        'close': float(c['close']),
+                        'volume': float(c['volume'])
+                    })
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"خطا در دریافت تاریخچه {symbol}: {e}")
+            break
+            
+    # حذف موارد تکراری و مرتب‌سازی
+    seen = set()
+    unique_candles = []
+    for c in all_candles:
+        if c['timestamp'] not in seen:
+            seen.add(c['timestamp'])
+            unique_candles.append(c)
+            
+    unique_candles.sort(key=lambda x: x['timestamp'])
+    return unique_candles
 
 # ==============================================================================
-# توابع اندیکاتورهای پیشرفته (EMA, RSI, Bollinger Bands, ATR)
+# توابع محاسباتی اندیکاتورها
 # ==============================================================================
 def calculate_ema(prices, span):
     alpha = 2 / (span + 1)
@@ -65,10 +58,8 @@ def calculate_rsi(closes, period=14):
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
     gains = [d if d > 0 else 0 for d in deltas]
     losses = [-d if d < 0 else 0 for d in deltas]
-    
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-    
     rsi = [50] * period
     for i in range(period, len(deltas)):
         gain = gains[i]
@@ -81,21 +72,6 @@ def calculate_rsi(closes, period=14):
             rs = avg_gain / avg_loss
             rsi.append(100 - (100 / (1 + rs)))
     return [50] + rsi
-
-def calculate_bollinger_bands(closes, period=20, std_dev_multiplier=2.0):
-    upper_band, lower_band = [], []
-    for i in range(len(closes)):
-        if i < period - 1:
-            upper_band.append(closes[i])
-            lower_band.append(closes[i])
-        else:
-            window = closes[i - period + 1 : i + 1]
-            mean = sum(window) / period
-            variance = sum((x - mean) ** 2 for x in window) / period
-            std_dev = variance ** 0.5
-            upper_band.append(mean + (std_dev_multiplier * std_dev))
-            lower_band.append(mean - (std_dev_multiplier * std_dev))
-    return upper_band, lower_band
 
 def calculate_atr(highs, lows, closes, period=14):
     tr_list = []
@@ -112,16 +88,16 @@ def calculate_atr(highs, lows, closes, period=14):
     return [atr[0]] * (period - 1) + atr
 
 # ==============================================================================
-# موتور بک‌تست نسخه v9.0 (اسکالپر با وین‌ریت بالا)
+# موتور بک‌تست نسخه v9.1 (اسکالپر فعال با وین‌ریت بالا)
 # ==============================================================================
-def run_v9_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.1, risk_per_trade_pct=1.5):
+def run_v9_1_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.2, risk_per_trade_pct=1.5):
     capital = initial_capital
     peak_capital = initial_capital
     max_drawdown = 0.0
     all_trades = []
 
     for asset_name, candles in assets_data.items():
-        if len(candles) < 60:
+        if len(candles) < 50:
             continue
 
         closes = [c['close'] for c in candles]
@@ -129,15 +105,14 @@ def run_v9_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.1, risk_per_
         lows = [c['low'] for c in candles]
         volumes = [c['volume'] for c in candles]
 
-        ema7 = calculate_ema(closes, 7)
-        ema21 = calculate_ema(closes, 21)
+        ema5 = calculate_ema(closes, 5)
+        ema13 = calculate_ema(closes, 13)
         rsi = calculate_rsi(closes, 14)
-        upper_b, lower_b = calculate_bollinger_bands(closes, 20, 2.0)
         atr = calculate_atr(highs, lows, closes, 14)
 
         active_trade = None
 
-        for i in range(30, len(candles)):
+        for i in range(20, len(candles)):
             current = candles[i]
             prev = candles[i-1]
 
@@ -167,17 +142,18 @@ def run_v9_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.1, risk_per_
                         active_trade = None
 
             if not active_trade:
-                long_signal = (ema7[i-1] > ema21[i-1]) and (rsi[i-1] < 45) and (prev['low'] <= lower_b[i-1])
-                short_signal = (ema7[i-1] < ema21[i-1]) and (rsi[i-1] > 55) and (prev['high'] >= upper_b[i-1])
+                # شرایط پویاتر برای تولید سیگنال‌های روزانه بیشتر با فیلتر RSI
+                long_cond = (ema5[i-1] > ema13[i-1]) and (rsi[i-1] < 40) and (prev['close'] > prev['open'])
+                short_cond = (ema5[i-1] < ema13[i-1]) and (rsi[i-1] > 60) and (prev['close'] < prev['open'])
 
                 risk_amt = capital * (risk_per_trade_pct / 100.0)
 
-                if long_signal:
+                if long_cond:
                     entry = current['open']
                     sl = entry - (atr[i-1] * 1.0)
                     tp = entry + ((entry - sl) * rr_ratio)
                     active_trade = {'asset': asset_name, 'type': 'LONG', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
-                elif short_signal:
+                elif short_cond:
                     entry = current['open']
                     sl = entry + (atr[i-1] * 1.0)
                     tp = entry - ((sl - entry) * rr_ratio)
@@ -195,22 +171,21 @@ if __name__ == "__main__":
     symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
     assets_data = {}
 
-    print("در حال دانلود داده‌های ۵ دقیقه‌ای (اسکلپ) از صرافی کوینکس...")
+    print("در حال دانلود داده‌های کامل اسکالپ از کوینکس...")
     for symbol in symbols:
-        candles = fetch_scalp_candles(symbol, timeframe='5min', limit=1000)
+        candles = fetch_full_scalp_candles(symbol, timeframe='5min', total_candles=3000)
         if candles:
             assets_data[symbol] = candles
             print(f"دریافت {len(candles)} کندل ۵ دقیقه‌ای برای {symbol}")
         time.sleep(0.5)
 
-    final_cap, trades, max_dd = run_v9_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.1)
+    final_cap, trades, max_dd = run_v9_1_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.2)
     
-    # اصلاح‌شده و کاملاً درست:
     win_trades = [t for t in trades if t.get('result') == 'TP']
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
-    print("=== گزارش بک‌تست ربات اسکالپر v9.0 (صرافی کوینکس) ===")
+    print("=== گزارش بک‌تست ربات اسکالپر v9.1 (پویا و فعال) ===")
     print("="*50)
     print(f"موجودی اولیه: $1000.00")
     print(f"موجودی نهایی: ${final_cap:.2f}")
