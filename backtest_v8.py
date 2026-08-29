@@ -27,7 +27,6 @@ def fetch_scalp_candles(symbol, timeframe='5min', limit=1000):
             candles.sort(key=lambda x: x['timestamp'])
             return candles
         
-        # حالت جایگزین در صورت نیاز
         params_alt = {"market": market, "limit": limit, "interval": timeframe}
         response_alt = requests.get(url, params=params_alt, timeout=10)
         data_alt = response_alt.json()
@@ -70,7 +69,7 @@ def calculate_rsi(closes, period=14):
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
     
-    rsi = [50] * period  # مقدار پیش‌فرض برای ابتدای لیست
+    rsi = [50] * period
     for i in range(period, len(deltas)):
         gain = gains[i]
         loss = losses[i]
@@ -81,7 +80,7 @@ def calculate_rsi(closes, period=14):
         else:
             rs = avg_gain / avg_loss
             rsi.append(100 - (100 / (1 + rs)))
-    return [50] + rsi  # هماهنگ‌سازی طول با closes
+    return [50] + rsi
 
 def calculate_bollinger_bands(closes, period=20, std_dev_multiplier=2.0):
     upper_band, lower_band = [], []
@@ -142,7 +141,6 @@ def run_v9_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.1, risk_per_
             current = candles[i]
             prev = candles[i-1]
 
-            # مدیریت پوزیشن فعال
             if active_trade:
                 t = active_trade
                 if t['type'] == 'LONG':
@@ -168,9 +166,7 @@ def run_v9_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.1, risk_per_
                         all_trades.append(t)
                         active_trade = None
 
-            # شرایط ورود اسکلپر (برای وین‌ریت بالا و حجم سیگنال زیاد)
             if not active_trade:
-                # تلاقی روند EMA و موقعیت RSI و Bollinger Bands
                 long_signal = (ema7[i-1] > ema21[i-1]) and (rsi[i-1] < 45) and (prev['low'] <= lower_b[i-1])
                 short_signal = (ema7[i-1] < ema21[i-1]) and (rsi[i-1] > 55) and (prev['high'] >= upper_b[i-1])
 
@@ -208,7 +204,9 @@ if __name__ == "__main__":
         time.sleep(0.5)
 
     final_cap, trades, max_dd = run_v9_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.1)
-    win_trades = [t for t in trades if t.get('result'] == 'TP']
+    
+    # اصلاح‌شده و کاملاً درست:
+    win_trades = [t for t in trades if t.get('result') == 'TP']
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
