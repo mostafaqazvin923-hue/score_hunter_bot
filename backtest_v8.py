@@ -2,9 +2,9 @@ import time
 import requests
 
 # ==============================================================================
-# دریافت کندل‌های استاندارد از صرافی کوینکس (تایم‌فریم ۱۵ دقیقه)
+# دریافت کندل‌های استاندارد از صرافی کوینکس (تایم‌فریم ۱ ساعته برای کاهش تعداد معاملات)
 # ==============================================================================
-def fetch_safe_candles(symbol, timeframe='15min', limit=500):
+def fetch_safe_candles(symbol, timeframe='1hour', limit=500):
     market = symbol.replace('/', '')
     url = "https://api.coinex.com/v2/spot/kline"
     params = {"market": market, "limit": limit, "period": timeframe}
@@ -52,9 +52,9 @@ def calculate_atr(highs, lows, closes, period=14):
     return [atr[0]] * (period - 1) + atr
 
 # ==============================================================================
-# موتور بک‌تست نسخه v14.0 (پایتون خالص، ساده، بدون خطای پرانتز)
+# موتور بک‌تست نسخه v15.0 (تایم ۱ ساعته، کم‌تعداد، کیفی و آرام)
 # ==============================================================================
-def run_v14_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5):
+def run_v15_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5):
     capital = initial_capital
     peak_capital = initial_capital
     max_drawdown = 0.0
@@ -77,8 +77,9 @@ def run_v14_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5
         for i in range(50, len(candles)):
             current = candles[i]
             prev = candles[i-1]
+            prev2 = candles[i-2]
 
-            # مدیریت پوزیشن باز (چک کردن حد سود و حد ضرر)
+            # مدیریت پوزیشن باز
             if active_trade:
                 t = active_trade
                 if t['type'] == 'LONG':
@@ -88,7 +89,7 @@ def run_v14_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5
                         all_trades.append(t)
                         active_trade = None
                     elif current['high'] >= t['tp']:
-                        capital += t['risk_amount'] * 1.5
+                        capital += t['risk_amount'] * 1.8  # ریسک به ریوارد بالاتر در تایم ۱ ساعته
                         t['result'] = 'TP'
                         all_trades.append(t)
                         active_trade = None
@@ -99,30 +100,34 @@ def run_v14_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5
                         all_trades.append(t)
                         active_trade = None
                     elif current['low'] <= t['tp']:
-                        capital += t['risk_amount'] * 1.5
+                        capital += t['risk_amount'] * 1.8
                         t['result'] = 'TP'
                         all_trades.append(t)
                         active_trade = None
 
-            # بررسی شرایط ورود جدید
+            # بررسی شرایط ورود جدید (با فیلتر قوی‌تر برای کاهش تعداد پوزیشن‌ها)
             if not active_trade:
                 trend_up = ema20[i-1] > ema50[i-1]
                 trend_down = ema20[i-1] < ema50[i-1]
 
-                long_cond = trend_up and (prev['close'] > prev['open']) and (current['close'] > current['open'])
-                short_cond = trend_down and (prev['close'] < prev['open']) and (current['close'] < current['open'])
+                # نیاز به اصلاحِ تمیزتر (دو کندل خلاف جهت و بعد تاییدیه)
+                pullback_long = prev2['close'] < prev2['open'] and prev['close'] < prev['open'] and current['close'] > current['open']
+                pullback_short = prev2['close'] > prev2['open'] and prev['close'] > prev['open'] and current['close'] < current['open']
+
+                long_cond = trend_up and pullback_long
+                short_cond = trend_down and pullback_short
 
                 risk_amt = capital * (risk_per_trade_pct / 100.0)
 
                 if long_cond:
                     entry = current['open']
                     sl = entry - (atr[i-1] * 1.5)
-                    tp = entry + ((entry - sl) * 1.5)
+                    tp = entry + ((entry - sl) * 1.8)
                     active_trade = {'asset': asset_name, 'type': 'LONG', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
                 elif short_cond:
                     entry = current['open']
                     sl = entry + (atr[i-1] * 1.5)
-                    tp = entry - ((sl - entry) * 1.5)
+                    tp = entry - ((sl - entry) * 1.8)
                     active_trade = {'asset': asset_name, 'type': 'SHORT', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
 
             if capital > peak_capital:
@@ -137,20 +142,20 @@ if __name__ == "__main__":
     symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
     assets_data = {}
 
-    print("در حال دریافت داده‌های بازار برای ربات نسخه v14.0...")
+    print("در حال دریافت داده‌های تایم‌فریم ۱ ساعته برای ربات نسخه v15.0...")
     for symbol in symbols:
-        candles = fetch_safe_candles(symbol, timeframe='15min', limit=500)
+        candles = fetch_safe_candles(symbol, timeframe='1hour', limit=500)
         if candles:
             assets_data[symbol] = candles
         time.sleep(0.2)
 
-    final_cap, trades, max_dd = run_v14_backtest(assets_data, initial_capital=1000.0)
+    final_cap, trades, max_dd = run_v15_backtest(assets_data, initial_capital=1000.0)
     
     win_trades = [t for t in trades if t.get('result') == 'TP']
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
-    print("=== گزارش بک‌تست ربات نسخه v14.0 (پایتون خالص) ===")
+    print("=== گزارش بک‌تست ربات نسخه v15.0 (تایم ۱ ساعته و کم‌معامله) ===")
     print("="*50)
     print(f"موجودی اولیه: $1000.00")
     print(f"موجودی نهایی: ${final_cap:.2f}")
