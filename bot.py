@@ -22,7 +22,7 @@ def send_telegram_message(message):
         return None
 
 # ==============================================================================
-# توابع محاسباتی اندیکاتورها (منطبق بر v8.6)
+# توابع محاسباتی اندیکاتورها (منطبق بر v8.7)
 # ==============================================================================
 
 def calculate_ema(prices, span):
@@ -52,7 +52,7 @@ def calculate_atr(highs, lows, closes, period=14):
     return [atr[0]] * (period - 1) + atr
 
 # ==============================================================================
-# موتور اصلی ربات (Score Hunter v8.6)
+# موتور اصلی ربات (Score Hunter v8.7)
 # ==============================================================================
 
 class ScoreHunterBot:
@@ -144,7 +144,7 @@ class ScoreHunterBot:
                     send_telegram_message(msg)
                     del self.active_trades[asset_name]
 
-        # ۲. بررسی شرایط سیگنال جدید (فقط در صورت عدم وجود پوزیشن باز روی نماد)
+        # ۲. بررسی شرایط سیگنال جدید (منطبق با نسخه v8.7 بک‌تست)
         if asset_name not in self.active_trades:
             c_close = prev['close']
             c_open = prev['open']
@@ -152,11 +152,13 @@ class ScoreHunterBot:
             bull_trend = (ema10[i-1] > ema30[i-1] > ema100[i-1]) and (ema10[i-1] > ema10[i-3])
             bear_trend = (ema10[i-1] < ema30[i-1] < ema100[i-1]) and (ema10[i-1] < ema10[i-3])
 
-            strong_bull = (c_close > c_open) and ((c_close - c_open) / (prev['high'] - prev['low']) > 0.70) if (prev['high'] - prev['low']) > 0 else False
-            strong_bear = (c_open > c_close) and ((c_open - c_close) / (prev['high'] - prev['low']) > 0.70) if (prev['high'] - prev['low']) > 0 else False
+            # فیلتر سخت‌گیرانه بدنه ۷۵ درصدی
+            strong_bull = (c_close > c_open) and ((c_close - c_open) / (prev['high'] - prev['low']) > 0.75) if (prev['high'] - prev['low']) > 0 else False
+            strong_bear = (c_open > c_close) and ((c_open - c_close) / (prev['high'] - prev['low']) > 0.75) if (prev['high'] - prev['low']) > 0 else False
 
+            # فیلتر حجم ۲.۰ برابری
             avg_vol = sum(volumes[i-15:i-1]) / 14.0
-            high_vol = prev['volume'] > (1.8 * avg_vol)
+            high_vol = prev['volume'] > (2.0 * avg_vol)
 
             long_cond = bull_trend and strong_bull and high_vol
             short_cond = bear_trend and strong_bear and high_vol
@@ -177,7 +179,7 @@ class ScoreHunterBot:
                 }
 
                 msg = (
-                    f"🚀 **سیگنال جدید ورود (LONG)**\n\n"
+                    f"🚀 **سیگنال جدید ورود (LONG - v8.7)**\n\n"
                     f"📌 نماد: #{asset_name.replace('/', '')}\n"
                     f"قیمت ورود (Entry): `{entry:.4f}`\n"
                     f"حد ضرر (SL): `{sl:.4f}` `(-{sl_pct:.2f}%)`\n"
@@ -201,7 +203,7 @@ class ScoreHunterBot:
                 }
 
                 msg = (
-                    f"🔻 **سیگنال جدید ورود (SHORT)**\n\n"
+                    f"🔻 **سیگنال جدید ورود (SHORT - v8.7)**\n\n"
                     f"📌 نماد: #{asset_name.replace('/', '')}\n"
                     f"قیمت ورود (Entry): `{entry:.4f}`\n"
                     f"حد ضرر (SL): `{sl:.4f}` `(-{sl_pct:.2f}%)`\n"
@@ -239,10 +241,10 @@ def fetch_real_candles_coinex(symbol, timeframe='15m', limit=150):
         return None
 
 if __name__ == "__main__":
-    symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'AVAX/USDT']
+    symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'AVAX/USDT', 'LINK/USDT']
     bot = ScoreHunterBot(assets=symbols)
     
-    print("ربات Mostafa Signal Bot فعال شد.")
+    print("ربات Mostafa Signal Bot (نسخه v8.7) فعال شد.")
     print("در حال دریافت لایو داده‌های بازار کریپتو...")
 
     for symbol in symbols:
