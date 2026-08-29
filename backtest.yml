@@ -1,5 +1,5 @@
     steps:
-      - name: Check out repository
+      - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Set up Python
@@ -7,14 +7,9 @@
         with:
           python-version: '3.10'
 
-      # -------------------------------------------------------------
-      # اضافه کردن این بخش برای نصب کتابخانه‌های مورد نیاز
-      # -------------------------------------------------------------
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install pandas numpy requests
+          pip install ccxt requests
 
-      # اجرای اسکریپت بک‌تست
-      - name: Run Backtest
-        run: python backtest_v8.py
+      - name: Run bot
+        run: python bot.py
