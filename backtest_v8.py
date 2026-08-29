@@ -13,7 +13,8 @@ def fetch_safe_candles(symbol, timeframe='15min', limit=500):
         response = requests.get(url, params=params, timeout=10)
         data = response.json()
         
-        if data.get('code'] == 0 and data.get('data'):
+        # اصلاح خطای پرانتز و کروشه در این بخش
+        if data.get('code') == 0 and data.get('data'):
             candles = []
             for c in data['data']:
                 candles.append({
@@ -97,7 +98,7 @@ def calculate_atr(highs, lows, closes, period=14):
     return [atr[0]] * (period - 1) + atr
 
 # ==============================================================================
-# موتور بک‌تست نسخه v13.0 (ترکیب بولینگر بند، RSI و روند کلان)
+# موتور بک‌تست نسخه v13.1 (ترکیب بولینگر بند، RSI و روند کلان)
 # ==============================================================================
 def run_v13_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5):
     capital = initial_capital
@@ -151,11 +152,9 @@ def run_v13_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5
                         active_trade = None
 
             if not active_trade:
-                # تشخیص روند کلان صعودی یا نزولی
                 macro_up = ema50[i-1] > ema200[i-1] and closes[i-1] > ema50[i-1]
                 macro_down = ema50[i-1] < ema200[i-1] and closes[i-1] < ema50[i-1]
 
-                # شرایط ورود با بولینگر بند و RSI (خرید در کف باند پایینی در روند صعودی / فروش در سقف باند بالایی در روند نزولی)
                 long_cond = macro_up and (prev['low'] <= lower_bb[i-1]) and (rsi[i-1] < 40) and (current['close'] > current['open'])
                 short_cond = macro_down and (prev['high'] >= upper_bb[i-1]) and (rsi[i-1] > 60) and (current['close'] < current['open'])
 
@@ -184,7 +183,7 @@ if __name__ == "__main__":
     symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
     assets_data = {}
 
-    print("در حال دریافت داده‌های تایم‌فریم ۱۵ دقیقه برای ربات نسخه v13.0 (بولینگر + RSI)...")
+    print("در حال دریافت داده‌های تایم‌فریم ۱۵ دقیقه برای ربات نسخه v13.1 (بولینگر + RSI)...")
     for symbol in symbols:
         candles = fetch_safe_candles(symbol, timeframe='15min', limit=500)
         if candles:
@@ -197,7 +196,7 @@ if __name__ == "__main__":
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
-    print("=== گزارش بک‌تست ربات نسخه v13.0 (سیستم بولینگر و RSI حرفه‌ای) ===")
+    print("=== گزارش بک‌تست ربات نسخه v13.1 (سیستم بولینگر و RSI حرفه‌ای) ===")
     print("="*50)
     print(f"موجودی اولیه: $1000.00")
     print(f"موجودی نهایی: ${final_cap:.2f}")
