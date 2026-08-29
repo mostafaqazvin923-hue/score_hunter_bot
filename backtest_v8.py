@@ -1,8 +1,9 @@
 import time
 import requests
+import math
 
 # ==============================================================================
-# دریافت کندل‌های استاندارد از صرافی کوینکس (تایم‌فریم ۱ ساعته)
+# دریافت کندل‌های استاندارد از صرافی کوینکس (تایم‌فریم ۱ ساعته، حداکثر ظرفیت تاریخچه)
 # ==============================================================================
 def fetch_safe_candles(symbol, timeframe='1hour', limit=1000):
     market = symbol.replace('/', '')
@@ -30,6 +31,29 @@ def fetch_safe_candles(symbol, timeframe='1hour', limit=1000):
     except Exception:
         return []
 
+def calculate_bollinger_bands(closes, period=20, num_std=2.0):
+    middle, upper, lower, bandwidth = [], [], [], []
+    for i in range(len(closes)):
+        if i < period - 1:
+            middle.append(closes[i])
+            upper.append(closes[i])
+            lower.append(closes[i])
+            bandwidth.append(0.0)
+        else:
+            window = closes[i - period + 1 : i + 1]
+            m = sum(window) / period
+            variance = sum((x - m) ** 2 for x in window) / period
+            std = math.sqrt(variance)
+            u = m + (num_std * std)
+            l = m - (num_std * std)
+            bw = (u - l) / m if m > 0 else 0.0
+            
+            middle.append(m)
+            upper.append(u)
+            lower.append(l)
+            bandwidth.append(bw)
+    return middle, upper, lower, bandwidth
+
 def calculate_sma(prices, period):
     sma = []
     for i in range(len(prices)):
@@ -54,9 +78,9 @@ def calculate_atr(highs, lows, closes, period=14):
     return [atr[0]] * (period - 1) + atr
 
 # ==============================================================================
-# موتور بک‌تست نسخه v18.0 (استراتژی تک‌تیرانداز / شکست محدوده با حجم بالا)
+# موتور بک‌تست نسخه v19.0 (استراتژی بولینگر سکیوئز و انفجار نوسان)
 # ==============================================================================
-def run_v18_sniper_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5):
+def run_v19_squeeze_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5):
     capital = initial_capital
     peak_capital = initial_capital
     max_drawdown = 0.0
@@ -71,13 +95,13 @@ def run_v18_sniper_backtest(assets_data, initial_capital=1000.0, risk_per_trade_
         lows = [c['low'] for c in candles]
         volumes = [c['volume'] for c in candles]
 
+        middle, upper, lower, bandwidth = calculate_bollinger_bands(closes, period=20, num_std=2.0)
         volume_sma = calculate_sma(volumes, 20)
         atr = calculate_atr(highs, lows, closes, 14)
 
         active_trade = None
-        lookback_period = 20  # بررسی بالاترین و پایین‌ترین قیمت در ۲۰ کندل گذشته
 
-        for i in range(lookback_period, len(candles)):
+        for i in range(25, len(candles)):
             current = candles[i]
             
             # مدیریت پوزیشن باز
@@ -90,7 +114,7 @@ def run_v18_sniper_backtest(assets_data, initial_capital=1000.0, risk_per_trade_
                         all_trades.append(t)
                         active_trade = None
                     elif current['high'] >= t['tp']:
-                        capital += t['risk_amount'] * 2.0  # ریسک به ریوارد طلایی ۲ به ۱
+                        capital += t['risk_amount'] * 2.2  # ریسک به ریوارد قدرتمند ۲.۲
                         t['result'] = 'TP'
                         all_trades.append(t)
                         active_trade = None
@@ -101,33 +125,33 @@ def run_v18_sniper_backtest(assets_data, initial_capital=1000.0, risk_per_trade_
                         all_trades.append(t)
                         active_trade = None
                     elif current['low'] <= t['tp']:
-                        capital += t['risk_amount'] * 2.0
+                        capital += t['risk_amount'] * 2.2
                         t['result'] = 'TP'
                         all_trades.append(t)
                         active_trade = None
 
-            # شرایط شکار (تک‌تیرانداز): شکست سقف یا کف ۲۰ کندل قبل با حجم حداقل ۱.۵ برابر میانگین
+            # شرایط ورود: خروج قیمت از باندهای بولینگر همراه با حجم بالا بعد از یک دوره فشرده‌سازی
             if not active_trade:
-                recent_high = max(highs[i-lookback_period : i])
-                recent_low = min(lows[i-lookback_period : i])
+                # بررسی اینکه پهنای باند در ۵ کندل قبل نسبتاً کم بوده (فشرده‌سازی)
+                recent_bw = bandwidth[i-5:i]
+                is_squeezed = bandwidth[i-1] <= min(recent_bw) * 1.1
+                
+                is_high_volume = volumes[i] > (volume_sma[i] * 1.4)
 
-                # حجم باید به طور محسوسی بالا باشد تا فیک‌بریک‌اوت نشود
-                is_high_volume = volumes[i] > (volume_sma[i] * 1.5)
-
-                long_breakout = closes[i] > recent_high and is_high_volume
-                short_breakout = closes[i] < recent_low and is_high_volume
+                long_signal = closes[i] > upper[i] and is_high_volume and is_squeezed
+                short_signal = closes[i] < lower[i] and is_high_volume and is_squeezed
 
                 risk_amt = capital * (risk_per_trade_pct / 100.0)
 
-                if long_breakout:
+                if long_signal:
                     entry = current['close']
                     sl = entry - (atr[i] * 1.5)
-                    tp = entry + ((entry - sl) * 2.0)
+                    tp = entry + ((entry - sl) * 2.2)
                     active_trade = {'asset': asset_name, 'type': 'LONG', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
-                elif short_breakout:
+                elif short_signal:
                     entry = current['close']
                     sl = entry + (atr[i] * 1.5)
-                    tp = entry - ((sl - entry) * 2.0)
+                    tp = entry - ((sl - entry) * 2.2)
                     active_trade = {'asset': asset_name, 'type': 'SHORT', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
 
             if capital > peak_capital:
@@ -142,20 +166,20 @@ if __name__ == "__main__":
     symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
     assets_data = {}
 
-    print("در حال دریافت داده‌های تاریخی برای ربات نسخه v18.0 (مدل تک‌تیرانداز)...")
+    print("در حال دریافت داده‌ها و اجرای ربات نسخه v19.0 (بولینگر سکیوئز)...")
     for symbol in symbols:
         candles = fetch_safe_candles(symbol, timeframe='1hour', limit=1000)
         if candles:
             assets_data[symbol] = candles
         time.sleep(0.2)
 
-    final_cap, trades, max_dd = run_v18_sniper_backtest(assets_data, initial_capital=1000.0)
+    final_cap, trades, max_dd = run_v19_squeeze_backtest(assets_data, initial_capital=1000.0)
     
     win_trades = [t for t in trades if t.get('result') == 'TP']
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
-    print("=== گزارش بک‌تست ربات نسخه v18.0 (استراتژی تک‌تیرانداز) ===")
+    print("=== گزارش بک‌تست ربات نسخه v19.0 (استراتژی بولینگر سکیوئز) ===")
     print("="*50)
     print(f"موجودی اولیه: $1000.00")
     print(f"موجودی نهایی: ${final_cap:.2f}")
