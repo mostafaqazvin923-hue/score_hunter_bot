@@ -30,37 +30,14 @@ def fetch_safe_candles(symbol, timeframe='1hour', limit=1000):
     except Exception:
         return []
 
-def calculate_ema(prices, span):
-    alpha = 2 / (span + 1)
-    ema = [prices[0]]
-    for price in prices[1:]:
-        ema.append(price * alpha + ema[-1] * (1 - alpha))
-    return ema
-
-def calculate_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return [50.0] * len(closes)
-    
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [d if d > 0 else 0.0 for d in deltas]
-    losses = [-d if d < 0 else 0.0 for d in deltas]
-    
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    
-    rsi = [50.0] * period
-    for i in range(period, len(deltas)):
-        gain = gains[i]
-        loss = losses[i]
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-        
-        if avg_loss == 0:
-            rsi.append(100.0)
+def calculate_sma(prices, period):
+    sma = []
+    for i in range(len(prices)):
+        if i < period - 1:
+            sma.append(sum(prices[:i+1]) / (i + 1))
         else:
-            rs = avg_gain / avg_loss
-            rsi.append(100.0 - (100.0 / (1.0 + rs)))
-    return [50.0] + rsi
+            sma.append(sum(prices[i-period+1:i+1]) / period)
+    return sma
 
 def calculate_atr(highs, lows, closes, period=14):
     tr_list = []
@@ -77,33 +54,33 @@ def calculate_atr(highs, lows, closes, period=14):
     return [atr[0]] * (period - 1) + atr
 
 # ==============================================================================
-# موتور بک‌تست نسخه v17.0 (ترکیب EMA و RSI برای تعادل بین تعداد معامله و وین‌ریت)
+# موتور بک‌تست نسخه v18.0 (استراتژی تک‌تیرانداز / شکست محدوده با حجم بالا)
 # ==============================================================================
-def run_v17_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5):
+def run_v18_sniper_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5):
     capital = initial_capital
     peak_capital = initial_capital
     max_drawdown = 0.0
     all_trades = []
 
     for asset_name, candles in assets_data.items():
-        if len(candles) < 100:
+        if len(candles) < 50:
             continue
 
         closes = [c['close'] for c in candles]
         highs = [c['high'] for c in candles]
         lows = [c['low'] for c in candles]
+        volumes = [c['volume'] for c in candles]
 
-        ema20 = calculate_ema(closes, 20)
-        ema50 = calculate_ema(closes, 50)
-        rsi = calculate_rsi(closes, 14)
+        volume_sma = calculate_sma(volumes, 20)
         atr = calculate_atr(highs, lows, closes, 14)
 
         active_trade = None
+        lookback_period = 20  # بررسی بالاترین و پایین‌ترین قیمت در ۲۰ کندل گذشته
 
-        for i in range(50, len(candles)):
+        for i in range(lookback_period, len(candles)):
             current = candles[i]
-            prev = candles[i-1]
-
+            
+            # مدیریت پوزیشن باز
             if active_trade:
                 t = active_trade
                 if t['type'] == 'LONG':
@@ -113,7 +90,7 @@ def run_v17_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5
                         all_trades.append(t)
                         active_trade = None
                     elif current['high'] >= t['tp']:
-                        capital += t['risk_amount'] * 1.8
+                        capital += t['risk_amount'] * 2.0  # ریسک به ریوارد طلایی ۲ به ۱
                         t['result'] = 'TP'
                         all_trades.append(t)
                         active_trade = None
@@ -124,30 +101,33 @@ def run_v17_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5
                         all_trades.append(t)
                         active_trade = None
                     elif current['low'] <= t['tp']:
-                        capital += t['risk_amount'] * 1.8
+                        capital += t['risk_amount'] * 2.0
                         t['result'] = 'TP'
                         all_trades.append(t)
                         active_trade = None
 
+            # شرایط شکار (تک‌تیرانداز): شکست سقف یا کف ۲۰ کندل قبل با حجم حداقل ۱.۵ برابر میانگین
             if not active_trade:
-                # شرایط روند صعودی/نزولی با فیلتر RSI (جلوگیری از ورود در مناطق اشباع خطرناک)
-                trend_up = ema20[i-1] > ema50[i-1]
-                trend_down = ema20[i-1] < ema50[i-1]
+                recent_high = max(highs[i-lookback_period : i])
+                recent_low = min(lows[i-lookback_period : i])
 
-                long_cond = trend_up and (rsi[i-1] < 60) and (prev['close'] > prev['open']) and (current['close'] > current['open'])
-                short_cond = trend_down and (rsi[i-1] > 40) and (prev['close'] < prev['open']) and (current['close'] < current['open'])
+                # حجم باید به طور محسوسی بالا باشد تا فیک‌بریک‌اوت نشود
+                is_high_volume = volumes[i] > (volume_sma[i] * 1.5)
+
+                long_breakout = closes[i] > recent_high and is_high_volume
+                short_breakout = closes[i] < recent_low and is_high_volume
 
                 risk_amt = capital * (risk_per_trade_pct / 100.0)
 
-                if long_cond:
-                    entry = current['open']
-                    sl = entry - (atr[i-1] * 1.5)
-                    tp = entry + ((entry - sl) * 1.8)
+                if long_breakout:
+                    entry = current['close']
+                    sl = entry - (atr[i] * 1.5)
+                    tp = entry + ((entry - sl) * 2.0)
                     active_trade = {'asset': asset_name, 'type': 'LONG', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
-                elif short_cond:
-                    entry = current['open']
-                    sl = entry + (atr[i-1] * 1.5)
-                    tp = entry - ((sl - entry) * 1.8)
+                elif short_breakout:
+                    entry = current['close']
+                    sl = entry + (atr[i] * 1.5)
+                    tp = entry - ((sl - entry) * 2.0)
                     active_trade = {'asset': asset_name, 'type': 'SHORT', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
 
             if capital > peak_capital:
@@ -162,20 +142,20 @@ if __name__ == "__main__":
     symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
     assets_data = {}
 
-    print("در حال دریافت داده‌های نسخه v17.0 (با فیلتر RSI)...")
+    print("در حال دریافت داده‌های تاریخی برای ربات نسخه v18.0 (مدل تک‌تیرانداز)...")
     for symbol in symbols:
         candles = fetch_safe_candles(symbol, timeframe='1hour', limit=1000)
         if candles:
             assets_data[symbol] = candles
         time.sleep(0.2)
 
-    final_cap, trades, max_dd = run_v17_backtest(assets_data, initial_capital=1000.0)
+    final_cap, trades, max_dd = run_v18_sniper_backtest(assets_data, initial_capital=1000.0)
     
     win_trades = [t for t in trades if t.get('result') == 'TP']
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
-    print("=== گزارش بک‌تست ربات نسخه v17.0 (بهینه‌سازی RSI) ===")
+    print("=== گزارش بک‌تست ربات نسخه v18.0 (استراتژی تک‌تیرانداز) ===")
     print("="*50)
     print(f"موجودی اولیه: $1000.00")
     print(f"موجودی نهایی: ${final_cap:.2f}")
