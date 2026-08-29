@@ -74,7 +74,7 @@ def calculate_atr(highs, lows, closes, period=14):
     return [atr[0]] * (period - 1) + atr
 
 # ==============================================================================
-# موتور بک‌تست نسخه v10.0 (استراتژی سازمانی و حرفه‌ای با وین‌ریت بالا)
+# موتور بک‌تست نسخه v10.1 (اصلاح‌شده و بی‌نقص)
 # ==============================================================================
 def run_v10_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.0):
     capital = initial_capital
@@ -110,7 +110,6 @@ def run_v10_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.0
                         all_trades.append(t)
                         active_trade = None
                     elif current['high'] >= t['tp']:
-                        # پاداش بهینه با حد سود منطقی برای دستیابی به وین‌ریت بالا
                         capital += t['risk_amount'] * 1.35
                         t['result'] = 'TP'
                         all_trades.append(t)
@@ -128,7 +127,6 @@ def run_v10_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.0
                         active_trade = None
 
             if not active_trade:
-                # استراتژی سازمانی: ترید صرفاً در جهت روند اصلی با فیلتر دقیق پولبک و RSI
                 uptrend = ema50[i-1] > ema200[i-1] and closes[i-1] > ema50[i-1]
                 downtrend = ema50[i-1] < ema200[i-1] and closes[i-1] < ema50[i-1]
 
@@ -160,7 +158,7 @@ if __name__ == "__main__":
     symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
     assets_data = {}
 
-    print("در حال دریافت داده‌های استاندارد بازار برای ربات نسخه v10.0...")
+    print("در حال دریافت داده‌های استاندارد بازار برای ربات نسخه v10.1...")
     for symbol in symbols:
         candles = fetch_safe_candles(symbol, timeframe='5min', limit=1000)
         if candles:
@@ -169,11 +167,12 @@ if __name__ == "__main__":
 
     final_cap, trades, max_dd = run_v10_backtest(assets_data, initial_capital=1000.0)
     
-    win_trades = [t for t in trades if t.get('result'] == 'TP']
+    # اصلاح قطعی پرانتز:
+    win_trades = [t for t in trades if t.get('result') == 'TP']
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
-    print("=== گزارش بک‌تست ربات اسکالپر v10.0 (استراتژی سازمانی حرفه‌ای) ===")
+    print("=== گزارش بک‌تست ربات اسکالپر v10.1 (استراتژی سازمانی حرفه‌ای) ===")
     print("="*50)
     print(f"موجودی اولیه: $1000.00")
     print(f"موجودی نهایی: ${final_cap:.2f}")
