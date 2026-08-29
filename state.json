@@ -13,7 +13,7 @@
     },
     "signal_candle": 1786363200,
     "signal_time": 1787987440,
-    "last_checked_1h": 1787983200,
+    "last_checked_1h": 1787986800,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
     "position": {
@@ -50,7 +50,7 @@
     "last_signal_day": "2026-08-14",
     "signal_candle": 1786665600,
     "signal_time": 1787406299,
-    "last_checked_1h": 1787983200,
+    "last_checked_1h": 1787986800,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
     "signal_candle_1h": 1787209200,
@@ -76,7 +76,7 @@
     },
     "signal_candle": 1787097600,
     "signal_time": 1787754561,
-    "last_checked_1h": 1787983200,
+    "last_checked_1h": 1787986800,
     "last_signal_id": "1786867200_SHORT",
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "signal_candle_utc": "2026-08-19 00:00:00",
@@ -84,7 +84,7 @@
     "position": null
   },
   "BTC": {
-    "last_checked_1h": 1787983200,
+    "last_checked_1h": 1787986800,
     "last_signal_id": "1786870800_SHORT",
     "last_signal": {
       "direction": "LONG",
@@ -118,7 +118,7 @@
     }
   },
   "ADA": {
-    "last_checked_1h": 1787983200,
+    "last_checked_1h": 1787986800,
     "last_signal_id": "1786874400_SHORT",
     "last_signal": {
       "direction": "SHORT",
@@ -151,7 +151,7 @@
     },
     "signal_candle": 1786896000,
     "signal_time": 1787973077,
-    "last_checked_1h": 1787983200,
+    "last_checked_1h": 1787986800,
     "last_signal_id": "1786863600_LONG",
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
@@ -184,7 +184,7 @@
     },
     "signal_candle": 1787097600,
     "signal_time": 1787987443,
-    "last_checked_1h": 1787983200,
+    "last_checked_1h": 1787986800,
     "last_checked_candle_utc": "2026-08-19 00:00:00",
     "signal_candle_utc": "2026-08-19 00:00:00",
     "last_checked_1h_candle": 1787227200,
