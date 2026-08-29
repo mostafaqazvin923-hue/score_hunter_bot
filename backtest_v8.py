@@ -52,7 +52,7 @@ def calculate_atr(highs, lows, closes, period=14):
     return [atr[0]] * (period - 1) + atr
 
 # ==============================================================================
-# موتور بک‌تست نسخه v15.1 (بازه بزرگ‌تر روی داده‌های واقعی)
+# موتور بک‌تست نسخه v15.2 (بازه بزرگ‌تر روی داده‌های واقعی)
 # ==============================================================================
 def run_v15_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.5):
     capital = initial_capital
@@ -148,11 +148,12 @@ if __name__ == "__main__":
 
     final_cap, trades, max_dd = run_v15_backtest(assets_data, initial_capital=1000.0)
     
-    win_trades = [t for t in trades if t.get('result'] == 'TP']
+    # اصلاح خطای پرانتز در این بخش
+    win_trades = [t for t in trades if t.get('result') == 'TP']
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
-    print("=== گزارش بک‌تست ربات نسخه v15.1 (بازه طولانی‌تر) ===")
+    print("=== گزارش بک‌تست ربات نسخه v15.2 (بازه طولانی‌تر) ===")
     print("="*50)
     print(f"موجودی اولیه: $1000.00")
     print(f"موجودی نهایی: ${final_cap:.2f}")
