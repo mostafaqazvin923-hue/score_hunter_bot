@@ -27,7 +27,6 @@ def fetch_safe_candles(symbol, timeframe='5min', limit=1000):
             candles.sort(key=lambda x: x['timestamp'])
             return candles
         
-        # حالت جایگزین در صورت نیاز
         params_alt = {"market": market, "limit": limit, "interval": timeframe}
         response_alt = requests.get(url, params=params_alt, timeout=10)
         data_alt = response_alt.json()
@@ -96,7 +95,7 @@ def calculate_atr(highs, lows, closes, period=14):
     return [atr[0]] * (period - 1) + atr
 
 # ==============================================================================
-# موتور بک‌تست نسخه v9.2 (فعال، استاندارد و باینری قوی)
+# موتور بک‌تست نسخه v9.2 (فعال و استاندارد)
 # ==============================================================================
 def run_v9_2_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.5, risk_per_trade_pct=1.5):
     capital = initial_capital
@@ -149,7 +148,6 @@ def run_v9_2_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.5, risk_pe
                         active_trade = None
 
             if not active_trade:
-                # منطق اصلاح‌شده برای گرفتن سیگنال‌های روان و باکیفیت در تایم ۵ دقیقه
                 long_cond = (ema5[i-1] > ema12[i-1]) and (rsi[i-1] < 48) and (prev['close'] > prev['open'])
                 short_cond = (ema5[i-1] < ema12[i-1]) and (rsi[i-1] > 52) and (prev['close'] < prev['open'])
 
@@ -188,7 +186,8 @@ if __name__ == "__main__":
 
     final_cap, trades, max_dd = run_v9_2_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.5)
     
-    win_trades = [t for t in trades if t.get('result'] == 'TP']
+    # اصلاح اصولی پرانتز در خط زیر:
+    win_trades = [t for t in trades if t.get('result') == 'TP']
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
