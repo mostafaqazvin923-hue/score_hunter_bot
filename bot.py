@@ -1,26 +1,18 @@
 import json
 import urllib.request
-import time
 import requests
 
 # =========================================================
-# 1. تنظیمات تلگرام (این دو مورد را با اطلاعات خودت پر کن)
+# 1. تنظیمات تلگرام
 # =========================================================
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # توکن رباتت
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"      # آیدی کانال یا چت شخصی‌ات
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
 
-# لیست ۱۰ ارز مورد نظر با فرمت OKX
 SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "DOGE-USDT", "DYDX-USDT",
     "LINK-USDT", "ADA-USDT", "XRP-USDT", "NEAR-USDT", "AVAX-USDT"
 ]
 
-# حافظه برای جلوگیری از ارسال سیگنال تکراری
-last_signals = {s: None for s in SYMBOLS}
-
-# =========================================================
-# 2. توابع ارسال پیام و دریافت دیتا
-# =========================================================
 def send_telegram_message(message):
     """ارسال پیام به تلگرام"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -35,7 +27,7 @@ def send_telegram_message(message):
         print(f"خطا در ارسال پیام به تلگرام: {e}")
 
 def get_crypto_klines_okx(symbol, bar="15m", limit=150):
-    """دریافت کندل‌ها از OKX (بدون تحریم و بدون کلید)"""
+    """دریافت کندل‌ها از OKX"""
     url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={bar}&limit={limit}"
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     try:
@@ -69,9 +61,6 @@ def calculate_ema(prices, span):
         ema.append(p * alpha + ema[-1] * (1 - alpha))
     return ema
 
-# =========================================================
-# 3. منطق تحلیلی استراتژی (نسخه v8.16)
-# =========================================================
 def analyze_and_signal(symbol):
     klines_15m = get_crypto_klines_okx(symbol=symbol, bar="15m", limit=150)
     if not klines_15m or len(klines_15m) < 100:
@@ -112,7 +101,7 @@ def analyze_and_signal(symbol):
     # EMA 100
     ema_htf = calculate_ema(closes, 100)
 
-    # بررسی کندل قبلی (آخرین کندلِ تمام‌شده)
+    # بررسی کندل قبلی (آخرین کندل بسته شده)
     idx = -2
     c_close = closes[idx]
     c_atr = atr_smooth[idx]
@@ -128,22 +117,18 @@ def analyze_and_signal(symbol):
     signal_type = None
     entry_price = c_close
 
-    # شرط ورود به پوزیشن LONG
+    # شرط ورود
     if (c_close > htf_trend) and (c_close > upper_break) and (c_rsi > 50):
         signal_type = "LONG 🟩"
         sl = entry_price - (c_atr * atr_sl_mult)
         tp = entry_price + ((entry_price - sl) * rr_ratio)
 
-    # شرط ورود به پوزیشن SHORT
     elif (c_close < htf_trend) and (c_close < lower_break) and (c_rsi < 50):
         signal_type = "SHORT 🟥"
         sl = entry_price + (c_atr * atr_sl_mult)
         tp = entry_price - ((sl - entry_price) * rr_ratio)
 
-    # اگر سیگنال جدید بود و قبلاً فرستاده نشده بود
-    if signal_type and last_signals[symbol] != (signal_type, entry_price):
-        last_signals[symbol] = (signal_type, entry_price)
-        
+    if signal_type:
         msg = (
             f"🚨 **سیگنال جدید Score Hunter** 🚨\n\n"
             f"📌 **ارز:** `{symbol}`\n"
@@ -154,23 +139,14 @@ def analyze_and_signal(symbol):
             f"⏰ **تایم‌فریم:** 15m\n"
             f"⚖️ **ریسک به ریوارد:** 1:1.5"
         )
-        print(f"[{symbol}] سیگنال جدید پیدا شد -> ارسال به تلگرام")
+        print(f"[{symbol}] سیگنال {signal_type} ارسال شد.")
         send_telegram_message(msg)
 
-# =========================================================
-# 4. اجرای مداوم ربات
-# =========================================================
 def main():
-    print("=== ربات Score Hunter Pro با موفقیت روشن شد ===")
-    print("در حال اسکن بازار...")
-    
-    while True:
-        for symbol in SYMBOLS:
-            analyze_and_signal(symbol)
-            time.sleep(1) # وقفه ۱ ثانیه‌ای بین ارزها
-        
-        # ۶۰ ثانیه صبر می‌کنه و دوباره ۱۰ ارز رو بررسی می‌کنه
-        time.sleep(60)
+    print("شروع اسکن بازار توسط GitHub Actions...")
+    for symbol in SYMBOLS:
+        analyze_and_signal(symbol)
+    print("اسکن تمام شد.")
 
 if __name__ == "__main__":
     main()
