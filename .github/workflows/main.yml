@@ -1,45 +1,24 @@
 name: Score Hunter Bot
 
 on:
-  workflow_dispatch:
-
   schedule:
-    # Run once every hour, around minute 5
-    - cron: "5 * * * *"
-
-concurrency:
-  group: score-hunter-bot
-  cancel-in-progress: false
-
-permissions:
-  contents: write
+    - cron: '*/15 * * * *'  # اجرا خودکار هر ۱۵ دقیقه
+  workflow_dispatch:        # قابلیت اجرای دستی
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.12"
+          python-version: '3.x'
 
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run Score Hunter
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Run Bot Script
         run: python bot.py
-
-      - name: Save price state
-        run: |
-          git config user.name "Score Hunter Bot"
-          git config user.email "score-hunter-bot@users.noreply.github.com"
-          git add state.json
-          git diff --cached --quiet || git commit -m "Update price state"
-          git push
