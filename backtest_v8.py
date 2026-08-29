@@ -6,84 +6,78 @@ from datetime import datetime, timezone
 
 
 # ============================================================
-# COINEX FUTURES REAL DATA BACKTEST
+# SCORE HUNTER
+# LBank REAL DATA BACKTEST
 #
-# 15M TREND + BREAKOUT / PULLBACK
-# REAL COINEX DATA
-# PAGINATED HISTORICAL DOWNLOAD
-# NO PANDAS
-# NO NUMPY
+# ORIGINAL STRATEGY:
+# EMA 10 / 30 / 100
+# STRONG CANDLE >= 75%
+# VOLUME >= 2.0x average volume
+# ATR 14
+# SL = 1.2 ATR / SWING
+# TP = 2R
 # CLOSED CANDLE ONLY
 # ENTRY = NEXT CANDLE OPEN
 #
-# Indicators:
-# EMA 20 / 50 / 200
-# RSI 14
-# ATR 14
-# ADX 14
-# Volume confirmation
-#
-# Risk:
-# SL = max(structure, ATR)
-# TP = 2R
-#
+# NO PANDAS
+# NO NUMPY
 # ============================================================
-
-
-API_URL = "https://api.coinex.com/v2/futures/kline"
 
 
 # ============================================================
 # SETTINGS
 # ============================================================
 
+BASE_URL = "https://api.lbank.info/v2/kline.do"
+
 SYMBOLS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "SOLUSDT",
-    "XRPUSDT",
-    "AVAXUSDT",
-    "LINKUSDT",
+    "btc_usdt",
+    "eth_usdt",
+    "sol_usdt",
+    "xrp_usdt",
+    "avax_usdt",
+    "link_usdt",
 ]
 
-PERIOD = "15min"
+TIMEFRAME = "minute15"
 
-# Six months approximately
-DAYS = 180
+# Number of REAL historical 15m candles requested
+TARGET_CANDLES = 20000
 
-INITIAL_CAPITAL = 1000.0
+# LBank maximum size per request
+PAGE_SIZE = 2000
 
-RISK_PER_TRADE = 0.01
-
-RR = 2.0
+EMA_FAST = 10
+EMA_MID = 30
+EMA_SLOW = 100
 
 ATR_PERIOD = 14
-RSI_PERIOD = 14
-ADX_PERIOD = 14
 
-EMA_FAST = 20
-EMA_MID = 50
-EMA_SLOW = 200
+VOLUME_LOOKBACK = 14
+VOLUME_MULTIPLIER = 2.0
 
-BREAKOUT_LOOKBACK = 20
-PULLBACK_LOOKBACK = 8
+STRONG_BODY_RATIO = 0.75
 
-VOLUME_LOOKBACK = 20
-VOLUME_MULTIPLIER = 1.20
+SWING_LOOKBACK = 10
 
-ADX_MIN = 20.0
+ATR_SL_MULTIPLIER = 1.2
 
-ATR_SL_MULTIPLIER = 1.20
+RR_RATIO = 2.0
 
-MAX_BARS = 18000
+# ------------------------------------------------------------
+# REALISTIC COSTS
+#
+# Set to zero if you want a pure price-action comparison
+# with the original backtest.
+# ------------------------------------------------------------
 
-FEE_RATE = 0.0005
+FEE_PER_SIDE = 0.0005       # 0.05%
+SLIPPAGE_PER_SIDE = 0.0002  # 0.02%
 
-SLIPPAGE = 0.0002
+# Risk percentage
+RISK_PER_TRADE = 1.0
 
-REQUEST_LIMIT = 1000
-
-REQUEST_SLEEP = 0.15
+INITIAL_CAPITAL = 1000.0
 
 
 # ============================================================
@@ -96,7 +90,7 @@ def http_get(url, params):
 
     full_url = url + "?" + query
 
-    req = urllib.request.Request(
+    request = urllib.request.Request(
         full_url,
         headers={
             "User-Agent": "Mozilla/5.0"
@@ -104,81 +98,99 @@ def http_get(url, params):
     )
 
     with urllib.request.urlopen(
-        req,
+        request,
         timeout=30
     ) as response:
 
-        raw = response.read().decode(
-            "utf-8"
-        )
+        raw = response.read().decode("utf-8")
 
     return json.loads(raw)
 
 
 # ============================================================
-# COINEX DATA
+# GET LBANK KLINES
 # ============================================================
 
-def download_coinex_klines(
-    symbol,
-    days=DAYS
-):
-
-    now_ms = int(
-        time.time() * 1000
-    )
-
-    start_ms = (
-        now_ms
-        - days
-        * 24
-        * 60
-        * 60
-        * 1000
-    )
-
-    end_ms = now_ms
+def get_klines(symbol, target):
 
     all_candles = []
 
-    print(
-        f"Downloading {symbol}..."
+    # Current time in seconds
+    now = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
     )
 
-    while start_ms < end_ms:
+    # 15 minutes
+    interval_seconds = 15 * 60
 
-        params = {
-            "market": symbol,
-            "period": PERIOD,
-            "limit": REQUEST_LIMIT,
-            "start_time": start_ms,
-            "end_time": end_ms
-        }
+    # Start sufficiently far in the past
+    cursor = (
+        now
+        - target * interval_seconds
+    )
+
+    print(
+        f"Downloading {symbol.upper()}..."
+    )
+
+    while len(all_candles) < target:
+
+        remaining = (
+            target
+            - len(all_candles)
+        )
+
+        size = min(
+            PAGE_SIZE,
+            remaining
+        )
 
         try:
 
             data = http_get(
-                API_URL,
-                params
+                BASE_URL,
+                {
+                    "symbol": symbol,
+                    "size": size,
+                    "type": TIMEFRAME,
+                    "time": str(cursor)
+                }
             )
 
         except Exception as e:
 
             print(
-                f"{symbol} request error: "
+                f"{symbol.upper()} HTTP ERROR: "
                 f"{type(e).__name__}: {e}"
             )
 
-            time.sleep(2)
+            break
 
-            continue
+        if not isinstance(data, dict):
 
-        if data.get("code") != 0:
-
-            raise RuntimeError(
-                f"{symbol}: "
-                f"{data.get('message')}"
+            print(
+                f"{symbol.upper()}: "
+                f"Unexpected response."
             )
+
+            break
+
+        if data.get("result") not in (
+            True,
+            "true",
+            "TRUE",
+            None
+        ):
+
+            print(
+                f"{symbol.upper()}: "
+                f"LBank response error: "
+                f"{data}"
+            )
+
+            break
 
         rows = data.get(
             "data",
@@ -187,68 +199,83 @@ def download_coinex_klines(
 
         if not rows:
 
+            print(
+                f"{symbol.upper()}: "
+                f"No more historical candles."
+            )
+
             break
 
         batch = []
 
         for row in rows:
 
-            candle = {
-                "time": int(
-                    row["created_at"]
-                ),
-                "open": float(
-                    row["open"]
-                ),
-                "close": float(
-                    row["close"]
-                ),
-                "high": float(
-                    row["high"]
-                ),
-                "low": float(
-                    row["low"]
-                ),
-                "volume": float(
-                    row["volume"]
-                )
-            }
+            if len(row) < 6:
+                continue
 
-            batch.append(candle)
+            try:
+
+                candle = {
+                    "time": int(
+                        float(row[0])
+                    ),
+
+                    "open": float(
+                        row[1]
+                    ),
+
+                    "high": float(
+                        row[2]
+                    ),
+
+                    "low": float(
+                        row[3]
+                    ),
+
+                    "close": float(
+                        row[4]
+                    ),
+
+                    "volume": float(
+                        row[5]
+                    )
+                }
+
+                batch.append(candle)
+
+            except Exception:
+
+                continue
+
+        if not batch:
+            break
 
         all_candles.extend(batch)
 
-        oldest = min(
-            c["time"]
-            for c in batch
-        )
-
-        newest = max(
-            c["time"]
-            for c in batch
-        )
-
-        # Move backward in time.
-        new_end = oldest - 1
-
-        if new_end >= end_ms:
-
-            break
-
-        end_ms = new_end
-
         print(
-            f"{symbol}: "
+            f"{symbol.upper()}: "
             f"{len(all_candles)} candles"
         )
 
-        if len(all_candles) >= MAX_BARS:
-
-            break
-
-        time.sleep(
-            REQUEST_SLEEP
+        # Move cursor forward.
+        newest_time = max(
+            c["time"]
+            for c in batch
         )
+
+        cursor = (
+            newest_time
+            + interval_seconds
+        )
+
+        # Protection against duplicate responses
+        if len(batch) < size:
+
+            # Try one more request.
+            if len(all_candles) >= target:
+                break
+
+        time.sleep(0.15)
 
     # --------------------------------------------------------
     # Remove duplicates
@@ -271,50 +298,72 @@ def download_coinex_klines(
     )
 
     # --------------------------------------------------------
-    # Remove current candle
+    # Remove currently forming candle
     # --------------------------------------------------------
 
-    if len(candles) > 1:
+    current_time = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
 
-        candles = candles[:-1]
+    closed = []
+
+    for candle in candles:
+
+        candle_end = (
+            candle["time"]
+            + interval_seconds
+        )
+
+        if candle_end <= current_time:
+            closed.append(candle)
+
+    candles = closed
+
+    # Keep latest target candles
+    if len(candles) > target:
+        candles = candles[-target:]
 
     print(
-        f"{symbol}: "
-        f"{len(candles)} closed candles"
+        f"{symbol.upper()}: "
+        f"{len(candles)} CLOSED candles"
     )
 
     return candles
 
 
 # ============================================================
-# EMA
+# EMA SERIES
 # ============================================================
 
-def calculate_ema(
-    values,
-    period
-):
+def ema_series(values, period):
+
+    result = [
+        None
+        for _ in values
+    ]
 
     if len(values) < period:
+        return result
 
-        return [None] * len(values)
-
-    result = [None] * len(values)
-
-    seed = sum(
-        values[:period]
-    ) / period
+    sma = (
+        sum(
+            values[:period]
+        )
+        / period
+    )
 
     result[
         period - 1
-    ] = seed
+    ] = sma
 
     multiplier = (
         2.0
         / (period + 1)
     )
 
-    previous = seed
+    previous = sma
 
     for i in range(
         period,
@@ -338,602 +387,90 @@ def calculate_ema(
 
 
 # ============================================================
-# ATR
+# ATR SERIES
 # ============================================================
 
-def calculate_atr(
-    candles,
-    period
-):
+def atr_series(candles, period):
 
     result = [
         None
-    ] * len(candles)
+        for _ in candles
+    ]
 
     if len(candles) <= period:
-
         return result
 
     trs = []
 
     for i in range(
-        1,
         len(candles)
     ):
 
-        current = candles[i]
+        if i == 0:
 
-        previous = candles[
-            i - 1
-        ]
-
-        tr = max(
-            current["high"]
-            - current["low"],
-
-            abs(
-                current["high"]
-                - previous["close"]
-            ),
-
-            abs(
-                current["low"]
-                - previous["close"]
+            tr = (
+                candles[i]["high"]
+                - candles[i]["low"]
             )
-        )
+
+        else:
+
+            high = candles[i]["high"]
+            low = candles[i]["low"]
+
+            previous_close = (
+                candles[i - 1]["close"]
+            )
+
+            tr = max(
+                high - low,
+                abs(
+                    high
+                    - previous_close
+                ),
+                abs(
+                    low
+                    - previous_close
+                )
+            )
 
         trs.append(tr)
 
-    if len(trs) < period:
-
-        return result
-
-    value = (
+    initial = (
         sum(
-            trs[:period]
+            trs[1:period + 1]
         )
         / period
     )
 
-    result[period] = value
+    result[period] = initial
 
-    for j in range(
-        period,
-        len(trs)
-    ):
-
-        value = (
-            (
-                value
-                * (period - 1)
-                + trs[j]
-            )
-            / period
-        )
-
-        result[j + 1] = value
-
-    return result
-
-
-# ============================================================
-# RSI
-# ============================================================
-
-def calculate_rsi(
-    candles,
-    period
-):
-
-    result = [
-        None
-    ] * len(candles)
-
-    if len(candles) <= period:
-
-        return result
-
-    gains = []
-    losses = []
+    previous_atr = initial
 
     for i in range(
-        1,
+        period + 1,
         len(candles)
     ):
 
-        change = (
-            candles[i]["close"]
-            - candles[i - 1]["close"]
-        )
-
-        gains.append(
-            max(change, 0.0)
-        )
-
-        losses.append(
-            max(-change, 0.0)
-        )
-
-    avg_gain = (
-        sum(
-            gains[:period]
-        )
-        / period
-    )
-
-    avg_loss = (
-        sum(
-            losses[:period]
-        )
-        / period
-    )
-
-    def rsi_value():
-
-        if avg_loss == 0:
-
-            return 100.0
-
-        rs = (
-            avg_gain
-            / avg_loss
-        )
-
-        return (
-            100
-            - 100
-            / (1 + rs)
-        )
-
-    result[period] = rsi_value()
-
-    for i in range(
-        period,
-        len(gains)
-    ):
-
-        avg_gain = (
+        previous_atr = (
             (
-                avg_gain
+                previous_atr
                 * (period - 1)
-                + gains[i]
+                + trs[i]
             )
             / period
         )
 
-        avg_loss = (
-            (
-                avg_loss
-                * (period - 1)
-                + losses[i]
-            )
-            / period
-        )
-
-        if avg_loss == 0:
-
-            result[
-                i + 1
-            ] = 100.0
-
-        else:
-
-            rs = (
-                avg_gain
-                / avg_loss
-            )
-
-            result[
-                i + 1
-            ] = (
-                100
-                - 100
-                / (1 + rs)
-            )
+        result[i] = previous_atr
 
     return result
 
 
 # ============================================================
-# ADX
+# STRONG CANDLE
 # ============================================================
 
-def calculate_adx(
-    candles,
-    period
-):
-
-    result = [
-        None
-    ] * len(candles)
-
-    if len(candles) < (
-        period * 2 + 2
-    ):
-
-        return result
-
-    tr = []
-    plus_dm = []
-    minus_dm = []
-
-    for i in range(
-        1,
-        len(candles)
-    ):
-
-        c = candles[i]
-        p = candles[i - 1]
-
-        tr_value = max(
-            c["high"] - c["low"],
-
-            abs(
-                c["high"]
-                - p["close"]
-            ),
-
-            abs(
-                c["low"]
-                - p["close"]
-            )
-        )
-
-        up = (
-            c["high"]
-            - p["high"]
-        )
-
-        down = (
-            p["low"]
-            - c["low"]
-        )
-
-        plus = (
-            up
-            if (
-                up > down
-                and up > 0
-            )
-            else 0.0
-        )
-
-        minus = (
-            down
-            if (
-                down > up
-                and down > 0
-            )
-            else 0.0
-        )
-
-        tr.append(
-            tr_value
-        )
-
-        plus_dm.append(
-            plus
-        )
-
-        minus_dm.append(
-            minus
-        )
-
-    atr_value = (
-        sum(
-            tr[:period]
-        )
-        / period
-    )
-
-    plus_value = (
-        sum(
-            plus_dm[:period]
-        )
-        / period
-    )
-
-    minus_value = (
-        sum(
-            minus_dm[:period]
-        )
-        / period
-    )
-
-    dx = []
-
-    for i in range(
-        period,
-        len(tr)
-    ):
-
-        atr_value = (
-            (
-                atr_value
-                * (period - 1)
-                + tr[i]
-            )
-            / period
-        )
-
-        plus_value = (
-            (
-                plus_value
-                * (period - 1)
-                + plus_dm[i]
-            )
-            / period
-        )
-
-        minus_value = (
-            (
-                minus_value
-                * (period - 1)
-                + minus_dm[i]
-            )
-            / period
-        )
-
-        if atr_value == 0:
-
-            dx.append(0.0)
-
-            continue
-
-        plus_di = (
-            100
-            * plus_value
-            / atr_value
-        )
-
-        minus_di = (
-            100
-            * minus_value
-            / atr_value
-        )
-
-        total = (
-            plus_di
-            + minus_di
-        )
-
-        if total == 0:
-
-            dx.append(0.0)
-
-        else:
-
-            dx.append(
-                100
-                * abs(
-                    plus_di
-                    - minus_di
-                )
-                / total
-            )
-
-    if len(dx) < period:
-
-        return result
-
-    adx_value = (
-        sum(
-            dx[:period]
-        )
-        / period
-    )
-
-    index = (
-        period
-        + period
-    )
-
-    result[index] = adx_value
-
-    for i in range(
-        period,
-        len(dx)
-    ):
-
-        adx_value = (
-            (
-                adx_value
-                * (period - 1)
-                + dx[i]
-            )
-            / period
-        )
-
-        index = (
-            i
-            + period
-        )
-
-        if index < len(result):
-
-            result[index] = (
-                adx_value
-            )
-
-    return result
-
-
-# ============================================================
-# UTILITY
-# ============================================================
-
-def average(
-    values
-):
-
-    if not values:
-
-        return 0.0
-
-    return (
-        sum(values)
-        / len(values)
-    )
-
-
-# ============================================================
-# SIGNAL
-# ============================================================
-
-def generate_signal(
-    candles,
-    i,
-    ema20,
-    ema50,
-    ema200,
-    rsi,
-    atr,
-    adx
-):
-
-    if i < 250:
-
-        return None
-
-    if (
-        ema20[i] is None
-        or ema50[i] is None
-        or ema200[i] is None
-        or rsi[i] is None
-        or atr[i] is None
-        or adx[i] is None
-    ):
-
-        return None
-
-    candle = candles[i]
-
-    previous = candles[
-        i - 1
-    ]
-
-    # --------------------------------------------------------
-    # Trend
-    # --------------------------------------------------------
-
-    bullish_trend = (
-        ema20[i]
-        > ema50[i]
-        > ema200[i]
-    )
-
-    bearish_trend = (
-        ema20[i]
-        < ema50[i]
-        < ema200[i]
-    )
-
-    # --------------------------------------------------------
-    # EMA slope
-    # --------------------------------------------------------
-
-    if i < 5:
-
-        return None
-
-    bull_slope = (
-        ema20[i]
-        > ema20[i - 5]
-        and ema50[i]
-        > ema50[i - 5]
-    )
-
-    bear_slope = (
-        ema20[i]
-        < ema20[i - 5]
-        and ema50[i]
-        < ema50[i - 5]
-    )
-
-    # --------------------------------------------------------
-    # ADX
-    # --------------------------------------------------------
-
-    if adx[i] < ADX_MIN:
-
-        return None
-
-    # --------------------------------------------------------
-    # Volume
-    # --------------------------------------------------------
-
-    if i < (
-        VOLUME_LOOKBACK
-        + 1
-    ):
-
-        return None
-
-    volumes = [
-        candles[j]["volume"]
-        for j in range(
-            i - VOLUME_LOOKBACK,
-            i
-        )
-    ]
-
-    avg_volume = average(
-        volumes
-    )
-
-    if avg_volume <= 0:
-
-        return None
-
-    volume_ok = (
-        candle["volume"]
-        >=
-        avg_volume
-        * VOLUME_MULTIPLIER
-    )
-
-    # --------------------------------------------------------
-    # Previous structure
-    # --------------------------------------------------------
-
-    start = max(
-        0,
-        i - BREAKOUT_LOOKBACK
-    )
-
-    previous_high = max(
-        candles[j]["high"]
-        for j in range(
-            start,
-            i
-        )
-    )
-
-    previous_low = min(
-        candles[j]["low"]
-        for j in range(
-            start,
-            i
-        )
-    )
-
-    # --------------------------------------------------------
-    # Breakout
-    # --------------------------------------------------------
-
-    bullish_breakout = (
-        candle["close"]
-        > previous_high
-    )
-
-    bearish_breakout = (
-        candle["close"]
-        < previous_low
-    )
-
-    # --------------------------------------------------------
-    # Candle strength
-    # --------------------------------------------------------
+def strong_bull(candle):
 
     candle_range = (
         candle["high"]
@@ -941,557 +478,616 @@ def generate_signal(
     )
 
     if candle_range <= 0:
+        return False
 
-        return None
-
-    body = abs(
+    body = (
         candle["close"]
         - candle["open"]
     )
 
-    body_ratio = (
-        body
-        / candle_range
+    return (
+        body > 0
+        and (
+            body
+            / candle_range
+        ) >= STRONG_BODY_RATIO
     )
 
-    bullish_candle = (
-        candle["close"]
-        > candle["open"]
-        and body_ratio >= 0.55
+
+def strong_bear(candle):
+
+    candle_range = (
+        candle["high"]
+        - candle["low"]
     )
 
-    bearish_candle = (
-        candle["close"]
-        < candle["open"]
-        and body_ratio >= 0.55
+    if candle_range <= 0:
+        return False
+
+    body = (
+        candle["open"]
+        - candle["close"]
     )
 
-    # --------------------------------------------------------
-    # Pullback
-    # --------------------------------------------------------
-
-    pullback_long = False
-    pullback_short = False
-
-    for j in range(
-        max(
-            0,
-            i - PULLBACK_LOOKBACK
-        ),
-        i
-    ):
-
-        c = candles[j]
-
-        if (
-            c["low"]
-            <= ema20[j]
-            and c["close"]
-            > ema20[j]
-        ):
-
-            pullback_long = True
-
-        if (
-            c["high"]
-            >= ema20[j]
-            and c["close"]
-            < ema20[j]
-        ):
-
-            pullback_short = True
-
-    # --------------------------------------------------------
-    # LONG
-    # --------------------------------------------------------
-
-    long_breakout = (
-        bullish_trend
-        and bull_slope
-        and bullish_breakout
-        and bullish_candle
-        and volume_ok
-        and 52 <= rsi[i] <= 72
+    return (
+        body > 0
+        and (
+            body
+            / candle_range
+        ) >= STRONG_BODY_RATIO
     )
-
-    long_pullback = (
-        bullish_trend
-        and bull_slope
-        and pullback_long
-        and bullish_candle
-        and volume_ok
-        and 50 <= rsi[i] <= 68
-    )
-
-    if (
-        long_breakout
-        or long_pullback
-    ):
-
-        setup = (
-            "BREAKOUT"
-            if long_breakout
-            else "PULLBACK"
-        )
-
-        return {
-            "direction": "LONG",
-            "setup": setup
-        }
-
-    # --------------------------------------------------------
-    # SHORT
-    # --------------------------------------------------------
-
-    short_breakout = (
-        bearish_trend
-        and bear_slope
-        and bearish_breakout
-        and bearish_candle
-        and volume_ok
-        and 28 <= rsi[i] <= 48
-    )
-
-    short_pullback = (
-        bearish_trend
-        and bear_slope
-        and pullback_short
-        and bearish_candle
-        and volume_ok
-        and 32 <= rsi[i] <= 50
-    )
-
-    if (
-        short_breakout
-        or short_pullback
-    ):
-
-        setup = (
-            "BREAKOUT"
-            if short_breakout
-            else "PULLBACK"
-        )
-
-        return {
-            "direction": "SHORT",
-            "setup": setup
-        }
-
-    return None
 
 
 # ============================================================
-# BACKTEST
+# BACKTEST ONE SYMBOL
 # ============================================================
 
-def run_backtest(
+def backtest_symbol(
+    symbol,
     candles
 ):
+
+    if len(candles) < 300:
+
+        return {
+            "symbol": symbol,
+            "trades": [],
+            "capital": INITIAL_CAPITAL,
+            "max_drawdown": 0.0
+        }
 
     closes = [
         c["close"]
         for c in candles
     ]
 
-    ema20 = calculate_ema(
+    volumes = [
+        c["volume"]
+        for c in candles
+    ]
+
+    ema10 = ema_series(
         closes,
         EMA_FAST
     )
 
-    ema50 = calculate_ema(
+    ema30 = ema_series(
         closes,
         EMA_MID
     )
 
-    ema200 = calculate_ema(
+    ema100 = ema_series(
         closes,
         EMA_SLOW
     )
 
-    atr = calculate_atr(
+    atr = atr_series(
         candles,
         ATR_PERIOD
     )
 
-    rsi = calculate_rsi(
-        candles,
-        RSI_PERIOD
-    )
-
-    adx = calculate_adx(
-        candles,
-        ADX_PERIOD
-    )
-
     capital = INITIAL_CAPITAL
 
-    peak = capital
+    peak_capital = capital
 
     max_drawdown = 0.0
 
     trades = []
 
-    active = None
+    active_trade = None
+
+    # --------------------------------------------------------
+    # We use i as the CURRENT candle.
+    #
+    # Signal is generated using candle i-1.
+    # Entry is candle i OPEN.
+    #
+    # This prevents look-ahead.
+    # --------------------------------------------------------
 
     for i in range(
-        250,
-        len(candles) - 1
+        EMA_SLOW + 5,
+        len(candles)
     ):
 
-        candle = candles[i]
+        current = candles[i]
 
-        # ----------------------------------------------------
-        # Manage existing trade
-        # ----------------------------------------------------
+        previous = candles[i - 1]
 
-        if active is not None:
+        # ====================================================
+        # MANAGE EXISTING TRADE
+        # ====================================================
+
+        if active_trade is not None:
+
+            trade = active_trade
+
+            direction = trade["type"]
+
+            entry = trade["entry"]
+
+            sl = trade["sl"]
+
+            tp = trade["tp"]
 
             result = None
+
             exit_price = None
 
-            if active[
-                "direction"
-            ] == "LONG":
+            # ------------------------------------------------
+            # LONG
+            # ------------------------------------------------
 
-                if (
-                    candle["low"]
-                    <= active["sl"]
-                ):
+            if direction == "LONG":
+
+                hit_sl = (
+                    current["low"]
+                    <= sl
+                )
+
+                hit_tp = (
+                    current["high"]
+                    >= tp
+                )
+
+                if hit_sl and hit_tp:
+
+                    # Conservative assumption:
+                    # if both occur in same candle,
+                    # SL wins.
+                    result = "SL"
+                    exit_price = sl
+
+                elif hit_sl:
 
                     result = "SL"
+                    exit_price = sl
 
-                    exit_price = (
-                        active["sl"]
-                    )
-
-                elif (
-                    candle["high"]
-                    >= active["tp"]
-                ):
+                elif hit_tp:
 
                     result = "TP"
+                    exit_price = tp
 
-                    exit_price = (
-                        active["tp"]
-                    )
+            # ------------------------------------------------
+            # SHORT
+            # ------------------------------------------------
 
             else:
 
-                if (
-                    candle["high"]
-                    >= active["sl"]
-                ):
+                hit_sl = (
+                    current["high"]
+                    >= sl
+                )
+
+                hit_tp = (
+                    current["low"]
+                    <= tp
+                )
+
+                if hit_sl and hit_tp:
 
                     result = "SL"
+                    exit_price = sl
 
-                    exit_price = (
-                        active["sl"]
-                    )
+                elif hit_sl:
 
-                elif (
-                    candle["low"]
-                    <= active["tp"]
-                ):
+                    result = "SL"
+                    exit_price = sl
+
+                elif hit_tp:
 
                     result = "TP"
+                    exit_price = tp
 
-                    exit_price = (
-                        active["tp"]
-                    )
+            # ------------------------------------------------
+            # CLOSE TRADE
+            # ------------------------------------------------
 
-            if result:
+            if result is not None:
 
-                if active[
-                    "direction"
-                ] == "LONG":
+                risk_price = trade[
+                    "risk_price"
+                ]
+
+                if direction == "LONG":
 
                     gross_r = (
                         exit_price
-                        - active["entry"]
-                    ) / active["risk_distance"]
+                        - entry
+                    ) / risk_price
 
                 else:
 
                     gross_r = (
-                        active["entry"]
+                        entry
                         - exit_price
-                    ) / active["risk_distance"]
+                    ) / risk_price
 
-                # ------------------------------------------------
-                # Fees
-                # ------------------------------------------------
+                # Trading costs
+                total_cost = (
+                    FEE_PER_SIDE * 2
+                    + SLIPPAGE_PER_SIDE * 2
+                )
 
-                fee_cost = (
-                    FEE_RATE
-                    * 2.0
+                # Approximate R impact
+                cost_r = (
+                    total_cost
+                    * entry
+                    / risk_price
                 )
 
                 net_r = (
                     gross_r
-                    - (
-                        fee_cost
-                        / active["risk_percent"]
-                    )
+                    - cost_r
                 )
 
+                risk_amount = trade[
+                    "risk_amount"
+                ]
+
                 pnl = (
-                    active[
-                        "risk_amount"
-                    ]
-                    * net_r
+                    net_r
+                    * risk_amount
                 )
 
                 capital += pnl
 
                 trades.append({
+
+                    "symbol": symbol,
+
+                    "type": direction,
+
+                    "entry": entry,
+
+                    "sl": sl,
+
+                    "tp": tp,
+
+                    "exit": exit_price,
+
+                    "result": result,
+
+                    "gross_r": gross_r,
+
+                    "net_r": net_r,
+
+                    "pnl": pnl,
+
                     "entry_time":
-                        active["entry_time"],
+                        trade[
+                            "entry_time"
+                        ],
 
                     "exit_time":
-                        candle["time"],
-
-                    "direction":
-                        active["direction"],
-
-                    "setup":
-                        active["setup"],
-
-                    "entry":
-                        active["entry"],
-
-                    "sl":
-                        active["sl"],
-
-                    "tp":
-                        active["tp"],
-
-                    "result":
-                        result,
-
-                    "gross_r":
-                        gross_r,
-
-                    "net_r":
-                        net_r,
-
-                    "pnl":
-                        pnl
+                        current[
+                            "time"
+                        ]
                 })
 
-                active = None
+                active_trade = None
 
-                if capital > peak:
+                if capital > peak_capital:
 
-                    peak = capital
+                    peak_capital = capital
 
                 dd = (
                     (
-                        peak
+                        peak_capital
                         - capital
                     )
-                    / peak
-                    * 100
+                    / peak_capital
+                    * 100.0
                 )
 
-                max_drawdown = max(
-                    max_drawdown,
-                    dd
-                )
+                if dd > max_drawdown:
 
+                    max_drawdown = dd
+
+                # Do not open another trade
+                # on the same candle.
                 continue
 
-        # ----------------------------------------------------
-        # Do not open another position
-        # ----------------------------------------------------
+        # ====================================================
+        # NO ACTIVE TRADE
+        # CHECK SIGNAL
+        # ====================================================
 
-        if active is not None:
-
+        if active_trade is not None:
             continue
 
-        # ----------------------------------------------------
-        # Signal on CLOSED candle
-        # ----------------------------------------------------
-
-        signal = generate_signal(
-            candles,
-            i,
-            ema20,
-            ema50,
-            ema200,
-            rsi,
-            atr,
-            adx
-        )
-
-        if signal is None:
-
+        # Need enough history
+        if (
+            ema10[i - 1] is None
+            or ema30[i - 1] is None
+            or ema100[i - 1] is None
+            or atr[i - 1] is None
+        ):
             continue
 
-        # ----------------------------------------------------
-        # NEXT CANDLE OPEN
-        # ----------------------------------------------------
+        # ====================================================
+        # ORIGINAL TREND CONDITIONS
+        # ====================================================
 
-        next_candle = candles[
-            i + 1
-        ]
-
-        entry = (
-            next_candle["open"]
+        bull_trend = (
+            ema10[i - 1]
+            > ema30[i - 1]
+            > ema100[i - 1]
         )
 
-        # Slippage
-        if signal[
-            "direction"
-        ] == "LONG":
+        bear_trend = (
+            ema10[i - 1]
+            < ema30[i - 1]
+            < ema100[i - 1]
+        )
 
-            entry *= (
-                1.0
-                + SLIPPAGE
+        # ====================================================
+        # TREND MOMENTUM
+        # ====================================================
+
+        if i >= 4:
+
+            bull_trend = (
+                bull_trend
+                and (
+                    ema10[i - 1]
+                    > ema10[i - 3]
+                )
             )
 
-        else:
-
-            entry *= (
-                1.0
-                - SLIPPAGE
+            bear_trend = (
+                bear_trend
+                and (
+                    ema10[i - 1]
+                    < ema10[i - 3]
+                )
             )
 
-        atr_value = atr[i]
+        # ====================================================
+        # STRONG CANDLE
+        #
+        # IMPORTANT:
+        # Signal candle is PREVIOUS CLOSED candle.
+        # ====================================================
 
-        if atr_value is None:
-
-            continue
-
-        # ----------------------------------------------------
-        # Structure
-        # ----------------------------------------------------
-
-        structure_start = max(
-            0,
-            i - 10
+        strong_bull_signal = (
+            strong_bull(
+                previous
+            )
         )
 
-        if signal[
-            "direction"
-        ] == "LONG":
+        strong_bear_signal = (
+            strong_bear(
+                previous
+            )
+        )
+
+        # ====================================================
+        # VOLUME
+        # ====================================================
+
+        if i - 1 < (
+            VOLUME_LOOKBACK + 1
+        ):
+            continue
+
+        volume_start = (
+            i - 1
+            - VOLUME_LOOKBACK
+        )
+
+        volume_end = (
+            i - 1
+        )
+
+        historical_volumes = (
+            volumes[
+                volume_start:
+                volume_end
+            ]
+        )
+
+        if not historical_volumes:
+            continue
+
+        avg_volume = (
+            sum(
+                historical_volumes
+            )
+            / len(
+                historical_volumes
+            )
+        )
+
+        high_volume = (
+            previous["volume"]
+            >= (
+                VOLUME_MULTIPLIER
+                * avg_volume
+            )
+        )
+
+        # ====================================================
+        # FINAL SIGNAL
+        # ====================================================
+
+        long_cond = (
+            bull_trend
+            and strong_bull_signal
+            and high_volume
+        )
+
+        short_cond = (
+            bear_trend
+            and strong_bear_signal
+            and high_volume
+        )
+
+        if not (
+            long_cond
+            or short_cond
+        ):
+            continue
+
+        # ====================================================
+        # ENTRY = NEXT CANDLE OPEN
+        # ====================================================
+
+        entry = current["open"]
+
+        atr_value = atr[i - 1]
+
+        risk_amount = (
+            capital
+            * (
+                RISK_PER_TRADE
+                / 100.0
+            )
+        )
+
+        # ====================================================
+        # LONG
+        # ====================================================
+
+        if long_cond:
 
             swing_low = min(
                 candles[j]["low"]
                 for j in range(
-                    structure_start,
-                    i + 1
+                    max(
+                        0,
+                        i - SWING_LOOKBACK
+                    ),
+                    i
                 )
             )
 
-            atr_sl = (
+            atr_stop = (
                 entry
-                - atr_value
-                * ATR_SL_MULTIPLIER
+                - (
+                    atr_value
+                    * ATR_SL_MULTIPLIER
+                )
             )
 
             sl = min(
                 swing_low,
-                atr_sl
+                atr_stop
             )
 
-            risk_distance = (
+            risk_price = (
                 entry
                 - sl
             )
 
-            if risk_distance <= 0:
-
+            if risk_price <= 0:
                 continue
 
             tp = (
                 entry
-                + risk_distance
-                * RR
+                + (
+                    risk_price
+                    * RR_RATIO
+                )
             )
 
-        else:
+            active_trade = {
+
+                "type": "LONG",
+
+                "entry": entry,
+
+                "sl": sl,
+
+                "tp": tp,
+
+                "risk_price":
+                    risk_price,
+
+                "risk_amount":
+                    risk_amount,
+
+                "entry_time":
+                    current["time"]
+            }
+
+        # ====================================================
+        # SHORT
+        # ====================================================
+
+        elif short_cond:
 
             swing_high = max(
                 candles[j]["high"]
                 for j in range(
-                    structure_start,
-                    i + 1
+                    max(
+                        0,
+                        i - SWING_LOOKBACK
+                    ),
+                    i
                 )
             )
 
-            atr_sl = (
+            atr_stop = (
                 entry
-                + atr_value
-                * ATR_SL_MULTIPLIER
+                + (
+                    atr_value
+                    * ATR_SL_MULTIPLIER
+                )
             )
 
             sl = max(
                 swing_high,
-                atr_sl
+                atr_stop
             )
 
-            risk_distance = (
+            risk_price = (
                 sl
                 - entry
             )
 
-            if risk_distance <= 0:
-
+            if risk_price <= 0:
                 continue
 
             tp = (
                 entry
-                - risk_distance
-                * RR
+                - (
+                    risk_price
+                    * RR_RATIO
+                )
             )
 
-        risk_amount = (
-            capital
-            * RISK_PER_TRADE
-        )
+            active_trade = {
 
-        active = {
+                "type": "SHORT",
 
-            "direction":
-                signal[
-                    "direction"
-                ],
+                "entry": entry,
 
-            "setup":
-                signal[
-                    "setup"
-                ],
+                "sl": sl,
 
-            "entry":
-                entry,
+                "tp": tp,
 
-            "sl":
-                sl,
+                "risk_price":
+                    risk_price,
 
-            "tp":
-                tp,
+                "risk_amount":
+                    risk_amount,
 
-            "risk_distance":
-                risk_distance,
+                "entry_time":
+                    current["time"]
+            }
 
-            "risk_amount":
-                risk_amount,
-
-            "risk_percent":
-                RISK_PER_TRADE,
-
-            "entry_time":
-                next_candle[
-                    "time"
-                ]
-        }
+    # ========================================================
+    # RESULT
+    # ========================================================
 
     return {
-        "capital":
-            capital,
 
-        "trades":
-            trades,
+        "symbol": symbol,
+
+        "trades": trades,
+
+        "capital": capital,
 
         "max_drawdown":
             max_drawdown
@@ -1502,50 +1098,47 @@ def run_backtest(
 # STATISTICS
 # ============================================================
 
-def statistics(
+def calculate_stats(
     trades,
-    initial_capital,
-    final_capital,
-    max_drawdown,
-    days
+    initial_capital
 ):
 
+    total = len(trades)
+
     wins = [
-        t
-        for t in trades
+        t for t in trades
         if t["result"] == "TP"
     ]
 
     losses = [
-        t
-        for t in trades
+        t for t in trades
         if t["result"] == "SL"
     ]
 
     win_rate = (
         len(wins)
-        / len(trades)
-        * 100
-        if trades
-        else 0
+        / total
+        * 100.0
+        if total
+        else 0.0
     )
 
     gross_profit = sum(
         max(
-            t["pnl"],
+            t["net_r"],
             0
         )
         for t in trades
     )
 
-    gross_loss = abs(
-        sum(
+    gross_loss = sum(
+        abs(
             min(
-                t["pnl"],
+                t["net_r"],
                 0
             )
-            for t in trades
         )
+        for t in trades
     )
 
     if gross_loss > 0:
@@ -1564,21 +1157,25 @@ def statistics(
         for t in trades
     )
 
-    avg_r = (
-        net_r
-        / len(trades)
-        if trades
-        else 0
+    average_r = (
+        net_r / total
+        if total
+        else 0.0
     )
 
-    signals_day = (
-        len(trades)
-        / days
+    final_capital = (
+        initial_capital
     )
+
+    for trade in trades:
+
+        final_capital += (
+            trade["pnl"]
+        )
 
     return {
-        "trades":
-            len(trades),
+
+        "trades": total,
 
         "wins":
             len(wins),
@@ -1596,97 +1193,11 @@ def statistics(
             net_r,
 
         "average_r":
-            avg_r,
+            average_r,
 
-        "max_drawdown":
-            max_drawdown,
-
-        "initial":
-            initial_capital,
-
-        "final":
-            final_capital,
-
-        "signals_day":
-            signals_day
+        "final_capital":
+            final_capital
     }
-
-
-# ============================================================
-# PRINT
-# ============================================================
-
-def print_stats(
-    title,
-    stats
-):
-
-    print()
-    print("=" * 60)
-    print(title)
-    print("=" * 60)
-
-    print(
-        f"Trades       : "
-        f"{stats['trades']}"
-    )
-
-    print(
-        f"Wins         : "
-        f"{stats['wins']}"
-    )
-
-    print(
-        f"Losses       : "
-        f"{stats['losses']}"
-    )
-
-    print(
-        f"Win Rate     : "
-        f"{stats['win_rate']:.2f}%"
-    )
-
-    pf = stats[
-        "profit_factor"
-    ]
-
-    if pf is None:
-
-        print(
-            "Profit Factor: None"
-        )
-
-    else:
-
-        print(
-            f"Profit Factor: "
-            f"{pf:.2f}"
-        )
-
-    print(
-        f"Net R        : "
-        f"{stats['net_r']:.2f}"
-    )
-
-    print(
-        f"Average R    : "
-        f"{stats['average_r']:.4f}"
-    )
-
-    print(
-        f"Max Drawdown : "
-        f"{stats['max_drawdown']:.2f}%"
-    )
-
-    print(
-        f"Balance      : "
-        f"${stats['final']:.2f}"
-    )
-
-    print(
-        f"Signals/day  : "
-        f"{stats['signals_day']:.2f}"
-    )
 
 
 # ============================================================
@@ -1695,56 +1206,91 @@ def print_stats(
 
 def main():
 
-    print()
-    print("=" * 60)
     print(
-        "COINEX REAL DATA BACKTEST v10"
+        "\n"
+        + "=" * 70
     )
+
     print(
-        "15M TREND + BREAKOUT / PULLBACK"
+        "SCORE HUNTER"
     )
+
     print(
-        "PAGINATED HISTORICAL DATA"
+        "LBANK REAL DATA BACKTEST"
     )
+
     print(
-        "NO PANDAS / NO NUMPY"
+        "ORIGINAL 61.24% STRATEGY"
     )
+
     print(
-        "CLOSED CANDLE ONLY"
+        "15M"
     )
+
     print(
-        "ENTRY = NEXT CANDLE OPEN"
+        "EMA 10 / 30 / 100"
     )
+
+    print(
+        "STRONG CANDLE >= 75%"
+    )
+
+    print(
+        "VOLUME >= 2X"
+    )
+
+    print(
+        "SL = 1.2 ATR / SWING"
+    )
+
     print(
         "TP = 2R"
     )
-    print("=" * 60)
+
+    print(
+        "ENTRY = NEXT CANDLE OPEN"
+    )
+
+    print(
+        "CLOSED CANDLE ONLY"
+    )
+
+    print(
+        "REAL LBANK DATA"
+    )
+
+    print(
+        "=" * 70
+    )
 
     all_trades = []
 
-    per_coin = {}
+    results = {}
+
+    # ========================================================
+    # DOWNLOAD + TEST
+    # ========================================================
 
     for symbol in SYMBOLS:
 
         try:
 
-            candles = (
-                download_coinex_klines(
-                    symbol
-                )
+            candles = get_klines(
+                symbol,
+                TARGET_CANDLES
             )
 
-            if len(candles) < 1000:
+            if len(candles) < 500:
 
                 print(
-                    f"{symbol}: "
-                    f"Not enough data: "
-                    f"{len(candles)}"
+                    f"{symbol.upper()}: "
+                    f"Not enough data."
                 )
 
                 continue
 
-            result = run_backtest(
+            result = backtest_symbol(
+                symbol.upper(),
                 candles
             )
 
@@ -1752,129 +1298,253 @@ def main():
                 "trades"
             ]
 
-            stats = statistics(
+            stats = calculate_stats(
                 trades,
-                INITIAL_CAPITAL,
-                result["capital"],
-                result[
-                    "max_drawdown"
-                ],
-                DAYS
+                INITIAL_CAPITAL
             )
 
-            per_coin[
-                symbol
-            ] = stats
+            results[
+                symbol.upper()
+            ] = {
+
+                "candles":
+                    len(candles),
+
+                "trades":
+                    trades,
+
+                "capital":
+                    result[
+                        "capital"
+                    ],
+
+                "max_drawdown":
+                    result[
+                        "max_drawdown"
+                    ],
+
+                "stats":
+                    stats
+            }
 
             all_trades.extend(
                 trades
             )
 
-            print_stats(
-                symbol,
-                stats
+            print(
+                "\n"
+                + "=" * 55
+            )
+
+            print(
+                symbol.upper()
+            )
+
+            print(
+                "=" * 55
+            )
+
+            print(
+                f"Candles      : "
+                f"{len(candles)}"
+            )
+
+            print(
+                f"Trades       : "
+                f"{stats['trades']}"
+            )
+
+            print(
+                f"Wins         : "
+                f"{stats['wins']}"
+            )
+
+            print(
+                f"Losses       : "
+                f"{stats['losses']}"
+            )
+
+            print(
+                f"Win Rate     : "
+                f"{stats['win_rate']:.2f}%"
+            )
+
+            print(
+                f"Profit Factor: "
+                f"{stats['profit_factor']}"
+            )
+
+            print(
+                f"Net R        : "
+                f"{stats['net_r']:.2f}"
+            )
+
+            print(
+                f"Average R    : "
+                f"{stats['average_r']:.4f}"
+            )
+
+            print(
+                f"Max Drawdown : "
+                f"{result['max_drawdown']:.2f}%"
+            )
+
+            print(
+                f"Balance      : "
+                f"${stats['final_capital']:.2f}"
             )
 
         except Exception as e:
 
             print(
-                f"{symbol} ERROR: "
-                f"{type(e).__name__}: "
-                f"{e}"
+                f"{symbol.upper()} ERROR: "
+                f"{type(e).__name__}: {e}"
             )
 
     # ========================================================
     # ALL COINS
     # ========================================================
 
-    all_stats = statistics(
+    combined = calculate_stats(
         all_trades,
-        INITIAL_CAPITAL,
-        INITIAL_CAPITAL,
-        0.0,
-        DAYS
+        INITIAL_CAPITAL
     )
 
-    # Reconstruct combined equity approximately
-    # from trade PNL sequence.
+    # --------------------------------------------------------
+    # Signal frequency
+    # --------------------------------------------------------
 
-    balance = INITIAL_CAPITAL
-    peak = balance
-    combined_dd = 0.0
+    if all_trades:
 
-    ordered_trades = sorted(
-        all_trades,
-        key=lambda x: x[
-            "exit_time"
-        ]
-    )
+        first_time = min(
+            t["entry_time"]
+            for t in all_trades
+        )
 
-    for trade in ordered_trades:
+        last_time = max(
+            t["entry_time"]
+            for t in all_trades
+        )
 
-        balance += trade[
-            "pnl"
-        ]
-
-        if balance > peak:
-
-            peak = balance
-
-        dd = (
+        days = max(
             (
-                peak
-                - balance
+                last_time
+                - first_time
             )
-            / peak
-            * 100
+            / 86400.0,
+            1.0
         )
 
-        combined_dd = max(
-            combined_dd,
-            dd
+        signals_per_day = (
+            len(all_trades)
+            / days
         )
 
-    all_stats = statistics(
-        all_trades,
-        INITIAL_CAPITAL,
-        balance,
-        combined_dd,
-        DAYS
+    else:
+
+        days = 0.0
+        signals_per_day = 0.0
+
+    # ========================================================
+    # PRINT FINAL
+    # ========================================================
+
+    print(
+        "\n"
+        + "=" * 70
     )
 
-    print_stats(
-        "ALL COINS",
-        all_stats
+    print(
+        "ALL COINS"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"Trades       : "
+        f"{combined['trades']}"
+    )
+
+    print(
+        f"Wins         : "
+        f"{combined['wins']}"
+    )
+
+    print(
+        f"Losses       : "
+        f"{combined['losses']}"
+    )
+
+    print(
+        f"Win Rate     : "
+        f"{combined['win_rate']:.2f}%"
+    )
+
+    print(
+        f"Profit Factor: "
+        f"{combined['profit_factor']}"
+    )
+
+    print(
+        f"Net R        : "
+        f"{combined['net_r']:.2f}"
+    )
+
+    print(
+        f"Average R    : "
+        f"{combined['average_r']:.4f}"
+    )
+
+    print(
+        f"Balance      : "
+        f"${combined['final_capital']:.2f}"
+    )
+
+    print(
+        f"Trading days : "
+        f"{days:.1f}"
+    )
+
+    print(
+        f"Signals/day  : "
+        f"{signals_per_day:.2f}"
     )
 
     # ========================================================
-    # TARGET
+    # TARGET CHECK
     # ========================================================
 
-    print()
-    print("=" * 60)
-    print("TARGET CHECK")
-    print("=" * 60)
-
-    wr_pass = (
-        70
-        <= all_stats[
-            "win_rate"
-        ]
-        <= 80
+    win_target = (
+        70.0
+        <= combined["win_rate"]
+        <= 80.0
     )
 
-    freq_pass = (
-        all_stats[
-            "signals_day"
-        ]
-        >= 2
+    frequency_target = (
+        signals_per_day
+        >= 2.0
+    )
+
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "TARGET CHECK"
+    )
+
+    print(
+        "=" * 70
     )
 
     print(
         "Win Rate 70-80% : "
         + (
             "PASS"
-            if wr_pass
+            if win_target
             else "FAIL"
         )
     )
@@ -1883,66 +1553,104 @@ def main():
         "Signals >= 2/day : "
         + (
             "PASS"
-            if freq_pass
+            if frequency_target
             else "FAIL"
         )
     )
 
     print(
-        "Both targets     : "
-        + (
-            "PASS"
-            if (
-                wr_pass
-                and freq_pass
-            )
-            else "FAIL"
-        )
+        "Real LBank data  : PASS"
     )
 
     # ========================================================
-    # SAVE
+    # SAVE JSON
     # ========================================================
 
     output = {
+
         "settings": {
-            "period":
-                PERIOD,
 
-            "days":
-                DAYS,
+            "exchange":
+                "LBank",
 
-            "rr":
-                RR,
+            "timeframe":
+                TIMEFRAME,
 
-            "risk_per_trade":
-                RISK_PER_TRADE,
+            "target_candles":
+                TARGET_CANDLES,
 
-            "fee_rate":
-                FEE_RATE,
+            "ema_fast":
+                EMA_FAST,
 
-            "slippage":
-                SLIPPAGE,
+            "ema_mid":
+                EMA_MID,
 
-            "adx_min":
-                ADX_MIN,
+            "ema_slow":
+                EMA_SLOW,
+
+            "atr_period":
+                ATR_PERIOD,
 
             "volume_multiplier":
-                VOLUME_MULTIPLIER
+                VOLUME_MULTIPLIER,
+
+            "strong_body_ratio":
+                STRONG_BODY_RATIO,
+
+            "atr_sl":
+                ATR_SL_MULTIPLIER,
+
+            "rr":
+                RR_RATIO,
+
+            "fee_per_side":
+                FEE_PER_SIDE,
+
+            "slippage_per_side":
+                SLIPPAGE_PER_SIDE,
+
+            "risk_per_trade":
+                RISK_PER_TRADE
         },
 
-        "all_coins":
-            all_stats,
+        "results": results,
 
-        "per_coin":
-            per_coin,
+        "combined": {
 
-        "trades":
-            all_trades
+            "trades":
+                combined["trades"],
+
+            "wins":
+                combined["wins"],
+
+            "losses":
+                combined["losses"],
+
+            "win_rate":
+                combined["win_rate"],
+
+            "profit_factor":
+                combined["profit_factor"],
+
+            "net_r":
+                combined["net_r"],
+
+            "average_r":
+                combined["average_r"],
+
+            "final_capital":
+                combined["final_capital"],
+
+            "trading_days":
+                days,
+
+            "signals_per_day":
+                signals_per_day
+        }
     }
 
     with open(
-        "coinex_backtest_results.json",
+        "lbank_backtest_results.json",
         "w",
         encoding="utf-8"
     ) as f:
@@ -1950,23 +1658,26 @@ def main():
         json.dump(
             output,
             f,
-            indent=2
+            indent=2,
+            ensure_ascii=False
         )
 
-    print()
     print(
-        "Results saved to:"
+        "\nResults saved to:"
     )
 
     print(
-        "coinex_backtest_results.json"
+        "lbank_backtest_results.json"
     )
 
-    print()
     print(
-        "BACKTEST FINISHED."
+        "\nBACKTEST FINISHED."
     )
 
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
 
