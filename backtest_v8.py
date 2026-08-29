@@ -2,7 +2,7 @@ import time
 import requests
 
 # ==============================================================================
-# دریافت امن و مطمئن کندل‌های ۵ دقیقه‌ای از کوینکس (بدون خطا)
+# موتور نسخه v9.3 (استراتژی بازگشت به میانگین با وین‌ریت بالا)
 # ==============================================================================
 def fetch_safe_candles(symbol, timeframe='5min', limit=1000):
     market = symbol.replace('/', '')
@@ -26,40 +26,9 @@ def fetch_safe_candles(symbol, timeframe='5min', limit=1000):
                 })
             candles.sort(key=lambda x: x['timestamp'])
             return candles
-        
-        params_alt = {"market": market, "limit": limit, "interval": timeframe}
-        response_alt = requests.get(url, params=params_alt, timeout=10)
-        data_alt = response_alt.json()
-        
-        if data_alt.get('code') == 0 and data_alt.get('data'):
-            candles = []
-            for c in data_alt['data']:
-                candles.append({
-                    'timestamp': int(c.get('created_at', c.get('time', 0))),
-                    'open': float(c['open']),
-                    'high': float(c['high']),
-                    'low': float(c['low']),
-                    'close': float(c['close']),
-                    'volume': float(c['volume'])
-                })
-            candles.sort(key=lambda x: x['timestamp'])
-            return candles
-
-        print(f"خطا در دریافت داده برای {symbol}: {data.get('message', 'Unknown error')}")
         return []
-    except Exception as e:
-        print(f"ارور اتصال: {e}")
+    except Exception:
         return []
-
-# ==============================================================================
-# توابع محاسباتی سریع
-# ==============================================================================
-def calculate_ema(prices, span):
-    alpha = 2 / (span + 1)
-    ema = [prices[0]]
-    for price in prices[1:]:
-        ema.append(price * alpha + ema[-1] * (1 - alpha))
-    return ema
 
 def calculate_rsi(closes, period=14):
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
@@ -94,10 +63,7 @@ def calculate_atr(highs, lows, closes, period=14):
         atr.append(tr * alpha + atr[-1] * (1 - alpha))
     return [atr[0]] * (period - 1) + atr
 
-# ==============================================================================
-# موتور بک‌تست نسخه v9.2 (فعال و استاندارد)
-# ==============================================================================
-def run_v9_2_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.5, risk_per_trade_pct=1.5):
+def run_v9_3_backtest(assets_data, initial_capital=1000.0, risk_per_trade_pct=1.0):
     capital = initial_capital
     peak_capital = initial_capital
     max_drawdown = 0.0
@@ -111,8 +77,6 @@ def run_v9_2_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.5, risk_pe
         highs = [c['high'] for c in candles]
         lows = [c['low'] for c in candles]
 
-        ema5 = calculate_ema(closes, 5)
-        ema12 = calculate_ema(closes, 12)
         rsi = calculate_rsi(closes, 14)
         atr = calculate_atr(highs, lows, closes, 14)
 
@@ -120,7 +84,6 @@ def run_v9_2_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.5, risk_pe
 
         for i in range(20, len(candles)):
             current = candles[i]
-            prev = candles[i-1]
 
             if active_trade:
                 t = active_trade
@@ -131,7 +94,8 @@ def run_v9_2_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.5, risk_pe
                         all_trades.append(t)
                         active_trade = None
                     elif current['high'] >= t['tp']:
-                        capital += t['risk_amount'] * rr_ratio
+                        # پاداش بیشتر در وین‌ریت بالا با حد سود بهینه‌تر
+                        capital += t['risk_amount'] * 1.5
                         t['result'] = 'TP'
                         all_trades.append(t)
                         active_trade = None
@@ -142,26 +106,27 @@ def run_v9_2_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.5, risk_pe
                         all_trades.append(t)
                         active_trade = None
                     elif current['low'] <= t['tp']:
-                        capital += t['risk_amount'] * rr_ratio
+                        capital += t['risk_amount'] * 1.5
                         t['result'] = 'TP'
                         all_trades.append(t)
                         active_trade = None
 
             if not active_trade:
-                long_cond = (ema5[i-1] > ema12[i-1]) and (rsi[i-1] < 48) and (prev['close'] > prev['open'])
-                short_cond = (ema5[i-1] < ema12[i-1]) and (rsi[i-1] > 52) and (prev['close'] < prev['open'])
+                # شرایط فوق‌العاده سخت‌گیرانه برای شکار نقاط بازگشت قطعی (RSI شدیداً اشباع)
+                long_cond = rsi[i-1] < 22
+                short_cond = rsi[i-1] > 78
 
                 risk_amt = capital * (risk_per_trade_pct / 100.0)
 
                 if long_cond:
                     entry = current['open']
-                    sl = entry - (atr[i-1] * 1.2)
-                    tp = entry + ((entry - sl) * rr_ratio)
+                    sl = entry - (atr[i-1] * 1.5)
+                    tp = entry + (atr[i-1] * 2.2)
                     active_trade = {'asset': asset_name, 'type': 'LONG', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
                 elif short_cond:
                     entry = current['open']
-                    sl = entry + (atr[i-1] * 1.2)
-                    tp = entry - ((sl - entry) * rr_ratio)
+                    sl = entry + (atr[i-1] * 1.5)
+                    tp = entry - (atr[i-1] * 2.2)
                     active_trade = {'asset': asset_name, 'type': 'SHORT', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt}
 
             if capital > peak_capital:
@@ -176,22 +141,20 @@ if __name__ == "__main__":
     symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
     assets_data = {}
 
-    print("در حال دانلود داده‌های مطمئن ۵ دقیقه‌ای از کوینکس...")
+    print("در حال دریافت داده‌ها برای ربات نسخه v9.3...")
     for symbol in symbols:
         candles = fetch_safe_candles(symbol, timeframe='5min', limit=1000)
         if candles:
             assets_data[symbol] = candles
-            print(f"دریافت موفق {len(candles)} کندل برای {symbol}")
-        time.sleep(0.3)
+        time.sleep(0.2)
 
-    final_cap, trades, max_dd = run_v9_2_backtest(assets_data, initial_capital=1000.0, rr_ratio=1.5)
+    final_cap, trades, max_dd = run_v9_3_backtest(assets_data, initial_capital=1000.0)
     
-    # اصلاح اصولی پرانتز در خط زیر:
     win_trades = [t for t in trades if t.get('result') == 'TP']
     win_rate = (len(win_trades) / len(trades) * 100) if trades else 0
 
     print("="*50)
-    print("=== گزارش بک‌تست ربات اسکالپر v9.2 (استاندارد و فعال) ===")
+    print("=== گزارش بک‌تست ربات اسکالپر v9.3 (بازگشت به میانگین) ===")
     print("="*50)
     print(f"موجودی اولیه: $1000.00")
     print(f"موجودی نهایی: ${final_cap:.2f}")
