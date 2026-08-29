@@ -1,31 +1,13 @@
-import json
-import os
-import urllib.request
+import time
 import requests
+import ccxt
 
-# ================= تنظیمات اختصاصی شما =================
-TELEGRAM_BOT_TOKEN = "8937303392:AAGXDckoHV61vY6G0B4VFcHMi90YbhY-jiY"
-TELEGRAM_CHAT_ID = "2090120004"
-
-SYMBOLS = [
-    "BTC-USDT", "ETH-USDT", "SOL-USDT", "DOGE-USDT", "DYDX-USDT",
-    "LINK-USDT", "ADA-USDT", "XRP-USDT", "NEAR-USDT", "AVAX-USDT"
-]
-
-DATA_FILE = "active_signals.json"
-
-def load_active_signals():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def save_active_signals(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+# ==============================================================================
+# تنظیمات ربات تلگرام و آیدی چت
+# ==============================================================================
+# دقت کنید: بخش بعد از : را حتما با توکن واقعی BotFather جایگزین کنید
+TELEGRAM_BOT_TOKEN = "7543298101:AAH8j-XXXXXXXXXXXXXXX" 
+TELEGRAM_CHAT_ID = "2090120004"                         # آیدی چت مصطفی
 
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -35,168 +17,229 @@ def send_telegram_message(message):
         "parse_mode": "Markdown"
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        return response.json()
     except Exception as e:
-        print(f"خطا در ارسال پیام: {e}")
-
-def get_crypto_klines_okx(symbol, bar="15m", limit=150):
-    url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={bar}&limit={limit}"
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            res_data = json.loads(response.read().decode())
-            if res_data.get('code') != '0' or 'data' not in res_data:
-                return None
-            raw_list = res_data['data']
-            raw_list.reverse()
-            klines = []
-            for item in raw_list:
-                klines.append({
-                    'timestamp': int(item[0]),
-                    'open': float(item[1]),
-                    'high': float(item[2]),
-                    'low': float(item[3]),
-                    'close': float(item[4]),
-                    'volume': float(item[5])
-                })
-            return klines
-    except Exception as e:
-        print(f"خطا در دریافت دیتا {symbol}: {e}")
+        print(f"ارور در ارسال پیام به تلگرام: {e}")
         return None
+
+# ==============================================================================
+# توابع محاسباتی اندیکاتورها
+# ==============================================================================
 
 def calculate_ema(prices, span):
     alpha = 2 / (span + 1)
     ema = [prices[0]]
-    for p in prices[1:]:
-        ema.append(p * alpha + ema[-1] * (1 - alpha))
+    for price in prices[1:]:
+        ema.append(price * alpha + ema[-1] * (1 - alpha))
     return ema
 
-def check_active_positions(symbol, klines, active_signals):
-    """بررسی رسیدن پوزیشن‌های فعال به حد سود (TP) یا حد ضرر (SL)"""
-    if symbol not in active_signals:
-        return
-
-    sig = active_signals[symbol]
-    last_candle = klines[-1]
-    high = last_candle['high']
-    low = last_candle['low']
-
-    result_type = None
-
-    if sig['type'] == 'LONG':
-        if low <= sig['sl']:
-            result_type = "❌ **حد ضرر (SL) خورد!**"
-        elif high >= sig['tp']:
-            result_type = "🎯 **حد سود (TP) لمس شد! (+1.5R)**"
-    elif sig['type'] == 'SHORT':
-        if high >= sig['sl']:
-            result_type = "❌ **حد ضرر (SL) خورد!**"
-        elif low <= sig['tp']:
-            result_type = "🎯 **حد سود (TP) لمس شد! (+1.5R)**"
-
-    if result_type:
-        msg = (
-            f"🔔 **بسته‌شدن موقعیت**\n\n"
-            f"📌 **ارز:** `{symbol}`\n"
-            f"📊 **نتیجه:** {result_type}\n"
-            f"💵 **قیمت ورود:** `{sig['entry']:.4f}`\n"
-            f"🛑 **SL:** `{sig['sl']:.4f}` | 🎯 **TP:** `{sig['tp']:.4f}`"
-        )
-        send_telegram_message(msg)
-        del active_signals[symbol]
-
-def analyze_and_signal(symbol, active_signals):
-    klines_15m = get_crypto_klines_okx(symbol=symbol, bar="15m", limit=150)
-    if not klines_15m or len(klines_15m) < 100:
-        return
-
-    # ابتدا بررسی وضعیت پوزیشن‌های فعال قبلی
-    check_active_positions(symbol, klines_15m, active_signals)
-
-    # اگر از قبل پوزیشن فعال داشته باشد، سیگنال جدید صادر نمی‌کند
-    if symbol in active_signals:
-        return
-
-    closes = [k['close'] for k in klines_15m]
-    highs = [k['high'] for k in klines_15m]
-    lows = [k['low'] for k in klines_15m]
-
-    # محاسبه ATR (14)
-    atr = []
-    for i in range(len(klines_15m)):
+def calculate_atr(highs, lows, closes, period=14):
+    tr_list = []
+    for i in range(len(closes)):
         if i == 0:
-            atr.append(highs[0] - lows[0])
+            tr_list.append(highs[i] - lows[i])
         else:
-            tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-            atr.append(tr)
-    atr_smooth = [sum(atr[:i+1]) / (i+1) if i < 14 else sum(atr[i-13:i+1]) / 14 for i in range(len(atr))]
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i-1]),
+                abs(lows[i] - closes[i-1])
+            )
+            tr_list.append(tr)
+    
+    atr = [sum(tr_list[:period]) / period]
+    alpha = 1.0 / period
+    for tr in tr_list[period:]:
+        atr.append(tr * alpha + atr[-1] * (1 - alpha))
+    return [atr[0]] * (period - 1) + atr
 
-    # محاسبه RSI (14)
-    rsi = [50.0] * len(closes)
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        delta = closes[i] - closes[i-1]
-        gains.append(max(delta, 0))
-        losses.append(max(-delta, 0))
-        if i >= 14:
-            avg_gain = sum(gains[-14:]) / 14
-            avg_loss = sum(losses[-14:]) / 14
-            rs = avg_gain / avg_loss if avg_loss != 0 else 100
-            rsi[i] = 100.0 - (100.0 / (1.0 + rs)) if avg_loss != 0 else 100.0
+# ==============================================================================
+# موتور اصلی ربات (Score Hunter v8.6 - Real Market Data)
+# ==============================================================================
 
-    # محاسبه EMA 100
-    ema_htf = calculate_ema(closes, 100)
+class ScoreHunterBot:
+    def __init__(self, assets, initial_capital=1000.0, rr_ratio=2.0, risk_per_trade_pct=1.5):
+        self.assets = assets
+        self.capital = initial_capital
+        self.rr_ratio = rr_ratio
+        self.risk_per_trade_pct = risk_per_trade_pct
+        self.active_trades = {}  # جلوگیری از سیگنال تکراری
 
-    # کندل قبلی (آخرین کندل تمام‌شده)
-    idx = -2
-    c_close = closes[idx]
-    c_atr = atr_smooth[idx]
-    htf_trend = ema_htf[idx]
-    c_rsi = rsi[idx]
+    def process_candles(self, asset_name, candles):
+        closes = [c['close'] for c in candles]
+        highs = [c['high'] for c in candles]
+        lows = [c['low'] for c in candles]
+        opens = [c['open'] for c in candles]
+        volumes = [c['volume'] for c in candles]
 
-    upper_break = max(highs[idx-10:idx])
-    lower_break = min(lows[idx-10:idx])
+        i = len(candles) - 1
+        current = candles[i]
+        prev = candles[i-1]
 
-    rr_ratio = 1.5
-    atr_sl_mult = 1.5
+        ema10 = calculate_ema(closes, 10)
+        ema30 = calculate_ema(closes, 30)
+        ema100 = calculate_ema(closes, 100)
+        atr = calculate_atr(highs, lows, closes, 14)
 
-    pos_type = None
-    entry_price = c_close
+        # ۱. بررسی وضعیت پوزیشن‌های فعال (حد سود یا حد ضرر)
+        if asset_name in self.active_trades:
+            t = self.active_trades[asset_name]
+            
+            if t['type'] == 'LONG':
+                if current['low'] <= t['sl']:
+                    pnl = -t['risk_amount']
+                    self.capital += pnl
+                    msg = (
+                        f"❌ **نتیجه معامله: حد ضرر (SL)**\n\n"
+                        f"📌 نماد: #{asset_name.replace('/', '')}\n"
+                        f"نوع: LONG\n"
+                        f"قیمت خروج: `{t['sl']:.4f}`\n"
+                        f"سود/زیان: `{pnl:.2f}$`\n"
+                        f"موجودی جدید: `{self.capital:.2f}$`"
+                    )
+                    send_telegram_message(msg)
+                    del self.active_trades[asset_name]
 
-    if (c_close > htf_trend) and (c_close > upper_break) and (c_rsi > 50):
-        pos_type = "LONG"
-        sl = entry_price - (c_atr * atr_sl_mult)
-        tp = entry_price + ((entry_price - sl) * rr_ratio)
-    elif (c_close < htf_trend) and (c_close < lower_break) and (c_rsi < 50):
-        pos_type = "SHORT"
-        sl = entry_price + (c_atr * atr_sl_mult)
-        tp = entry_price - ((sl - entry_price) * rr_ratio)
+                elif current['high'] >= t['tp']:
+                    pnl = t['risk_amount'] * self.rr_ratio
+                    self.capital += pnl
+                    msg = (
+                        f"🎯 **نتیجه معامله: تارگت (TP)**\n\n"
+                        f"📌 نماد: #{asset_name.replace('/', '')}\n"
+                        f"نوع: LONG\n"
+                        f"قیمت خروج: `{t['tp']:.4f}`\n"
+                        f"سود/زیان: `+{pnl:.2f}$`\n"
+                        f"موجودی جدید: `{self.capital:.2f}$`"
+                    )
+                    send_telegram_message(msg)
+                    del self.active_trades[asset_name]
 
-    if pos_type:
-        active_signals[symbol] = {
-            'type': pos_type,
-            'entry': entry_price,
-            'sl': sl,
-            'tp': tp
-        }
-        symbol_icon = "LONG 🟩" if pos_type == "LONG" else "SHORT 🟥"
-        msg = (
-            f"🚨 **سیگنال جدید Score Hunter** 🚨\n\n"
-            f"📌 **ارز:** `{symbol}`\n"
-            f"📊 **موقعیت:** {symbol_icon}\n"
-            f"💵 **قیمت ورود:** `{entry_price:.4f}`\n"
-            f"🛑 **حد ضرر (SL):** `{sl:.4f}`\n"
-            f"🎯 **حد سود (TP):** `{tp:.4f}`\n\n"
-            f"⏰ **تایم‌فریم:** 15m\n"
-            f"⚖️ **ریسک به ریوارد:** 1:1.5"
-        )
-        send_telegram_message(msg)
+            elif t['type'] == 'SHORT':
+                if current['high'] >= t['sl']:
+                    pnl = -t['risk_amount']
+                    self.capital += pnl
+                    msg = (
+                        f"❌ **نتیجه معامله: حد ضرر (SL)**\n\n"
+                        f"📌 نماد: #{asset_name.replace('/', '')}\n"
+                        f"نوع: SHORT\n"
+                        f"قیمت خروج: `{t['sl']:.4f}`\n"
+                        f"سود/زیان: `{pnl:.2f}$`\n"
+                        f"موجودی جدید: `{self.capital:.2f}$`"
+                    )
+                    send_telegram_message(msg)
+                    del self.active_trades[asset_name]
 
-def main():
-    active_signals = load_active_signals()
-    for symbol in SYMBOLS:
-        analyze_and_signal(symbol, active_signals)
-    save_active_signals(active_signals)
+                elif current['low'] <= t['tp']:
+                    pnl = t['risk_amount'] * self.rr_ratio
+                    self.capital += pnl
+                    msg = (
+                        f"🎯 **نتیجه معامله: تارگت (TP)**\n\n"
+                        f"📌 نماد: #{asset_name.replace('/', '')}\n"
+                        f"نوع: SHORT\n"
+                        f"قیمت خروج: `{t['tp']:.4f}`\n"
+                        f"سود/زیان: `+{pnl:.2f}$`\n"
+                        f"موجودی جدید: `{self.capital:.2f}$`"
+                    )
+                    send_telegram_message(msg)
+                    del self.active_trades[asset_name]
+
+        # ۲. بررسی ورود به معامله جدید
+        if asset_name not in self.active_trades:
+            c_close = prev['close']
+            c_open = prev['open']
+            
+            bull_trend = (ema10[i-1] > ema30[i-1] > ema100[i-1]) and (ema10[i-1] > ema10[i-3])
+            bear_trend = (ema10[i-1] < ema30[i-1] < ema100[i-1]) and (ema10[i-1] < ema10[i-3])
+
+            strong_bull = (c_close > c_open) and ((c_close - c_open) / (prev['high'] - prev['low']) > 0.70) if (prev['high'] - prev['low']) > 0 else False
+            strong_bear = (c_open > c_close) and ((c_open - c_close) / (prev['high'] - prev['low']) > 0.70) if (prev['high'] - prev['low']) > 0 else False
+
+            avg_vol = sum(volumes[i-15:i-1]) / 14.0
+            high_vol = prev['volume'] > (1.8 * avg_vol)
+
+            long_cond = bull_trend and strong_bull and high_vol
+            short_cond = bear_trend and strong_bear and high_vol
+
+            risk_amt = self.capital * (self.risk_per_trade_pct / 100.0)
+
+            if long_cond:
+                entry = current['open']
+                swing_low = min([candles[j]['low'] for j in range(i-10, i)])
+                sl = min(swing_low, entry - (atr[i-1] * 1.2))
+                tp = entry + ((entry - sl) * self.rr_ratio)
+                
+                self.active_trades[asset_name] = {
+                    'type': 'LONG', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt
+                }
+
+                msg = (
+                    f"🚀 **سیگنال جدید ورود (LONG)**\n\n"
+                    f"📌 نماد: #{asset_name.replace('/', '')}\n"
+                    f"قیمت ورود (Entry): `{entry:.4f}`\n"
+                    f"حد ضرر (SL): `{sl:.4f}`\n"
+                    f"حد سود (TP): `{tp:.4f}`\n"
+                    f"ریسک معامله: `1.5% ({risk_amt:.2f}$)`\n"
+                    f"نسبت R:R برابر 1:2"
+                )
+                send_telegram_message(msg)
+
+            elif short_cond:
+                entry = current['open']
+                swing_high = max([candles[j]['high'] for j in range(i-10, i)])
+                sl = max(swing_high, entry + (atr[i-1] * 1.2))
+                tp = entry - ((sl - entry) * self.rr_ratio)
+                
+                self.active_trades[asset_name] = {
+                    'type': 'SHORT', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt
+                }
+
+                msg = (
+                    f"🔻 **سیگنال جدید ورود (SHORT)**\n\n"
+                    f"📌 نماد: #{asset_name.replace('/', '')}\n"
+                    f"قیمت ورود (Entry): `{entry:.4f}`\n"
+                    f"حد ضرر (SL): `{sl:.4f}`\n"
+                    f"حد سود (TP): `{tp:.4f}`\n"
+                    f"ریسک معامله: `1.5% ({risk_amt:.2f}$)`\n"
+                    f"نسبت R:R برابر 1:2"
+                )
+                send_telegram_message(msg)
+
+# ==============================================================================
+# دریافت قیمت‌های واقعی بازار کریپتو از صرافی
+# ==============================================================================
+def fetch_real_candles(exchange, symbol, timeframe='15m', limit=150):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        candles = []
+        for c in ohlcv:
+            candles.append({
+                'timestamp': c[0],
+                'open': c[1],
+                'high': c[2],
+                'low': c[3],
+                'close': c[4],
+                'volume': c[5]
+            })
+        return candles
+    except Exception as e:
+        print(f"خطا در دریافت داده برای {symbol}: {e}")
+        return None
 
 if __name__ == "__main__":
-    main()
+    # اتصال به صرافی (کوینکس یا بایننس بدون نیاز به API Key برای قیمت عمومی)
+    exchange = ccxt.coinex()
+    
+    symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'AVAX/USDT']
+    bot = ScoreHunterBot(assets=symbols)
+    
+    print("ربات Score Hunter v8.6 فعال شد.")
+    print("در حال پایش لایو بازار کریپتو...")
+
+    while True:
+        for symbol in symbols:
+            candles = fetch_real_candles(exchange, symbol, timeframe='15m', limit=150)
+            if candles:
+                bot.process_candles(symbol, candles)
+            time.sleep(1)  # رعایت محدودیت نرخ درخواست API
+            
+        time.sleep(60)  # چک کردن بازار در فواصل ۶۰ ثانیه‌ای
