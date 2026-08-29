@@ -1,24 +1,28 @@
 import json
 import urllib.request
-from datetime import datetime
 
-def get_crypto_klines(symbol="SOLUSDT", interval="15", limit=1000):
-    """دریافت دیتای کندل‌ها از API بای‌بیت جهت دور زدن تحریم‌های بایننس روی گیت‌هاب"""
-    url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit}"
+def get_crypto_klines(symbol="sol_usdt", type_str="15min", size=1000):
+    """دریافت دیتای کندل‌ها از API عمومی صرافی LBank"""
+    # تبدیل نماد به حروف کوچک جهت مطابقت با API ال‌بنگ
+    symbol = symbol.lower()
+    url = f"https://api.lbank.info/v2/kline.do?symbol={symbol}&size={size}&type={type_str}"
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode())
-            if data.get('retCode') != 0:
-                print(f"خطا در دیتا {symbol}: {data.get('retMsg')}")
+            res_data = json.loads(response.read().decode())
+            
+            # بررسی صحت پاسخ API ال‌بنگ
+            if res_data.get('result') != 'true' or 'data' not in res_data:
+                print(f"خطا در دیتا {symbol}: {res_data.get('error_code', 'ناشناخته')}")
                 return None
             
-            raw_list = data['result']['list']
-            # بای‌بیت کندل‌ها را از جدید به قدیم می‌دهد، آن‌ها را مرتب می‌کنیم
+            raw_list = res_data['data']
+            # ال‌بنگ دیتای کندل‌ها را از جدید به قدیم ارسال می‌کند؛ آن‌ها را مرتب می‌کنیم
             raw_list.reverse()
             
             klines = []
             for item in raw_list:
+                # ساختار دیتای LBank: [timestamp, open, high, low, close, volume]
                 klines.append({
                     'timestamp': int(item[0]),
                     'open': float(item[1]),
@@ -40,11 +44,10 @@ def calculate_ema(prices, span):
         ema.append(p * alpha + ema[-1] * (1 - alpha))
     return ema
 
-def run_multi_timeframe_backtest(symbol="SOLUSDT"):
-    # دریافت کندل‌های 15 دقیقه از بای‌بیت
-    klines_15m = get_crypto_klines(symbol=symbol, interval="15", limit=1000)
+def run_multi_timeframe_backtest(symbol="sol_usdt"):
+    klines_15m = get_crypto_klines(symbol=symbol, type_str="15min", size=1000)
     if not klines_15m or len(klines_15m) < 200:
-        print(f"[{symbol}] دیتای کافی دریافت نشد.")
+        print(f"[{symbol.upper()}] دیتای کافی دریافت نشد.")
         return []
 
     closes = [k['close'] for k in klines_15m]
@@ -127,22 +130,22 @@ def run_multi_timeframe_backtest(symbol="SOLUSDT"):
         else:
             if pos_type == 'LONG':
                 if c_low <= sl:
-                    trades.append({'symbol': symbol, 'type': 'LONG', 'result': 'LOSS', 'pnl': -1.0})
+                    trades.append({'symbol': symbol.upper(), 'type': 'LONG', 'result': 'LOSS', 'pnl': -1.0})
                     in_position = False
                 elif c_high >= tp:
-                    trades.append({'symbol': symbol, 'type': 'LONG', 'result': 'WIN', 'pnl': rr_ratio})
+                    trades.append({'symbol': symbol.upper(), 'type': 'LONG', 'result': 'WIN', 'pnl': rr_ratio})
                     in_position = False
 
             elif pos_type == 'SHORT':
                 if c_high >= sl:
-                    trades.append({'symbol': symbol, 'type': 'SHORT', 'result': 'LOSS', 'pnl': -1.0})
+                    trades.append({'symbol': symbol.upper(), 'type': 'SHORT', 'result': 'LOSS', 'pnl': -1.0})
                     in_position = False
-                elif c_low <= tp:
-                    trades.append({'symbol': symbol, 'type': 'SHORT', 'result': 'WIN', 'pnl': rr_ratio})
+                elif c_low >= tp:
+                    trades.append({'symbol': symbol.upper(), 'type': 'SHORT', 'result': 'WIN', 'pnl': rr_ratio})
                     in_position = False
 
     if not trades:
-        print(f"[{symbol}] هیچ سیگنالی صادر نشد.")
+        print(f"[{symbol.upper()}] هیچ سیگنالی صادر نشد.")
         return []
 
     total = len(trades)
@@ -151,24 +154,25 @@ def run_multi_timeframe_backtest(symbol="SOLUSDT"):
     win_rate = (wins / total) * 100
     pnl_r = sum([t['pnl'] for t in trades])
 
-    print(f"[{symbol}] تعداد سیگنال: {total} | برد: {wins} | باخت: {losses} | وین‌ریت: {win_rate:.2f}% | سود: {pnl_r:.2f}R")
+    print(f"[{symbol.upper()}] تعداد سیگنال: {total} | برد: {wins} | باخت: {losses} | وین‌ریت: {win_rate:.2f}% | سود: {pnl_r:.2f}R")
     return trades
 
 if __name__ == "__main__":
+    # فرمت نمادها در LBank به‌صورت symbol_usdt است
     symbols = [
-        "BTCUSDT",
-        "ETHUSDT",
-        "SOLUSDT",
-        "DOGEUSDT",
-        "DYDXUSDT",
-        "LINKUSDT",
-        "ADAUSDT",
-        "XRPUSDT",
-        "NEARUSDT",
-        "AVAXUSDT"
+        "btc_usdt",
+        "eth_usdt",
+        "sol_usdt",
+        "doge_usdt",
+        "dydx_usdt",
+        "link_usdt",
+        "ada_usdt",
+        "xrp_usdt",
+        "near_usdt",
+        "avax_usdt"
     ]
 
-    print("=== شروع بک‌تست بر پایه API بای‌بیت (بدون خطای تحریم) ===\n")
+    print("=== شروع بک‌تست بر پایه API صرافی LBank ===\n")
     all_trades = []
 
     for s in symbols:
