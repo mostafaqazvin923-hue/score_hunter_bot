@@ -169,6 +169,9 @@ class ScoreHunterBot:
                 sl = min(swing_low, entry - (atr[i-1] * 1.2))
                 tp = entry + ((entry - sl) * self.rr_ratio)
                 
+                sl_pct = ((entry - sl) / entry) * 100
+                tp_pct = ((tp - entry) / entry) * 100
+
                 self.active_trades[asset_name] = {
                     'type': 'LONG', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt
                 }
@@ -177,8 +180,8 @@ class ScoreHunterBot:
                     f"🚀 **سیگنال جدید ورود (LONG)**\n\n"
                     f"📌 نماد: #{asset_name.replace('/', '')}\n"
                     f"قیمت ورود (Entry): `{entry:.4f}`\n"
-                    f"حد ضرر (SL): `{sl:.4f}`\n"
-                    f"حد سود (TP): `{tp:.4f}`\n"
+                    f"حد ضرر (SL): `{sl:.4f}` `(-{sl_pct:.2f}%)`\n"
+                    f"حد سود (TP): `{tp:.4f}` `(+{tp_pct:.2f}%)`\n"
                     f"ریسک معامله: `1.5% ({risk_amt:.2f}$)`\n"
                     f"نسبت R:R برابر 1:2"
                 )
@@ -190,6 +193,9 @@ class ScoreHunterBot:
                 sl = max(swing_high, entry + (atr[i-1] * 1.2))
                 tp = entry - ((sl - entry) * self.rr_ratio)
                 
+                sl_pct = ((sl - entry) / entry) * 100
+                tp_pct = ((entry - tp) / entry) * 100
+
                 self.active_trades[asset_name] = {
                     'type': 'SHORT', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt
                 }
@@ -198,8 +204,8 @@ class ScoreHunterBot:
                     f"🔻 **سیگنال جدید ورود (SHORT)**\n\n"
                     f"📌 نماد: #{asset_name.replace('/', '')}\n"
                     f"قیمت ورود (Entry): `{entry:.4f}`\n"
-                    f"حد ضرر (SL): `{sl:.4f}`\n"
-                    f"حد سود (TP): `{tp:.4f}`\n"
+                    f"حد ضرر (SL): `{sl:.4f}` `(-{sl_pct:.2f}%)`\n"
+                    f"حد سود (TP): `{tp:.4f}` `(+{tp_pct:.2f}%)`\n"
                     f"ریسک معامله: `1.5% ({risk_amt:.2f}$)`\n"
                     f"نسبت R:R برابر 1:2"
                 )
