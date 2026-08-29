@@ -2,11 +2,10 @@ import time
 import requests
 
 # ==============================================================================
-# تنظیمات ربات تلگرام (جای‌گذاری شده)
+# تنظیمات ربات تلگرام و آیدی چت (ثبت شده برای Mostafa Signal Bot)
 # ==============================================================================
-# نکته: بخش XXXXXXXXXXXXXXX را با ادامه توکن دریافتی از BotFather جایگزین کنید
-TELEGRAM_BOT_TOKEN = "7543298101:AAH8j-XXXXXXXXXXXXXXX"
-TELEGRAM_CHAT_ID = "2090120004"                         # آیدی چت اختصاصی مصطفی
+TELEGRAM_BOT_TOKEN = "8937303392:AAGXDckoHV61vY6G0B4VFcHMi90YbhY-jiY"
+TELEGRAM_CHAT_ID = "2090120004"
 
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -207,7 +206,7 @@ class ScoreHunterBot:
                 send_telegram_message(msg)
 
 # ==============================================================================
-# دریافت داده‌های واقعی بازار از API عمومی CoinEx (بدون نیاز به ccxt)
+# دریافت داده‌های واقعی بازار از API عمومی CoinEx
 # ==============================================================================
 
 def fetch_real_candles_coinex(symbol, timeframe='15m', limit=150):
@@ -237,7 +236,7 @@ if __name__ == "__main__":
     symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'AVAX/USDT']
     bot = ScoreHunterBot(assets=symbols)
     
-    print("ربات Score Hunter v8.6 بدون وابستگی به ccxt فعال شد.")
+    print("ربات Mostafa Signal Bot فعال شد.")
     print("در حال دریافت لایو داده‌های بازار کریپتو...")
 
     for symbol in symbols:
