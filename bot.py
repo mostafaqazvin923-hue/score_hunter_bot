@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# TELEGRAM & STRATEGY SETTINGS
+# TELEGRAM & STRATEGY SETTINGS (BTC & SOL - SL: 1.2% / TP: 1.5%)
 # ============================================================
 
 TELEGRAM_TOKEN = "8937303392:AAGXDckoHV61vY6G0B4VFcHMi90YbhY-jiY"
@@ -15,15 +15,10 @@ BASE_URL = "https://api.coinex.com/v2"
 SYMBOLS = ["BTCUSDT", "SOLUSDT"]
 TIMEFRAME = "15min"
 
-# ذخیره آخرین کندل بررسی شده برای هر ارز جهت جلوگیری از ارسال تکراری سیگنال
 last_processed_timestamps = {
     "BTCUSDT": 0,
     "SOLUSDT": 0
 }
-
-# ============================================================
-# TELEGRAM SENDER FUNCTION
-# ============================================================
 
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -33,7 +28,6 @@ def send_telegram_message(message):
         "parse_mode": "Markdown"
     }
     data = urllib.parse.urlencode(payload).encode("utf-8")
-    
     try:
         req = urllib.request.Request(url, data=data, method="POST")
         with urllib.request.urlopen(req, timeout=10) as response:
@@ -42,17 +36,12 @@ def send_telegram_message(message):
         print(f"خطا در ارسال پیام به تلگرام: {e}")
         return False
 
-# ============================================================
-# DATA DOWNLOADER
-# ============================================================
-
 def download_latest_klines(symbol, limit=100):
     url = f"{BASE_URL}/spot/kline?market={symbol}&period={TIMEFRAME}&limit={limit}"
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-LIVE"}
     )
-
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             raw = response.read().decode("utf-8")
@@ -97,10 +86,6 @@ def download_latest_klines(symbol, limit=100):
         return candles
     except Exception:
         return []
-
-# ============================================================
-# TECHNICAL INDICATORS
-# ============================================================
 
 def calculate_ema(closes, period):
     if len(closes) < period:
@@ -151,25 +136,18 @@ def calculate_rsi(candles, period=14):
             
     return rsi_values
 
-# ============================================================
-# LIVE SIGNAL CHECKER
-# ============================================================
-
 def check_market_signals():
-    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] در حال بررسی بازار برای سیگنال جدید...")
+    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] در حال بررسی بازار برای BTC و SOL...")
     
     for symbol in SYMBOLS:
         candles = download_latest_klines(symbol, limit=100)
         if len(candles) < 60:
             continue
             
-        # بررسی آخرین کندل بسته‌شده (کندل یکی مانده به آخر لیست)
-        # candles[-1] کندل در حال شکل‌گیری است و candles[-2] آخرین کندل کاملاً بسته شده است.
         i = len(candles) - 2
         c = candles[i]
         prev_c = candles[i-1]
         
-        # چک کردن اینکه این کندل قبلاً بررسی و سیگنال صادر شده یا نه
         if c["timestamp"] <= last_processed_timestamps[symbol]:
             continue
 
@@ -188,7 +166,6 @@ def check_market_signals():
         is_green = close_p > open_p
 
         if is_uptrend and is_pullback_recovery and is_rsi_good and is_green:
-            # فیلتر بررسی موانع در ۳ کندل قبل
             has_obstacle = False
             for j in range(max(0, i-3), i):
                 upper_wick = candles[j]["high"] - max(candles[j]["open"], candles[j]["close"])
@@ -198,14 +175,12 @@ def check_market_signals():
                     break
 
             if not has_obstacle:
-                # ثبت به عنوان بررسی شده
                 last_processed_timestamps[symbol] = c["timestamp"]
                 
                 entry_price = close_p
                 stop_loss = entry_price * 0.988     # ۱.۲٪ ضرر
                 take_profit = entry_price * 1.015   # ۱.۵٪ سود
                 
-                # ساخت متن پیام سیگنال برای تلگرام
                 msg = (
                     f"🚨 **سیگنال خرید جدید (Score Hunter Pro)** 🚨\n\n"
                     f"🔹 **ارز:** `{symbol}`\n"
@@ -220,20 +195,5 @@ def check_market_signals():
                 send_telegram_message(msg)
                 print(f"سیگنال جدید برای {symbol} ارسال شد!")
 
-# ============================================================
-# MAIN LOOP
-# ============================================================
-
 if __name__ == "__main__":
-    startup_msg = "🤖 ربات سیگنال‌دهی Score Hunter Pro با موفقیت روشن شد و روی BTC و SOL فعال گردید."
-    send_telegram_message(startup_msg)
-    print("ربات روشن شد و در حال پایش بازار است...")
-
-    while True:
-        try:
-            check_market_signals()
-        except Exception as e:
-            print(f"خطای غیرمنتظره در حلقه اصلی: {e}")
-        
-        # هر ۶۰ ثانیه یک‌بار بازار را چک می‌کند
-        time.sleep(60)
+    check_market_signals()
