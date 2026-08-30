@@ -1,89 +1,119 @@
 import json
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (CoinEx API v2)
+# SETTINGS (CoinEx API v2 - 6 Months Backtest)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
 SYMBOL = "SOLUSDT"
 TIMEFRAME = "15min"
-TARGET_CANDLES = 1000
+TARGET_CANDLES = 17500  # حدود ۶ ماه کندل ۱۵ دقیقه‌ای (۱۸۰ روز * ۹۶ کندل)
+PAGE_LIMIT = 1000       # حداکثر تعداد کندل در هر درخواست صرافی
 
 INITIAL_CAPITAL = 1000.0  # سرمایه اولیه (دلار)
-RISK_PERCENT = 0.05       # ریسک ۵ درصد از کل سرمایه در هر معامله
+RISK_PERCENT = 0.02       # ریسک ۲ درصد از کل سرمایه در هر معامله (مدیریت ریسک امن)
 
 # ============================================================
-# HTTP & DATA DOWNLOADER (CoinEx)
+# HTTP & PAGINATION DATA DOWNLOADER (6 Months)
 # ============================================================
 
-def download_klines(symbol, timeframe, limit=1000):
-    url = f"{BASE_URL}/spot/kline?market={symbol}&period={timeframe}&limit={limit}"
-    
-    print("در حال دریافت تاریخچه کندل‌ها از CoinEx برای " + symbol + "...")
+def download_klines(symbol, timeframe, target_count):
+    all_rows = {}
+    end_time = None
+    pages = 0
+    max_pages = 25
 
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 SCORE-HUNTER-BACKTEST"
-        }
-    )
+    print(f"در حال دریافت تاریخچه ۶ ماهه کندل‌ها از CoinEx برای {symbol}...")
 
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            raw = response.read().decode("utf-8")
-            payload = json.loads(raw)
-    except Exception as exc:
-        print("خطا در ارتباط با سرور کوینکس: " + str(exc))
-        return []
+    while len(all_rows) < target_count and pages < max_pages:
+        pages += 1
+        
+        url = f"{BASE_URL}/spot/kline?market={symbol}&period={timeframe}&limit={PAGE_LIMIT}"
+        if end_time:
+            url += f"&end_time={end_time}"
 
-    if not isinstance(payload, dict) or payload.get("code") != 0:
-        print("پاسخ نامعتبر از صرافی کوینکس")
-        return []
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 SCORE-HUNTER-BACKTEST"
+            }
+        )
 
-    rows = payload.get("data", [])
-    candles = []
-
-    for row in rows:
         try:
-            if isinstance(row, dict):
-                ts = int(float(row.get("created_at", row.get("time", 0))))
-                op = float(row.get("open", 0))
-                hi = float(row.get("high", 0))
-                lo = float(row.get("low", 0))
-                cl = float(row.get("close", 0))
-                vol = float(row.get("volume", 0))
-            elif isinstance(row, list) and len(row) >= 6:
-                ts = int(float(row[0]))
-                op = float(row[1])
-                cl = float(row.get("2", row[2])) if len(row) > 2 else float(row[2])
-                hi = float(row.get("3", row[3])) if len(row) > 3 else float(row[3])
-                lo = float(row.get("4", row[4])) if len(row) > 4 else float(row[4])
-                vol = float(row.get("5", row[5])) if len(row) > 5 else float(row[5])
-            else:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw = response.read().decode("utf-8")
+                payload = json.loads(raw)
+        except Exception as exc:
+            print(f"خطا در ارتباط با سرور کوینکس در صفحه {pages}: {exc}")
+            break
+
+        if not isinstance(payload, dict) or payload.get("code") != 0:
+            print("پاسخ پایان داده‌ها یا نامعتبر از صرافی کوینکس")
+            break
+
+        rows = payload.get("data", [])
+        if not rows:
+            break
+
+        added = 0
+        for row in rows:
+            try:
+                if isinstance(row, dict):
+                    ts = int(float(row.get("created_at", row.get("time", 0))))
+                    op = float(row.get("open", 0))
+                    hi = float(row.get("high", 0))
+                    lo = float(row.get("low", 0))
+                    cl = float(row.get("close", 0))
+                    vol = float(row.get("volume", 0))
+                elif isinstance(row, list) and len(row) >= 6:
+                    ts = int(float(row[0]))
+                    op = float(row[1])
+                    cl = float(row[2])
+                    hi = float(row[3])
+                    lo = float(row[4])
+                    vol = float(row[5])
+                else:
+                    continue
+
+                if ts > 100000000000:
+                    ts = ts // 1000
+
+                if hi <= 0 or lo <= 0 or op <= 0 or cl <= 0:
+                    continue
+
+                if ts not in all_rows:
+                    all_rows[ts] = {
+                        "timestamp": ts,
+                        "open": op,
+                        "high": hi,
+                        "low": lo,
+                        "close": cl,
+                        "volume": vol,
+                    }
+                    added += 1
+            except Exception:
                 continue
 
-            if ts > 100000000000:
-                ts = ts // 1000
+        if added == 0:
+            break
 
-            if hi <= 0 or lo <= 0 or op <= 0 or cl <= 0:
-                continue
+        # تعیین قدیمی‌ترین زمان برای درخواست صفحه بعدی به سمت گذشته
+        oldest_ts = min(all_rows.keys())
+        end_time = oldest_ts * 1000  # کوینکس معمولاً میلی‌ثانیه می‌خواهد
 
-            candles.append({
-                "timestamp": ts,
-                "open": op,
-                "high": hi,
-                "low": lo,
-                "close": cl,
-                "volume": vol,
-            })
-        except Exception:
-            continue
+        time.sleep(0.2) # استراحت کوتاه بین درخواست‌ها
 
+    candles = list(all_rows.values())
     candles.sort(key=lambda x: x["timestamp"])
+
+    if len(candles) > target_count:
+        candles = candles[-target_count:]
+
     return candles
 
 # ============================================================
@@ -131,7 +161,7 @@ def calculate_rsi(candles, period=14):
     return rsi_values
 
 # ============================================================
-# BACKTEST ENGINE
+# BACKTEST ENGINE (6-Month Strict Filter Strategy)
 # ============================================================
 
 def run_backtest():
@@ -139,7 +169,7 @@ def run_backtest():
     
     print("تعداد کل کندل‌های دریافت شده: " + str(len(candles)))
     
-    if len(candles) < 50:
+    if len(candles) < 100:
         print("تعداد کندل‌های دریافتی برای بک‌تست کافی نیست.")
         return
 
@@ -147,7 +177,7 @@ def run_backtest():
     last_time = datetime.fromtimestamp(candles[-1]["timestamp"], tz=timezone.utc)
     total_days = (candles[-1]["timestamp"] - candles[0]["timestamp"]) / 86400
     
-    print("بازه زمانی داده‌ها: از " + first_time.strftime('%Y-%m-%d %H:%M') + " تا " + last_time.strftime('%Y-%m-%d %H:%M'))
+    print(f"بازه زمانی دقیق داده‌ها: از {first_time.strftime('%Y-%m-%d %H:%M')} تا {last_time.strftime('%Y-%m-%d %H:%M')} (حدود {total_days:.1f} روز)")
 
     rsi_list = calculate_rsi(candles, period=14)
 
@@ -157,29 +187,29 @@ def run_backtest():
     losses = 0
     
     print("-" * 50)
-    print("شروع بک‌تست روی " + str(len(candles)) + " کندل...")
+    print("شروع بک‌تست ۶ ماهه روی " + str(len(candles)) + " کندل...")
     print("-" * 50)
 
-    for i in range(30, len(candles) - 1):
+    for i in range(50, len(candles) - 1):
         current_candle = candles[i]
         close_price = current_candle["close"]
         open_price = current_candle["open"]
         volume = current_candle["volume"]
         
-        sma_50 = sum(c["close"] for c in candles[i-50:i]) / 50
+        sma_100 = sum(c["close"] for c in candles[i-100:i]) / 100
         avg_volume = sum(c["volume"] for c in candles[i-20:i]) / 20
         current_rsi = rsi_list[i]
-        prev_rsi = rsi_list[i - 1]
 
-        is_uptrend = close_price > sma_50
+        # فیلترهای فوق‌العاده سخت‌گیرانه برای تست واقعی در بازه بلندمدت
+        is_strong_uptrend = close_price > sma_100
         is_green = close_price > open_price
-        is_rsi_bullish = (prev_rsi <= 52 and current_rsi > 52) or (45 <= current_rsi <= 65 and current_rsi > prev_rsi)
-        is_volume_ok = volume > (avg_volume * 1.2)
+        is_rsi_safe = 50 <= current_rsi <= 65  # محدوده سلامت روند صعودی
+        is_volume_high = volume > (avg_volume * 1.5)
 
-        if is_uptrend and is_green and is_rsi_bullish and is_volume_ok:
+        if is_strong_uptrend and is_green and is_rsi_safe and is_volume_high:
             entry_price = close_price
-            stop_loss = entry_price * 0.988
-            take_profit = entry_price * 1.025
+            stop_loss = entry_price * 0.985   # ۱.۵ درصد حد ضرر
+            take_profit = entry_price * 1.03  # ۳ درصد حد سود (ریسک به ریوارد ۱ به ۲)
             
             trade_result = None
             for future_candle in candles[i+1:]:
@@ -190,21 +220,19 @@ def run_backtest():
                     trade_result = "WIN"
                     break
             
-            total_trades += 1
-            risk_amount = capital * RISK_PERCENT
+            if trade_result:
+                total_trades += 1
+                risk_amount = capital * RISK_PERCENT
 
-            if trade_result == "WIN":
-                wins += 1
-                profit_amount = risk_amount * 2.0
-                capital += profit_amount
-            elif trade_result == "LOSS":
-                losses += 1
-                capital -= risk_amount
-            else:
-                total_trades -= 1
+                if trade_result == "WIN":
+                    wins += 1
+                    capital += risk_amount * 2.0
+                elif trade_result == "LOSS":
+                    losses += 1
+                    capital -= risk_amount
 
     print("-" * 50)
-    print("نتایج نهایی بک‌تست:")
+    print("نتایج نهایی بک‌تست ۶ ماهه:")
     print("کل معاملات انجام شده: " + str(total_trades))
     print("معاملات موفق (Win): " + str(wins))
     print("معاملات ناموفق (Loss): " + str(losses))
@@ -217,6 +245,7 @@ def run_backtest():
         print(f"وین‌ریت استراتژی: {win_rate:.2f}%")
         print(f"سرمایه نهایی: {capital:.2f}$")
         print(f"سود/زیان خالص: {net_profit:+.2f}$ ({profit_percentage:+.2f}%)")
+        print(f"میانگین تعداد معامله در روز: {total_trades / max(total_days, 0.1):.2f}")
     else:
         print("هیچ معامله‌ای با این شرایط در این بازه فعال نشد.")
 
