@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Aggressive High-Winrate Mode for BTC, ETH, SOL, XRP)
+# SETTINGS (4-Asset Portfolio / High Win-Rate / 5% Risk)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -16,7 +16,7 @@ TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
 
 INITIAL_CAPITAL = 1000.0
-FIXED_RISK_AMOUNT = 20.0  # ریسک کنترل‌شده برای جلوگیری از لیک‌شدن
+RISK_PERCENT = 0.05  # ریسک ۵ درصدی روی سرمایه لحظه‌ای
 
 # ============================================================
 # HTTP & PAGINATION DATA DOWNLOADER
@@ -69,7 +69,7 @@ def download_klines(symbol, timeframe, target_count):
                     cl = float(row[2]) if len(row) > 2 else float(row[2])
                     hi = float(row[3]) if len(row) > 3 else float(row[3])
                     lo = float(row[4]) if len(row) > 4 else float(row[4])
-                    vol = float(row[5]) if len(row) > 5 else float(row[5])
+                    vol = float(row.get("5", row[5])) if len(row) > 5 else float(row[5])
                 else:
                     continue
 
@@ -108,34 +108,15 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# TECHNICAL INDICATORS (Bollinger Bands, RSI, ATR)
+# TECHNICAL INDICATORS
 # ============================================================
 
-def calculate_sma(closes, period):
-    sma = []
-    for i in range(len(closes)):
-        if i < period - 1:
-            sma.append(closes[i])
-        else:
-            sma.append(sum(closes[i - period + 1:i + 1]) / period)
-    return sma
-
-def calculate_bollinger_bands(closes, period=20, std_dev=2.0):
-    sma = calculate_sma(closes, period)
-    upper_bands = []
-    lower_bands = []
-    for i in range(len(closes)):
-        if i < period - 1:
-            upper_bands.append(closes[i])
-            lower_bands.append(closes[i])
-        else:
-            chunk = closes[i - period + 1:i + 1]
-            mean = sma[i]
-            variance = sum((x - mean) ** 2 for x in chunk) / period
-            stdev = variance ** 0.5
-            upper_bands.append(mean + (std_dev * stdev))
-            lower_bands.append(mean - (std_dev * stdev))
-    return upper_bands, lower_bands, sma
+def calculate_ema(closes, period):
+    ema = [closes[0]]
+    multiplier = 2 / (period + 1)
+    for price in closes[1:]:
+        ema.append((price - ema[-1]) * multiplier + ema[-1])
+    return ema
 
 def calculate_rsi(candles, period=14):
     if len(candles) < period + 1:
@@ -177,25 +158,8 @@ def calculate_rsi(candles, period=14):
             
     return rsi_values
 
-def calculate_atr(candles, period=14):
-    atr_values = [0.0] * len(candles)
-    tr_list = [candles[0]["high"] - candles[0]["low"]]
-    
-    for i in range(1, len(candles)):
-        h_l = candles[i]["high"] - candles[i]["low"]
-        h_pc = abs(candles[i]["high"] - candles[i-1]["close"])
-        l_pc = abs(candles[i]["low"] - candles[i-1]["close"])
-        tr = max(h_l, h_pc, l_pc)
-        tr_list.append(tr)
-        
-    if len(tr_list) >= period:
-        atr_values[period-1] = sum(tr_list[:period]) / period
-        for i in range(period, len(candles)):
-            atr_values[i] = (atr_values[i-1] * (period - 1) + tr_list[i]) / period
-    return atr_values
-
 # ============================================================
-# MAIN BACKTEST (Aggressive Strategy Setup)
+# PORTFOLIO BACKTEST ENGINE (4 Assets Combined Chronologically)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -203,7 +167,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال اجرای اسکریپت با استراتژی تهاجمیِ بازگشت از باند و تاییدیه مومنتوم...")
+    print("در حال دریافت داده‌ها و اجرای استراتژی روی ۴ ارز (BTC, ETH, SOL, XRP)...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -216,37 +180,27 @@ def run_portfolio_backtest():
             global_max_ts = candles[-1]["timestamp"]
 
         closes = [c["close"] for c in candles]
-        upper_b, lower_b, sma_20 = calculate_bollinger_bands(closes, 20, 2.0)
+        ema_20 = calculate_ema(closes, 20)
+        ema_50 = calculate_ema(closes, 50)
         rsi_list = calculate_rsi(candles, 14)
-        atr_list = calculate_atr(candles, 14)
 
-        for i in range(25, len(candles) - 1):
+        for i in range(50, len(candles) - 1):
             c = candles[i]
             prev_c = candles[i-1]
+            
             close_p = c["close"]
             open_p = c["open"]
-            low_p = c["low"]
-            atr = atr_list[i]
             
-            if atr <= 0:
-                continue
-
-            # استراتژی تهاجمی: برخورد قیمت به باند پایین و برگشت سریع با تاییدیه RSI
-            is_touch_lower_band = (prev_c["low"] <= lower_b[i-1])
-            is_rebound = (close_p > open_p) and (close_p > sma_20[i])
+            is_uptrend = ema_20[i] > ema_50[i]
+            is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
             rsi = rsi_list[i]
-            is_rsi_oversold_recovery = (35 <= rsi <= 55)
+            is_rsi_good = 42 <= rsi <= 62
+            is_green = close_p > open_p
 
-            if is_touch_lower_band and is_rebound and is_rsi_oversold_recovery:
+            if is_uptrend and is_pullback_recovery and is_rsi_good and is_green:
                 entry_price = close_p
-                stop_loss = low_p - (0.5 * atr)
-                risk = entry_price - stop_loss
-                
-                if risk <= 0:
-                    continue
-                
-                # تنظیم ریسک به ریوارد تهاجمی
-                take_profit = entry_price + (1.5 * risk)
+                stop_loss = entry_price * 0.988
+                take_profit = entry_price * 1.015
                 
                 trade_result = None
                 exit_ts = c["timestamp"]
@@ -268,6 +222,7 @@ def run_portfolio_backtest():
                         "result": trade_result
                     })
 
+    # مرتب‌سازی تمام معاملات ۴ ارز بر اساس زمان ورود (برای شبیه‌سازی دقیق و واقعی سرمایه)
     all_trades.sort(key=lambda x: x["entry_time"])
     total_days = (global_max_ts - global_min_ts) / 86400
 
@@ -276,33 +231,35 @@ def run_portfolio_backtest():
     losses = 0
 
     for trade in all_trades:
-        if capital < FIXED_RISK_AMOUNT:
+        if capital <= 0:
             break
+            
+        risk_amount = capital * RISK_PERCENT
 
         if trade["result"] == "WIN":
             wins += 1
-            capital += FIXED_RISK_AMOUNT * 1.5
-        else:
+            capital += risk_amount * 1.25
+        elif trade["result"] == "LOSS":
             losses += 1
-            capital -= FIXED_RISK_AMOUNT
+            capital -= risk_amount
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی استراتژی تهاجمی (BTC, ETH, SOL, XRP):")
+    print("نتایج نهایی سبد ۴ ارز برتر با ریسک ۵٪:")
     print("=" * 50)
-    total_handled = wins + losses
-    print(f"کل معاملات سبد: {total_handled}")
-    print(f"معاملات موفق (Win): {wins}")
-    print(f"معاملات ناموفق (Loss): {losses}")
+    total_trades = wins + losses
+    print("کل معاملات کل سبد: " + str(total_trades))
+    print("معاملات موفق (Win): " + str(wins))
+    print("معاملات ناموفق (Loss): " + str(losses))
     
-    if total_handled > 0:
-        win_rate = (wins / total_handled) * 100
+    if total_trades > 0:
+        win_rate = (wins / total_trades) * 100
         net_profit = capital - INITIAL_CAPITAL
         profit_percentage = (net_profit / INITIAL_CAPITAL) * 100
         
         print(f"وین‌ریت کل سبد: {win_rate:.2f}%")
         print(f"سرمایه نهایی سبد: {capital:.2f}$")
         print(f"سود/زیان خالص کل: {net_profit:+.2f}$ ({profit_percentage:+.2f}%)")
-        print(f"میانگین معاملات در روز: {total_handled / max(total_days, 0.1):.2f}")
+        print(f"میانگین تعداد معامله در روز (برای کل سبد): {total_trades / max(total_days, 0.1):.2f}")
     else:
         print("هیچ معامله‌ای انجام نشد.")
 
