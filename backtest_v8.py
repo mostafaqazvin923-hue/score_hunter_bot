@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (High Win-Rate Pullback Strategy - 6 Months)
+# SETTINGS (Elite Win-Rate Strategy - Target 60%+ WinRate)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -70,8 +70,8 @@ def download_klines(symbol, timeframe, target_count):
                     op = float(row[1])
                     cl = float(row[2]) if len(row) > 2 else float(row[2])
                     hi = float(row[3]) if len(row) > 3 else float(row[3])
-                    lo = float(row.get("4", row[4])) if len(row) > 4 else float(row[4])
-                    vol = float(row.get("5", row[5])) if len(row) > 5 else float(row[5])
+                    lo = float(row[4]) if len(row) > 4 else float(row[4])
+                    vol = float(row[5]) if len(row) > 5 else float(row[5])
                 else:
                     continue
 
@@ -110,7 +110,7 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# TECHNICAL INDICATORS (EMA, RSI)
+# TECHNICAL INDICATORS (EMA, RSI, ATR)
 # ============================================================
 
 def calculate_ema(closes, period):
@@ -160,8 +160,25 @@ def calculate_rsi(candles, period=14):
             
     return rsi_values
 
+def calculate_atr(candles, period=14):
+    atr_values = [0.0] * len(candles)
+    tr_list = [candles[0]["high"] - candles[0]["low"]]
+    
+    for i in range(1, len(candles)):
+        h_l = candles[i]["high"] - candles[i]["low"]
+        h_pc = abs(candles[i]["high"] - candles[i-1]["close"])
+        l_pc = abs(candles[i]["low"] - candles[i-1]["close"])
+        tr = max(h_l, h_pc, l_pc)
+        tr_list.append(tr)
+        
+    if len(tr_list) >= period:
+        atr_values[period-1] = sum(tr_list[:period]) / period
+        for i in range(period, len(candles)):
+            atr_values[i] = (atr_values[i-1] * (period - 1) + tr_list[i]) / period
+    return atr_values
+
 # ============================================================
-# BACKTEST ENGINE (High Win-Rate Pullback Strategy)
+# BACKTEST ENGINE (Elite Pullback Strategy with Volume & ATR Filters)
 # ============================================================
 
 def run_backtest():
@@ -183,6 +200,7 @@ def run_backtest():
     ema_20 = calculate_ema(closes, 20)
     ema_50 = calculate_ema(closes, 50)
     rsi_list = calculate_rsi(candles, 14)
+    atr_list = calculate_atr(candles, 14)
 
     capital = INITIAL_CAPITAL
     total_trades = 0
@@ -190,7 +208,7 @@ def run_backtest():
     losses = 0
     
     print("-" * 50)
-    print("شروع بک‌تست استراتژی پولبک با وین‌ریت بالا روی " + str(len(candles)) + " کندل...")
+    print("شروع بک‌تست استراتژی الایت (هدف وین‌ریت ۶۰٪+) روی " + str(len(candles)) + " کندل...")
     print("-" * 50)
 
     for i in range(50, len(candles) - 1):
@@ -199,25 +217,32 @@ def run_backtest():
         
         close_p = c["close"]
         open_p = c["open"]
-        low_p = c["low"]
         
-        # ۱. روند کلی صعودی است (EMA 20 بالای EMA 50)
-        is_uptrend = ema_20[i] > ema_50[i]
+        atr = atr_list[i]
+        if atr <= 0:
+            continue
+
+        # ۱. روند قدرتمند صعودی (فاصله مناسب میان EMA 20 و EMA 50)
+        is_uptrend = (ema_20[i] > ema_50[i]) and ((ema_20[i] - ema_50[i]) > (atr * 0.1))
         
-        # ۲. پولبک: قیمت در کندل قبلی به نزدیکی یا پایین EMA 20 نفوذ کرده و حالا برگشته بالا
+        # ۲. پولبک استاندارد و تمیز به محدوده EMA 20
         is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
         
-        # ۳. RSI در محدوده مناسب برگشت روند (بین ۴2 تا ۶2)
+        # ۳. فیلتر RSI در ناحیه امن و خنثی رو به بالا (۴۵ تا ۶۵)
         rsi = rsi_list[i]
-        is_rsi_good = 42 <= rsi <= 62
+        is_rsi_safe = 45 <= rsi <= 65
         
-        # ۴. کندل صعودی تاییدیه
+        # ۴. تاییدیه حجم معاملات (حجم کندل فعلی بالاتر از میانگین ۱۰ کندل اخیر)
+        avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
+        is_volume_confirmed = c["volume"] > (avg_vol * 1.15)
+        
+        # ۵. کندل صعودی با بدنه قوی
         is_green = close_p > open_p
 
-        if is_uptrend and is_pullback_recovery and is_rsi_good and is_green:
+        if is_uptrend and is_pullback_recovery and is_rsi_safe and is_volume_confirmed and is_green:
             entry_price = close_p
-            stop_loss = entry_price * 0.988   # ۱.۲ درصد حد ضرر منطقی
-            take_profit = entry_price * 1.015 # ۱.۵ درصد حد سود سریع (دستیابی آسان‌تر برای بالا بردن وین‌ریت)
+            stop_loss = entry_price - (1.3 * atr)    # حد ضرر ایمن مبتنی بر ATR
+            take_profit = entry_price + (1.6 * atr)  # حد سود هدفمند برای بالاتر بردن ضریب موفقیت (Win Rate)
             
             trade_result = None
             for future_c in candles[i+1:]:
@@ -234,13 +259,13 @@ def run_backtest():
 
                 if trade_result == "WIN":
                     wins += 1
-                    capital += risk_amount * 1.25  # با توجه به وین‌ریت بالا، سود هر معامله متناسب تنظیم شده
+                    capital += risk_amount * 1.23
                 elif trade_result == "LOSS":
                     losses += 1
                     capital -= risk_amount
 
     print("-" * 50)
-    print("نتایج نهایی بک‌تست پولبک:")
+    print("نتایج نهایی بک‌تست الایت:")
     print("کل معاملات انجام شده: " + str(total_trades))
     print("معاملات موفق (Win): " + str(wins))
     print("معاملات ناموفق (Loss): " + str(losses))
