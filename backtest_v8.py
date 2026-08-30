@@ -3,7 +3,7 @@ import json
 import os
 from datetime import datetime
 
-# تنظیمات تلگرام (از متغیرهای محیطی یا مستقیم)
+# تنظیمات تلگرام (از متغیرهای محیطی گیت‌هاب یا مقادیر پیش‌فرض)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "CHAT_ID_HERE")
 
@@ -31,19 +31,25 @@ def send_telegram_message(message):
         "parse_mode": "Markdown"
     }
     try:
-        requests.post(url, json=payload)
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"خطا در ارسال پیام به تلگرام: {e}")
 
 def get_market_data(symbol):
-    # دریافت قیمت و RSI از صرافی یا منبع دلخواه
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+    # دریافت قیمت از API صرافی کوینکس (Coinex)
+    url = f"https://api.coinex.com/v1/market/ticker?market={symbol}"
     try:
-        res = requests.get(url).json()
-        price = float(res["price"])
-        return price
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        
+        # ساختار پاسخ کوینکس: {"code": 0, "data": {"ticker": {"last": "..."}}}
+        if "data" in data and "ticker" in data["data"] and "last" in data["data"]["ticker"]:
+            return float(data["data"]["ticker"]["last"])
+        else:
+            print(f"پاسخ کوینکس برای {symbol} نامعتبر بود: {data}")
+            return None
     except Exception as e:
-        print(f"خطا در دریافت قیمت {symbol}: {e}")
+        print(f"خطا در دریافت قیمت از کوینکس برای {symbol}: {e}")
         return None
 
 def run_bot():
@@ -55,29 +61,28 @@ def run_bot():
         if not current_price:
             continue
             
-        # بررسی وضعیت پوزیشن باز قبلی برای این ارز
+        # بررسی پوزیشن باز قبلی برای این ارز
         if symbol in state:
             pos = state[symbol]
             tp = pos["tp"]
             sl = pos["sl"]
             
-            # چک کردن اینکه آیا قیمت به TP یا SL رسیده است یا خیر
+            # بررسی اینکه آیا قیمت به حد سود (TP) یا حد ضرر (SL) رسیده است یا خیر
             if current_price >= tp or current_price <= sl:
                 print(f"پوزیشن {symbol} بسته شد. قیمت فعلی: {current_price}")
-                # پوزیشن بسته شد پس آن را از حالت انتظار خارج می‌کنیم
+                # پوزیشن بسته شد، پس آن را پاک می‌کنیم تا اجازه صدور سیگنال جدید داده شود
                 del state[symbol]
             else:
                 print(f"ارز {symbol} پوزیشن باز دارد (ورود: {pos['entry']}, TP: {tp}, SL: {sl}). سیگنال جدید رد شد.")
-                continue # یعنی سیگنال جدید نده تا پوزیشن قبلی تعیین تکلیف بشه
+                continue 
         
-        # شبیه‌سازی شرایط استراتژی (مثلاً اینجا سیگنال صادر می‌شود)
-        # در کد اصلی خودت شرایط RSI و اسکور رو اینجا قرار می‌دهی
+        # شرایط صدور سیگنال جدید
         entry_price = current_price
         sl_price = entry_price * (1 - 0.012)  # 1.2 درصد حد ضرر
         tp_price = entry_price * (1 + 0.015)  # 1.5 درصد حد سود
-        rsi_val = 55.5  # نمونه فرض برای RSI
+        rsi_val = 55.5  # مقدار نمونه RSI
         
-        # ثبت پوزیشن جدید در فایل state
+        # ذخیره وضعیت پوزیشن جدید
         state[symbol] = {
             "entry": entry_price,
             "tp": tp_price,
