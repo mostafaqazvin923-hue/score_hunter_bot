@@ -2,7 +2,6 @@ import requests
 
 # --- تنظیمات صرافی LBank ---
 SYMBOL = "sol_usdt"
-# درخواست تعداد کندل بیشتر برای بک‌تست معتبرتر (حداکثر مقداری که API بدهد)
 LBANK_API_URL = f"https://api.lbank.info/v2/kline.do?symbol={SYMBOL}&size=500&type=15min"
 
 def fetch_historical_candles():
@@ -14,7 +13,6 @@ def fetch_historical_candles():
         if data.get("result") and "data" in data:
             raw_candles = data["data"]
             candles = []
-            # ساختار استاندارد ل‌بنک: [timestamp, open, high, low, close, volume]
             for c in raw_candles:
                 candles.append({
                     "time": c[0],
@@ -39,13 +37,12 @@ def run_backtest():
         return
 
     total_trades = 0
-wins = 0
+    wins = 0
     losses = 0
     
     print(f"شروع بک‌تست روی {len(candles)} کندل آخرِ {SYMBOL.upper()}...")
     print("-" * 50)
 
-    # از کندل بیستم به بعد شروع می‌کنیم تا میانگین حجم قابل محاسبه باشد
     for i in range(20, len(candles) - 1):
         prev_candle = candles[i - 1]
         current_candle = candles[i]
@@ -53,24 +50,20 @@ wins = 0
         close_price = current_candle["close"]
         volume = current_candle["volume"]
         
-        # میانگین حجم ۲۰ کندل قبل
         avg_volume = sum(c["volume"] for c in candles[i-20:i]) / 20
 
-        # فیلترهای ورود
         is_bullish_momentum = close_price > prev_candle["high"]
         is_volume_confirmed = volume > (avg_volume * 1.5)
 
         if is_bullish_momentum and is_volume_confirmed:
             entry_price = close_price
-            stop_loss = entry_price * 0.985      # حد ضرر ۱.۵ درصد
-            take_profit = entry_price * 1.03     # حد سود ۳ درصد
+            stop_loss = entry_price * 0.985
+            take_profit = entry_price * 1.03
             
             total_trades += 1
             
-            # بررسی نتیجه معامله در کندل‌های بعدی (شبیه‌سازی ساده معامله)
             trade_result = None
             for future_candle in candles[i+1:]:
-                # اول چک می‌کنیم استاپ خورده یا اول تاپ فیت شده
                 if future_candle["low"] <= stop_loss:
                     trade_result = "LOSS"
                     break
@@ -83,8 +76,7 @@ wins = 0
             elif trade_result == "LOSS":
                 losses += 1
             else:
-                # اگر تا آخر بازه نه استاپ خورده و نه تی‌پی
-                total_trades -= 1 # معامله بسته نشده را فاکتور می‌گیریم
+                total_trades -= 1
 
     print("-" * 50)
     print(f"📊 **نتایج نهایی بک‌تست:**")
