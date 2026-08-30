@@ -5,18 +5,18 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (BTC & SOL Only / Optimized Strategy)
+# SETTINGS (BTC & SOL / SL: 1.0% & TP: 1.5% -> R:R 1:1.5)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
-SYMBOLS = ["BTCUSDT", "SOLUSDT"]  # فقط بیت‌کوین و سولانا
+SYMBOLS = ["BTCUSDT", "SOLUSDT"]
 TIMEFRAME = "15min"
 TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
 
-INITIAL_CAPITAL_PER_SYMBOL = 500.0  # تقسیم سرمایه اولیه بین ۲ ارز ($1000 کل)
-FIXED_RISK_AMOUNT = 50.0            # ریسک ثابت ۵۰ دلار برای هر معامله
+INITIAL_CAPITAL_PER_SYMBOL = 500.0  
+FIXED_RISK_AMOUNT = 50.0            # ریسک ثابت ۵۰ دلار برای هر معامله (معادل ۱٪ ضرر)
 
 # ============================================================
 # HTTP & PAGINATION DATA DOWNLOADER
@@ -159,10 +159,10 @@ def calculate_rsi(candles, period=14):
     return rsi_values
 
 # ============================================================
-# PORTFOLIO BACKTEST ENGINE (BTC & SOL Only)
+# PORTFOLIO BACKTEST ENGINE (SL: 1% & TP: 1.5%)
 # ============================================================
 
-def run_btc_sol_backtest():
+def run_backtest():
     total_portfolio_profit = 0.0
     total_trades_all = 0
     total_wins_all = 0
@@ -170,7 +170,7 @@ def run_btc_sol_backtest():
     total_days = 0
 
     print("=" * 60)
-    print("گزارش عملکرد استراتژی روی سبد دوتایی (BTC & SOL):")
+    print("گزارش تست با حد ضرر ۱٪ و حد سود ۱.۵٪ (R:R 1:1.5) روی BTC و SOL:")
     print("=" * 60)
 
     for symbol in SYMBOLS:
@@ -203,8 +203,10 @@ def run_btc_sol_backtest():
 
             if is_uptrend and is_pullback_recovery and is_rsi_good and is_green:
                 entry_price = close_p
-                stop_loss = entry_price * 0.988
-                take_profit = entry_price * 1.015
+                
+                # تنظیمات جدید ریسک به ریوارد (۱٪ ضرر به ازای ۱.۵٪ سود)
+                stop_loss = entry_price * 0.990     # ۱٪ ضرر
+                take_profit = entry_price * 1.015   # ۱.۵٪ سود
                 
                 # فیلتر بررسی موانع در ۳ کندل قبل
                 has_obstacle = False
@@ -235,7 +237,8 @@ def run_btc_sol_backtest():
         symbol_total_trades = wins + losses
         symbol_win_rate = (wins / symbol_total_trades * 100) if symbol_total_trades > 0 else 0.0
         
-        symbol_profit = (wins * FIXED_RISK_AMOUNT * 1.25) - (losses * FIXED_RISK_AMOUNT)
+        # ریوارد هر برد ۷۵ دلار (چون نسبت ۱.۵ است) و ضرر هر باخت ۵۰ دلار
+        symbol_profit = (wins * FIXED_RISK_AMOUNT * 1.5) - (losses * FIXED_RISK_AMOUNT)
         
         total_trades_all += symbol_total_trades
         total_wins_all += wins
@@ -251,7 +254,7 @@ def run_btc_sol_backtest():
         print("-" * 40)
 
     print("\n" + "=" * 60)
-    print("برآیند نهایی سبد دوتایی (BTC & SOL):")
+    print("برآیند نهایی با R:R 1:1.5 (SL 1.0% / TP 1.5%):")
     print("=" * 60)
     print(f"کل معاملات کل سبد: {total_trades_all}")
     print(f"معاملات موفق (Win): {total_wins_all}")
@@ -267,4 +270,4 @@ def run_btc_sol_backtest():
     print(f"میانگین کل معاملات در روز: {total_trades_all / max(total_days, 0.1):.2f}")
 
 if __name__ == "__main__":
-    run_btc_sol_backtest()
+    run_backtest()
