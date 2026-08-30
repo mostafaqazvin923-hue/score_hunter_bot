@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Targeting 65%+ Win-Rate with 1:1 Risk-to-Reward)
+# SETTINGS (Targeting 50%+ Win-Rate with 1:2 Risk-to-Reward)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -176,7 +176,7 @@ def calculate_atr(candles, period=14):
     return atr_values
 
 # ============================================================
-# MAIN PORTFOLIO BACKTEST (High Win-Rate + 1:1 RR)
+# MAIN PORTFOLIO BACKTEST (Targeting ~50% Win-Rate with 1:2 RR)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -184,7 +184,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال اجرای اسکریپت با فیلترهای تخصص‌یافته برای وین‌ریت بالای ۶۵ درصد...")
+    print("در حال اجرای اسکریپت با فیلترهای بهیه‌سازی برای وین‌ریت ۵۰٪ و ریسک به ریوارد ۱ به ۲...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -215,26 +215,26 @@ def run_portfolio_backtest():
             if atr <= 0:
                 continue
 
-            # فیلترهای فوق‌العاده گزینشی برای اطمینان از پیروزی معامله
-            is_strong_uptrend = (ema_9[i] > ema_21[i]) and (ema_21[i] > ema_50[i]) and ((ema_9[i] - ema_50[i]) > (atr * 0.5))
-            is_clean_pullback = (prev_c["low"] <= ema_9[i-1]) and (close_p > ema_9[i])
+            # فیلترهای پیشرفته جهت دستیابی به وین‌ریت نزدیک به ۵۰ درصد با ریوارد ۱ به ۲
+            is_super_uptrend = (ema_9[i] > ema_21[i]) and (ema_21[i] > ema_50[i]) and ((ema_9[i] - ema_50[i]) > (atr * 0.7))
+            is_safe_pullback = (prev_c["low"] <= ema_9[i-1]) and (close_p > ema_9[i])
             
             rsi = rsi_list[i]
-            is_rsi_safe = 52 <= rsi <= 60  # ناحیه امن و پایدار مومنتوم
+            is_rsi_golden = 54 <= rsi <= 64  # محدوده طلایی مومنتوم صعودی پایدار
             
             avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
-            is_volume_strong = c["volume"] > (avg_vol * 1.5)  # حجم بسیار بالا برای تایید پولبک
+            is_volume_spike = c["volume"] > (avg_vol * 1.6)  # حجم بسیار بالا برای تایید قدرت گاوها
             
-            candle_body = abs(close_p - open_p)
             candle_range = high_p - low_p
-            is_strong_body = candle_range > 0 and (candle_body / candle_range) >= 0.6  # بدنه قوی صعودی
+            # شرط بسته شدن کندل در نیمه بالای رنج خود (نشان‌دهنده قدرت خریداران در انتهای کندل)
+            is_strong_close = candle_range > 0 and ((close_p - low_p) / candle_range) >= 0.65
             is_green = close_p > open_p
 
-            if is_strong_uptrend and is_clean_pullback and is_rsi_safe and is_volume_strong and is_strong_body and is_green:
+            if is_super_uptrend and is_safe_pullback and is_rsi_golden and is_volume_spike and is_strong_close and is_green:
                 entry_price = close_p
-                # ریسک به ریوارد ۱ به ۱ دقیق (تارگت نزدیک و کاملاً در دسترس)
+                # ریسک به ریوارد طلایی ۱ به ۲
                 stop_loss = entry_price - (1.0 * atr)
-                take_profit = entry_price + (1.0 * atr)
+                take_profit = entry_price + (2.0 * atr)
                 
                 trade_result = None
                 exit_ts = c["timestamp"]
@@ -268,13 +268,13 @@ def run_portfolio_backtest():
         risk_amount = FIXED_RISK_AMOUNT
         if trade["result"] == "WIN":
             wins += 1
-            capital += risk_amount * 1.0  # سود ۱ برابری (ریسک به ریوارد 1:1)
+            capital += risk_amount * 2.0  # سود ۲ برابری (ریسک به ریوارد 1:2)
         else:
             losses += 1
             capital -= risk_amount
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی سبد (هدف وین‌ریت بالا + ریسک به ریوارد ۱ به ۱):")
+    print("نتایج نهایی سبد (هدف وین‌ریت ۵۰٪ + ریسک به ریوارد ۱ به ۲):")
     print("=" * 50)
     print(f"کل معاملات سبد: {total_trades}")
     print(f"معاملات موفق (Win): {wins}")
