@@ -5,12 +5,12 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (4 Assets / Risk-to-Reward 1:2 / Fixed $50 Risk)
+# SETTINGS (Only ETH & SOL / Original Golden Formula / Fixed $50 Risk)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+SYMBOLS = ["ETHUSDT", "SOLUSDT"]  # فقط اتریوم و سولانا
 TIMEFRAME = "15min"
 TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
@@ -159,7 +159,7 @@ def calculate_rsi(candles, period=14):
     return rsi_values
 
 # ============================================================
-# PORTFOLIO BACKTEST ENGINE (R:R 1:2 / 4 Assets)
+# PORTFOLIO BACKTEST ENGINE (ETH & SOL Only)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -167,7 +167,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال اجرای بک‌تست با ریسک به ریوارد ۱ به ۲ روی ۴ ارز...")
+    print("در حال اجرای بک‌تست فقط روی ETH و سولانا با فرمول اصلی...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -199,8 +199,8 @@ def run_portfolio_backtest():
 
             if is_uptrend and is_pullback_recovery and is_rsi_good and is_green:
                 entry_price = close_p
-                stop_loss = entry_price * 0.988         # ریسک ۱.۲٪
-                take_profit = entry_price * 1.024       # ریوارد ۲.۴٪ (نسبت ۱ به ۲)
+                stop_loss = entry_price * 0.988
+                take_profit = entry_price * 1.015
                 
                 trade_result = None
                 exit_ts = c["timestamp"]
@@ -232,13 +232,13 @@ def run_portfolio_backtest():
     for trade in all_trades:
         if trade["result"] == "WIN":
             wins += 1
-            capital += FIXED_RISK_AMOUNT * 2.0  # سود معامله موفق با ریوارد دو برابری
+            capital += FIXED_RISK_AMOUNT * 1.25
         elif trade["result"] == "LOSS":
             losses += 1
-            capital -= FIXED_RISK_AMOUNT       # زیان ثابت معامله ناموفق
+            capital -= FIXED_RISK_AMOUNT
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی با ریسک به ریوارد ۱ به ۲ و ۴ ارز:")
+    print("نتایج نهایی سبد اختصاصی (ETH & SOL):")
     print("=" * 50)
     total_trades = wins + losses
     print("کل معاملات کل سبد: " + str(total_trades))
