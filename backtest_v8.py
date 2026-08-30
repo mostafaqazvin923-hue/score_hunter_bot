@@ -4,13 +4,13 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (CoinEx API v2 Correct Endpoint)
+# SETTINGS (CoinEx API v2)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
 SYMBOL = "SOLUSDT"
-TIMEFRAME = "15m"   # تایم‌فریم ۱۵ دقیقه
+TIMEFRAME = "15min"   # اصلاح به فرمت استاندارد کوینکس (15min)
 TARGET_CANDLES = 1000
 
 # ============================================================
@@ -18,7 +18,6 @@ TARGET_CANDLES = 1000
 # ============================================================
 
 def download_klines(symbol, timeframe, limit=1000):
-    # مسیر درست ای‌پی‌آی کندل‌های کوینکس
     url = f"{BASE_URL}/spot/kline?market={symbol}&period={timeframe}&limit={limit}"
     
     print(f"در حال دریافت تاریخچه کندل‌ها از CoinEx برای {symbol}...")
@@ -45,10 +44,8 @@ def download_klines(symbol, timeframe, limit=1000):
     rows = payload.get("data", [])
     candles = []
 
-    # ساختار کندل در کوینکس v2: معمولاً دیکشنری یا لیست شامل [time, open, close, high, low, volume, ...]
     for row in rows:
         try:
-            # اگر داده به شکل دیکشنری یا لیست باشد
             if isinstance(row, dict):
                 ts = int(float(row.get("created_at", row.get("time", 0))))
                 op = float(row.get("open", 0))
