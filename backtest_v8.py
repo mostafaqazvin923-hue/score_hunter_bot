@@ -60,11 +60,16 @@ def download_klines(symbol, timeframe, limit=1000):
                 ts = int(float(row[0]))
                 op = float(row[1])
                 cl = float(row[2])
-                hi = float(row[3])
-                lo = float(row[4])
-                vol = float(row[5])
+                hi = float(row.get("high", 3))
+                lo = float(row.get("low", 4))
+                vol = float(row.get("volume", 5))
             else:
-                continue
+                ts = int(float(row[0]))
+                op = float(row[1])
+                cl = float(row[2])
+                hi = float(row[3])
+                lo = float(row.get("low", 4))
+                vol = float(row.get("volume", 5))
 
             if ts > 100000000000:
                 ts = ts // 1000
@@ -87,7 +92,7 @@ def download_klines(symbol, timeframe, limit=1000):
     return candles
 
 # ============================================================
-# BACKTEST ENGINE (Proper Risk Management)
+# BACKTEST ENGINE (High Win-Rate Strategy with Trend Filter)
 # ============================================================
 
 def run_backtest():
@@ -111,10 +116,10 @@ def run_backtest():
     losses = 0
     
     print("-" * 50)
-    print(f"شروع بک‌تست روی {len(candles)} کندلِ {SYMBOL.upper()} با سرمایه اولیه {INITIAL_CAPITAL}$ (ریسک هر معامله: {RISK_PERCENT*100}٪)...")
+    print(f"شروع بک‌تست روی {len(candles)} کندلِ {SYMBOL.upper()} با سرمایه اولیه {INITIAL_CAPITAL}$...")
     print("-" * 50)
 
-    for i in range(20, len(candles) - 1):
+    for i in range(25, len(candles) - 1):
         current_candle = candles[i]
         prev_candle = candles[i - 1]
         
@@ -122,16 +127,23 @@ def run_backtest():
         open_price = current_candle["open"]
         volume = current_candle["volume"]
         
+        # محاسبه میانگین متحرک ساده (SMA 20) برای تشخیص روند صعودی
+        sma_20 = sum(c["close"] for c in candles[i-20:i]) / 20
         avg_volume = sum(c["volume"] for c in candles[i-20:i]) / 20
 
+        # فیلترهای سخت‌گیرانه برای بالا بردن وین‌ریت:
+        # ۱. قیمت بالای میانگین متحرک ۲۰ دوره‌ای باشد (روند صعودی تایید شود)
+        is_uptrend = close_price > sma_20
+        # ۲. کندل صعودی قوی
         is_green = close_price > open_price
-        is_volume_high = volume > (avg_volume * 1.5)
+        # ۳. شکستن سقف کندل قبل با حجم بالاتر از میانگین
         is_breakout = close_price > prev_candle["high"]
+        is_volume_ok = volume > (avg_volume * 1.1)
 
-        if is_green and is_volume_high and is_breakout:
+        if is_uptrend and is_green and is_breakout and is_volume_ok:
             entry_price = close_price
-            stop_loss = entry_price * 0.985   # ۱.۵ درصد حد ضرر
-            take_profit = entry_price * 1.03  # ۳ درصد حد سود (ریسک به ریوارد ۱ به ۲)
+            stop_loss = entry_price * 0.99      # حد ضرر ۱ درصد (تطبیق‌پذیرتر)
+            take_profit = entry_price * 1.02    # حد سود ۲ درصد (وین‌ریت بالاتر)
             
             trade_result = None
             for future_candle in candles[i+1:]:
@@ -147,7 +159,7 @@ def run_backtest():
 
             if trade_result == "WIN":
                 wins += 1
-                profit_amount = risk_amount * 2.0  # ریسک به ریوارد ۱ به ۲
+                profit_amount = risk_amount * 2.0
                 capital += profit_amount
             elif trade_result == "LOSS":
                 losses += 1
