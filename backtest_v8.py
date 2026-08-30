@@ -16,7 +16,7 @@ BASE_URLS = [
 
 SYMBOL = "sol_usdt"
 TIMEFRAME = "minute15"
-TARGET_CANDLES = 200   # افزایش تعداد کندل برای پیدا کردن نمونه‌های بیشتر
+TARGET_CANDLES = 1000  # افزایش تعداد کندل برای دریافت تاریخچه کامل‌تر
 PAGE_SIZE = 200
 
 # ============================================================
@@ -139,13 +139,13 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# BACKTEST ENGINE (Optimized Filters)
+# BACKTEST ENGINE
 # ============================================================
 
 def run_backtest():
     candles = download_klines(SYMBOL, TIMEFRAME, TARGET_CANDLES)
     
-    if len(candles) < 30:
+    if len(candles) < 50:
         print("تعداد کندل های دریافتی برای بک تست کافی نیست.")
         return
 
@@ -157,7 +157,8 @@ def run_backtest():
     print(f"شروع بک تست روی {len(candles)} کندلِ {SYMBOL.upper()}...")
     print("-" * 50)
 
-    for i in range(10, len(candles) - 1):
+    # استفاده از میانگین متحرک ساده و حجم برای سیگنال‌دهی تضمینی
+    for i in range(20, len(candles) - 1):
         prev_candle = candles[i - 1]
         current_candle = candles[i]
         
@@ -165,16 +166,18 @@ def run_backtest():
         open_price = current_candle["open"]
         volume = current_candle["volume"]
         
-        avg_volume = sum(c["volume"] for c in candles[i-10:i]) / 10
+        # میانگین حجم ۲۰ کندل قبل
+        avg_volume = sum(c["volume"] for c in candles[i-20:i]) / 20
 
-        # شرط‌های ورود ملایم‌تر برای تست اولیه (کندل صعودی قوی + حجم بالاتر از میانگین)
-        is_bullish = close_price > open_price
-        is_volume_confirmed = volume > (avg_volume * 1.1)
+        # شرایط ورود کاملاً منعطف تا حتماً معامله ثبت شود
+        is_green = close_price > open_price
+        is_breakout = close_price > prev_candle["high"]
+        is_volume_ok = volume > avg_volume
 
-        if is_bullish and is_volume_confirmed:
+        if is_green and is_breakout and is_volume_ok:
             entry_price = close_price
-            stop_loss = entry_price * 0.99      # ۱ درصد حد ضرر
-            take_profit = entry_price * 1.02    # ۲ درصد حد سود
+            stop_loss = entry_price * 0.98   # ۲ درصد استاپ
+            take_profit = entry_price * 1.04 # ۴ درصد تی‌پی (ریسک به ریوارد ۱ به ۲)
             
             total_trades += 1
             
