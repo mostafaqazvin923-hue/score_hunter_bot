@@ -13,6 +13,9 @@ SYMBOL = "SOLUSDT"
 TIMEFRAME = "15min"
 TARGET_CANDLES = 1000
 
+INITIAL_CAPITAL = 1000.0  # سرمایه اولیه (دلار)
+RISK_PERCENT = 0.05       # ریسک ۵ درصد از کل سرمایه در هر معامله
+
 # ============================================================
 # HTTP & DATA DOWNLOADER (CoinEx)
 # ============================================================
@@ -56,10 +59,10 @@ def download_klines(symbol, timeframe, limit=1000):
             elif isinstance(row, list) and len(row) >= 6:
                 ts = int(float(row[0]))
                 op = float(row[1])
-                cl = float(row.get("close", 2))
-                hi = float(row.get("high", 3))
-                lo = float(row.get("low", 4))
-                vol = float(row.get("volume", 5))
+                cl = float(row[2])
+                hi = float(row[3])
+                lo = float(row[4])
+                vol = float(row[5])
             else:
                 continue
 
@@ -84,7 +87,7 @@ def download_klines(symbol, timeframe, limit=1000):
     return candles
 
 # ============================================================
-# BACKTEST ENGINE (Optimized & Filtered Strategy)
+# BACKTEST ENGINE (Proper Risk Management)
 # ============================================================
 
 def run_backtest():
@@ -102,15 +105,15 @@ def run_backtest():
     
     print(f"📅 بازه زمانی داده‌ها: از {first_time.strftime('%Y-%m-%d %H:%M')} تا {last_time.strftime('%Y-%m-%d %H:%M')} (حدود {total_days:.1f} روز)")
 
+    capital = INITIAL_CAPITAL
     total_trades = 0
     wins = 0
     losses = 0
     
     print("-" * 50)
-    print(f"شروع بک‌تست روی {len(candles)} کندلِ {SYMBOL.upper()}...")
+    print(f"شروع بک‌تست روی {len(candles)} کندلِ {SYMBOL.upper()} با سرمایه اولیه {INITIAL_CAPITAL}$ (ریسک هر معامله: {RISK_PERCENT*100}٪)...")
     print("-" * 50)
 
-    # شروع از کندل بیستم برای محاسبه میانگین حجم ۲۰ دوره گذشته
     for i in range(20, len(candles) - 1):
         current_candle = candles[i]
         prev_candle = candles[i - 1]
@@ -119,23 +122,16 @@ def run_backtest():
         open_price = current_candle["open"]
         volume = current_candle["volume"]
         
-        # محاسبه میانگین حجم ۲۰ کندل قبل
         avg_volume = sum(c["volume"] for c in candles[i-20:i]) / 20
 
-        # فیلترهای سخت‌گیرانه‌تر:
-        # ۱. کندل صعودی قوی (بدنه کندل رو به بالا)
         is_green = close_price > open_price
-        # ۲. حجم معاملات حداقل ۱.۵ برابر میانگین (تاییدیه ورود پول)
         is_volume_high = volume > (avg_volume * 1.5)
-        # ۳. شکستن سقف کندل قبلی (Breakout)
         is_breakout = close_price > prev_candle["high"]
 
         if is_green and is_volume_high and is_breakout:
             entry_price = close_price
-            stop_loss = entry_price * 0.985   معامله (۱.۵ درصد حد ضرر)
-            take_profit = entry_price * 1.03  # ۳ درصد حد سود (ریسک به ریوارد ۲)
-            
-            total_trades += 1
+            stop_loss = entry_price * 0.985   # ۱.۵ درصد حد ضرر
+            take_profit = entry_price * 1.03  # ۳ درصد حد سود (ریسک به ریوارد ۱ به ۲)
             
             trade_result = None
             for future_candle in candles[i+1:]:
@@ -146,10 +142,16 @@ def run_backtest():
                     trade_result = "WIN"
                     break
             
+            total_trades += 1
+            risk_amount = capital * RISK_PERCENT
+
             if trade_result == "WIN":
                 wins += 1
+                profit_amount = risk_amount * 2.0  # ریسک به ریوارد ۱ به ۲
+                capital += profit_amount
             elif trade_result == "LOSS":
                 losses += 1
+                capital -= risk_amount
             else:
                 total_trades -= 1
 
@@ -161,7 +163,12 @@ def run_backtest():
     
     if total_trades > 0:
         win_rate = (wins / total_trades) * 100
+        net_profit = capital - INITIAL_CAPITAL
+        profit_percentage = (net_profit / INITIAL_CAPITAL) * 100
+        
         print(f"🎯 وین‌ریت استراتژی: {win_rate:.2f}%")
+        print(f"💰 سرمایه نهایی: {capital:.2f}$")
+        print(f"📈 سود/زیان خالص: {net_profit:+.2f}$ ({profit_percentage:+.2f}%)")
         print(f"📈 میانگین تعداد معامله در روز: {total_trades / max(total_days, 0.1):.1f}")
     else:
         print("هیچ معامله‌ای با این شرایط در این بازه فعال نشد.")
