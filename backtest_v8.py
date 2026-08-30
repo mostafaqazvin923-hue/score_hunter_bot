@@ -4,12 +4,11 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Multi-Coin 70% Win-Rate Setup & R:R 1:2)
+# SETTINGS (Ichimoku Professional Strategy & R:R 1:2)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
-# گسترش سبد ارزها (چندارزی)
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 TIMEFRAME = "15min"
 TARGET_CANDLES = 17500
@@ -36,7 +35,7 @@ def download_klines(symbol, timeframe, target_count):
 
         request = urllib.request.Request(
             url,
-            headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-ELITE-70"}
+            headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-ICHIMOKU"}
         )
 
         try:
@@ -108,37 +107,42 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# TECHNICAL INDICATORS
+# ICHIMOKU INDICATORS
 # ============================================================
 
-def calculate_ema(closes, period):
-    ema = [closes[0]]
-    multiplier = 2 / (period + 1)
-    for price in closes[1:]:
-        ema.append((price - ema[-1]) * multiplier + ema[-1])
-    return ema
+def calculate_donchian(candles, period, start_idx):
+    if start_idx < period - 1:
+        slice_candles = candles[:start_idx+1]
+    else:
+        slice_candles = candles[start_idx-period+1:start_idx+1]
+    highest = max(c["high"] for c in slice_candles)
+    lowest = min(c["low"] for c in slice_candles)
+    return (highest + lowest) / 2.0
 
-def calculate_sma(values, period):
-    sma = []
-    for i in range(len(values)):
-        if i < period - 1:
-            sma.append(sum(values[:i+1]) / (i + 1))
-        else:
-            sma.append(sum(values[i-period+1:i+1]) / period)
-    return sma
+def calculate_ichimoku_series(candles):
+    tenkan_sen = []
+    kijun_sen = []
+    senkou_a = []
+    senkou_b = []
 
-def calculate_atr(candles, period=14):
-    atr = [candles[0]["high"] - candles[0]["low"]]
-    for i in range(1, len(candles)):
-        high = candles[i]["high"]
-        low = candles[i]["low"]
-        prev_close = candles[i-1]["close"]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        if i < period:
-            atr.append((atr[-1] * i + tr) / (i + 1))
-        else:
-            atr.append((atr[-1] * (period - 1) + tr) / period)
-    return atr
+    for i in range(len(candles)):
+        # Tenkan-sen (9 periods)
+        t = calculate_donchian(candles, 9, i)
+        tenkan_sen.append(t)
+        
+        # Kijun-sen (26 periods)
+        k = calculate_donchian(candles, 26, i)
+        kijun_sen.append(k)
+        
+        # Senkou Span A (Shifted 26 ahead, calculated current here)
+        sa = (t + k) / 2.0
+        senkou_a.append(sa)
+        
+        # Senkou Span B (52 periods)
+        sb = calculate_donchian(candles, 52, i)
+        senkou_b.append(sb)
+
+    return tenkan_sen, kijun_sen, senkou_a, senkou_b
 
 def calculate_rsi(candles, period=14):
     if len(candles) < period + 1:
@@ -181,7 +185,7 @@ def calculate_rsi(candles, period=14):
     return rsi_values
 
 # ============================================================
-# ELITE BACKTEST ENGINE (Targeting ~70% Win-Rate & R:R 1:2)
+# BACKTEST ENGINE (Ichimoku Setup + R:R 1:2)
 # ============================================================
 
 def run_backtest():
@@ -192,35 +196,29 @@ def run_backtest():
     total_days = 0
 
     print("=" * 60)
-    print("گزارش تست چندارزی (سودآور و با وین‌ریت بالا / R:R 1:2):")
+    print("گزارش تست استراتژی ایچیموکو (Ichimoku Kijun Bounce + Kumo Trend):")
     print("=" * 60)
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
-        if len(candles) < 200:
+        if len(candles) < 60:
             continue
 
         min_ts = candles[0]["timestamp"]
         max_ts = candles[-1]["timestamp"]
         total_days = (max_ts - min_ts) / 86400
 
-        closes = [c["close"] for c in candles]
-        volumes = [c["volume"] for c in candles]
-        
-        ema_50 = calculate_ema(closes, 50)
-        ema_200 = calculate_ema(closes, 200)
-        atr_list = calculate_atr(candles, 14)
-        sma_vol_50 = calculate_sma(volumes, 50)
+        tenkan, kijun, span_a, span_b = calculate_ichimoku_series(candles)
         rsi_list = calculate_rsi(candles, 14)
 
         trades = []
-        active_position = None  # قفل پوزیشن برای جلوگیری از تداخل
+        active_position = None
 
-        for i in range(200, len(candles) - 1):
+        for i in range(55, len(candles) - 1):
             c = candles[i]
+            prev_c = candles[i-1]
             close_p = c["close"]
-            
-            # مدیریت پوزیشن باز فعلی
+
             if active_position is not None:
                 if c["low"] <= active_position["sl"]:
                     trades.append("LOSS")
@@ -231,27 +229,29 @@ def run_backtest():
                 else:
                     continue
 
-            # استراتژی الیت جهت رسیدن به وین‌ریت بالا
-            # 1. روند بلندمدت صعودی (قیمت بالای EMA 200 و EMA 50 بالای EMA 200)
-            is_macro_uptrend = (close_p > ema_200[i]) and (ema_50[i] > ema_200[i])
+            # شرایط ایچیموکو حرفه‌ای:
+            # 1. قیمت و خطوط بالای ابر کومو (Kumo) باشند (روند صعودی قوی)
+            cloud_top = max(span_a[i], span_b[i])
+            is_above_cloud = close_p > cloud_top
             
-            # 2. اصلاح قیمتی تمیز و تایید بازگشت با قدرت ساختار بازار
-            is_structure_bullish = (c["close"] > c["open"]) and (c["close"] > candles[i-1]["high"])
+            # 2. کراس صعودی تنکان‌سن از روی کیجون‌سن یا برخورد و پولبک به کیجون‌سن
+            is_tenkan_cross = (tenkan[i-1] <= kijun[i-1]) and (tenkan[i] > kijun[i])
+            is_kijun_bounce = (prev_c["low"] <= kijun[i]) and (close_p > kijun[i]) and (close_p > open)
             
-            # 3. RSI در ناحیه سلامت روند (بین ۵۲ تا ۶۸ بدون اشباع خطرناک)
+            # 3. تاییدیه RSI در ناحیه صعودی سالم
             rsi = rsi_list[i]
-            is_rsi_safe = 52 <= rsi <= 68
-            
-            # 4. تایید حجم معاملات بالاتر از میانگین ۵۰ کندل اخیر
-            is_volume_strong = c["volume"] > (sma_vol_50[i] * 1.3)
+            is_rsi_valid = 50 <= rsi <= 70
 
-            if is_macro_uptrend and is_structure_bullish and is_rsi_safe and is_volume_strong:
+            if is_above_cloud and (is_tenkan_cross or is_kijun_bounce) and is_rsi_valid:
                 entry_price = close_p
-                current_atr = atr_list[i]
                 
-                # تنظیم دقیق حد ضرر بر اساس ATR و حد سود دقیقاً ۲ برابر (R:R 1:2)
-                stop_loss = entry_price - (current_atr * 1.2)
-                take_profit = entry_price + (current_atr * 2.4)
+                # تنظیم حد ضرر پشت کیجون‌سن یا زیر نوسان اخیر و حد سود دقیقاً ۲ برابر (R:R 1:2)
+                risk_distance = entry_price - kijun[i]
+                if risk_distance <= 0 or risk_distance / entry_price > 0.03:
+                    risk_distance = entry_price * 0.012  # حد ضرر ایمن پیش‌فرض ۱.۲٪
+                
+                stop_loss = entry_price - risk_distance
+                take_profit = entry_price + (risk_distance * 2.0)
                 
                 trade_result = None
                 for future_c in candles[i+1:]:
@@ -272,7 +272,6 @@ def run_backtest():
         symbol_total_trades = wins + losses
         symbol_win_rate = (wins / symbol_total_trades * 100) if symbol_total_trades > 0 else 0.0
         
-        # محاسبه سود خالص با ریسک به ریوارد دقیق ۱ به ۲ (هر برد = ۲ برابر ریسک)
         symbol_profit = (wins * FIXED_RISK_AMOUNT * 2.0) - (losses * FIXED_RISK_AMOUNT)
         
         total_trades_all += symbol_total_trades
@@ -288,7 +287,7 @@ def run_backtest():
         print("-" * 40)
 
     print("\n" + "=" * 60)
-    print("برآیند نهایی سبد چندارزی (هدف Win-Rate بالا و R:R 1:2):")
+    print("برآیند نهایی سبد ایچیموکو (R:R 1:2):")
     print("=" * 60)
     print(f"کل معاملات کل سبد: {total_trades_all}")
     print(f"معاملات موفق (Win): {total_wins_all}")
