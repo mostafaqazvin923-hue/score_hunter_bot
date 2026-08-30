@@ -69,9 +69,9 @@ def download_klines(symbol, timeframe, target_count):
                     ts = int(float(row[0]))
                     op = float(row[1])
                     cl = float(row[2]) if len(row) > 2 else float(row[2])
-                    hi = float(row.get("3", row[3])) if len(row) > 3 else float(row[3])
-                    lo = float(row.get("4", row[4])) if len(row) > 4 else float(row[4])
-                    vol = float(row.get("5", row[5])) if len(row) > 5 else float(row[5])
+                    hi = float(row[3]) if len(row) > 3 else float(row[3])
+                    lo = float(row[4]) if len(row) > 4 else float(row[4])
+                    vol = float(row[5]) if len(row) > 5 else float(row[5])
                 else:
                     continue
 
@@ -188,24 +188,20 @@ def run_backtest():
         close_p = c["close"]
         open_p = c["open"]
         
-        # روند کلی بلندمدت صعودی (قیمت بالای SMA 200)
         is_macro_uptrend = close_p > sma_200[i]
         
-        # تغییر روند هیکین آشی از نزولی/بدون روند به صعودی قوی
-        # کندل قبلی قرمز یا کوچک بوده، کندل فعلی سبز بلند بدون سایه پایینی (شانه‌ی صعودی قوی)
         is_ha_green = close_p > open_p
         prev_ha_green = prev_c["close"] > prev_c["open"]
         
         is_trend_flip = (not prev_ha_green) and is_ha_green
         
-        # تاییدیه حجم معاملات بالاتر از میانگین ۲۰ دوره
         avg_vol = sum(x["volume"] for x in candles[i-20:i]) / 20
         is_volume_confirmed = c["volume"] > (avg_vol * 1.2)
 
         if is_macro_uptrend and is_trend_flip and is_volume_confirmed:
             entry_price = close_p
-            stop_loss = entry_price * 0.985   لت ۱.۵ درصد حد ضرر علمی
-            take_profit = entry_price * 1.03  # حد سود ۳ درصد (ریسک به ریوارد ۱ به ۲)
+            stop_loss = entry_price * 0.985   # ۱.۵ درصد حد ضرر
+            take_profit = entry_price * 1.03  # ۳ درصد حد سود
             
             trade_result = None
             for future_c in candles[i+1:]:
