@@ -5,13 +5,23 @@ SYMBOL = "sol_usdt"
 LBANK_API_URL = f"https://api.lbank.info/v2/kline.do?symbol={SYMBOL}&size=500&type=15min"
 
 def fetch_historical_candles():
-    """دریافت کندل‌های تاریخی از LBank برای بک‌تست"""
+    """دریافت کندل‌های تاریخی از LBank با هدر استاندارد برای جلوگیری از مسدود شدن"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     try:
-        response = requests.get(LBANK_API_URL, timeout=10)
-        data = response.json()
+        response = requests.get(LBANK_API_URL, headers=headers, timeout=10)
+        print(f"وضعیت پاسخ صرافی LBank: {response.status_code}")
         
-        if data.get("result") and "data" in data:
-            raw_candles = data["data"]
+        data = response.json()
+        print(f"محتوای پاسخ: {str(data)[:200]}")
+        
+        if data.get("result") == "true" or data.get("result") is True or "data" in data:
+            raw_candles = data.get("data", [])
+            if not raw_candles:
+                print("داده‌ای داخل کلید data وجود ندارد.")
+                return []
+            
             candles = []
             for c in raw_candles:
                 candles.append({
@@ -24,10 +34,10 @@ def fetch_historical_candles():
                 })
             return candles
         else:
-            print("خطا در دریافت داده از ال‌بنک.")
+            print(f"خطا در نتیجه API ال‌بنک: {data}")
             return []
     except Exception as e:
-        print(f"خطای ارتباطی: {e}")
+        print(f"خطای ارتباطی یا پارس JSON: {e}")
         return []
 
 def run_backtest():
