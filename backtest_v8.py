@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 BASE_URL = "https://api.coinex.com/v2"
 
 SYMBOL = "SOLUSDT"
-TIMEFRAME = "15min"   # اصلاح به فرمت استاندارد کوینکس (15min)
+TIMEFRAME = "15min"
 TARGET_CANDLES = 1000
 
 # ============================================================
@@ -62,6 +62,10 @@ def download_klines(symbol, timeframe, limit=1000):
                 vol = float(row[5])
             else:
                 continue
+
+            # اصلاح واحد تایم‌استمپ اگر میلی‌ثانیه باشد
+            if ts > 100000000000:
+                ts = ts // 1000
 
             if hi <= 0 or lo <= 0 or op <= 0 or cl <= 0:
                 continue
