@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (4-Asset Portfolio / Fixed $50 Margin per Trade)
+# SETTINGS (Fixed $50 Risk / Full Timeline Simulation)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -16,7 +16,7 @@ TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
 
 INITIAL_CAPITAL = 1000.0
-FIXED_RISK_AMOUNT = 50.0  # مارجین و ریسک ثابت ۵۰ دلار برای هر معامله
+FIXED_RISK_AMOUNT = 50.0  # ریسک ثابت ۵۰ دلار برای هر معامله
 
 # ============================================================
 # HTTP & PAGINATION DATA DOWNLOADER
@@ -69,7 +69,7 @@ def download_klines(symbol, timeframe, target_count):
                     cl = float(row[2]) if len(row) > 2 else float(row[2])
                     hi = float(row[3]) if len(row) > 3 else float(row[3])
                     lo = float(row[4]) if len(row) > 4 else float(row[4])
-                    vol = float(row.get("5", row[5])) if len(row) > 5 else float(row[5])
+                    vol = float(row[5]) if len(row) > 5 else float(row[5])
                 else:
                     continue
 
@@ -159,7 +159,7 @@ def calculate_rsi(candles, period=14):
     return rsi_values
 
 # ============================================================
-# PORTFOLIO BACKTEST ENGINE (Fixed $50 Margin)
+# PORTFOLIO BACKTEST ENGINE (Fixed Risk / No Break)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -167,7 +167,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال اجرای استراتژی با مارجین ثابت ۵۰ دلار روی ۴ ارز...")
+    print("در حال اجرای مجدد تست کامل روی ۴ ارز...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -230,18 +230,15 @@ def run_portfolio_backtest():
     losses = 0
 
     for trade in all_trades:
-        if capital < FIXED_RISK_AMOUNT:
-            break
-
         if trade["result"] == "WIN":
             wins += 1
-            capital += FIXED_RISK_AMOUNT * 1.25
+            capital += FIXED_RISK_AMOUNT * 1.25  # سود معامله موفق
         elif trade["result"] == "LOSS":
             losses += 1
-            capital -= FIXED_RISK_AMOUNT
+            capital -= FIXED_RISK_AMOUNT       # زیان معامله ناموفق
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی سبد ۴ ارز با مارجین ثابت ۵۰ دلاری:")
+    print("نتایج واقعی و کامل سبد ۴ ارز با ریسک ثابت ۵۰ دلاری:")
     print("=" * 50)
     total_trades = wins + losses
     print("کل معاملات کل سبد: " + str(total_trades))
