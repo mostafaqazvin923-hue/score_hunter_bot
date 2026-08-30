@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Optimized Core 4-Coin Basket: 10% Risk & Balanced Filters)
+# SETTINGS (Targeting >60% Win-Rate with 10% Risk)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -16,7 +16,7 @@ TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
 
 INITIAL_CAPITAL = 1000.0
-RISK_PERCENT = 0.10  # ۱۰ درصد ریسک به ازای هر معامله
+RISK_PERCENT = 0.10  # ۱۰ درصد ریسک به ازای هر معامله به درخواست شما
 
 # ============================================================
 # HTTP & PAGINATION DATA DOWNLOADER
@@ -176,7 +176,7 @@ def calculate_atr(candles, period=14):
     return atr_values
 
 # ============================================================
-# MAIN PORTFOLIO BACKTEST (Balanced & Optimized)
+# MAIN PORTFOLIO BACKTEST (High Precision Filters)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -184,7 +184,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال استخراج سیگنال‌ها با پارامترهای متعادل و ریسک ۱۰ درصدی...")
+    print("در حال استخراج سیگنال‌ها با فیلترهای دقیق برای هدف وین‌ریت بالای ۶۰٪...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -215,30 +215,30 @@ def run_portfolio_backtest():
             if atr <= 0:
                 continue
 
-            # ۱. روند صعودی پایدار
-            is_uptrend = ema_20[i] > ema_50[i]
+            # ۱. روند صعودی بسیار قوی با فاصله مطمئن بین EMAها
+            is_uptrend = (ema_20[i] > ema_50[i]) and ((ema_20[i] - ema_50[i]) > (atr * 0.35))
             
-            # ۲. پولبک استاندارد و تمیز به EMA 20
+            # ۲. پولبک تمیز و کنترل‌شده به زیر EMA 20 و برگشت پرقدرت
             is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
             
-            # ۳. فیلتر RSI بهینه شده برای حفظ تعداد معاملات و بهبود وین‌ریت
+            # ۳. محدوده RSI طلایی برای شتاب صعودی بالا
             rsi = rsi_list[i]
-            is_rsi_good = 51 <= rsi <= 61
+            is_rsi_good = 55 <= rsi <= 64
             
-            # ۴. تاییدیه حجم متناسب
+            # ۴. تاییدیه حجم سنگین (حداقل ۴۵ درصد بالاتر از میانگین ۱۰ کندل اخیر)
             avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
-            is_volume_ok = c["volume"] > (avg_vol * 1.15)
+            is_volume_heavy = c["volume"] > (avg_vol * 1.45)
             
-            # ۵. کندل تاییدیه بدنه صعودی
+            # ۵. کندل بدنه کاملاً قاطع و صعودی
             candle_body = abs(close_p - open_p)
             candle_range = high_p - low_p
-            is_strong_body = candle_range > 0 and (candle_body / candle_range) >= 0.42
+            is_strong_body = candle_range > 0 and (candle_body / candle_range) >= 0.55
             is_green = close_p > open_p
 
-            if is_uptrend and is_pullback_recovery and is_rsi_good and is_volume_ok and is_strong_body and is_green:
+            if is_uptrend and is_pullback_recovery and is_rsi_good and is_volume_heavy and is_strong_body and is_green:
                 entry_price = close_p
                 stop_loss = entry_price - (1.1 * atr)
-                take_profit = entry_price + (1.7 * atr)
+                take_profit = entry_price + (1.6 * atr)
                 
                 trade_result = None
                 exit_ts = c["timestamp"]
@@ -272,13 +272,13 @@ def run_portfolio_backtest():
         risk_amount = capital * RISK_PERCENT
         if trade["result"] == "WIN":
             wins += 1
-            capital += risk_amount * 1.545  # نسبت ریسک به ریوارد متناسب با TP و SL
+            capital += risk_amount * 1.455  # ضریب ریسک به ریوارد متناسب با TP و SL
         else:
             losses += 1
             capital -= risk_amount
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی سبد (نسخه بهینه‌شده ۴ ارزی با ریسک ۱۰٪):")
+    print("نتایج نهایی سبد (هدف وین‌ریت بالای ۶۰٪ با ریسک ۱۰٪):")
     print("=" * 50)
     print(f"کل معاملات سبد: {total_trades}")
     print(f"معاملات موفق (Win): {wins}")
