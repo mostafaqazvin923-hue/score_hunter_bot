@@ -5,12 +5,12 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Unified Portfolio Backtest: BTC, ETH, SOL, XRP, LINK, ADA)
+# SETTINGS (Optimized Portfolio: BTC, ETH, SOL, LINK, DOGE, AVAX)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "LINKUSDT", "ADAUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "DOGEUSDT", "AVAXUSDT"]
 TIMEFRAME = "15min"
 TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
@@ -176,7 +176,7 @@ def calculate_atr(candles, period=14):
     return atr_values
 
 # ============================================================
-# MAIN PORTFOLIO BACKTEST
+# MAIN PORTFOLIO BACKTEST (Optimized New Basket)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -184,7 +184,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال جمع‌آوری اطلاعات و استخراج سیگنال‌ها از کل سبد ارزی...")
+    print("در حال استخراج سیگنال‌ها روی سبد جدید (BTC, ETH, SOL, LINK, DOGE, AVAX)...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -215,26 +215,27 @@ def run_portfolio_backtest():
             if atr <= 0:
                 continue
 
-            # فیلترهای سخت‌گیرانه‌تر برای کاهش تعداد معاملات و افزایش دقت
-            is_uptrend = (ema_20[i] > ema_50[i]) and ((ema_20[i] - ema_50[i]) > (atr * 0.15))
+            # ۱. روند صعودی قدرتمند
+            is_uptrend = ema_20[i] > ema_50[i]
+            
+            # ۲. پولبک استاندارد به EMA 20
             is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
             
+            # ۳. فیلتر RSI دقیق در محدوده کاملاً صعودی و ایمن
             rsi = rsi_list[i]
-            is_rsi_good = 48 <= rsi <= 60  # بازه دقیق‌تر و ایمن‌تر
+            is_rsi_good = 50 <= rsi <= 62
             
-            # فیلتر حجم و بدنه قوی کندل برای حذف سیگنال‌های فیک
-            avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
-            is_volume_ok = c["volume"] > (avg_vol * 1.15)
-            
+            # ۴. تاییدیه بدنه کندل صعودی قوی
             candle_body = abs(close_p - open_p)
             candle_range = high_p - low_p
-            is_decent_body = candle_range > 0 and (candle_body / candle_range) >= 0.4
+            is_strong_body = candle_range > 0 and (candle_body / candle_range) >= 0.45
             is_green = close_p > open_p
 
-            if is_uptrend and is_pullback_recovery and is_rsi_good and is_volume_ok and is_decent_body and is_green:
+            if is_uptrend and is_pullback_recovery and is_rsi_good and is_strong_body and is_green:
                 entry_price = close_p
-                stop_loss = entry_price * 0.988
-                take_profit = entry_price * 1.018
+                # مدیریت ریسک پویا بر اساس ATR
+                stop_loss = entry_price - (1.1 * atr)
+                take_profit = entry_price + (1.6 * atr)
                 
                 trade_result = None
                 exit_ts = c["timestamp"]
@@ -256,9 +257,7 @@ def run_portfolio_backtest():
                         "result": trade_result
                     })
 
-    # مرتب‌سازی تمام معاملات به ترتیب زمان ورود (برای شبیه‌سازی واقعی حساب یکپارچه)
     all_trades.sort(key=lambda x: x["entry_time"])
-
     total_days = (global_max_ts - global_min_ts) / 86400
 
     capital = INITIAL_CAPITAL
@@ -270,13 +269,13 @@ def run_portfolio_backtest():
         risk_amount = capital * RISK_PERCENT
         if trade["result"] == "WIN":
             wins += 1
-            capital += risk_amount * 1.3
+            capital += risk_amount * 1.45
         else:
             losses += 1
             capital -= risk_amount
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی سبد ارزی (به صورت حساب یکپارچه):")
+    print("نتایج نهایی سبد جدید (BTC, ETH, SOL, LINK, DOGE, AVAX):")
     print("=" * 50)
     print(f"کل معاملات سبد: {total_trades}")
     print(f"معاملات موفق (Win): {wins}")
