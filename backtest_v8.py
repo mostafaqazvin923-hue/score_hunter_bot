@@ -4,7 +4,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (BTC & SOL / SL: 1.0% & TP: 1.5% -> R:R 1:1.5)
+# SETTINGS (Professional High-Winrate Setup)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -15,7 +15,7 @@ TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
 
 INITIAL_CAPITAL_PER_SYMBOL = 500.0  
-FIXED_RISK_AMOUNT = 50.0            # ریسک ثابت ۵۰ دلار برای هر معامله (معادل ۱٪ ضرر)
+FIXED_RISK_AMOUNT = 50.0            # ریسک ثابت ۵۰ دلار برای هر معامله
 
 # ============================================================
 # HTTP & PAGINATION DATA DOWNLOADER
@@ -35,7 +35,7 @@ def download_klines(symbol, timeframe, target_count):
 
         request = urllib.request.Request(
             url,
-            headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-BACKTEST"}
+            headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-PROFESSIONAL"}
         )
 
         try:
@@ -117,6 +117,15 @@ def calculate_ema(closes, period):
         ema.append((price - ema[-1]) * multiplier + ema[-1])
     return ema
 
+def calculate_sma(values, period):
+    sma = []
+    for i in range(len(values)):
+        if i < period - 1:
+            sma.append(sum(values[:i+1]) / (i + 1))
+        else:
+            sma.append(sum(values[i-period+1:i+1]) / period)
+    return sma
+
 def calculate_rsi(candles, period=14):
     if len(candles) < period + 1:
         return [50.0] * len(candles)
@@ -158,7 +167,7 @@ def calculate_rsi(candles, period=14):
     return rsi_values
 
 # ============================================================
-# PORTFOLIO BACKTEST ENGINE (With Active Position Lock)
+# PROFESSIONAL BACKTEST ENGINE (High Win-Rate Rules)
 # ============================================================
 
 def run_backtest():
@@ -169,12 +178,12 @@ def run_backtest():
     total_days = 0
 
     print("=" * 60)
-    print("گزارش تست با فیلتر پوزیشن باز و R:R 1:1.5 روی BTC و SOL:")
+    print("گزارش تست حرفه‌ای با فیلترهای سخت‌گیرانه روند و حجم روی BTC و SOL:")
     print("=" * 60)
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
-        if len(candles) < 100:
+        if len(candles) < 150:
             continue
 
         min_ts = candles[0]["timestamp"]
@@ -182,21 +191,25 @@ def run_backtest():
         total_days = (max_ts - min_ts) / 86400
 
         closes = [c["close"] for c in candles]
+        volumes = [c["volume"] for c in candles]
+        
         ema_20 = calculate_ema(closes, 20)
         ema_50 = calculate_ema(closes, 50)
+        ema_100 = calculate_ema(closes, 100)
+        sma_vol_20 = calculate_sma(volumes, 20)
         rsi_list = calculate_rsi(candles, 14)
 
         trades = []
-        active_position = None  # قفل پوزیشن باز برای جلوگیری از سیگنال‌های موازی
+        active_position = None  # قفل پوزیشن برای جلوگیری از تداخل
 
-        for i in range(50, len(candles) - 1):
+        for i in range(100, len(candles) - 1):
             c = candles[i]
             prev_c = candles[i-1]
             
             close_p = c["close"]
             open_p = c["open"]
             
-            # اگر پوزیشن بازی داریم، باید اول چک کنیم بسته شده یا نه
+            # مدیریت پوزیشن باز فعلی
             if active_position is not None:
                 if c["low"] <= active_position["sl"]:
                     trades.append("LOSS")
@@ -205,32 +218,37 @@ def run_backtest():
                     trades.append("WIN")
                     active_position = None
                 else:
-                    continue  # پوزیشن هنوز باز است، هیچ سیگنال جدیدی بررسی نمی‌شود
+                    continue
 
-            is_uptrend = ema_20[i] > ema_50[i]
-            is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
+            # فیلترهای حرفه‌ای و سخت‌گیرانه برای بالا بردن دقت و وین‌ریت
+            is_strong_uptrend = (ema_20[i] > ema_50[i]) and (ema_50[i] > ema_100[i])
+            is_pullback = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
+            
             rsi = rsi_list[i]
-            is_rsi_good = 42 <= rsi <= 62
-            is_green = close_p > open_p
+            is_rsi_optimal = 50 <= rsi <= 60  # محدوده‌ی دقیق مومنتوم صعودی سالم
+            
+            is_green_candle = close_p > open_p
+            is_volume_confirmed = c["volume"] > (sma_vol_20[i] * 1.2)  # حجم معاملات بالاتر از میانگین
 
-            if is_uptrend and is_pullback_recovery and is_rsi_good and is_green:
+            if is_strong_uptrend and is_pullback and is_rsi_optimal and is_green_candle and is_volume_confirmed:
                 entry_price = close_p
-                stop_loss = entry_price * 0.990     # ۱٪ ضرر
-                take_profit = entry_price * 1.015   # ۱.۵٪ سود
                 
-                # فیلتر بررسی موانع در ۳ کندل قبل
+                # تنظیمات ریسک به ریوارد حرفه‌ای (SL دقیق و TP هدفمند)
+                stop_loss = entry_price * 0.992     # 0.8% حد ضرر فشرده‌تر و امن‌تر
+                take_profit = entry_price * 1.018   # 1.8% حد سود منطقی برای R:R بالا
+                
+                # بررسی موانع قیمتی در کندل‌های قبلی
                 has_obstacle = False
                 for j in range(max(0, i-3), i):
                     upper_wick = candles[j]["high"] - max(candles[j]["open"], candles[j]["close"])
                     body = abs(candles[j]["close"] - candles[j]["open"])
-                    if body > 0 and upper_wick > (body * 2.0):
+                    if body > 0 and upper_wick > (body * 1.8):
                         has_obstacle = True
                         break
 
                 if has_obstacle:
                     continue
 
-                # بررسی اینکه آیا TP یا SL همین کندل ورود زده شده یا می‌رود برای کندل‌های بعد
                 trade_result = None
                 for future_c in candles[i+1:]:
                     if future_c["low"] <= stop_loss:
@@ -243,7 +261,6 @@ def run_backtest():
                 if trade_result:
                     trades.append(trade_result)
                 else:
-                    # اگر در بازه بسته نشد، به عنوان پوزیشن باز نگهش می‌داریم تا کندل‌های بعدی تعیین تکلیفش کنند
                     active_position = {"tp": take_profit, "sl": stop_loss}
 
         wins = trades.count("WIN")
@@ -251,7 +268,8 @@ def run_backtest():
         symbol_total_trades = wins + losses
         symbol_win_rate = (wins / symbol_total_trades * 100) if symbol_total_trades > 0 else 0.0
         
-        symbol_profit = (wins * FIXED_RISK_AMOUNT * 1.5) - (losses * FIXED_RISK_AMOUNT)
+        # محاسبه سود خالص با ضریب ریسک به ریوارد جدید (تخمین نسبت ~2.25)
+        symbol_profit = (wins * FIXED_RISK_AMOUNT * 2.25) - (losses * FIXED_RISK_AMOUNT)
         
         total_trades_all += symbol_total_trades
         total_wins_all += wins
@@ -259,14 +277,14 @@ def run_backtest():
         total_portfolio_profit += symbol_profit
 
         print(f"\nارز: {symbol}")
-        print(f"  - تعداد کل معاملات (با فیلتر پوزیشن باز): {symbol_total_trades}")
+        print(f"  - تعداد کل معاملات حرفه‌ای: {symbol_total_trades}")
         print(f"  - موفق (Win): {wins} | ناموفق (Loss): {losses}")
         print(f"  - وین‌ریت: {symbol_win_rate:.2f}%")
         print(f"  - سود/زیان خالص: {symbol_profit:+.2f}$")
         print("-" * 40)
 
     print("\n" + "=" * 60)
-    print("برآیند نهایی با اعمال فیلتر پوزیشن باز:")
+    print("برآیند نهایی ستاپ حرفه‌ای:")
     print("=" * 60)
     print(f"کل معاملات کل سبد: {total_trades_all}")
     print(f"معاملات موفق (Win): {total_wins_all}")
