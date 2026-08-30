@@ -5,18 +5,18 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Top 3 Assets Only: BTC, ETH, SOL / Optimized Strategy)
+# SETTINGS (BTC & SOL Only / Optimized Strategy)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]  # حذف کامل XRPUSDT
+SYMBOLS = ["BTCUSDT", "SOLUSDT"]  # فقط بیت‌کوین و سولانا
 TIMEFRAME = "15min"
 TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
 
-INITIAL_CAPITAL_PER_SYMBOL = 333.33  # تقسیم سرمایه بین ۳ ارز ($1000 کل)
-FIXED_RISK_AMOUNT = 50.0             # ریسک ثابت ۵۰ دلار برای هر معامله
+INITIAL_CAPITAL_PER_SYMBOL = 500.0  # تقسیم سرمایه اولیه بین ۲ ارز ($1000 کل)
+FIXED_RISK_AMOUNT = 50.0            # ریسک ثابت ۵۰ دلار برای هر معامله
 
 # ============================================================
 # HTTP & PAGINATION DATA DOWNLOADER
@@ -159,17 +159,18 @@ def calculate_rsi(candles, period=14):
     return rsi_values
 
 # ============================================================
-# PORTFOLIO BACKTEST ENGINE (Top 3 Assets)
+# PORTFOLIO BACKTEST ENGINE (BTC & SOL Only)
 # ============================================================
 
-def run_top3_backtest():
+def run_btc_sol_backtest():
     total_portfolio_profit = 0.0
     total_trades_all = 0
     total_wins_all = 0
     total_losses_all = 0
+    total_days = 0
 
     print("=" * 60)
-    print("گزارش عملکرد استراتژی روی سبد طلایی (BTC, ETH, SOL):")
+    print("گزارش عملکرد استراتژی روی سبد دوتایی (BTC & SOL):")
     print("=" * 60)
 
     for symbol in SYMBOLS:
@@ -250,7 +251,7 @@ def run_top3_backtest():
         print("-" * 40)
 
     print("\n" + "=" * 60)
-    print("برآیند نهایی سبد طلایی (BTC, ETH, SOL):")
+    print("برآیند نهایی سبد دوتایی (BTC & SOL):")
     print("=" * 60)
     print(f"کل معاملات کل سبد: {total_trades_all}")
     print(f"معاملات موفق (Win): {total_wins_all}")
@@ -266,4 +267,4 @@ def run_top3_backtest():
     print(f"میانگین کل معاملات در روز: {total_trades_all / max(total_days, 0.1):.2f}")
 
 if __name__ == "__main__":
-    run_top3_backtest()
+    run_btc_sol_backtest()
