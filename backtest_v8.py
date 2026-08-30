@@ -3,13 +3,9 @@ import urllib.request
 import math
 import random
 
-# ============================================================
-# SCORE HUNTER PRO - 6-MONTH BACKTEST (Fixed RR = 2.0)
-# ============================================================
-
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 TIMEFRAME = "1hour"
-TARGET_RR = 2.0  # تنظیم ریسک به ریوارد جدید (۱ به ۲)
+TARGET_RR = 2.0
 
 def fetch_historical_klines(symbol, limit=4320):
     url = f"https://api.coinex.com/v2/spot/kline?market={symbol}&period={TIMEFRAME}&limit={limit}"
@@ -113,15 +109,23 @@ def run_backtest():
 
                 trade_won = False
                 trade_lost = False
-                for j in range(i + 1, min(i + 30, len(candles))):
+                end_idx = min(i + 30, len(candles) - 1)
+                
+                for j in range(i + 1, end_idx + 1):
                     future_c = candles[j]
-                    # بررسی اولویت برخورد با حد ضرر یا حد سود در کندل‌های آینده
                     if future_c["low"] <= stop_loss:
                         trade_lost = True
                         break
                     if future_c["high"] >= take_profit:
                         trade_won = True
                         break
+                
+                # اگر در انتهای بازه نه TP خورد و نه SL، قیمت پایانی ملاک تعیین سود/زیان می‌شود
+                if not trade_won and not trade_lost:
+                    if candles[end_idx]["close"] > entry_price:
+                        trade_won = True
+                    else:
+                        trade_lost = True
 
                 symbol_trades += 1
                 if trade_won:
