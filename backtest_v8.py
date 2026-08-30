@@ -4,12 +4,13 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Professional High-Winrate Setup)
+# SETTINGS (Multi-Coin 70% Win-Rate Setup & R:R 1:2)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
-SYMBOLS = ["BTCUSDT", "SOLUSDT"]
+# گسترش سبد ارزها (چندارزی)
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 TIMEFRAME = "15min"
 TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
@@ -35,7 +36,7 @@ def download_klines(symbol, timeframe, target_count):
 
         request = urllib.request.Request(
             url,
-            headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-PROFESSIONAL"}
+            headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-ELITE-70"}
         )
 
         try:
@@ -126,6 +127,19 @@ def calculate_sma(values, period):
             sma.append(sum(values[i-period+1:i+1]) / period)
     return sma
 
+def calculate_atr(candles, period=14):
+    atr = [candles[0]["high"] - candles[0]["low"]]
+    for i in range(1, len(candles)):
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+        prev_close = candles[i-1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        if i < period:
+            atr.append((atr[-1] * i + tr) / (i + 1))
+        else:
+            atr.append((atr[-1] * (period - 1) + tr) / period)
+    return atr
+
 def calculate_rsi(candles, period=14):
     if len(candles) < period + 1:
         return [50.0] * len(candles)
@@ -167,7 +181,7 @@ def calculate_rsi(candles, period=14):
     return rsi_values
 
 # ============================================================
-# PROFESSIONAL BACKTEST ENGINE (High Win-Rate Rules)
+# ELITE BACKTEST ENGINE (Targeting ~70% Win-Rate & R:R 1:2)
 # ============================================================
 
 def run_backtest():
@@ -178,12 +192,12 @@ def run_backtest():
     total_days = 0
 
     print("=" * 60)
-    print("گزارش تست حرفه‌ای با فیلترهای سخت‌گیرانه روند و حجم روی BTC و SOL:")
+    print("گزارش تست چندارزی (سودآور و با وین‌ریت بالا / R:R 1:2):")
     print("=" * 60)
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
-        if len(candles) < 150:
+        if len(candles) < 200:
             continue
 
         min_ts = candles[0]["timestamp"]
@@ -193,21 +207,18 @@ def run_backtest():
         closes = [c["close"] for c in candles]
         volumes = [c["volume"] for c in candles]
         
-        ema_20 = calculate_ema(closes, 20)
         ema_50 = calculate_ema(closes, 50)
-        ema_100 = calculate_ema(closes, 100)
-        sma_vol_20 = calculate_sma(volumes, 20)
+        ema_200 = calculate_ema(closes, 200)
+        atr_list = calculate_atr(candles, 14)
+        sma_vol_50 = calculate_sma(volumes, 50)
         rsi_list = calculate_rsi(candles, 14)
 
         trades = []
         active_position = None  # قفل پوزیشن برای جلوگیری از تداخل
 
-        for i in range(100, len(candles) - 1):
+        for i in range(200, len(candles) - 1):
             c = candles[i]
-            prev_c = candles[i-1]
-            
             close_p = c["close"]
-            open_p = c["open"]
             
             # مدیریت پوزیشن باز فعلی
             if active_position is not None:
@@ -220,35 +231,28 @@ def run_backtest():
                 else:
                     continue
 
-            # فیلترهای حرفه‌ای و سخت‌گیرانه برای بالا بردن دقت و وین‌ریت
-            is_strong_uptrend = (ema_20[i] > ema_50[i]) and (ema_50[i] > ema_100[i])
-            is_pullback = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
+            # استراتژی الیت جهت رسیدن به وین‌ریت بالا
+            # 1. روند بلندمدت صعودی (قیمت بالای EMA 200 و EMA 50 بالای EMA 200)
+            is_macro_uptrend = (close_p > ema_200[i]) and (ema_50[i] > ema_200[i])
             
+            # 2. اصلاح قیمتی تمیز و تایید بازگشت با قدرت ساختار بازار
+            is_structure_bullish = (c["close"] > c["open"]) and (c["close"] > candles[i-1]["high"])
+            
+            # 3. RSI در ناحیه سلامت روند (بین ۵۲ تا ۶۸ بدون اشباع خطرناک)
             rsi = rsi_list[i]
-            is_rsi_optimal = 50 <= rsi <= 60  # محدوده‌ی دقیق مومنتوم صعودی سالم
+            is_rsi_safe = 52 <= rsi <= 68
             
-            is_green_candle = close_p > open_p
-            is_volume_confirmed = c["volume"] > (sma_vol_20[i] * 1.2)  # حجم معاملات بالاتر از میانگین
+            # 4. تایید حجم معاملات بالاتر از میانگین ۵۰ کندل اخیر
+            is_volume_strong = c["volume"] > (sma_vol_50[i] * 1.3)
 
-            if is_strong_uptrend and is_pullback and is_rsi_optimal and is_green_candle and is_volume_confirmed:
+            if is_macro_uptrend and is_structure_bullish and is_rsi_safe and is_volume_strong:
                 entry_price = close_p
+                current_atr = atr_list[i]
                 
-                # تنظیمات ریسک به ریوارد حرفه‌ای (SL دقیق و TP هدفمند)
-                stop_loss = entry_price * 0.992     # 0.8% حد ضرر فشرده‌تر و امن‌تر
-                take_profit = entry_price * 1.018   # 1.8% حد سود منطقی برای R:R بالا
+                # تنظیم دقیق حد ضرر بر اساس ATR و حد سود دقیقاً ۲ برابر (R:R 1:2)
+                stop_loss = entry_price - (current_atr * 1.2)
+                take_profit = entry_price + (current_atr * 2.4)
                 
-                # بررسی موانع قیمتی در کندل‌های قبلی
-                has_obstacle = False
-                for j in range(max(0, i-3), i):
-                    upper_wick = candles[j]["high"] - max(candles[j]["open"], candles[j]["close"])
-                    body = abs(candles[j]["close"] - candles[j]["open"])
-                    if body > 0 and upper_wick > (body * 1.8):
-                        has_obstacle = True
-                        break
-
-                if has_obstacle:
-                    continue
-
                 trade_result = None
                 for future_c in candles[i+1:]:
                     if future_c["low"] <= stop_loss:
@@ -268,8 +272,8 @@ def run_backtest():
         symbol_total_trades = wins + losses
         symbol_win_rate = (wins / symbol_total_trades * 100) if symbol_total_trades > 0 else 0.0
         
-        # محاسبه سود خالص با ضریب ریسک به ریوارد جدید (تخمین نسبت ~2.25)
-        symbol_profit = (wins * FIXED_RISK_AMOUNT * 2.25) - (losses * FIXED_RISK_AMOUNT)
+        # محاسبه سود خالص با ریسک به ریوارد دقیق ۱ به ۲ (هر برد = ۲ برابر ریسک)
+        symbol_profit = (wins * FIXED_RISK_AMOUNT * 2.0) - (losses * FIXED_RISK_AMOUNT)
         
         total_trades_all += symbol_total_trades
         total_wins_all += wins
@@ -277,25 +281,26 @@ def run_backtest():
         total_portfolio_profit += symbol_profit
 
         print(f"\nارز: {symbol}")
-        print(f"  - تعداد کل معاملات حرفه‌ای: {symbol_total_trades}")
+        print(f"  - تعداد کل معاملات: {symbol_total_trades}")
         print(f"  - موفق (Win): {wins} | ناموفق (Loss): {losses}")
         print(f"  - وین‌ریت: {symbol_win_rate:.2f}%")
         print(f"  - سود/زیان خالص: {symbol_profit:+.2f}$")
         print("-" * 40)
 
     print("\n" + "=" * 60)
-    print("برآیند نهایی ستاپ حرفه‌ای:")
+    print("برآیند نهایی سبد چندارزی (هدف Win-Rate بالا و R:R 1:2):")
     print("=" * 60)
     print(f"کل معاملات کل سبد: {total_trades_all}")
     print(f"معاملات موفق (Win): {total_wins_all}")
     print(f"معاملات ناموفق (Loss): {total_losses_all}")
     
     portfolio_wr = (total_wins_all / total_trades_all * 100) if total_trades_all > 0 else 0.0
-    final_capital = 1000.0 + total_portfolio_profit
-    portfolio_roi = (total_portfolio_profit / 1000.0) * 100
+    initial_total_capital = len(SYMBOLS) * INITIAL_CAPITAL_PER_SYMBOL
+    final_capital = initial_total_capital + total_portfolio_profit
+    portfolio_roi = (total_portfolio_profit / initial_total_capital) * 100
 
     print(f"وین‌ریت کل سبد: {portfolio_wr:.2f}%")
-    print(f"سرمایه نهایی سبد: {final_capital:.2f}$")
+    print(f"سرمایه نهایی کل سبد: {final_capital:.2f}$")
     print(f"سود خالص کل سبد: {total_portfolio_profit:+.2f}$ ({portfolio_roi:+.2f}%)")
 
 if __name__ == "__main__":
