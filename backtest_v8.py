@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Targeting 50%+ Win-Rate with 1:2 Risk-to-Reward)
+# SETTINGS (Smart Structural SL + 1:2 RR for ~50% Win-Rate)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -176,7 +176,7 @@ def calculate_atr(candles, period=14):
     return atr_values
 
 # ============================================================
-# MAIN PORTFOLIO BACKTEST (Targeting ~50% Win-Rate with 1:2 RR)
+# MAIN PORTFOLIO BACKTEST (Structural SL + 1:2 RR)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -184,7 +184,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال اجرای اسکریپت با فیلترهای بهیه‌سازی برای وین‌ریت ۵۰٪ و ریسک به ریوارد ۱ به ۲...")
+    print("در حال اجرای اسکریپت با استاپ‌لاس ساختاری و هدف وین‌ریت ۵۰ درصدی...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -206,6 +206,7 @@ def run_portfolio_backtest():
         for i in range(50, len(candles) - 1):
             c = candles[i]
             prev_c = candles[i-1]
+            prev_prev_c = candles[i-2]
             close_p = c["close"]
             open_p = c["open"]
             high_p = c["high"]
@@ -215,26 +216,31 @@ def run_portfolio_backtest():
             if atr <= 0:
                 continue
 
-            # فیلترهای پیشرفته جهت دستیابی به وین‌ریت نزدیک به ۵۰ درصد با ریوارد ۱ به ۲
-            is_super_uptrend = (ema_9[i] > ema_21[i]) and (ema_21[i] > ema_50[i]) and ((ema_9[i] - ema_50[i]) > (atr * 0.7))
-            is_safe_pullback = (prev_c["low"] <= ema_9[i-1]) and (close_p > ema_9[i])
+            # فیلترهای روند و پولبک تمیز
+            is_uptrend = (ema_9[i] > ema_21[i]) and (ema_21[i] > ema_50[i])
+            is_pullback = (prev_c["low"] <= ema_9[i-1]) and (close_p > ema_9[i])
             
             rsi = rsi_list[i]
-            is_rsi_golden = 54 <= rsi <= 64  # محدوده طلایی مومنتوم صعودی پایدار
+            is_rsi_ok = 50 <= rsi <= 65
             
             avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
-            is_volume_spike = c["volume"] > (avg_vol * 1.6)  # حجم بسیار بالا برای تایید قدرت گاوها
+            is_vol_good = c["volume"] > (avg_vol * 1.3)
             
-            candle_range = high_p - low_p
-            # شرط بسته شدن کندل در نیمه بالای رنج خود (نشان‌دهنده قدرت خریداران در انتهای کندل)
-            is_strong_close = candle_range > 0 and ((close_p - low_p) / candle_range) >= 0.65
             is_green = close_p > open_p
 
-            if is_super_uptrend and is_safe_pullback and is_rsi_golden and is_volume_spike and is_strong_close and is_green:
+            if is_uptrend and is_pullback and is_rsi_ok and is_vol_good and is_green:
                 entry_price = close_p
-                # ریسک به ریوارد طلایی ۱ به ۲
-                stop_loss = entry_price - (1.0 * atr)
-                take_profit = entry_price + (2.0 * atr)
+                
+                # استاپ‌لاس ساختاری: کفِ پایین‌ترین نقطه بین ۳ کندل اخیر (خیلی دقیق‌تر و هوشمندانه‌تر)
+                structural_low = min(c["low"], prev_c["low"], prev_prev_c["low"])
+                stop_loss = structural_low - (0.1 * atr)  # کمی پایین‌تر از کف برای امنیت
+                
+                risk = entry_price - stop_loss
+                if risk <= 0:
+                    continue
+                
+                # ریسک به ریوارد دقیق ۱ به ۲ بر اساس استقامت واقعی بازار
+                take_profit = entry_price + (2.0 * risk)
                 
                 trade_result = None
                 exit_ts = c["timestamp"]
@@ -274,7 +280,7 @@ def run_portfolio_backtest():
             capital -= risk_amount
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی سبد (هدف وین‌ریت ۵۰٪ + ریسک به ریوارد ۱ به ۲):")
+    print("نتایج نهایی سبد (استاپ ساختاری هوشمند + ریسک به ریوارد ۱ به ۲):")
     print("=" * 50)
     print(f"کل معاملات سبد: {total_trades}")
     print(f"معاملات موفق (Win): {wins}")
