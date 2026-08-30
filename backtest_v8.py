@@ -5,12 +5,12 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Optimized Portfolio: BTC, ETH, SOL, LINK, DOGE, AVAX)
+# SETTINGS (Optimal 4-Coin Core Basket: BTC, ETH, SOL, LINK)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "DOGEUSDT", "AVAXUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT"]
 TIMEFRAME = "15min"
 TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
@@ -176,7 +176,7 @@ def calculate_atr(candles, period=14):
     return atr_values
 
 # ============================================================
-# MAIN PORTFOLIO BACKTEST (Optimized New Basket)
+# MAIN PORTFOLIO BACKTEST (Core 4 Coins)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -184,7 +184,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال استخراج سیگنال‌ها روی سبد جدید (BTC, ETH, SOL, LINK, DOGE, AVAX)...")
+    print("در حال استخراج سیگنال‌ها روی سبد هسته اصلی (BTC, ETH, SOL, LINK)...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -215,27 +215,25 @@ def run_portfolio_backtest():
             if atr <= 0:
                 continue
 
-            # ۱. روند صعودی قدرتمند
+            # فیلترهای استاندارد و بهینه برای 4 ارز اصلی
             is_uptrend = ema_20[i] > ema_50[i]
-            
-            # ۲. پولبک استاندارد به EMA 20
             is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
             
-            # ۳. فیلتر RSI دقیق در محدوده کاملاً صعودی و ایمن
             rsi = rsi_list[i]
             is_rsi_good = 50 <= rsi <= 62
             
-            # ۴. تاییدیه بدنه کندل صعودی قوی
+            avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
+            is_volume_ok = c["volume"] > (avg_vol * 1.1)
+            
             candle_body = abs(close_p - open_p)
             candle_range = high_p - low_p
-            is_strong_body = candle_range > 0 and (candle_body / candle_range) >= 0.45
+            is_strong_body = candle_range > 0 and (candle_body / candle_range) >= 0.4
             is_green = close_p > open_p
 
-            if is_uptrend and is_pullback_recovery and is_rsi_good and is_strong_body and is_green:
+            if is_uptrend and is_pullback_recovery and is_rsi_good and is_volume_ok and is_strong_body and is_green:
                 entry_price = close_p
-                # مدیریت ریسک پویا بر اساس ATR
-                stop_loss = entry_price - (1.1 * atr)
-                take_profit = entry_price + (1.6 * atr)
+                stop_loss = entry_price - (1.15 * atr)
+                take_profit = entry_price + (1.75 * atr)
                 
                 trade_result = None
                 exit_ts = c["timestamp"]
@@ -269,13 +267,13 @@ def run_portfolio_backtest():
         risk_amount = capital * RISK_PERCENT
         if trade["result"] == "WIN":
             wins += 1
-            capital += risk_amount * 1.45
+            capital += risk_amount * 1.5
         else:
             losses += 1
             capital -= risk_amount
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی سبد جدید (BTC, ETH, SOL, LINK, DOGE, AVAX):")
+    print("نتایج نهایی سبد ۴ ارزی هسته اصلی:")
     print("=" * 50)
     print(f"کل معاملات سبد: {total_trades}")
     print(f"معاملات موفق (Win): {wins}")
