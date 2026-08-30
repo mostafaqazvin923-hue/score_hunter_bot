@@ -1,143 +1,80 @@
 import json
-import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS
+# SETTINGS (CoinEx API)
 # ============================================================
 
-BASE_URLS = [
-    "https://api.lbank.info",
-    "https://api.lbkex.com",
-    "https://www.lbkex.net",
-]
+BASE_URL = "https://api.coinex.com/v2"
 
-SYMBOL = "sol_usdt"
-TIMEFRAME = "minute15"
-TARGET_CANDLES = 1000  # هدف: دریافت ۱۰۰۰ کندل کامل
-PAGE_SIZE = 2000       # حداکثر سایز مجاز صفحه در ال‌بنک برای دریافت یکجای تاریخچه
+SYMBOL = "SOLUSDT"
+TIMEFRAME = "15m"   # تایم‌فریم ۱۵ دقیقه در کوینکس
+TARGET_CANDLES = 1000
 
 # ============================================================
-# HTTP & DATA DOWNLOADER
+# HTTP & DATA DOWNLOADER (CoinEx)
 # ============================================================
 
-def http_get(url, params, timeout=20):
-    query = urllib.parse.urlencode(params)
-    full_url = url + "/v2/kline.do?" + query
+def download_klines(symbol, timeframe, limit=1000):
+    # کوینکس به راحتی در هر درخواست تا ۱۰۰۰ کندل تاریخچه میده
+    url = f"{BASE_URL}/spot/market-kline?market={symbol}&type={timeframe}&limit={limit}"
+    
+    print(f"در حال دریافت تاریخچه کندل‌ها از CoinEx برای {symbol}...")
 
     request = urllib.request.Request(
-        full_url,
+        url,
         headers={
             "User-Agent": "Mozilla/5.0 SCORE-HUNTER-BACKTEST"
         }
     )
 
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        raw = response.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = response.read().decode("utf-8")
+            payload = json.loads(raw)
+    except Exception as exc:
+        print(f"خطا در ارتباط با سرور کوینکس: {exc}")
+        return []
 
-    return json.loads(raw)
+    # ساختار پاسخ کوینکس: {"code": 0, "data": [...]}
+    if not isinstance(payload, dict) or payload.get("code") != 0:
+        print("پاسخ نامعتبر از صرافی کوینکس")
+        return []
 
-def extract_data(payload):
-    if isinstance(payload, dict):
-        data = payload.get("data")
-        if data is None:
-            return []
-        return data
-    if isinstance(payload, list):
-        return payload
-    return []
+    rows = payload.get("data", [])
+    candles = []
 
-def download_klines(symbol, timeframe, target_count):
-    all_rows = {}
-    end_time = int(time.time())
-    pages = 0
-    last_oldest = None
-
-    print(f"در حال دریافت تاریخچه کامل کندل‌ها از LBank برای {symbol}...")
-
-    while len(all_rows) < target_count:
-        pages += 1
-        if pages > 20:
-            break
-
-        params = {
-            "symbol": symbol,
-            "size": PAGE_SIZE,
-            "type": timeframe,
-            "time": end_time,
-        }
-
-        payload = None
-        last_error = None
-
-        for base in BASE_URLS:
-            try:
-                payload = http_get(base, params)
-                break
-            except Exception as exc:
-                last_error = exc
-                continue
-
-        if payload is None:
-            print(f"خطا در ارتباط با سرورهای ال‌بنک: {last_error}")
-            break
-
-        rows = extract_data(payload)
-        if not rows:
-            break
-
-        added = 0
-        for row in rows:
+    # ساختار هر کندل در کوینکس: [time, open, close, high, low, volume, amount, ...]
+    for row in rows:
+        try:
             if not isinstance(row, list) or len(row) < 6:
                 continue
 
-            try:
-                ts = int(float(row[0]))
-                op = float(row[1])
-                hi = float(row[2])
-                lo = float(row[3])
-                cl = float(row[4])
-                vol = float(row[5])
+            ts = int(float(row[0]))
+            op = float(row[1])
+            cl = float(row[2])
+            hi = float(row[3])
+            lo = float(row[4])
+            vol = float(row[5])
 
-                if hi <= 0 or lo <= 0 or op <= 0 or cl <= 0:
-                    continue
-
-                all_rows[ts] = {
-                    "timestamp": ts,
-                    "open": op,
-                    "high": hi,
-                    "low": lo,
-                    "close": cl,
-                    "volume": vol,
-                }
-                added += 1
-            except Exception:
+            if hi <= 0 or lo <= 0 or op <= 0 or cl <= 0:
                 continue
 
-        if not all_rows:
-            break
+            candles.append({
+                "timestamp": ts,
+                "open": op,
+                "high": hi,
+                "low": lo,
+                "close": cl,
+                "volume": vol,
+            })
+        except Exception:
+            continue
 
-        oldest = min(all_rows.keys())
-        if last_oldest == oldest:
-            break
-        last_oldest = oldest
-        
-        # عقب بردن زمان برای صفحه بعدی (تبدیل به ثانیه منهای یک)
-        end_time = oldest - 1
-
-        if added == 0:
-            break
-
-        time.sleep(0.1)
-
-    candles = list(all_rows.values())
+    # مرتب‌سازی بر اساس زمان (قدیمی به جدید)
     candles.sort(key=lambda x: x["timestamp"])
-
-    if len(candles) > target_count:
-        candles = candles[-target_count:]
-
     return candles
 
 # ============================================================
@@ -153,7 +90,6 @@ def run_backtest():
         print("تعداد کندل‌های دریافتی برای بک‌تست کافی نیست.")
         return
 
-    # محاسبه بازه زمانی دقیق بر اساس اولین و آخرین کندل
     first_time = datetime.fromtimestamp(candles[0]["timestamp"], tz=timezone.utc)
     last_time = datetime.fromtimestamp(candles[-1]["timestamp"], tz=timezone.utc)
     total_days = (candles[-1]["timestamp"] - candles[0]["timestamp"]) / 86400
