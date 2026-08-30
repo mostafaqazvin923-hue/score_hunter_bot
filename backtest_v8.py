@@ -4,13 +4,13 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (CoinEx API)
+# SETTINGS (CoinEx API v2 Correct Endpoint)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
 SYMBOL = "SOLUSDT"
-TIMEFRAME = "15m"   # تایم‌فریم ۱۵ دقیقه در کوینکس
+TIMEFRAME = "15m"   # تایم‌فریم ۱۵ دقیقه
 TARGET_CANDLES = 1000
 
 # ============================================================
@@ -18,8 +18,8 @@ TARGET_CANDLES = 1000
 # ============================================================
 
 def download_klines(symbol, timeframe, limit=1000):
-    # کوینکس به راحتی در هر درخواست تا ۱۰۰۰ کندل تاریخچه میده
-    url = f"{BASE_URL}/spot/market-kline?market={symbol}&type={timeframe}&limit={limit}"
+    # مسیر درست ای‌پی‌آی کندل‌های کوینکس
+    url = f"{BASE_URL}/spot/kline?market={symbol}&period={timeframe}&limit={limit}"
     
     print(f"در حال دریافت تاریخچه کندل‌ها از CoinEx برای {symbol}...")
 
@@ -38,26 +38,33 @@ def download_klines(symbol, timeframe, limit=1000):
         print(f"خطا در ارتباط با سرور کوینکس: {exc}")
         return []
 
-    # ساختار پاسخ کوینکس: {"code": 0, "data": [...]}
     if not isinstance(payload, dict) or payload.get("code") != 0:
-        print("پاسخ نامعتبر از صرافی کوینکس")
+        print("پاسخ نامعتبر از صرافی کوینکس:", payload.get("message"))
         return []
 
     rows = payload.get("data", [])
     candles = []
 
-    # ساختار هر کندل در کوینکس: [time, open, close, high, low, volume, amount, ...]
+    # ساختار کندل در کوینکس v2: معمولاً دیکشنری یا لیست شامل [time, open, close, high, low, volume, ...]
     for row in rows:
         try:
-            if not isinstance(row, list) or len(row) < 6:
+            # اگر داده به شکل دیکشنری یا لیست باشد
+            if isinstance(row, dict):
+                ts = int(float(row.get("created_at", row.get("time", 0))))
+                op = float(row.get("open", 0))
+                hi = float(row.get("high", 0))
+                lo = float(row.get("low", 0))
+                cl = float(row.get("close", 0))
+                vol = float(row.get("volume", 0))
+            elif isinstance(row, list) and len(row) >= 6:
+                ts = int(float(row[0]))
+                op = float(row[1])
+                cl = float(row[2])
+                hi = float(row[3])
+                lo = float(row[4])
+                vol = float(row[5])
+            else:
                 continue
-
-            ts = int(float(row[0]))
-            op = float(row[1])
-            cl = float(row[2])
-            hi = float(row[3])
-            lo = float(row[4])
-            vol = float(row[5])
 
             if hi <= 0 or lo <= 0 or op <= 0 or cl <= 0:
                 continue
@@ -73,7 +80,6 @@ def download_klines(symbol, timeframe, limit=1000):
         except Exception:
             continue
 
-    # مرتب‌سازی بر اساس زمان (قدیمی به جدید)
     candles.sort(key=lambda x: x["timestamp"])
     return candles
 
