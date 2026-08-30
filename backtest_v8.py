@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (4-Asset Portfolio / High Win-Rate / 5% Risk)
+# SETTINGS (4-Asset Portfolio / Fixed $50 Margin per Trade)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -16,7 +16,7 @@ TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
 
 INITIAL_CAPITAL = 1000.0
-RISK_PERCENT = 0.05  # ریسک ۵ درصدی روی سرمایه لحظه‌ای
+FIXED_RISK_AMOUNT = 50.0  # مارجین و ریسک ثابت ۵۰ دلار برای هر معامله
 
 # ============================================================
 # HTTP & PAGINATION DATA DOWNLOADER
@@ -159,7 +159,7 @@ def calculate_rsi(candles, period=14):
     return rsi_values
 
 # ============================================================
-# PORTFOLIO BACKTEST ENGINE (4 Assets Combined Chronologically)
+# PORTFOLIO BACKTEST ENGINE (Fixed $50 Margin)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -167,7 +167,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال دریافت داده‌ها و اجرای استراتژی روی ۴ ارز (BTC, ETH, SOL, XRP)...")
+    print("در حال اجرای استراتژی با مارجین ثابت ۵۰ دلار روی ۴ ارز...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -222,7 +222,6 @@ def run_portfolio_backtest():
                         "result": trade_result
                     })
 
-    # مرتب‌سازی تمام معاملات ۴ ارز بر اساس زمان ورود (برای شبیه‌سازی دقیق و واقعی سرمایه)
     all_trades.sort(key=lambda x: x["entry_time"])
     total_days = (global_max_ts - global_min_ts) / 86400
 
@@ -231,20 +230,18 @@ def run_portfolio_backtest():
     losses = 0
 
     for trade in all_trades:
-        if capital <= 0:
+        if capital < FIXED_RISK_AMOUNT:
             break
-            
-        risk_amount = capital * RISK_PERCENT
 
         if trade["result"] == "WIN":
             wins += 1
-            capital += risk_amount * 1.25
+            capital += FIXED_RISK_AMOUNT * 1.25
         elif trade["result"] == "LOSS":
             losses += 1
-            capital -= risk_amount
+            capital -= FIXED_RISK_AMOUNT
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی سبد ۴ ارز برتر با ریسک ۵٪:")
+    print("نتایج نهایی سبد ۴ ارز با مارجین ثابت ۵۰ دلاری:")
     print("=" * 50)
     total_trades = wins + losses
     print("کل معاملات کل سبد: " + str(total_trades))
@@ -259,7 +256,7 @@ def run_portfolio_backtest():
         print(f"وین‌ریت کل سبد: {win_rate:.2f}%")
         print(f"سرمایه نهایی سبد: {capital:.2f}$")
         print(f"سود/زیان خالص کل: {net_profit:+.2f}$ ({profit_percentage:+.2f}%)")
-        print(f"میانگین تعداد معامله در روز (برای کل سبد): {total_trades / max(total_days, 0.1):.2f}")
+        print(f"میانگین تعداد معامله در روز: {total_trades / max(total_days, 0.1):.2f}")
     else:
         print("هیچ معامله‌ای انجام نشد.")
 
