@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS
+# SETTINGS (الگوبرداری دقیق از اسکریپت خودت)
 # ============================================================
 
 BASE_URLS = [
@@ -16,7 +16,7 @@ BASE_URLS = [
 
 SYMBOL = "sol_usdt"
 TIMEFRAME = "minute15"
-TARGET_CANDLES = 1000  # افزایش تعداد کندل برای دریافت تاریخچه کامل‌تر
+TARGET_CANDLES = 1000
 PAGE_SIZE = 200
 
 # ============================================================
@@ -55,11 +55,11 @@ def download_klines(symbol, timeframe, target_count):
     pages = 0
     last_oldest = None
 
-    print(f"در حال دریافت تاریخچه کندل ها از LBank برای {symbol}...")
+    print(f"در حال دریافت تاریخچه کندل‌ها از LBank برای {symbol}...")
 
     while len(all_rows) < target_count:
         pages += 1
-        if pages > 50:
+        if pages > 100:
             break
 
         params = {
@@ -81,7 +81,7 @@ def download_klines(symbol, timeframe, target_count):
                 continue
 
         if payload is None:
-            print(f"خطا در ارتباط با سرورهای ال بنک: {last_error}")
+            print(f"خطا در ارتباط با سرورهای ال‌بنک: {last_error}")
             break
 
         rows = extract_data(payload)
@@ -139,14 +139,16 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# BACKTEST ENGINE
+# BACKTEST ENGINE (با شرط‌های قطعی برای ثبت معامله)
 # ============================================================
 
 def run_backtest():
     candles = download_klines(SYMBOL, TIMEFRAME, TARGET_CANDLES)
     
+    print(f"تعداد کل کندل‌های دریافت شده: {len(candles)}")
+    
     if len(candles) < 50:
-        print("تعداد کندل های دریافتی برای بک تست کافی نیست.")
+        print("تعداد کندل‌های دریافتی برای بک‌تست کافی نیست.")
         return
 
     total_trades = 0
@@ -154,30 +156,22 @@ def run_backtest():
     losses = 0
     
     print("-" * 50)
-    print(f"شروع بک تست روی {len(candles)} کندلِ {SYMBOL.upper()}...")
+    print(f"شروع بک‌تست روی {len(candles)} کندلِ {SYMBOL.upper()}...")
     print("-" * 50)
 
-    # استفاده از میانگین متحرک ساده و حجم برای سیگنال‌دهی تضمینی
-    for i in range(20, len(candles) - 1):
-        prev_candle = candles[i - 1]
-        current_candle = candles[i]
+    for i in range(10, len(candles) - 1):
+        candle = candles[i]
         
-        close_price = current_candle["close"]
-        open_price = current_candle["open"]
-        volume = current_candle["volume"]
+        close_price = candle["close"]
+        open_price = candle["open"]
         
-        # میانگین حجم ۲۰ کندل قبل
-        avg_volume = sum(c["volume"] for c in candles[i-20:i]) / 20
-
-        # شرایط ورود کاملاً منعطف تا حتماً معامله ثبت شود
+        # شرط ساده و تضمینی برای اینکه ببینیم موتور معامله‌گر کار می‌کند یا نه
         is_green = close_price > open_price
-        is_breakout = close_price > prev_candle["high"]
-        is_volume_ok = volume > avg_volume
 
-        if is_green and is_breakout and is_volume_ok:
+        if is_green:
             entry_price = close_price
-            stop_loss = entry_price * 0.98   # ۲ درصد استاپ
-            take_profit = entry_price * 1.04 # ۴ درصد تی‌پی (ریسک به ریوارد ۱ به ۲)
+            stop_loss = entry_price * 0.99
+            take_profit = entry_price * 1.02
             
             total_trades += 1
             
@@ -198,16 +192,16 @@ def run_backtest():
                 total_trades -= 1
 
     print("-" * 50)
-    print("نتایج نهایی بک تست:")
-    print(f"کل معاملات انجام شده: {total_trades}")
-    print(f"معاملات موفق (Win): {wins}")
-    print(f"معاملات ناموفق (Loss): {losses}")
+    print("📊 نتایج نهایی بک‌تست:")
+    print(f"🔹 کل معاملات انجام شده: {total_trades}")
+    print(f"✅ معاملات موفق (Win): {wins}")
+    print(f"❌ معاملات ناموفق (Loss): {losses}")
     
     if total_trades > 0:
         win_rate = (wins / total_trades) * 100
-        print(f"وین ریت استراتژی: {win_rate:.2f}%")
+        print(f"🎯 وین‌ریت استراتژی: {win_rate:.2f}%")
     else:
-        print("هیچ معامله ای با این شرایط در این بازه فعال نشد.")
+        print("هیچ معامله‌ای با این شرایط در این بازه فعال نشد.")
 
 if __name__ == "__main__":
     run_backtest()
