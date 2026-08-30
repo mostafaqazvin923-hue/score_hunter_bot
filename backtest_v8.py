@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Smart Structural SL + 1:2 RR for ~50% Win-Rate)
+# SETTINGS (Real Strict Holy-Grail Test: 60% Win-Rate + 1:2 RR)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -176,7 +176,7 @@ def calculate_atr(candles, period=14):
     return atr_values
 
 # ============================================================
-# MAIN PORTFOLIO BACKTEST (Structural SL + 1:2 RR)
+# MAIN PORTFOLIO BACKTEST (Strict Anti-Bankruptcy + 1:2 RR)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -184,7 +184,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال اجرای اسکریپت با استاپ‌لاس ساختاری و هدف وین‌ریت ۵۰ درصدی...")
+    print("در حال اجرای اسکریپت با فیلترهای فوق‌سخت‌گیرانه برای هدف وین‌ریت بالا و ریسک به ریوارد ۱ به ۲...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -206,7 +206,6 @@ def run_portfolio_backtest():
         for i in range(50, len(candles) - 1):
             c = candles[i]
             prev_c = candles[i-1]
-            prev_prev_c = candles[i-2]
             close_p = c["close"]
             open_p = c["open"]
             high_p = c["high"]
@@ -216,31 +215,24 @@ def run_portfolio_backtest():
             if atr <= 0:
                 continue
 
-            # فیلترهای روند و پولبک تمیز
-            is_uptrend = (ema_9[i] > ema_21[i]) and (ema_21[i] > ema_50[i])
-            is_pullback = (prev_c["low"] <= ema_9[i-1]) and (close_p > ema_9[i])
+            # فیلترهای بسیار سخت برای حذف کامل نویز و رِنج بازار
+            is_mega_uptrend = (ema_9[i] > ema_21[i]) and (ema_21[i] > ema_50[i]) and ((ema_9[i] - ema_50[i]) > (atr * 0.9))
+            is_perfect_pullback = (prev_c["low"] <= ema_9[i-1]) and (close_p > ema_9[i])
             
             rsi = rsi_list[i]
-            is_rsi_ok = 50 <= rsi <= 65
+            is_rsi_perfect = 55 <= rsi <= 62  # محدوده بسیار پاک و مومنتوم‌دار صعودی
             
             avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
-            is_vol_good = c["volume"] > (avg_vol * 1.3)
+            is_volume_huge = c["volume"] > (avg_vol * 1.8)  # حجم انفجاری برای تایید ورود خریداران بزرگ
             
+            candle_range = high_p - low_p
+            is_huge_body = candle_range > 0 and ((close_p - low_p) / candle_range) >= 0.7  # کندل قدرتمند بسته شده در بالا
             is_green = close_p > open_p
 
-            if is_uptrend and is_pullback and is_rsi_ok and is_vol_good and is_green:
+            if is_mega_uptrend and is_perfect_pullback and is_rsi_perfect and is_volume_huge and is_huge_body and is_green:
                 entry_price = close_p
-                
-                # استاپ‌لاس ساختاری: کفِ پایین‌ترین نقطه بین ۳ کندل اخیر (خیلی دقیق‌تر و هوشمندانه‌تر)
-                structural_low = min(c["low"], prev_c["low"], prev_prev_c["low"])
-                stop_loss = structural_low - (0.1 * atr)  # کمی پایین‌تر از کف برای امنیت
-                
-                risk = entry_price - stop_loss
-                if risk <= 0:
-                    continue
-                
-                # ریسک به ریوارد دقیق ۱ به ۲ بر اساس استقامت واقعی بازار
-                take_profit = entry_price + (2.0 * risk)
+                stop_loss = entry_price - (1.2 * atr)  # استاپ ایمن‌تر در برابر نوسانات فیک
+                take_profit = entry_price + (2.4 * atr)  # ریسک به ریوارد دقیقاً ۱ به ۲
                 
                 trade_result = None
                 exit_ts = c["timestamp"]
@@ -270,7 +262,12 @@ def run_portfolio_backtest():
     wins = 0
     losses = 0
 
+    # شبیه‌سازی واقعی حساب با بررسی احتمال ورشکستگی (جلوگیری از منفی شدن سرمایه)
     for trade in all_trades:
+        if capital < FIXED_RISK_AMOUNT:
+            print("هشدار: سرمایه حساب برای ادامه معاملات تمام شد (ورشکستگی حساب)!")
+            break
+
         risk_amount = FIXED_RISK_AMOUNT
         if trade["result"] == "WIN":
             wins += 1
@@ -280,14 +277,15 @@ def run_portfolio_backtest():
             capital -= risk_amount
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی سبد (استاپ ساختاری هوشمند + ریسک به ریوارد ۱ به ۲):")
+    print("نتایج نهایی واقعی (بدون باگ و با کنترل سرمایه):")
     print("=" * 50)
     print(f"کل معاملات سبد: {total_trades}")
     print(f"معاملات موفق (Win): {wins}")
     print(f"معاملات ناموفق (Loss): {losses}")
     
-    if total_trades > 0:
-        win_rate = (wins / total_trades) * 100
+    handled_total = wins + losses
+    if handled_total > 0:
+        win_rate = (wins / handled_total) * 100
         net_profit = capital - INITIAL_CAPITAL
         profit_percentage = (net_profit / INITIAL_CAPITAL) * 100
         
