@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Heikin Ashi + ADX High Win-Rate Strategy)
+# SETTINGS (Balanced Medium-Frequency Strategy - 3+ Trades/Day)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -70,8 +70,8 @@ def download_klines(symbol, timeframe, target_count):
                     op = float(row[1])
                     cl = float(row[2]) if len(row) > 2 else float(row[2])
                     hi = float(row[3]) if len(row) > 3 else float(row[3])
-                    lo = float(row.get("4", row[4])) if len(row) > 4 else float(row[4])
-                    vol = float(row.get("5", row[5])) if len(row) > 5 else float(row[5])
+                    lo = float(row[4]) if len(row) > 4 else float(row[4])
+                    vol = float(row[5]) if len(row) > 5 else float(row[5])
                 else:
                     continue
 
@@ -110,108 +110,68 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# HEIKIN ASHI & INDICATORS (SMA, ADX)
+# TECHNICAL INDICATORS (EMA & RSI)
 # ============================================================
 
-def convert_to_heikin_ashi(candles):
-    ha_candles = []
-    for i, c in enumerate(candles):
-        ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4.0
-        if i == 0:
-            ha_open = (c["open"] + c["close"]) / 2.0
+def calculate_ema(closes, period):
+    ema = [closes[0]]
+    multiplier = 2 / (period + 1)
+    for price in closes[1:]:
+        ema.append((price - ema[-1]) * multiplier + ema[-1])
+    return ema
+
+def calculate_rsi(candles, period=14):
+    if len(candles) < period + 1:
+        return [50.0] * len(candles)
+    
+    rsi_values = [50.0] * len(candles)
+    gains = 0.0
+    losses = 0.0
+    
+    for i in range(1, period + 1):
+        change = candles[i]["close"] - candles[i - 1]["close"]
+        if change > 0:
+            gains += change
         else:
-            ha_open = (ha_candles[i-1]["open"] + ha_candles[i-1]["close"]) / 2.0
-        
-        ha_high = max(c["high"], ha_open, ha_close)
-        ha_low = min(c["low"], ha_open, ha_close)
-        
-        ha_candles.append({
-            "timestamp": c["timestamp"],
-            "open": ha_open,
-            "high": ha_high,
-            "low": ha_low,
-            "close": ha_close,
-            "volume": c["volume"]
-        })
-    return ha_candles
+            losses -= change
+            
+    avg_gain = gains / period
+    avg_loss = losses / period
+    
+    if avg_loss == 0:
+        rsi_values[period] = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi_values[period] = 100.0 - (100.0 / (1.0 + rs))
 
-def calculate_sma(values, period):
-    sma = []
-    for i in range(len(values)):
-        if i < period - 1:
-            sma.append(sum(values[:i+1]) / (i + 1))
+    for i in range(period + 1, len(candles)):
+        change = candles[i]["close"] - candles[i - 1]["close"]
+        gain = change if change > 0 else 0.0
+        loss = -change if change < 0 else 0.0
+        
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        
+        if avg_loss == 0:
+            rsi_values[i] = 100.0
         else:
-            sma.append(sum(values[i-period+1:i+1]) / period)
-    return sma
-
-def calculate_adx(candles, period=14):
-    # محاسبه ساده ADX برای تشخیص قدرت روند
-    adx_values = [20.0] * len(candles)
-    tr_list = []
-    plus_dm_list = []
-    minus_dm_list = []
-
-    for i in range(len(candles)):
-        if i == 0:
-            tr_list.append(candles[i]["high"] - candles[i]["low"])
-            plus_dm_list.append(0.0)
-            minus_dm_list.append(0.0)
-            continue
-        
-        h = candles[i]["high"]
-        l = candles[i]["low"]
-        pc = candles[i-1]["close"]
-        ph = candles[i-1]["high"]
-        pl = candles[i-1]["low"]
-
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        tr_list.append(tr)
-
-        up_move = h - ph
-        down_move = pl - l
-
-        plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
-        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
-
-        plus_dm_list.append(plus_dm)
-        minus_dm_list.append(minus_dm)
-
-    if len(candles) > period * 2:
-        for i in range(period, len(candles)):
-            tr_s = sum(tr_list[i-period+1:i+1])
-            p_dm_s = sum(plus_dm_list[i-period+1:i+1])
-            m_dm_s = sum(minus_dm_list[i-period+1:i+1])
-
-            if tr_s == 0:
-                continue
+            rs = avg_gain / avg_loss
+            rsi_values[i] = 100.0 - (100.0 / (1.0 + rs))
             
-            p_di = (p_dm_s / tr_s) * 100
-            m_di = (m_dm_s / tr_s) * 100
-
-            sum_di = p_di + m_di
-            if sum_di == 0:
-                dx = 0
-            else:
-                dx = (abs(p_di - m_di) / sum_di) * 100
-            
-            adx_values[i] = dx
-
-    return adx_values
+    return rsi_values
 
 # ============================================================
-# BACKTEST ENGINE (Heikin Ashi + ADX Filter)
+# BACKTEST ENGINE (Balanced Strategy: EMA 8/21 + RSI)
 # ============================================================
 
 def run_backtest():
-    raw_candles = download_klines(SYMBOL, TIMEFRAME, TARGET_CANDLES)
+    candles = download_klines(SYMBOL, TIMEFRAME, TARGET_CANDLES)
     
-    print("تعداد کل کندل‌های دریافت شده: " + str(len(raw_candles)))
+    print("تعداد کل کندل‌های دریافت شده: " + str(len(candles)))
     
-    if len(raw_candles) < 200:
+    if len(candles) < 100:
         print("تعداد کندل‌های دریافتی برای بک‌تست کافی نیست.")
         return
-
-    candles = convert_to_heikin_ashi(raw_candles)
 
     first_time = datetime.fromtimestamp(candles[0]["timestamp"], tz=timezone.utc)
     last_time = datetime.fromtimestamp(candles[-1]["timestamp"], tz=timezone.utc)
@@ -220,41 +180,47 @@ def run_backtest():
     print(f"بازه زمانی دقیق داده‌ها: از {first_time.strftime('%Y-%m-%d %H:%M')} تا {last_time.strftime('%Y-%m-%d %H:%M')} (حدود {total_days:.1f} روز)")
 
     closes = [c["close"] for c in candles]
-    sma_200 = calculate_sma(closes, 200)
-    adx_list = calculate_adx(raw_candles, 14)
-    
+    ema_8 = calculate_ema(closes, 8)
+    ema_21 = calculate_ema(closes, 21)
+    rsi_list = calculate_rsi(candles, 14)
+
     capital = INITIAL_CAPITAL
     total_trades = 0
     wins = 0
     losses = 0
     
     print("-" * 50)
-    print("شروع بک‌تست هیکین آشی + فیلتر ADX روی " + str(len(candles)) + " کندل...")
+    print("شروع بک‌تست استراتژی متعادل (حداقل ۳ معامله در روز) روی " + str(len(candles)) + " کندل...")
     print("-" * 50)
 
-    for i in range(200, len(candles) - 1):
+    for i in range(50, len(candles) - 1):
         c = candles[i]
         prev_c = candles[i-1]
         
         close_p = c["close"]
         open_p = c["open"]
         
-        is_macro_uptrend = close_p > sma_200[i]
+        e8 = ema_8[i]
+        e21 = ema_21[i]
+        prev_e8 = ema_8[i-1]
+        prev_e21 = ema_21[i-1]
         
-        is_ha_green = close_p > open_p
-        prev_ha_green = prev_c["close"] > prev_c["open"]
-        is_trend_flip = (not prev_ha_green) and is_ha_green
+        # شرایط ورود پویا برای تولید تعداد معامله کافی (حداقل ۳ تا در روز)
+        # ۱. تقاطع رو به بالا یا قرار داشتن EMA 8 بالای EMA 21
+        is_trend_up = e8 > e21
+        is_crossover = (prev_e8 <= prev_e21) and (e8 > e21)
         
-        # فیلتر قدرت روند: ADX بالای ۲۲ یعنی روند بازار قوی است و بازیچه نوسانات الکی نیستیم
-        is_adx_strong = adx_list[i] > 22
+        # ۲. RSI در محدوده مناسب صعودی (بالای ۴۸ و زیر ۷۵)
+        rsi = rsi_list[i]
+        is_rsi_ok = 48 <= rsi <= 75
         
-        avg_vol = sum(x["volume"] for x in candles[i-20:i]) / 20
-        is_volume_confirmed = c["volume"] > (avg_vol * 1.3)
+        # ۳. کندل صعودی
+        is_green = close_p > open_p
 
-        if is_macro_uptrend and is_trend_flip and is_adx_strong and is_volume_confirmed:
+        if (is_crossover or (is_trend_up and is_green)) and is_rsi_ok:
             entry_price = close_p
-            stop_loss = entry_price * 0.985   # ۱.۵ درصد حد ضرر
-            take_profit = entry_price * 1.03  # ۳ درصد حد سود
+            stop_loss = entry_price * 0.992   # ۰.۸ درصد حد ضرر
+            take_profit = entry_price * 1.018 # ۱.۸ درصد حد سود (ریسک به ریوارد حدود ۲.۲)
             
             trade_result = None
             for future_c in candles[i+1:]:
@@ -271,13 +237,13 @@ def run_backtest():
 
                 if trade_result == "WIN":
                     wins += 1
-                    capital += risk_amount * 2.0
+                    capital += risk_amount * 2.25
                 elif trade_result == "LOSS":
                     losses += 1
                     capital -= risk_amount
 
     print("-" * 50)
-    print("نتایج نهایی بک‌تست با فیلتر ADX:")
+    print("نتایج نهایی بک‌تست متعادل:")
     print("کل معاملات انجام شده: " + str(total_trades))
     print("معاملات موفق (Win): " + str(wins))
     print("معاملات ناموفق (Loss): " + str(losses))
