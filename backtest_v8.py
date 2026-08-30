@@ -16,8 +16,8 @@ BASE_URLS = [
 
 SYMBOL = "sol_usdt"
 TIMEFRAME = "minute15"
-TARGET_CANDLES = 500  # تعداد کندل برای بک‌تست
-PAGE_SIZE = 200        # اندازه هر صفحه درخواست
+TARGET_CANDLES = 200   # افزایش تعداد کندل برای پیدا کردن نمونه‌های بیشتر
+PAGE_SIZE = 200
 
 # ============================================================
 # HTTP & DATA DOWNLOADER
@@ -139,13 +139,13 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# BACKTEST ENGINE
+# BACKTEST ENGINE (Optimized Filters)
 # ============================================================
 
 def run_backtest():
     candles = download_klines(SYMBOL, TIMEFRAME, TARGET_CANDLES)
     
-    if len(candles) < 50:
+    if len(candles) < 30:
         print("تعداد کندل های دریافتی برای بک تست کافی نیست.")
         return
 
@@ -157,22 +157,24 @@ def run_backtest():
     print(f"شروع بک تست روی {len(candles)} کندلِ {SYMBOL.upper()}...")
     print("-" * 50)
 
-    for i in range(20, len(candles) - 1):
+    for i in range(10, len(candles) - 1):
         prev_candle = candles[i - 1]
         current_candle = candles[i]
         
         close_price = current_candle["close"]
+        open_price = current_candle["open"]
         volume = current_candle["volume"]
         
-        avg_volume = sum(c["volume"] for c in candles[i-20:i]) / 20
+        avg_volume = sum(c["volume"] for c in candles[i-10:i]) / 10
 
-        is_bullish_momentum = close_price > prev_candle["high"]
-        is_volume_confirmed = volume > (avg_volume * 1.5)
+        # شرط‌های ورود ملایم‌تر برای تست اولیه (کندل صعودی قوی + حجم بالاتر از میانگین)
+        is_bullish = close_price > open_price
+        is_volume_confirmed = volume > (avg_volume * 1.1)
 
-        if is_bullish_momentum and is_volume_confirmed:
+        if is_bullish and is_volume_confirmed:
             entry_price = close_price
-            stop_loss = entry_price * 0.985
-            take_profit = entry_price * 1.03
+            stop_loss = entry_price * 0.99      # ۱ درصد حد ضرر
+            take_profit = entry_price * 1.02    # ۲ درصد حد سود
             
             total_trades += 1
             
@@ -193,7 +195,7 @@ def run_backtest():
                 total_trades -= 1
 
     print("-" * 50)
-    print(f"نتایج نهایی بک تست:")
+    print("نتایج نهایی بک تست:")
     print(f"کل معاملات انجام شده: {total_trades}")
     print(f"معاملات موفق (Win): {wins}")
     print(f"معاملات ناموفق (Loss): {losses}")
