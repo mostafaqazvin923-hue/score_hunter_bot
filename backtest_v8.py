@@ -5,12 +5,12 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Only ETH & SOL / Original Golden Formula / Fixed $50 Risk)
+# SETTINGS (4 Assets / Dynamic ATR SL-TP / Obstacle Check / 1:2 RR)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
-SYMBOLS = ["ETHUSDT", "SOLUSDT"]  # فقط اتریوم و سولانا
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 TIMEFRAME = "15min"
 TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
@@ -158,8 +158,25 @@ def calculate_rsi(candles, period=14):
             
     return rsi_values
 
+def calculate_atr(candles, period=14):
+    atr_values = [0.0] * len(candles)
+    tr_list = [candles[0]["high"] - candles[0]["low"]]
+    
+    for i in range(1, len(candles)):
+        h_l = candles[i]["high"] - candles[i]["low"]
+        h_pc = abs(candles[i]["high"] - candles[i-1]["close"])
+        l_pc = abs(candles[i]["low"] - candles[i-1]["close"])
+        tr = max(h_l, h_pc, l_pc)
+        tr_list.append(tr)
+        
+    if len(tr_list) >= period:
+        atr_values[period-1] = sum(tr_list[:period]) / period
+        for i in range(period, len(candles)):
+            atr_values[i] = (atr_values[i-1] * (period - 1) + tr_list[i]) / period
+    return atr_values
+
 # ============================================================
-# PORTFOLIO BACKTEST ENGINE (ETH & SOL Only)
+# PORTFOLIO BACKTEST ENGINE (Dynamic ATR & Obstacle Check)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -167,7 +184,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال اجرای بک‌تست فقط روی ETH و سولانا با فرمول اصلی...")
+    print("در حال اجرای بک‌تست هوشمند با ATR پویا و بررسی موانع روی ۴ ارز...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -183,6 +200,7 @@ def run_portfolio_backtest():
         ema_20 = calculate_ema(closes, 20)
         ema_50 = calculate_ema(closes, 50)
         rsi_list = calculate_rsi(candles, 14)
+        atr_list = calculate_atr(candles, 14)
 
         for i in range(50, len(candles) - 1):
             c = candles[i]
@@ -190,7 +208,11 @@ def run_portfolio_backtest():
             
             close_p = c["close"]
             open_p = c["open"]
+            atr = atr_list[i]
             
+            if atr <= 0:
+                continue
+
             is_uptrend = ema_20[i] > ema_50[i]
             is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
             rsi = rsi_list[i]
@@ -199,9 +221,24 @@ def run_portfolio_backtest():
 
             if is_uptrend and is_pullback_recovery and is_rsi_good and is_green:
                 entry_price = close_p
-                stop_loss = entry_price * 0.988
-                take_profit = entry_price * 1.015
                 
+                # تعیین حد سود و ضرر پویا بر اساس ATR (ریسک به ریوارد ۱ به ۲)
+                stop_loss = entry_price - (atr * 1.2)
+                take_profit = entry_price + (atr * 2.4)
+                
+                # فیلتر بررسی فضای خالی و نبود مانع (چک کردن عدم وجود سایه یا مقاومت سنگین در ۳ کندل اخیر)
+                has_obstacle = False
+                for j in range(max(0, i-3), i):
+                    # اگر در کندل‌های قبل سایه بالایی خیلی بلندی وجود داشته باشد یعنی فشار فروش بالاست
+                    upper_wick = candles[j]["high"] - max(candles[j]["open"], candles[j]["close"])
+                    body = abs(candles[j]["close"] - candles[j]["open"])
+                    if body > 0 and upper_wick > (body * 2.0):
+                        has_obstacle = True
+                        break
+
+                if has_obstacle:
+                    continue  # اگر مانع یا فشار فروش بود، از معامله صرف‌نظر کن
+
                 trade_result = None
                 exit_ts = c["timestamp"]
                 for future_c in candles[i+1:]:
@@ -232,13 +269,13 @@ def run_portfolio_backtest():
     for trade in all_trades:
         if trade["result"] == "WIN":
             wins += 1
-            capital += FIXED_RISK_AMOUNT * 1.25
+            capital += FIXED_RISK_AMOUNT * 2.0  # ریوارد دو برابری در صورت برد
         elif trade["result"] == "LOSS":
             losses += 1
-            capital -= FIXED_RISK_AMOUNT
+            capital -= FIXED_RISK_AMOUNT       # ریسک ثابت در صورت باخت
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی سبد اختصاصی (ETH & SOL):")
+    print("نتایج نهایی سبد ۴ ارز با ATR پویا، چک موانع و R:R 1:2:")
     print("=" * 50)
     total_trades = wins + losses
     print("کل معاملات کل سبد: " + str(total_trades))
