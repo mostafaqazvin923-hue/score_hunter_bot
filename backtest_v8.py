@@ -5,21 +5,21 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (CoinEx API v2 - 6 Months Backtest)
+# SETTINGS (High Win-Rate Strategy - 6 Months)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
 SYMBOL = "SOLUSDT"
 TIMEFRAME = "15min"
-TARGET_CANDLES = 17500  # حدود ۶ ماه کندل ۱۵ دقیقه‌ای (۱۸۰ روز * ۹۶ کندل)
-PAGE_LIMIT = 1000       # حداکثر تعداد کندل در هر درخواست صرافی
+TARGET_CANDLES = 17500  # ۶ ماه دیتای کامل
+PAGE_LIMIT = 1000
 
-INITIAL_CAPITAL = 1000.0  # سرمایه اولیه (دلار)
-RISK_PERCENT = 0.02       # ریسک ۲ درصد از کل سرمایه در هر معامله (مدیریت ریسک امن)
+INITIAL_CAPITAL = 1000.0
+RISK_PERCENT = 0.02
 
 # ============================================================
-# HTTP & PAGINATION DATA DOWNLOADER (6 Months)
+# HTTP & PAGINATION DATA DOWNLOADER
 # ============================================================
 
 def download_klines(symbol, timeframe, target_count):
@@ -32,16 +32,13 @@ def download_klines(symbol, timeframe, target_count):
 
     while len(all_rows) < target_count and pages < max_pages:
         pages += 1
-        
         url = f"{BASE_URL}/spot/kline?market={symbol}&period={timeframe}&limit={PAGE_LIMIT}"
         if end_time:
             url += f"&end_time={end_time}"
 
         request = urllib.request.Request(
             url,
-            headers={
-                "User-Agent": "Mozilla/5.0 SCORE-HUNTER-BACKTEST"
-            }
+            headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-BACKTEST"}
         )
 
         try:
@@ -49,11 +46,9 @@ def download_klines(symbol, timeframe, target_count):
                 raw = response.read().decode("utf-8")
                 payload = json.loads(raw)
         except Exception as exc:
-            print(f"خطا در ارتباط با سرور کوینکس در صفحه {pages}: {exc}")
             break
 
         if not isinstance(payload, dict) or payload.get("code") != 0:
-            print("پاسخ پایان داده‌ها یا نامعتبر از صرافی کوینکس")
             break
 
         rows = payload.get("data", [])
@@ -73,10 +68,10 @@ def download_klines(symbol, timeframe, target_count):
                 elif isinstance(row, list) and len(row) >= 6:
                     ts = int(float(row[0]))
                     op = float(row[1])
-                    cl = float(row[2])
-                    hi = float(row[3])
-                    lo = float(row[4])
-                    vol = float(row[5])
+                    cl = float(row.get("2", row[2])) if len(row) > 2 else float(row[2])
+                    hi = float(row.get("3", row[3])) if len(row) > 3 else float(row[3])
+                    lo = float(row.get("4", row[4])) if len(row) > 4 else float(row[4])
+                    vol = float(row.get("5", row[5])) if len(row) > 5 else float(row[5])
                 else:
                     continue
 
@@ -102,11 +97,9 @@ def download_klines(symbol, timeframe, target_count):
         if added == 0:
             break
 
-        # تعیین قدیمی‌ترین زمان برای درخواست صفحه بعدی به سمت گذشته
         oldest_ts = min(all_rows.keys())
-        end_time = oldest_ts * 1000  # کوینکس معمولاً میلی‌ثانیه می‌خواهد
-
-        time.sleep(0.2) # استراحت کوتاه بین درخواست‌ها
+        end_time = oldest_ts * 1000
+        time.sleep(0.2)
 
     candles = list(all_rows.values())
     candles.sort(key=lambda x: x["timestamp"])
@@ -117,7 +110,7 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# TECHNICAL INDICATORS (Pure Python RSI)
+# TECHNICAL INDICATORS (RSI & Bollinger Bands)
 # ============================================================
 
 def calculate_rsi(candles, period=14):
@@ -161,7 +154,7 @@ def calculate_rsi(candles, period=14):
     return rsi_values
 
 # ============================================================
-# BACKTEST ENGINE (6-Month Strict Filter Strategy)
+# BACKTEST ENGINE (High Win-Rate Pullback Strategy)
 # ============================================================
 
 def run_backtest():
@@ -187,29 +180,40 @@ def run_backtest():
     losses = 0
     
     print("-" * 50)
-    print("شروع بک‌تست ۶ ماهه روی " + str(len(candles)) + " کندل...")
+    print("شروع بک‌تست استراتژی جدید (بالا بردن وین‌ریت) روی " + str(len(candles)) + " کندل...")
     print("-" * 50)
 
     for i in range(50, len(candles) - 1):
         current_candle = candles[i]
         close_price = current_candle["close"]
         open_price = current_candle["open"]
-        volume = current_candle["volume"]
+        low_price = current_candle["low"]
         
-        sma_100 = sum(c["close"] for c in candles[i-100:i]) / 100
-        avg_volume = sum(c["volume"] for c in candles[i-20:i]) / 20
+        # میانگین متحرک برای روند (SMA 50)
+        sma_50 = sum(c["close"] for c in candles[i-50:i]) / 50
+        
+        # باندهای بولینگر (۲۰ دوره)
+        window = [c["close"] for c in candles[i-20:i]]
+        sma_20 = sum(window) / 20
+        variance = sum((x - sma_20) ** 2 for x in window) / 20
+        std_dev = variance ** 0.5
+        lower_band = sma_20 - (2.0 * std_dev)
+        
         current_rsi = rsi_list[i]
+        prev_rsi = rsi_list[i - 1]
 
-        # فیلترهای فوق‌العاده سخت‌گیرانه برای تست واقعی در بازه بلندمدت
-        is_strong_uptrend = close_price > sma_100
+        # استراتژی وین‌ریت بالا (خرید در اصلاح بولینگر پایین در روند صعودی)
+        is_uptrend = close_price > sma_50
+        # قیمت به باند پایین نفوذ کرده یا به آن نزدیک شده و الان برگشته بالا (کندل صعودی)
+        is_near_lower_band = low_price <= lower_band * 1.002
         is_green = close_price > open_price
-        is_rsi_safe = 50 <= current_rsi <= 65  # محدوده سلامت روند صعودی
-        is_volume_high = volume > (avg_volume * 1.5)
+        # RSI از حالت اشباع فروش یا نزدیک آن برگشته بالا (مثلا از زیر ۴۰ آمده بالا)
+        is_rsi_rebound = prev_rsi < 45 and current_rsi >= 45
 
-        if is_strong_uptrend and is_green and is_rsi_safe and is_volume_high:
+        if is_uptrend and is_near_lower_band and is_green and is_rsi_rebound:
             entry_price = close_price
-            stop_loss = entry_price * 0.985   # ۱.۵ درصد حد ضرر
-            take_profit = entry_price * 1.03  # ۳ درصد حد سود (ریسک به ریوارد ۱ به ۲)
+            stop_loss = entry_price * 0.99    # ۱ درصد حد ضرر نزدیک
+            take_profit = entry_price * 1.015 # ۱.۵ درصد حد سود سریع برای بالا بردن وین‌ریت
             
             trade_result = None
             for future_candle in candles[i+1:]:
@@ -226,13 +230,13 @@ def run_backtest():
 
                 if trade_result == "WIN":
                     wins += 1
-                    capital += risk_amount * 2.0
+                    capital += risk_amount * 1.5 # با توجه به نسبت ریسک به ریوارد
                 elif trade_result == "LOSS":
                     losses += 1
                     capital -= risk_amount
 
     print("-" * 50)
-    print("نتایج نهایی بک‌تست ۶ ماهه:")
+    print("نتایج نهایی بک‌تست جدید:")
     print("کل معاملات انجام شده: " + str(total_trades))
     print("معاملات موفق (Win): " + str(wins))
     print("معاملات ناموفق (Loss): " + str(losses))
