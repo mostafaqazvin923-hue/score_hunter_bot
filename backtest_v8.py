@@ -1,13 +1,12 @@
 import requests
 
 # --- تنظیمات صرافی LBank ---
-# فرمت صحیح نماد در ال‌بنک همراه با زیرخط است
 SYMBOL = "sol_usdt"
-# فرمت صحیح تایم‌فریم طبق مستندات ال‌بنک (minute15)
-LBANK_API_URL = f"https://api.lbank.info/v2/kline.do?symbol={SYMBOL}&size=500&type=minute15"
+# اصلاح حیاتی: حداکثر سایز مجاز در ال‌بنک 100 است (بیشتر از آن خطای Illegal parameter می‌دهد)
+LBANK_API_URL = f"https://api.lbank.info/v2/kline.do?symbol={SYMBOL}&size=100&type=15min"
 
 def fetch_historical_candles():
-    """دریافت کندل‌های تاریخی از LBank با پارامترهای استاندارد"""
+    """دریافت کندل‌های تاریخی از LBank با پارامترهای کاملاً استاندارد و مجاز"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -16,7 +15,6 @@ def fetch_historical_candles():
         print(f"وضعیت پاسخ صرافی LBank: {response.status_code}")
         
         data = response.json()
-        print(f"محتوای پاسخ: {str(data)[:200]}")
         
         if data.get("result") == "true" or data.get("result") is True or "data" in data:
             raw_candles = data.get("data", [])
@@ -44,7 +42,7 @@ def fetch_historical_candles():
 
 def run_backtest():
     candles = fetch_historical_candles()
-    if len(candles) < 50:
+    if len(candles) < 20:
         print("تعداد کندل‌های دریافتی برای بک‌تست کافی نیست.")
         return
 
@@ -52,17 +50,19 @@ def run_backtest():
     wins = 0
     losses = 0
     
-    print(f"شروع بک‌تست روی {len(candles)} کندل آخرِ {SYMBOL.upper()}...")
+    print(f"شروع بک‌تست روی {len(candles)} کندلِ آخرِ {SYMBOL.upper()}...")
     print("-" * 50)
 
-    for i in range(20, len(candles) - 1):
+    # از کندل دهم به بعد شروع می‌کنیم تا میانگین حجم قابل محاسبه باشد
+    for i in range(10, len(candles) - 1):
         prev_candle = candles[i - 1]
         current_candle = candles[i]
         
         close_price = current_candle["close"]
         volume = current_candle["volume"]
         
-        avg_volume = sum(c["volume"] for c in candles[i-20:i]) / 20
+        # میانگین حجم ۱۰ کندل قبل (با توجه به محدودیت ۱۰۰ کندلی LBank)
+        avg_volume = sum(c["volume"] for c in candles[i-10:i]) / 10
 
         is_bullish_momentum = close_price > prev_candle["high"]
         is_volume_confirmed = volume > (avg_volume * 1.5)
