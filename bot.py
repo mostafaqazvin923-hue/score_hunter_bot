@@ -1,255 +1,239 @@
+import json
 import time
-import requests
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 
-# ==============================================================================
-# تنظیمات ربات تلگرام و آیدی چت (ثبت شده برای Mostafa Signal Bot)
-# ==============================================================================
-TELEGRAM_BOT_TOKEN = "8937303392:AAGXDckoHV61vY6G0B4VFcHMi90YbhY-jiY"
-TELEGRAM_CHAT_ID = "2090120004"
+# ============================================================
+# TELEGRAM & STRATEGY SETTINGS
+# ============================================================
+
+TELEGRAM_TOKEN = "8937303392:AAGXDckoHV61vY6G0B4VFcHMi90YbhY-jiY"
+CHAT_ID = "2090120004"
+
+BASE_URL = "https://api.coinex.com/v2"
+SYMBOLS = ["BTCUSDT", "SOLUSDT"]
+TIMEFRAME = "15min"
+
+# ذخیره آخرین کندل بررسی شده برای هر ارز جهت جلوگیری از ارسال تکراری سیگنال
+last_processed_timestamps = {
+    "BTCUSDT": 0,
+    "SOLUSDT": 0
+}
+
+# ============================================================
+# TELEGRAM SENDER FUNCTION
+# ============================================================
 
 def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": CHAT_ID,
         "text": message,
         "parse_mode": "Markdown"
     }
+    data = urllib.parse.urlencode(payload).encode("utf-8")
+    
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        return response.json()
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.status == 200
     except Exception as e:
-        print(f"ارور در ارسال پیام به تلگرام: {e}")
-        return None
+        print(f"خطا در ارسال پیام به تلگرام: {e}")
+        return False
 
-# ==============================================================================
-# توابع محاسباتی اندیکاتورها (منطبق بر v8.7)
-# ==============================================================================
+# ============================================================
+# DATA DOWNLOADER
+# ============================================================
 
-def calculate_ema(prices, span):
-    alpha = 2 / (span + 1)
-    ema = [prices[0]]
-    for price in prices[1:]:
-        ema.append(price * alpha + ema[-1] * (1 - alpha))
+def download_latest_klines(symbol, limit=100):
+    url = f"{BASE_URL}/spot/kline?market={symbol}&period={TIMEFRAME}&limit={limit}"
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-LIVE"}
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = response.read().decode("utf-8")
+            payload = json.loads(raw)
+            
+        if not isinstance(payload, dict) or payload.get("code") != 0:
+            return []
+
+        rows = payload.get("data", [])
+        candles = []
+        for row in rows:
+            try:
+                if isinstance(row, dict):
+                    ts = int(float(row.get("created_at", row.get("time", 0))))
+                    op = float(row.get("open", 0))
+                    hi = float(row.get("high", 0))
+                    lo = float(row.get("low", 0))
+                    cl = float(row.get("close", 0))
+                elif isinstance(row, list) and len(row) >= 6:
+                    ts = int(float(row[0]))
+                    op = float(row[1])
+                    cl = float(row[2])
+                    hi = float(row[3])
+                    lo = float(row[4])
+                else:
+                    continue
+
+                if ts > 100000000000:
+                    ts = ts // 1000
+
+                candles.append({
+                    "timestamp": ts,
+                    "open": op,
+                    "high": hi,
+                    "low": lo,
+                    "close": cl
+                })
+            except Exception:
+                continue
+
+        candles.sort(key=lambda x: x["timestamp"])
+        return candles
+    except Exception:
+        return []
+
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
+
+def calculate_ema(closes, period):
+    if len(closes) < period:
+        return closes
+    ema = [closes[0]]
+    multiplier = 2 / (period + 1)
+    for price in closes[1:]:
+        ema.append((price - ema[-1]) * multiplier + ema[-1])
     return ema
 
-def calculate_atr(highs, lows, closes, period=14):
-    tr_list = []
-    for i in range(len(closes)):
-        if i == 0:
-            tr_list.append(highs[i] - lows[i])
-        else:
-            tr = max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i-1]),
-                abs(lows[i] - closes[i-1])
-            )
-            tr_list.append(tr)
+def calculate_rsi(candles, period=14):
+    if len(candles) < period + 1:
+        return [50.0] * len(candles)
     
-    atr = [sum(tr_list[:period]) / period]
-    alpha = 1.0 / period
-    for tr in tr_list[period:]:
-        atr.append(tr * alpha + atr[-1] * (1 - alpha))
-    return [atr[0]] * (period - 1) + atr
-
-# ==============================================================================
-# موتور اصلی ربات (Score Hunter v8.7)
-# ==============================================================================
-
-class ScoreHunterBot:
-    def __init__(self, assets, initial_capital=1000.0, rr_ratio=2.0, risk_per_trade_pct=1.5):
-        self.assets = assets
-        self.capital = initial_capital
-        self.rr_ratio = rr_ratio
-        self.risk_per_trade_pct = risk_per_trade_pct
-        self.active_trades = {}  # جلوگیری قطعی از ارسال سیگنال تکراری
-
-    def process_candles(self, asset_name, candles):
-        if len(candles) < 100:
-            return
-
-        closes = [c['close'] for c in candles]
-        highs = [c['high'] for c in candles]
-        lows = [c['low'] for c in candles]
-        opens = [c['open'] for c in candles]
-        volumes = [c['volume'] for c in candles]
-
-        i = len(candles) - 1
-        current = candles[i]
-        prev = candles[i-1]
-
-        ema10 = calculate_ema(closes, 10)
-        ema30 = calculate_ema(closes, 30)
-        ema100 = calculate_ema(closes, 100)
-        atr = calculate_atr(highs, lows, closes, 14)
-
-        # ۱. بررسی پوزیشن‌های فعال (خروج با TP یا SL)
-        if asset_name in self.active_trades:
-            t = self.active_trades[asset_name]
+    rsi_values = [50.0] * len(candles)
+    gains = 0.0
+    losses = 0.0
+    
+    for i in range(1, period + 1):
+        change = candles[i]["close"] - candles[i - 1]["close"]
+        if change > 0:
+            gains += change
+        else:
+            losses -= change
             
-            if t['type'] == 'LONG':
-                if current['low'] <= t['sl']:
-                    pnl = -t['risk_amount']
-                    self.capital += pnl
-                    msg = (
-                        f"❌ **نتیجه معامله: حد ضرر (SL)**\n\n"
-                        f"📌 نماد: #{asset_name.replace('/', '')}\n"
-                        f"نوع: LONG\n"
-                        f"قیمت خروج: `{t['sl']:.4f}`\n"
-                        f"سود/زیان: `{pnl:.2f}$`\n"
-                        f"موجودی جدید: `{self.capital:.2f}$`"
-                    )
-                    send_telegram_message(msg)
-                    del self.active_trades[asset_name]
+    avg_gain = gains / period
+    avg_loss = losses / period
+    
+    if avg_loss == 0:
+        rsi_values[period] = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi_values[period] = 100.0 - (100.0 / (1.0 + rs))
 
-                elif current['high'] >= t['tp']:
-                    pnl = t['risk_amount'] * self.rr_ratio
-                    self.capital += pnl
-                    msg = (
-                        f"🎯 **نتیجه معامله: تارگت (TP)**\n\n"
-                        f"📌 نماد: #{asset_name.replace('/', '')}\n"
-                        f"نوع: LONG\n"
-                        f"قیمت خروج: `{t['tp']:.4f}`\n"
-                        f"سود/زیان: `+{pnl:.2f}$`\n"
-                        f"موجودی جدید: `{self.capital:.2f}$`"
-                    )
-                    send_telegram_message(msg)
-                    del self.active_trades[asset_name]
-
-            elif t['type'] == 'SHORT':
-                if current['high'] >= t['sl']:
-                    pnl = -t['risk_amount']
-                    self.capital += pnl
-                    msg = (
-                        f"❌ **نتیجه معامله: حد ضرر (SL)**\n\n"
-                        f"📌 نماد: #{asset_name.replace('/', '')}\n"
-                        f"نوع: SHORT\n"
-                        f"قیمت خروج: `{t['sl']:.4f}`\n"
-                        f"سود/زیان: `{pnl:.2f}$`\n"
-                        f"موجودی جدید: `{self.capital:.2f}$`"
-                    )
-                    send_telegram_message(msg)
-                    del self.active_trades[asset_name]
-
-                elif current['low'] <= t['tp']:
-                    pnl = t['risk_amount'] * self.rr_ratio
-                    self.capital += pnl
-                    msg = (
-                        f"🎯 **نتیجه معامله: تارگت (TP)**\n\n"
-                        f"📌 نماد: #{asset_name.replace('/', '')}\n"
-                        f"نوع: SHORT\n"
-                        f"قیمت خروج: `{t['tp']:.4f}`\n"
-                        f"سود/زیان: `+{pnl:.2f}$`\n"
-                        f"موجودی جدید: `{self.capital:.2f}$`"
-                    )
-                    send_telegram_message(msg)
-                    del self.active_trades[asset_name]
-
-        # ۲. بررسی شرایط سیگنال جدید (منطبق با نسخه v8.7 بک‌تست)
-        if asset_name not in self.active_trades:
-            c_close = prev['close']
-            c_open = prev['open']
+    for i in range(period + 1, len(candles)):
+        change = candles[i]["close"] - candles[i - 1]["close"]
+        gain = change if change > 0 else 0.0
+        loss = -change if change < 0 else 0.0
+        
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        
+        if avg_loss == 0:
+            rsi_values[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi_values[i] = 100.0 - (100.0 / (1.0 + rs))
             
-            bull_trend = (ema10[i-1] > ema30[i-1] > ema100[i-1]) and (ema10[i-1] > ema10[i-3])
-            bear_trend = (ema10[i-1] < ema30[i-1] < ema100[i-1]) and (ema10[i-1] < ema10[i-3])
+    return rsi_values
 
-            # فیلتر سخت‌گیرانه بدنه ۷۵ درصدی
-            strong_bull = (c_close > c_open) and ((c_close - c_open) / (prev['high'] - prev['low']) > 0.75) if (prev['high'] - prev['low']) > 0 else False
-            strong_bear = (c_open > c_close) and ((c_open - c_close) / (prev['high'] - prev['low']) > 0.75) if (prev['high'] - prev['low']) > 0 else False
+# ============================================================
+# LIVE SIGNAL CHECKER
+# ============================================================
 
-            # فیلتر حجم ۲.۰ برابری
-            avg_vol = sum(volumes[i-15:i-1]) / 14.0
-            high_vol = prev['volume'] > (2.0 * avg_vol)
+def check_market_signals():
+    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] در حال بررسی بازار برای سیگنال جدید...")
+    
+    for symbol in SYMBOLS:
+        candles = download_latest_klines(symbol, limit=100)
+        if len(candles) < 60:
+            continue
+            
+        # بررسی آخرین کندل بسته‌شده (کندل یکی مانده به آخر لیست)
+        # candles[-1] کندل در حال شکل‌گیری است و candles[-2] آخرین کندل کاملاً بسته شده است.
+        i = len(candles) - 2
+        c = candles[i]
+        prev_c = candles[i-1]
+        
+        # چک کردن اینکه این کندل قبلاً بررسی و سیگنال صادر شده یا نه
+        if c["timestamp"] <= last_processed_timestamps[symbol]:
+            continue
 
-            long_cond = bull_trend and strong_bull and high_vol
-            short_cond = bear_trend and strong_bear and high_vol
+        closes = [item["close"] for item in candles]
+        ema_20 = calculate_ema(closes, 20)
+        ema_50 = calculate_ema(closes, 50)
+        rsi_list = calculate_rsi(candles, 14)
 
-            risk_amt = self.capital * (self.risk_per_trade_pct / 100.0)
+        close_p = c["close"]
+        open_p = c["open"]
+        
+        is_uptrend = ema_20[i] > ema_50[i]
+        is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
+        rsi = rsi_list[i]
+        is_rsi_good = 42 <= rsi <= 62
+        is_green = close_p > open_p
 
-            if long_cond:
-                entry = current['open']
-                swing_low = min([candles[j]['low'] for j in range(i-10, i)])
-                sl = min(swing_low, entry - (atr[i-1] * 1.2))
-                tp = entry + ((entry - sl) * self.rr_ratio)
+        if is_uptrend and is_pullback_recovery and is_rsi_good and is_green:
+            # فیلتر بررسی موانع در ۳ کندل قبل
+            has_obstacle = False
+            for j in range(max(0, i-3), i):
+                upper_wick = candles[j]["high"] - max(candles[j]["open"], candles[j]["close"])
+                body = abs(candles[j]["close"] - candles[j]["open"])
+                if body > 0 and upper_wick > (body * 2.0):
+                    has_obstacle = True
+                    break
+
+            if not has_obstacle:
+                # ثبت به عنوان بررسی شده
+                last_processed_timestamps[symbol] = c["timestamp"]
                 
-                sl_pct = ((entry - sl) / entry) * 100
-                tp_pct = ((tp - entry) / entry) * 100
-
-                self.active_trades[asset_name] = {
-                    'type': 'LONG', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt
-                }
-
-                msg = (
-                    f"🚀 **سیگنال جدید ورود (LONG - v8.7)**\n\n"
-                    f"📌 نماد: #{asset_name.replace('/', '')}\n"
-                    f"قیمت ورود (Entry): `{entry:.4f}`\n"
-                    f"حد ضرر (SL): `{sl:.4f}` `(-{sl_pct:.2f}%)`\n"
-                    f"حد سود (TP): `{tp:.4f}` `(+{tp_pct:.2f}%)`\n"
-                    f"ریسک معامله: `1.5% ({risk_amt:.2f}$)`\n"
-                    f"نسبت R:R برابر 1:2"
-                )
-                send_telegram_message(msg)
-
-            elif short_cond:
-                entry = current['open']
-                swing_high = max([candles[j]['high'] for j in range(i-10, i)])
-                sl = max(swing_high, entry + (atr[i-1] * 1.2))
-                tp = entry - ((sl - entry) * self.rr_ratio)
+                entry_price = close_p
+                stop_loss = entry_price * 0.988     # ۱.۲٪ ضرر
+                take_profit = entry_price * 1.015   # ۱.۵٪ سود
                 
-                sl_pct = ((sl - entry) / entry) * 100
-                tp_pct = ((entry - tp) / entry) * 100
-
-                self.active_trades[asset_name] = {
-                    'type': 'SHORT', 'entry': entry, 'sl': sl, 'tp': tp, 'risk_amount': risk_amt
-                }
-
+                # ساخت متن پیام سیگنال برای تلگرام
                 msg = (
-                    f"🔻 **سیگنال جدید ورود (SHORT - v8.7)**\n\n"
-                    f"📌 نماد: #{asset_name.replace('/', '')}\n"
-                    f"قیمت ورود (Entry): `{entry:.4f}`\n"
-                    f"حد ضرر (SL): `{sl:.4f}` `(-{sl_pct:.2f}%)`\n"
-                    f"حد سود (TP): `{tp:.4f}` `(+{tp_pct:.2f}%)`\n"
-                    f"ریسک معامله: `1.5% ({risk_amt:.2f}$)`\n"
-                    f"نسبت R:R برابر 1:2"
+                    f"🚨 **سیگنال خرید جدید (Score Hunter Pro)** 🚨\n\n"
+                    f"🔹 **ارز:** `{symbol}`\n"
+                    f"⏱ **تایم‌فریم:** `15m`\n\n"
+                    f"📥 **قیمت ورود:** `{entry_price}`\n"
+                    f"🛑 **حد ضرر (SL):** `{stop_loss:.4f}` (-1.2%)\n"
+                    f"🎯 **حد سود (TP):** `{take_profit:.4f}` (+1.5%)\n\n"
+                    f"📊 **شاخص RSI:** `{rsi:.1f}`\n"
+                    f"⏰ **زمان:** `{datetime.fromtimestamp(c['timestamp'], tz=timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC`"
                 )
+                
                 send_telegram_message(msg)
+                print(f"سیگنال جدید برای {symbol} ارسال شد!")
 
-# ==============================================================================
-# دریافت داده‌های واقعی بازار از API عمومی CoinEx
-# ==============================================================================
-
-def fetch_real_candles_coinex(symbol, timeframe='15m', limit=150):
-    market = symbol.replace('/', '')
-    url = f"https://api.coinex.com/v2/spot/kline?market={market}&limit={limit}&interval={timeframe}"
-    try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        if data.get('code') == 0:
-            candles = []
-            for c in data['data']:
-                candles.append({
-                    'timestamp': c['created_at'],
-                    'open': float(c['open']),
-                    'high': float(c['high']),
-                    'low': float(c['low']),
-                    'close': float(c['close']),
-                    'volume': float(c['volume'])
-                })
-            return candles
-        return None
-    except Exception as e:
-        print(f"خطا در دریافت داده برای {symbol}: {e}")
-        return None
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
 if __name__ == "__main__":
-    symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'AVAX/USDT', 'LINK/USDT']
-    bot = ScoreHunterBot(assets=symbols)
-    
-    print("ربات Mostafa Signal Bot (نسخه v8.7) فعال شد.")
-    print("در حال دریافت لایو داده‌های بازار کریپتو...")
+    startup_msg = "🤖 ربات سیگنال‌دهی Score Hunter Pro با موفقیت روشن شد و روی BTC و SOL فعال گردید."
+    send_telegram_message(startup_msg)
+    print("ربات روشن شد و در حال پایش بازار است...")
 
-    for symbol in symbols:
-        candles = fetch_real_candles_coinex(symbol, timeframe='15m', limit=150)
-        if candles:
-            bot.process_candles(symbol, candles)
-            print(f"پردازش {symbol} با موفقیت انجام شد.")
-        time.sleep(1)
+    while True:
+        try:
+            check_market_signals()
+        except Exception as e:
+            print(f"خطای غیرمنتظره در حلقه اصلی: {e}")
+        
+        # هر ۶۰ ثانیه یک‌بار بازار را چک می‌کند
+        time.sleep(60)
