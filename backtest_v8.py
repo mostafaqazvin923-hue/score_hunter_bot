@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Price Action Momentum Breakout - 6 Months)
+# SETTINGS (High Win-Rate Momentum Strategy - 6 Months)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -71,7 +71,7 @@ def download_klines(symbol, timeframe, target_count):
                     cl = float(row[2]) if len(row) > 2 else float(row[2])
                     hi = float(row[3]) if len(row) > 3 else float(row[3])
                     lo = float(row[4]) if len(row) > 4 else float(row[4])
-                    vol = float(row.get("5", row[5])) if len(row) > 5 else float(row[5])
+                    vol = float(row[5]) if len(row) > 5 else float(row[5])
                 else:
                     continue
 
@@ -110,17 +110,55 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# TECHNICAL INDICATORS
+# TECHNICAL INDICATORS (EMA, RSI, ATR)
 # ============================================================
 
-def calculate_sma(values, period):
-    sma = []
-    for i in range(len(values)):
-        if i < period - 1:
-            sma.append(sum(values[:i+1]) / (i + 1))
+def calculate_ema(closes, period):
+    ema = [closes[0]]
+    multiplier = 2 / (period + 1)
+    for price in closes[1:]:
+        ema.append((price - ema[-1]) * multiplier + ema[-1])
+    return ema
+
+def calculate_rsi(candles, period=14):
+    if len(candles) < period + 1:
+        return [50.0] * len(candles)
+    
+    rsi_values = [50.0] * len(candles)
+    gains = 0.0
+    losses = 0.0
+    
+    for i in range(1, period + 1):
+        change = candles[i]["close"] - candles[i - 1]["close"]
+        if change > 0:
+            gains += change
         else:
-            sma.append(sum(values[i-period+1:i+1]) / period)
-    return sma
+            losses -= change
+            
+    avg_gain = gains / period
+    avg_loss = losses / period
+    
+    if avg_loss == 0:
+        rsi_values[period] = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi_values[period] = 100.0 - (100.0 / (1.0 + rs))
+
+    for i in range(period + 1, len(candles)):
+        change = candles[i]["close"] - candles[i - 1]["close"]
+        gain = change if change > 0 else 0.0
+        loss = -change if change < 0 else 0.0
+        
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        
+        if avg_loss == 0:
+            rsi_values[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi_values[i] = 100.0 - (100.0 / (1.0 + rs))
+            
+    return rsi_values
 
 def calculate_atr(candles, period=14):
     atr_values = [0.0] * len(candles)
@@ -140,7 +178,7 @@ def calculate_atr(candles, period=14):
     return atr_values
 
 # ============================================================
-# BACKTEST ENGINE (Price Action Breakout Strategy)
+# BACKTEST ENGINE (High Win-Rate Momentum Filter)
 # ============================================================
 
 def run_backtest():
@@ -159,7 +197,9 @@ def run_backtest():
     print(f"بازه زمانی دقیق داده‌ها: از {first_time.strftime('%Y-%m-%d %H:%M')} تا {last_time.strftime('%Y-%m-%d %H:%M')} (حدود {total_days:.1f} روز)")
 
     closes = [c["close"] for c in candles]
-    sma_50 = calculate_sma(closes, 50)
+    ema_20 = calculate_ema(closes, 20)
+    ema_50 = calculate_ema(closes, 50)
+    rsi_list = calculate_rsi(candles, 14)
     atr_list = calculate_atr(candles, 14)
 
     capital = INITIAL_CAPITAL
@@ -168,7 +208,7 @@ def run_backtest():
     losses = 0
     
     print("-" * 50)
-    print("شروع بک‌تست استراتژی پرایس اکشن بریک‌اوت روی " + str(len(candles)) + " کندل...")
+    print("شروع بک‌تست استراتژی مومنتوم با وین‌ریت بالا روی " + str(len(candles)) + " کندل...")
     print("-" * 50)
 
     for i in range(50, len(candles) - 1):
@@ -177,33 +217,30 @@ def run_backtest():
         
         close_p = c["close"]
         open_p = c["open"]
-        high_p = c["high"]
-        low_p = c["low"]
         
         atr = atr_list[i]
         if atr <= 0:
             continue
 
-        # بررسی روند میان‌مدت (قیمت بالای میانگین متحرک ۵۰)
-        is_uptrend = close_p > sma_50[i]
+        # ۱. روند پرقدرت صعودی (EMA 20 بالای EMA 50 و قیمت بالا)
+        is_uptrend = (ema_20[i] > ema_50[i]) and (close_p > ema_20[i])
         
-        # شکست سقف ۵ کندل گذشته (Breakout)
-        recent_highest = max(x["high"] for x in candles[i-5:i])
-        is_breakout = close_p > recent_highest
+        # ۲. تاییدیه RSI در ناحیه سلامت روند (بین ۵۳ تا ۷۲ برای دوری از اشباع خرید خطرناک)
+        rsi = rsi_list[i]
+        is_rsi_valid = 53 <= rsi <= 72
         
-        # کندل صعودی پرقدرت (بدنه کندل حداقل ۶۰ درصد کل طول کندل باشد تا از پین‌بارهای جعلی جلوگیری شود)
-        candle_body = abs(close_p - open_p)
-        candle_range = high_p - low_p
-        is_strong_body = candle_range > 0 and (candle_body / candle_range) >= 0.55
+        # ۳. کندل تاییدیه قدرتمند (دو کندل متوالی سبز با بدنه استاندارد)
+        is_current_green = close_p > open_p
+        is_prev_green = prev_c["close"] > prev_c["open"]
         
-        # حجم معاملات بالاتر از میانگین ۱۰ کندل گذشته
-        avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
-        is_volume_ok = c["volume"] > (avg_vol * 1.15)
+        # ۴. حجم بالاتر از میانگین ۱۵ دوره برای اطمینان از حمایت خریداران واقعی
+        avg_vol = sum(x["volume"] for x in candles[i-15:i]) / 15
+        is_volume_confirmed = c["volume"] > (avg_vol * 1.25)
 
-        if is_uptrend and is_breakout and is_strong_body and is_volume_ok:
+        if is_uptrend and is_rsi_valid and is_current_green and is_prev_green and is_volume_confirmed:
             entry_price = close_p
-            stop_loss = entry_price - (1.5 * atr)    # حد ضرر استاندارد مبتنی بر ATR
-            take_profit = entry_price + (2.5 * atr)  # ریسک به ریوارد ۱ به ۱.۶۷ برای افزایش وین‌ریت
+            stop_loss = entry_price - (1.2 * atr)    # حد ضرر بهینه و محافظه‌کارانه
+            take_profit = entry_price + (2.2 * atr)  # حد سود مناسب با ریسک به ریوارد بالای ۱.۸
             
             trade_result = None
             for future_c in candles[i+1:]:
@@ -220,13 +257,13 @@ def run_backtest():
 
                 if trade_result == "WIN":
                     wins += 1
-                    capital += risk_amount * 1.67
+                    capital += risk_amount * 1.83
                 elif trade_result == "LOSS":
                     losses += 1
                     capital -= risk_amount
 
     print("-" * 50)
-    print("نتایج نهایی بک‌تست پرایس اکشن:")
+    print("نتایج نهایی بک‌تست بهینه‌شده:")
     print("کل معاملات انجام شده: " + str(total_trades))
     print("معاملات موفق (Win): " + str(wins))
     print("معاملات ناموفق (Loss): " + str(losses))
