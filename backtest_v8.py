@@ -1,109 +1,284 @@
-import requests
 import json
-import os
-from datetime import datetime
+import time
+import urllib.request
+from datetime import datetime, timezone
 
-# تنظیمات تلگرام (از متغیرهای محیطی گیت‌هاب یا مقادیر پیش‌فرض)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "TOKEN_HERE")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "CHAT_ID_HERE")
+# ============================================================
+# SETTINGS (BTC & SOL / SL: 1.0% & TP: 1.5% -> R:R 1:1.5)
+# ============================================================
+
+BASE_URL = "https://api.coinex.com/v2"
 
 SYMBOLS = ["BTCUSDT", "SOLUSDT"]
-STATE_FILE = "state.json"
+TIMEFRAME = "15min"
+TARGET_CANDLES = 17500
+PAGE_LIMIT = 1000
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
+INITIAL_CAPITAL_PER_SYMBOL = 500.0  
+FIXED_RISK_AMOUNT = 50.0            # ریسک ثابت ۵۰ دلار برای هر معامله (معادل ۱٪ ضرر)
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=4)
+# ============================================================
+# HTTP & PAGINATION DATA DOWNLOADER
+# ============================================================
 
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"خطا در ارسال پیام به تلگرام: {e}")
+def download_klines(symbol, timeframe, target_count):
+    all_rows = {}
+    end_time = None
+    pages = 0
+    max_pages = 25
 
-def get_market_data(symbol):
-    # دریافت قیمت از API صرافی کوینکس (Coinex)
-    url = f"https://api.coinex.com/v1/market/ticker?market={symbol}"
-    try:
-        res = requests.get(url, timeout=10)
-        data = res.json()
-        
-        # ساختار پاسخ کوینکس: {"code": 0, "data": {"ticker": {"last": "..."}}}
-        if "data" in data and "ticker" in data["data"] and "last" in data["data"]["ticker"]:
-            return float(data["data"]["ticker"]["last"])
-        else:
-            print(f"پاسخ کوینکس برای {symbol} نامعتبر بود: {data}")
-            return None
-    except Exception as e:
-        print(f"خطا در دریافت قیمت از کوینکس برای {symbol}: {e}")
-        return None
+    while len(all_rows) < target_count and pages < max_pages:
+        pages += 1
+        url = f"{BASE_URL}/spot/kline?market={symbol}&period={timeframe}&limit={PAGE_LIMIT}"
+        if end_time:
+            url += f"&end_time={end_time}"
 
-def run_bot():
-    print(f"[{datetime.utcnow()}] در حال بررسی بازار...")
-    state = load_state()
-    
-    for symbol in SYMBOLS:
-        current_price = get_market_data(symbol)
-        if not current_price:
-            continue
-            
-        # بررسی پوزیشن باز قبلی برای این ارز
-        if symbol in state:
-            pos = state[symbol]
-            tp = pos["tp"]
-            sl = pos["sl"]
-            
-            # بررسی اینکه آیا قیمت به حد سود (TP) یا حد ضرر (SL) رسیده است یا خیر
-            if current_price >= tp or current_price <= sl:
-                print(f"پوزیشن {symbol} بسته شد. قیمت فعلی: {current_price}")
-                # پوزیشن بسته شد، پس آن را پاک می‌کنیم تا اجازه صدور سیگنال جدید داده شود
-                del state[symbol]
-            else:
-                print(f"ارز {symbol} پوزیشن باز دارد (ورود: {pos['entry']}, TP: {tp}, SL: {sl}). سیگنال جدید رد شد.")
-                continue 
-        
-        # شرایط صدور سیگنال جدید
-        entry_price = current_price
-        sl_price = entry_price * (1 - 0.012)  # 1.2 درصد حد ضرر
-        tp_price = entry_price * (1 + 0.015)  # 1.5 درصد حد سود
-        rsi_val = 55.5  # مقدار نمونه RSI
-        
-        # ذخیره وضعیت پوزیشن جدید
-        state[symbol] = {
-            "entry": entry_price,
-            "tp": tp_price,
-            "sl": sl_price
-        }
-        
-        # ارسال سیگنال به تلگرام
-        message = (
-            f"🚨 *سیگنال خرید جدید (Score Hunter Pro)* 🚨\n\n"
-            f"🔹 ارز: `{symbol}`\n"
-            f"⏱ تایم‌فریم: `15m`\n\n"
-            f"📥 قیمت ورود: `{entry_price}`\n"
-            f"🛑 حد ضرر (SL): `{sl_price:.4f} (-1.2%)`\n"
-            f"🎯 حد سود (TP): `{tp_price:.4f} (+1.5%)`\n\n"
-            f"📊 شاخص RSI: `{rsi_val}`\n"
-            f"⏰ زمان: `{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC`"
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-BACKTEST"}
         )
-        send_telegram_message(message)
-        print(f"سیگنال جدید برای {symbol} ارسال شد.")
 
-    save_state(state)
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw = response.read().decode("utf-8")
+                payload = json.loads(raw)
+        except Exception:
+            break
+
+        if not isinstance(payload, dict) or payload.get("code") != 0:
+            break
+
+        rows = payload.get("data", [])
+        if not rows:
+            break
+
+        added = 0
+        for row in rows:
+            try:
+                if isinstance(row, dict):
+                    ts = int(float(row.get("created_at", row.get("time", 0))))
+                    op = float(row.get("open", 0))
+                    hi = float(row.get("high", 0))
+                    lo = float(row.get("low", 0))
+                    cl = float(row.get("close", 0))
+                    vol = float(row.get("volume", 0))
+                elif isinstance(row, list) and len(row) >= 6:
+                    ts = int(float(row[0]))
+                    op = float(row[1])
+                    cl = float(row[2])
+                    hi = float(row[3])
+                    lo = float(row[4])
+                    vol = float(row[5])
+                else:
+                    continue
+
+                if ts > 100000000000:
+                    ts = ts // 1000
+
+                if hi <= 0 or lo <= 0 or op <= 0 or cl <= 0:
+                    continue
+
+                if ts not in all_rows:
+                    all_rows[ts] = {
+                        "timestamp": ts,
+                        "open": op,
+                        "high": hi,
+                        "low": lo,
+                        "close": cl,
+                        "volume": vol,
+                    }
+                    added += 1
+            except Exception:
+                continue
+
+        if added == 0:
+            break
+
+        oldest_ts = min(all_rows.keys())
+        end_time = oldest_ts * 1000
+        time.sleep(0.1)
+
+    candles = list(all_rows.values())
+    candles.sort(key=lambda x: x["timestamp"])
+
+    if len(candles) > target_count:
+        candles = candles[-target_count:]
+
+    return candles
+
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
+
+def calculate_ema(closes, period):
+    ema = [closes[0]]
+    multiplier = 2 / (period + 1)
+    for price in closes[1:]:
+        ema.append((price - ema[-1]) * multiplier + ema[-1])
+    return ema
+
+def calculate_rsi(candles, period=14):
+    if len(candles) < period + 1:
+        return [50.0] * len(candles)
+    
+    rsi_values = [50.0] * len(candles)
+    gains = 0.0
+    losses = 0.0
+    
+    for i in range(1, period + 1):
+        change = candles[i]["close"] - candles[i - 1]["close"]
+        if change > 0:
+            gains += change
+        else:
+            losses -= change
+            
+    avg_gain = gains / period
+    avg_loss = losses / period
+    
+    if avg_loss == 0:
+        rsi_values[period] = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi_values[period] = 100.0 - (100.0 / (1.0 + rs))
+
+    for i in range(period + 1, len(candles)):
+        change = candles[i]["close"] - candles[i - 1]["close"]
+        gain = change if change > 0 else 0.0
+        loss = -change if change < 0 else 0.0
+        
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        
+        if avg_loss == 0:
+            rsi_values[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi_values[i] = 100.0 - (100.0 / (1.0 + rs))
+            
+    return rsi_values
+
+# ============================================================
+# PORTFOLIO BACKTEST ENGINE (With Active Position Lock)
+# ============================================================
+
+def run_backtest():
+    total_portfolio_profit = 0.0
+    total_trades_all = 0
+    total_wins_all = 0
+    total_losses_all = 0
+    total_days = 0
+
+    print("=" * 60)
+    print("گزارش تست با فیلتر پوزیشن باز و R:R 1:1.5 روی BTC و SOL:")
+    print("=" * 60)
+
+    for symbol in SYMBOLS:
+        candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
+        if len(candles) < 100:
+            continue
+
+        min_ts = candles[0]["timestamp"]
+        max_ts = candles[-1]["timestamp"]
+        total_days = (max_ts - min_ts) / 86400
+
+        closes = [c["close"] for c in candles]
+        ema_20 = calculate_ema(closes, 20)
+        ema_50 = calculate_ema(closes, 50)
+        rsi_list = calculate_rsi(candles, 14)
+
+        trades = []
+        active_position = None  # قفل پوزیشن باز برای جلوگیری از سیگنال‌های موازی
+
+        for i in range(50, len(candles) - 1):
+            c = candles[i]
+            prev_c = candles[i-1]
+            
+            close_p = c["close"]
+            open_p = c["open"]
+            
+            # اگر پوزیشن بازی داریم، باید اول چک کنیم بسته شده یا نه
+            if active_position is not None:
+                if c["low"] <= active_position["sl"]:
+                    trades.append("LOSS")
+                    active_position = None
+                elif c["high"] >= active_position["tp"]:
+                    trades.append("WIN")
+                    active_position = None
+                else:
+                    continue  # پوزیشن هنوز باز است، هیچ سیگنال جدیدی بررسی نمی‌شود
+
+            is_uptrend = ema_20[i] > ema_50[i]
+            is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
+            rsi = rsi_list[i]
+            is_rsi_good = 42 <= rsi <= 62
+            is_green = close_p > open_p
+
+            if is_uptrend and is_pullback_recovery and is_rsi_good and is_green:
+                entry_price = close_p
+                stop_loss = entry_price * 0.990     # ۱٪ ضرر
+                take_profit = entry_price * 1.015   # ۱.۵٪ سود
+                
+                # فیلتر بررسی موانع در ۳ کندل قبل
+                has_obstacle = False
+                for j in range(max(0, i-3), i):
+                    upper_wick = candles[j]["high"] - max(candles[j]["open"], candles[j]["close"])
+                    body = abs(candles[j]["close"] - candles[j]["open"])
+                    if body > 0 and upper_wick > (body * 2.0):
+                        has_obstacle = True
+                        break
+
+                if has_obstacle:
+                    continue
+
+                # بررسی اینکه آیا TP یا SL همین کندل ورود زده شده یا می‌رود برای کندل‌های بعد
+                trade_result = None
+                for future_c in candles[i+1:]:
+                    if future_c["low"] <= stop_loss:
+                        trade_result = "LOSS"
+                        break
+                    elif future_c["high"] >= take_profit:
+                        trade_result = "WIN"
+                        break
+                
+                if trade_result:
+                    trades.append(trade_result)
+                else:
+                    # اگر در بازه بسته نشد، به عنوان پوزیشن باز نگهش می‌داریم تا کندل‌های بعدی تعیین تکلیفش کنند
+                    active_position = {"tp": take_profit, "sl": stop_loss}
+
+        wins = trades.count("WIN")
+        losses = trades.count("LOSS")
+        symbol_total_trades = wins + losses
+        symbol_win_rate = (wins / symbol_total_trades * 100) if symbol_total_trades > 0 else 0.0
+        
+        symbol_profit = (wins * FIXED_RISK_AMOUNT * 1.5) - (losses * FIXED_RISK_AMOUNT)
+        
+        total_trades_all += symbol_total_trades
+        total_wins_all += wins
+        total_losses_all += losses
+        total_portfolio_profit += symbol_profit
+
+        print(f"\nارز: {symbol}")
+        print(f"  - تعداد کل معاملات (با فیلتر پوزیشن باز): {symbol_total_trades}")
+        print(f"  - موفق (Win): {wins} | ناموفق (Loss): {losses}")
+        print(f"  - وین‌ریت: {symbol_win_rate:.2f}%")
+        print(f"  - سود/زیان خالص: {symbol_profit:+.2f}$")
+        print("-" * 40)
+
+    print("\n" + "=" * 60)
+    print("برآیند نهایی با اعمال فیلتر پوزیشن باز:")
+    print("=" * 60)
+    print(f"کل معاملات کل سبد: {total_trades_all}")
+    print(f"معاملات موفق (Win): {total_wins_all}")
+    print(f"معاملات ناموفق (Loss): {total_losses_all}")
+    
+    portfolio_wr = (total_wins_all / total_trades_all * 100) if total_trades_all > 0 else 0.0
+    final_capital = 1000.0 + total_portfolio_profit
+    portfolio_roi = (total_portfolio_profit / 1000.0) * 100
+
+    print(f"وین‌ریت کل سبد: {portfolio_wr:.2f}%")
+    print(f"سرمایه نهایی سبد: {final_capital:.2f}$")
+    print(f"سود خالص کل سبد: {total_portfolio_profit:+.2f}$ ({portfolio_roi:+.2f}%)")
 
 if __name__ == "__main__":
-    run_bot()
+    run_backtest()
