@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Elite Win-Rate Strategy - Target 60%+ WinRate)
+# SETTINGS (Optimized Master Strategy - High Frequency & High Profit)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -110,7 +110,7 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# TECHNICAL INDICATORS (EMA, RSI, ATR)
+# TECHNICAL INDICATORS (EMA, RSI)
 # ============================================================
 
 def calculate_ema(closes, period):
@@ -160,25 +160,8 @@ def calculate_rsi(candles, period=14):
             
     return rsi_values
 
-def calculate_atr(candles, period=14):
-    atr_values = [0.0] * len(candles)
-    tr_list = [candles[0]["high"] - candles[0]["low"]]
-    
-    for i in range(1, len(candles)):
-        h_l = candles[i]["high"] - candles[i]["low"]
-        h_pc = abs(candles[i]["high"] - candles[i-1]["close"])
-        l_pc = abs(candles[i]["low"] - candles[i-1]["close"])
-        tr = max(h_l, h_pc, l_pc)
-        tr_list.append(tr)
-        
-    if len(tr_list) >= period:
-        atr_values[period-1] = sum(tr_list[:period]) / period
-        for i in range(period, len(candles)):
-            atr_values[i] = (atr_values[i-1] * (period - 1) + tr_list[i]) / period
-    return atr_values
-
 # ============================================================
-# BACKTEST ENGINE (Elite Pullback Strategy with Volume & ATR Filters)
+# BACKTEST ENGINE (Optimized Master Strategy)
 # ============================================================
 
 def run_backtest():
@@ -200,7 +183,6 @@ def run_backtest():
     ema_20 = calculate_ema(closes, 20)
     ema_50 = calculate_ema(closes, 50)
     rsi_list = calculate_rsi(candles, 14)
-    atr_list = calculate_atr(candles, 14)
 
     capital = INITIAL_CAPITAL
     total_trades = 0
@@ -208,7 +190,7 @@ def run_backtest():
     losses = 0
     
     print("-" * 50)
-    print("شروع بک‌تست استراتژی الایت (هدف وین‌ریت ۶۰٪+) روی " + str(len(candles)) + " کندل...")
+    print("شروع بک‌تست نسخه بهینه‌شده اصلی روی " + str(len(candles)) + " کندل...")
     print("-" * 50)
 
     for i in range(50, len(candles) - 1):
@@ -218,31 +200,23 @@ def run_backtest():
         close_p = c["close"]
         open_p = c["open"]
         
-        atr = atr_list[i]
-        if atr <= 0:
-            continue
-
-        # ۱. روند قدرتمند صعودی (فاصله مناسب میان EMA 20 و EMA 50)
-        is_uptrend = (ema_20[i] > ema_50[i]) and ((ema_20[i] - ema_50[i]) > (atr * 0.1))
+        # ۱. روند کلی صعودی
+        is_uptrend = ema_20[i] > ema_50[i]
         
-        # ۲. پولبک استاندارد و تمیز به محدوده EMA 20
+        # ۲. پولبک استاندارد به EMA 20 و بازگشت موفق
         is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
         
-        # ۳. فیلتر RSI در ناحیه امن و خنثی رو به بالا (۴۵ تا ۶۵)
+        # ۳. RSI بهینه‌شده برای حفظ حجم معاملات و در عین حال کیفیت بالا
         rsi = rsi_list[i]
-        is_rsi_safe = 45 <= rsi <= 65
+        is_rsi_good = 40 <= rsi <= 65
         
-        # ۴. تاییدیه حجم معاملات (حجم کندل فعلی بالاتر از میانگین ۱۰ کندل اخیر)
-        avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
-        is_volume_confirmed = c["volume"] > (avg_vol * 1.15)
-        
-        # ۵. کندل صعودی با بدنه قوی
+        # ۴. تاییدیه کندل صعودی
         is_green = close_p > open_p
 
-        if is_uptrend and is_pullback_recovery and is_rsi_safe and is_volume_confirmed and is_green:
+        if is_uptrend and is_pullback_recovery and is_rsi_good and is_green:
             entry_price = close_p
-            stop_loss = entry_price - (1.3 * atr)    # حد ضرر ایمن مبتنی بر ATR
-            take_profit = entry_price + (1.6 * atr)  # حد سود هدفمند برای بالاتر بردن ضریب موفقیت (Win Rate)
+            stop_loss = entry_price * 0.989   # ۱.۱ درصد حد ضرر استاندارد
+            take_profit = entry_price * 1.016 # ۱.۶ درصد حد سود سریع و مطمئن
             
             trade_result = None
             for future_c in candles[i+1:]:
@@ -259,13 +233,13 @@ def run_backtest():
 
                 if trade_result == "WIN":
                     wins += 1
-                    capital += risk_amount * 1.23
+                    capital += risk_amount * 1.28
                 elif trade_result == "LOSS":
                     losses += 1
                     capital -= risk_amount
 
     print("-" * 50)
-    print("نتایج نهایی بک‌تست الایت:")
+    print("نتایج نهایی بک‌تست نسخه نهایی بهینه‌شده:")
     print("کل معاملات انجام شده: " + str(total_trades))
     print("معاملات موفق (Win): " + str(wins))
     print("معاملات ناموفق (Loss): " + str(losses))
