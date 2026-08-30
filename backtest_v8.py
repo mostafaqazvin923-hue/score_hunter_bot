@@ -5,18 +5,18 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Master Trader Setup with XRP & ADA + 1:2 RR)
+# SETTINGS (Elite 4 Assets + Strict Quality Control + 1:2 RR)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "XRPUSDT", "ADAUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 TIMEFRAME = "15min"
 TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
 
 INITIAL_CAPITAL = 1000.0
-FIXED_RISK_AMOUNT = 100.0  # ریسک ثابت ۱۰۰ دلار به ازای هر معامله
+FIXED_RISK_AMOUNT = 20.0  # ریسک امن و منطقی ۲۰ دلار برای هر معامله
 
 # ============================================================
 # HTTP & PAGINATION DATA DOWNLOADER
@@ -176,7 +176,7 @@ def calculate_atr(candles, period=14):
     return atr_values
 
 # ============================================================
-# MAIN PORTFOLIO BACKTEST (Master Trader Strategy + XRP/ADA)
+# MAIN PORTFOLIO BACKTEST (Top 4 Assets + Low Frequency / High Precision)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -184,7 +184,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال اجرای اسکریپت با سبد کامل (شامل XRP و ADA) و ستاپ پرایس‌اکشن حرفه‌ای...")
+    print("در حال اجرای اسکریپت روی ۴ ارز برتر (BTC, ETH, SOL, XRP) با فیلترهای بهیه‌شده و تعداد معاملات منطقی...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -214,30 +214,31 @@ def run_portfolio_backtest():
             if atr <= 0:
                 continue
 
-            # استراتژی ریتم روند و برگشت به میانگین (سبک اساتید برتر)
-            is_trend_active = (ema_20[i] > ema_50[i])
-            # پولبک تمیز به محدوده EMA 20
-            is_pullback_to_ema = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
+            # فیلترهای بسیار سخت‌گیرانه برای شکارچیان حرفه‌ای (کاهش تعداد معاملات)
+            is_strong_trend = (ema_20[i] > ema_50[i]) and ((ema_20[i] - ema_50[i]) > (atr * 0.4))
+            is_clean_pullback = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
             
             rsi = rsi_list[i]
-            is_rsi_bullish = (50 <= rsi <= 68)
+            is_rsi_ideal = (53 <= rsi <= 65)
             
-            # تاییدیه حجم معاملات نسبت به میانگین ۵ کندل اخیر
-            avg_vol = sum(x["volume"] for x in candles[i-5:i]) / 5
-            is_volume_confirmed = c["volume"] > (avg_vol * 1.25)
+            # حجم معاملات باید به طور چشمگیری بالاتر از میانگین ۱۰ کندل قبل باشد
+            avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
+            is_high_volume = c["volume"] > (avg_vol * 1.5)
             
-            is_bullish_candle = close_p > open_p
+            is_bullish_close = close_p > open_p
+            candle_body = close_p - open_p
+            candle_range = high_p - low_p
+            is_strong_body = candle_range > 0 and (candle_body / candle_range) >= 0.55
 
-            if is_trend_active and is_pullback_to_ema and is_rsi_bullish and is_volume_confirmed and is_bullish_candle:
+            if is_strong_trend and is_clean_pullback and is_rsi_ideal and is_high_volume and is_bullish_close and is_strong_body:
                 entry_price = close_p
-                # استاپ‌لاس زیر کف کندل پولبک برای دقت حداکثری
-                stop_loss = min(c["low"], prev_c["low"]) - (0.2 * atr)
+                stop_loss = min(c["low"], prev_c["low"]) - (0.15 * atr)
                 risk = entry_price - stop_loss
                 
                 if risk <= 0:
                     continue
                 
-                # ریسک به ریوارد طلایی ۱ به ۲
+                # ریسک به ریوارد دقیق ۱ به ۲
                 take_profit = entry_price + (2.0 * risk)
                 
                 trade_result = None
@@ -264,40 +265,37 @@ def run_portfolio_backtest():
     total_days = (global_max_ts - global_min_ts) / 86400
 
     capital = INITIAL_CAPITAL
-    total_trades = len(all_trades)
     wins = 0
     losses = 0
 
-    # شبیه‌سازی مدیریت سرمایه و جلوگیری از ورشکستگی
     for trade in all_trades:
         if capital < FIXED_RISK_AMOUNT:
             break
 
-        risk_amount = FIXED_RISK_AMOUNT
         if trade["result"] == "WIN":
             wins += 1
-            capital += risk_amount * 2.0  # ریوارد ۱ به ۲
+            capital += FIXED_RISK_AMOUNT * 2.0  # ریوارد ۱ به ۲
         else:
             losses += 1
-            capital -= risk_amount
+            capital -= FIXED_RISK_AMOUNT
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی سبد کامل (BTC, ETH, SOL, LINK, XRP, ADA):")
+    print("نتایج نهایی سبد ۴ ارز برتر (BTC, ETH, SOL, XRP):")
     print("=" * 50)
-    print(f"کل معاملات سبد: {total_trades}")
+    total_handled = wins + losses
+    print(f"کل معاملات سبد: {total_handled}")
     print(f"معاملات موفق (Win): {wins}")
     print(f"معاملات ناموفق (Loss): {losses}")
     
-    handled_total = wins + losses
-    if handled_total > 0:
-        win_rate = (wins / handled_total) * 100
+    if total_handled > 0:
+        win_rate = (wins / total_handled) * 100
         net_profit = capital - INITIAL_CAPITAL
         profit_percentage = (net_profit / INITIAL_CAPITAL) * 100
         
         print(f"وین‌ریت کل سبد: {win_rate:.2f}%")
         print(f"سرمایه نهایی سبد: {capital:.2f}$")
         print(f"سود/زیان خالص کل: {net_profit:+.2f}$ ({profit_percentage:+.2f}%)")
-        print(f"میانگین کل معاملات در روز (کل سبد): {total_trades / max(total_days, 0.1):.2f}")
+        print(f"میانگین معاملات در روز (برای کل سبد): {total_handled / max(total_days, 0.1):.2f}")
     else:
         print("هیچ معامله‌ای انجام نشد.")
 
