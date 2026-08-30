@@ -5,18 +5,18 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Individual Symbol Analysis & Portfolio Breakdown)
+# SETTINGS (Top 3 Assets Only: BTC, ETH, SOL / Optimized Strategy)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]  # حذف کامل XRPUSDT
 TIMEFRAME = "15min"
 TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
 
-INITIAL_CAPITAL_PER_SYMBOL = 250.0  # تقسیم سرمایه اولیه بین ۴ ارز ($1000 کل)
-FIXED_RISK_AMOUNT = 50.0
+INITIAL_CAPITAL_PER_SYMBOL = 333.33  # تقسیم سرمایه بین ۳ ارز ($1000 کل)
+FIXED_RISK_AMOUNT = 50.0             # ریسک ثابت ۵۰ دلار برای هر معامله
 
 # ============================================================
 # HTTP & PAGINATION DATA DOWNLOADER
@@ -159,17 +159,17 @@ def calculate_rsi(candles, period=14):
     return rsi_values
 
 # ============================================================
-# INDIVIDUAL & PORTFOLIO BACKTEST ENGINE
+# PORTFOLIO BACKTEST ENGINE (Top 3 Assets)
 # ============================================================
 
-def run_detailed_backtest():
+def run_top3_backtest():
     total_portfolio_profit = 0.0
     total_trades_all = 0
     total_wins_all = 0
     total_losses_all = 0
 
     print("=" * 60)
-    print("گزارش تفکیکی عملکرد استراتژی روی هر ارز به صورت مجزا:")
+    print("گزارش عملکرد استراتژی روی سبد طلایی (BTC, ETH, SOL):")
     print("=" * 60)
 
     for symbol in SYMBOLS:
@@ -205,6 +205,18 @@ def run_detailed_backtest():
                 stop_loss = entry_price * 0.988
                 take_profit = entry_price * 1.015
                 
+                # فیلتر بررسی موانع در ۳ کندل قبل
+                has_obstacle = False
+                for j in range(max(0, i-3), i):
+                    upper_wick = candles[j]["high"] - max(candles[j]["open"], candles[j]["close"])
+                    body = abs(candles[j]["close"] - candles[j]["open"])
+                    if body > 0 and upper_wick > (body * 2.0):
+                        has_obstacle = True
+                        break
+
+                if has_obstacle:
+                    continue
+
                 trade_result = None
                 for future_c in candles[i+1:]:
                     if future_c["low"] <= stop_loss:
@@ -217,13 +229,11 @@ def run_detailed_backtest():
                 if trade_result:
                     trades.append(trade_result)
 
-        # محاسبه نتایج این ارز
         wins = trades.count("WIN")
         losses = trades.count("LOSS")
         symbol_total_trades = wins + losses
         symbol_win_rate = (wins / symbol_total_trades * 100) if symbol_total_trades > 0 else 0.0
         
-        # محاسبه سود/زیان این ارز با فرض ریسک ثابت
         symbol_profit = (wins * FIXED_RISK_AMOUNT * 1.25) - (losses * FIXED_RISK_AMOUNT)
         
         total_trades_all += symbol_total_trades
@@ -231,7 +241,7 @@ def run_detailed_backtest():
         total_losses_all += losses
         total_portfolio_profit += symbol_profit
 
-        print(f"\n ارز: {symbol}")
+        print(f"\nارز: {symbol}")
         print(f"  - تعداد کل معاملات: {symbol_total_trades}")
         print(f"  - موفق (Win): {wins} | ناموفق (Loss): {losses}")
         print(f"  - وین‌ریت: {symbol_win_rate:.2f}%")
@@ -240,14 +250,20 @@ def run_detailed_backtest():
         print("-" * 40)
 
     print("\n" + "=" * 60)
-    print("برآیند کل سبد (تجمیع ۴ ارز):")
+    print("برآیند نهایی سبد طلایی (BTC, ETH, SOL):")
     print("=" * 60)
     print(f"کل معاملات کل سبد: {total_trades_all}")
     print(f"معاملات موفق (Win): {total_wins_all}")
     print(f"معاملات ناموفق (Loss): {total_losses_all}")
+    
     portfolio_wr = (total_wins_all / total_trades_all * 100) if total_trades_all > 0 else 0.0
+    final_capital = 1000.0 + total_portfolio_profit
+    portfolio_roi = (total_portfolio_profit / 1000.0) * 100
+
     print(f"وین‌ریت کل سبد: {portfolio_wr:.2f}%")
-    print(f"سود خالص کل سبد: {total_portfolio_profit:+.2f}$")
+    print(f"سرمایه نهایی سبد: {final_capital:.2f}$")
+    print(f"سود خالص کل سبد: {total_portfolio_profit:+.2f}$ ({portfolio_roi:+.2f}%)")
+    print(f"میانگین کل معاملات در روز: {total_trades_all / max(total_days, 0.1):.2f}")
 
 if __name__ == "__main__":
-    run_detailed_backtest()
+    run_top3_backtest()
