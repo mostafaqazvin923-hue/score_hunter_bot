@@ -7,11 +7,11 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 TIMEFRAME = "1hour"
 TARGET_RR = 2.0
 
-def fetch_historical_klines(symbol, limit=4320):
+def fetch_historical_klines(symbol, limit=8800):
     url = f"https://api.coinex.com/v2/spot/kline?market={symbol}&period={TIMEFRAME}&limit={limit}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-BACKTEST"})
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with urllib.request.urlopen(req, timeout=20) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
             if isinstance(payload, dict) and payload.get("code") == 0:
@@ -27,7 +27,7 @@ def fetch_historical_klines(symbol, limit=4320):
                     elif isinstance(row, list) and len(row) >= 6:
                         ts = int(float(row[0]))
                         op = float(row[1])
-                        cl = float(row[2])
+                        cl = float(row.get("close", 0))
                         hi = float(row[3])
                         lo = float(row[4])
                     else:
@@ -41,7 +41,7 @@ def fetch_historical_klines(symbol, limit=4320):
     
     base_p = 100.0 if "SOL" in symbol else (3000.0 if "ETH" in symbol else (60000.0 if "BTC" in symbol else 0.5))
     dummy = []
-    for t in range(4320):
+    for t in range(8800):
         base_p += random.uniform(-1.0, 1.2)
         hi = base_p + random.uniform(0.1, 0.5)
         lo = base_p - random.uniform(0.1, 0.5)
@@ -73,12 +73,12 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - 6 MONTH BACKTEST (RR = 2.0) ")
+    print("   SCORE HUNTER PRO - 1 YEAR BACKTEST (RR = 2.0)  ")
     print("==================================================")
 
     for symbol in SYMBOLS:
-        print(f"\n[*] Fetching and testing 6-month data for {symbol}...")
-        candles = fetch_historical_klines(symbol, limit=4320)
+        print(f"\n[*] Fetching and testing 1-year data for {symbol}...")
+        candles = fetch_historical_klines(symbol, limit=8800)
         
         wins = 0
         losses = 0
@@ -120,7 +120,6 @@ def run_backtest():
                         trade_won = True
                         break
                 
-                # اگر در انتهای بازه نه TP خورد و نه SL، قیمت پایانی ملاک تعیین سود/زیان می‌شود
                 if not trade_won and not trade_lost:
                     if candles[end_idx]["close"] > entry_price:
                         trade_won = True
@@ -143,7 +142,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("             AGGREGATED 6-MONTH RESULTS           ")
+    print("             AGGREGATED 1-YEAR RESULTS            ")
     print("==================================================")
     print(f"Total Coins Tested : {len(SYMBOLS)}")
     print(f"Total Trades       : {grand_total_trades}")
