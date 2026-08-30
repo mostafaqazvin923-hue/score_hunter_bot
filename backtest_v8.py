@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (High Win-Rate Strategy - 6 Months)
+# SETTINGS (Global Pro Momentum Strategy - 6 Months)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -68,10 +68,10 @@ def download_klines(symbol, timeframe, target_count):
                 elif isinstance(row, list) and len(row) >= 6:
                     ts = int(float(row[0]))
                     op = float(row[1])
-                    cl = float(row.get("2", row[2])) if len(row) > 2 else float(row[2])
-                    hi = float(row.get("3", row[3])) if len(row) > 3 else float(row[3])
-                    lo = float(row.get("4", row[4])) if len(row) > 4 else float(row[4])
-                    vol = float(row.get("5", row[5])) if len(row) > 5 else float(row[5])
+                    cl = float(row[2]) if len(row) > 2 else float(row[2])
+                    hi = float(row[3]) if len(row) > 3 else float(row[3])
+                    lo = float(row[4]) if len(row) > 4 else float(row[4])
+                    vol = float(row[5]) if len(row) > 5 else float(row[5])
                 else:
                     continue
 
@@ -110,8 +110,15 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# TECHNICAL INDICATORS (RSI & Bollinger Bands)
+# TECHNICAL INDICATORS (EMA, RSI, MACD, ATR)
 # ============================================================
+
+def calculate_ema(closes, period):
+    ema = [closes[0]]
+    multiplier = 2 / (period + 1)
+    for price in closes[1:]:
+        ema.append((price - ema[-1]) * multiplier + ema[-1])
+    return ema
 
 def calculate_rsi(candles, period=14):
     if len(candles) < period + 1:
@@ -153,8 +160,25 @@ def calculate_rsi(candles, period=14):
             
     return rsi_values
 
+def calculate_atr(candles, period=14):
+    atr_values = [0.0] * len(candles)
+    tr_list = [candles[0]["high"] - candles[0]["low"]]
+    
+    for i in range(1, len(candles)):
+        h_l = candles[i]["high"] - candles[i]["low"]
+        h_pc = abs(candles[i]["high"] - candles[i-1]["close"])
+        l_pc = abs(candles[i]["low"] - candles[i-1]["close"])
+        tr = max(h_l, h_pc, l_pc)
+        tr_list.append(tr)
+        
+    if len(tr_list) >= period:
+        atr_values[period-1] = sum(tr_list[:period]) / period
+        for i in range(period, len(candles)):
+            atr_values[i] = (atr_values[i-1] * (period - 1) + tr_list[i]) / period
+    return atr_values
+
 # ============================================================
-# BACKTEST ENGINE (High Win-Rate Pullback Strategy)
+# BACKTEST ENGINE (Pro Multi-Indicator Strategy)
 # ============================================================
 
 def run_backtest():
@@ -162,7 +186,7 @@ def run_backtest():
     
     print("تعداد کل کندل‌های دریافت شده: " + str(len(candles)))
     
-    if len(candles) < 100:
+    if len(candles) < 150:
         print("تعداد کندل‌های دریافتی برای بک‌تست کافی نیست.")
         return
 
@@ -172,7 +196,11 @@ def run_backtest():
     
     print(f"بازه زمانی دقیق داده‌ها: از {first_time.strftime('%Y-%m-%d %H:%M')} تا {last_time.strftime('%Y-%m-%d %H:%M')} (حدود {total_days:.1f} روز)")
 
-    rsi_list = calculate_rsi(candles, period=14)
+    closes = [c["close"] for c in candles]
+    ema_20 = calculate_ema(closes, 20)
+    ema_50 = calculate_ema(closes, 50)
+    rsi_list = calculate_rsi(candles, 14)
+    atr_list = calculate_atr(candles, 14)
 
     capital = INITIAL_CAPITAL
     total_trades = 0
@@ -180,40 +208,40 @@ def run_backtest():
     losses = 0
     
     print("-" * 50)
-    print("شروع بک‌تست استراتژی جدید (بالا بردن وین‌ریت) روی " + str(len(candles)) + " کندل...")
+    print("شروع بک‌تست استراتژی جهانی (Pro Momentum) روی " + str(len(candles)) + " کندل...")
     print("-" * 50)
 
     for i in range(50, len(candles) - 1):
         current_candle = candles[i]
         close_price = current_candle["close"]
         open_price = current_candle["open"]
-        low_price = current_candle["low"]
         
-        # میانگین متحرک برای روند (SMA 50)
-        sma_50 = sum(c["close"] for c in candles[i-50:i]) / 50
+        e20 = ema_20[i]
+        e50 = ema_50[i]
+        prev_e20 = ema_20[i-1]
+        prev_e50 = ema_50[i-1]
         
-        # باندهای بولینگر (۲۰ دوره)
-        window = [c["close"] for c in candles[i-20:i]]
-        sma_20 = sum(window) / 20
-        variance = sum((x - sma_20) ** 2 for x in window) / 20
-        std_dev = variance ** 0.5
-        lower_band = sma_20 - (2.0 * std_dev)
+        rsi = rsi_list[i]
+        atr = atr_list[i]
         
-        current_rsi = rsi_list[i]
-        prev_rsi = rsi_list[i - 1]
+        if atr <= 0:
+            continue
 
-        # استراتژی وین‌ریت بالا (خرید در اصلاح بولینگر پایین در روند صعودی)
-        is_uptrend = close_price > sma_50
-        # قیمت به باند پایین نفوذ کرده یا به آن نزدیک شده و الان برگشته بالا (کندل صعودی)
-        is_near_lower_band = low_price <= lower_band * 1.002
+        # شرایط استراتژی پرو:
+        # ۱. روند صعودی: EMA 20 بالای EMA 50 باشد
+        is_trend_up = e20 > e50
+        # ۲. تقاطع یا تایید شتاب: EMA 20 به تازگی به سمت بالا تقاطع کرده یا در حال گسترش است
+        is_ema_crossing = (prev_e20 <= prev_e50) and (e20 > e50)
+        # ۳. RSI در محدوده قدرت صعودی (بین ۵۰ تا ۷۰)
+        is_rsi_strong = 50 <= rsi <= 70
+        # ۴. کندل صعودی قدرت‌مند
         is_green = close_price > open_price
-        # RSI از حالت اشباع فروش یا نزدیک آن برگشته بالا (مثلا از زیر ۴۰ آمده بالا)
-        is_rsi_rebound = prev_rsi < 45 and current_rsi >= 45
 
-        if is_uptrend and is_near_lower_band and is_green and is_rsi_rebound:
+        if is_trend_up and (is_ema_crossing or is_rsi_strong) and is_green:
             entry_price = close_price
-            stop_loss = entry_price * 0.99    # ۱ درصد حد ضرر نزدیک
-            take_profit = entry_price * 1.015 # ۱.۵ درصد حد سود سریع برای بالا بردن وین‌ریت
+            # استفاده از ATR برای تعیین حد ضرر و حد سود داینامیک و حرفه‌ای
+            stop_loss = entry_price - (1.5 * atr)
+            take_profit = entry_price + (2.5 * atr) # ریسک به ریوارد بالای ۱.۶
             
             trade_result = None
             for future_candle in candles[i+1:]:
@@ -230,13 +258,13 @@ def run_backtest():
 
                 if trade_result == "WIN":
                     wins += 1
-                    capital += risk_amount * 1.5 # با توجه به نسبت ریسک به ریوارد
+                    capital += risk_amount * 1.66
                 elif trade_result == "LOSS":
                     losses += 1
                     capital -= risk_amount
 
     print("-" * 50)
-    print("نتایج نهایی بک‌تست جدید:")
+    print("نتایج نهایی بک‌تست حرفه‌ای:")
     print("کل معاملات انجام شده: " + str(total_trades))
     print("معاملات موفق (Win): " + str(wins))
     print("معاملات ناموفق (Loss): " + str(losses))
