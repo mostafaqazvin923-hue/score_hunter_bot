@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (الگوبرداری دقیق از اسکریپت خودت)
+# SETTINGS
 # ============================================================
 
 BASE_URLS = [
@@ -16,8 +16,8 @@ BASE_URLS = [
 
 SYMBOL = "sol_usdt"
 TIMEFRAME = "minute15"
-TARGET_CANDLES = 1000
-PAGE_SIZE = 200
+TARGET_CANDLES = 1000  # هدف: دریافت ۱۰۰۰ کندل کامل
+PAGE_SIZE = 2000       # حداکثر سایز مجاز صفحه در ال‌بنک برای دریافت یکجای تاریخچه
 
 # ============================================================
 # HTTP & DATA DOWNLOADER
@@ -55,11 +55,11 @@ def download_klines(symbol, timeframe, target_count):
     pages = 0
     last_oldest = None
 
-    print(f"در حال دریافت تاریخچه کندل‌ها از LBank برای {symbol}...")
+    print(f"در حال دریافت تاریخچه کامل کندل‌ها از LBank برای {symbol}...")
 
     while len(all_rows) < target_count:
         pages += 1
-        if pages > 100:
+        if pages > 20:
             break
 
         params = {
@@ -123,12 +123,14 @@ def download_klines(symbol, timeframe, target_count):
         if last_oldest == oldest:
             break
         last_oldest = oldest
+        
+        # عقب بردن زمان برای صفحه بعدی (تبدیل به ثانیه منهای یک)
         end_time = oldest - 1
 
         if added == 0:
             break
 
-        time.sleep(0.05)
+        time.sleep(0.1)
 
     candles = list(all_rows.values())
     candles.sort(key=lambda x: x["timestamp"])
@@ -139,7 +141,7 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# BACKTEST ENGINE (با شرط‌های قطعی برای ثبت معامله)
+# BACKTEST ENGINE
 # ============================================================
 
 def run_backtest():
@@ -150,6 +152,13 @@ def run_backtest():
     if len(candles) < 50:
         print("تعداد کندل‌های دریافتی برای بک‌تست کافی نیست.")
         return
+
+    # محاسبه بازه زمانی دقیق بر اساس اولین و آخرین کندل
+    first_time = datetime.fromtimestamp(candles[0]["timestamp"], tz=timezone.utc)
+    last_time = datetime.fromtimestamp(candles[-1]["timestamp"], tz=timezone.utc)
+    total_days = (candles[-1]["timestamp"] - candles[0]["timestamp"]) / 86400
+    
+    print(f"📅 بازه زمانی داده‌ها: از {first_time.strftime('%Y-%m-%d %H:%M')} تا {last_time.strftime('%Y-%m-%d %H:%M')} (حدود {total_days:.1f} روز)")
 
     total_trades = 0
     wins = 0
@@ -165,7 +174,6 @@ def run_backtest():
         close_price = candle["close"]
         open_price = candle["open"]
         
-        # شرط ساده و تضمینی برای اینکه ببینیم موتور معامله‌گر کار می‌کند یا نه
         is_green = close_price > open_price
 
         if is_green:
@@ -200,6 +208,7 @@ def run_backtest():
     if total_trades > 0:
         win_rate = (wins / total_trades) * 100
         print(f"🎯 وین‌ریت استراتژی: {win_rate:.2f}%")
+        print(f"📈 میانگین تعداد معامله در روز: {total_trades / max(total_days, 0.1):.1f}")
     else:
         print("هیچ معامله‌ای با این شرایط در این بازه فعال نشد.")
 
