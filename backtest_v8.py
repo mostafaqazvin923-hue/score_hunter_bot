@@ -20,7 +20,7 @@ TARGET_CANDLES = 500  # تعداد کندل برای بک‌تست
 PAGE_SIZE = 200        # اندازه هر صفحه درخواست
 
 # ============================================================
-# HTTP & DATA DOWNLOADER (الگوی دقیق اتصال به LBank)
+# HTTP & DATA DOWNLOADER
 # ============================================================
 
 def http_get(url, params, timeout=20):
@@ -55,7 +55,7 @@ def download_klines(symbol, timeframe, target_count):
     pages = 0
     last_oldest = None
 
-    print(در حال دریافت تاریخچه کندل‌ها از LBank برای {symbol}...)
+    print(f"در حال دریافت تاریخچه کندل ها از LBank برای {symbol}...")
 
     while len(all_rows) < target_count:
         pages += 1
@@ -81,7 +81,7 @@ def download_klines(symbol, timeframe, target_count):
                 continue
 
         if payload is None:
-            print(f"خطا در ارتباط با سرورهای ال‌بنک: {last_error}")
+            print(f"خطا در ارتباط با سرورهای ال بنک: {last_error}")
             break
 
         rows = extract_data(payload)
@@ -146,7 +146,7 @@ def run_backtest():
     candles = download_klines(SYMBOL, TIMEFRAME, TARGET_CANDLES)
     
     if len(candles) < 50:
-        print("تعداد کندل‌های دریافتی برای بک‌تست کافی نیست.")
+        print("تعداد کندل های دریافتی برای بک تست کافی نیست.")
         return
 
     total_trades = 0
@@ -154,10 +154,9 @@ def run_backtest():
     losses = 0
     
     print("-" * 50)
-    print(f"شروع بک‌تست روی {len(candles)} کندلِ {SYMBOL.upper()}...")
+    print(f"شروع بک تست روی {len(candles)} کندلِ {SYMBOL.upper()}...")
     print("-" * 50)
 
-    # از کندل بیستم به بعد شروع می‌کنیم تا میانگین حجم قابل محاسبه باشد
     for i in range(20, len(candles) - 1):
         prev_candle = candles[i - 1]
         current_candle = candles[i]
@@ -165,21 +164,18 @@ def run_backtest():
         close_price = current_candle["close"]
         volume = current_candle["volume"]
         
-        # میانگین حجم ۲۰ کندل قبل
         avg_volume = sum(c["volume"] for c in candles[i-20:i]) / 20
 
-        # فیلترهای ورود (مومنتوم صعودی + تایید حجم)
         is_bullish_momentum = close_price > prev_candle["high"]
         is_volume_confirmed = volume > (avg_volume * 1.5)
 
         if is_bullish_momentum and is_volume_confirmed:
             entry_price = close_price
-            stop_loss = entry_price * 0.985      # حد ضرر ۱.۵ درصد
-            take_profit = entry_price * 1.03     # حد سود ۳ درصد (ریسک به ریوارد ۱ به ۲)
+            stop_loss = entry_price * 0.985
+            take_profit = entry_price * 1.03
             
             total_trades += 1
             
-            # بررسی نتیجه معامله در کندل‌های آینده
             trade_result = None
             for future_candle in candles[i+1:]:
                 if future_candle["low"] <= stop_loss:
@@ -194,19 +190,19 @@ def run_backtest():
             elif trade_result == "LOSS":
                 losses += 1
             else:
-                total_trades -= 1  # اگر تا آخر بازه باز ماند فاکتور گرفته می‌شود
+                total_trades -= 1
 
     print("-" * 50)
-    print(f"📊 **نتایج نهایی بک‌تست:**")
-    print(f"🔹 کل معاملات انجام شده: {total_trades}")
-    print(f"✅ معاملات موفق (Win): {wins}")
-    print(f"❌ معاملات ناموفق (Loss): {losses}")
+    print(f"نتایج نهایی بک تست:")
+    print(f"کل معاملات انجام شده: {total_trades}")
+    print(f"معاملات موفق (Win): {wins}")
+    print(f"معاملات ناموفق (Loss): {losses}")
     
     if total_trades > 0:
         win_rate = (wins / total_trades) * 100
-        print(f"🎯 وین‌ریت استراتژی: {win_rate:.2f}%")
+        print(f"وین ریت استراتژی: {win_rate:.2f}%")
     else:
-        print("هیچ معامله‌ای با این شرایط در این بازه فعال نشد.")
+        print("هیچ معامله ای با این شرایط در این بازه فعال نشد.")
 
 if __name__ == "__main__":
     run_backtest()
