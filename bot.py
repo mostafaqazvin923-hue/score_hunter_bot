@@ -1,18 +1,15 @@
 import json
-import time
 import urllib.request
 import urllib.parse
+import os
 import math
 
-# ============================================================
-# SCORE HUNTER PRO - LIVE BOT WITH TRADE RESULT TRACKER
-# ============================================================
-
-TOKEN = "8937303392:AAGXDckoHV61vY6G0B4VFcHMi90YbhY-jiY"
-CHAT_ID = "2090120004"
+TOKEN = os.environ.get("TELE_BOT_TOKEN", "8937303392:AAGXDckoHV61vY6G0B4VFcHMi90YbhY-jiY")
+CHAT_ID = os.environ.get("TELE_CHAT_ID", "2090120004")
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 TIMEFRAME = "1hour"
 TARGET_RR = 2.0
+STATE_FILE = "active_trades_state.json"
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -76,94 +73,106 @@ def calculate_rsi(candles, period=14):
     rs = (gains / period) / (losses / period)
     return 100.0 - (100.0 / (1.0 + rs))
 
-def run_bot():
-    print("==================================================")
-    print("   SCORE HUNTER PRO - LIVE BOT WITH TRACKER      ")
-    print("==================================================")
-    send_telegram("🚀 **Score Hunter Pro** ربات روشن شد و سیستم پیگیری نتایج پوزیشن‌ها فعال است!")
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {"active_trades": {}, "last_timestamps": {}}
 
-    last_timestamps = {s: 0 for s in SYMBOLS}
-    active_trades = {}  # ذخیره پوزیشن‌های فعال هر ارز برای بررسی نتیجه
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=4)
 
-    while True:
-        for symbol in SYMBOLS:
-            candles = fetch_klines(symbol)
-            if len(candles) < 20:
-                continue
+def main():
+    state = load_state()
+    active_trades = state.get("active_trades", {})
+    last_timestamps = state.get("last_timestamps", {})
 
-            current_candle = candles[-1]
-            c = candles[-2]       # کندل بسته شده‌ی قبلی
-            prev_c = candles[-3]
-            prev2_c = candles[-4]
+    print("[*] Running Score Hunter Pro 15-min check...")
 
-            # ۱. بررسی پوزیشن فعال روی این ارز جهت اعلام نتیجه (TP یا SL)
-            if symbol in active_trades:
-                trade = active_trades[symbol]
-                if current_candle["low"] <= trade["stop_loss"]:
-                    msg = (
-                        f"❌ **حد ضرر معامله لمس شد (SL Hit)**\n\n"
-                        f"🪙 ارز: `{symbol}`\n"
-                        f"📍 نقطه ورود: `{trade['entry_price']:.4f}`\n"
-                        f"🛑 قیمت حد ضرر: `{trade['stop_loss']:.4f}`\n"
-                        f"📉 زیان: `-{trade['sl_pct']:.2f}%`"
-                    )
-                    send_telegram(msg)
-                    del active_trades[symbol]
-                elif current_candle["high"] >= trade["take_profit"]:
-                    msg = (
-                        f"✅ **حد سود معامله لمس شد (TP Hit - WON!)**\n\n"
-                        f"🪙 ارز: `{symbol}`\n"
-                        f"📍 نقطه ورود: `{trade['entry_price']:.4f}`\n"
-                        f"🎯 قیمت حد سود: `{trade['take_profit']:.4f}`\n"
-                        f"📈 سود خالص: `+{trade['tp_pct']:.2f}%`"
-                    )
-                    send_telegram(msg)
-                    del active_trades[symbol]
+    for symbol in SYMBOLS:
+        candles = fetch_klines(symbol)
+        if len(candles) < 20:
+                    continue
 
-            # ۲. جستجوی سیگنال جدید (فقط اگر پوزیشن فعالی روی این ارز باز نباشد)
-            if symbol not in active_trades and c["timestamp"] != last_timestamps[symbol]:
-                recent_highs = max(x["high"] for x in candles[-15:-2])
-                is_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.4
-                has_bullish_fvg = prev2_c["high"] < c["low"]
-                
-                current_rsi = calculate_rsi(candles)
-                rsi_filter = 40 < current_rsi < 70
+        current_candle = candles[-1]
+        c = candles[-2]
+        prev_c = candles[-3]
+        prev2_c = candles[-4]
 
-                if is_bos and has_bullish_fvg and rsi_filter:
-                    entry_price = c["close"]
-                    stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
-                    risk_dist = entry_price - stop_loss
+        # ۱. بررسی پوزیشن فعال برای این ارز
+        if symbol in active_trades:
+            trade = active_trades[symbol]
+            if current_candle["low"] <= trade["stop_loss"]:
+                msg = (
+                    f"❌ **حد ضرر معامله لمس شد (SL Hit)**\n\n"
+                    f"🪙 ارز: `{symbol}`\n"
+                    f"📍 نقطه ورود: `{trade['entry_price']:.4f}`\n"
+                    f"🛑 قیمت حد ضرر: `{trade['stop_loss']:.4f}`\n"
+                    f"📉 زیان: `-{trade['sl_pct']:.2f}%`"
+                )
+                send_telegram(msg)
+                del active_trades[symbol]
+            elif current_candle["high"] >= trade["take_profit"]:
+                msg = (
+                    f"✅ **حد سود معامله لمس شد (TP Hit - WON!)**\n\n"
+                    f"🪙 ارز: `{symbol}`\n"
+                    f"📍 نقطه ورود: `{trade['entry_price']:.4f}`\n"
+                    f"🎯 قیمت حد سود: `{trade['take_profit']:.4f}`\n"
+                    f"📈 سود خالص: `+{trade['tp_pct']:.2f}%`"
+                )
+                send_telegram(msg)
+                del active_trades[symbol]
 
-                    if risk_dist <= 0 or (risk_dist / entry_price) > 0.03:
-                        continue
+        # ۲. جستجوی سیگنال جدید
+        if symbol not in active_trades and c["timestamp"] != last_timestamps.get(symbol, 0):
+            recent_highs = max(x["high"] for x in candles[-15:-2])
+            is_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.4
+            has_bullish_fvg = prev2_c["high"] < c["low"]
+            
+            current_rsi = calculate_rsi(candles)
+            rsi_filter = 40 < current_rsi < 70
 
-                    take_profit = entry_price + (risk_dist * TARGET_RR)
+            if is_bos and has_bullish_fvg and rsi_filter:
+                entry_price = c["close"]
+                stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
+                risk_dist = entry_price - stop_loss
 
-                    tp_percentage = ((take_profit - entry_price) / entry_price) * 100
-                    sl_percentage = ((entry_price - stop_loss) / entry_price) * 100
+                if risk_dist <= 0 or (risk_dist / entry_price) > 0.03:
+                    continue
 
-                    # ثبت پوزیشن فعال
-                    active_trades[symbol] = {
-                        "entry_price": entry_price,
-                        "take_profit": take_profit,
-                        "stop_loss": stop_loss,
-                        "tp_pct": tp_percentage,
-                        "sl_pct": sl_percentage
-                    }
+                take_profit = entry_price + (risk_dist * TARGET_RR)
+                tp_percentage = ((take_profit - entry_price) / entry_price) * 100
+                sl_percentage = ((entry_price - stop_loss) / entry_price) * 100
 
-                    msg = (
-                        f"🟢 **سیگنال جدید لانگ (Long)**\n\n"
-                        f"🪙 ارز: `{symbol}`\n"
-                        f"📍 نقطه ورود: `{entry_price:.4f}`\n\n"
-                        f"🎯 **TP:** `{take_profit:.4f}` (سود: `+`{tp_percentage:.2f}%)\n"
-                        f"🛑 **SL:** `{stop_loss:.4f}` (ضرر: `-`{sl_percentage:.2f}%)\n"
-                        f"⚖️ ریسک به ریوارد: `1:2`\n"
-                        f"📊 RSI: `{current_rsi:.1f}`"
-                    )
-                    send_telegram(msg)
-                    last_timestamps[symbol] = c["timestamp"]
+                active_trades[symbol] = {
+                    "entry_price": entry_price,
+                    "take_profit": take_profit,
+                    "stop_loss": stop_loss,
+                    "tp_pct": tp_percentage,
+                    "sl_pct": sl_percentage
+                }
 
-        time.sleep(60)
+                msg = (
+                    f"🟢 **سیگنال جدید لانگ (Long)**\n\n"
+                    f"🪙 ارز: `{symbol}`\n"
+                    f"📍 نقطه ورود: `{entry_price:.4f}`\n\n"
+                    f"🎯 **TP:** `{take_profit:.4f}` (سود: `+`{tp_percentage:.2f}%)\n"
+                    f"🛑 **SL:** `{stop_loss:.4f}` (ضرر: `-`{sl_percentage:.2f}%)\n"
+                    f"⚖️ ریسک به ریوارد: `1:2`\n"
+                    f"📊 RSI: `{current_rsi:.1f}`"
+                )
+                send_telegram(msg)
+                last_timestamps[symbol] = c["timestamp"]
+
+    # ذخیره تغییرات وضعیت در فایل برای اجرای بعدی گیت‌هاب اکشن
+    state["active_trades"] = active_trades
+    state["last_timestamps"] = last_timestamps
+    save_state(state)
+    print("[*] State successfully saved.")
 
 if __name__ == "__main__":
-    run_bot()
+    main()
