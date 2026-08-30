@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (SuperTrend Pro High Win-Rate Strategy)
+# SETTINGS (Price Action Momentum Breakout - 6 Months)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -70,7 +70,7 @@ def download_klines(symbol, timeframe, target_count):
                     op = float(row[1])
                     cl = float(row[2]) if len(row) > 2 else float(row[2])
                     hi = float(row[3]) if len(row) > 3 else float(row[3])
-                    lo = float(row.get("4", row[4])) if len(row) > 4 else float(row[4])
+                    lo = float(row[4]) if len(row) > 4 else float(row[4])
                     vol = float(row.get("5", row[5])) if len(row) > 5 else float(row[5])
                 else:
                     continue
@@ -110,50 +110,19 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# TECHNICAL INDICATORS (ATR, RSI, SuperTrend)
+# TECHNICAL INDICATORS
 # ============================================================
 
-def calculate_rsi(candles, period=14):
-    if len(candles) < period + 1:
-        return [50.0] * len(candles)
-    
-    rsi_values = [50.0] * len(candles)
-    gains = 0.0
-    losses = 0.0
-    
-    for i in range(1, period + 1):
-        change = candles[i]["close"] - candles[i - 1]["close"]
-        if change > 0:
-            gains += change
+def calculate_sma(values, period):
+    sma = []
+    for i in range(len(values)):
+        if i < period - 1:
+            sma.append(sum(values[:i+1]) / (i + 1))
         else:
-            losses -= change
-            
-    avg_gain = gains / period
-    avg_loss = losses / period
-    
-    if avg_loss == 0:
-        rsi_values[period] = 100.0
-    else:
-        rs = avg_gain / avg_loss
-        rsi_values[period] = 100.0 - (100.0 / (1.0 + rs))
+            sma.append(sum(values[i-period+1:i+1]) / period)
+    return sma
 
-    for i in range(period + 1, len(candles)):
-        change = candles[i]["close"] - candles[i - 1]["close"]
-        gain = change if change > 0 else 0.0
-        loss = -change if change < 0 else 0.0
-        
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-        
-        if avg_loss == 0:
-            rsi_values[i] = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            rsi_values[i] = 100.0 - (100.0 / (1.0 + rs))
-            
-    return rsi_values
-
-def calculate_atr(candles, period=10):
+def calculate_atr(candles, period=14):
     atr_values = [0.0] * len(candles)
     tr_list = [candles[0]["high"] - candles[0]["low"]]
     
@@ -171,7 +140,7 @@ def calculate_atr(candles, period=10):
     return atr_values
 
 # ============================================================
-# BACKTEST ENGINE (SuperTrend Strategy)
+# BACKTEST ENGINE (Price Action Breakout Strategy)
 # ============================================================
 
 def run_backtest():
@@ -189,8 +158,9 @@ def run_backtest():
     
     print(f"بازه زمانی دقیق داده‌ها: از {first_time.strftime('%Y-%m-%d %H:%M')} تا {last_time.strftime('%Y-%m-%d %H:%M')} (حدود {total_days:.1f} روز)")
 
-    rsi_list = calculate_rsi(candles, 14)
-    atr_list = calculate_atr(candles, 10)
+    closes = [c["close"] for c in candles]
+    sma_50 = calculate_sma(closes, 50)
+    atr_list = calculate_atr(candles, 14)
 
     capital = INITIAL_CAPITAL
     total_trades = 0
@@ -198,58 +168,42 @@ def run_backtest():
     losses = 0
     
     print("-" * 50)
-    print("شروع بک‌تست استراتژی SuperTrend Pro روی " + str(len(candles)) + " کندل...")
+    print("شروع بک‌تست استراتژی پرایس اکشن بریک‌اوت روی " + str(len(candles)) + " کندل...")
     print("-" * 50)
 
-    # شبیه‌سازی سوپرترند (period=10, multiplier=3.0)
-    supertrend_dir = 1 # 1 for uptrend, -1 for downtrend
-    basic_upperband = 0.0
-    basic_lowerband = 0.0
-    final_upperband = 0.0
-    final_lowerband = 0.0
-
-    for i in range(20, len(candles) - 1):
+    for i in range(50, len(candles) - 1):
         c = candles[i]
         prev_c = candles[i-1]
         
-        hl2 = (c["high"] + c["low"]) / 2.0
-        atr = atr_list[i]
+        close_p = c["close"]
+        open_p = c["open"]
+        high_p = c["high"]
+        low_p = c["low"]
         
+        atr = atr_list[i]
         if atr <= 0:
             continue
 
-        basic_upperband = hl2 + (3.0 * atr)
-        basic_lowerband = hl2 - (3.0 * atr)
-
-        # محاسبه SuperTrend داینامیک
-        if i == 20:
-            final_lowerband = basic_lowerband
-            final_upperband = basic_upperband
+        # بررسی روند میان‌مدت (قیمت بالای میانگین متحرک ۵۰)
+        is_uptrend = close_p > sma_50[i]
         
-        prev_close = prev_c["close"]
+        # شکست سقف ۵ کندل گذشته (Breakout)
+        recent_highest = max(x["high"] for x in candles[i-5:i])
+        is_breakout = close_p > recent_highest
         
-        if basic_lowerband > final_lowerband or prev_close < final_lowerband:
-            final_lowerband = basic_lowerband
-        if basic_upperband < final_upperband or prev_close > final_upperband:
-            final_upperband = basic_upperband
+        # کندل صعودی پرقدرت (بدنه کندل حداقل ۶۰ درصد کل طول کندل باشد تا از پین‌بارهای جعلی جلوگیری شود)
+        candle_body = abs(close_p - open_p)
+        candle_range = high_p - low_p
+        is_strong_body = candle_range > 0 and (candle_body / candle_range) >= 0.55
+        
+        # حجم معاملات بالاتر از میانگین ۱۰ کندل گذشته
+        avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
+        is_volume_ok = c["volume"] > (avg_vol * 1.15)
 
-        prev_st_dir = supertrend_dir
-        if supertrend_dir == 1:
-            if c["close"] < final_lowerband:
-                supertrend_dir = -1
-        else:
-            if c["close"] > final_upperband:
-                supertrend_dir = 1
-
-        # شرایط ورود دقیق و کنترل شده برای رسیدن به تعداد معامله منطقی (حداقل ۳ تا در روز)
-        is_trend_flip_to_up = (prev_st_dir == -1) and (supertrend_dir == 1)
-        is_rsi_healthy = 50 <= rsi_list[i] <= 70
-        is_volume_ok = c["volume"] > (sum(x["volume"] for x in candles[i-10:i]) / 10) * 1.1
-
-        if is_trend_flip_to_up and is_rsi_healthy and is_volume_ok:
-            entry_price = c["close"]
-            stop_loss = entry_price - (2.0 * atr)   # حد ضرر مبتنی بر ATR واقعی
-            take_profit = entry_price + (3.5 * atr) # ریسک به ریوارد بالای ۱.۷ برای سودآوری بالا
+        if is_uptrend and is_breakout and is_strong_body and is_volume_ok:
+            entry_price = close_p
+            stop_loss = entry_price - (1.5 * atr)    # حد ضرر استاندارد مبتنی بر ATR
+            take_profit = entry_price + (2.5 * atr)  # ریسک به ریوارد ۱ به ۱.۶۷ برای افزایش وین‌ریت
             
             trade_result = None
             for future_c in candles[i+1:]:
@@ -266,13 +220,13 @@ def run_backtest():
 
                 if trade_result == "WIN":
                     wins += 1
-                    capital += risk_amount * 1.75
+                    capital += risk_amount * 1.67
                 elif trade_result == "LOSS":
                     losses += 1
                     capital -= risk_amount
 
     print("-" * 50)
-    print("نتایج نهایی بک‌تست SuperTrend Pro:")
+    print("نتایج نهایی بک‌تست پرایس اکشن:")
     print("کل معاملات انجام شده: " + str(total_trades))
     print("معاملات موفق (Win): " + str(wins))
     print("معاملات ناموفق (Loss): " + str(losses))
