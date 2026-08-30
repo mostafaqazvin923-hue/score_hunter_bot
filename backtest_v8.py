@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Targeting >60% Win-Rate with 10% Risk)
+# SETTINGS (Targeting 60-70% Win-Rate Strategy)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -16,7 +16,7 @@ TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
 
 INITIAL_CAPITAL = 1000.0
-RISK_PERCENT = 0.10  # ۱۰ درصد ریسک به ازای هر معامله به درخواست شما
+RISK_PERCENT = 0.05  # ریسک معقول
 
 # ============================================================
 # HTTP & PAGINATION DATA DOWNLOADER
@@ -176,7 +176,7 @@ def calculate_atr(candles, period=14):
     return atr_values
 
 # ============================================================
-# MAIN PORTFOLIO BACKTEST (High Precision Filters)
+# MAIN PORTFOLIO BACKTEST (High Win-Rate Target Setup)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -184,7 +184,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال استخراج سیگنال‌ها با فیلترهای دقیق برای هدف وین‌ریت بالای ۶۰٪...")
+    print("در حال اجرای اسکریپت با هدف دستیابی به وین‌ریت ۶۰ الی ۷۰ درصدی...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -197,15 +197,14 @@ def run_portfolio_backtest():
             global_max_ts = candles[-1]["timestamp"]
 
         closes = [c["close"] for c in candles]
-        ema_20 = calculate_ema(closes, 20)
+        ema_9 = calculate_ema(closes, 9)
+        ema_21 = calculate_ema(closes, 21)
         ema_50 = calculate_ema(closes, 50)
         rsi_list = calculate_rsi(candles, 14)
         atr_list = calculate_atr(candles, 14)
 
         for i in range(50, len(candles) - 1):
             c = candles[i]
-            prev_c = candles[i-1]
-            
             close_p = c["close"]
             open_p = c["open"]
             high_p = c["high"]
@@ -215,30 +214,25 @@ def run_portfolio_backtest():
             if atr <= 0:
                 continue
 
-            # ۱. روند صعودی بسیار قوی با فاصله مطمئن بین EMAها
-            is_uptrend = (ema_20[i] > ema_50[i]) and ((ema_20[i] - ema_50[i]) > (atr * 0.35))
+            # فیلترهای بسیار سخت‌گیرانه برای مومنتوم قطعی صعودی
+            is_strong_uptrend = (ema_9[i] > ema_21[i]) and (ema_21[i] > ema_50[i])
             
-            # ۲. پولبک تمیز و کنترل‌شده به زیر EMA 20 و برگشت پرقدرت
-            is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
+            # بازگشت دقیق قیمت روی EMA 9 در روند پرقدرت
+            is_touch_ema9 = (c["low"] <= ema_9[i]) and (close_p > ema_9[i])
             
-            # ۳. محدوده RSI طلایی برای شتاب صعودی بالا
             rsi = rsi_list[i]
-            is_rsi_good = 55 <= rsi <= 64
+            is_rsi_perfect = 52 <= rsi <= 65
             
-            # ۴. تاییدیه حجم سنگین (حداقل ۴۵ درصد بالاتر از میانگین ۱۰ کندل اخیر)
             avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
-            is_volume_heavy = c["volume"] > (avg_vol * 1.45)
+            is_volume_spike = c["volume"] > (avg_vol * 1.2)
             
-            # ۵. کندل بدنه کاملاً قاطع و صعودی
-            candle_body = abs(close_p - open_p)
-            candle_range = high_p - low_p
-            is_strong_body = candle_range > 0 and (candle_body / candle_range) >= 0.55
             is_green = close_p > open_p
 
-            if is_uptrend and is_pullback_recovery and is_rsi_good and is_volume_heavy and is_strong_body and is_green:
+            if is_strong_uptrend and is_touch_ema9 and is_rsi_perfect and is_volume_spike and is_green:
                 entry_price = close_p
-                stop_loss = entry_price - (1.1 * atr)
-                take_profit = entry_price + (1.6 * atr)
+                # ساختار تارگت نزدیک و استاپ کنترل شده برای بالا بردن وین‌ریت
+                stop_loss = entry_price - (0.9 * atr)
+                take_profit = entry_price + (0.85 * atr)
                 
                 trade_result = None
                 exit_ts = c["timestamp"]
@@ -272,13 +266,13 @@ def run_portfolio_backtest():
         risk_amount = capital * RISK_PERCENT
         if trade["result"] == "WIN":
             wins += 1
-            capital += risk_amount * 1.455  # ضریب ریسک به ریوارد متناسب با TP و SL
+            capital += risk_amount * 0.94  # متناسب با سود تارگت نزدیک
         else:
             losses += 1
             capital -= risk_amount
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی سبد (هدف وین‌ریت بالای ۶۰٪ با ریسک ۱۰٪):")
+    print("نتایج نهایی سبد (هدف وین‌ریت بالا):")
     print("=" * 50)
     print(f"کل معاملات سبد: {total_trades}")
     print(f"معاملات موفق (Win): {wins}")
