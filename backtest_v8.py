@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Low Frequency / High Precision / Fixed $50 Risk)
+# SETTINGS (Original Gold Version + Fixed $50 Risk / 4 Assets)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -68,8 +68,8 @@ def download_klines(symbol, timeframe, target_count):
                     op = float(row[1])
                     cl = float(row[2]) if len(row) > 2 else float(row[2])
                     hi = float(row[3]) if len(row) > 3 else float(row[3])
-                    lo = float(row.get("4", row[4])) if len(row) > 4 else float(row[4])
-                    vol = float(row.get("5", row[5])) if len(row) > 5 else float(row[5])
+                    lo = float(row[4]) if len(row) > 4 else float(row[4])
+                    vol = float(row[5]) if len(row) > 5 else float(row[5])
                 else:
                     continue
 
@@ -158,25 +158,8 @@ def calculate_rsi(candles, period=14):
             
     return rsi_values
 
-def calculate_atr(candles, period=14):
-    atr_values = [0.0] * len(candles)
-    tr_list = [candles[0]["high"] - candles[0]["low"]]
-    
-    for i in range(1, len(candles)):
-        h_l = candles[i]["high"] - candles[i]["low"]
-        h_pc = abs(candles[i]["high"] - candles[i-1]["close"])
-        l_pc = abs(candles[i]["low"] - candles[i-1]["close"])
-        tr = max(h_l, h_pc, l_pc)
-        tr_list.append(tr)
-        
-    if len(tr_list) >= period:
-        atr_values[period-1] = sum(tr_list[:period]) / period
-        for i in range(period, len(candles)):
-            atr_values[i] = (atr_values[i-1] * (period - 1) + tr_list[i]) / period
-    return atr_values
-
 # ============================================================
-# PORTFOLIO BACKTEST ENGINE (Strict Filter / Low Frequency)
+# PORTFOLIO BACKTEST ENGINE (Original Golden Formula)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -184,7 +167,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال اجرای تست با فیلترهای سخت‌گیرانه برای کاهش تعداد معاملات...")
+    print("در حال اجرای نسخه اصلی و طلایی روی ۴ ارز (BTC, ETH, SOL, XRP)...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -200,7 +183,6 @@ def run_portfolio_backtest():
         ema_20 = calculate_ema(closes, 20)
         ema_50 = calculate_ema(closes, 50)
         rsi_list = calculate_rsi(candles, 14)
-        atr_list = calculate_atr(candles, 14)
 
         for i in range(50, len(candles) - 1):
             c = candles[i]
@@ -208,27 +190,15 @@ def run_portfolio_backtest():
             
             close_p = c["close"]
             open_p = c["open"]
-            high_p = c["high"]
-            low_p = c["low"]
-            atr = atr_list[i]
             
-            if atr <= 0:
-                continue
-
-            # فیلترهای سنگین‌تر برای جلوگیری از ترید رگباری
-            is_strong_uptrend = (ema_20[i] > ema_50[i]) and ((ema_20[i] - ema_50[i]) > (atr * 0.3))
+            # همان منطق دقیق طلایی
+            is_uptrend = ema_20[i] > ema_50[i]
             is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
-            
             rsi = rsi_list[i]
-            is_rsi_good = 45 <= rsi <= 60
-            
-            # تاییدیه حجم بالا (حجم کندل باید به طور واضح بالاتر از میانگین باشد)
-            avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
-            is_volume_confirmed = c["volume"] > (avg_vol * 1.3)
-            
+            is_rsi_good = 42 <= rsi <= 62
             is_green = close_p > open_p
 
-            if is_strong_uptrend and is_pullback_recovery and is_rsi_good and is_volume_confirmed and is_green:
+            if is_uptrend and is_pullback_recovery and is_rsi_good and is_green:
                 entry_price = close_p
                 stop_loss = entry_price * 0.988
                 take_profit = entry_price * 1.015
@@ -269,7 +239,7 @@ def run_portfolio_backtest():
             capital -= FIXED_RISK_AMOUNT
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی با فیلترهای سخت‌گیرانه و تعداد معاملات منطقی:")
+    print("نتایج نهایی فرمول طلایی اصلی با ریسک ثابت ۵۰ دلاری:")
     print("=" * 50)
     total_trades = wins + losses
     print("کل معاملات کل سبد: " + str(total_trades))
