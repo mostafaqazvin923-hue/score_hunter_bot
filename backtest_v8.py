@@ -56,14 +56,13 @@ def download_klines(symbol, timeframe, limit=1000):
             elif isinstance(row, list) and len(row) >= 6:
                 ts = int(float(row[0]))
                 op = float(row[1])
-                cl = float(row[2])
-                hi = float(row[3])
-                lo = float(row[4])
-                vol = float(row[5])
+                cl = float(row.get("close", 2))
+                hi = float(row.get("high", 3))
+                lo = float(row.get("low", 4))
+                vol = float(row.get("volume", 5))
             else:
                 continue
 
-            # اصلاح واحد تایم‌استمپ اگر میلی‌ثانیه باشد
             if ts > 100000000000:
                 ts = ts // 1000
 
@@ -85,7 +84,7 @@ def download_klines(symbol, timeframe, limit=1000):
     return candles
 
 # ============================================================
-# BACKTEST ENGINE
+# BACKTEST ENGINE (Optimized & Filtered Strategy)
 # ============================================================
 
 def run_backtest():
@@ -111,18 +110,30 @@ def run_backtest():
     print(f"شروع بک‌تست روی {len(candles)} کندلِ {SYMBOL.upper()}...")
     print("-" * 50)
 
-    for i in range(10, len(candles) - 1):
-        candle = candles[i]
+    # شروع از کندل بیستم برای محاسبه میانگین حجم ۲۰ دوره گذشته
+    for i in range(20, len(candles) - 1):
+        current_candle = candles[i]
+        prev_candle = candles[i - 1]
         
-        close_price = candle["close"]
-        open_price = candle["open"]
+        close_price = current_candle["close"]
+        open_price = current_candle["open"]
+        volume = current_candle["volume"]
         
-        is_green = close_price > open_price
+        # محاسبه میانگین حجم ۲۰ کندل قبل
+        avg_volume = sum(c["volume"] for c in candles[i-20:i]) / 20
 
-        if is_green:
+        # فیلترهای سخت‌گیرانه‌تر:
+        # ۱. کندل صعودی قوی (بدنه کندل رو به بالا)
+        is_green = close_price > open_price
+        # ۲. حجم معاملات حداقل ۱.۵ برابر میانگین (تاییدیه ورود پول)
+        is_volume_high = volume > (avg_volume * 1.5)
+        # ۳. شکستن سقف کندل قبلی (Breakout)
+        is_breakout = close_price > prev_candle["high"]
+
+        if is_green and is_volume_high and is_breakout:
             entry_price = close_price
-            stop_loss = entry_price * 0.99
-            take_profit = entry_price * 1.02
+            stop_loss = entry_price * 0.985   معامله (۱.۵ درصد حد ضرر)
+            take_profit = entry_price * 1.03  # ۳ درصد حد سود (ریسک به ریوارد ۲)
             
             total_trades += 1
             
