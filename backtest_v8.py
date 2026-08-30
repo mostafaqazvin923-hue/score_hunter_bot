@@ -1,11 +1,13 @@
 import requests
 
 # --- تنظیمات صرافی LBank ---
-SYMBOL = "sol_usdt"
-LBANK_API_URL = f"https://api.lbank.info/v2/kline.do?symbol={SYMBOL}&size=500&type=15min"
+# در ال‌بنک معمولاً نمادها به صورت حروف کوچک بدون جداکننده نوشته می‌شوند (مثل solusdt)
+SYMBOL = "solusdt"
+# اصلاح پارامتر تایم‌فریم از 15min به min15 طبق استاندارد ال‌بنک
+LBANK_API_URL = f"https://api.lbank.info/v2/kline.do?symbol={SYMBOL}&size=500&type=min15"
 
 def fetch_historical_candles():
-    """دریافت کندل‌های تاریخی از LBank با هدر استاندارد برای جلوگیری از مسدود شدن"""
+    """دریافت کندل‌های تاریخی از LBank با پارامترهای اصلاح‌شده"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -16,6 +18,7 @@ def fetch_historical_candles():
         data = response.json()
         print(f"محتوای پاسخ: {str(data)[:200]}")
         
+        # بررسی صحیح ساختار پاسخ ال‌بنک
         if data.get("result") == "true" or data.get("result") is True or "data" in data:
             raw_candles = data.get("data", [])
             if not raw_candles:
