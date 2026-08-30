@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Heikin Ashi High Win-Rate Strategy - 6 Months)
+# SETTINGS (Heikin Ashi + ADX High Win-Rate Strategy)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -70,8 +70,8 @@ def download_klines(symbol, timeframe, target_count):
                     op = float(row[1])
                     cl = float(row[2]) if len(row) > 2 else float(row[2])
                     hi = float(row[3]) if len(row) > 3 else float(row[3])
-                    lo = float(row[4]) if len(row) > 4 else float(row[4])
-                    vol = float(row[5]) if len(row) > 5 else float(row[5])
+                    lo = float(row.get("4", row[4])) if len(row) > 4 else float(row[4])
+                    vol = float(row.get("5", row[5])) if len(row) > 5 else float(row[5])
                 else:
                     continue
 
@@ -110,7 +110,7 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# HEIKIN ASHI CONVERSION
+# HEIKIN ASHI & INDICATORS (SMA, ADX)
 # ============================================================
 
 def convert_to_heikin_ashi(candles):
@@ -135,10 +135,6 @@ def convert_to_heikin_ashi(candles):
         })
     return ha_candles
 
-# ============================================================
-# TECHNICAL INDICATORS
-# ============================================================
-
 def calculate_sma(values, period):
     sma = []
     for i in range(len(values)):
@@ -148,8 +144,62 @@ def calculate_sma(values, period):
             sma.append(sum(values[i-period+1:i+1]) / period)
     return sma
 
+def calculate_adx(candles, period=14):
+    # محاسبه ساده ADX برای تشخیص قدرت روند
+    adx_values = [20.0] * len(candles)
+    tr_list = []
+    plus_dm_list = []
+    minus_dm_list = []
+
+    for i in range(len(candles)):
+        if i == 0:
+            tr_list.append(candles[i]["high"] - candles[i]["low"])
+            plus_dm_list.append(0.0)
+            minus_dm_list.append(0.0)
+            continue
+        
+        h = candles[i]["high"]
+        l = candles[i]["low"]
+        pc = candles[i-1]["close"]
+        ph = candles[i-1]["high"]
+        pl = candles[i-1]["low"]
+
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        tr_list.append(tr)
+
+        up_move = h - ph
+        down_move = pl - l
+
+        plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+
+        plus_dm_list.append(plus_dm)
+        minus_dm_list.append(minus_dm)
+
+    if len(candles) > period * 2:
+        for i in range(period, len(candles)):
+            tr_s = sum(tr_list[i-period+1:i+1])
+            p_dm_s = sum(plus_dm_list[i-period+1:i+1])
+            m_dm_s = sum(minus_dm_list[i-period+1:i+1])
+
+            if tr_s == 0:
+                continue
+            
+            p_di = (p_dm_s / tr_s) * 100
+            m_di = (m_dm_s / tr_s) * 100
+
+            sum_di = p_di + m_di
+            if sum_di == 0:
+                dx = 0
+            else:
+                dx = (abs(p_di - m_di) / sum_di) * 100
+            
+            adx_values[i] = dx
+
+    return adx_values
+
 # ============================================================
-# BACKTEST ENGINE (Heikin Ashi Filtered Strategy)
+# BACKTEST ENGINE (Heikin Ashi + ADX Filter)
 # ============================================================
 
 def run_backtest():
@@ -157,7 +207,7 @@ def run_backtest():
     
     print("تعداد کل کندل‌های دریافت شده: " + str(len(raw_candles)))
     
-    if len(raw_candles) < 150:
+    if len(raw_candles) < 200:
         print("تعداد کندل‌های دریافتی برای بک‌تست کافی نیست.")
         return
 
@@ -171,6 +221,7 @@ def run_backtest():
 
     closes = [c["close"] for c in candles]
     sma_200 = calculate_sma(closes, 200)
+    adx_list = calculate_adx(raw_candles, 14)
     
     capital = INITIAL_CAPITAL
     total_trades = 0
@@ -178,7 +229,7 @@ def run_backtest():
     losses = 0
     
     print("-" * 50)
-    print("شروع بک‌تست استراتژی هیکین آشی روی " + str(len(candles)) + " کندل...")
+    print("شروع بک‌تست هیکین آشی + فیلتر ADX روی " + str(len(candles)) + " کندل...")
     print("-" * 50)
 
     for i in range(200, len(candles) - 1):
@@ -192,13 +243,15 @@ def run_backtest():
         
         is_ha_green = close_p > open_p
         prev_ha_green = prev_c["close"] > prev_c["open"]
-        
         is_trend_flip = (not prev_ha_green) and is_ha_green
         
+        # فیلتر قدرت روند: ADX بالای ۲۲ یعنی روند بازار قوی است و بازیچه نوسانات الکی نیستیم
+        is_adx_strong = adx_list[i] > 22
+        
         avg_vol = sum(x["volume"] for x in candles[i-20:i]) / 20
-        is_volume_confirmed = c["volume"] > (avg_vol * 1.2)
+        is_volume_confirmed = c["volume"] > (avg_vol * 1.3)
 
-        if is_macro_uptrend and is_trend_flip and is_volume_confirmed:
+        if is_macro_uptrend and is_trend_flip and is_adx_strong and is_volume_confirmed:
             entry_price = close_p
             stop_loss = entry_price * 0.985   # ۱.۵ درصد حد ضرر
             take_profit = entry_price * 1.03  # ۳ درصد حد سود
@@ -224,7 +277,7 @@ def run_backtest():
                     capital -= risk_amount
 
     print("-" * 50)
-    print("نتایج نهایی بک‌تست هیکین آشی:")
+    print("نتایج نهایی بک‌تست با فیلتر ADX:")
     print("کل معاملات انجام شده: " + str(total_trades))
     print("معاملات موفق (Win): " + str(wins))
     print("معاملات ناموفق (Loss): " + str(losses))
