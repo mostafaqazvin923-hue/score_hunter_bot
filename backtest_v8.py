@@ -126,19 +126,15 @@ def calculate_ichimoku_series(candles):
     senkou_b = []
 
     for i in range(len(candles)):
-        # Tenkan-sen (9 periods)
         t = calculate_donchian(candles, 9, i)
         tenkan_sen.append(t)
         
-        # Kijun-sen (26 periods)
         k = calculate_donchian(candles, 26, i)
         kijun_sen.append(k)
         
-        # Senkou Span A (Shifted 26 ahead, calculated current here)
         sa = (t + k) / 2.0
         senkou_a.append(sa)
         
-        # Senkou Span B (52 periods)
         sb = calculate_donchian(candles, 52, i)
         senkou_b.append(sb)
 
@@ -218,6 +214,7 @@ def run_backtest():
             c = candles[i]
             prev_c = candles[i-1]
             close_p = c["close"]
+            open_p = c["open"]  # اصلاح نام متغیر
 
             if active_position is not None:
                 if c["low"] <= active_position["sl"]:
@@ -229,26 +226,21 @@ def run_backtest():
                 else:
                     continue
 
-            # شرایط ایچیموکو حرفه‌ای:
-            # 1. قیمت و خطوط بالای ابر کومو (Kumo) باشند (روند صعودی قوی)
             cloud_top = max(span_a[i], span_b[i])
             is_above_cloud = close_p > cloud_top
             
-            # 2. کراس صعودی تنکان‌سن از روی کیجون‌سن یا برخورد و پولبک به کیجون‌سن
             is_tenkan_cross = (tenkan[i-1] <= kijun[i-1]) and (tenkan[i] > kijun[i])
-            is_kijun_bounce = (prev_c["low"] <= kijun[i]) and (close_p > kijun[i]) and (close_p > open)
+            is_kijun_bounce = (prev_c["low"] <= kijun[i]) and (close_p > kijun[i]) and (close_p > open_p)
             
-            # 3. تاییدیه RSI در ناحیه صعودی سالم
             rsi = rsi_list[i]
             is_rsi_valid = 50 <= rsi <= 70
 
             if is_above_cloud and (is_tenkan_cross or is_kijun_bounce) and is_rsi_valid:
                 entry_price = close_p
                 
-                # تنظیم حد ضرر پشت کیجون‌سن یا زیر نوسان اخیر و حد سود دقیقاً ۲ برابر (R:R 1:2)
                 risk_distance = entry_price - kijun[i]
                 if risk_distance <= 0 or risk_distance / entry_price > 0.03:
-                    risk_distance = entry_price * 0.012  # حد ضرر ایمن پیش‌فرض ۱.۲٪
+                    risk_distance = entry_price * 0.012
                 
                 stop_loss = entry_price - risk_distance
                 take_profit = entry_price + (risk_distance * 2.0)
