@@ -5,14 +5,14 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Global Pro Momentum Strategy - 6 Months)
+# SETTINGS (Heikin Ashi High Win-Rate Strategy - 6 Months)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
 
 SYMBOL = "SOLUSDT"
 TIMEFRAME = "15min"
-TARGET_CANDLES = 17500  # ۶ ماه دیتای کامل
+TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
 
 INITIAL_CAPITAL = 1000.0
@@ -69,9 +69,9 @@ def download_klines(symbol, timeframe, target_count):
                     ts = int(float(row[0]))
                     op = float(row[1])
                     cl = float(row[2]) if len(row) > 2 else float(row[2])
-                    hi = float(row[3]) if len(row) > 3 else float(row[3])
-                    lo = float(row[4]) if len(row) > 4 else float(row[4])
-                    vol = float(row[5]) if len(row) > 5 else float(row[5])
+                    hi = float(row.get("3", row[3])) if len(row) > 3 else float(row[3])
+                    lo = float(row.get("4", row[4])) if len(row) > 4 else float(row[4])
+                    vol = float(row.get("5", row[5])) if len(row) > 5 else float(row[5])
                 else:
                     continue
 
@@ -110,85 +110,58 @@ def download_klines(symbol, timeframe, target_count):
     return candles
 
 # ============================================================
-# TECHNICAL INDICATORS (EMA, RSI, MACD, ATR)
+# HEIKIN ASHI CONVERSION
 # ============================================================
 
-def calculate_ema(closes, period):
-    ema = [closes[0]]
-    multiplier = 2 / (period + 1)
-    for price in closes[1:]:
-        ema.append((price - ema[-1]) * multiplier + ema[-1])
-    return ema
-
-def calculate_rsi(candles, period=14):
-    if len(candles) < period + 1:
-        return [50.0] * len(candles)
-    
-    rsi_values = [50.0] * len(candles)
-    gains = 0.0
-    losses = 0.0
-    
-    for i in range(1, period + 1):
-        change = candles[i]["close"] - candles[i - 1]["close"]
-        if change > 0:
-            gains += change
+def convert_to_heikin_ashi(candles):
+    ha_candles = []
+    for i, c in enumerate(candles):
+        ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4.0
+        if i == 0:
+            ha_open = (c["open"] + c["close"]) / 2.0
         else:
-            losses -= change
-            
-    avg_gain = gains / period
-    avg_loss = losses / period
-    
-    if avg_loss == 0:
-        rsi_values[period] = 100.0
-    else:
-        rs = avg_gain / avg_loss
-        rsi_values[period] = 100.0 - (100.0 / (1.0 + rs))
-
-    for i in range(period + 1, len(candles)):
-        change = candles[i]["close"] - candles[i - 1]["close"]
-        gain = change if change > 0 else 0.0
-        loss = -change if change < 0 else 0.0
+            ha_open = (ha_candles[i-1]["open"] + ha_candles[i-1]["close"]) / 2.0
         
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
+        ha_high = max(c["high"], ha_open, ha_close)
+        ha_low = min(c["low"], ha_open, ha_close)
         
-        if avg_loss == 0:
-            rsi_values[i] = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            rsi_values[i] = 100.0 - (100.0 / (1.0 + rs))
-            
-    return rsi_values
-
-def calculate_atr(candles, period=14):
-    atr_values = [0.0] * len(candles)
-    tr_list = [candles[0]["high"] - candles[0]["low"]]
-    
-    for i in range(1, len(candles)):
-        h_l = candles[i]["high"] - candles[i]["low"]
-        h_pc = abs(candles[i]["high"] - candles[i-1]["close"])
-        l_pc = abs(candles[i]["low"] - candles[i-1]["close"])
-        tr = max(h_l, h_pc, l_pc)
-        tr_list.append(tr)
-        
-    if len(tr_list) >= period:
-        atr_values[period-1] = sum(tr_list[:period]) / period
-        for i in range(period, len(candles)):
-            atr_values[i] = (atr_values[i-1] * (period - 1) + tr_list[i]) / period
-    return atr_values
+        ha_candles.append({
+            "timestamp": c["timestamp"],
+            "open": ha_open,
+            "high": ha_high,
+            "low": ha_low,
+            "close": ha_close,
+            "volume": c["volume"]
+        })
+    return ha_candles
 
 # ============================================================
-# BACKTEST ENGINE (Pro Multi-Indicator Strategy)
+# TECHNICAL INDICATORS
+# ============================================================
+
+def calculate_sma(values, period):
+    sma = []
+    for i in range(len(values)):
+        if i < period - 1:
+            sma.append(sum(values[:i+1]) / (i + 1))
+        else:
+            sma.append(sum(values[i-period+1:i+1]) / period)
+    return sma
+
+# ============================================================
+# BACKTEST ENGINE (Heikin Ashi Filtered Strategy)
 # ============================================================
 
 def run_backtest():
-    candles = download_klines(SYMBOL, TIMEFRAME, TARGET_CANDLES)
+    raw_candles = download_klines(SYMBOL, TIMEFRAME, TARGET_CANDLES)
     
-    print("تعداد کل کندل‌های دریافت شده: " + str(len(candles)))
+    print("تعداد کل کندل‌های دریافت شده: " + str(len(raw_candles)))
     
-    if len(candles) < 150:
+    if len(raw_candles) < 150:
         print("تعداد کندل‌های دریافتی برای بک‌تست کافی نیست.")
         return
+
+    candles = convert_to_heikin_ashi(raw_candles)
 
     first_time = datetime.fromtimestamp(candles[0]["timestamp"], tz=timezone.utc)
     last_time = datetime.fromtimestamp(candles[-1]["timestamp"], tz=timezone.utc)
@@ -197,58 +170,49 @@ def run_backtest():
     print(f"بازه زمانی دقیق داده‌ها: از {first_time.strftime('%Y-%m-%d %H:%M')} تا {last_time.strftime('%Y-%m-%d %H:%M')} (حدود {total_days:.1f} روز)")
 
     closes = [c["close"] for c in candles]
-    ema_20 = calculate_ema(closes, 20)
-    ema_50 = calculate_ema(closes, 50)
-    rsi_list = calculate_rsi(candles, 14)
-    atr_list = calculate_atr(candles, 14)
-
+    sma_200 = calculate_sma(closes, 200)
+    
     capital = INITIAL_CAPITAL
     total_trades = 0
     wins = 0
     losses = 0
     
     print("-" * 50)
-    print("شروع بک‌تست استراتژی جهانی (Pro Momentum) روی " + str(len(candles)) + " کندل...")
+    print("شروع بک‌تست استراتژی هیکین آشی روی " + str(len(candles)) + " کندل...")
     print("-" * 50)
 
-    for i in range(50, len(candles) - 1):
-        current_candle = candles[i]
-        close_price = current_candle["close"]
-        open_price = current_candle["open"]
+    for i in range(200, len(candles) - 1):
+        c = candles[i]
+        prev_c = candles[i-1]
         
-        e20 = ema_20[i]
-        e50 = ema_50[i]
-        prev_e20 = ema_20[i-1]
-        prev_e50 = ema_50[i-1]
+        close_p = c["close"]
+        open_p = c["open"]
         
-        rsi = rsi_list[i]
-        atr = atr_list[i]
+        # روند کلی بلندمدت صعودی (قیمت بالای SMA 200)
+        is_macro_uptrend = close_p > sma_200[i]
         
-        if atr <= 0:
-            continue
+        # تغییر روند هیکین آشی از نزولی/بدون روند به صعودی قوی
+        # کندل قبلی قرمز یا کوچک بوده، کندل فعلی سبز بلند بدون سایه پایینی (شانه‌ی صعودی قوی)
+        is_ha_green = close_p > open_p
+        prev_ha_green = prev_c["close"] > prev_c["open"]
+        
+        is_trend_flip = (not prev_ha_green) and is_ha_green
+        
+        # تاییدیه حجم معاملات بالاتر از میانگین ۲۰ دوره
+        avg_vol = sum(x["volume"] for x in candles[i-20:i]) / 20
+        is_volume_confirmed = c["volume"] > (avg_vol * 1.2)
 
-        # شرایط استراتژی پرو:
-        # ۱. روند صعودی: EMA 20 بالای EMA 50 باشد
-        is_trend_up = e20 > e50
-        # ۲. تقاطع یا تایید شتاب: EMA 20 به تازگی به سمت بالا تقاطع کرده یا در حال گسترش است
-        is_ema_crossing = (prev_e20 <= prev_e50) and (e20 > e50)
-        # ۳. RSI در محدوده قدرت صعودی (بین ۵۰ تا ۷۰)
-        is_rsi_strong = 50 <= rsi <= 70
-        # ۴. کندل صعودی قدرت‌مند
-        is_green = close_price > open_price
-
-        if is_trend_up and (is_ema_crossing or is_rsi_strong) and is_green:
-            entry_price = close_price
-            # استفاده از ATR برای تعیین حد ضرر و حد سود داینامیک و حرفه‌ای
-            stop_loss = entry_price - (1.5 * atr)
-            take_profit = entry_price + (2.5 * atr) # ریسک به ریوارد بالای ۱.۶
+        if is_macro_uptrend and is_trend_flip and is_volume_confirmed:
+            entry_price = close_p
+            stop_loss = entry_price * 0.985   لت ۱.۵ درصد حد ضرر علمی
+            take_profit = entry_price * 1.03  # حد سود ۳ درصد (ریسک به ریوارد ۱ به ۲)
             
             trade_result = None
-            for future_candle in candles[i+1:]:
-                if future_candle["low"] <= stop_loss:
+            for future_c in candles[i+1:]:
+                if future_c["low"] <= stop_loss:
                     trade_result = "LOSS"
                     break
-                elif future_candle["high"] >= take_profit:
+                elif future_c["high"] >= take_profit:
                     trade_result = "WIN"
                     break
             
@@ -258,13 +222,13 @@ def run_backtest():
 
                 if trade_result == "WIN":
                     wins += 1
-                    capital += risk_amount * 1.66
+                    capital += risk_amount * 2.0
                 elif trade_result == "LOSS":
                     losses += 1
                     capital -= risk_amount
 
     print("-" * 50)
-    print("نتایج نهایی بک‌تست حرفه‌ای:")
+    print("نتایج نهایی بک‌تست هیکین آشی:")
     print("کل معاملات انجام شده: " + str(total_trades))
     print("معاملات موفق (Win): " + str(wins))
     print("معاملات ناموفق (Loss): " + str(losses))
