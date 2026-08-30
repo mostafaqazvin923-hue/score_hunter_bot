@@ -1,48 +1,151 @@
-import requests
+import json
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 
-# --- تنظیمات صرافی LBank ---
+# ============================================================
+# SETTINGS
+# ============================================================
+
+BASE_URLS = [
+    "https://api.lbank.info",
+    "https://api.lbkex.com",
+    "https://www.lbkex.net",
+]
+
 SYMBOL = "sol_usdt"
-# اصلاح حیاتی: حداکثر سایز مجاز در ال‌بنک 100 است (بیشتر از آن خطای Illegal parameter می‌دهد)
-LBANK_API_URL = f"https://api.lbank.info/v2/kline.do?symbol={SYMBOL}&size=100&type=15min"
+TIMEFRAME = "minute15"
+TARGET_CANDLES = 500  # تعداد کندل برای بک‌تست
+PAGE_SIZE = 200        # اندازه هر صفحه درخواست
 
-def fetch_historical_candles():
-    """دریافت کندل‌های تاریخی از LBank با پارامترهای کاملاً استاندارد و مجاز"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    try:
-        response = requests.get(LBANK_API_URL, headers=headers, timeout=10)
-        print(f"وضعیت پاسخ صرافی LBank: {response.status_code}")
-        
-        data = response.json()
-        
-        if data.get("result") == "true" or data.get("result") is True or "data" in data:
-            raw_candles = data.get("data", [])
-            if not raw_candles:
-                print("داده‌ای داخل کلید data وجود ندارد.")
-                return []
-            
-            candles = []
-            for c in raw_candles:
-                candles.append({
-                    "time": c[0],
-                    "open": float(c[1]),
-                    "high": float(c[2]),
-                    "low": float(c[3]),
-                    "close": float(c[4]),
-                    "volume": float(c[5])
-                })
-            return candles
-        else:
-            print(f"خطا در نتیجه API ال‌بنک: {data}")
+# ============================================================
+# HTTP & DATA DOWNLOADER (الگوی دقیق اتصال به LBank)
+# ============================================================
+
+def http_get(url, params, timeout=20):
+    query = urllib.parse.urlencode(params)
+    full_url = url + "/v2/kline.do?" + query
+
+    request = urllib.request.Request(
+        full_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 SCORE-HUNTER-BACKTEST"
+        }
+    )
+
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8")
+
+    return json.loads(raw)
+
+def extract_data(payload):
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if data is None:
             return []
-    except Exception as e:
-        print(f"خطای ارتباطی یا پارس JSON: {e}")
-        return []
+        return data
+    if isinstance(payload, list):
+        return payload
+    return []
+
+def download_klines(symbol, timeframe, target_count):
+    all_rows = {}
+    end_time = int(time.time())
+    pages = 0
+    last_oldest = None
+
+    print(در حال دریافت تاریخچه کندل‌ها از LBank برای {symbol}...)
+
+    while len(all_rows) < target_count:
+        pages += 1
+        if pages > 50:
+            break
+
+        params = {
+            "symbol": symbol,
+            "size": PAGE_SIZE,
+            "type": timeframe,
+            "time": end_time,
+        }
+
+        payload = None
+        last_error = None
+
+        for base in BASE_URLS:
+            try:
+                payload = http_get(base, params)
+                break
+            except Exception as exc:
+                last_error = exc
+                continue
+
+        if payload is None:
+            print(f"خطا در ارتباط با سرورهای ال‌بنک: {last_error}")
+            break
+
+        rows = extract_data(payload)
+        if not rows:
+            break
+
+        added = 0
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 6:
+                continue
+
+            try:
+                ts = int(float(row[0]))
+                op = float(row[1])
+                hi = float(row[2])
+                lo = float(row[3])
+                cl = float(row[4])
+                vol = float(row[5])
+
+                if hi <= 0 or lo <= 0 or op <= 0 or cl <= 0:
+                    continue
+
+                all_rows[ts] = {
+                    "timestamp": ts,
+                    "open": op,
+                    "high": hi,
+                    "low": lo,
+                    "close": cl,
+                    "volume": vol,
+                }
+                added += 1
+            except Exception:
+                continue
+
+        if not all_rows:
+            break
+
+        oldest = min(all_rows.keys())
+        if last_oldest == oldest:
+            break
+        last_oldest = oldest
+        end_time = oldest - 1
+
+        if added == 0:
+            break
+
+        time.sleep(0.05)
+
+    candles = list(all_rows.values())
+    candles.sort(key=lambda x: x["timestamp"])
+
+    if len(candles) > target_count:
+        candles = candles[-target_count:]
+
+    return candles
+
+# ============================================================
+# BACKTEST ENGINE
+# ============================================================
 
 def run_backtest():
-    candles = fetch_historical_candles()
-    if len(candles) < 20:
+    candles = download_klines(SYMBOL, TIMEFRAME, TARGET_CANDLES)
+    
+    if len(candles) < 50:
         print("تعداد کندل‌های دریافتی برای بک‌تست کافی نیست.")
         return
 
@@ -50,30 +153,33 @@ def run_backtest():
     wins = 0
     losses = 0
     
-    print(f"شروع بک‌تست روی {len(candles)} کندلِ آخرِ {SYMBOL.upper()}...")
+    print("-" * 50)
+    print(f"شروع بک‌تست روی {len(candles)} کندلِ {SYMBOL.upper()}...")
     print("-" * 50)
 
-    # از کندل دهم به بعد شروع می‌کنیم تا میانگین حجم قابل محاسبه باشد
-    for i in range(10, len(candles) - 1):
+    # از کندل بیستم به بعد شروع می‌کنیم تا میانگین حجم قابل محاسبه باشد
+    for i in range(20, len(candles) - 1):
         prev_candle = candles[i - 1]
         current_candle = candles[i]
         
         close_price = current_candle["close"]
         volume = current_candle["volume"]
         
-        # میانگین حجم ۱۰ کندل قبل (با توجه به محدودیت ۱۰۰ کندلی LBank)
-        avg_volume = sum(c["volume"] for c in candles[i-10:i]) / 10
+        # میانگین حجم ۲۰ کندل قبل
+        avg_volume = sum(c["volume"] for c in candles[i-20:i]) / 20
 
+        # فیلترهای ورود (مومنتوم صعودی + تایید حجم)
         is_bullish_momentum = close_price > prev_candle["high"]
         is_volume_confirmed = volume > (avg_volume * 1.5)
 
         if is_bullish_momentum and is_volume_confirmed:
             entry_price = close_price
-            stop_loss = entry_price * 0.985
-            take_profit = entry_price * 1.03
+            stop_loss = entry_price * 0.985      # حد ضرر ۱.۵ درصد
+            take_profit = entry_price * 1.03     # حد سود ۳ درصد (ریسک به ریوارد ۱ به ۲)
             
             total_trades += 1
             
+            # بررسی نتیجه معامله در کندل‌های آینده
             trade_result = None
             for future_candle in candles[i+1:]:
                 if future_candle["low"] <= stop_loss:
@@ -88,7 +194,7 @@ def run_backtest():
             elif trade_result == "LOSS":
                 losses += 1
             else:
-                total_trades -= 1
+                total_trades -= 1  # اگر تا آخر بازه باز ماند فاکتور گرفته می‌شود
 
     print("-" * 50)
     print(f"📊 **نتایج نهایی بک‌تست:**")
