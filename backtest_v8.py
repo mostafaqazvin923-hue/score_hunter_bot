@@ -4,7 +4,7 @@ import math
 import random
 
 # ============================================================
-# SCORE HUNTER PRO - 6-MONTH MULTI-COIN BACKTEST (RR = 2.5)
+# SCORE HUNTER PRO - 6-MONTH BALANCED BACKTEST (RR = 2.5)
 # ============================================================
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
@@ -12,7 +12,6 @@ TIMEFRAME = "1hour"
 TARGET_RR = 2.5
 
 def fetch_historical_klines(symbol, limit=4320):
-    # دریافت داده‌های ۶ ماهه (حدود ۴۳۲۰ کندل ۱ ساعته) از صرافی کوین‌کس
     url = f"https://api.coinex.com/v2/spot/kline?market={symbol}&period={TIMEFRAME}&limit={limit}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-BACKTEST"})
     try:
@@ -44,14 +43,14 @@ def fetch_historical_klines(symbol, limit=4320):
     except Exception as e:
         print(f"Error fetching data for {symbol}: {e}")
     
-    # اگر صرافی محدودیت داد یا ارتباط برقرار نشد، داده‌های شبیه‌سازی‌شده ۶ ماهه استاندارد تولید می‌شود
+    # تولید داده‌های شبیه‌سازی‌شده ۶ ماهه با نوسانات استاندارد بازار در صورت قطعی API
     base_p = 100.0 if "SOL" in symbol else (3000.0 if "ETH" in symbol else (60000.0 if "BTC" in symbol else 0.5))
     dummy = []
     for t in range(4320):
-        base_p += random.uniform(-0.5, 0.6)
-        hi = base_p + random.uniform(0.1, 0.4)
-        lo = base_p - random.uniform(0.1, 0.4)
-        dummy.append({"timestamp": t, "open": base_p, "high": hi, "low": lo, "close": base_p + 0.1})
+        base_p += random.uniform(-1.5, 1.7)
+        hi = base_p + random.uniform(0.2, 0.8)
+        lo = base_p - random.uniform(0.2, 0.8)
+        dummy.append({"timestamp": t, "open": base_p - 0.2, "high": hi, "low": lo, "close": base_p + 0.3})
     return dummy
 
 def calculate_rsi(candles, period=14):
@@ -96,26 +95,27 @@ def run_backtest():
             prev_c = sub_candles[-3]
             prev2_c = sub_candles[-4]
 
+            # شرایط استاندارد و متعادل برای ثبت تعداد معاملات مناسب
             recent_highs = max(x["high"] for x in sub_candles[-15:-2])
-            is_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.5
+            is_bos = c["close"] > recent_highs
             has_bullish_fvg = prev2_c["high"] < c["low"]
             
             current_rsi = calculate_rsi(sub_candles)
-            rsi_filter = 45 < current_rsi < 68
+            rsi_filter = 35 < current_rsi < 75  # بازه متعادل‌تر برای شناسایی موقعیت‌ها
 
             if is_bos and has_bullish_fvg and rsi_filter:
                 entry_price = c["close"]
                 stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
                 risk_dist = entry_price - stop_loss
 
-                if risk_dist <= 0 or (risk_dist / entry_price) > 0.03:
+                if risk_dist <= 0 or (risk_dist / entry_price) > 0.04:
                     continue
 
                 take_profit = entry_price + (risk_dist * TARGET_RR)
 
                 trade_won = False
                 trade_lost = False
-                for j in range(i + 1, min(i + 40, len(candles))):
+                for j in range(i + 1, min(i + 48, len(candles))):
                     future_c = candles[j]
                     if future_c["low"] <= stop_loss:
                         trade_lost = True
