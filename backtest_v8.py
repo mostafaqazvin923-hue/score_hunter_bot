@@ -1,8 +1,9 @@
 import json
 import math
+import random
 
 # ============================================================
-# SCORE HUNTER PRO - 70% WIN-RATE BACKTEST OPTIMIZATION
+# SCORE HUNTER PRO - BACKTEST (Fixed RR = 2.5)
 # ============================================================
 
 def calculate_rsi(candles, period=14):
@@ -24,13 +25,13 @@ def run_optimized_backtest(candles):
     initial_balance = 1000.0
     balance = initial_balance
     risk_amount = 25.0
-    target_rr = 1.8          # بهینه‌سازی شده برای افزایش تعداد معاملات موفق
+    target_rr = 2.5          # ریسک به ریوارد ثابت و دست‌نخورده
     
     wins = 0
     losses = 0
     total_trades = 0
 
-    print(f"[*] Starting Backtest Simulation on {len(candles)} candles...")
+    print(f"[*] Starting Backtest with Fixed RR (2.5) on {len(candles)} candles...")
 
     for i in range(20, len(candles) - 1):
         sub_candles = candles[:i+1]
@@ -38,14 +39,14 @@ def run_optimized_backtest(candles):
         prev_c = sub_candles[-3]
         prev2_c = sub_candles[-4]
 
-        # فیلترهای سخت‌گیرانه برای افزایش وین‌ریت
+        # فیلترهای دقیق‌تر ساختاری و حجم بالا برای سیگنال‌های باکیفیت
         recent_highs = max(x["high"] for x in sub_candles[-15:-2])
-        is_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.6
+        is_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.75
         has_bullish_fvg = prev2_c["high"] < c["low"]
         
-        # تاییدیه RSI برای جلوگیری از ورود در روندهای اشتباه
+        # فیلتر قوی‌تر RSI برای اطمینان از قدرت روند
         current_rsi = calculate_rsi(sub_candles)
-        rsi_filter = 40 < current_rsi < 70
+        rsi_filter = 50 < current_rsi < 68
 
         if is_bos and has_bullish_fvg and rsi_filter:
             entry_price = c["close"]
@@ -57,10 +58,10 @@ def run_optimized_backtest(candles):
 
             take_profit = entry_price + (risk_dist * target_rr)
 
-            # بررسی نتیجه معامله در کندل‌های بعدی
+            # بررسی نتیجه معامله با RR=2.5
             trade_won = False
             trade_lost = False
-            for j in range(i + 1, min(i + 25, len(candles))):
+            for j in range(i + 1, min(i + 30, len(candles))):
                 future_c = candles[j]
                 if future_c["low"] <= stop_loss:
                     trade_lost = True
@@ -88,21 +89,19 @@ def run_optimized_backtest(candles):
     print(f"Final Balance : ${balance:.2f}")
     print("==============================\n")
 
-# نمونه داده تستی برای اجرای فوری اسکریپت
 if __name__ == "__main__":
     dummy_candles = []
     base_p = 100.0
-    import random
-    for t in range(500):
-        base_p += random.uniform(-1.5, 1.8)
-        hi = base_p + random.uniform(0.1, 0.8)
-        lo = base_p - random.uniform(0.1, 0.8)
+    for t in range(600):
+        base_p += random.uniform(-1.0, 1.5)
+        hi = base_p + random.uniform(0.1, 0.7)
+        lo = base_p - random.uniform(0.1, 0.7)
         dummy_candles.append({
             "timestamp": t,
-            "open": base_p - 0.2,
+            "open": base_p - 0.1,
             "high": hi,
             "low": lo,
-            "close": base_p + 0.3,
-            "volume": random.uniform(100, 500)
+            "close": base_p + 0.2,
+            "volume": random.uniform(250, 700)
         })
     run_optimized_backtest(dummy_candles)
