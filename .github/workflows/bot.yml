@@ -2,8 +2,8 @@ name: Score Hunter Bot Runner
 
 on:
   schedule:
-    - cron: '*/15 * * * *'  # اجرا در هر ۱۵ دقیقه به صورت خودکار
-  workflow_dispatch:        # دکمه اجرای دستی (Run workflow) در گیت‌هاب
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
 
 jobs:
   run-bot:
