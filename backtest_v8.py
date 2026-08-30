@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Multi-Asset Backtest: BTC, ETH, SOL, XRP, LINK, ADA)
+# SETTINGS (Unified Portfolio Backtest: BTC, ETH, SOL, XRP, LINK, ADA)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -158,91 +158,141 @@ def calculate_rsi(candles, period=14):
             
     return rsi_values
 
-# ============================================================
-# SINGLE SYMBOL BACKTEST FUNCTION
-# ============================================================
-
-def run_single_backtest(symbol):
-    print(f"\nدر حال پردازش و بک‌تست ارز: {symbol} ...")
-    candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
+def calculate_atr(candles, period=14):
+    atr_values = [0.0] * len(candles)
+    tr_list = [candles[0]["high"] - candles[0]["low"]]
     
-    if len(candles) < 100:
-        print(f"-> داده‌های کافی برای {symbol} دریافت نشد.")
-        return
+    for i in range(1, len(candles)):
+        h_l = candles[i]["high"] - candles[i]["low"]
+        h_pc = abs(candles[i]["high"] - candles[i-1]["close"])
+        l_pc = abs(candles[i]["low"] - candles[i-1]["close"])
+        tr = max(h_l, h_pc, l_pc)
+        tr_list.append(tr)
+        
+    if len(tr_list) >= period:
+        atr_values[period-1] = sum(tr_list[:period]) / period
+        for i in range(period, len(candles)):
+            atr_values[i] = (atr_values[i-1] * (period - 1) + tr_list[i]) / period
+    return atr_values
 
-    total_days = (candles[-1]["timestamp"] - candles[0]["timestamp"]) / 86400
+# ============================================================
+# MAIN PORTFOLIO BACKTEST
+# ============================================================
 
-    closes = [c["close"] for c in candles]
-    ema_20 = calculate_ema(closes, 20)
-    ema_50 = calculate_ema(closes, 50)
-    rsi_list = calculate_rsi(candles, 14)
+def run_portfolio_backtest():
+    all_trades = []
+    global_min_ts = float('inf')
+    global_max_ts = 0
+
+    print("در حال جمع‌آوری اطلاعات و استخراج سیگنال‌ها از کل سبد ارزی...")
+
+    for symbol in SYMBOLS:
+        candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
+        if len(candles) < 100:
+            continue
+
+        if candles[0]["timestamp"] < global_min_ts:
+            global_min_ts = candles[0]["timestamp"]
+        if candles[-1]["timestamp"] > global_max_ts:
+            global_max_ts = candles[-1]["timestamp"]
+
+        closes = [c["close"] for c in candles]
+        ema_20 = calculate_ema(closes, 20)
+        ema_50 = calculate_ema(closes, 50)
+        rsi_list = calculate_rsi(candles, 14)
+        atr_list = calculate_atr(candles, 14)
+
+        for i in range(50, len(candles) - 1):
+            c = candles[i]
+            prev_c = candles[i-1]
+            
+            close_p = c["close"]
+            open_p = c["open"]
+            high_p = c["high"]
+            low_p = c["low"]
+            atr = atr_list[i]
+            
+            if atr <= 0:
+                continue
+
+            # فیلترهای سخت‌گیرانه‌تر برای کاهش تعداد معاملات و افزایش دقت
+            is_uptrend = (ema_20[i] > ema_50[i]) and ((ema_20[i] - ema_50[i]) > (atr * 0.15))
+            is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
+            
+            rsi = rsi_list[i]
+            is_rsi_good = 48 <= rsi <= 60  # بازه دقیق‌تر و ایمن‌تر
+            
+            # فیلتر حجم و بدنه قوی کندل برای حذف سیگنال‌های فیک
+            avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
+            is_volume_ok = c["volume"] > (avg_vol * 1.15)
+            
+            candle_body = abs(close_p - open_p)
+            candle_range = high_p - low_p
+            is_decent_body = candle_range > 0 and (candle_body / candle_range) >= 0.4
+            is_green = close_p > open_p
+
+            if is_uptrend and is_pullback_recovery and is_rsi_good and is_volume_ok and is_decent_body and is_green:
+                entry_price = close_p
+                stop_loss = entry_price * 0.988
+                take_profit = entry_price * 1.018
+                
+                trade_result = None
+                exit_ts = c["timestamp"]
+                for future_c in candles[i+1:]:
+                    if future_c["low"] <= stop_loss:
+                        trade_result = "LOSS"
+                        exit_ts = future_c["timestamp"]
+                        break
+                    elif future_c["high"] >= take_profit:
+                        trade_result = "WIN"
+                        exit_ts = future_c["timestamp"]
+                        break
+                
+                if trade_result:
+                    all_trades.append({
+                        "entry_time": c["timestamp"],
+                        "exit_time": exit_ts,
+                        "symbol": symbol,
+                        "result": trade_result
+                    })
+
+    # مرتب‌سازی تمام معاملات به ترتیب زمان ورود (برای شبیه‌سازی واقعی حساب یکپارچه)
+    all_trades.sort(key=lambda x: x["entry_time"])
+
+    total_days = (global_max_ts - global_min_ts) / 86400
 
     capital = INITIAL_CAPITAL
-    total_trades = 0
+    total_trades = len(all_trades)
     wins = 0
     losses = 0
 
-    for i in range(50, len(candles) - 1):
-        c = candles[i]
-        prev_c = candles[i-1]
-        
-        close_p = c["close"]
-        open_p = c["open"]
-        high_p = c["high"]
-        low_p = c["low"]
-        
-        is_uptrend = ema_20[i] > ema_50[i]
-        is_pullback_recovery = (prev_c["low"] <= ema_20[i-1]) and (close_p > ema_20[i])
-        rsi = rsi_list[i]
-        is_rsi_good = 43 <= rsi <= 64
-        
-        candle_body = abs(close_p - open_p)
-        candle_range = high_p - low_p
-        is_decent_body = candle_range > 0 and (candle_body / candle_range) >= 0.35
-        is_green = close_p > open_p
+    for trade in all_trades:
+        risk_amount = capital * RISK_PERCENT
+        if trade["result"] == "WIN":
+            wins += 1
+            capital += risk_amount * 1.3
+        else:
+            losses += 1
+            capital -= risk_amount
 
-        if is_uptrend and is_pullback_recovery and is_rsi_good and is_decent_body and is_green:
-            entry_price = close_p
-            stop_loss = entry_price * 0.988
-            take_profit = entry_price * 1.016
-            
-            trade_result = None
-            for future_c in candles[i+1:]:
-                if future_c["low"] <= stop_loss:
-                    trade_result = "LOSS"
-                    break
-                elif future_c["high"] >= take_profit:
-                    trade_result = "WIN"
-                    break
-            
-            if trade_result:
-                total_trades += 1
-                risk_amount = capital * RISK_PERCENT
-
-                if trade_result == "WIN":
-                    wins += 1
-                    capital += risk_amount * 1.25
-                elif trade_result == "LOSS":
-                    losses += 1
-                    capital -= risk_amount
-
-    print(f"--- نتیجه برای {symbol} ---")
-    print(f"تعداد معاملات: {total_trades} | برد: {wins} | باخت: {losses}")
+    print("\n" + "=" * 50)
+    print("نتایج نهایی سبد ارزی (به صورت حساب یکپارچه):")
+    print("=" * 50)
+    print(f"کل معاملات سبد: {total_trades}")
+    print(f"معاملات موفق (Win): {wins}")
+    print(f"معاملات ناموفق (Loss): {losses}")
     
     if total_trades > 0:
         win_rate = (wins / total_trades) * 100
         net_profit = capital - INITIAL_CAPITAL
         profit_percentage = (net_profit / INITIAL_CAPITAL) * 100
-        print(f"وین‌ریت: {win_rate:.2f}% | سرمایه نهایی: {capital:.2f}$ | سود خالص: {net_profit:+.2f}$ ({profit_percentage:+.2f}%)")
-        print(f"میانگین معامله در روز: {total_trades / max(total_days, 0.1):.2f}")
+        
+        print(f"وین‌ریت کل سبد: {win_rate:.2f}%")
+        print(f"سرمایه نهایی سبد: {capital:.2f}$")
+        print(f"سود/زیان خالص کل: {net_profit:+.2f}$ ({profit_percentage:+.2f}%)")
+        print(f"میانگین کل معاملات در روز (کل سبد): {total_trades / max(total_days, 0.1):.2f}")
     else:
         print("هیچ معامله‌ای انجام نشد.")
 
 if __name__ == "__main__":
-    print("شروع بک‌تست روی کل سبد ارزها...")
-    for sym in SYMBOLS:
-        try:
-            run_single_backtest(sym)
-        except Exception as e:
-            print(f"خطا در پردازش {sym}: {e}")
-    print("\nپایان بررسی تمام ارزها.")
+    run_portfolio_backtest()
