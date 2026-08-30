@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ============================================================
-# SETTINGS (Guaranteed High Win-Rate 65%+ Setup)
+# SETTINGS (True 1:2 Risk-to-Reward Ratio Setup)
 # ============================================================
 
 BASE_URL = "https://api.coinex.com/v2"
@@ -16,7 +16,7 @@ TARGET_CANDLES = 17500
 PAGE_LIMIT = 1000
 
 INITIAL_CAPITAL = 1000.0
-FIXED_RISK_AMOUNT = 100.0  # ریسک ثابت ۱۰۰ دلار برای هر معامله
+FIXED_RISK_AMOUNT = 100.0  # ریسک ثابت ۱۰۰ دلار به ازای هر معامله
 
 # ============================================================
 # HTTP & PAGINATION DATA DOWNLOADER
@@ -176,7 +176,7 @@ def calculate_atr(candles, period=14):
     return atr_values
 
 # ============================================================
-# MAIN PORTFOLIO BACKTEST (High Win-Rate Optimized)
+# MAIN PORTFOLIO BACKTEST (1:2 Risk-to-Reward Strategy)
 # ============================================================
 
 def run_portfolio_backtest():
@@ -184,7 +184,7 @@ def run_portfolio_backtest():
     global_min_ts = float('inf')
     global_max_ts = 0
 
-    print("در حال اجرای اسکریپت با فیلترهای استاندارد طلایی برای دستیابی به وین‌ریت ۶۵٪ به بالا...")
+    print("در حال اجرای اسکریپت با ریسک به ریوارد طلایی ۱ به ۲...")
 
     for symbol in SYMBOLS:
         candles = download_klines(symbol, TIMEFRAME, TARGET_CANDLES)
@@ -214,23 +214,23 @@ def run_portfolio_backtest():
             if atr <= 0:
                 continue
 
-            # فیلترهای قدرتمند روند صعودی پایدار و پولبک امن روی EMA 9
+            # فیلترهای استاندارد روند صعودی و پولبک امن
             is_uptrend = (ema_9[i] > ema_21[i]) and (ema_21[i] > ema_50[i])
             is_pullback = (c["low"] <= ema_9[i]) and (close_p > ema_9[i])
             
             rsi = rsi_list[i]
-            is_rsi_healthy = 50 <= rsi <= 68  # مومنتوم کاملاً صعودی بدون اشباع خرید خطرناک
+            is_rsi_healthy = 50 <= rsi <= 68
             
             avg_vol = sum(x["volume"] for x in candles[i-10:i]) / 10
-            is_volume_ok = c["volume"] > (avg_vol * 1.15)
+            is_volume_ok = c["volume"] > (avg_vol * 1.1)
             
             is_green = close_p > open_p
 
             if is_uptrend and is_pullback and is_rsi_healthy and is_volume_ok and is_green:
                 entry_price = close_p
-                # تنظیم نسبت ریسک به ریوارد هوشمند (TP کمی فشرده‌تر برای ثبت پیروزی قطعی‌تر)
-                stop_loss = entry_price - (1.1 * atr)
-                take_profit = entry_price + (1.35 * atr)
+                # اعمال دقیق ریسک به ریوارد ۱ به ۲
+                stop_loss = entry_price - (1.0 * atr)
+                take_profit = entry_price + (2.0 * atr)  # ریوارد دقیقا دو برابر ریسک
                 
                 trade_result = None
                 exit_ts = c["timestamp"]
@@ -264,13 +264,13 @@ def run_portfolio_backtest():
         risk_amount = FIXED_RISK_AMOUNT
         if trade["result"] == "WIN":
             wins += 1
-            capital += risk_amount * 1.225  # ریوارد متناسب با ضریب تنظیم شده
+            capital += risk_amount * 2.0  # سود دقیقاً ۲ برابر ریسک (ریسک به ریوارد 1:2)
         else:
             losses += 1
             capital -= risk_amount
 
     print("\n" + "=" * 50)
-    print("نتایج نهایی سبد (بهینه‌سازی قطعی وین‌ریت بالا - سرمایه ۱۰۰۰$ و ریسک ۱۰۰$):")
+    print("نتایج نهایی سبد (ریسک به ریوارد ۱ به ۲ - سرمایه ۱۰۰۰$ و ریسک ۱۰۰$):")
     print("=" * 50)
     print(f"کل معاملات سبد: {total_trades}")
     print(f"معاملات موفق (Win): {wins}")
