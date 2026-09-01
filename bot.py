@@ -4,6 +4,7 @@ import urllib.parse
 import os
 import math
 
+# تنظیمات کاملاً منطبق با کد بک‌تست
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8937303392:AAGXDckoHV61vY6G0B4VFcHMi90YbhY-jiY")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "2090120004")
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
@@ -26,8 +27,8 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
-def fetch_klines(symbol):
-    url = f"https://api.coinex.com/v2/spot/kline?market={symbol}&period={TIMEFRAME}&limit=50"
+def fetch_klines(symbol, limit=100):
+    url = f"https://api.coinex.com/v2/spot/kline?market={symbol}&period={TIMEFRAME}&limit={limit}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-BOT"})
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
@@ -53,7 +54,8 @@ def fetch_klines(symbol):
                         continue
                     candles.append({"timestamp": ts, "open": op, "high": hi, "low": lo, "close": cl})
                 candles.sort(key=lambda x: x["timestamp"])
-                return candles
+                if len(candles) > 0:
+                    return candles
     except Exception as e:
         print(f"Error fetching data for {symbol}: {e}")
     return []
@@ -91,52 +93,50 @@ def main():
     active_trades = state.get("active_trades", {})
     last_timestamps = state.get("last_timestamps", {})
 
-    print("[*] Running Score Hunter Pro 15-min check...")
-    
-    # ارسال پیام تست برای اطمینان از کارکرد تلگرام
-    send_telegram("🤖 **ربات اسکور هانتر با موفقیت اجرا شد و بازار را پایش می‌کند.**")
+    print("[*] Running Score Hunter Pro live check...")
 
     for symbol in SYMBOLS:
-        candles = fetch_klines(symbol)
-        if len(candles) < 20:
+        candles = fetch_klines(symbol, limit=100)
+        if len(candles) < 25:
             continue
 
         current_candle = candles[-1]
-        c = candles[-2]
-        prev_c = candles[-3]
-        prev2_c = candles[-4]
+        sub_candles = candles
+        c = sub_candles[-2]
+        prev_c = sub_candles[-3]
+        prev2_c = sub_candles[-4]
 
-        # ۱. بررسی پوزیشن فعال برای این ارز
+        # ۱. بررسی پوزیشن‌های فعال برای اعلام نتیجه (تاچ شدن TP یا SL)
         if symbol in active_trades:
             trade = active_trades[symbol]
             if current_candle["low"] <= trade["stop_loss"]:
                 msg = (
-                    f"❌ **حد ضرر معامله لمس شد (SL Hit)**\n\n"
+                    f"❌ **نتیجه معامله: حد ضرر لمس شد (SL Hit)**\n\n"
                     f"🪙 ارز: `{symbol}`\n"
                     f"📍 نقطه ورود: `{trade['entry_price']:.4f}`\n"
                     f"🛑 قیمت حد ضرر: `{trade['stop_loss']:.4f}`\n"
-                    f"📉 زیان: `-{trade['sl_pct']:.2f}%`"
+                    f"📉 درصد ضرر: `-{trade['sl_pct']:.2f}%`"
                 )
                 send_telegram(msg)
                 del active_trades[symbol]
             elif current_candle["high"] >= trade["take_profit"]:
                 msg = (
-                    f"✅ **حد سود معامله لمس شد (TP Hit - WON!)**\n\n"
+                    f"✅ **نتیجه معامله: حد سود لمس شد (TP Hit - WON!)**\n\n"
                     f"🪙 ارز: `{symbol}`\n"
                     f"📍 نقطه ورود: `{trade['entry_price']:.4f}`\n"
                     f"🎯 قیمت حد سود: `{trade['take_profit']:.4f}`\n"
-                    f"📈 سود خالص: `+{trade['tp_pct']:.2f}%`"
+                    f"📈 درصد سود: `+{trade['tp_pct']:.2f}%`"
                 )
                 send_telegram(msg)
                 del active_trades[symbol]
 
-        # ۲. جستجوی سیگنال جدید
+        # ۲. جستجوی سیگنال جدید و درج درصد سود و ضرر در پیام
         if symbol not in active_trades and c["timestamp"] != last_timestamps.get(symbol, 0):
-            recent_highs = max(x["high"] for x in candles[-15:-2])
+            recent_highs = max(x["high"] for x in sub_candles[-15:-2])
             is_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.4
             has_bullish_fvg = prev2_c["high"] < c["low"]
             
-            current_rsi = calculate_rsi(candles)
+            current_rsi = calculate_rsi(sub_candles)
             rsi_filter = 40 < current_rsi < 70
 
             if is_bos and has_bullish_fvg and rsi_filter:
@@ -148,6 +148,8 @@ def main():
                     continue
 
                 take_profit = entry_price + (risk_dist * TARGET_RR)
+                
+                # محاسبه دقیق درصدها برای نمایش در سیگنال
                 tp_percentage = ((take_profit - entry_price) / entry_price) * 100
                 sl_percentage = ((entry_price - stop_loss) / entry_price) * 100
 
@@ -160,11 +162,11 @@ def main():
                 }
 
                 msg = (
-                    f"🟢 **سیگنال جدید لانگ (Long)**\n\n"
+                    f"🟢 **سیگنال جدید لانگ (Score Hunter Pro)**\n\n"
                     f"🪙 ارز: `{symbol}`\n"
                     f"📍 نقطه ورود: `{entry_price:.4f}`\n\n"
-                    f"🎯 **TP:** `{take_profit:.4f}` (سود: `+`{tp_percentage:.2f}%)\n"
-                    f"🛑 **SL:** `{stop_loss:.4f}` (ضرر: `-`{sl_percentage:.2f}%)\n"
+                    f"🎯 **TP:** `{take_profit:.4f}` (سود: `+{tp_percentage:.2f}%`)\n"
+                    f"🛑 **SL:** `{stop_loss:.4f}` (ضرر: `-{sl_percentage:.2f}%`)\n"
                     f"⚖️ ریسک به ریوارد: `1:2`\n"
                     f"📊 RSI: `{current_rsi:.1f}`"
                 )
