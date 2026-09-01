@@ -29,7 +29,7 @@ def fetch_historical_klines(symbol, limit=8800):
                         op = float(row[1])
                         cl = float(row[2])
                         hi = float(row[3])
-                        lo = float(row.get("4", row[4]))
+                        lo = float(row[4])
                     else:
                         continue
                     candles.append({"timestamp": ts, "open": op, "high": hi, "low": lo, "close": cl})
@@ -75,7 +75,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - 1 YEAR DUAL BACKTEST (V10)")
+    print("   SCORE HUNTER PRO - 1 YEAR DUAL BACKTEST (V11)")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -139,13 +139,13 @@ def run_backtest():
                 elif trade_lost:
                     losses += 1
                     balance -= risk_amount
-                continue  # عبور از این کندل برای جلوگیری از تداخل
+                continue
 
-            # --- شرایط پوزیشن شورت (اصلاح‌شده و مستقل برای تضمین اجرا) ---
+            # --- شرایط پوزیشن شورت (اصلاح‌شده و منعطف برای بازار واقعی) ---
             recent_lows = min(x["low"] for x in sub_candles[-15:-2])
-            # شرط شورت ساده‌تر و کاربردی‌تر برای صرافی
-            is_bearish_bos = c["close"] < prev_c["low"] and c["close"] < c["open"]
-            has_bearish_fvg = prev2_c["low"] > c["high"]
+            is_bearish_bos = c["close"] < recent_lows or c["close"] < prev_c["low"]
+            # اصلاح FVG شورت برای همخوانی با روندهای اصلاحی بازار
+            has_bearish_fvg = prev2_c["open"] > c["close"]
 
             if is_bearish_bos and has_bearish_fvg and (current_rsi < 65):
                 entry_price = c["close"]
