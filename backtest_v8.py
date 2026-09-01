@@ -1,45 +1,62 @@
 import json
 import urllib.request
-import math
+import urllib.parse
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
-TIMEFRAME = "1hour"
+SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
+TIMEFRAME = "1h"
 TARGET_RR = 2.0
 
-def fetch_real_klines(symbol, limit=8800):
-    url = f"https://api.coinex.com/v2/spot/kline?market={symbol}&period={TIMEFRAME}&limit={limit}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-BACKTEST"})
+def fetch_real_klines_yahoo(symbol, limit=8800):
+    # استفاده از یاهو فایننس برای دریافت داده‌های واقعی تاریخی ۱ ساعته بدون تحریم و خطای صرافی
+    # هر کندل ۱ ساعته تقریباً معادل است با بازه زمانی مشخص
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
+    
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
-        with urllib.request.urlopen(req, timeout=25) as response:
+        with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
-            if isinstance(payload, dict) and payload.get("code") == 0:
-                rows = payload.get("data", [])
-                candles = []
-                for row in rows:
-                    if isinstance(row, dict):
-                        ts = int(float(row.get("created_at", row.get("time", 0))))
-                        op = float(row.get("open", 0))
-                        hi = float(row.get("high", 0))
-                        lo = float(row.get("low", 0))
-                        cl = float(row.get("close", 0))
-                    elif isinstance(row, list) and len(row) >= 6:
-                        ts = int(float(row[0]))
-                        op = float(row[1])
-                        cl = float(row[2])
-                        hi = float(row[3])
-                        lo = float(row[4])
-                    else:
-                        continue
-                    candles.append({"timestamp": ts, "open": op, "high": hi, "low": lo, "close": cl})
-                candles.sort(key=lambda x: x["timestamp"])
-                if len(candles) > 100:
-                    print(f"[*] Successfully fetched {len(candles)} real candles for {symbol}")
-                    return candles
+            result = payload.get("chart", {}).get("result", [])
+            if not result:
+                raise ValueError("Empty result from Yahoo Finance")
+            
+            data = result[0]
+            timestamps = data.get("timestamp", [])
+            quotes = data.get("indicators", {}).get("quote", [{}])[0]
+            
+            opens = quotes.get("open", [])
+            highs = quotes.get("high", [])
+            lows = quotes.get("low", [])
+            closes = quotes.get("close", [])
+            
+            candles = []
+            for idx in range(len(timestamps)):
+                op = opens[idx]
+                hi = highs[idx]
+                lo = lows[idx]
+                cl = closes[idx]
+                ts = timestamps[idx]
+                
+                # حذف داده‌های نامعتبر (None)
+                if op is None or hi is None or lo is None or cl is None:
+                    continue
+                
+                candles.append({
+                    "timestamp": int(ts),
+                    "open": float(op),
+                    "high": float(hi),
+                    "low": float(lo),
+                    "close": float(cl)
+                })
+            
+            candles.sort(key=lambda x: x["timestamp"])
+            if len(candles) > 100:
+                print(f"[*] Successfully fetched {len(candles)} real candles for {symbol}")
+                return candles[-limit:]
     except Exception as e:
-        print(f"[!] Error fetching real data for {symbol}: {e}")
+        print(f"[!] Error fetching data for {symbol}: {e}")
     
-    raise ValueError(f"[!] Could not fetch real data for {symbol}. Aborting to prevent fake/biased testing.")
+    raise ValueError(f"[!] Could not fetch real historical data for {symbol}.")
 
 def calculate_rsi(candles, period=14):
     if len(candles) < period + 1:
@@ -73,12 +90,12 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - STRICT REAL-DATA BACKTEST   ")
+    print("   SCORE HUNTER PRO - REAL DATA YAHOO BACKTEST    ")
     print("==================================================")
 
     for symbol in SYMBOLS:
         try:
-            candles = fetch_real_klines(symbol, limit=8800)
+            candles = fetch_real_klines_yahoo(symbol, limit=8800)
         except Exception as err:
             print(err)
             continue
@@ -103,7 +120,7 @@ def run_backtest():
             trend_sma = calculate_sma(sub_candles, period=50)
             trade_taken = False
 
-            # --- ۱. بررسی شورت (فقط در روند نزولی واقعی با تاییدیه مومنتوم) ---
+            # --- شورت واقعی ---
             is_down_trend = c["close"] < trend_sma
             is_short_momentum = (c["close"] < c["open"]) and ((c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.4)
 
@@ -120,7 +137,6 @@ def run_backtest():
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
-                        # بررسی محافظه‌کارانه: اگر هم‌زمان به استاپ و تیک‌پرفت برسد، استاپ اولویت دارد
                         hit_sl = future_c["high"] >= stop_loss
                         hit_tp = future_c["low"] <= take_profit
 
@@ -153,7 +169,7 @@ def run_backtest():
                         losses += 1
                         balance -= risk_amount
 
-            # --- ۲. بررسی لانگ (فقط در روند صعودی واقعی با تاییدیه مومنتوم) ---
+            # --- لانگ واقعی ---
             if not trade_taken:
                 is_up_trend = c["close"] > trend_sma
                 is_long_momentum = (c["close"] > c["open"]) and ((c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.4)
