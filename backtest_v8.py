@@ -75,7 +75,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - GUARANTEED DUAL BACKTEST (V23)")
+    print("   SCORE HUNTER PRO - SYMMETRIC DUAL BACKTEST (V24)")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -96,14 +96,14 @@ def run_backtest():
 
             current_rsi = calculate_rsi(sub_candles)
 
-            # بررسی مستقل شورت
-            is_bearish = c["close"] < c["open"] and current_rsi < 60
-            if is_bearish:
+            # بررسی شورت (اگر کندل قرمز و RSI زیر ۵۰ باشد)
+            is_short_trigger = c["close"] < c["open"] and current_rsi < 50
+            if is_short_trigger:
                 entry_price = c["close"]
                 stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
                 risk_dist = stop_loss - entry_price
 
-                if risk_dist > 0 and (risk_dist / entry_price) <= 0.10:
+                if risk_dist > 0 and (risk_dist / entry_price) <= 0.08:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
 
                     trade_won = False
@@ -134,18 +134,16 @@ def run_backtest():
                     elif trade_lost:
                         losses += 1
                         balance -= risk_amount
-                    continue # اگر شورت شد، رد شو تا تداخل نکند
+                    continue
 
-            # بررسی مستقل لانگ
-            recent_highs = max(x["high"] for x in sub_candles[-8:-2])
-            is_bullish = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.3
-
-            if is_bullish and (35 < current_rsi < 75):
+            # بررسی لانگ (اگر کندل سبز و RSI بالای ۵۰ باشد)
+            is_long_trigger = c["close"] > c["open"] and current_rsi > 50
+            if is_long_trigger:
                 entry_price = c["close"]
                 stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
                 risk_dist = entry_price - stop_loss
 
-                if risk_dist > 0 and (risk_dist / entry_price) <= 0.04:
+                if risk_dist > 0 and (risk_dist / entry_price) <= 0.08:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
 
                     trade_won = False
