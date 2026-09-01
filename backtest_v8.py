@@ -39,13 +39,16 @@ def fetch_historical_klines(symbol, limit=8800):
     except Exception as e:
         print(f"Error fetching data for {symbol}: {e}")
     
+    # تولید داده‌های فیک متوازن (جهت تست آفلاین دوطرفه)
     base_p = 100.0 if "SOL" in symbol else (3000.0 if "ETH" in symbol else (60000.0 if "BTC" in symbol else 0.5))
     dummy = []
     for t in range(8800):
-        base_p += random.uniform(-1.0, 1.2)
-        hi = base_p + random.uniform(0.1, 0.5)
-        lo = base_p - random.uniform(0.1, 0.5)
-        dummy.append({"timestamp": t, "open": base_p - 0.1, "high": hi, "low": lo, "close": base_p + 0.1})
+        base_p += random.uniform(-1.5, 1.5)
+        op = base_p
+        cl = base_p + random.uniform(-1.2, 1.2)
+        hi = max(op, cl) + random.uniform(0.1, 0.6)
+        lo = min(op, cl) - random.uniform(0.1, 0.6)
+        dummy.append({"timestamp": t, "open": op, "high": hi, "low": lo, "close": cl})
     return dummy
 
 def calculate_rsi(candles, period=14):
@@ -75,7 +78,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - SYMMETRIC DUAL BACKTEST (V24)")
+    print("   SCORE HUNTER PRO - CLEAN BALANCED BACKTEST")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -87,28 +90,34 @@ def run_backtest():
         symbol_trades = 0
         symbol_longs = 0
         symbol_shorts = 0
+        
+        skip_until = 0
 
         for i in range(20, len(candles) - 1):
+            if i < skip_until:
+                continue
+
             sub_candles = candles[:i+1]
             c = sub_candles[-2]
             prev_c = sub_candles[-3]
             prev2_c = sub_candles[-4]
 
             current_rsi = calculate_rsi(sub_candles)
+            trade_taken = False
 
-            # بررسی شورت (اگر کندل قرمز و RSI زیر ۵۰ باشد)
-            is_short_trigger = c["close"] < c["open"] and current_rsi < 50
+            # --- ۱. بررسی شورت ---
+            is_short_trigger = (c["close"] < c["open"]) and (current_rsi < 48)
             if is_short_trigger:
                 entry_price = c["close"]
                 stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
                 risk_dist = stop_loss - entry_price
 
-                if risk_dist > 0 and (risk_dist / entry_price) <= 0.08:
+                if risk_dist > 0 and (risk_dist / entry_price) <= 0.05:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
 
                     trade_won = False
                     trade_lost = False
-                    end_idx = min(i + 30, len(candles) - 1)
+                    end_idx = min(i + 24, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -128,52 +137,57 @@ def run_backtest():
                     symbol_trades += 1
                     symbol_shorts += 1
                     grand_total_shorts += 1
+                    skip_until = end_idx
+                    trade_taken = True
+
                     if trade_won:
                         wins += 1
                         balance += (risk_amount * TARGET_RR)
                     elif trade_lost:
                         losses += 1
                         balance -= risk_amount
-                    continue
 
-            # بررسی لانگ (اگر کندل سبز و RSI بالای ۵۰ باشد)
-            is_long_trigger = c["close"] > c["open"] and current_rsi > 50
-            if is_long_trigger:
-                entry_price = c["close"]
-                stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
-                risk_dist = entry_price - stop_loss
+            # --- ۲. بررسی لانگ (اگر شورت باز نشد) ---
+            if not trade_taken:
+                is_long_trigger = (c["close"] > c["open"]) and (current_rsi > 52)
+                if is_long_trigger:
+                    entry_price = c["close"]
+                    stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
+                    risk_dist = entry_price - stop_loss
 
-                if risk_dist > 0 and (risk_dist / entry_price) <= 0.08:
-                    take_profit = entry_price + (risk_dist * TARGET_RR)
+                    if risk_dist > 0 and (risk_dist / entry_price) <= 0.05:
+                        take_profit = entry_price + (risk_dist * TARGET_RR)
 
-                    trade_won = False
-                    trade_lost = False
-                    end_idx = min(i + 30, len(candles) - 1)
-                    
-                    for j in range(i + 1, end_idx + 1):
-                        future_c = candles[j]
-                        if future_c["low"] <= stop_loss:
-                            trade_lost = True
-                            break
-                        if future_c["high"] >= take_profit:
-                            trade_won = True
-                            break
-                    
-                    if not trade_won and not trade_lost:
-                        if candles[end_idx]["close"] > entry_price:
-                            trade_won = True
-                        else:
-                            trade_lost = True
+                        trade_won = False
+                        trade_lost = False
+                        end_idx = min(i + 24, len(candles) - 1)
+                        
+                        for j in range(i + 1, end_idx + 1):
+                            future_c = candles[j]
+                            if future_c["low"] <= stop_loss:
+                                trade_lost = True
+                                break
+                            if future_c["high"] >= take_profit:
+                                trade_won = True
+                                break
+                        
+                        if not trade_won and not trade_lost:
+                            if candles[end_idx]["close"] > entry_price:
+                                trade_won = True
+                            else:
+                                trade_lost = True
 
-                    symbol_trades += 1
-                    symbol_longs += 1
-                    grand_total_longs += 1
-                    if trade_won:
-                        wins += 1
-                        balance += (risk_amount * TARGET_RR)
-                    elif trade_lost:
-                        losses += 1
-                        balance -= risk_amount
+                        symbol_trades += 1
+                        symbol_longs += 1
+                        grand_total_longs += 1
+                        skip_until = end_idx
+
+                        if trade_won:
+                            wins += 1
+                            balance += (risk_amount * TARGET_RR)
+                        elif trade_lost:
+                            losses += 1
+                            balance -= risk_amount
 
         total_wins += wins
         total_losses += losses
