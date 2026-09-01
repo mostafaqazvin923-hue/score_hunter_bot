@@ -75,7 +75,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - FORCED DUAL BACKTEST (V21)")
+    print("   SCORE HUNTER PRO - UNLOCKED DUAL BACKTEST (V22)")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -88,7 +88,6 @@ def run_backtest():
         symbol_longs = 0
         symbol_shorts = 0
 
-        # برای اینکه شورت و لانگ کاملاً متوازن و مستقل چک شوند، ایندکس زوج و فرد می‌کنیم
         for i in range(20, len(candles) - 1):
             sub_candles = candles[:i+1]
             c = sub_candles[-2]
@@ -97,16 +96,16 @@ def run_backtest():
 
             current_rsi = calculate_rsi(sub_candles)
 
-            # اگر ایندکس زوج بود حتماً شورت را تست کن، اگر فرد بود لانگ را!
+            # زوج: شورت | فرد: لانگ
             if i % 2 == 0:
-                # --- بررسی پوزیشن شورت (آزاد و بدون محدودیت سخت‌گیرانه) ---
-                is_bearish = c["close"] < c["open"] and current_rsi < 60
+                is_bearish = c["close"] < c["open"] and current_rsi < 65
                 if is_bearish:
                     entry_price = c["close"]
                     stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
                     risk_dist = stop_loss - entry_price
 
-                    if risk_dist > 0 and (risk_dist / entry_price) <= 0.04:
+                    # اصلاح محدوده ریسک شورت تا ۱۰ درصد برای جلوگیری از بلاک شدن
+                    if risk_dist > 0 and (risk_dist / entry_price) <= 0.10:
                         take_profit = entry_price - (risk_dist * TARGET_RR)
 
                         trade_won = False
@@ -138,7 +137,6 @@ def run_backtest():
                             losses += 1
                             balance -= risk_amount
             else:
-                # --- بررسی پوزیشن لانگ ---
                 recent_highs = max(x["high"] for x in sub_candles[-8:-2])
                 is_bullish_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.3
 
