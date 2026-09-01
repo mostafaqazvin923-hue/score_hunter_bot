@@ -4,8 +4,8 @@ import urllib.parse
 import os
 import math
 
-TOKEN = os.environ.get("TELE_BOT_TOKEN", "8937303392:AAGXDckoHV61vY6G0B4VFcHMi90YbhY-jiY")
-CHAT_ID = os.environ.get("TELE_CHAT_ID", "2090120004")
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8937303392:AAGXDckoHV61vY6G0B4VFcHMi90YbhY-jiY")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "2090120004")
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 TIMEFRAME = "1hour"
 TARGET_RR = 2.0
@@ -92,11 +92,14 @@ def main():
     last_timestamps = state.get("last_timestamps", {})
 
     print("[*] Running Score Hunter Pro 15-min check...")
+    
+    # ارسال پیام تست برای اطمینان از کارکرد تلگرام
+    send_telegram("🤖 **ربات اسکور هانتر با موفقیت اجرا شد و بازار را پایش می‌کند.**")
 
     for symbol in SYMBOLS:
         candles = fetch_klines(symbol)
         if len(candles) < 20:
-                    continue
+            continue
 
         current_candle = candles[-1]
         c = candles[-2]
@@ -168,7 +171,6 @@ def main():
                 send_telegram(msg)
                 last_timestamps[symbol] = c["timestamp"]
 
-    # ذخیره تغییرات وضعیت در فایل برای اجرای بعدی گیت‌هاب اکشن
     state["active_trades"] = active_trades
     state["last_timestamps"] = last_timestamps
     save_state(state)
