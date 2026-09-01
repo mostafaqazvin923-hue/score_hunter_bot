@@ -3,7 +3,7 @@ import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 TIMEFRAME = "1h"
-TARGET_RR = 2.0  # قفل روی ریسک به ریوارد ۲.۰ به دستور شما
+TARGET_RR = 2.0  # قفل روی ۲.۰ طبق دستور
 
 def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
@@ -35,10 +35,14 @@ def fetch_real_klines_yahoo(symbol, limit=8800):
         print(f"[!] Error fetching {symbol}: {e}")
     raise ValueError(f"[!] Could not fetch data for {symbol}.")
 
-def calculate_sma(candles, period):
+def calculate_ema(candles, period):
     if len(candles) < period:
         return candles[-1]["close"]
-    return sum(x["close"] for x in candles[-period:]) / period
+    multiplier = 2 / (period + 1)
+    ema = sum(x["close"] for x in candles[:period]) / period
+    for c in candles[period:]:
+        ema = (c["close"] - ema) * multiplier + ema
+    return ema
 
 def run_backtest():
     initial_balance = 1000.0
@@ -52,7 +56,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - STRICT RR 2.0 BACKTEST      ")
+    print(" SCORE HUNTER PRO - HIGH WIN-RATE STRICT RR 2.0 ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -77,20 +81,25 @@ def run_backtest():
             c = sub[-2]
             prev_c = sub[-3]
 
-            sma20 = calculate_sma(sub, 20)
-            sma50 = calculate_sma(sub, 50)
+            ema20 = calculate_ema(sub, 20)
+            ema50 = calculate_ema(sub, 50)
             trade_taken = False
 
-            # --- شورت با ریسک به ریوارد ۲.۰ ---
-            is_down_trend = sma20 < sma50
-            is_short_signal = (c["close"] < c["open"]) and (c["close"] < sma20)
+            # --- فیلتر قدرت روند (فاصله بین EMAها برای جلوگیری از بازار رنج) ---
+            trend_strength = abs(ema20 - ema50) / c["close"]
+            if trend_strength < 0.003: # اگر بازار در حال رنج و فشردگی باشد اصلاً ترید نمی‌کند
+                continue
 
-            if is_down_trend and is_short_signal:
+            # --- شورت با تاییدیه مومنتوم قدرتمند و ساختار روند نزولی ---
+            is_down_trend = ema20 < ema50
+            is_strong_short = (c["close"] < c["open"]) and ((c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.55) and (c["close"] < ema20)
+
+            if is_down_trend and is_strong_short:
                 entry_price = c["close"]
-                stop_loss = prev_c["high"] + (entry_price * 0.001)
+                stop_loss = prev_c["high"] + (entry_price * 0.0012)
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.03:
+                if 0 < (risk_dist / entry_price) <= 0.035:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 24, len(candles) - 1)
@@ -115,17 +124,17 @@ def run_backtest():
                     if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
                     elif trade_lost: losses += 1; balance -= risk_amount
 
-            # --- لانگ با ریسک به ریوارد ۲.۰ ---
+            # --- لانگ با تاییدیه مومنتوم قدرتمند و ساختار روند صعودی ---
             if not trade_taken:
-                is_up_trend = sma20 > sma50
-                is_long_signal = (c["close"] > c["open"]) and (c["close"] > sma20)
+                is_up_trend = ema20 > ema50
+                is_strong_long = (c["close"] > c["open"]) and ((c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.55) and (c["close"] > ema20)
 
-                if is_up_trend and is_long_signal:
+                if is_up_trend and is_strong_long:
                     entry_price = c["close"]
-                    stop_loss = prev_c["low"] - (entry_price * 0.001)
+                    stop_loss = prev_c["low"] - (entry_price * 0.0012)
                     risk_dist = entry_price - stop_loss
 
-                    if 0 < (risk_dist / entry_price) <= 0.03:
+                    if 0 < (risk_dist / entry_price) <= 0.035:
                         take_profit = entry_price + (risk_dist * TARGET_RR)
                         trade_won, trade_lost = False, False
                         end_idx = min(i + 24, len(candles) - 1)
@@ -157,7 +166,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("             AGGREGATED RR 2.0 RESULTS            ")
+    print("       AGGREGATED HIGH WIN-RATE RR 2.0 RESULTS    ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
