@@ -65,6 +65,11 @@ def calculate_rsi(candles, period=14):
     rs = (gains / period) / (losses / period)
     return 100.0 - (100.0 / (1.0 + rs))
 
+def calculate_sma(candles, period=50):
+    if len(candles) < period:
+        return candles[-1]["close"]
+    return sum(x["close"] for x in candles[-period:]) / period
+
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
@@ -77,7 +82,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - OPTIMIZED DUAL BACKTEST   ")
+    print("   SCORE HUNTER PRO - TREND-FILTERED BACKTEST   ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -92,7 +97,7 @@ def run_backtest():
         
         skip_until = 0
 
-        for i in range(20, len(candles) - 1):
+        for i in range(50, len(candles) - 1):
             if i < skip_until:
                 continue
 
@@ -102,13 +107,14 @@ def run_backtest():
             prev2_c = sub_candles[-4]
 
             current_rsi = calculate_rsi(sub_candles)
+            trend_sma = calculate_sma(sub_candles, period=50)
             trade_taken = False
 
-            # --- ۱. بررسی شورت (اصلاح‌شده با تاییدیه شکست کف و مومنتوم نزولی واقعی) ---
+            # --- ۱. بررسی شورت (فقط در روند نزولی: قیمت زیر میانگین ۵۰) ---
             past_lows = min(x["low"] for x in sub_candles[-8:-2])
             is_bearish_bos = (c["close"] < past_lows) and ((c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.4)
             
-            if is_bearish_bos and (current_rsi < 45):
+            if is_bearish_bos and (c["close"] < trend_sma) and (current_rsi < 45):
                 entry_price = c["close"]
                 stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
                 risk_dist = stop_loss - entry_price
@@ -148,12 +154,12 @@ def run_backtest():
                         losses += 1
                         balance -= risk_amount
 
-            # --- ۲. بررسی لانگ (اگر شورت باز نشد) ---
+            # --- ۲. بررسی لانگ (فقط در روند صعودی: قیمت بالای میانگین ۵۰) ---
             if not trade_taken:
                 past_highs = max(x["high"] for x in sub_candles[-8:-2])
                 is_bullish_bos = (c["close"] > past_highs) and ((c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.4)
 
-                if is_bullish_bos and (current_rsi > 55):
+                if is_bullish_bos and (c["close"] > trend_sma) and (current_rsi > 55):
                     entry_price = c["close"]
                     stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
                     risk_dist = entry_price - stop_loss
