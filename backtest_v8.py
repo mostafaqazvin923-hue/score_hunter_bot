@@ -39,7 +39,6 @@ def fetch_historical_klines(symbol, limit=8800):
     except Exception as e:
         print(f"Error fetching data for {symbol}: {e}")
     
-    # تولید داده‌های فیک متوازن (جهت تست آفلاین دوطرفه)
     base_p = 100.0 if "SOL" in symbol else (3000.0 if "ETH" in symbol else (60000.0 if "BTC" in symbol else 0.5))
     dummy = []
     for t in range(8800):
@@ -78,7 +77,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - CLEAN BALANCED BACKTEST")
+    print("   SCORE HUNTER PRO - OPTIMIZED DUAL BACKTEST   ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -105,9 +104,11 @@ def run_backtest():
             current_rsi = calculate_rsi(sub_candles)
             trade_taken = False
 
-            # --- ۱. بررسی شورت ---
-            is_short_trigger = (c["close"] < c["open"]) and (current_rsi < 48)
-            if is_short_trigger:
+            # --- ۱. بررسی شورت (اصلاح‌شده با تاییدیه شکست کف و مومنتوم نزولی واقعی) ---
+            past_lows = min(x["low"] for x in sub_candles[-8:-2])
+            is_bearish_bos = (c["close"] < past_lows) and ((c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.4)
+            
+            if is_bearish_bos and (current_rsi < 45):
                 entry_price = c["close"]
                 stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
                 risk_dist = stop_loss - entry_price
@@ -149,8 +150,10 @@ def run_backtest():
 
             # --- ۲. بررسی لانگ (اگر شورت باز نشد) ---
             if not trade_taken:
-                is_long_trigger = (c["close"] > c["open"]) and (current_rsi > 52)
-                if is_long_trigger:
+                past_highs = max(x["high"] for x in sub_candles[-8:-2])
+                is_bullish_bos = (c["close"] > past_highs) and ((c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.4)
+
+                if is_bullish_bos and (current_rsi > 55):
                     entry_price = c["close"]
                     stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
                     risk_dist = entry_price - stop_loss
