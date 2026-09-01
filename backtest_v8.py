@@ -27,9 +27,9 @@ def fetch_historical_klines(symbol, limit=8800):
                     elif isinstance(row, list) and len(row) >= 6:
                         ts = int(float(row[0]))
                         op = float(row[1])
-                        cl = float(row[2])
-                        hi = float(row[3])
-                        lo = float(row[4])
+                        cl = float(row.get("close", 0))
+                        hi = float(row.get("high", 0))
+                        lo = float(row.get("low", 0))
                     else:
                         continue
                     candles.append({"timestamp": ts, "open": op, "high": hi, "low": lo, "close": cl})
@@ -82,7 +82,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - TREND-FILTERED BACKTEST   ")
+    print("   SCORE HUNTER PRO - ORGANIC SMART BACKTEST     ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -110,16 +110,17 @@ def run_backtest():
             trend_sma = calculate_sma(sub_candles, period=50)
             trade_taken = False
 
-            # --- ۱. بررسی شورت (فقط در روند نزولی: قیمت زیر میانگین ۵۰) ---
-            past_lows = min(x["low"] for x in sub_candles[-8:-2])
-            is_bearish_bos = (c["close"] < past_lows) and ((c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.4)
-            
-            if is_bearish_bos and (c["close"] < trend_sma) and (current_rsi < 45):
+            # --- تشخیص ارگانیک شورت توسط ربات ---
+            past_lows = min(x["low"] for x in sub_candles[-10:-2])
+            is_bearish_structure = (c["close"] < past_lows) and (c["close"] < trend_sma)
+            strong_bearish_momentum = (c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.5
+
+            if is_bearish_structure and strong_bearish_momentum and (current_rsi < 42):
                 entry_price = c["close"]
-                stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
+                stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.001)
                 risk_dist = stop_loss - entry_price
 
-                if risk_dist > 0 and (risk_dist / entry_price) <= 0.05:
+                if risk_dist > 0 and (risk_dist / entry_price) <= 0.04:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
 
                     trade_won = False
@@ -154,17 +155,18 @@ def run_backtest():
                         losses += 1
                         balance -= risk_amount
 
-            # --- ۲. بررسی لانگ (فقط در روند صعودی: قیمت بالای میانگین ۵۰) ---
+            # --- تشخیص ارگانیک لانگ توسط ربات (اگر شورت تریگر نشد) ---
             if not trade_taken:
-                past_highs = max(x["high"] for x in sub_candles[-8:-2])
-                is_bullish_bos = (c["close"] > past_highs) and ((c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.4)
+                past_highs = max(x["high"] for x in sub_candles[-10:-2])
+                is_bullish_structure = (c["close"] > past_highs) and (c["close"] > trend_sma)
+                strong_bullish_momentum = (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.5
 
-                if is_bullish_bos and (c["close"] > trend_sma) and (current_rsi > 55):
+                if is_bullish_structure and strong_bullish_momentum and (current_rsi > 58):
                     entry_price = c["close"]
-                    stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
+                    stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.001)
                     risk_dist = entry_price - stop_loss
 
-                    if risk_dist > 0 and (risk_dist / entry_price) <= 0.05:
+                    if risk_dist > 0 and (risk_dist / entry_price) <= 0.04:
                         take_profit = entry_price + (risk_dist * TARGET_RR)
 
                         trade_won = False
@@ -201,7 +203,7 @@ def run_backtest():
         total_wins += wins
         total_losses += losses
         grand_total_trades += symbol_trades
-        print(f" > {symbol} -> Total: {symbol_trades} (Longs: {symbol_longs}, Shorts: {symbol_shorts}) | Wins: {wins} | Losses: {losses}")
+        print(f" > {symbol} -> Total: {symbol_trades} (Longs: {symbol_symbol_longs if 'symbol_symbol_longs' in locals() else symbol_longs}, Shorts: {symbol_shorts}) | Wins: {wins} | Losses: {losses}")
 
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
@@ -211,7 +213,7 @@ def run_backtest():
     print(f"Total Coins Tested : {len(SYMBOLS)}")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
-    print(f"  - Total Shorts   : {grand_total_shorts}")
+    print(f"  - Total Shorts     : {grand_total_shorts}")
     print(f"Winning Trades     : {total_wins}")
     print(f"Losing Trades      : {total_losses}")
     print(f"Overall Win Rate   : {win_rate:.2f}%")
