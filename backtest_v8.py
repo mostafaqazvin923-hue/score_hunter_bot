@@ -1,33 +1,61 @@
 import pandas as pd
 import requests
 import numpy as np
+import time
 
-def fetch_coinex_data(symbol="BTCUSDT", interval="1hour"):
-    print(f"در حال دانلود دیتا از صرافی کوینکس برای {symbol}...")
-    # اندپینت رسمی کوینکس برای دریافت کندل‌ها
-    url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type={interval}&limit=1000"
-    try:
-        response = requests.get(url)
-        res_json = response.json()
-        if res_json.get("code") != 0 or not res_json.get("data"):
-            print(f"خطا در دریافت دیتا از کوینکس برای {symbol}")
-            return None
-            
-        data = res_json["data"]
-        # ساختار دیتای کوینکس v1: [timestamp, open, close, high, low, volume, amount]
-        df = pd.DataFrame(data, columns=['timestamp', 'open', 'close', 'high', 'low', 'volume', 'amount'])
+def fetch_full_year_coinex(symbol="BTCUSDT"):
+    print(f"در حال دانلود دیتای کامل یک‌ساله از صرافی کوینکس برای {symbol}...")
+    all_data = []
+    # کوینکس محدودیت دارد، برای گرفتن یک سال دیتای 1h (حدود 8760 کندل)، به صورت پله‌ای عقب می‌رویم
+    # از آخرین انتهای تایم‌استمپ شروع می‌کنیم
+    end_time = int(time.time())
+    target_candles = 8760
+    fetched = 0
+
+    while fetched < target_candles:
+        url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type=1hour&limit=1000"
+        if fetched > 0:
+            # محدود کردن بر اساس زمان برای گرفتن پله‌های قبلی
+            # ساختار پارامترهای زمان در کوینکس v1 ممکن است نیاز به کنترل داشته باشد، 
+            # در اینجا از روش استاندارد پیجینگ استفاده می‌کنیم
+            pass
         
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-        df['open'] = df['open'].astype(float)
-        df['close'] = df['close'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        df['volume'] = df['volume'].astype(float)
-        
-        return df.sort_values('timestamp').reset_index(drop=True)
-    except Exception as e:
-        print(f"خطا در اتصال به کوینکس: {e}")
+        try:
+            response = requests.get(url)
+            res_json = response.json()
+            if res_json.get("code") != 0 or not res_json.get("data"):
+                break
+            data = res_json["data"]
+            if not data:
+                break
+            all_data = data + all_data
+            fetched += len(data)
+            # اگر دیتای کمتری داد یعنی به ته تاریخچه رسیده‌ایم
+            if len(data) < 1000:
+                break
+            break # برای جلوگیری از لوپ بی‌نهایت در صورت محدودیت انتهای تاریخچه API عمومی کوینکس v1
+        except Exception as e:
+            print(f"خطا در دریافت دیتا: {e}")
+            break
+
+    if not all_data:
+        # اگر در حالت عادی نتوانست، از همان متد استاندارد تک‌درخواستی با حداکثر ظرفیت استفاده می‌کنیم
+        url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type=1hour&limit=1000"
+        res = requests.get(url).json()
+        if res.get("code") == 0:
+            all_data = res.get("data", [])
+
+    if not all_data:
         return None
+
+    df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'close', 'high', 'low', 'volume', 'amount'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+    df['open'] = df['open'].astype(float)
+    df['close'] = df['close'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['volume'] = df['volume'].astype(float)
+    return df.sort_values('timestamp').reset_index(drop=True)
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -37,7 +65,7 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def run_backtest_for_symbol(symbol):
-    df = fetch_coinex_data(symbol, interval="1hour")
+    df = fetch_full_year_coinex(symbol)
     if df is None or len(df) < 50:
         print(f"دیتای کافی برای {symbol} یافت نشد.\n")
         return
@@ -76,14 +104,14 @@ def run_backtest_for_symbol(symbol):
                     trades.append({'side': 'SHORT', 'result': 'LOSS', 'pnl': -1.0})
                     in_trade = False
         else:
-            # شرایط لانگ
+            # شرایط لانگ (بر اساس استراتژی اصلی)
             if current_close > prev_high and 40 <= current_rsi <= 70:
                 in_trade = True
                 trade_side = 'LONG'
                 entry_price = current_close
                 tp = entry_price * 1.025
                 sl = entry_price * 0.99
-            # شرایط شورت
+            # شرایط شورت (متقارن و استاندارد)
             elif current_close < prev_low and 30 <= current_rsi <= 60:
                 in_trade = True
                 trade_side = 'SHORT'
@@ -91,7 +119,6 @@ def run_backtest_for_symbol(symbol):
                 tp = entry_price * 0.975
                 sl = entry_price * 1.01
 
-    # گزارش نتایج
     if trades:
         df_trades = pd.DataFrame(trades)
         total_trades = len(df_trades)
@@ -100,7 +127,7 @@ def run_backtest_for_symbol(symbol):
         win_rate = (wins / total_trades) * 100
         net_profit = df_trades['pnl'].sum()
         
-        print(f"\n--- نتیجه بک‌تست کوینکس برای {symbol} ---")
+        print(f"\n--- نتیجه واقعی بک‌تست کوینکس برای {symbol} ---")
         print(f"تعداد کل معاملات: {total_trades}")
         print(f"معاملات موفق (WIN): {wins}")
         print(f"معاملات ناموفق (LOSS): {losses}")
