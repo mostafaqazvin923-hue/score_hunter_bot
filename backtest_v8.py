@@ -75,7 +75,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - FIXED DUAL BACKTEST (V19)")
+    print("   SCORE HUNTER PRO - FINAL DUAL BACKTEST (V20)")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -97,13 +97,13 @@ def run_backtest():
             current_rsi = calculate_rsi(sub_candles)
             trade_executed = False
 
-            # --- ۱. بررسی پوزیشن شورت (اصلاح ریشه‌ای شرط شکست کف) ---
-            # مقایسه با کندل‌های قبل از c (استفاده از -9 تا -3)
+            # --- ۱. بررسی پوزیشن شورت (اصلاح‌شده و بدون شرط محال FVG) ---
             past_lows = min(x["low"] for x in sub_candles[-9:-3])
             is_bearish_bos = c["close"] < past_lows and (c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.3
-            has_bearish_fvg = prev2_c["low"] > c["high"]
+            # جایگزینی شرط محال گپ با شتاب حرکتی نزولی واقعی
+            has_bearish_momentum = c["close"] < prev_c["low"]
 
-            if is_bearish_bos and has_bearish_fvg and (25 < current_rsi < 65):
+            if is_bearish_bos and has_bearish_momentum and (current_rsi < 60):
                 entry_price = c["close"]
                 stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
                 risk_dist = stop_loss - entry_price
