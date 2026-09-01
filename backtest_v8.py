@@ -99,10 +99,10 @@ def run_backtest():
             is_bullish_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.3
             has_bullish_fvg = prev2_c["high"] < c["low"]
 
-            # شرایط پوزیشن شورت (اصلاح‌شده و منعطف‌تر برای تست)
+            # شرایط پوزیشن شورت (اصلاح‌شده)
             recent_lows = min(x["low"] for x in sub_candles[-15:-2])
             is_bearish_bos = c["close"] < recent_lows and (c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.3
-            has_bearish_fvg = prev2_c["low']" if False else (prev2_c["low"] > c["high"]) # منطق درست FVG شورت
+            has_bearish_fvg = prev2_c["low"] > c["high"]
 
             current_rsi = calculate_rsi(sub_candles)
 
@@ -146,7 +146,7 @@ def run_backtest():
                     losses += 1
                     balance -= risk_amount
 
-            # چک کردن سیگنال SHORT (با بازه RSI بازتر برای تست)
+            # چک کردن سیگنال SHORT
             elif is_bearish_bos and has_bearish_fvg and (25 < current_rsi < 65):
                 entry_price = c["close"]
                 stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
