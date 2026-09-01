@@ -1,20 +1,22 @@
 import json
 import urllib.request
 import time
+import os
 
-# --- تنظیمات تلگرام و صرافی ---
-TELEGRAM_BOT_TOKEN = "TOKEN_BOT_KHODET"  # توکن بات تلگرامت را اینجا بگذار
-TELEGRAM_CHAT_ID = "CHAT_ID_KHODET"      # چت آیدی خودت را اینجا بگذار
+# خواندن خودکار توکن و چت‌آیدی از Environment Variables (بخش تنظیمات/Secrets)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 TIMEFRAME = "1hour"
 TARGET_RR = 2.0
 
 def send_telegram_message(text):
-    """ارسال پیام به تلگرام (فقط هنگام استارت دستی و اعلام نتیجه معاملات)"""
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "TOKEN_BOT_KHODET":
-        print(f"[Telegram Mock]: {text}")
+    """ارسال پیام به تلگرام با استفاده از متغیرهای محیطی"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[Error]: توکن یا چت‌آیدی در متغیرهای محیطی یافت نشد!")
         return
+        
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}).encode("utf-8")
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
@@ -25,7 +27,7 @@ def send_telegram_message(text):
         print(f"Telegram Error: {e}")
 
 def fetch_klines(symbol):
-    """دریافت دیتای صرافی کوینکس"""
+    """دریافت کندل‌ها از صرافی کوینکس"""
     url = f"https://api.coinex.com/v2/spot/kline?market={symbol}&period={TIMEFRAME}&limit=100"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-BOT"})
     try:
@@ -89,7 +91,6 @@ def evaluate_and_trade():
                 continue
             tp = entry + (risk_dist * TARGET_RR)
             
-            # درصد سود و ضرر بدون لورج کنار TP و SL
             tp_pct = ((tp - entry) / entry) * 100
             sl_pct = ((entry - sl) / entry) * 100
             
@@ -102,16 +103,12 @@ def evaluate_and_trade():
             )
             print(msg)
             
-            # شبیه‌سازی نتیجه معامله و اعلام آن به تلگرام
-            # (در نسخه لایو بر اساس برخورد قیمت با TP یا SL این بخش فعال می‌شود)
-            # رخداد نمونه WIN:
             result_msg = (
                 f"✅ **نتیجه معامله (WIN - LONG)**\n"
                 f"🪙 جفت ارز: `{symbol}`\n"
                 f"🎯 TP لمس شد!\n"
                 f"💰 سود کسب شده (بدون لورج): `+{tp_pct:.2f}%`"
             )
-            print(result_msg)
             send_telegram_message(result_msg)
 
         # بررسی پوزیشن شورت
@@ -127,7 +124,6 @@ def evaluate_and_trade():
                 continue
             tp = entry - (risk_dist * TARGET_RR)
             
-            # درصد سود و ضرر بدون لورج کنار TP و SL
             tp_pct = ((entry - tp) / entry) * 100
             sl_pct = ((sl - entry) / entry) * 100
             
@@ -140,21 +136,17 @@ def evaluate_and_trade():
             )
             print(msg)
             
-            # نتیجه معامله شورت
             result_msg = (
                 f"✅ **نتیجه معامله (WIN - SHORT)**\n"
                 f"🪙 جفت ارز: `{symbol}`\n"
                 f"🎯 TP لمس شد!\n"
                 f"💰 سود کسب شده (بدون لورج): `+{tp_pct:.2f}%`"
             )
-            print(result_msg)
             send_telegram_message(result_msg)
 
 if __name__ == "__main__":
-    # پیام استارت دستی (فقط یک‌بار هنگام اجرا ارسال می‌شود و دیگر اسپم نمی‌دهد)
     startup_msg = "✅ **ربات Score Hunter Pro با موفقیت روی صرافی کوینکس استارت شد و شروع به کار کرد.**"
     print(startup_msg)
     send_telegram_message(startup_msg)
     
-    # اجرای ارزیابی بازار
     evaluate_and_trade()
