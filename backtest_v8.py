@@ -2,50 +2,32 @@ import pandas as pd
 import requests
 import numpy as np
 
-def fetch_one_year_data(symbol="BTCUSDT", interval="1h"):
-    print(f"در حال دانلود ۱ سال دیتای ۱ ساعته برای {symbol} از بایننس...")
-    url = "https://api.binance.com/api/v3/klines"
-    all_data = []
-    limit = 1000
-    end_time = int(pd.Timestamp.now().timestamp() * 1000)
-    fetched = 0
-    target_candles = 8760  # حدود ۱ سال (24 ساعت * 365 روز)
-    
-    while fetched < target_candles:
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-            "endTime": end_time
-        }
-        try:
-            response = requests.get(url, params=params)
-            if response.status_code != 200:
-                break
-            data = response.json()
-            if not data:
-                break
-            all_data = data + all_data
-            end_time = data[0][0] - 1
-            fetched += len(data)
-            if len(data) < limit:
-                break
-        except Exception as e:
-            print(f"خطا در دریافت دیتا: {e}")
-            break
+def fetch_coinex_data(symbol="BTCUSDT", interval="1hour"):
+    print(f"در حال دانلود دیتا از صرافی کوینکس برای {symbol}...")
+    # اندپینت رسمی کوینکس برای دریافت کندل‌ها
+    url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type={interval}&limit=1000"
+    try:
+        response = requests.get(url)
+        res_json = response.json()
+        if res_json.get("code") != 0 or not res_json.get("data"):
+            print(f"خطا در دریافت دیتا از کوینکس برای {symbol}")
+            return None
             
-    df = pd.DataFrame(all_data, columns=[
-        'timestamp', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_asset_volume', 'number_of_trades',
-        'taker_buy_base_asset_volume', 'taker_buy_quote_volume', 'ignore'
-    ])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df['open'] = df['open'].astype(float)
-    df['high'] = df['high'].astype(float)
-    df['low'] = df['low'].astype(float)
-    df['close'] = df['close'].astype(float)
-    df['volume'] = df['volume'].astype(float)
-    return df.drop_duplicates(subset=['timestamp']).reset_index(drop=True)
+        data = res_json["data"]
+        # ساختار دیتای کوینکس v1: [timestamp, open, close, high, low, volume, amount]
+        df = pd.DataFrame(data, columns=['timestamp', 'open', 'close', 'high', 'low', 'volume', 'amount'])
+        
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+        df['open'] = df['open'].astype(float)
+        df['close'] = df['close'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
+        df['volume'] = df['volume'].astype(float)
+        
+        return df.sort_values('timestamp').reset_index(drop=True)
+    except Exception as e:
+        print(f"خطا در اتصال به کوینکس: {e}")
+        return None
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -55,9 +37,9 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def run_backtest_for_symbol(symbol):
-    df = fetch_one_year_data(symbol, interval="1h")
-    if df.empty or len(df) < 100:
-        print(f"دیتای کافی برای {symbol} یافت نشد.")
+    df = fetch_coinex_data(symbol, interval="1hour")
+    if df is None or len(df) < 50:
+        print(f"دیتای کافی برای {symbol} یافت نشد.\n")
         return
         
     df['rsi'] = calculate_rsi(df['close'], period=14)
@@ -118,7 +100,7 @@ def run_backtest_for_symbol(symbol):
         win_rate = (wins / total_trades) * 100
         net_profit = df_trades['pnl'].sum()
         
-        print(f"\n--- نتیجه بک‌تست یک‌ساله برای {symbol} ---")
+        print(f"\n--- نتیجه بک‌تست کوینکس برای {symbol} ---")
         print(f"تعداد کل معاملات: {total_trades}")
         print(f"معاملات موفق (WIN): {wins}")
         print(f"معاملات ناموفق (LOSS): {losses}")
