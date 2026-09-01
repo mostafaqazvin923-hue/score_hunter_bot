@@ -1,4 +1,3 @@
-_backtest()
 import json
 import urllib.request
 import math
@@ -76,7 +75,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - 1 YEAR DUAL BACKTEST (V17)")
+    print("   SCORE HUNTER PRO - 1 YEAR DUAL BACKTEST (V18)")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -98,7 +97,7 @@ def run_backtest():
             current_rsi = calculate_rsi(sub_candles)
             is_red_candle = c["close"] < c["open"]
 
-            # --- اگر کندل قرمز است، اولویت مطلق با شورت است! ---
+            # --- بررسی پوزیشن شورت (اولویت برای کندل‌های نزولی) ---
             if is_red_candle:
                 recent_lows = min(x["low"] for x in sub_candles[-8:-2])
                 is_bearish_bos = c["close"] < recent_lows
@@ -139,9 +138,9 @@ def run_backtest():
                         elif trade_lost:
                             losses += 1
                             balance -= risk_amount
-                        continue # معامله شورت انجام شد، برو کندل بعد
+                        continue
 
-            # --- اگر کندل سبز است یا شورت نشد، لانگ را بررسی کن ---
+            # --- بررسی پوزیشن لانگ ---
             recent_highs = max(x["high"] for x in sub_candles[-8:-2])
             is_bullish_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.3
             has_bullish_fvg = prev2_c["high"] < c["low"]
