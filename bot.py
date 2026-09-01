@@ -1,83 +1,57 @@
-import json
-import urllib.request
-import urllib.parse
 import os
-import math
+import json
+import requests
+import pandas as pd
+import numpy as np
 
-# خواندن ایمن توکن و چت‌آیدی از محیط گیت‌هاب
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# تنظیمات تلگرام از محیط گیت‌هاب (Environment Variables)
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
-TIMEFRAME = "1hour"
-TARGET_RR = 2.0
 STATE_FILE = "active_trades_state.json"
 
-def send_telegram(message):
-    if not TOKEN or not CHAT_ID:
-        print("Telegram Error: Token or Chat ID is missing from environment variables.")
+def send_telegram_message(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram credentials not found!")
         return
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
         "parse_mode": "Markdown"
     }
-    data = urllib.parse.urlencode(payload).encode("utf-8")
     try:
-        req = urllib.request.Request(url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return response.read()
+        response = requests.post(url, json=payload)
+        return response.json()
     except Exception as e:
-        print(f"Telegram Error: {e}")
+        print(f"Error sending telegram message: {e}")
 
-def fetch_klines(symbol, limit=100):
-    url = f"https://api.coinex.com/v2/spot/kline?market={symbol}&period={TIMEFRAME}&limit={limit}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-BOT"})
+def get_binance_data(symbol="BTCUSDT", interval="1h", limit=200):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            raw = response.read().decode("utf-8")
-            payload = json.loads(raw)
-            if isinstance(payload, dict) and payload.get("code") == 0:
-                rows = payload.get("data", [])
-                candles = []
-                for row in rows:
-                    if isinstance(row, dict):
-                        ts = int(float(row.get("created_at", row.get("time", 0))))
-                        op = float(row.get("open", 0))
-                        hi = float(row.get("high", 0))
-                        lo = float(row.get("low", 0))
-                        cl = float(row.get("close", 0))
-                    elif isinstance(row, list) and len(row) >= 6:
-                        ts = int(float(row[0]))
-                        op = float(row[1])
-                        cl = float(row[2])
-                        hi = float(row[3])
-                        lo = float(row[4])
-                    else:
-                        continue
-                    candles.append({"timestamp": ts, "open": op, "high": hi, "low": lo, "close": cl})
-                candles.sort(key=lambda x: x["timestamp"])
-                if len(candles) > 0:
-                    return candles
+        response = requests.get(url)
+        data = response.json()
+        df = pd.DataFrame(data, columns=[
+            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_asset_volume', 'number_of_trades',
+            'taker_buy_base_asset_volume', 'taker_buy_quote_volume', 'ignore'
+        ])
+        df['open'] = df['open'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
+        df['close'] = df['close'].astype(float)
+        df['volume'] = df['volume'].astype(float)
+        return df
     except Exception as e:
         print(f"Error fetching data for {symbol}: {e}")
-    return []
+        return None
 
-def calculate_rsi(candles, period=14):
-    if len(candles) < period + 1:
-        return 50.0
-    gains, losses = 0.0, 0.0
-    for i in range(1, period + 1):
-        diff = candles[-i]["close"] - candles[-i-1]["close"]
-        if diff >= 0:
-            gains += diff
-        else:
-            losses -= diff
-    if losses == 0:
-        return 100.0
-    rs = (gains / period) / (losses / period)
-    return 100.0 - (100.0 / (1.0 + rs))
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -85,104 +59,83 @@ def load_state():
             with open(STATE_FILE, "r") as f:
                 return json.load(f)
         except:
-            pass
-    return {"active_trades": {}, "last_timestamps": {}}
+            return {}
+    return {}
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=4)
 
-def main():
+def run_bot():
+    print("[*] Running Score Hunter Pro live check...")
+    
+    # تشخیص اینکه آیا اجرا به صورت دستی (Workflow Dispatch) بوده یا خودکار
+    # اگر فایلگیت‌هاب اکشن متغیر RUN_TYPE را ست کرده باشد یا برای تست دستی اولیه
+    is_manual_run = os.environ.get("MANUAL_RUN", "false").lower() == "true"
+    if is_manual_run:
+        send_telegram_message("🤖 ربات اسکور هانتر با موفقیت اجرا شد و بازار را پایش می‌کند.")
+
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
     state = load_state()
-    active_trades = state.get("active_trades", {})
-    last_timestamps = state.get("last_timestamps", {})
 
-    print("[*] Running Score Hunter Pro live check (Secure Mode)...")
-
-    # ارسال پیام تست برای اطمینان از برقراری ارتباط تلگرام و امن بودن توکن‌ها
-    send_telegram("🤖 **ربات اسکور هانتر پرو**\nبررسی ادواری بازار انجام شد و وضعیت پایدار است.")
-
-    for symbol in SYMBOLS:
-        candles = fetch_klines(symbol, limit=100)
-        if len(candles) < 25:
+    for symbol in symbols:
+        df = get_binance_data(symbol, interval="1h", limit=100)
+        if df is None or len(df) < 50:
             continue
 
-        current_candle = candles[-1]
-        sub_candles = candles
-        c = sub_candles[-2]
-        prev_c = sub_candles[-3]
-        prev2_c = sub_candles[-4]
+        df['rsi'] = calculate_rsi(df['close'], period=14)
+        
+        # منطق استراتژی (بک‌تست)
+        current_close = df['close'].iloc[-2]
+        current_rsi = df['rsi'].iloc[-2]
+        prev_high = df['high'].iloc[-5:-1].max()
 
-        # ۱. بررسی پوزیشن‌های فعال برای اعلام نتیجه (تاچ شدن TP یا SL)
-        if symbol in active_trades:
-            trade = active_trades[symbol]
-            if current_candle["low"] <= trade["stop_loss"]:
-                msg = (
-                    f"❌ **نتیجه معامله: حد ضرر لمس شد (SL Hit)**\n\n"
-                    f"🪙 ارز: `{symbol}`\n"
-                    f"📍 نقطه ورود: `{trade['entry_price']:.4f}`\n"
-                    f"🛑 قیمت حد ضرر: `{trade['stop_loss']:.4f}`\n"
-                    f"📉 درصد ضرر: `-{trade['sl_pct']:.2f}%`"
-                )
-                send_telegram(msg)
-                del active_trades[symbol]
-            elif current_candle["high"] >= trade["take_profit"]:
-                msg = (
-                    f"✅ **نتیجه معامله: حد سود لمس شد (TP Hit - WON!)**\n\n"
-                    f"🪙 ارز: `{symbol}`\n"
-                    f"📍 نقطه ورود: `{trade['entry_price']:.4f}`\n"
-                    f"🎯 قیمت حد سود: `{trade['take_profit']:.4f}`\n"
-                    f"📈 درصد سود: `+{trade['tp_pct']:.2f}%`"
-                )
-                send_telegram(msg)
-                del active_trades[symbol]
-
-        # ۲. جستجوی سیگنال جدید و درج درصد سود و ضرر در پیام
-        if symbol not in active_trades and c["timestamp"] != last_timestamps.get(symbol, 0):
-            recent_highs = max(x["high"] for x in sub_candles[-15:-2])
-            is_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.4
-            has_bullish_fvg = prev2_c["high"] < c["low"]
+        # بررسی پوزیشن باز برای این ارز
+        if symbol in state and state[symbol]:
+            trade = state[symbol]
+            entry_price = trade['entry_price']
+            tp = trade['tp']
+            sl = trade['sl']
             
-            current_rsi = calculate_rsi(sub_candles)
-            rsi_filter = 40 < current_rsi < 70
+            high_price = df['high'].iloc[-1]
+            low_price = df['low'].iloc[-1]
 
-            if is_bos and has_bullish_fvg and rsi_filter:
-                entry_price = c["close"]
-                stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
-                risk_dist = entry_price - stop_loss
-
-                if risk_dist <= 0 or (risk_dist / entry_price) > 0.03:
-                    continue
-
-                take_profit = entry_price + (risk_dist * TARGET_RR)
+            if high_price >= tp:
+                tp_pct = round(((tp - entry_price) / entry_price) * 100, 2)
+                send_telegram_message(f"🟢 *TP Hit (سود)*\nرمز ارز: `{symbol}`\nحد سود لمس شد! 🎯\nسود معامله: `+{tp_pct}%`")
+                del state[symbol]
+            elif low_price <= sl:
+                sl_pct = round(((entry_price - sl) / entry_price) * 100, 2)
+                send_telegram_message(f"🔴 *SL Hit (ضرر)*\nرمز ارز: `{symbol}`\nحد ضرر لمس شد! 🛑\nضرر معامله: `-{sl_pct}%`")
+                del state[symbol]
+        else:
+            # شرایط ورود به معامله (مطابق بک‌تست)
+            # مثال: عبور قیمت از مقاومت قبلی (BOS) همراه با RSI بین 40 تا 70
+            if current_close > prev_high and 40 <= current_rsi <= 70:
+                entry_price = current_close
+                tp = entry_price * 1.025  # فرض مثال 2.5 درصد تی پی
+                sl = entry_price * 0.99   # فرض مثال 1 درصد اس ال
                 
-                tp_percentage = ((take_profit - entry_price) / entry_price) * 100
-                sl_percentage = ((entry_price - stop_loss) / entry_price) * 100
+                tp_pct = round(((tp - entry_price) / entry_price) * 100, 2)
+                sl_pct = round(((entry_price - sl) / entry_price) * 100, 2)
 
-                active_trades[symbol] = {
+                state[symbol] = {
                     "entry_price": entry_price,
-                    "take_profit": take_profit,
-                    "stop_loss": stop_loss,
-                    "tp_pct": tp_percentage,
-                    "sl_pct": sl_percentage
+                    "tp": tp,
+                    "sl": sl
                 }
-
-                msg = (
-                    f"🟢 **سیگنال جدید لانگ (Score Hunter Pro)**\n\n"
-                    f"🪙 ارز: `{symbol}`\n"
-                    f"📍 نقطه ورود: `{entry_price:.4f}`\n\n"
-                    f"🎯 **TP:** `{take_profit:.4f}` (سود: `+{tp_percentage:.2f}%`)\n"
-                    f"🛑 **SL:** `{stop_loss:.4f}` (ضرر: `-{sl_percentage:.2f}%`)\n"
-                    f"⚖️ ریسک به ریوارد: `1:2`\n"
-                    f"📊 RSI: `{current_rsi:.1f}`"
+                
+                send_telegram_message(
+                    f"🚀 *سیگنال جدید (Score Hunter Pro)*\n\n"
+                    f"ارز: `{symbol}`\n"
+                    f"قیمت ورود: `{entry_price}`\n"
+                    f"🎯 حد سود (TP): `{tp}` (`+{tp_pct}%`)\n"
+                    f"🛑 حد ضرر (SL): `{sl}` (`-{sl_pct}%`)\n"
+                    f"📊 RSI: `{round(current_rsi, 2)}`"
                 )
-                send_telegram(msg)
-                last_timestamps[symbol] = c["timestamp"]
 
-    state["active_trades"] = active_trades
-    state["last_timestamps"] = last_timestamps
     save_state(state)
     print("[*] State successfully saved.")
 
 if __name__ == "__main__":
-    main()
+    run_bot()
