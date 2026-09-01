@@ -1,13 +1,5 @@
 {
-    "active_trades": {
-        "SOLUSDT": {
-            "entry_price": 104.48,
-            "take_profit": 108.89792000000001,
-            "stop_loss": 102.27104,
-            "tp_pct": 4.228483920367544,
-            "sl_pct": 2.114241960183772
-        }
-    },
+    "active_trades": {},
     "last_timestamps": {
         "SOLUSDT": 1788199200000
     }
