@@ -3,7 +3,7 @@ import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 TIMEFRAME = "1h"
-TARGET_RR = 2.0  # قفل روی ۲.۰ طبق دستور
+TARGET_RR = 2.0  # قفل قطعی روی ریسک به ریوارد ۱ به ۲ ثابت
 
 def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
@@ -56,7 +56,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - HIGH WIN-RATE STRICT RR 2.0 ")
+    print(" SCORE HUNTER PRO - PURE FIXED RR 2.0 BACKTEST  ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -85,12 +85,11 @@ def run_backtest():
             ema50 = calculate_ema(sub, 50)
             trade_taken = False
 
-            # --- فیلتر قدرت روند (فاصله بین EMAها برای جلوگیری از بازار رنج) ---
             trend_strength = abs(ema20 - ema50) / c["close"]
-            if trend_strength < 0.003: # اگر بازار در حال رنج و فشردگی باشد اصلاً ترید نمی‌کند
+            if trend_strength < 0.003:
                 continue
 
-            # --- شورت با تاییدیه مومنتوم قدرتمند و ساختار روند نزولی ---
+            # --- شورت با حد سود و زیان کاملاً ثابت (Fixed SL & TP) ---
             is_down_trend = ema20 < ema50
             is_strong_short = (c["close"] < c["open"]) and ((c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.55) and (c["close"] < ema20)
 
@@ -106,10 +105,18 @@ def run_backtest():
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
-                        if future_c["high"] >= stop_loss:
-                            trade_lost = True; break
-                        if future_c["low"] <= take_profit:
-                            trade_won = True; break
+                        hit_sl = future_c["high"] >= stop_loss
+                        hit_tp = future_c["low"] <= take_profit
+
+                        if hit_sl and hit_tp:
+                            trade_lost = True
+                            break
+                        elif hit_sl:
+                            trade_lost = True
+                            break
+                        elif hit_tp:
+                            trade_won = True
+                            break
                     
                     if not trade_won and not trade_lost:
                         trade_won = True if candles[end_idx]["close"] < entry_price else False
@@ -121,10 +128,12 @@ def run_backtest():
                     skip_until = end_idx
                     trade_taken = True
 
-                    if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
-                    elif trade_lost: losses += 1; balance -= risk_amount
+                    if trade_won: 
+                        wins += 1; balance += (risk_amount * TARGET_RR)
+                    elif trade_lost: 
+                        losses += 1; balance -= risk_amount
 
-            # --- لانگ با تاییدیه مومنتوم قدرتمند و ساختار روند صعودی ---
+            # --- لانگ با حد سود و زیان کاملاً ثابت (Fixed SL & TP) ---
             if not trade_taken:
                 is_up_trend = ema20 > ema50
                 is_strong_long = (c["close"] > c["open"]) and ((c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.55) and (c["close"] > ema20)
@@ -141,10 +150,18 @@ def run_backtest():
                         
                         for j in range(i + 1, end_idx + 1):
                             future_c = candles[j]
-                            if future_c["low"] <= stop_loss:
-                                trade_lost = True; break
-                            if future_c["high"] >= take_profit:
-                                trade_won = True; break
+                            hit_sl = future_c["low"] <= stop_loss
+                            hit_tp = future_c["high"] >= take_profit
+
+                            if hit_sl and hit_tp:
+                                trade_lost = True
+                                break
+                            elif hit_sl:
+                                trade_lost = True
+                                break
+                            elif hit_tp:
+                                trade_won = True
+                                break
                         
                         if not trade_won and not trade_lost:
                             trade_won = True if candles[end_idx]["close"] > entry_price else False
@@ -155,8 +172,10 @@ def run_backtest():
                         grand_total_longs += 1
                         skip_until = end_idx
 
-                        if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
-                        elif trade_lost: losses += 1; balance -= risk_amount
+                        if trade_won: 
+                            wins += 1; balance += (risk_amount * TARGET_RR)
+                        elif trade_lost: 
+                            losses += 1; balance -= risk_amount
 
         total_wins += wins
         total_losses += losses
@@ -166,7 +185,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("       AGGREGATED HIGH WIN-RATE RR 2.0 RESULTS    ")
+    print("         AGGREGATED PURE FIXED RR 2.0 RESULTS     ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
