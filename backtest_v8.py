@@ -3,7 +3,7 @@ import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 TIMEFRAME = "1h"
-TARGET_RR = 2.0  # قفل قطعی روی ریسک به ریوارد ۱ به ۲ ثابت
+TARGET_RR = 2.0  # قفل روی ۱ به ۲ ثابت
 
 def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
@@ -56,7 +56,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - PURE FIXED RR 2.0 BACKTEST  ")
+    print(" SCORE HUNTER PRO - SPATIAL ROOM CHECK RR 2.0   ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -89,7 +89,7 @@ def run_backtest():
             if trend_strength < 0.003:
                 continue
 
-            # --- شورت با حد سود و زیان کاملاً ثابت (Fixed SL & TP) ---
+            # --- شورت با بررسی فضای خالی مسیر تا تیک‌پرفت ---
             is_down_trend = ema20 < ema50
             is_strong_short = (c["close"] < c["open"]) and ((c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.55) and (c["close"] < ema20)
 
@@ -100,6 +100,17 @@ def run_backtest():
 
                 if 0 < (risk_dist / entry_price) <= 0.035:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
+                    
+                    # بررسی فضای خالی (برای شورت چک می‌کنیم آیا کفِ مهمی بین ورود و تیک‌پرفت به‌عنوان مانع وجود دارد یا نه)
+                    # نگاه به ۳۰ کندل گذشته برای پیدا کردن کف‌های حمایتی سر راه
+                    recent_lows = [x["low"] for x in sub[-30:-2]]
+                    closest_support = min(recent_lows) if recent_lows else 0
+                    
+                    # اگر یک حمایت محکم بالاتر از تیک‌پرفتِ ما قرار داشته باشد، یعنی مسیر مسدود است و ترید کنسل می‌شود
+                    if closest_support > take_profit and closest_support < entry_price:
+                        # مسیر مسدود است، ترید رد می‌شود تا وین‌ریت خراب نشود
+                        continue
+
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 24, len(candles) - 1)
                     
@@ -109,14 +120,11 @@ def run_backtest():
                         hit_tp = future_c["low"] <= take_profit
 
                         if hit_sl and hit_tp:
-                            trade_lost = True
-                            break
+                            trade_lost = True; break
                         elif hit_sl:
-                            trade_lost = True
-                            break
+                            trade_lost = True; break
                         elif hit_tp:
-                            trade_won = True
-                            break
+                            trade_won = True; break
                     
                     if not trade_won and not trade_lost:
                         trade_won = True if candles[end_idx]["close"] < entry_price else False
@@ -133,7 +141,7 @@ def run_backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ با حد سود و زیان کاملاً ثابت (Fixed SL & TP) ---
+            # --- لانگ با بررسی فضای خالی مسیر تا تیک‌پرفت ---
             if not trade_taken:
                 is_up_trend = ema20 > ema50
                 is_strong_long = (c["close"] > c["open"]) and ((c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.55) and (c["close"] > ema20)
@@ -145,6 +153,15 @@ def run_backtest():
 
                     if 0 < (risk_dist / entry_price) <= 0.035:
                         take_profit = entry_price + (risk_dist * TARGET_RR)
+                        
+                        # بررسی فضای خالی (برای لانگ چک می‌کنیم آیا سقفِ مهمی بین ورود و تیک‌پرفت به عنوان مانع وجود دارد یا نه)
+                        recent_highs = [x["high"] for x in sub[-30:-2]]
+                        closest_resistance = max(recent_highs) if recent_highs else 999999
+                        
+                        # اگر سقف مقاومت پایین‌تر از تیک‌پرفتِ ما باشد، یعنی مسیر مسدود است
+                        if closest_resistance < take_profit and closest_resistance > entry_price:
+                            continue
+
                         trade_won, trade_lost = False, False
                         end_idx = min(i + 24, len(candles) - 1)
                         
@@ -154,14 +171,11 @@ def run_backtest():
                             hit_tp = future_c["high"] >= take_profit
 
                             if hit_sl and hit_tp:
-                                trade_lost = True
-                                break
+                                trade_lost = True; break
                             elif hit_sl:
-                                trade_lost = True
-                                break
+                                trade_lost = True; break
                             elif hit_tp:
-                                trade_won = True
-                                break
+                                trade_won = True; break
                         
                         if not trade_won and not trade_lost:
                             trade_won = True if candles[end_idx]["close"] > entry_price else False
@@ -185,7 +199,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("         AGGREGATED PURE FIXED RR 2.0 RESULTS     ")
+    print("       AGGREGATED SPATIAL ROOM CHECK RESULTS      ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
