@@ -75,7 +75,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - UNLOCKED DUAL BACKTEST (V22)")
+    print("   SCORE HUNTER PRO - GUARANTEED DUAL BACKTEST (V23)")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -96,86 +96,86 @@ def run_backtest():
 
             current_rsi = calculate_rsi(sub_candles)
 
-            # زوج: شورت | فرد: لانگ
-            if i % 2 == 0:
-                is_bearish = c["close"] < c["open"] and current_rsi < 65
-                if is_bearish:
-                    entry_price = c["close"]
-                    stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
-                    risk_dist = stop_loss - entry_price
+            # بررسی مستقل شورت
+            is_bearish = c["close"] < c["open"] and current_rsi < 60
+            if is_bearish:
+                entry_price = c["close"]
+                stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
+                risk_dist = stop_loss - entry_price
 
-                    # اصلاح محدوده ریسک شورت تا ۱۰ درصد برای جلوگیری از بلاک شدن
-                    if risk_dist > 0 and (risk_dist / entry_price) <= 0.10:
-                        take_profit = entry_price - (risk_dist * TARGET_RR)
+                if risk_dist > 0 and (risk_dist / entry_price) <= 0.10:
+                    take_profit = entry_price - (risk_dist * TARGET_RR)
 
-                        trade_won = False
-                        trade_lost = False
-                        end_idx = min(i + 30, len(candles) - 1)
-                        
-                        for j in range(i + 1, end_idx + 1):
-                            future_c = candles[j]
-                            if future_c["high"] >= stop_loss:
-                                trade_lost = True
-                                break
-                            if future_c["low"] <= take_profit:
-                                trade_won = True
-                                break
-                        
-                        if not trade_won and not trade_lost:
-                            if candles[end_idx]["close"] < entry_price:
-                                trade_won = True
-                            else:
-                                trade_lost = True
+                    trade_won = False
+                    trade_lost = False
+                    end_idx = min(i + 30, len(candles) - 1)
+                    
+                    for j in range(i + 1, end_idx + 1):
+                        future_c = candles[j]
+                        if future_c["high"] >= stop_loss:
+                            trade_lost = True
+                            break
+                        if future_c["low"] <= take_profit:
+                            trade_won = True
+                            break
+                    
+                    if not trade_won and not trade_lost:
+                        if candles[end_idx]["close"] < entry_price:
+                            trade_won = True
+                        else:
+                            trade_lost = True
 
-                        symbol_trades += 1
-                        symbol_shorts += 1
-                        grand_total_shorts += 1
-                        if trade_won:
-                            wins += 1
-                            balance += (risk_amount * TARGET_RR)
-                        elif trade_lost:
-                            losses += 1
-                            balance -= risk_amount
-            else:
-                recent_highs = max(x["high"] for x in sub_candles[-8:-2])
-                is_bullish_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.3
+                    symbol_trades += 1
+                    symbol_shorts += 1
+                    grand_total_shorts += 1
+                    if trade_won:
+                        wins += 1
+                        balance += (risk_amount * TARGET_RR)
+                    elif trade_lost:
+                        losses += 1
+                        balance -= risk_amount
+                    continue # اگر شورت شد، رد شو تا تداخل نکند
 
-                if is_bullish_bos and (35 < current_rsi < 75):
-                    entry_price = c["close"]
-                    stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
-                    risk_dist = entry_price - stop_loss
+            # بررسی مستقل لانگ
+            recent_highs = max(x["high"] for x in sub_candles[-8:-2])
+            is_bullish = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.3
 
-                    if risk_dist > 0 and (risk_dist / entry_price) <= 0.04:
-                        take_profit = entry_price + (risk_dist * TARGET_RR)
+            if is_bullish and (35 < current_rsi < 75):
+                entry_price = c["close"]
+                stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
+                risk_dist = entry_price - stop_loss
 
-                        trade_won = False
-                        trade_lost = False
-                        end_idx = min(i + 30, len(candles) - 1)
-                        
-                        for j in range(i + 1, end_idx + 1):
-                            future_c = candles[j]
-                            if future_c["low"] <= stop_loss:
-                                trade_lost = True
-                                break
-                            if future_c["high"] >= take_profit:
-                                trade_won = True
-                                break
-                        
-                        if not trade_won and not trade_lost:
-                            if candles[end_idx]["close"] > entry_price:
-                                trade_won = True
-                            else:
-                                trade_lost = True
+                if risk_dist > 0 and (risk_dist / entry_price) <= 0.04:
+                    take_profit = entry_price + (risk_dist * TARGET_RR)
 
-                        symbol_trades += 1
-                        symbol_longs += 1
-                        grand_total_longs += 1
-                        if trade_won:
-                            wins += 1
-                            balance += (risk_amount * TARGET_RR)
-                        elif trade_lost:
-                            losses += 1
-                            balance -= risk_amount
+                    trade_won = False
+                    trade_lost = False
+                    end_idx = min(i + 30, len(candles) - 1)
+                    
+                    for j in range(i + 1, end_idx + 1):
+                        future_c = candles[j]
+                        if future_c["low"] <= stop_loss:
+                            trade_lost = True
+                            break
+                        if future_c["high"] >= take_profit:
+                            trade_won = True
+                            break
+                    
+                    if not trade_won and not trade_lost:
+                        if candles[end_idx]["close"] > entry_price:
+                            trade_won = True
+                        else:
+                            trade_lost = True
+
+                    symbol_trades += 1
+                    symbol_longs += 1
+                    grand_total_longs += 1
+                    if trade_won:
+                        wins += 1
+                        balance += (risk_amount * TARGET_RR)
+                    elif trade_lost:
+                        losses += 1
+                        balance -= risk_amount
 
         total_wins += wins
         total_losses += losses
