@@ -75,7 +75,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - 1 YEAR DUAL BACKTEST (FIXED)")
+    print("   SCORE HUNTER PRO - 1 YEAR DUAL BACKTEST (V9)")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -99,9 +99,11 @@ def run_backtest():
             is_bullish_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.3
             has_bullish_fvg = prev2_c["high"] < c["low"]
 
-            # شرایط پوزیشن شورت (اصلاح‌شده)
+            # شرایط پوزیشن شورت (اصلاح منطق BOS برای بازار واقعی)
             recent_lows = min(x["low"] for x in sub_candles[-15:-2])
-            is_bearish_bos = c["close"] < recent_lows and (c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.3
+            # اصلاح: چک کردن شکست قیمت به زیرِ میانگینِ کف‌ها یا حمایت نزدیک‌تر
+            avg_lows = sum(x["low"] for x in sub_candles[-10:-2]) / 8
+            is_bearish_bos = c["close"] < avg_lows and (c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.3
             has_bearish_fvg = prev2_c["low"] > c["high"]
 
             current_rsi = calculate_rsi(sub_candles)
