@@ -6,20 +6,17 @@ import time
 def fetch_full_year_coinex(symbol="BTCUSDT"):
     print(f"در حال دانلود دیتای کامل یک‌ساله از صرافی کوینکس برای {symbol}...")
     all_data = []
-    # کوینکس محدودیت دارد، برای گرفتن یک سال دیتای 1h (حدود 8760 کندل)، به صورت پله‌ای عقب می‌رویم
-    # از آخرین انتهای تایم‌استمپ شروع می‌کنیم
+    # آخرین زمان برای شروع پیمایش به سمت گذشته
     end_time = int(time.time())
-    target_candles = 8760
-    fetched = 0
-
-    while fetched < target_candles:
+    target_candles = 8760 # حدود یک سال کندل 1 ساعته
+    
+    while len(all_data) < target_candles:
         url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type=1hour&limit=1000"
-        if fetched > 0:
-            # محدود کردن بر اساس زمان برای گرفتن پله‌های قبلی
-            # ساختار پارامترهای زمان در کوینکس v1 ممکن است نیاز به کنترل داشته باشد، 
-            # در اینجا از روش استاندارد پیجینگ استفاده می‌کنیم
-            pass
-        
+        if all_data:
+            # عقب بردن زمان بر اساس قدیمی‌ترین کندلی که تاکنون گرفته‌ایم
+            oldest_timestamp = all_data[0][0]
+            url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type=1hour&limit=1000&end_time={oldest_timestamp}"
+            
         try:
             response = requests.get(url)
             res_json = response.json()
@@ -28,22 +25,19 @@ def fetch_full_year_coinex(symbol="BTCUSDT"):
             data = res_json["data"]
             if not data:
                 break
+            
+            # اضافه کردن دیتا به ابتدای لیست
             all_data = data + all_data
-            fetched += len(data)
-            # اگر دیتای کمتری داد یعنی به ته تاریخچه رسیده‌ایم
+            
+            # اگر دیتای جدیدی نداد یعنی به ته تاریخچه رسیده‌ایم
             if len(data) < 1000:
                 break
-            break # برای جلوگیری از لوپ بی‌نهایت در صورت محدودیت انتهای تاریخچه API عمومی کوینکس v1
+                
+            # وقفه کوتاه برای بلاک نشدن توسط API
+            time.sleep(0.2)
         except Exception as e:
-            print(f"خطا در دریافت دیتا: {e}")
+            print(f"خطا در دریافت پله‌ای دیتا: {e}")
             break
-
-    if not all_data:
-        # اگر در حالت عادی نتوانست، از همان متد استاندارد تک‌درخواستی با حداکثر ظرفیت استفاده می‌کنیم
-        url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type=1hour&limit=1000"
-        res = requests.get(url).json()
-        if res.get("code") == 0:
-            all_data = res.get("data", [])
 
     if not all_data:
         return None
@@ -55,7 +49,10 @@ def fetch_full_year_coinex(symbol="BTCUSDT"):
     df['high'] = df['high'].astype(float)
     df['low'] = df['low'].astype(float)
     df['volume'] = df['volume'].astype(float)
-    return df.sort_values('timestamp').reset_index(drop=True)
+    
+    # حذف تکراری‌ها و مرتب‌سازی
+    df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
+    return df
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -66,7 +63,7 @@ def calculate_rsi(series, period=14):
 
 def run_backtest_for_symbol(symbol):
     df = fetch_full_year_coinex(symbol)
-    if df is None or len(df) < 50:
+    if df is None or len(df) < 200:
         print(f"دیتای کافی برای {symbol} یافت نشد.\n")
         return
         
@@ -75,11 +72,9 @@ def run_backtest_for_symbol(symbol):
     trades = []
     in_trade = False
     trade_side = None
-    entry_price = 0
-    tp = 0
-    sl = 0
+    entry_price, tp, sl = 0, 0, 0
     
-    for i in range(50, len(df)):
+    for i in range(200, len(df)):
         current_close = df['close'].iloc[i]
         current_rsi = df['rsi'].iloc[i]
         prev_high = df['high'].iloc[i-5:i].max()
@@ -104,14 +99,14 @@ def run_backtest_for_symbol(symbol):
                     trades.append({'side': 'SHORT', 'result': 'LOSS', 'pnl': -1.0})
                     in_trade = False
         else:
-            # شرایط لانگ (بر اساس استراتژی اصلی)
+            # شرایط لانگ
             if current_close > prev_high and 40 <= current_rsi <= 70:
                 in_trade = True
                 trade_side = 'LONG'
                 entry_price = current_close
                 tp = entry_price * 1.025
                 sl = entry_price * 0.99
-            # شرایط شورت (متقارن و استاندارد)
+            # شرایط شورت
             elif current_close < prev_low and 30 <= current_rsi <= 60:
                 in_trade = True
                 trade_side = 'SHORT'
@@ -127,7 +122,7 @@ def run_backtest_for_symbol(symbol):
         win_rate = (wins / total_trades) * 100
         net_profit = df_trades['pnl'].sum()
         
-        print(f"\n--- نتیجه واقعی بک‌تست کوینکس برای {symbol} ---")
+        print(f"\n--- نتیجه واقعی بک‌تست یک‌ساله کوینکس برای {symbol} ---")
         print(f"تعداد کل معاملات: {total_trades}")
         print(f"معاملات موفق (WIN): {wins}")
         print(f"معاملات ناموفق (LOSS): {losses}")
@@ -137,6 +132,5 @@ def run_backtest_for_symbol(symbol):
         print(f"هیچ معامله‌ای برای {symbol} ثبت نشد.\n")
 
 if __name__ == "__main__":
-    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
-    for sym in symbols:
+    for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]:
         run_backtest_for_symbol(sym)
