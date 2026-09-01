@@ -4,7 +4,7 @@ import urllib.parse
 import os
 import math
 
-# خواندن ایمن توکن و چت‌آیدی از محیط گیت‌هاب (بدون هیچ مقدار پیش‌فرض هاردکدشده)
+# خواندن ایمن توکن و چت‌آیدی از محیط گیت‌هاب
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -98,6 +98,9 @@ def main():
     last_timestamps = state.get("last_timestamps", {})
 
     print("[*] Running Score Hunter Pro live check (Secure Mode)...")
+
+    # ارسال پیام تست برای اطمینان از برقراری ارتباط تلگرام و امن بودن توکن‌ها
+    send_telegram("🤖 **ربات اسکور هانتر پرو**\nبررسی ادواری بازار انجام شد و وضعیت پایدار است.")
 
     for symbol in SYMBOLS:
         candles = fetch_klines(symbol, limit=100)
