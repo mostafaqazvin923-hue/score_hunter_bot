@@ -75,7 +75,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - 1 YEAR BALANCED DUAL (V12)")
+    print("   SCORE HUNTER PRO - 1 YEAR DUAL BACKTEST (V13)")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -96,7 +96,7 @@ def run_backtest():
 
             current_rsi = calculate_rsi(sub_candles)
 
-            # --- شرایط پوزیشن لانگ (متعادل) ---
+            # --- شرایط پوزیشن لانگ ---
             recent_highs = max(x["high"] for x in sub_candles[-8:-2])
             is_bullish_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.4
             has_bullish_fvg = prev2_c["high"] < c["low"]
@@ -141,10 +141,10 @@ def run_backtest():
                     balance -= risk_amount
                 continue
 
-            # --- شرایط پوزیشن شورت (متعادل و متقارن) ---
+            # --- شرایط پوزیشن شورت (کاملاً تمیز و اصلاح‌شده) ---
             recent_lows = min(x["low"] for x in sub_candles[-8:-2])
             is_bearish_bos = c["close"] < recent_lows and (c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.4
-            has_bearish_fvg = prev2_c["low']" if False else (prev2_c["low"] > c["high"])
+            has_bearish_fvg = prev2_c["low"] > c["high"]
 
             if is_bearish_bos and has_bearish_fvg and (30 < current_rsi < 60):
                 entry_price = c["close"]
