@@ -29,7 +29,7 @@ def fetch_historical_klines(symbol, limit=8800):
                         op = float(row[1])
                         cl = float(row[2])
                         hi = float(row[3])
-                        lo = float(row[4])
+                        lo = float(row.get("4", row[4]))
                     else:
                         continue
                     candles.append({"timestamp": ts, "open": op, "high": hi, "low": lo, "close": cl})
@@ -75,7 +75,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - 1 YEAR DUAL BACKTEST (V9)")
+    print("   SCORE HUNTER PRO - 1 YEAR DUAL BACKTEST (V10)")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -94,21 +94,13 @@ def run_backtest():
             prev_c = sub_candles[-3]
             prev2_c = sub_candles[-4]
 
-            # شرایط پوزیشن لانگ
+            current_rsi = calculate_rsi(sub_candles)
+
+            # --- شرایط پوزیشن لانگ ---
             recent_highs = max(x["high"] for x in sub_candles[-15:-2])
             is_bullish_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.3
             has_bullish_fvg = prev2_c["high"] < c["low"]
 
-            # شرایط پوزیشن شورت (اصلاح منطق BOS برای بازار واقعی)
-            recent_lows = min(x["low"] for x in sub_candles[-15:-2])
-            # اصلاح: چک کردن شکست قیمت به زیرِ میانگینِ کف‌ها یا حمایت نزدیک‌تر
-            avg_lows = sum(x["low"] for x in sub_candles[-10:-2]) / 8
-            is_bearish_bos = c["close"] < avg_lows and (c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.3
-            has_bearish_fvg = prev2_c["low"] > c["high"]
-
-            current_rsi = calculate_rsi(sub_candles)
-
-            # چک کردن سیگنال LONG
             if is_bullish_bos and has_bullish_fvg and (35 < current_rsi < 75):
                 entry_price = c["close"]
                 stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
@@ -147,9 +139,15 @@ def run_backtest():
                 elif trade_lost:
                     losses += 1
                     balance -= risk_amount
+                continue  # عبور از این کندل برای جلوگیری از تداخل
 
-            # چک کردن سیگنال SHORT
-            elif is_bearish_bos and has_bearish_fvg and (25 < current_rsi < 65):
+            # --- شرایط پوزیشن شورت (اصلاح‌شده و مستقل برای تضمین اجرا) ---
+            recent_lows = min(x["low"] for x in sub_candles[-15:-2])
+            # شرط شورت ساده‌تر و کاربردی‌تر برای صرافی
+            is_bearish_bos = c["close"] < prev_c["low"] and c["close"] < c["open"]
+            has_bearish_fvg = prev2_c["low"] > c["high"]
+
+            if is_bearish_bos and has_bearish_fvg and (current_rsi < 65):
                 entry_price = c["close"]
                 stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
                 risk_dist = stop_loss - entry_price
