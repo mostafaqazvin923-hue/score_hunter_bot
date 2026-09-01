@@ -4,15 +4,19 @@ import urllib.parse
 import os
 import math
 
-# تنظیمات کاملاً منطبق با کد بک‌تست
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8937303392:AAGXDckoHV61vY6G0B4VFcHMi90YbhY-jiY")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "2090120004")
+# خواندن ایمن توکن و چت‌آیدی از محیط گیت‌هاب (بدون هیچ مقدار پیش‌فرض هاردکدشده)
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 TIMEFRAME = "1hour"
 TARGET_RR = 2.0
 STATE_FILE = "active_trades_state.json"
 
 def send_telegram(message):
+    if not TOKEN or not CHAT_ID:
+        print("Telegram Error: Token or Chat ID is missing from environment variables.")
+        return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -93,7 +97,7 @@ def main():
     active_trades = state.get("active_trades", {})
     last_timestamps = state.get("last_timestamps", {})
 
-    print("[*] Running Score Hunter Pro live check...")
+    print("[*] Running Score Hunter Pro live check (Secure Mode)...")
 
     for symbol in SYMBOLS:
         candles = fetch_klines(symbol, limit=100)
@@ -149,7 +153,6 @@ def main():
 
                 take_profit = entry_price + (risk_dist * TARGET_RR)
                 
-                # محاسبه دقیق درصدها برای نمایش در سیگنال
                 tp_percentage = ((take_profit - entry_price) / entry_price) * 100
                 sl_percentage = ((entry_price - stop_loss) / entry_price) * 100
 
