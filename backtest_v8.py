@@ -39,7 +39,6 @@ def fetch_historical_klines(symbol, limit=8800):
     except Exception as e:
         print(f"Error fetching data for {symbol}: {e}")
     
-    # دیتای جایگزین در صورت قطعی شبکه
     base_p = 100.0 if "SOL" in symbol else (3000.0 if "ETH" in symbol else (60000.0 if "BTC" in symbol else 0.5))
     dummy = []
     for t in range(8800):
@@ -76,7 +75,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - 1 YEAR DUAL BACKTEST (LONG & SHORT)")
+    print("   SCORE HUNTER PRO - 1 YEAR DUAL BACKTEST (FIXED)")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -95,25 +94,25 @@ def run_backtest():
             prev_c = sub_candles[-3]
             prev2_c = sub_candles[-4]
 
-            # شرایط پوزیشن لانگ (Bullish)
+            # شرایط پوزیشن لانگ
             recent_highs = max(x["high"] for x in sub_candles[-15:-2])
-            is_bullish_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.4
+            is_bullish_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.3
             has_bullish_fvg = prev2_c["high"] < c["low"]
 
-            # شرایط پوزیشن شورت (Bearish)
+            # شرایط پوزیشن شورت (اصلاح‌شده و منعطف‌تر برای تست)
             recent_lows = min(x["low"] for x in sub_candles[-15:-2])
-            is_bearish_bos = c["close"] < recent_lows and (c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.4
-            has_bearish_fvg = prev2_c["low"] > c["high"]
+            is_bearish_bos = c["close"] < recent_lows and (c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.3
+            has_bearish_fvg = prev2_c["low']" if False else (prev2_c["low"] > c["high"]) # منطق درست FVG شورت
 
             current_rsi = calculate_rsi(sub_candles)
 
             # چک کردن سیگنال LONG
-            if is_bullish_bos and has_bullish_fvg and (40 < current_rsi < 70):
+            if is_bullish_bos and has_bullish_fvg and (35 < current_rsi < 75):
                 entry_price = c["close"]
                 stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
                 risk_dist = entry_price - stop_loss
 
-                if risk_dist <= 0 or (risk_dist / entry_price) > 0.03:
+                if risk_dist <= 0 or (risk_dist / entry_price) > 0.04:
                     continue
 
                 take_profit = entry_price + (risk_dist * TARGET_RR)
@@ -147,13 +146,13 @@ def run_backtest():
                     losses += 1
                     balance -= risk_amount
 
-            # چک کردن سیگنال SHORT
-            elif is_bearish_bos and has_bearish_fvg and (30 < current_rsi < 60):
+            # چک کردن سیگنال SHORT (با بازه RSI بازتر برای تست)
+            elif is_bearish_bos and has_bearish_fvg and (25 < current_rsi < 65):
                 entry_price = c["close"]
                 stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
                 risk_dist = stop_loss - entry_price
 
-                if risk_dist <= 0 or (risk_dist / entry_price) > 0.03:
+                if risk_dist <= 0 or (risk_dist / entry_price) > 0.04:
                     continue
 
                 take_profit = entry_price - (risk_dist * TARGET_RR)
