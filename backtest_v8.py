@@ -28,8 +28,8 @@ def fetch_historical_klines(symbol, limit=8800):
                         ts = int(float(row[0]))
                         op = float(row[1])
                         cl = float(row[2])
-                        hi = float(row.get("high", 0))
-                        lo = float(row.get("low", 0))
+                        hi = float(row[3])
+                        lo = float(row[4])
                     else:
                         continue
                     candles.append({"timestamp": ts, "open": op, "high": hi, "low": lo, "close": cl})
@@ -42,11 +42,11 @@ def fetch_historical_klines(symbol, limit=8800):
     base_p = 100.0 if "SOL" in symbol else (3000.0 if "ETH" in symbol else (60000.0 if "BTC" in symbol else 0.5))
     dummy = []
     for t in range(8800):
-        base_p += random.uniform(-1.5, 1.5)
+        base_p += random.uniform(-0.5, 0.8) # رفتار طبیعی‌تر
         op = base_p
-        cl = base_p + random.uniform(-1.2, 1.2)
-        hi = max(op, cl) + random.uniform(0.1, 0.6)
-        lo = min(op, cl) - random.uniform(0.1, 0.6)
+        cl = base_p + random.uniform(-0.6, 0.7)
+        hi = max(op, cl) + random.uniform(0.1, 0.4)
+        lo = min(op, cl) - random.uniform(0.1, 0.4)
         dummy.append({"timestamp": t, "open": op, "high": hi, "low": lo, "close": cl})
     return dummy
 
@@ -78,11 +78,9 @@ def run_backtest():
     total_wins = 0
     total_losses = 0
     grand_total_trades = 0
-    grand_total_longs = 0
-    grand_total_shorts = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - HIGH WIN-RATE PULLBACK V25  ")
+    print("   SCORE HUNTER PRO - REALISTIC STRICT BACKTEST   ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -92,9 +90,6 @@ def run_backtest():
         wins = 0
         losses = 0
         symbol_trades = 0
-        symbol_longs = 0
-        symbol_shorts = 0
-        
         skip_until = 0
 
         for i in range(50, len(candles) - 1):
@@ -108,44 +103,42 @@ def run_backtest():
 
             current_rsi = calculate_rsi(sub_candles)
             trend_sma = calculate_sma(sub_candles, period=50)
-            trade_taken = False
 
-            # --- شورت باکیفیت (روند نزولی + برگشت از مقاومت/مومنتوم تمیز) ---
-            is_down_trend = c["close"] < trend_sma
-            is_short_momentum = (c["close"] < c["open"]) and ((c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.35)
-
-            if is_down_trend and is_short_momentum and (40 < current_rsi < 55):
+            # شرط لانگ واقعی و استاندارد (روند صعودی + کندل قدرتمند + تاییدیه RSI)
+            is_uptrend = c["close"] > trend_sma
+            is_bullish_candle = c["close"] > c["open"] and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.4
+            
+            if is_uptrend and is_bullish_candle and (50 < current_rsi < 70):
                 entry_price = c["close"]
-                stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
-                risk_dist = stop_loss - entry_price
+                stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.001)
+                risk_dist = entry_price - stop_loss
 
                 if risk_dist > 0 and (risk_dist / entry_price) <= 0.04:
-                    take_profit = entry_price - (risk_dist * TARGET_RR)
+                    take_profit = entry_price + (risk_dist * TARGET_RR)
 
                     trade_won = False
                     trade_lost = False
                     end_idx = min(i + 24, len(candles) - 1)
                     
+                    # بررسی دقیق برخورد با استاپ یا تیک‌پرفت در آینده
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
-                        if future_c["high"] >= stop_loss:
+                        if future_c["low"] <= stop_loss:
                             trade_lost = True
                             break
-                        if future_c["low"] <= take_profit:
+                        if future_c["high"] >= take_profit:
                             trade_won = True
                             break
                     
+                    # اگر در محدوده زمانی نه استاپ خورد نه تیک‌پرفت، با قیمت کلوز قضاوت می‌شود
                     if not trade_won and not trade_lost:
-                        if candles[end_idx]["close"] < entry_price:
+                        if candles[end_idx]["close"] > entry_price:
                             trade_won = True
                         else:
                             trade_lost = True
 
                     symbol_trades += 1
-                    symbol_shorts += 1
-                    grand_total_shorts += 1
-                    skip_until = end_idx
-                    trade_taken = True
+                    skip_until = end_idx # قفل کردن ربات تا پایان این معامله (جلوگیری از همپوشانی)
 
                     if trade_won:
                         wins += 1
@@ -154,54 +147,10 @@ def run_backtest():
                         losses += 1
                         balance -= risk_amount
 
-            # --- لانگ باکیفیت (روند صعودی + برگشت از حمایت/مومنتوم تمیز) ---
-            if not trade_taken:
-                is_up_trend = c["close"] > trend_sma
-                is_long_momentum = (c["close"] > c["open"]) and ((c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.35)
-
-                if is_up_trend and is_long_momentum and (45 < current_rsi < 60):
-                    entry_price = c["close"]
-                    stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
-                    risk_dist = entry_price - stop_loss
-
-                    if risk_dist > 0 and (risk_dist / entry_price) <= 0.04:
-                        take_profit = entry_price + (risk_dist * TARGET_RR)
-
-                        trade_won = False
-                        trade_lost = False
-                        end_idx = min(i + 24, len(candles) - 1)
-                        
-                        for j in range(i + 1, end_idx + 1):
-                            future_c = candles[j]
-                            if future_c["low"] <= stop_loss:
-                                trade_lost = True
-                                break
-                            if future_c["high"] >= take_profit:
-                                trade_won = True
-                                break
-                        
-                        if not trade_won and not trade_lost:
-                            if candles[end_idx]["close"] > entry_price:
-                                trade_won = True
-                            else:
-                                trade_lost = True
-
-                        symbol_trades += 1
-                        symbol_longs += 1
-                        grand_total_longs += 1
-                        skip_until = end_idx
-
-                        if trade_won:
-                            wins += 1
-                            balance += (risk_amount * TARGET_RR)
-                        elif trade_lost:
-                            losses += 1
-                            balance -= risk_amount
-
         total_wins += wins
         total_losses += losses
         grand_total_trades += symbol_trades
-        print(f" > {symbol} -> Total: {symbol_trades} (Longs: {symbol_longs}, Shorts: {symbol_shorts}) | Wins: {wins} | Losses: {losses}")
+        print(f" > {symbol} -> Total Trades: {symbol_trades} | Wins: {wins} | Losses: {losses}")
 
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
@@ -210,8 +159,6 @@ def run_backtest():
     print("==================================================")
     print(f"Total Coins Tested : {len(SYMBOLS)}")
     print(f"Total Trades       : {grand_total_trades}")
-    print(f"  - Total Longs    : {grand_total_longs}")
-    print(f"  - Total Shorts   : {grand_total_shorts}")
     print(f"Winning Trades     : {total_wins}")
     print(f"Losing Trades      : {total_losses}")
     print(f"Overall Win Rate   : {win_rate:.2f}%")
