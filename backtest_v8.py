@@ -44,6 +44,23 @@ def calculate_ema(candles, period):
         ema = (c["close"] - ema) * multiplier + ema
     return ema
 
+def calculate_rsi(candles, period=14):
+    if len(candles) < period + 1:
+        return 50.0
+    gains, losses = 0.0, 0.0
+    for i in range(1, period + 1):
+        change = candles[-i]["close"] - candles[-i-1]["close"]
+        if change > 0:
+            gains += change
+        else:
+            losses -= change
+    avg_gain = gains / period
+    avg_loss = losses / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
@@ -56,7 +73,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - SPATIAL ROOM CHECK RR 2.0   ")
+    print(" SCORE HUNTER PRO - ULTRA ELITE SNIPER RR 2.0   ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -83,32 +100,28 @@ def run_backtest():
 
             ema20 = calculate_ema(sub, 20)
             ema50 = calculate_ema(sub, 50)
+            rsi = calculate_rsi(sub, 14)
             trade_taken = False
 
             trend_strength = abs(ema20 - ema50) / c["close"]
-            if trend_strength < 0.003:
+            if trend_strength < 0.004:  # سخت‌گیری بیشتر روی روند
                 continue
 
-            # --- شورت با بررسی فضای خالی مسیر تا تیک‌پرفت ---
+            # --- شورت الیت با تاییدیه RSI و پاکسازی مسیر ---
             is_down_trend = ema20 < ema50
-            is_strong_short = (c["close"] < c["open"]) and ((c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.55) and (c["close"] < ema20)
+            is_strong_short = (c["close"] < c["open"]) and ((c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.6) and (c["close"] < ema20) and (rsi < 48)
 
             if is_down_trend and is_strong_short:
                 entry_price = c["close"]
-                stop_loss = prev_c["high"] + (entry_price * 0.0012)
+                stop_loss = prev_c["high"] + (entry_price * 0.001)
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.035:
+                if 0 < (risk_dist / entry_price) <= 0.03:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     
-                    # بررسی فضای خالی (برای شورت چک می‌کنیم آیا کفِ مهمی بین ورود و تیک‌پرفت به‌عنوان مانع وجود دارد یا نه)
-                    # نگاه به ۳۰ کندل گذشته برای پیدا کردن کف‌های حمایتی سر راه
                     recent_lows = [x["low"] for x in sub[-30:-2]]
                     closest_support = min(recent_lows) if recent_lows else 0
-                    
-                    # اگر یک حمایت محکم بالاتر از تیک‌پرفتِ ما قرار داشته باشد، یعنی مسیر مسدود است و ترید کنسل می‌شود
                     if closest_support > take_profit and closest_support < entry_price:
-                        # مسیر مسدود است، ترید رد می‌شود تا وین‌ریت خراب نشود
                         continue
 
                     trade_won, trade_lost = False, False
@@ -141,24 +154,21 @@ def run_backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ با بررسی فضای خالی مسیر تا تیک‌پرفت ---
+            # --- لانگ الیت با تاییدیه RSI و پاکسازی مسیر ---
             if not trade_taken:
                 is_up_trend = ema20 > ema50
-                is_strong_long = (c["close"] > c["open"]) and ((c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.55) and (c["close"] > ema20)
+                is_strong_long = (c["close"] > c["open"]) and ((c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.6) and (c["close"] > ema20) and (rsi > 52)
 
                 if is_up_trend and is_strong_long:
                     entry_price = c["close"]
-                    stop_loss = prev_c["low"] - (entry_price * 0.0012)
+                    stop_loss = prev_c["low"] - (entry_price * 0.001)
                     risk_dist = entry_price - stop_loss
 
-                    if 0 < (risk_dist / entry_price) <= 0.035:
+                    if 0 < (risk_dist / entry_price) <= 0.03:
                         take_profit = entry_price + (risk_dist * TARGET_RR)
                         
-                        # بررسی فضای خالی (برای لانگ چک می‌کنیم آیا سقفِ مهمی بین ورود و تیک‌پرفت به عنوان مانع وجود دارد یا نه)
                         recent_highs = [x["high"] for x in sub[-30:-2]]
                         closest_resistance = max(recent_highs) if recent_highs else 999999
-                        
-                        # اگر سقف مقاومت پایین‌تر از تیک‌پرفتِ ما باشد، یعنی مسیر مسدود است
                         if closest_resistance < take_profit and closest_resistance > entry_price:
                             continue
 
@@ -199,7 +209,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("       AGGREGATED SPATIAL ROOM CHECK RESULTS      ")
+    print("     AGGREGATED ULTRA ELITE SNIPER RESULTS        ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
