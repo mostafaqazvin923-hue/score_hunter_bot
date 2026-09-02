@@ -2,8 +2,7 @@ import json
 import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
-TIMEFRAME = "1h"
-TARGET_RR = 2.0  # ریسک به ریوارد ثابت ۱ به ۲
+TARGET_RR = 2.0
 
 def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
@@ -19,59 +18,65 @@ def fetch_real_klines_yahoo(symbol, limit=8800):
             data = result[0]
             timestamps = data.get("timestamp", [])
             quotes = data.get("indicators", {}).get("quote", [{}])[0]
-            opens, highs, lows, closes, volumes = quotes.get("open", []), quotes.get("high", []), quotes.get("low", []), quotes.get("close", []), quotes.get("volume", [])
+            opens = quotes.get("open", [])
+            highs = quotes.get("high", [])
+            lows = quotes.get("low", [])
+            closes = quotes.get("close", [])
+            volumes = quotes.get("volume", [])
             
             candles = []
             for idx in range(len(timestamps)):
-                op, hi, lo, cl, vol, ts = opens[idx], highs[idx], lows[idx], closes[idx], volumes[idx], timestamps[idx]
-                if op is None or hi is None or lo is None or cl is None:
+                if opens[idx] is None or highs[idx] is None or lows[idx] is None or closes[idx] is None:
                     continue
                 candles.append({
-                    "timestamp": int(ts), 
-                    "open": float(op), 
-                    "high": float(hi), 
-                    "low": float(lo), 
-                    "close": float(cl),
-                    "volume": float(vol) if vol is not None else 0.0
+                    "timestamp": int(timestamps[idx]),
+                    "open": float(opens[idx]),
+                    "high": float(highs[idx]),
+                    "low": float(lows[idx]),
+                    "close": float(closes[idx]),
+                    "volume": float(volumes[idx]) if volumes[idx] is not None else 0.0
                 })
-            
             candles.sort(key=lambda x: x["timestamp"])
-            if len(candles) > 100:
-                return candles[-limit:]
+            return candles[-limit:] if len(candles) > 100 else []
     except Exception as e:
         print(f"[!] Error fetching {symbol}: {e}")
-    raise ValueError(f"[!] Could not fetch data for {symbol}.")
+    return []
 
-def calculate_ema(candles, period):
-    if len(candles) < period:
-        return candles[-1]["close"]
+def resample_to_4h(candles_1h):
+    candles_4h = []
+    for i in range(0, len(candles_1h), 4):
+        chunk = candles_1h[i:i+4]
+        if not chunk: continue
+        candles_4h.append({
+            "timestamp": chunk[0]["timestamp"],
+            "open": chunk[0]["open"],
+            "high": max(x["high"] for x in chunk),
+            "low": min(x["low"] for x in chunk),
+            "close": chunk[-1]["close"],
+            "volume": sum(x["volume"] for x in chunk)
+        })
+    return candles_4h
+
+def calculate_ema(closes, period):
+    if len(closes) < period: return closes[-1]
     multiplier = 2 / (period + 1)
-    ema = sum(x["close"] for x in candles[:period]) / period
-    for c in candles[period:]:
-        ema = (c["close"] - ema) * multiplier + ema
+    ema = sum(closes[:period]) / period
+    for p in closes[period:]:
+        ema = (p - ema) * multiplier + ema
     return ema
 
-def calculate_rsi(candles, period=14):
-    if len(candles) < period + 1:
-        return 50.0
-    gains, losses = 0.0, 0.0
-    for i in range(1, period + 1):
-        change = candles[-i]["close"] - candles[-i-1]["close"]
-        if change > 0:
-            gains += change
-        else:
-            losses -= change
-    avg_gain = gains / period
-    avg_loss = losses / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+def calculate_atr(candles, period=14):
+    if len(candles) < period + 1: return candles[-1]["high"] - candles[-1]["low"]
+    trs = []
+    for i in range(1, len(candles)):
+        h = candles[i]["high"]; l = candles[i]["low"]; pc = candles[i-1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs[-period:]) / period
 
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
-    risk_percentage = 0.02  # ریسک ۲ درصدی برای کنترل ریسک
+    risk_percentage = 0.025  # ریسک ۲.۵ درصدی برای سود مرکب بهینه
     
     total_wins = 0
     total_losses = 0
@@ -80,15 +85,14 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - HIGH-PROBABILITY SNIPER V19   ")
+    print(" SCORE HUNTER PRO - MTF 4H/1H + RUNWAY V20        ")
     print("==================================================")
 
     for symbol in SYMBOLS:
-        try:
-            candles = fetch_real_klines_yahoo(symbol, limit=8800)
-        except Exception as err:
-            print(err)
-            continue
+        candles_1h = fetch_real_klines_yahoo(symbol, limit=8800)
+        if not candles_1h or len(candles_1h) < 200: continue
+        
+        candles_4h = resample_to_4h(candles_1h)
         
         wins = 0
         losses = 0
@@ -97,104 +101,107 @@ def run_backtest():
         symbol_shorts = 0
         skip_until = 0
 
-        for i in range(50, len(candles) - 20):
-            if i < skip_until:
-                continue
+        for i in range(50, len(candles_1h) - 20):
+            if i < skip_until: continue
 
-            sub = candles[:i+1]
-            c = sub[-2]       # کندل سیگنال
-            prev_c = sub[-3]  # کندل قبل برای استاپ
+            c1h = candles_1h[i]
+            current_ts = c1h["timestamp"]
 
-            ema20 = calculate_ema(sub, 20)
-            ema50 = calculate_ema(sub, 50)
-            rsi = calculate_rsi(sub, 14)
-            trade_taken = False
+            # پیدا کردن جهت 4 ساعته متناظر
+            active_4h_idx = -1
+            for idx, c4 in enumerate(candles_4h):
+                if c4["timestamp"] <= current_ts:
+                    active_4h_idx = idx
+                else:
+                    break
+            
+            if active_4h_idx < 30: continue
+            
+            sub_4h = candles_4h[:active_4h_idx+1]
+            closes_4h = [x["close"] for x in sub_4h]
+            ema_50_4h = calculate_ema(closes_4h, 50)
+            
+            is_4h_bullish = closes_4h[-1] > ema_50_4h
+            is_4h_bearish = closes_4h[-1] < ema_50_4h
 
-            trend_strength = abs(ema20 - ema50) / c["close"]
-            if trend_strength < 0.0018:  # سخت‌گیری بیشتر روی قدرت روند
-                continue
-
-            candle_range = c["high"] - c["low"]
-            if candle_range == 0:
-                continue
-
-            # فیلتر حجم معاملات (حجم کندل باید بالاتر از میانگین ۲۰ دوره اخیر باشد)
-            recent_volumes = [x["volume"] for x in sub[-22:-2]]
-            avg_volume = sum(recent_volumes) / len(recent_volumes) if recent_volumes else 1.0
-            volume_confirmed = c["volume"] > (avg_volume * 1.35)
-
-            if not volume_confirmed:
-                continue
+            sub_1h = candles_1h[:i+1]
+            c = sub_1h[-2]       # کندل سیگنال
+            prev_c = sub_1h[-3]  # کندل قبل برای استاپ
+            atr_1h = calculate_atr(sub_1h, 14)
+            if atr_1h == 0: continue
 
             current_risk_amount = balance * risk_percentage
+            trade_taken = False
 
-            # --- شورت با فیلترهای سنگین‌تر (Sniper Short) ---
-            is_down_trend = ema20 < ema50
-            body_ratio_short = (c["open"] - c["close"]) / candle_range
-            is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.50) and (c["close"] < ema20) and (rsi < 42)
+            # بررسی فضای مسیر (Runway Check) بر اساس سوییگ‌های اخیر
+            recent_highs = [x["high"] for x in sub_1h[-40:-2]]
+            recent_lows = [x["low"] for x in sub_1h[-40:-2]]
+            major_resistance = max(recent_highs) if recent_highs else c["high"] * 1.05
+            major_support = min(recent_lows) if recent_lows else c["low"] * 0.95
 
-            if is_down_trend and is_short:
+            # تریگر لانگ (همراستا با روند صعودی ۴ ساعته)
+            if is_4h_bullish and (c["close"] > c["open"]) and (c["close"] > prev_c["high"]):
                 entry_price = c["close"]
-                stop_loss = prev_c["high"] + (entry_price * 0.0012)
-                risk_dist = stop_loss - entry_price
+                stop_loss = min(prev_c["low"], c["low"]) - (atr_1h * 0.3)
+                risk_dist = entry_price - stop_loss
 
-                if 0 < (risk_dist / entry_price) <= 0.035:
-                    take_profit = entry_price - (risk_dist * TARGET_RR)
-                    trade_won, trade_lost = False, False
-                    end_idx = min(i + 16, len(candles) - 1)
+                if 0.002 * entry_price <= risk_dist <= 0.035 * entry_price:
+                    take_profit = entry_price + (risk_dist * TARGET_RR)
                     
-                    for j in range(i + 1, end_idx + 1):
-                        future_c = candles[j]
-                        if future_c["high"] >= stop_loss:
-                            trade_lost = True; break
-                        if future_c["low"] <= take_profit:
-                            trade_won = True; break
-                    
-                    if not trade_won and not trade_lost:
-                        trade_won = True if candles[end_idx]["close"] < entry_price else False
-                        trade_lost = not trade_won
-
-                    symbol_trades += 1
-                    symbol_shorts += 1
-                    grand_total_shorts += 1
-                    skip_until = end_idx
-                    trade_taken = True
-
-                    if trade_won: 
-                        wins += 1; balance += (current_risk_amount * TARGET_RR)
-                    elif trade_lost: 
-                        losses += 1; balance -= current_risk_amount
-
-            # --- لانگ با فیلترهای سنگین‌تر (Sniper Long) ---
-            if not trade_taken:
-                is_up_trend = ema20 > ema50
-                body_ratio_long = (c["close"] - c["open"]) / candle_range
-                is_long = (c["close"] > c["open"]) and (body_ratio_long > 0.50) and (c["close"] > ema20) and (rsi > 58)
-
-                if is_up_trend and is_long:
-                    entry_price = c["close"]
-                    stop_loss = prev_c["low"] - (entry_price * 0.0012)
-                    risk_dist = entry_price - stop_loss
-
-                    if 0 < (risk_dist / entry_price) <= 0.035:
-                        take_profit = entry_price + (risk_dist * TARGET_RR)
+                    # فیلتر فضای مسیر: آیا تا TP مانع محکمی هست؟
+                    if major_resistance >= (take_profit - (risk_dist * 0.1)):
                         trade_won, trade_lost = False, False
-                        end_idx = min(i + 16, len(candles) - 1)
+                        end_idx = min(i + 16, len(candles_1h) - 1)
                         
                         for j in range(i + 1, end_idx + 1):
-                            future_c = candles[j]
+                            future_c = candles_1h[j]
                             if future_c["low"] <= stop_loss:
                                 trade_lost = True; break
                             if future_c["high"] >= take_profit:
                                 trade_won = True; break
                         
                         if not trade_won and not trade_lost:
-                            trade_won = True if candles[end_idx]["close"] > entry_price else False
+                            trade_won = True if candles_1h[end_idx]["close"] > entry_price else False
                             trade_lost = not trade_won
 
                         symbol_trades += 1
                         symbol_longs += 1
                         grand_total_longs += 1
+                        skip_until = end_idx
+                        trade_taken = True
+
+                        if trade_won: 
+                            wins += 1; balance += (current_risk_amount * TARGET_RR)
+                        elif trade_lost: 
+                            losses += 1; balance -= current_risk_amount
+
+            # تریگر شورت (همراستا با روند نزولی ۴ ساعته)
+            if is_4h_bearish and not trade_taken and (c["close"] < c["open"]) and (c["close"] < prev_c["low"]):
+                entry_price = c["close"]
+                stop_loss = max(prev_c["high"], c["high"]) + (atr_1h * 0.3)
+                risk_dist = stop_loss - entry_price
+
+                if 0.002 * entry_price <= risk_dist <= 0.035 * entry_price:
+                    take_profit = entry_price - (risk_dist * TARGET_RR)
+                    
+                    if major_support <= (take_profit + (risk_dist * 0.1)):
+                        trade_won, trade_lost = False, False
+                        end_idx = min(i + 16, len(candles_1h) - 1)
+                        
+                        for j in range(i + 1, end_idx + 1):
+                            future_c = candles_1h[j]
+                            if future_c["high"] >= stop_loss:
+                                trade_lost = True; break
+                            if future_c["low"] <= take_profit:
+                                trade_won = True; break
+                        
+                        if not trade_won and not trade_lost:
+                            trade_won = True if candles_1h[end_idx]["close"] < entry_price else False
+                            trade_lost = not trade_won
+
+                        symbol_trades += 1
+                        symbol_shorts += 1
+                        grand_total_shorts += 1
                         skip_until = end_idx
 
                         if trade_won: 
@@ -210,7 +217,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED V19 SNIPER RESULTS               ")
+    print("      AGGREGATED MTF V20 RESULTS                  ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
