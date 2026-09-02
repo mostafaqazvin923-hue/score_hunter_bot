@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading 1-year Institutional Data for {symbol_key}...")
+        print(f"[*] Downloading 1-year Optimized Data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -53,13 +53,18 @@ def calculate_atr(candles, period=14):
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-period:]) / period
 
-def calculate_ema(closes, period=50):
-    if len(closes) < period: return closes[-1]
-    multiplier = 2 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for price in closes[period:]:
-        ema = (price - ema) * multiplier + ema
-    return ema
+def calculate_rsi(closes, period=14):
+    if len(closes) < period + 1: return 50.0
+    gains, losses = 0.0, 0.0
+    for i in range(1, period + 1):
+        diff = closes[-i] - closes[-i-1]
+        if diff >= 0: gains += diff
+        else: losses -= diff
+    avg_gain = gains / period
+    avg_loss = losses / period
+    if avg_loss == 0: return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 def run_backtest():
     initial_balance = 1000.0
@@ -68,60 +73,52 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - INSTITUTIONAL V3 (TREND)    ")
+    print("   SCORE HUNTER PRO - OPTIMIZED V4 (70% TARGET)   ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
         if not candles or len(candles) < 100: continue
         
-        print(f"[*] Running Trend-Pullback backtest for {symbol_key}...")
+        print(f"[*] Running High-Frequency V4 backtest for {symbol_key}...")
         wins, losses, symbol_trades = 0, 0, 0
-        
-        # متغیر برای مدیریت قفل معامله روی این ارز (Lock & Wait)
         in_position_until = 0
 
-        for i in range(50, len(candles) - 30):
-            # قانون: اگر روی این ارز پوزیشن باز داریم، به هیچ وجه سیگنال جدیدی نگیر
+        for i in range(30, len(candles) - 30):
+            # قانون قفل معامله روی هر ارز تا روشن شدن تکلیف پوزیشن قبلی
             if i < in_position_until: 
                 continue
 
             sub = candles[:i+1]
             closes = [x["close"] for x in sub]
             
-            c = sub[-1]       # کندل جاری
-            prev_c = sub[-2]  # کندل قبلی
+            c = sub[-1]
+            prev_c = sub[-2]
             
             atr = calculate_atr(sub, 14)
-            ema_50 = calculate_ema(closes, 50)
+            rsi = calculate_rsi(closes, 14)
             if atr == 0: continue
 
-            # تعیین روند با استفاده از EMA 50 (سبک نهنگی Trend Following)
-            is_uptrend = c["close"] > ema_50
-            is_downtrend = c["close"] < ema_50
+            # اسوینگ‌های نزدیک‌تر برای افزایش تعداد معاملات (فرکانس بالاتر)
+            recent_swing_high = max(x["high"] for x in sub[-12:-1])
+            recent_swing_low = min(x["low"] for x in sub[-12:-1])
 
-            # اسوینگ‌های اخیر برای تشخیص پولبک و نقدینگی
-            recent_swing_high = max(x["high"] for x in sub[-25:-1])
-            recent_swing_low = min(x["low"] for x in sub[-25:-1])
-
-            # شرایط ورود: پولبک به کف/سقف در راستای روند اصلی + تاییدیه کندلستیک
-            buy_signal = is_uptrend and (prev_c["low"] <= recent_swing_low * 1.002) and (c["close"] > c["open"]) and (c["volume"] > sub[-3]["volume"])
-            sell_signal = is_downtrend and (prev_c["high"] >= recent_swing_high * 0.998) and (c["close"] < c["open"]) and (c["volume"] > sub[-3]["volume"])
+            # شرایط ورود بهینه‌شده با فیلتر RSI برای بالا بردن وین‌ریت
+            buy_signal = (prev_c["low"] <= recent_swing_low) and (c["close"] > c["open"]) and (rsi < 45)
+            sell_signal = (prev_c["high"] >= recent_swing_high) and (c["close"] < c["open"]) and (rsi > 55)
 
             trade_taken = False
 
             if buy_signal:
                 entry_price = c["close"]
-                stop_loss = recent_swing_low - (atr * 0.5)
+                stop_loss = recent_swing_low - (atr * 0.4)
                 risk_dist = entry_price - stop_loss
 
-                # فیلتر منطقی اندازه ریسک
-                if 0.002 * entry_price <= risk_dist <= 0.035 * entry_price:
+                if 0.001 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
                     
-                    # رصد دقیق معامله تا مشخص شدن تکلیف نهایی (SL یا TP)
                     for j in range(i + 1, len(candles)):
                         future_c = candles[j]
                         if future_c["low"] <= stop_loss:
@@ -134,7 +131,7 @@ def run_backtest():
                             break
 
                     symbol_trades += 1
-                    in_position_until = end_idx + 1  # قفل کردن ارز تا پایان کامل این معامله
+                    in_position_until = end_idx + 1
                     trade_taken = True
                     
                     if trade_won: 
@@ -146,10 +143,10 @@ def run_backtest():
 
             elif sell_signal and not trade_taken:
                 entry_price = c["close"]
-                stop_loss = recent_swing_high + (atr * 0.5)
+                stop_loss = recent_swing_high + (atr * 0.4)
                 risk_dist = stop_loss - entry_price
 
-                if 0.002 * entry_price <= risk_dist <= 0.035 * entry_price:
+                if 0.001 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
@@ -166,7 +163,7 @@ def run_backtest():
                             break
 
                     symbol_trades += 1
-                    in_position_until = end_idx + 1  # قفل کردن ارز تا پایان کامل این معهمله
+                    in_position_until = end_idx + 1
                     
                     if trade_won: 
                         wins += 1
@@ -183,7 +180,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED INSTITUTIONAL V3 RESULTS         ")
+    print("      AGGREGATED OPTIMIZED V4 RESULTS             ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
