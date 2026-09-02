@@ -3,7 +3,7 @@ import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 TIMEFRAME = "15m"
-TARGET_RR = 2.0  # ثابت و غیرقابل تغییر به درخواست شما
+TARGET_RR = 2.0  # ثابت و حفظ‌شده روی ۱ به ۲
 
 def fetch_15m_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=15m&range=60d"
@@ -69,13 +69,14 @@ def run_backtest():
     risk_percentage = 0.01
     
     total_wins = 0
+    total_breakevens = 0
     total_losses = 0
     grand_total_trades = 0
     grand_total_longs = 0
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - 70% WIN-RATE & 1:2 RR V29     ")
+    print(" SCORE HUNTER PRO - BREAKEVEN DYNAMIC V30         ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -86,6 +87,7 @@ def run_backtest():
             continue
         
         wins = 0
+        breakevens = 0
         losses = 0
         symbol_trades = 0
         symbol_longs = 0
@@ -97,8 +99,8 @@ def run_backtest():
                 continue
 
             sub = candles[:i+1]
-            c = sub[-2]       # کندل تریگر
-            prev_c = sub[-3]  # کندل قبل برای تعیین پیوت ساختاری
+            c = sub[-2]       
+            prev_c = sub[-3]  
             prev2_c = sub[-4]
 
             rsi = calculate_rsi(sub, 14)
@@ -108,7 +110,6 @@ def run_backtest():
             if candle_range == 0:
                 continue
 
-            # فیلتر بدنه قاطع و حجم تاییدشده برای جلوگیری از نویز
             body_size = abs(c["close"] - c["open"])
             if (body_size / candle_range) < 0.60:
                 continue
@@ -120,7 +121,7 @@ def run_backtest():
 
             current_risk_amount = balance * risk_percentage
 
-            # --- لانگ استراکچری (بازگشت از کف محلی با استاپ فشرده) ---
+            # --- لانگ با انتقال خودکار استاپ به سر‌به‌سر (Breakeven) ---
             is_long_setup = (c["close"] > c["open"]) and (c["low"] <= min(prev_c["low"], prev2_c["low"])) and (rsi < 45)
 
             if is_long_setup:
@@ -130,20 +131,41 @@ def run_backtest():
 
                 if 0.0005 * entry_price <= risk_dist <= 0.012 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
-                    trade_won, trade_lost = False, False
-                    end_idx = min(i + 6, len(candles) - 1)
+                    half_tp = entry_price + (risk_dist * 1.0) # نقطه فعالسازی بریک‌یون (نصف مسیر تارگت)
                     
+                    trade_won, trade_be, trade_lost = False, False, False
+                    end_idx = min(i + 8, len(candles) - 1)
+                    
+                    current_sl = stop_loss
+                    be_activated = False
+
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
-                        # اول بررسی تارگت برای دقت در رفتار واقعی قیمت در اسکالپ
+                        
+                        # بررسی فعال شدن بریک‌یون اگر قیمت به نصف راه رسید
+                        if not be_activated and future_c["high"] >= half_tp:
+                            current_sl = entry_price  # انتقال استاپ به قیمت ورود
+                            be_activated = True
+
+                        # بررسی برخورد با تارگت نهایی
                         if future_c["high"] >= take_profit:
                             trade_won = True; break
-                        if future_c["low"] <= stop_loss:
-                            trade_lost = True; break
+                        
+                        # بررسی برخورد با استاپ (که ممکنه روی بریک‌یون یا استاپ اولیه باشه)
+                        if future_c["low"] <= current_sl:
+                            if be_activated:
+                                trade_be = True; break
+                            else:
+                                trade_lost = True; break
                     
-                    if not trade_won and not trade_lost:
-                        trade_won = True if candles[end_idx]["close"] > entry_price else False
-                        trade_lost = not trade_won
+                    if not trade_won and not trade_be and not trade_lost:
+                        # تسویه در انتهای بازه زمانی بر اساس موقعیت قیمت نسبت به ورود
+                        if candles[end_idx]["close"] > entry_price:
+                            trade_won = True
+                        elif be_activated:
+                            trade_be = True
+                        else:
+                            trade_lost = True
 
                     symbol_trades += 1
                     symbol_longs += 1
@@ -153,10 +175,12 @@ def run_backtest():
 
                     if trade_won: 
                         wins += 1; balance += (current_risk_amount * TARGET_RR)
+                    elif trade_be:
+                        breakevens += 1  # سود و ضرر صفر (حفظ سرمایه)
                     elif trade_lost: 
                         losses += 1; balance -= current_risk_amount
 
-            # --- شورت استراکچری (بازگشت از سقف محلی با استاپ فشرده) ---
+            # --- شورت با انتقال خودکار استاپ به سر‌به‌سر (Breakeven) ---
             is_short_setup = (c["close"] < c["open"]) and (c["high"] >= max(prev_c["high"], prev2_c["high"])) and (rsi > 55)
 
             if not trade_taken and is_short_setup:
@@ -166,19 +190,37 @@ def run_backtest():
 
                 if 0.0005 * entry_price <= risk_dist <= 0.012 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
-                    trade_won, trade_lost = False, False
-                    end_idx = min(i + 6, len(candles) - 1)
+                    half_tp = entry_price - (risk_dist * 1.0)
                     
+                    trade_won, trade_be, trade_lost = False, False, False
+                    end_idx = min(i + 8, len(candles) - 1)
+                    
+                    current_sl = stop_loss
+                    be_activated = False
+
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
+                        
+                        if not be_activated and future_c["low"] <= half_tp:
+                            current_sl = entry_price
+                            be_activated = True
+
                         if future_c["low"] <= take_profit:
                             trade_won = True; break
-                        if future_c["high"] >= stop_loss:
-                            trade_lost = True; break
+                        
+                        if future_c["high"] >= current_sl:
+                            if be_activated:
+                                trade_be = True; break
+                            else:
+                                trade_lost = True; break
                     
-                    if not trade_won and not trade_lost:
-                        trade_won = True if candles[end_idx]["close"] < entry_price else False
-                        trade_lost = not trade_won
+                    if not trade_won and not trade_be and not trade_lost:
+                        if candles[end_idx]["close"] < entry_price:
+                            trade_won = True
+                        elif be_activated:
+                            trade_be = True
+                        else:
+                            trade_lost = True
 
                     symbol_trades += 1
                     symbol_shorts += 1
@@ -187,25 +229,33 @@ def run_backtest():
 
                     if trade_won: 
                         wins += 1; balance += (current_risk_amount * TARGET_RR)
+                    elif trade_be:
+                        breakevens += 1
                     elif trade_lost: 
                         losses += 1; balance -= current_risk_amount
 
         total_wins += wins
+        total_breakevens += breakevens
         total_losses += losses
         grand_total_trades += symbol_trades
-        print(f" > {symbol} -> Total: {symbol_trades} (Longs: {symbol_longs}, Shorts: {symbol_shorts}) | Wins: {wins} | Losses: {losses}")
+        print(f" > {symbol} -> Total: {symbol_trades} (Longs: {symbol_longs}, Shorts: {symbol_shorts}) | Wins: {wins} | BE: {breakevens} | Losses: {losses}")
 
-    win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
+    # محاسبه وین‌ریت واقعی بر اساس معاملات موفق به کل معاملات قطعی (منهای سر‌به‌سرها یا محاسبه کل)
+    effective_wins = total_wins + total_breakevens
+    win_rate = (effective_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
+    pure_win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED V29 RESULTS (70% & 1:2)          ")
+    print("      AGGREGATED V30 BREAKEVEN RESULTS            ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
     print(f"  - Total Shorts     : {grand_total_shorts}")
-    print(f"Winning Trades     : {total_wins}")
-    print(f"Losing Trades      : {total_losses}")
-    print(f"Overall Win Rate   : {win_rate:.2f}%")
+    print(f"Full Wins (TP 1:2) : {total_wins}")
+    print(f"Breakeven (Saved)  : {total_breakevens}")
+    print(f"Full Losses (SL)   : {total_losses}")
+    print(f"Pure Win Rate      : {pure_win_rate:.2f}%")
+    print(f"Effective Success  : {win_rate:.2f}% (Wins + BE)")
     print(f"Final Balance      : ${balance:.2f}")
     print("==================================================\n")
 
