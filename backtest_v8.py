@@ -3,7 +3,7 @@ import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 TIMEFRAME = "1h"
-TARGET_RR = 2.0  # ریسک به ریوارد دقیقاً ۱ به ۲ (سود دو برابر ریسک)
+TARGET_RR = 2.0  # ریسک به ریوارد دقیقاً ۱ به ۲
 
 def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
@@ -61,22 +61,10 @@ def calculate_rsi(candles, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def calculate_atr(candles, period=14):
-    if len(candles) < period + 1:
-        return candles[-1]["high"] - candles[-1]["low"]
-    trs = []
-    for i in range(1, len(candles)):
-        h = candles[i]["high"]
-        l = candles[i]["low"]
-        pc = candles[i-1]["close"]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        trs.append(tr)
-    return sum(trs[-period:]) / period
-
 def _backtest():
     initial_balance = 1000.0
     balance = initial_balance
-    risk_amount = 25.0  # ریسک ثابت پایه برای ارزیابی دقیق تعداد برد و باخت
+    risk_amount = 25.0
     
     total_wins = 0
     total_losses = 0
@@ -85,7 +73,7 @@ def _backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - INSTITUTIONAL HYBRID MODEL  ")
+    print(" SCORE HUNTER PRO - IMPULSE MOMENTUM 1:2 MODEL    ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -102,44 +90,39 @@ def _backtest():
         symbol_shorts = 0
         skip_until = 0
 
-        for i in range(50, len(candles) - 1):
+        for i in range(30, len(candles) - 1):
             if i < skip_until:
                 continue
 
             sub = candles[:i+1]
             c = sub[-2]
             
-            ema20 = calculate_ema(sub, 20)
-            ema50 = calculate_ema(sub, 50)
-            ema200 = calculate_ema(sub, 200) # فیلتر روند بلندمدت موسساتی
+            ema10 = calculate_ema(sub, 10)
+            ema30 = calculate_ema(sub, 30)
             rsi = calculate_rsi(sub, 14)
-            atr = calculate_atr(sub, 14)
             trade_taken = False
-
-            # فیلتر رژیم بازار (جلوگیری از ورود در بازارهای خنثی با نوسان کم)
-            if atr == 0 or (atr / c["close"]) < 0.002:
-                continue
 
             candle_range = c["high"] - c["low"]
             if candle_range == 0:
                 continue
 
-            # --- مدل ترکیبی شورت (Institutional Short Confluence) ---
-            is_down_trend = (ema20 < ema50) and (c["close"] < ema200)
-            body_ratio_short = (c["open"] - c["close"]) / candle_range
-            is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.35) and (rsi < 46)
+            # --- شورت مومنتوم با حد ضرر و سود ساختاری (RR = 1:2) ---
+            is_down_trend = ema10 < ema30
+            body_size = c["open"] - c["close"]
+            body_ratio_short = body_size / candle_range
+            
+            # شرط ورود: بدنه قوی، جهت روند نزولی، بسته شدن زیر EMA10 و تایید RSI
+            is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.45) and (c["close"] < ema10) and (rsi < 48)
 
             if is_down_trend and is_short:
                 entry_price = c["close"]
-                # حد ضرر ساختاری ترکیبی بر اساس سقف کندل‌های اخیر + بافر ATR
-                recent_high = max(sub[-1]["high"], sub[-2]["high"], sub[-3]["high"])
-                stop_loss = recent_high + (atr * 0.4)
+                stop_loss = c["high"] + (entry_price * 0.001)  # سقف کندل فعلی به عنوان حد ضرر ساختاری
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.04:
+                if 0 < (risk_dist / entry_price) <= 0.03:
                     take_profit = entry_price - (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 14, len(candles) - 1)
+                    end_idx = min(i + 12, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -155,7 +138,7 @@ def _backtest():
                     symbol_trades += 1
                     symbol_shorts += 1
                     grand_total_shorts += 1
-                    skip_until = end_idx - 2
+                    skip_until = end_idx - 1
                     trade_taken = True
 
                     if trade_won: 
@@ -163,23 +146,23 @@ def _backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- مدل ترکیبی لانگ (Institutional Long Confluence) ---
+            # --- لانگ مومنتوم با حد ضرر و سود ساختاری (RR = 1:2) ---
             if not trade_taken:
-                is_up_trend = (ema20 > ema50) and (c["close"] > ema200)
-                body_ratio_long = (c["close"] - c["open"]) / candle_range
-                is_long = (c["close"] > c["open"]) and (body_ratio_long > 0.35) and (rsi > 54)
+                is_up_trend = ema10 > ema30
+                body_size = c["close"] - c["open"]
+                body_ratio_long = body_size / candle_range
+                
+                is_long = (c["close"] > c["open"]) and (body_ratio_long > 0.45) and (c["close"] > ema10) and (rsi > 52)
 
                 if is_up_trend and is_long:
                     entry_price = c["close"]
-                    # حد ضرر ساختاری ترکیبی بر اساس کف کندل‌های اخیر - بافر ATR
-                    recent_low = min(sub[-1]["low"], sub[-2]["low"], sub[-3]["low"])
-                    stop_loss = recent_low - (atr * 0.4)
+                    stop_loss = c["low"] - (entry_price * 0.001)  # کف کندل فعلی به عنوان حد ضرر ساختاری
                     risk_dist = entry_price - stop_loss
 
-                    if 0 < (risk_dist / entry_price) <= 0.04:
+                    if 0 < (risk_dist / entry_price) <= 0.03:
                         take_profit = entry_price + (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
                         trade_won, trade_lost = False, False
-                        end_idx = min(i + 14, len(candles) - 1)
+                        end_idx = min(i + 12, len(candles) - 1)
                         
                         for j in range(i + 1, end_idx + 1):
                             future_c = candles[j]
@@ -195,7 +178,7 @@ def _backtest():
                         symbol_trades += 1
                         symbol_longs += 1
                         grand_total_longs += 1
-                        skip_until = end_idx - 2
+                        skip_until = end_idx - 1
 
                         if trade_won: 
                             wins += 1; balance += (risk_amount * TARGET_RR)
@@ -210,7 +193,7 @@ def _backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED HYBRID MODEL RESULTS             ")
+    print("      AGGREGATED IMPULSE MOMENTUM RESULTS         ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
