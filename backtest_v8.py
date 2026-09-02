@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading V12 Robust Market Data for {symbol_key}...")
+        print(f"[*] Downloading V13 Sniper Data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -110,14 +110,14 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - ROBUST TREND V12 (FIXED)      ")
+    print(" SCORE HUNTER PRO - SNIPER HIGH WIN-RATE V13      ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
         if not candles or len(candles) < 250: continue
         
-        print(f"[*] Running V12 Backtest for {symbol_key}...")
+        print(f"[*] Running V13 Sniper Backtest for {symbol_key}...")
         wins, losses, symbol_trades = 0, 0, 0
         in_position_until = 0
 
@@ -141,31 +141,34 @@ def run_backtest():
             
             if atr == 0: continue
 
-            # فیلتر رژیم بازار قدرتمندتر
-            if adx < 20: continue
+            # فیلتر رژیم بسیار سنگین (فقط روندهای خیلی قوی ADX > 30)
+            if adx < 30: continue
 
-            is_bullish_trend = (c["close"] > ema_200) and (ema_20 > ema_50)
-            is_bearish_trend = (c["close"] < ema_200) and (ema_20 < ema_50)
+            # تلاقی کامل و بی‌نقص روندها
+            is_strong_bullish = (c["close"] > ema_200) and (ema_20 > ema_50) and (ema_50 > ema_200)
+            is_strong_bearish = (c["close"] < ema_200) and (ema_20 < ema_50) and (ema_50 < ema_200)
 
-            # شرایط تمیز روند و مومنتوم به جای تله بریک‌آوت‌های کاذب ساعتی
-            bullish_setup = is_bullish_trend and (prev_c["close"] < ema_20) and (c["close"] > c["open"]) and (rsi > 48)
-            bearish_setup = is_bearish_trend and (prev_c["close"] > ema_20) and (c["close"] < c["open"]) and (rsi < 52)
+            avg_vol = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else 1.0
+            volume_spike = c["volume"] > (avg_vol * 1.4)
+
+            # شرایط تک‌تیرانداز با سخت‌گیری بالا
+            sniper_buy = is_strong_bullish and volume_spike and (prev_c["close"] < ema_20) and (c["close"] > c["open"]) and (rsi > 55)
+            sniper_sell = is_strong_bearish and volume_spike and (prev_c["close"] > ema_20) and (c["close"] < c["open"]) and (rsi < 45)
 
             trade_taken = False
 
-            if bullish_setup:
+            if sniper_buy:
                 entry_price = c["close"]
-                stop_loss = entry_price - (atr * 1.5)  # فاصله ایمن‌تر برای جلوگیری از فیک‌ناتس
+                stop_loss = entry_price - (atr * 1.8)  # استاپ ایمن‌تر برای جلوگیری از اسکرپ
                 risk_dist = entry_price - stop_loss
 
-                if 0.002 * entry_price <= risk_dist <= 0.05 * entry_price:
+                if 0.003 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
                     
                     for j in range(i + 1, len(candles)):
                         future_c = candles[j]
-                        # اول بررسی می‌کنیم آیا تک‌پرافیت تاچ شده یا استاپ‌لاس
                         if future_c["high"] >= take_profit:
                             trade_won = True
                             end_idx = j
@@ -186,12 +189,12 @@ def run_backtest():
                         losses += 1
                         balance -= risk_amount
 
-            elif bearish_setup and not trade_taken:
+            elif sniper_sell and not trade_taken:
                 entry_price = c["close"]
-                stop_loss = entry_price + (atr * 1.5)
+                stop_loss = entry_price + (atr * 1.8)
                 risk_dist = stop_loss - entry_price
 
-                if 0.002 * entry_price <= risk_dist <= 0.05 * entry_price:
+                if 0.003 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
@@ -225,7 +228,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED V12 ROBUST RESULTS               ")
+    print("      AGGREGATED V13 SNIPER RESULTS               ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
