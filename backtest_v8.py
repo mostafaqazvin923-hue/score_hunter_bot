@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading 1-year Whale Data for {symbol_key}...")
+        print(f"[*] Downloading 1-year Institutional Data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -53,6 +53,14 @@ def calculate_atr(candles, period=14):
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-period:]) / period
 
+def calculate_ema(closes, period=50):
+    if len(closes) < period: return closes[-1]
+    multiplier = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
+
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
@@ -60,84 +68,112 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - SMART MONEY SWEEP V2        ")
+    print("   SCORE HUNTER PRO - INSTITUTIONAL V3 (TREND)    ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
         if not candles or len(candles) < 100: continue
         
-        print(f"[*] Running Smart Money backtest for {symbol_key}...")
-        wins, losses, symbol_trades, skip_until = 0, 0, 0, 0
+        print(f"[*] Running Trend-Pullback backtest for {symbol_key}...")
+        wins, losses, symbol_trades = 0, 0, 0
+        
+        # متغیر برای مدیریت قفل معامله روی این ارز (Lock & Wait)
+        in_position_until = 0
 
-        for i in range(30, len(candles) - 30):
-            if i < skip_until: continue
+        for i in range(50, len(candles) - 30):
+            # قانون: اگر روی این ارز پوزیشن باز داریم، به هیچ وجه سیگنال جدیدی نگیر
+            if i < in_position_until: 
+                continue
 
             sub = candles[:i+1]
-            c = sub[-2]       # کندل تاییدیه
-            prev_c = sub[-3]  # کندل نفوذ (Sweep)
+            closes = [x["close"] for x in sub]
+            
+            c = sub[-1]       # کندل جاری
+            prev_c = sub[-2]  # کندل قبلی
             
             atr = calculate_atr(sub, 14)
+            ema_50 = calculate_ema(closes, 50)
             if atr == 0: continue
 
-            # محدوده سقف و کف 20 کندل اخیر
-            recent_swing_high = max(x["high"] for x in sub[-22:-2])
-            recent_swing_low = min(x["low"] for x in sub[-22:-2])
+            # تعیین روند با استفاده از EMA 50 (سبک نهنگی Trend Following)
+            is_uptrend = c["close"] > ema_50
+            is_downtrend = c["close"] < ema_50
 
-            # شرایط انعطاف‌پذیرتر برای شکار نقدینگی و برگشت
-            bullish_sweep = (prev_c["low"] <= recent_swing_low) and (c["close"] > recent_swing_low) and (c["close"] > c["open"])
-            bearish_sweep = (prev_c["high"] >= recent_swing_high) and (c["close"] < recent_swing_high) and (c["close"] < c["open"])
+            # اسوینگ‌های اخیر برای تشخیص پولبک و نقدینگی
+            recent_swing_high = max(x["high"] for x in sub[-25:-1])
+            recent_swing_low = min(x["low"] for x in sub[-25:-1])
+
+            # شرایط ورود: پولبک به کف/سقف در راستای روند اصلی + تاییدیه کندلستیک
+            buy_signal = is_uptrend and (prev_c["low"] <= recent_swing_low * 1.002) and (c["close"] > c["open"]) and (c["volume"] > sub[-3]["volume"])
+            sell_signal = is_downtrend and (prev_c["high"] >= recent_swing_high * 0.998) and (c["close"] < c["open"]) and (c["volume"] > sub[-3]["volume"])
 
             trade_taken = False
 
-            if bullish_sweep:
+            if buy_signal:
                 entry_price = c["close"]
-                stop_loss = prev_c["low"] - (atr * 0.3)
+                stop_loss = recent_swing_low - (atr * 0.5)
                 risk_dist = entry_price - stop_loss
 
-                if 0 < (risk_dist / entry_price) <= 0.04:
+                # فیلتر منطقی اندازه ریسک
+                if 0.002 * entry_price <= risk_dist <= 0.035 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 36, len(candles) - 1)
+                    end_idx = len(candles) - 1
                     
-                    for j in range(i + 1, end_idx + 1):
+                    # رصد دقیق معامله تا مشخص شدن تکلیف نهایی (SL یا TP)
+                    for j in range(i + 1, len(candles)):
                         future_c = candles[j]
-                        if future_c["low"] <= stop_loss: trade_lost = True; end_idx = j; break
-                        if future_c["high"] >= take_profit: trade_won = True; end_idx = j; break
-                    
-                    if not trade_won and not trade_lost:
-                        trade_won = True if candles[end_idx]["close"] > entry_price else False
-                        trade_lost = not trade_won
+                        if future_c["low"] <= stop_loss:
+                            trade_lost = True
+                            end_idx = j
+                            break
+                        if future_c["high"] >= take_profit:
+                            trade_won = True
+                            end_idx = j
+                            break
 
                     symbol_trades += 1
-                    skip_until = end_idx + 6
+                    in_position_until = end_idx + 1  # قفل کردن ارز تا پایان کامل این معامله
                     trade_taken = True
-                    if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
-                    elif trade_lost: losses += 1; balance -= risk_amount
+                    
+                    if trade_won: 
+                        wins += 1
+                        balance += (risk_amount * TARGET_RR)
+                    elif trade_lost: 
+                        losses += 1
+                        balance -= risk_amount
 
-            if not trade_taken and bearish_sweep:
+            elif sell_signal and not trade_taken:
                 entry_price = c["close"]
-                stop_loss = prev_c["high"] + (atr * 0.3)
+                stop_loss = recent_swing_high + (atr * 0.5)
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.04:
+                if 0.002 * entry_price <= risk_dist <= 0.035 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 36, len(candles) - 1)
+                    end_idx = len(candles) - 1
                     
-                    for j in range(i + 1, end_idx + 1):
+                    for j in range(i + 1, len(candles)):
                         future_c = candles[j]
-                        if future_c["high"] >= stop_loss: trade_lost = True; end_idx = j; break
-                        if future_c["low"] <= take_profit: trade_won = True; end_idx = j; break
-                    
-                    if not trade_won and not trade_lost:
-                        trade_won = True if candles[end_idx]["close"] < entry_price else False
-                        trade_lost = not trade_won
+                        if future_c["high"] >= stop_loss:
+                            trade_lost = True
+                            end_idx = j
+                            break
+                        if future_c["low"] <= take_profit:
+                            trade_won = True
+                            end_idx = j
+                            break
 
                     symbol_trades += 1
-                    skip_until = end_idx + 6
-                    if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
-                    elif trade_lost: losses += 1; balance -= risk_amount
+                    in_position_until = end_idx + 1  # قفل کردن ارز تا پایان کامل این معهمله
+                    
+                    if trade_won: 
+                        wins += 1
+                        balance += (risk_amount * TARGET_RR)
+                    elif trade_lost: 
+                        losses += 1
+                        balance -= risk_amount
 
         total_wins += wins
         total_losses += losses
@@ -147,7 +183,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED SMART MONEY V2 RESULTS           ")
+    print("      AGGREGATED INSTITUTIONAL V3 RESULTS         ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
