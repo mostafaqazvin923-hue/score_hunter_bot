@@ -3,7 +3,7 @@ import urllib.request
 import math
 
 SYMBOLS = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD", "XRPUSDT": "XRP-USD"}
-TARGET_RR = 2.0  # دقیقاً دو برابر حد ضرر
+TARGET_RR = 2.0  # ضریب ریسک به ریوارد مهندسی‌شده
 
 def fetch_yahoo_one_year(symbol_key):
     yahoo_symbol = SYMBOLS[symbol_key]
@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading SMC V17 Market Data for {symbol_key}...")
+        print(f"[*] Downloading 1H Market Data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -45,6 +45,23 @@ def fetch_yahoo_one_year(symbol_key):
         print(f"[!] Error fetching data for {symbol_key}: {e}")
     return []
 
+def resample_to_4h(candles_1h):
+    # تبدیل کندل‌های ۱ ساعته به ۴ ساعته برای تشخیص جهت کلان بازار
+    candles_4h = []
+    for i in range(0, len(candles_1h), 4):
+        chunk = candles_1h[i:i+4]
+        if not chunk: continue
+        c4 = {
+            "timestamp": chunk[0]["timestamp"],
+            "open": chunk[0]["open"],
+            "high": max(x["high"] for x in chunk),
+            "low": min(x["low"] for x in chunk),
+            "close": chunk[-1]["close"],
+            "volume": sum(x["volume"] for x in chunk)
+        }
+        candles_4h.append(c4)
+    return candles_4h
+
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1: return candles[-1]["high"] - candles[-1]["low"]
     trs = []
@@ -68,73 +85,91 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print(" SMC V17 - INSTITUTIONAL SNIPER & RUNWAY CHECK    ")
+    print(" MTF V18 - 4H TREND + 1H SNIPER ENTRY & RUNWAY    ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
-        candles = fetch_yahoo_one_year(symbol_key)
-        if not candles or len(candles) < 250: continue
+        candles_1h = fetch_yahoo_one_year(symbol_key)
+        if not candles_1h or len(candles_1h) < 300: continue
         
-        print(f"[*] Running SMC V17 Backtest for {symbol_key}...")
+        candles_4h = resample_to_4h(candles_1h)
+        print(f"[*] Running MTF V18 Backtest for {symbol_key}...")
+        
         wins, losses, symbol_trades = 0, 0, 0
         in_position_until = 0
 
-        for i in range(200, len(candles) - 30):
+        # نقشه‌برداری زمانی برای دسترسی سریع به روند 4H از روی کندل 1H
+        for i in range(50, len(candles_1h) - 30):
             if i < in_position_until: 
                 continue
 
-            sub = candles[:i+1]
-            closes = [x["close"] for x in sub]
-            volumes = [x["volume"] for x in sub]
+            c1h = candles_1h[i]
+            current_timestamp = c1h["timestamp"]
+
+            # پیدا کردن کندل 4H متناظر با زمان فعلی
+            active_4h_index = -1
+            for idx, c4 in enumerate(candles_4h):
+                if c4["timestamp"] <= current_timestamp:
+                    active_4h_index = idx
+                else:
+                    break
             
-            c = sub[-1]      # کندل فعلی (ورود روی پولبک به بلوک سفارش)
-            prev = sub[-2]   # کندل ایمپالس (شکست ساختار / BOS)
-            prev2 = sub[-3]  # کندل شکار نقدینگی (Sweep)
+            if active_4h_index < 30: continue
+            
+            sub_4h = candles_4h[:active_4h_index+1]
+            closes_4h = [x["close"] for x in sub_4h]
+            ema_50_4h = calculate_ema(closes_4h, 50)
+            
+            # 1. تعیین جهت کلان در تایم فریم 4 ساعته
+            is_4h_bullish = closes_4h[-1] > ema_50_4h
+            is_4h_bearish = closes_4h[-1] < ema_50_4h
 
-            atr = calculate_atr(sub, 14)
-            ema_200 = calculate_ema(closes, 200) # فیلتر روند کلان مؤسساتی
-            if atr == 0: continue
+            # داده‌های 1 ساعته برای نقطه ورود
+            sub_1h = candles_1h[:i+1]
+            closes_1h = [x["close"] for x in sub_1h]
+            volumes_1h = [x["volume"] for x in sub_1h]
+            
+            c = sub_1h[-1]
+            prev = sub_1h[-2]
+            atr_1h = calculate_atr(sub_1h, 14)
+            if atr_1h == 0: continue
 
-            # تعیین سطوح ساختاری برای بررسی فضای مسیر (Runway)
-            recent_highs = [x["high"] for x in sub[-60:-3]]
-            recent_lows = [x["low"] for x in sub[-60:-3]]
+            # بررسی فضای مسیر (Runway & Obstacle Check) بر اساس سوییگ‌های 1 ساعته اخیر
+            recent_highs = [x["high"] for x in sub_1h[-50:-2]]
+            recent_lows = [x["low"] for x in sub_1h[-50:-2]]
             major_resistance = max(recent_highs) if recent_highs else c["high"] * 1.05
             major_support = min(recent_lows) if recent_lows else c["low"] * 0.95
 
-            # تشخیص نواحی کلیدی نقدینگی محلی
-            swing_low_market = min(x["low"] for x in sub[-40:-3])
-            swing_high_market = max(x["high"] for x in sub[-40:-3])
+            avg_vol = sum(volumes_1h[-20:]) / 20 if len(volumes_1h) >= 20 else 1.0
+            volume_spike = c["volume"] > (avg_vol * 1.3)
 
-            avg_vol = sum(volumes[-25:-3]) / 22 if len(volumes) >= 25 else 1.0
-            volume_spike = prev["volume"] > (avg_vol * 1.6) # حجم نهنگی
+            # 2. تریگر ورود در تایم‌فریم 1 ساعته همراستا با جهت 4 ساعته
+            swing_low_1h = min(x["low"] for x in sub_1h[-20:-2])
+            swing_high_1h = max(x["high"] for x in sub_1h[-20:-2])
 
-            # 1. ستاپ اسمارت مانی لانگ: قیمت کف قبلی را جارو کرده، با حجم بالا به سمت بالا پولک زده و بالای روند 200 است
-            sweep_low = prev2["low"] <= swing_low_market and prev2["close"] > swing_low_market
-            bullish_smc = sweep_low and volume_spike and (prev["close"] > prev["open"]) and (c["close"] > ema_200)
-
-            # 2. ستاپ اسمارت مانی شورت: قیمت سقف قبلی را جارو کرده، با حجم بالا ریخته و زیر روند 200 است
-            sweep_high = prev2["high"] >= swing_high_market and prev2["close"] < swing_high_market
-            bearish_smc = sweep_high and volume_spike and (prev["close"] < prev["open"]) and (c["close"] < ema_200)
+            bullish_entry = is_4h_bullish and volume_spike and (prev["close"] < prev["open"]) and (c["close"] > c["open"]) and (c["close"] > prev["high"])
+            bearish_entry = is_4h_bearish and volume_spike and (prev["close"] > prev["open"]) and (c["close"] < c["open"]) and (c["close"] < prev["low"])
 
             trade_taken = False
 
-            if bullish_smc:
+            if bullish_entry:
+                # مهندسی حد ضرر (SL): پشت کف سوینگ 1 ساعته منهای بافر ATR
                 entry_price = c["close"]
-                stop_loss = swing_low_market - (atr * 0.3) # پشت استاپ‌های جاروشده
+                stop_loss = swing_low_1h - (atr_1h * 0.5)
                 risk_dist = entry_price - stop_loss
 
-                if 0.003 * entry_price <= risk_dist <= 0.04 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     
-                    # فیلتر فضای مسیر (Runway Check): آیا مقاومت سنگینی مانع رسیدن به هدف 2R است؟
+                    # بررسی فضای مسیر: آیا تا رسیدن به TP مانع مقاومتی بزرگی وجود دارد؟
                     has_enough_room = major_resistance >= (take_profit - (risk_dist * 0.1))
 
                     if has_enough_room:
                         trade_won, trade_lost = False, False
-                        end_idx = len(candles) - 1
+                        end_idx = len(candles_1h) - 1
                         
-                        for j in range(i + 1, len(candles)):
-                            future_c = candles[j]
+                        for j in range(i + 1, len(candles_1h)):
+                            future_c = candles_1h[j]
                             if future_c["high"] >= take_profit:
                                 trade_won = True
                                 end_idx = j
@@ -155,23 +190,24 @@ def run_backtest():
                             losses += 1
                             balance -= risk_amount
 
-            elif bearish_smc and not trade_taken:
+            elif bearish_entry and not trade_taken:
+                # مهندسی حد ضرر برای شورت: پشت سقف سوینگ 1 ساعته به‌اضافه بافر ATR
                 entry_price = c["close"]
-                stop_loss = swing_high_market + (atr * 0.3)
+                stop_loss = swing_high_1h + (atr_1h * 0.5)
                 risk_dist = stop_loss - entry_price
 
-                if 0.003 * entry_price <= risk_dist <= 0.04 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     
-                    # فیلتر فضای مسیر برای شورت
+                    # بررسی فضای مسیر برای شورت
                     has_enough_room = major_support <= (take_profit + (risk_dist * 0.1))
 
                     if has_enough_room:
                         trade_won, trade_lost = False, False
-                        end_idx = len(candles) - 1
+                        end_idx = len(candles_1h) - 1
                         
-                        for j in range(i + 1, len(candles)):
-                            future_c = candles[j]
+                        for j in range(i + 1, len(candles_1h)):
+                            future_c = candles_1h[j]
                             if future_c["low"] <= take_profit:
                                 trade_won = True
                                 end_idx = j
@@ -199,7 +235,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED SMC V17 SNIPER RESULTS           ")
+    print("      AGGREGATED MTF V18 RESULTS                  ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
