@@ -73,7 +73,7 @@ def _backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - OPTIMIZED 1:2 RR & HIGH WIN   ")
+    print(" SCORE HUNTER PRO - BALANCED 1:2 RR & VOLUME      ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -102,30 +102,30 @@ def _backtest():
             rsi = calculate_rsi(sub, 14)
             trade_taken = False
 
-            # فیلتر قدرت روند برای جلوگیری از ورود در بازار رِنج و پرنویز
+            # بازگرداندن آستانه روند به حالت استاندارد برای حفظ حجم معاملات (~۲۲۰۰ معامله)
             trend_strength = abs(ema20 - ema50) / c["close"]
-            if trend_strength < 0.0011:
+            if trend_strength < 0.0008:
                 continue
 
             candle_range = c["high"] - c["low"]
             if candle_range == 0:
                 continue
 
-            # --- شورت با حد ضرر و حد سود ساختاری بازار (RR = 1:2) و فیلتر مومنتوم قوی‌تر ---
+            # --- شورت با حد ضرر و حد سود ساختاری بازار (RR = 1:2) ---
             is_down_trend = ema20 < ema50
             body_ratio_short = (c["open"] - c["close"]) / candle_range
-            is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.38) and (c["close"] < ema20) and (rsi < 45)
+            is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.28) and (c["close"] < ema20) and (rsi < 50)
 
             if is_down_trend and is_short:
                 entry_price = c["close"]
                 recent_high = max(sub[-1]["high"], sub[-2]["high"], sub[-3]["high"])
-                stop_loss = recent_high + (entry_price * 0.001)
+                stop_loss = recent_high + (entry_price * 0.0009)
                 risk_dist = stop_loss - entry_price
 
                 if 0 < (risk_dist / entry_price) <= 0.035:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 14, len(candles) - 1)
+                    end_idx = min(i + 12, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -149,22 +149,22 @@ def _backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ با حد ضرر و حد سود ساختاری بازار (RR = 1:2) و فیلتر مومنتوم قوی‌تر ---
+            # --- لانگ با حد ضرر و حد سود ساختاری بازار (RR = 1:2) ---
             if not trade_taken:
                 is_up_trend = ema20 > ema50
                 body_ratio_long = (c["close"] - c["open"]) / candle_range
-                is_long = (c["close"] > c["open"]) and (body_ratio_long > 0.38) and (c["close"] > ema20) and (rsi > 55)
+                is_long = (c["close"] > c["open"]) and (body_ratio_long > 0.28) and (c["close"] > ema20) and (rsi > 50)
 
                 if is_up_trend and is_long:
                     entry_price = c["close"]
                     recent_low = min(sub[-1]["low"], sub[-2]["low"], sub[-3]["low"])
-                    stop_loss = recent_low - (entry_price * 0.001)
+                    stop_loss = recent_low - (entry_price * 0.0009)
                     risk_dist = entry_price - stop_loss
 
                     if 0 < (risk_dist / entry_price) <= 0.035:
                         take_profit = entry_price + (risk_dist * TARGET_RR)
                         trade_won, trade_lost = False, False
-                        end_idx = min(i + 14, len(candles) - 1)
+                        end_idx = min(i + 12, len(candles) - 1)
                         
                         for j in range(i + 1, end_idx + 1):
                             future_c = candles[j]
@@ -195,7 +195,7 @@ def _backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED OPTIMIZED 1:2 RESULTS            ")
+    print("      AGGREGATED BALANCED 1:2 RESULTS             ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
