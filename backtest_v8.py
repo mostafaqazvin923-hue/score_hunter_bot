@@ -46,25 +46,21 @@ def fetch_yahoo_one_year(symbol_key):
     return []
 
 def calculate_ichimoku_levels(sub_candles):
-    # ایچیموکو استاندارد: Tenkan (9), Kijun (26), Senkou B (52)
     if len(sub_candles) < 52:
         return None
     
-    # 9 کندل اخیر
     nine_highs = [c["high"] for c in sub_candles[-9:]]
     nine_lows = [c["low"] for c in sub_candles[-9:]]
     tenkan = (max(nine_highs) + min(nine_lows)) / 2
     
-    # 26 کندل اخیر
-    26_highs = [c["high"] for c in sub_candles[-26:]]
-    26_lows = [c["low"] for c in sub_candles[-26:]]
-    kijun = (max(26_highs) + min(26_lows)) / 2
+    highs_26 = [c["high"] for c in sub_candles[-26:]]
+    lows_26 = [c["low"] for c in sub_candles[-26:]]
+    kijun = (max(highs_26) + min(lows_26)) / 2
     
-    # 52 کندل اخیر برای لبه ابر
-    52_highs = [c["high"] for c in sub_candles[-52:]]
-    52_lows = [c["low"] for c in sub_candles[-52:]]
+    highs_52 = [c["high"] for c in sub_candles[-52:]]
+    lows_52 = [c["low"] for c in sub_candles[-52:]]
     senkou_a = (tenkan + kijun) / 2
-    senkou_b = (max(52_highs) + min(52_lows)) / 2
+    senkou_b = (max(highs_52) + min(lows_52)) / 2
     
     return {
         "tenkan": tenkan,
@@ -103,10 +99,9 @@ def run_backtest():
 
             sub = candles[:i+1]
             c = sub[-2]
-            prev_c = sub[-3]
             
             ichi = calculate_ichimoku_levels(sub)
-            if not ichichi_valid := ichi: continue
+            if not ichi: continue
             
             atr = calculate_atr(sub, 14)
             if atr == 0: continue
@@ -119,29 +114,18 @@ def run_backtest():
             cloud_top = max(s_a, s_b)
             cloud_bottom = min(s_a, s_b)
 
-            # تاییدیه حرفه‌ای چیکو اسپن (Chikou Span Confirmation - مقایسه قیمت الان با ۲۶ کندل قبل)
             chikou_current_price = c["close"]
-            price_26_ago = sub[-28]["close"] # حدود 26 کندل عقب‌تر
+            price_26_ago = sub[-28]["close"]
             chikou_bullish = chikou_current_price > price_26_ago
             chikou_bearish = chikou_current_price < price_26_ago
 
-            # شرایط حرفه‌ای ایچیموکو برای لانگ:
-            # ۱. قیمت بالای ابر (Cloud Top)
-            # ۲. تنکان بالاتر از کیوجسن (TK Bullish Cross)
-            # ۳. تاییدیه چیکو اسپن
             is_long = (c["close"] > cloud_top) and (tenkan > kijun) and chikou_bullish and (c["close"] > tenkan)
-
-            # شرایط حرفه‌ای ایچیموکو برای شورت:
-            # ۱. قیمت زیر ابر (Cloud Bottom)
-            # ۲. تنکان پایین‌تر از کیوجسن (TK Bearish Cross)
-            # ۳. تاییدیه چیکو اسپن
             is_short = (c["close"] < cloud_bottom) and (tenkan < kijun) and chikou_bearish and (c["close"] < tenkan)
 
             trade_taken = False
 
             if is_long:
                 entry_price = c["close"]
-                # استاپ لاس حرفه‌ای پشت کیوجسن یا لبه ابر
                 stop_loss = min(kijun, cloud_bottom) - (atr * 0.2)
                 risk_dist = entry_price - stop_loss
 
@@ -167,7 +151,6 @@ def run_backtest():
 
             if not trade_taken and is_short:
                 entry_price = c["close"]
-                # استاپ لاس حرفه‌ای بالای کیوجسن یا لبه ابر
                 stop_loss = max(kijun, cloud_top) + (atr * 0.2)
                 risk_dist = stop_loss - entry_price
 
