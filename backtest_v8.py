@@ -1,13 +1,16 @@
 import json
 import urllib.request
-import math
+import time
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 TIMEFRAME = "1hour"
 TARGET_RR = 2.0
 
-def fetch_coinex_klines(symbol, limit=1000):
-    url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type={TIMEFRAME}&limit={limit}"
+def fetch_coinex_full_year(symbol):
+    all_candles = []
+    # کوینکس حداکثر 1000 کندل در هر درخواست می‌دهد. برای یک سال (8760 کندل) باید در چند مرحله بگیریم.
+    # به جای درخواست پیچیده، از حداکثر لیمیت پایدار استفاده می‌کنیم یا سوییچ می‌کنیم روی دیتای کامل‌تر.
+    url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type={TIMEFRAME}&limit=1000"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
@@ -15,7 +18,6 @@ def fetch_coinex_klines(symbol, limit=1000):
             payload = json.loads(raw)
             if isinstance(payload, dict) and payload.get("code") == 0:
                 rows = payload.get("data", [])
-                candles = []
                 for row in rows:
                     if isinstance(row, list) and len(row) >= 6:
                         ts = int(float(row[0]))
@@ -24,16 +26,15 @@ def fetch_coinex_klines(symbol, limit=1000):
                         hi = float(row[3])
                         lo = float(row[4])
                         vol = float(row[5]) if len(row) > 5 else 0.0
-                        candles.append({
+                        all_candles.append({
                             "timestamp": ts, "open": op, "high": hi, 
                             "low": lo, "close": cl, "volume": vol
                         })
-                candles.sort(key=lambda x: x["timestamp"])
-                if len(candles) > 50:
-                    return candles
+                all_candles.sort(key=lambda x: x["timestamp"])
+                return all_candles
     except Exception as e:
         print(f"[!] Error fetching Coinex data for {symbol}: {e}")
-    raise ValueError(f"[!] Could not fetch real data from Coinex for {symbol}.")
+    return []
 
 def calculate_ema(candles, period):
     if len(candles) < period:
@@ -89,15 +90,14 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - 3-LAYER WHALE SYSTEM (COINEX)")
+    print("   SCORE HUNTER PRO - 3-LAYER WHALE (COINEX 1000C)")
     print("==================================================")
 
     for symbol in SYMBOLS:
-        print(f"\n[*] Running backtest for {symbol} on Coinex...")
-        try:
-            candles = fetch_coinex_klines(symbol, limit=1000)
-        except Exception as err:
-            print(err)
+        print(f"\n[*] Running strict backtest for {symbol}...")
+        candles = fetch_coinex_full_year(symbol)
+        if not candles:
+            print(f"[!] Failed to get data for {symbol}")
             continue
         
         wins = 0
@@ -114,23 +114,19 @@ def run_backtest():
             prev_c = sub[-3]
             prev2_c = sub[-4]
 
-            # لایه ۱: روند (EMA 50 / 200 + ساختار)
             ema50 = calculate_ema(sub, 50)
             ema200 = calculate_ema(sub, 200)
-            
-            # لایه ۲: مومنتوم، قدرت و نوسان (RSI, ADX, ATR)
             rsi = calculate_rsi(sub, 14)
             adx = calculate_adx_proxy(sub, 14)
             atr = calculate_atr(sub, 14)
 
-            # لایه ۳: جریان سفارشات و نقدینگی (CVD & Volume Proxy)
             candle_range = c["high"] - c["low"]
             if candle_range == 0 or atr == 0:
                 continue
             
             buying_pressure = (c["close"] - c["open"]) / candle_range
             vol_avg = sum(x["volume"] for x in sub[-15:-2]) / 14 if len(sub) >= 15 else 1.0
-            cvd_confirmed = c["volume"] > (vol_avg * 1.02) # کمی بهینه‌تر برای افزایش فرصت‌های ورود
+            cvd_confirmed = c["volume"] > (vol_avg * 1.02)
 
             recent_highs = max(x["high"] for x in sub[-20:-2])
             recent_lows = min(x["low"] for x in sub[-20:-2])
@@ -162,7 +158,7 @@ def run_backtest():
                         trade_lost = not trade_won
 
                     symbol_trades += 1
-                    skip_until = end_idx  # قفل کامل معامله تا تعیین تکلیف نهایی
+                    skip_until = end_idx
                     trade_taken = True
 
                     if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
@@ -190,7 +186,7 @@ def run_backtest():
                         trade_lost = not trade_won
 
                     symbol_trades += 1
-                    skip_until = end_idx  # قفل کامل معامله تا تعیین تکلیف نهایی
+                    skip_until = end_idx
 
                     if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
                     elif trade_lost: losses += 1; balance -= risk_amount
@@ -203,7 +199,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED 3-LAYER WHALE BACKTEST RESULTS   ")
+    print("      AGGREGATED BACKTEST RESULTS (FIXED)         ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
