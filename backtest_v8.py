@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading 1-year Elite Data for {symbol_key}...")
+        print(f"[*] Downloading 1-year Balanced Data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -53,7 +53,7 @@ def calculate_atr(candles, period=14):
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-period:]) / period
 
-def calculate_ema(closes, period):
+def calculate_ema(closes, period=50):
     if len(closes) < period: return closes[-1]
     multiplier = 2 / (period + 1)
     ema = sum(closes[:period]) / period
@@ -81,77 +81,54 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - ELITE V6 (HIGH WIN-RATE)    ")
+    print("   SCORE HUNTER PRO - BALANCED V7 (OPTIMIZED)     ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
-        if not candles or len(candles) < 200: continue
+        if not candles or len(candles) < 100: continue
         
-        print(f"[*] Running V6 Elite backtest for {symbol_key}...")
+        print(f"[*] Running V7 Balanced backtest for {symbol_key}...")
         wins, losses, symbol_trades = 0, 0, 0
         in_position_until = 0
 
-        for i in range(200, len(candles) - 30):
-            # قانون قفل معامله روی هر ارز تا روشن شدن تکلیف پوزیشن قبلی
+        for i in range(50, len(candles) - 30):
+            # قانون قفل معامله روی هر ارز تا روشن شدن تکلیف پوزیشن قبلی همان ارز
             if i < in_position_until: 
                 continue
 
             sub = candles[:i+1]
             closes = [x["close"] for x in sub]
-            volumes = [x["volume"] for x in sub]
             
             c = sub[-1]
             prev_c = sub[-2]
             
             atr = calculate_atr(sub, 14)
             ema_50 = calculate_ema(closes, 50)
-            ema_200 = calculate_ema(closes, 200)
             rsi = calculate_rsi(closes, 14)
-            avg_vol = sum(volumes[-20:]) / 20
             
             if atr == 0: continue
 
-            # فیلتر روند قدرتمند دوگانه
-            strong_uptrend = (c["close"] > ema_50) and (ema_50 > ema_200)
-            strong_downtrend = (c["close"] < ema_50) and (ema_50 < ema_200)
+            # تعیین روند با EMA 50
+            is_uptrend = c["close"] > ema_50
+            is_downtrend = c["close"] < ema_50
 
-            # قدرت بدنه کندل نسبت به کل رنج آن
-            candle_body = abs(c["close"] - c["open"])
-            candle_range = c["high"] - c["low"]
-            if candle_range == 0: continue
-            body_ratio = candle_body / candle_range
+            # اسوینگ‌های پویای کوتاه‌مدت برای افزایش تعداد معاملات به حد استاندارد روزانه
+            recent_swing_high = max(x["high"] for x in sub[-10:-1])
+            recent_swing_low = min(x["low"] for x in sub[-10:-1])
 
-            recent_swing_high = max(x["high"] for x in sub[-20:-1])
-            recent_swing_low = min(x["low"] for x in sub[-20:-1])
-
-            # شرایط ورود الگوهای نهنگی با فیلترهای سخت‌گیرانه مومنتوم و حجم
-            buy_signal = (
-                strong_uptrend and 
-                (prev_c["low"] <= recent_swing_low * 1.003) and 
-                (c["close"] > c["open"]) and 
-                (body_ratio >= 0.55) and
-                (rsi < 45) and 
-                (c["volume"] > avg_vol * 1.3)
-            )
-
-            sell_signal = (
-                strong_downtrend and 
-                (prev_c["high"] >= recent_swing_high * 0.997) and 
-                (c["close"] < c["open"]) and 
-                (body_ratio >= 0.55) and
-                (rsi > 55) and 
-                (c["volume"] > avg_vol * 1.3)
-            )
+            # شرایط بهینه‌شده ورود (توازن بین فرکانس بالا و وین‌ریت مناسب)
+            buy_signal = is_uptrend and (prev_c["low"] <= recent_swing_low) and (c["close"] > c["open"]) and (rsi < 50)
+            sell_signal = is_downtrend and (prev_c["high"] >= recent_swing_high) and (c["close"] < c["open"]) and (rsi > 50)
 
             trade_taken = False
 
             if buy_signal:
                 entry_price = c["close"]
-                stop_loss = recent_swing_low - (atr * 0.3)
+                stop_loss = recent_swing_low - (atr * 0.4)
                 risk_dist = entry_price - stop_loss
 
-                if 0.002 * entry_price <= risk_dist <= 0.03 * entry_price:
+                if 0.001 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
@@ -180,10 +157,10 @@ def run_backtest():
 
             elif sell_signal and not trade_taken:
                 entry_price = c["close"]
-                stop_loss = recent_swing_high + (atr * 0.3)
+                stop_loss = recent_swing_high + (atr * 0.4)
                 risk_dist = stop_loss - entry_price
 
-                if 0.002 * entry_price <= risk_dist <= 0.03 * entry_price:
+                if 0.001 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
@@ -217,7 +194,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED ELITE V6 RESULTS                 ")
+    print("      AGGREGATED BALANCED V7 RESULTS              ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
