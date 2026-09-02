@@ -9,11 +9,6 @@ def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
-        with urllib.request.urlopen(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30) as response:
-            # Fixing the request call to match standard urllib syntax
-            pass
-        # Using standard robust fetch
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -111,19 +106,17 @@ def _backtest():
             body_ratio = body_size / candle_range
 
             # --- شورت به سبک جریان سفارشات و دیسپلیسمنت موسساتی (RR = 1:2) ---
-            # روند کلان نزولی + کندل دیسپلیسمنت قوی به سمت پایین که ساختار را می‌شکند
             is_macro_down = (c["close"] < ema50) and (ema50 < ema200)
             is_short_displacement = (c["close"] < c["open"]) and (body_ratio > 0.45) and (c["close"] < prev_c["low"])
 
             if is_macro_down and is_short_displacement:
                 entry_price = c["close"]
-                # حد ضرر ساختاری پشت بالاترین نقطه سویینگ اخیر با بافر ATR
                 recent_high = max(sub[-1]["high"], sub[-2]["high"], sub[-3]["high"], sub[-4]["high"])
                 stop_loss = recent_high + (atr * 0.25)
                 risk_dist = stop_loss - entry_price
 
                 if 0 < (risk_dist / entry_price) <= 0.035:
-                    take_profit = entry_price - (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
+                    take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 14, len(candles) - 1)
                     
@@ -156,13 +149,12 @@ def _backtest():
 
                 if is_macro_up and is_long_displacement:
                     entry_price = c["close"]
-                    # حد ضرر ساختاری پشت پایین‌ترین نقطه سویینگ اخیر با بافر ATR
                     recent_low = min(sub[-1]["low"], sub[-2]["low"], sub[-3]["low"], sub[-4]["low"])
                     stop_loss = recent_low - (atr * 0.25)
                     risk_dist = entry_price - stop_loss
 
                     if 0 < (risk_dist / entry_price) <= 0.035:
-                        take_profit = entry_price + (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
+                        take_profit = entry_price + (risk_dist * TARGET_RR)
                         trade_won, trade_lost = False, False
                         end_idx = min(i + 14, len(candles) - 1)
                         
