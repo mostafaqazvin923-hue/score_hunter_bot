@@ -3,7 +3,7 @@ import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 TIMEFRAME = "1h"
-TARGET_RR = 3.0  # ریسک به ریوارد ۱ به ۳ برای منفجر کردن سودآوری
+TARGET_RR = 2.0  # ریسک به ریوارد ثابت ۱ به ۲ برای وین‌ریت بالا
 
 def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
@@ -58,7 +58,7 @@ def calculate_ema(candles, period):
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
-    risk_percentage = 0.02  # ریسک ۲ درصدی برای حفظ سرمایه در عین رشد مرکب
+    risk_percentage = 0.02  # مدیریت ریسک امن و استاندارد
     
     total_wins = 0
     total_losses = 0
@@ -67,7 +67,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - MASTER EDITION (RR 1:3)       ")
+    print(" SCORE HUNTER PRO - HIGH WIN-RATE SNIPER V23      ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -84,38 +84,54 @@ def run_backtest():
         symbol_shorts = 0
         skip_until = 0
 
-        for i in range(50, len(candles) - 30):
+        for i in range(50, len(candles) - 20):
             if i < skip_until:
                 continue
 
             sub = candles[:i+1]
-            c = sub[-2]       # کندل سیگنال
-            prev_c = sub[-3]  # کندل قبل برای استاپ فیکس
+            c = sub[-2]       # کندل تریگر
+            prev_c = sub[-3]  # کندل قبل برای تعیین دقیق استاپ
 
             ema20 = calculate_ema(sub, 20)
             ema50 = calculate_ema(sub, 50)
             trade_taken = False
 
-            # فیلتر قدرت روند
+            # فیلتر قدرت روند ساختاری
             trend_strength = abs(ema20 - ema50) / c["close"]
-            if trend_strength < 0.001:
+            if trend_strength < 0.0022:  # سخت‌گیری بیشتر برای جلوگیری از بازارهای رِنج و پرنویز
+                continue
+
+            candle_range = c["high"] - c["low"]
+            if candle_range == 0:
+                continue
+
+            # فیلتر بدنه کندل (کندل باید حداقل ۶۰٪ بدنه خالص داشته باشد تا فیک نباشد)
+            body_size = abs(c["close"] - c["open"])
+            body_ratio = body_size / candle_range
+            if body_ratio < 0.60:
+                continue
+
+            # فیلتر حجم معاملات (حجم باید بالاتر از میانگین ۲۰ کندل اخیر باشد)
+            recent_volumes = [x["volume"] for x in sub[-22:-2]]
+            avg_volume = sum(recent_volumes) / len(recent_volumes) if recent_volumes else 1.0
+            if c["volume"] <= (avg_volume * 1.25):
                 continue
 
             current_risk_amount = balance * risk_percentage
 
-            # --- شورت (Short Setup) ---
+            # --- شورت با فیلترهای استریل‌شده ---
             is_down_trend = ema20 < ema50
             is_short = (c["close"] < c["open"]) and (c["close"] < ema20)
 
             if is_down_trend and is_short:
                 entry_price = c["close"]
-                stop_loss = prev_c["high"] + (entry_price * 0.0015)
+                stop_loss = prev_c["high"] + (entry_price * 0.001)
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.035:
+                if 0 < (risk_dist / entry_price) <= 0.03:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 24, len(candles) - 1)  # زمان بیشتر برای لمس تارگت ۳ برابری
+                    end_idx = min(i + 14, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -139,20 +155,20 @@ def run_backtest():
                     elif trade_lost: 
                         losses += 1; balance -= current_risk_amount
 
-            # --- لانگ (Long Setup) ---
+            # --- لانگ با فیلترهای استریل‌شده ---
             if not trade_taken:
                 is_up_trend = ema20 > ema50
                 is_long = (c["close"] > c["open"]) and (c["close"] > ema20)
 
                 if is_up_trend and is_long:
                     entry_price = c["close"]
-                    stop_loss = prev_c["low"] - (entry_price * 0.0015)
+                    stop_loss = prev_c["low"] - (entry_price * 0.001)
                     risk_dist = entry_price - stop_loss
 
-                    if 0 < (risk_dist / entry_price) <= 0.035:
+                    if 0 < (risk_dist / entry_price) <= 0.03:
                         take_profit = entry_price + (risk_dist * TARGET_RR)
                         trade_won, trade_lost = False, False
-                        end_idx = min(i + 24, len(candles) - 1)
+                        end_idx = min(i + 14, len(candles) - 1)
                         
                         for j in range(i + 1, end_idx + 1):
                             future_c = candles[j]
@@ -183,7 +199,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED MASTER RESULTS (RR 1:3)          ")
+    print("      AGGREGATED V23 HIGH WIN-RATE RESULTS        ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
