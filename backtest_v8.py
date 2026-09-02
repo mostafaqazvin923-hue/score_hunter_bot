@@ -1,8 +1,10 @@
+_backtest()
 import json
 import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 TIMEFRAME = "1h"
+TARGET_RR = 2.0  # ریسک به ریوارد دقیقاً ۱ به ۲ (سود دو برابر ریسک)
 
 def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
@@ -63,7 +65,7 @@ def calculate_rsi(candles, period=14):
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
-    risk_percentage = 0.025  # ریسک ۲.۵ درصدی پویا از کل بالانس برای ایجاد سود مرکب
+    risk_amount = 25.0  # ریسک ثابت پایه برای ارزیابی دقیق تعداد برد و باخت
     
     total_wins = 0
     total_losses = 0
@@ -72,7 +74,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - COMPOUND GROWTH & HIGH WIN    ")
+    print(" SCORE HUNTER PRO - MARKET SL/TP & 1:2 RR TARGET  ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -95,38 +97,37 @@ def run_backtest():
 
             sub = candles[:i+1]
             c = sub[-2]
-            prev_c = sub[-3]
-
+            
             ema20 = calculate_ema(sub, 20)
             ema50 = calculate_ema(sub, 50)
             rsi = calculate_rsi(sub, 14)
             trade_taken = False
 
+            # فیلتر حفظ حجم معاملات (حفظ فرکانس بالا)
             trend_strength = abs(ema20 - ema50) / c["close"]
-            if trend_strength < 0.0012:
+            if trend_strength < 0.0009:
                 continue
 
             candle_range = c["high"] - c["low"]
             if candle_range == 0:
                 continue
 
-            # محاسبه ریسک پویای بر اساس موجودی فعلی حساب
-            current_risk_amount = balance * risk_percentage
-
-            # --- شورت با فیلتر بدنه ---
+            # --- شورت با حد ضرر و حد سود ساختاری بازار (RR = 1:2) ---
             is_down_trend = ema20 < ema50
             body_ratio_short = (c["open"] - c["close"]) / candle_range
-            is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.35) and (c["close"] < ema20) and (rsi < 50)
+            is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.32) and (c["close"] < ema20) and (rsi < 49)
 
             if is_down_trend and is_short:
                 entry_price = c["close"]
-                stop_loss = prev_c["high"] + (entry_price * 0.001)
+                # حد ضرر ساختاری بر اساس بالاترین سقفِ ۳ کندل اخیر بازار (مقاومت واقعی ساختار)
+                recent_high = max(sub[-1]["high"], sub[-2]["high"], sub[-3]["high"])
+                stop_loss = recent_high + (entry_price * 0.0008)
                 risk_dist = stop_loss - entry_price
 
                 if 0 < (risk_dist / entry_price) <= 0.035:
-                    take_profit = entry_price - (risk_dist * 0.85)
+                    take_profit = entry_price - (risk_dist * TARGET_RR)  # دقیقاً دو برابر ریسک (۱ به ۲)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 12, len(candles) - 1)
+                    end_idx = min(i + 14, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -146,25 +147,27 @@ def run_backtest():
                     trade_taken = True
 
                     if trade_won: 
-                        wins += 1; balance += (current_risk_amount * 0.85)
+                        wins += 1; balance += (risk_amount * TARGET_RR)
                     elif trade_lost: 
-                        losses += 1; balance -= current_risk_amount
+                        losses += 1; balance -= risk_amount
 
-            # --- لانگ با فیلتر بدنه ---
+            # --- لانگ با حد ضرر و حد سود ساختاری بازار (RR = 1:2) ---
             if not trade_taken:
                 is_up_trend = ema20 > ema50
                 body_ratio_long = (c["close"] - c["open"]) / candle_range
-                is_long = (c["close"] > c["open"]) and (body_ratio_long > 0.35) and (c["close"] > ema20) and (rsi > 50)
+                is_long = (c["close"] > c["open"]) and (body_ratio_long > 0.32) and (c["close"] > ema20) and (rsi > 51)
 
                 if is_up_trend and is_long:
                     entry_price = c["close"]
-                    stop_loss = prev_c["low"] - (entry_price * 0.001)
+                    # حد ضرر ساختاری بر اساس پایین‌ترین کفِ ۳ کندل اخیر بازار (حمایت واقعی ساختار)
+                    recent_low = min(sub[-1]["low"], sub[-2]["low"], sub[-3]["low"])
+                    stop_loss = recent_low - (entry_price * 0.0008)
                     risk_dist = entry_price - stop_loss
 
                     if 0 < (risk_dist / entry_price) <= 0.035:
-                        take_profit = entry_price + (risk_dist * 0.85)
+                        take_profit = entry_price + (risk_dist * TARGET_RR)  # دقیقاً دو برابر ریسک (۱ به ۲)
                         trade_won, trade_lost = False, False
-                        end_idx = min(i + 12, len(candles) - 1)
+                        end_idx = min(i + 14, len(candles) - 1)
                         
                         for j in range(i + 1, end_idx + 1):
                             future_c = candles[j]
@@ -183,9 +186,9 @@ def run_backtest():
                         skip_until = end_idx - 2
 
                         if trade_won: 
-                            wins += 1; balance += (current_risk_amount * 0.85)
+                            wins += 1; balance += (risk_amount * TARGET_RR)
                         elif trade_lost: 
-                            losses += 1; balance -= current_risk_amount
+                            losses += 1; balance -= risk_amount
 
         total_wins += wins
         total_losses += losses
@@ -195,7 +198,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED COMPOUND GROWTH RESULTS          ")
+    print("      AGGREGATED MARKET-BASED 1:2 RESULTS         ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
