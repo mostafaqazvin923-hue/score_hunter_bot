@@ -12,7 +12,7 @@ def fetch_yahoo_one_year(symbol_key):
     
     try:
         print(f"[*] Downloading DVVE Market Data for {symbol_key}...")
-        with urllib.request.urlopen(url, headers={"User-Agent": "Mozilla/5.0"}) as response:
+        with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
             result = payload.get("chart", {}).get("result", [])
@@ -71,14 +71,14 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print(" DVVE V14 - STRATEGY WITH 2R & RUNWAY CHECK       ")
+    print(" DVVE V14.1 - STRATEGY WITH 2R & RUNWAY CHECK     ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
         if not candles or len(candles) < 250: continue
         
-        print(f"[*] Running DVVE V14 Backtest for {symbol_key}...")
+        print(f"[*] Running DVVE V14.1 Backtest for {symbol_key}...")
         wins, losses, symbol_trades = 0, 0, 0
         in_position_until = 0
 
@@ -91,27 +91,24 @@ def run_backtest():
             volumes = [x["volume"] for x in sub]
             
             c = sub[-1]
-            prev_c = sub[-2]
             
             atr = calculate_atr(sub, 14)
             upper_bb, mid_bb, lower_bb = calculate_bollinger_bands(closes, 20, 2.0)
-            bb_width = (upper_bb - lower_bb) / mid_bb  # سنجش فشردگی نوسان
+            bb_width = (upper_bb - lower_bb) / mid_bb
 
             if atr == 0: continue
 
-            # ۱. تشخیص فشردگی باندهای بولینگر (محدوده ارزش و تراکم نوسان)
-            is_squeezed = bb_width < 0.025  # باندها در حالت فشرده و آماده انفجار
+            # تشخیص فشردگی باندهای بولینگر
+            is_squeezed = bb_width < 0.035
 
-            # تعیین سطوح ساختاری محلی (برای بررسی مانع و فضای مسیر)
             recent_highs = [x["high"] for x in sub[-50:-2]]
             recent_lows = [x["low"] for x in sub[-50:-2]]
             major_resistance = max(recent_highs) if recent_highs else c["high"] * 1.05
             major_support = min(recent_lows) if recent_lows else c["low"] * 0.95
 
             avg_vol = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else 1.0
-            volume_spike = c["volume"] > (avg_vol * 1.3)
+            volume_spike = c["volume"] > (avg_vol * 1.2)
 
-            # ۲. شرایط ورود بر اساس شکست فشرده‌سازی با حجم بالا
             long_breakout = is_squeezed and volume_spike and (c["close"] > upper_bb) and (c["close"] > c["open"])
             short_breakout = is_squeezed and volume_spike and (c["close"] < lower_bb) and (c["close"] < c["open"])
 
@@ -119,15 +116,14 @@ def run_backtest():
 
             if long_breakout:
                 entry_price = c["close"]
-                stop_loss = min(sub[-5]["low"], c["low"] - (atr * 1.0))
+                stop_loss = entry_price - (atr * 1.5)
                 risk_dist = entry_price - stop_loss
 
-                if 0.002 * entry_price <= risk_dist <= 0.04 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.05 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     
-                    # ۳. فیلتر فضای مسیر (Runway Check): آیا تا حد سود ۲ برابری، مانع سنگینی (مقاومت نزدیک) وجود دارد؟
-                    # اگر مقاومت ساختاری بازار پایین‌تر از حد سود ما باشد، یعنی فضای کافی برای رسیدن به TP وجود ندارد!
-                    has_enough_room = major_resistance >= take_profit
+                    # فیلتر فضای مسیر (آیا هدف ۲ برابری تا مقاومت فاصله کافی دارد؟)
+                    has_enough_room = major_resistance >= (take_profit - (risk_dist * 0.2))
 
                     if has_enough_room:
                         trade_won, trade_lost = False, False
@@ -157,14 +153,14 @@ def run_backtest():
 
             elif short_breakout and not trade_taken:
                 entry_price = c["close"]
-                stop_loss = max(sub[-5]["high"], c["high"] + (atr * 1.0))
+                stop_loss = entry_price + (atr * 1.5)
                 risk_dist = stop_loss - entry_price
 
-                if 0.002 * entry_price <= risk_dist <= 0.04 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.05 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     
-                    # ۳. فیلتر فضای مسیر برای شورت (آیا کف حمایتی مانع هدف ۲ برابری ماست؟)
-                    has_enough_room = major_support <= take_profit
+                    # فیلتر فضای مسیر برای شورت
+                    has_enough_room = major_support <= (take_profit + (risk_dist * 0.2))
 
                     if has_enough_room:
                         trade_won, trade_lost = False, False
@@ -199,7 +195,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED DVVE V14 RESULTS                 ")
+    print("      AGGREGATED DVVE V14.1 RESULTS               ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
