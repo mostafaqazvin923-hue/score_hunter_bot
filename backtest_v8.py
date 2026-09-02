@@ -3,7 +3,7 @@ import urllib.request
 import math
 
 SYMBOLS = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD", "XRPUSDT": "XRP-USD"}
-TARGET_RR = 2.0  # دقیقاً دو برابر حد ضرر
+TARGET_RR = 2.0
 
 def fetch_yahoo_one_year(symbol_key):
     yahoo_symbol = SYMBOLS[symbol_key]
@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading DVVE V15 Market Data for {symbol_key}...")
+        print(f"[*] Downloading LSOB Market Data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -53,38 +53,6 @@ def calculate_atr(candles, period=14):
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-period:]) / period
 
-def calculate_ema(closes, period):
-    if len(closes) < period: return closes[-1]
-    multiplier = 2 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for price in closes[period:]:
-        ema = (price - ema) * multiplier + ema
-    return ema
-
-def calculate_rsi(closes, period=14):
-    if len(closes) < period + 1: return 50.0
-    gains, losses = 0.0, 0.0
-    for i in range(1, period + 1):
-        diff = closes[-i] - closes[-i-1]
-        if diff >= 0: gains += diff
-        else: losses -= diff
-    avg_gain = gains / period
-    avg_loss = losses / period
-    if avg_loss == 0: return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def calculate_bollinger_bands(closes, period=20, std_dev=2.0):
-    if len(closes) < period:
-        return closes[-1], closes[-1], closes[-1]
-    sub = closes[-period:]
-    sma = sum(sub) / period
-    variance = sum((x - sma) ** 2 for x in sub) / period
-    stdev = math.sqrt(variance)
-    upper = sma + (std_dev * stdev)
-    lower = sma - (std_dev * stdev)
-    return upper, sma, lower
-
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
@@ -92,129 +60,111 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print(" DVVE V15 - HIGH-PRECISION SNIPER STRATEGY        ")
+    print(" LSOB V16 - INSTITUTIONAL ORDER BLOCK STRATEGY    ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
         if not candles or len(candles) < 250: continue
         
-        print(f"[*] Running DVVE V15 Backtest for {symbol_key}...")
+        print(f"[*] Running LSOB V16 Backtest for {symbol_key}...")
         wins, losses, symbol_trades = 0, 0, 0
         in_position_until = 0
 
-        for i in range(200, len(candles) - 30):
+        for i in range(50, len(candles) - 30):
             if i < in_position_until: 
                 continue
 
             sub = candles[:i+1]
-            closes = [x["close"] for x in sub]
-            volumes = [x["volume"] for x in sub]
-            
-            c = sub[-1]
-            
-            atr = calculate_atr(sub, 14)
-            ema_50 = calculate_ema(closes, 50)
-            rsi = calculate_rsi(closes, 14)
-            upper_bb, mid_bb, lower_bb = calculate_bollinger_bands(closes, 20, 2.0)
-            bb_width = (upper_bb - lower_bb) / mid_bb
+            c = sub[-1]      # کندل جاری (تست بلوک سفارش)
+            prev = sub[-2]   # کندل ایمپالس (حرکت ناگهانی نهنگی)
+            prev2 = sub[-3]  # کندل شکار نقدینگی (Sweep)
 
+            atr = calculate_atr(sub, 14)
             if atr == 0: continue
 
-            # فشردگی شدیدتر برای شکار ستاپ‌های ناب
-            is_squeezed = bb_width < 0.030
+            # تعیین سقف و کف محلی برای تشخیص شکار نقدینگی
+            recent_high = max(x["high"] for x in sub[-30:-3])
+            recent_low = min(x["low"] for x in sub[-30:-3])
 
-            recent_highs = [x["high"] for x in sub[-60:-2]]
-            recent_lows = [x["low"] for x in sub[-60:-2]]
-            major_resistance = max(recent_highs) if recent_highs else c["high"] * 1.05
-            major_support = min(recent_lows) if recent_lows else c["low"] * 0.95
+            avg_vol = sum(x["volume"] for x in sub[-20:-3]) / 17 if len(sub) >= 20 else 1.0
+            volume_surge = prev["volume"] > (avg_vol * 1.5)
 
-            avg_vol = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else 1.0
-            volume_spike = c["volume"] > (avg_vol * 1.4) # حجم سنگین‌تر
-
-            # بررسی قدرت بدنه کندل (بدون سایه بزرگ گمراه‌کننده)
-            candle_body = abs(c["close"] - c["open"])
-            total_range = c["high"] - c["low"]
-            strong_body = (candle_body / total_range) >= 0.5 if total_range > 0 else False
-
-            # فیلترهای سخت‌گیرانه نهایی
-            long_setup = is_squeezed and volume_spike and strong_body and (c["close"] > upper_bb) and (c["close"] > ema_50) and (rsi > 55)
-            short_setup = is_squeezed and volume_spike and strong_body and (c["close"] < lower_bb) and (c["close"] < ema_50) and (rsi < 45)
+            # ۱. ستاپ لانگ: قیمت کفِ قبلی را جارو کرده (پایین‌تر از کف رفته و برگشته)، بعد با حجم بالا صعود کرده
+            sweep_low = prev2["low"] < recent_low and prev2["close"] > recent_low
+            bullish_mss = sweep_low and volume_surge and (prev["close"] > prev["open"])
+            
+            # ۲. ستاپ شورت: قیمت سقفِ قبلی را جارو کرده (بالاتر از سقف رفته و برگشته)، بعد با حجم بالا ریزش کرده
+            sweep_high = prev2["high"] > recent_high and prev2["close"] < recent_high
+            bearish_mss = sweep_high and volume_surge and (prev["close"] < prev["open"])
 
             trade_taken = False
 
-            if long_setup:
+            if bullish_mss:
+                # ورود روی بلوک سفارش (Order Block - کندل نزولیِ قبل از حرکت صعودی)
                 entry_price = c["close"]
-                stop_loss = entry_price - (atr * 1.5)
+                stop_loss = recent_low - (atr * 0.5)  # پشت سطح جارو شده با فاصله ایمن
                 risk_dist = entry_price - stop_loss
 
-                if 0.002 * entry_price <= risk_dist <= 0.04 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.05 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     
-                    # فیلتر فضای مسیر (Runway Check)
-                    has_enough_room = major_resistance >= (take_profit - (risk_dist * 0.1))
+                    trade_won, trade_lost = False, False
+                    end_idx = len(candles) - 1
+                    
+                    for j in range(i + 1, len(candles)):
+                        future_c = candles[j]
+                        if future_c["high"] >= take_profit:
+                            trade_won = True
+                            end_idx = j
+                            break
+                        if future_c["low"] <= stop_loss:
+                            trade_lost = True
+                            end_idx = j
+                            break
 
-                    if has_enough_room:
-                        trade_won, trade_lost = False, False
-                        end_idx = len(candles) - 1
-                        
-                        for j in range(i + 1, len(candles)):
-                            future_c = candles[j]
-                            if future_c["high"] >= take_profit:
-                                trade_won = True
-                                end_idx = j
-                                break
-                            if future_c["low"] <= stop_loss:
-                                trade_lost = True
-                                end_idx = j
-                                break
+                    symbol_trades += 1
+                    in_position_until = end_idx + 1
+                    trade_taken = True
+                    
+                    if trade_won: 
+                        wins += 1
+                        balance += (risk_amount * TARGET_RR)
+                    elif trade_lost: 
+                        losses += 1
+                        balance -= risk_amount
 
-                        symbol_trades += 1
-                        in_position_until = end_idx + 1
-                        trade_taken = True
-                        
-                        if trade_won: 
-                            wins += 1
-                            balance += (risk_amount * TARGET_RR)
-                        elif trade_lost: 
-                            losses += 1
-                            balance -= risk_amount
-
-            elif short_setup and not trade_taken:
+            elif bearish_mss and not trade_taken:
                 entry_price = c["close"]
-                stop_loss = entry_price + (atr * 1.5)
+                stop_loss = recent_high + (atr * 0.5)
                 risk_dist = stop_loss - entry_price
 
-                if 0.002 * entry_price <= risk_dist <= 0.04 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.05 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     
-                    # فیلتر فضای مسیر برای شورت
-                    has_enough_room = major_support <= (take_profit + (risk_dist * 0.1))
+                    trade_won, trade_lost = False, False
+                    end_idx = len(candles) - 1
+                    
+                    for j in range(i + 1, len(candles)):
+                        future_c = candles[j]
+                        if future_c["low"] <= take_profit:
+                            trade_won = True
+                            end_idx = j
+                            break
+                        if future_c["high"] >= stop_loss:
+                            trade_lost = True
+                            end_idx = j
+                            break
 
-                    if has_enough_room:
-                        trade_won, trade_lost = False, False
-                        end_idx = len(candles) - 1
-                        
-                        for j in range(i + 1, len(candles)):
-                            future_c = candles[j]
-                            if future_c["low"] <= take_profit:
-                                trade_won = True
-                                end_idx = j
-                                break
-                            if future_c["high"] >= stop_loss:
-                                trade_lost = True
-                                end_idx = j
-                                break
-
-                        symbol_trades += 1
-                        in_position_until = end_idx + 1
-                        
-                        if trade_won: 
-                            wins += 1
-                            balance += (risk_amount * TARGET_RR)
-                        elif trade_lost: 
-                            losses += 1
-                            balance -= risk_amount
+                    symbol_trades += 1
+                    in_position_until = end_idx + 1
+                    
+                    if trade_won: 
+                        wins += 1
+                        balance += (risk_amount * TARGET_RR)
+                    elif trade_lost: 
+                        losses += 1
+                        balance -= risk_amount
 
         total_wins += wins
         total_losses += losses
@@ -224,7 +174,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED DVVE V15 SNIPER RESULTS          ")
+    print("      AGGREGATED LSOB V16 RESULTS                 ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
