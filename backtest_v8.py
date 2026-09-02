@@ -2,66 +2,56 @@ import json
 import urllib.request
 import time
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
-INTERVAL = "60"  # کندل 1 ساعته در بای‌بیت
+# نمادها در یاهو فایننس
+SYMBOLS = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD", "XRPUSDT": "XRP-USD"}
 TARGET_RR = 2.0
 
-def fetch_bybit_full_year(symbol):
-    all_candles = []
-    # بای‌بیت در هر درخواست حداکثر 1000 کندل می‌دهد. با لوپ عقب‌گرد (Pagination) یک سال کامل (8760 کندل) را می‌گیریم.
-    end_time = int(time.time() * 1000)
-    start_time_limit = end_time - (365 * 24 * 3600 * 1000)
+def fetch_yahoo_one_year(symbol_key):
+    yahoo_symbol = SYMBOLS[symbol_key]
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?interval=1h&range=1y"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
-    current_end = end_time
-    print(f"[*] Downloading 1-year historical data for {symbol} from Bybit...")
-
-    while True:
-        url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval={INTERVAL}&limit=1000&end={current_end}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as response:
-                raw = response.read().decode("utf-8")
-                payload = json.loads(raw)
-                
-                if payload.get("retCode") != 0:
-                    print(f"[!] Bybit API Error: {payload.get('retMsg')}")
-                    break
-                
-                list_data = payload.get("result", {}).get("list", [])
-                if not list_data:
-                    break
-                
-                batch_candles = []
-                for row in list_data:
-                    # ساختار بای‌بیت: [startTime, open, high, low, close, volume, turnover]
-                    ts = int(row[0])
-                    op = float(row[1])
-                    hi = float(row[2])
-                    lo = float(row[3])
-                    cl = float(row[4])
-                    vol = float(row[5])
-                    batch_candles.append({
-                        "timestamp": ts, "open": op, "high": hi, 
-                        "low": lo, "close": cl, "volume": vol
+    try:
+        print(f"[*] Downloading 1-year historical data for {symbol_key}...")
+        with urllib.request.urlopen(req, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+            payload = json.loads(raw)
+            
+            result = payload.get("chart", {}).get("result", [])
+            if not result:
+                return []
+            
+            data = result[0]
+            timestamps = data.get("timestamp", [])
+            quotes = data.get("indicators", {}).get("quote", [{}])[0]
+            
+            opens = quotes.get("open", [])
+            highs = quotes.get("high", [])
+            lows = quotes.get("low", [])
+            closes = quotes.get("close", [])
+            volumes = quotes.get("volume", [])
+            
+            candles = []
+            for i in range(len(timestamps)):
+                # فیلتر کردن مقادیر None یا ناقص
+                if (
+                    i < len(opens) and i < len(highs) and i < len(lows) and i < len(closes) and i < len(volumes) and
+                    opens[i] is not None and highs[i] is not None and lows[i] is not None and closes[i] is not None
+                ):
+                    candles.append({
+                        "timestamp": int(timestamps[i]) * 1000,
+                        "open": float(opens[i]),
+                        "high": float(highs[i]),
+                        "low": float(lows[i]),
+                        "close": float(closes[i]),
+                        "volume": float(volumes[i]) if volumes[i] is not None else 0.0
                     })
-                
-                # بای‌بیت داده‌ها را از جدید به قدیم برمی‌گرداند
-                batch_candles.sort(key=lambda x: x["timestamp"])
-                all_candles = batch_candles + all_candles
-                
-                oldest_ts = batch_candles[0]["timestamp"]
-                if oldest_ts <= start_time_limit or len(list_data) < 1000:
-                    break
-                current_end = oldest_ts - 1
-                time.sleep(0.1)
-        except Exception as e:
-            print(f"[!] Error fetching Bybit data for {symbol}: {e}")
-            break
-
-    # فیلتر دقیق یک سال گذشته
-    all_candles = [c for c in all_candles if c["timestamp"] >= start_time_limit]
-    all_candles.sort(key=lambda x: x["timestamp"])
-    return all_candles
+            
+            candles.sort(key=lambda x: x["timestamp"])
+            return candles
+    except Exception as e:
+        print(f"[!] Error fetching data for {symbol_key}: {e}")
+    return []
 
 def calculate_ema(candles, period):
     if len(candles) < period:
@@ -117,16 +107,16 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - 3-LAYER WHALE (BYBIT 1Y)    ")
+    print("   SCORE HUNTER PRO - 1-YEAR TRUE BACKTEST        ")
     print("==================================================")
 
-    for symbol in SYMBOLS:
-        candles = fetch_bybit_full_year(symbol)
+    for symbol_key in SYMBOLS.keys():
+        candles = fetch_yahoo_one_year(symbol_key)
         if not candles or len(candles) < 500:
-            print(f"[!] Insufficient data for {symbol}")
+            print(f"[!] Insufficient data for {symbol_key}")
             continue
         
-        print(f"[*] Loaded {len(candles)} candles for {symbol}. Running backtest...")
+        print(f"[*] Loaded {len(candles)} candles for {symbol_key}. Running backtest...")
         wins = 0
         losses = 0
         symbol_trades = 0
@@ -221,7 +211,7 @@ def run_backtest():
         total_wins += wins
         total_losses += losses
         grand_total_trades += symbol_trades
-        print(f" > {symbol} -> Trades: {symbol_trades} | Wins: {wins} | Losses: {losses}")
+        print(f" > {symbol_key} -> Trades: {symbol_trades} | Wins: {wins} | Losses: {losses}")
 
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
