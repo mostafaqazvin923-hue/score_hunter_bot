@@ -7,7 +7,6 @@ TIMEFRAME = "1hour"
 TARGET_RR = 2.0
 
 def fetch_coinex_klines(symbol, limit=1000):
-    # استفاده از اندپوینت پایدار و رسمی V1 صرافی کوینکس
     url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type={TIMEFRAME}&limit={limit}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
@@ -131,22 +130,22 @@ def run_backtest():
             
             buying_pressure = (c["close"] - c["open"]) / candle_range
             vol_avg = sum(x["volume"] for x in sub[-15:-2]) / 14 if len(sub) >= 15 else 1.0
-            cvd_confirmed = c["volume"] > (vol_avg * 1.05)
+            cvd_confirmed = c["volume"] > (vol_avg * 1.02) # کمی بهینه‌تر برای افزایش فرصت‌های ورود
 
             recent_highs = max(x["high"] for x in sub[-20:-2])
             recent_lows = min(x["low"] for x in sub[-20:-2])
 
-            is_long = (c["close"] > ema50) and (ema50 > ema200) and (adx > 22) and (45 < rsi < 70) and (buying_pressure > 0.35) and cvd_confirmed and (c["close"] > recent_highs)
-            is_short = (c["close"] < ema50) and (ema50 < ema200) and (adx > 22) and (30 < rsi < 55) and (buying_pressure < -0.35) and cvd_confirmed and (c["close"] < recent_lows)
+            is_long = (c["close"] > ema50) and (ema50 > ema200) and (adx > 20) and (42 < rsi < 72) and (buying_pressure > 0.3) and cvd_confirmed and (c["close"] > recent_highs)
+            is_short = (c["close"] < ema50) and (ema50 < ema200) and (adx > 20) and (28 < rsi < 58) and (buying_pressure < -0.3) and cvd_confirmed and (c["close"] < recent_lows)
 
             trade_taken = False
 
             if is_long:
                 entry_price = c["close"]
-                stop_loss = min(prev_c["low"], prev2_c["low"]) - (atr * 0.3)
+                stop_loss = min(prev_c["low"], prev2_c["low"]) - (atr * 0.25)
                 risk_dist = entry_price - stop_loss
 
-                if 0 < (risk_dist / entry_price) <= 0.035:
+                if 0 < (risk_dist / entry_price) <= 0.04:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 36, len(candles) - 1)
@@ -171,10 +170,10 @@ def run_backtest():
 
             if not trade_taken and is_short:
                 entry_price = c["close"]
-                stop_loss = max(prev_c["high"], prev2_c["high"]) + (atr * 0.3)
+                stop_loss = max(prev_c["high"], prev2_c["high"]) + (atr * 0.25)
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.035:
+                if 0 < (risk_dist / entry_price) <= 0.04:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 36, len(candles) - 1)
@@ -183,7 +182,7 @@ def run_backtest():
                         future_c = candles[j]
                         if future_c["high"] >= stop_loss:
                             trade_lost = True; end_idx = j; break
-                        if future_c["low"] >= take_profit:
+                        if future_c["low"] <= take_profit:
                             trade_won = True; end_idx = j; break
                     
                     if not trade_won and not trade_lost:
