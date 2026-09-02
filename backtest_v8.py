@@ -3,7 +3,7 @@ import urllib.request
 import time
 
 SYMBOLS = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD", "XRPUSDT": "XRP-USD"}
-TARGET_RR = 2.5
+TARGET_RR = 2.0
 
 def fetch_yahoo_one_year(symbol_key):
     yahoo_symbol = SYMBOLS[symbol_key]
@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading 1-year Whale Liquidity data for {symbol_key}...")
+        print(f"[*] Downloading 1-year Whale Data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -60,52 +60,45 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - WHALE LIQUIDITY SWEEP       ")
+    print("   SCORE HUNTER PRO - SMART MONEY SWEEP V2        ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
         if not candles or len(candles) < 100: continue
         
-        print(f"[*] Running Liquidity Sweep backtest for {symbol_key}...")
+        print(f"[*] Running Smart Money backtest for {symbol_key}...")
         wins, losses, symbol_trades, skip_until = 0, 0, 0, 0
 
         for i in range(30, len(candles) - 30):
             if i < skip_until: continue
 
             sub = candles[:i+1]
-            c = sub[-2]       # کندل فعلی تاییدیه
-            prev_c = sub[-3]  # کندل نفوذ و شکار نقدینگی
+            c = sub[-2]       # کندل تاییدیه
+            prev_c = sub[-3]  # کندل نفوذ (Sweep)
             
             atr = calculate_atr(sub, 14)
             if atr == 0: continue
 
-            # تعیین سقف و کف مهم در 20 کندل گذشته (محل استاپ ریتیل‌ها)
+            # محدوده سقف و کف 20 کندل اخیر
             recent_swing_high = max(x["high"] for x in sub[-22:-2])
             recent_swing_low = min(x["low"] for x in sub[-22:-2])
 
-            vol_avg = sum(x["volume"] for x in sub[-15:-2]) / 14 if len(sub) >= 15 else 1.0
-            volume_spike = prev_c["volume"] > (vol_avg * 1.5) # حجم سنگین نهنگی در لحظه شکار
-
-            # 1. شکار کف (Bullish Sweep / Stop Hunt Long):
-            # کندل قبل به زیر کف مهم نفوذ کرده (استاپ‌ها را زده)، اما قیمت به شدت پس‌زده شده و کندل فعلی صعودی و با حجم بالاست.
-            bullish_sweep = (prev_c["low"] < recent_swing_low) and (c["close"] > recent_swing_low) and (c["close"] > c["open"]) and volume_spike
-
-            # 2. شکار سقف (Bearish Sweep / Stop Hunt Short):
-            # کندل قبل به بالای سقف مهم نفوذ کرده (استاپ شورت‌ها را زده)، اما قیمت پس‌زده شده و کندل فعلی نزولی و با حجم بالاست.
-            bearish_sweep = (prev_c["high"] > recent_swing_high) and (c["close"] < recent_swing_high) and (c["close"] < c["open"]) and volume_spike
+            # شرایط انعطاف‌پذیرتر برای شکار نقدینگی و برگشت
+            bullish_sweep = (prev_c["low"] <= recent_swing_low) and (c["close"] > recent_swing_low) and (c["close"] > c["open"])
+            bearish_sweep = (prev_c["high"] >= recent_swing_high) and (c["close"] < recent_swing_high) and (c["close"] < c["open"])
 
             trade_taken = False
 
             if bullish_sweep:
                 entry_price = c["close"]
-                stop_loss = prev_c["low"] - (atr * 0.2) # استاپ پشت پایین‌ترین نقطه شکار نقدینگی
+                stop_loss = prev_c["low"] - (atr * 0.3)
                 risk_dist = entry_price - stop_loss
 
-                if 0 < (risk_dist / entry_price) <= 0.035:
+                if 0 < (risk_dist / entry_price) <= 0.04:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 48, len(candles) - 1)
+                    end_idx = min(i + 36, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -117,20 +110,20 @@ def run_backtest():
                         trade_lost = not trade_won
 
                     symbol_trades += 1
-                    skip_until = end_idx + 10
+                    skip_until = end_idx + 6
                     trade_taken = True
                     if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
                     elif trade_lost: losses += 1; balance -= risk_amount
 
             if not trade_taken and bearish_sweep:
                 entry_price = c["close"]
-                stop_loss = prev_c["high"] + (atr * 0.2) # استاپ پشت بالاترین نقطه شکار نقدینگی
+                stop_loss = prev_c["high"] + (atr * 0.3)
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.035:
+                if 0 < (risk_dist / entry_price) <= 0.04:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 48, len(candles) - 1)
+                    end_idx = min(i + 36, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -142,7 +135,7 @@ def run_backtest():
                         trade_lost = not trade_won
 
                     symbol_trades += 1
-                    skip_until = end_idx + 10
+                    skip_until = end_idx + 6
                     if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
                     elif trade_lost: losses += 1; balance -= risk_amount
 
@@ -154,7 +147,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED WHALE SWEEP RESULTS              ")
+    print("      AGGREGATED SMART MONEY V2 RESULTS           ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
