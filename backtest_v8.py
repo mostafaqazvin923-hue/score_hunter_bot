@@ -3,7 +3,7 @@ import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 TIMEFRAME = "1h"
-TARGET_RR = 2.0  # ریسک به ریوارد ثابت ۱ به ۲
+TARGET_RR = 1.3  # ریسک به ریوارد بهینه برای سیستم‌های برگشت به میانگین
 
 def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
@@ -46,29 +46,17 @@ def fetch_real_klines_yahoo(symbol, limit=8800):
         print(f"[!] Error fetching {symbol}: {e}")
     raise ValueError(f"[!] Could not fetch data for {symbol}.")
 
-def resample_to_4h(candles_1h):
-    candles_4h = []
-    for i in range(0, len(candles_1h), 4):
-        chunk = candles_1h[i:i+4]
-        if not chunk: continue
-        candles_4h.append({
-            "timestamp": chunk[0]["timestamp"],
-            "open": chunk[0]["open"],
-            "high": max(x["high"] for x in chunk),
-            "low": min(x["low"] for x in chunk),
-            "close": chunk[-1]["close"],
-            "volume": sum(x["volume"] for x in chunk)
-        })
-    return candles_4h
-
-def calculate_ema(closes, period):
+def calculate_bollinger_bands(closes, period=20, num_std=2.0):
     if len(closes) < period:
-        return closes[-1]
-    multiplier = 2 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for p in closes[period:]:
-        ema = (p - ema) * multiplier + ema
-    return ema
+        c = closes[-1]
+        return c, c, c
+    sub = closes[-period:]
+    sma = sum(sub) / period
+    variance = sum((x - sma) ** 2 for x in sub) / period
+    std_dev = variance ** 0.5
+    upper = sma + (num_std * std_dev)
+    lower = sma - (num_std * std_dev)
+    return upper, sma, lower
 
 def calculate_rsi(candles, period=14):
     if len(candles) < period + 1:
@@ -99,20 +87,15 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - SNIPER ELITE V24 (TARGET 70%) ")
+    print(" SCORE HUNTER PRO - BOLLINGER MEAN REVERSION V25  ")
     print("==================================================")
 
     for symbol in SYMBOLS:
         try:
-            candles_1h = fetch_real_klines_yahoo(symbol, limit=8800)
+            candles = fetch_real_klines_yahoo(symbol, limit=8800)
         except Exception as err:
             print(err)
             continue
-        
-        if len(candles_1h) < 200:
-            continue
-
-        candles_4h = resample_to_4h(candles_1h)
         
         wins = 0
         losses = 0
@@ -121,86 +104,52 @@ def run_backtest():
         symbol_shorts = 0
         skip_until = 0
 
-        for i in range(50, len(candles_1h) - 20):
+        for i in range(30, len(candles) - 15):
             if i < skip_until:
                 continue
 
-            c1h = candles_1h[i]
-            current_ts = c1h["timestamp"]
+            sub = candles[:i+1]
+            closes = [x["close"] for x in sub]
+            c = sub[-2]       # کندل سیگنال
+            prev_c = sub[-3]
 
-            # پیدا کردن کندل متناظر ۴ ساعته برای فیلتر روند کلان
-            active_4h_idx = -1
-            for idx, c4 in enumerate(candles_4h):
-                if c4["timestamp"] <= current_ts:
-                    active_4h_idx = idx
-                else:
-                    break
-            
-            if active_4h_idx < 30: 
-                continue
-            
-            sub_4h = candles_4h[:active_4h_idx+1]
-            closes_4h = [x["close"] for x in sub_4h]
-            ema_20_4h = calculate_ema(closes_4h, 20)
-            ema_50_4h = calculate_ema(closes_4h, 50)
-            
-            is_4h_bullish = ema_20_4h > ema_50_4h
-            is_4h_bearish = ema_20_4h < ema_50_4h
-
-            sub_1h = candles_1h[:i+1]
-            c = sub_1h[-2]       # کندل سیگنال
-            prev_c = sub_1h[-3]  # کندل قبل برای تعیین استاپ
-
-            ema20_1h = calculate_ema([x["close"] for x in sub_1h], 20)
-            ema50_1h = calculate_ema([x["close"] for x in sub_1h], 50)
-            rsi = calculate_rsi(sub_1h, 14)
+            upper, sma, lower = calculate_bollinger_bands(closes, period=20, num_std=2.0)
+            rsi = calculate_rsi(sub, 14)
             trade_taken = False
 
             candle_range = c["high"] - c["low"]
             if candle_range == 0:
                 continue
 
-            # فیلتر بسیار سخت‌گیرانه مومنتوم بدنه (بدنه باید حداقل ۶۵٪ کل کندل باشد)
-            body_size = abs(c["close"] - c["open"])
-            body_ratio = body_size / candle_range
-            if body_ratio < 0.65:
-                continue
-
-            # تاییدیه حجم معاملات قوی (باید حداقل ۵۰٪ بالاتر از میانگین باشد)
-            recent_volumes = [x["volume"] for x in sub_1h[-22:-2]]
-            avg_volume = sum(recent_volumes) / len(recent_volumes) if recent_volumes else 1.0
-            if c["volume"] <= (avg_volume * 1.5):
-                continue
-
             current_risk_amount = balance * risk_percentage
 
-            # --- شورت با فیلترهای استریل و هم‌راستایی ۴ ساعته و ۱ ساعته ---
-            is_short = is_4h_bearish and (ema20_1h < ema50_1h) and (c["close"] < c["open"]) and (c["close"] < ema20_1h) and (rsi < 45)
+            # --- لانگ (خرید در کف باند بولینگر و اشباع فروش RSI) ---
+            is_oversold = (c["low"] <= lower or c["close"] <= lower) and (rsi < 35) and (c["close"] > c["open"])
 
-            if is_short:
+            if is_oversold:
                 entry_price = c["close"]
-                stop_loss = prev_c["high"] + (entry_price * 0.001)
-                risk_dist = stop_loss - entry_price
+                stop_loss = min(prev_c["low"], c["low"]) - (entry_price * 0.001)
+                risk_dist = entry_price - stop_loss
 
-                if 0 < (risk_dist / entry_price) <= 0.025:
-                    take_profit = entry_price - (risk_dist * TARGET_RR)
+                if 0 < (risk_dist / entry_price) <= 0.03:
+                    take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 8, len(candles_1h) - 1)  # بستن سریع‌تر پوزیشن در صورت عدم تحقق
+                    end_idx = min(i + 10, len(candles) - 1)  # بستن سریع معامله برای برگشت به میانگین
                     
                     for j in range(i + 1, end_idx + 1):
-                        future_c = candles_1h[j]
-                        if future_c["high"] >= stop_loss:
+                        future_c = candles[j]
+                        if future_c["low"] <= stop_loss:
                             trade_lost = True; break
-                        if future_c["low"] <= take_profit:
+                        if future_c["high"] >= take_profit:
                             trade_won = True; break
                     
                     if not trade_won and not trade_lost:
-                        trade_won = True if candles_1h[end_idx]["close"] < entry_price else False
+                        trade_won = True if candles[end_idx]["close"] > entry_price else False
                         trade_lost = not trade_won
 
                     symbol_trades += 1
-                    symbol_shorts += 1
-                    grand_total_shorts += 1
+                    symbol_longs += 1
+                    grand_total_longs += 1
                     skip_until = end_idx
                     trade_taken = True
 
@@ -209,40 +158,39 @@ def run_backtest():
                     elif trade_lost: 
                         losses += 1; balance -= current_risk_amount
 
-            # --- لانگ با فیلترهای استریل و هم‌راستایی ۴ ساعته و ۱ ساعته ---
-            if not trade_taken:
-                is_long = is_4h_bullish and (ema20_1h > ema50_1h) and (c["close"] > c["open"]) and (c["close"] > ema20_1h) and (rsi > 55)
+            # --- شورت (فروش در سقف باند بولینگر و اشباع خرید RSI) ---
+            is_overbought = (c["high"] >= upper or c["close"] >= upper) and (rsi > 65) and (c["close"] < c["open"])
 
-                if is_long:
-                    entry_price = c["close"]
-                    stop_loss = prev_c["low"] - (entry_price * 0.001)
-                    risk_dist = entry_price - stop_loss
+            if not trade_taken and is_overbought:
+                entry_price = c["close"]
+                stop_loss = max(prev_c["high"], c["high"]) + (entry_price * 0.001)
+                risk_dist = stop_loss - entry_price
 
-                    if 0 < (risk_dist / entry_price) <= 0.025:
-                        take_profit = entry_price + (risk_dist * TARGET_RR)
-                        trade_won, trade_lost = False, False
-                        end_idx = min(i + 8, len(candles_1h) - 1)
-                        
-                        for j in range(i + 1, end_idx + 1):
-                            future_c = candles_1h[j]
-                            if future_c["low"] <= stop_loss:
-                                trade_lost = True; break
-                            if future_c["high"] >= take_profit:
-                                trade_won = True; break
-                        
-                        if not trade_won and not trade_lost:
-                            trade_won = True if candles_1h[end_idx]["close"] > entry_price else False
-                            trade_lost = not trade_won
+                if 0 < (risk_dist / entry_price) <= 0.03:
+                    take_profit = entry_price - (risk_dist * TARGET_RR)
+                    trade_won, trade_lost = False, False
+                    end_idx = min(i + 10, len(candles) - 1)
+                    
+                    for j in range(i + 1, end_idx + 1):
+                        future_c = candles[j]
+                        if future_c["high"] >= stop_loss:
+                            trade_lost = True; break
+                        if future_c["low"] <= take_profit:
+                            trade_won = True; break
+                    
+                    if not trade_won and not trade_lost:
+                        trade_won = True if candles[end_idx]["close"] < entry_price else False
+                        trade_lost = not trade_won
 
-                        symbol_trades += 1
-                        symbol_longs += 1
-                        grand_total_longs += 1
-                        skip_until = end_idx
+                    symbol_trades += 1
+                    symbol_shorts += 1
+                    grand_total_shorts += 1
+                    skip_until = end_idx
 
-                        if trade_won: 
-                            wins += 1; balance += (current_risk_amount * TARGET_RR)
-                        elif trade_lost: 
-                            losses += 1; balance -= current_risk_amount
+                    if trade_won: 
+                        wins += 1; balance += (current_risk_amount * TARGET_RR)
+                    elif trade_lost: 
+                        losses += 1; balance -= current_risk_amount
 
         total_wins += wins
         total_losses += losses
@@ -252,7 +200,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED V24 SNIPER ELITE RESULTS         ")
+    print("      AGGREGATED BOLLINGER REVERSION V25 RESULTS  ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
