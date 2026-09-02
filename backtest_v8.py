@@ -1,68 +1,33 @@
-"""
-WHALE FLOW PRO
-1H Bias + 15M Precision Entry
-Binance USD-M Futures
-1-Year Historical Backtest
-
-Symbols:
-BTCUSDT
-ETHUSDT
-SOLUSDT
-XRPUSDT
-
-NO pandas required.
-Uses Binance public REST API.
-
-Strategy:
-1H:
-    EMA20 > EMA50 > EMA200  -> LONG bias
-    EMA20 < EMA50 < EMA200  -> SHORT bias
-    ADX >= 20
-    RSI filter
-    VWAP filter
-
-15M:
-    Liquidity Sweep
-    Market Structure Shift
-    Displacement
-    FVG
-    Volume confirmation
-    ATR-based SL
-    TP = 2R
-
-Risk:
-    1R = SL distance
-    TP = 2R
-    Max 4 trades/day
-    Max daily loss = -2R
-    Max 2 correlated positions
-    No overlapping positions
-"""
-
-import requests
+import json
+import urllib.request
+import urllib.parse
 import time
+from datetime import datetime, timezone, timedelta
 import math
-import csv
-from datetime import datetime, timedelta, timezone
-from collections import defaultdict
-
 
 # ============================================================
-# CONFIG
+# WHALE FLOW PRO
+# Yahoo Finance Backtest
+#
+# 1H  = Trend Filter
+# 15M = Entry
+#
+# BTC / ETH / SOL / XRP
+# RR = 1:2
+# NO PANDAS
 # ============================================================
 
-BASE_URL = "https://fapi.binance.com"
+SYMBOLS = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "SOL": "SOL-USD",
+    "XRP": "XRP-USD"
+}
 
-SYMBOLS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "SOLUSDT",
-    "XRPUSDT"
-]
+INITIAL_BALANCE = 1000.0
+RISK_PER_TRADE = 25.0
+TARGET_RR = 2.0
 
-DAYS = 365
-
-# Indicators
 EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 200
@@ -71,208 +36,193 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 
-ADX_MIN = 20.0
-
-# RSI
-LONG_RSI_MIN = 52.0
-LONG_RSI_MAX = 68.0
-
-SHORT_RSI_MIN = 32.0
-SHORT_RSI_MAX = 48.0
-
-# Liquidity
-SWEEP_LOOKBACK = 10
-
-# Structure
-MSS_LOOKBACK = 8
-
-# Displacement
-DISPLACEMENT_ATR = 1.15
-
-# Volume
-VOLUME_LOOKBACK = 20
-VOLUME_MULTIPLIER = 1.15
-
-# FVG
-FVG_MIN_ATR = 0.10
-
-# SL
-MIN_SL_ATR = 0.80
-MAX_SL_ATR = 1.30
-
-# Risk / reward
-RR = 2.0
-
-# Trading limits
 MAX_TRADES_PER_DAY = 4
 MAX_DAILY_LOSS_R = -2.0
 
-# To avoid taking all highly correlated coins
-MAX_SIMULTANEOUS_DIRECTION = 2
-
-# Fees / slippage assumptions
-TAKER_FEE = 0.0005
-SLIPPAGE = 0.0002
-
-# Save files
-TRADES_FILE = "whale_flow_trades.csv"
-SUMMARY_FILE = "whale_flow_summary.csv"
+# Yahoo limitations:
+# 1H -> up to ~730 days
+# 15M -> ~60 days
+TREND_RANGE = "1y"
+ENTRY_RANGE = "60d"
 
 
 # ============================================================
-# HTTP
+# DATA
 # ============================================================
 
-session = requests.Session()
+def fetch_yahoo(symbol, interval, range_value):
 
+    encoded = urllib.parse.quote(symbol)
 
-def get_json(url, params, retries=5):
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/"
+        f"{encoded}?interval={interval}&range={range_value}"
+        f"&includePrePost=false"
+    )
 
-    for attempt in range(retries):
-
-        try:
-            r = session.get(
-                url,
-                params=params,
-                timeout=20
-            )
-
-            if r.status_code == 200:
-                return r.json()
-
-            if r.status_code == 429:
-                time.sleep(2 + attempt * 2)
-                continue
-
-            print("HTTP ERROR:", r.status_code, r.text[:200])
-
-        except Exception as e:
-            print("REQUEST ERROR:", e)
-
-        time.sleep(1 + attempt)
-
-    raise RuntimeError("Binance API request failed")
-
-
-# ============================================================
-# BINANCE KLINES
-# ============================================================
-
-def get_klines(symbol, interval, start_ms, end_ms):
-
-    data = []
-
-    current = start_ms
-
-    while current < end_ms:
-
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "startTime": current,
-            "endTime": end_ms,
-            "limit": 1500
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         }
+    )
 
-        batch = get_json(
-            BASE_URL + "/fapi/v1/klines",
-            params
+    print(
+        f"[*] Downloading {symbol} | "
+        f"{interval} | {range_value}"
+    )
+
+    try:
+
+        with urllib.request.urlopen(req, timeout=40) as response:
+
+            raw = response.read().decode("utf-8")
+            payload = json.loads(raw)
+
+        result = payload.get("chart", {}).get("result")
+
+        if not result:
+            print("[!] Yahoo returned no data")
+            return []
+
+        data = result[0]
+
+        timestamps = data.get("timestamp", [])
+
+        quote = (
+            data.get("indicators", {})
+            .get("quote", [{}])[0]
         )
 
-        if not batch:
-            break
+        opens = quote.get("open", [])
+        highs = quote.get("high", [])
+        lows = quote.get("low", [])
+        closes = quote.get("close", [])
+        volumes = quote.get("volume", [])
 
-        for k in batch:
+        candles = []
 
-            ts = int(k[0])
+        for i in range(len(timestamps)):
 
-            if ts >= start_ms and ts <= end_ms:
-                data.append({
-                    "time": ts,
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4]),
-                    "volume": float(k[5])
-                })
+            if (
+                i >= len(opens)
+                or i >= len(highs)
+                or i >= len(lows)
+                or i >= len(closes)
+                or i >= len(volumes)
+            ):
+                continue
 
-        last_ts = int(batch[-1][0])
+            if (
+                opens[i] is None
+                or highs[i] is None
+                or lows[i] is None
+                or closes[i] is None
+            ):
+                continue
 
-        next_ts = last_ts + 1
+            candles.append({
+                "timestamp": int(timestamps[i]) * 1000,
+                "open": float(opens[i]),
+                "high": float(highs[i]),
+                "low": float(lows[i]),
+                "close": float(closes[i]),
+                "volume": float(volumes[i] or 0)
+            })
 
-        if next_ts <= current:
-            break
+        candles.sort(key=lambda x: x["timestamp"])
 
-        current = next_ts
+        print(
+            f"    -> {len(candles):,} candles received"
+        )
 
-        if len(batch) < 1500:
-            break
+        if candles:
 
-        time.sleep(0.05)
+            first = datetime.fromtimestamp(
+                candles[0]["timestamp"] / 1000,
+                tz=timezone.utc
+            )
 
-    # remove duplicates
-    unique = {}
+            last = datetime.fromtimestamp(
+                candles[-1]["timestamp"] / 1000,
+                tz=timezone.utc
+            )
 
-    for x in data:
-        unique[x["time"]] = x
+            print(
+                f"    -> {first:%Y-%m-%d %H:%M} UTC"
+                f" -> {last:%Y-%m-%d %H:%M} UTC"
+            )
 
-    return [
-        unique[k]
-        for k in sorted(unique)
-    ]
+        return candles
+
+    except Exception as e:
+
+        print(
+            f"[!] Yahoo error for {symbol} "
+            f"{interval}: {e}"
+        )
+
+        return []
 
 
 # ============================================================
 # INDICATORS
 # ============================================================
 
-def sma(values, period):
+def ema(values, period):
 
     if len(values) < period:
         return None
 
-    return sum(values[-period:]) / period
-
-
-def ema_series(values, period):
-
-    if len(values) < period:
-        return [None] * len(values)
-
-    result = [None] * len(values)
-
-    seed = sum(values[:period]) / period
-
-    result[period - 1] = seed
-
     multiplier = 2.0 / (period + 1)
 
-    prev = seed
+    result = sum(values[:period]) / period
 
-    for i in range(period, len(values)):
-
-        prev = (
-            values[i] - prev
-        ) * multiplier + prev
-
-        result[i] = prev
+    for price in values[period:]:
+        result = (
+            price - result
+        ) * multiplier + result
 
     return result
 
 
-def rsi_series(closes, period=14):
+def ema_series(values, period):
 
-    result = [None] * len(closes)
+    result = [None] * len(values)
 
-    if len(closes) <= period:
+    if len(values) < period:
         return result
+
+    current = sum(values[:period]) / period
+    result[period - 1] = current
+
+    multiplier = 2.0 / (period + 1)
+
+    for i in range(period, len(values)):
+
+        current = (
+            (values[i] - current)
+            * multiplier
+            + current
+        )
+
+        result[i] = current
+
+    return result
+
+
+def rsi(values, period=14):
+
+    if len(values) < period + 1:
+        return None
 
     gains = []
     losses = []
 
-    for i in range(1, len(closes)):
+    for i in range(1, len(values)):
 
-        change = closes[i] - closes[i - 1]
+        change = values[i] - values[i - 1]
 
         gains.append(max(change, 0))
         losses.append(max(-change, 0))
@@ -280,1569 +230,841 @@ def rsi_series(closes, period=14):
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    if avg_loss == 0:
-        result[period] = 100.0
-    else:
-        rs = avg_gain / avg_loss
-        result[period] = 100 - (100 / (1 + rs))
-
-    for i in range(period + 1, len(closes)):
-
-        gain = gains[i - 1]
-        loss = losses[i - 1]
+    for i in range(period, len(gains)):
 
         avg_gain = (
-            (avg_gain * (period - 1)) + gain
+            (avg_gain * (period - 1))
+            + gains[i]
         ) / period
 
         avg_loss = (
-            (avg_loss * (period - 1)) + loss
+            (avg_loss * (period - 1))
+            + losses[i]
         ) / period
 
-        if avg_loss == 0:
-            result[i] = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            result[i] = 100 - (100 / (1 + rs))
+    if avg_loss == 0:
+        return 100.0
 
-    return result
+    rs = avg_gain / avg_loss
 
-
-def atr_series(candles, period=14):
-
-    tr = [None] * len(candles)
-
-    for i in range(len(candles)):
-
-        if i == 0:
-            tr[i] = (
-                candles[i]["high"]
-                - candles[i]["low"]
-            )
-        else:
-
-            h = candles[i]["high"]
-            l = candles[i]["low"]
-            pc = candles[i - 1]["close"]
-
-            tr[i] = max(
-                h - l,
-                abs(h - pc),
-                abs(l - pc)
-            )
-
-    result = [None] * len(candles)
-
-    if len(candles) <= period:
-        return result
-
-    first = sum(
-        tr[1:period + 1]
-    ) / period
-
-    result[period] = first
-
-    prev = first
-
-    for i in range(period + 1, len(candles)):
-
-        prev = (
-            (prev * (period - 1))
-            + tr[i]
-        ) / period
-
-        result[i] = prev
-
-    return result
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
-def adx_series(candles, period=14):
+def atr(candles, period=14):
 
-    n = len(candles)
+    if len(candles) < period + 1:
+        return 0.0
 
-    if n < period * 2 + 2:
-        return [None] * n
+    trs = []
 
-    tr = [0.0] * n
-    plus_dm = [0.0] * n
-    minus_dm = [0.0] * n
-
-    for i in range(1, n):
+    for i in range(1, len(candles)):
 
         h = candles[i]["high"]
         l = candles[i]["low"]
-
-        ph = candles[i - 1]["high"]
-        pl = candles[i - 1]["low"]
         pc = candles[i - 1]["close"]
 
-        tr[i] = max(
+        tr = max(
             h - l,
             abs(h - pc),
             abs(l - pc)
         )
 
-        up = h - ph
-        down = pl - l
+        trs.append(tr)
 
-        if up > down and up > 0:
-            plus_dm[i] = up
+    return sum(trs[-period:]) / period
 
-        if down > up and down > 0:
-            minus_dm[i] = down
 
-    atr = [None] * n
-    p_dm = [None] * n
-    m_dm = [None] * n
+def adx(candles, period=14):
 
-    atr[period] = sum(
-        tr[1:period + 1]
-    )
+    if len(candles) < period * 2 + 1:
+        return 0.0
 
-    p_dm[period] = sum(
-        plus_dm[1:period + 1]
-    )
+    trs = []
+    plus_dm = []
+    minus_dm = []
 
-    m_dm[period] = sum(
-        minus_dm[1:period + 1]
-    )
+    for i in range(1, len(candles)):
 
-    dx = [None] * n
+        high = candles[i]["high"]
+        low = candles[i]["low"]
 
-    for i in range(period, n):
+        prev_high = candles[i - 1]["high"]
+        prev_low = candles[i - 1]["low"]
+        prev_close = candles[i - 1]["close"]
 
-        if i > period:
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close)
+        )
 
-            atr[i] = (
-                atr[i - 1]
-                - atr[i - 1] / period
-                + tr[i]
-            )
+        up_move = high - prev_high
+        down_move = prev_low - low
 
-            p_dm[i] = (
-                p_dm[i - 1]
-                - p_dm[i - 1] / period
-                + plus_dm[i]
-            )
+        plus = (
+            up_move
+            if up_move > down_move and up_move > 0
+            else 0
+        )
 
-            m_dm[i] = (
-                m_dm[i - 1]
-                - m_dm[i - 1] / period
-                + minus_dm[i]
-            )
+        minus = (
+            down_move
+            if down_move > up_move and down_move > 0
+            else 0
+        )
 
-        if atr[i] == 0:
+        trs.append(tr)
+        plus_dm.append(plus)
+        minus_dm.append(minus)
+
+    if len(trs) < period:
+        return 0.0
+
+    tr_avg = sum(trs[:period]) / period
+    plus_avg = sum(plus_dm[:period]) / period
+    minus_avg = sum(minus_dm[:period]) / period
+
+    dx_values = []
+
+    for i in range(period, len(trs)):
+
+        tr_avg = (
+            (tr_avg * (period - 1))
+            + trs[i]
+        ) / period
+
+        plus_avg = (
+            (plus_avg * (period - 1))
+            + plus_dm[i]
+        ) / period
+
+        minus_avg = (
+            (minus_avg * (period - 1))
+            + minus_dm[i]
+        ) / period
+
+        if tr_avg == 0:
             continue
 
-        pdi = 100 * p_dm[i] / atr[i]
-        mdi = 100 * m_dm[i] / atr[i]
+        plus_di = 100 * plus_avg / tr_avg
+        minus_di = 100 * minus_avg / tr_avg
 
-        denominator = pdi + mdi
+        denominator = plus_di + minus_di
 
-        if denominator != 0:
+        if denominator == 0:
+            continue
 
-            dx[i] = (
-                100
-                * abs(pdi - mdi)
-                / denominator
-            )
-
-    adx = [None] * n
-
-    valid_dx = [
-        x for x in dx
-        if x is not None
-    ]
-
-    if len(valid_dx) < period:
-        return adx
-
-    first_adx = sum(
-        valid_dx[:period]
-    ) / period
-
-    first_index = None
-
-    count = 0
-
-    for i in range(n):
-
-        if dx[i] is not None:
-
-            count += 1
-
-            if count == period:
-                first_index = i
-                break
-
-    if first_index is None:
-        return adx
-
-    adx[first_index] = first_adx
-
-    prev = first_adx
-
-    for i in range(first_index + 1, n):
-
-        if dx[i] is not None:
-
-            prev = (
-                (prev * (period - 1))
-                + dx[i]
-            ) / period
-
-            adx[i] = prev
-
-    return adx
-
-
-# ============================================================
-# VWAP
-# ============================================================
-
-def add_daily_vwap(candles):
-
-    cumulative_pv = 0.0
-    cumulative_volume = 0.0
-    current_day = None
-
-    for c in candles:
-
-        dt = datetime.fromtimestamp(
-            c["time"] / 1000,
-            tz=timezone.utc
+        dx = (
+            100
+            * abs(plus_di - minus_di)
+            / denominator
         )
 
-        day = dt.date()
+        dx_values.append(dx)
 
-        if day != current_day:
+    if len(dx_values) < period:
+        return 0.0
 
-            current_day = day
-            cumulative_pv = 0.0
-            cumulative_volume = 0.0
-
-        typical = (
-            c["high"]
-            + c["low"]
-            + c["close"]
-        ) / 3
-
-        cumulative_pv += (
-            typical * c["volume"]
-        )
-
-        cumulative_volume += c["volume"]
-
-        if cumulative_volume > 0:
-            c["vwap"] = (
-                cumulative_pv
-                / cumulative_volume
-            )
-        else:
-            c["vwap"] = c["close"]
+    return sum(dx_values[-period:]) / period
 
 
 # ============================================================
-# INDICATOR PREPARATION
+# 1H TREND
 # ============================================================
 
-def prepare_1h(candles):
+def get_1h_bias(candles, timestamp):
 
-    closes = [
-        c["close"]
-        for c in candles
+    usable = [
+        c for c in candles
+        if c["timestamp"] <= timestamp
     ]
 
-    ema20 = ema_series(
-        closes,
-        EMA_FAST
-    )
-
-    ema50 = ema_series(
-        closes,
-        EMA_MID
-    )
-
-    ema200 = ema_series(
-        closes,
-        EMA_SLOW
-    )
-
-    rsi = rsi_series(
-        closes,
-        RSI_PERIOD
-    )
-
-    atr = atr_series(
-        candles,
-        ATR_PERIOD
-    )
-
-    adx = adx_series(
-        candles,
-        ADX_PERIOD
-    )
-
-    add_daily_vwap(candles)
-
-    for i, c in enumerate(candles):
-
-        c["ema20"] = ema20[i]
-        c["ema50"] = ema50[i]
-        c["ema200"] = ema200[i]
-        c["rsi"] = rsi[i]
-        c["atr"] = atr[i]
-        c["adx"] = adx[i]
-
-
-def prepare_15m(candles):
-
-    atr = atr_series(
-        candles,
-        ATR_PERIOD
-    )
-
-    avg_vol = [None] * len(candles)
-
-    for i in range(
-        VOLUME_LOOKBACK,
-        len(candles)
-    ):
-
-        vals = [
-            candles[j]["volume"]
-            for j in range(
-                i - VOLUME_LOOKBACK,
-                i
-            )
-        ]
-
-        avg_vol[i] = (
-            sum(vals) / len(vals)
-        )
-
-    for i, c in enumerate(candles):
-
-        c["atr"] = atr[i]
-        c["avg_volume"] = avg_vol[i]
-
-
-# ============================================================
-# TIME MAPPING
-# ============================================================
-
-def find_1h_context(candles_1h, timestamp):
-
-    # latest 1H candle that has CLOSED
-    lo = 0
-    hi = len(candles_1h) - 1
-
-    answer = None
-
-    while lo <= hi:
-
-        mid = (lo + hi) // 2
-
-        if candles_1h[mid]["time"] <= timestamp:
-            answer = mid
-            lo = mid + 1
-        else:
-            hi = mid - 1
-
-    return answer
-
-
-# ============================================================
-# MARKET STRUCTURE
-# ============================================================
-
-def previous_swing_high(candles, i, lookback):
-
-    start = max(
-        0,
-        i - lookback
-    )
-
-    highs = [
-        candles[j]["high"]
-        for j in range(start, i)
-    ]
-
-    if not highs:
+    if len(usable) < 220:
         return None
 
-    return max(highs)
+    closes = [c["close"] for c in usable]
 
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    e200 = ema(closes, 200)
 
-def previous_swing_low(candles, i, lookback):
+    current_rsi = rsi(closes, RSI_PERIOD)
+    current_adx = adx(usable, ADX_PERIOD)
 
-    start = max(
-        0,
-        i - lookback
-    )
-
-    lows = [
-        candles[j]["low"]
-        for j in range(start, i)
-    ]
-
-    if not lows:
-        return None
-
-    return min(lows)
-
-
-# ============================================================
-# SIGNAL DETECTION
-# ============================================================
-
-def long_signal(candles, i):
-
-    if i < max(
-        SWEEP_LOOKBACK,
-        MSS_LOOKBACK,
-        VOLUME_LOOKBACK
-    ) + 3:
-        return None
-
-    c = candles[i]
-
-    atr = c["atr"]
-
-    if atr is None:
-        return None
-
-    # --------------------------------------------------------
-    # 1. Liquidity Sweep
-    # Current candle takes previous low,
-    # but closes back above it.
-    # --------------------------------------------------------
-
-    prior_low = previous_swing_low(
-        candles,
-        i,
-        SWEEP_LOOKBACK
-    )
-
-    if prior_low is None:
-        return None
-
-    sweep = (
-        c["low"] < prior_low
-        and c["close"] > prior_low
-    )
-
-    if not sweep:
-        return None
-
-    # --------------------------------------------------------
-    # 2. MSS
-    # After sweep, current close must break
-    # a recent lower high.
-    # --------------------------------------------------------
-
-    mss_level = previous_swing_high(
-        candles,
-        i,
-        MSS_LOOKBACK
-    )
-
-    if mss_level is None:
-        return None
-
-    # We require the displacement candle itself
-    # to close above structure.
-    if c["close"] <= mss_level:
-        return None
-
-    # --------------------------------------------------------
-    # 3. Displacement
-    # --------------------------------------------------------
-
-    body = abs(
-        c["close"] - c["open"]
-    )
-
-    if body < DISPLACEMENT_ATR * atr:
-        return None
-
-    if c["close"] <= c["open"]:
-        return None
-
-    # --------------------------------------------------------
-    # 4. Volume
-    # --------------------------------------------------------
-
-    if c["avg_volume"] is None:
-        return None
-
-    if c["volume"] < (
-        c["avg_volume"]
-        * VOLUME_MULTIPLIER
-    ):
-        return None
-
-    # --------------------------------------------------------
-    # 5. FVG
-    #
-    # Bullish FVG:
-    # current candle low > candle two bars ago high
-    # --------------------------------------------------------
-
-    if i < 2:
-        return None
-
-    fvg_low = candles[i - 2]["high"]
-    fvg_high = c["low"]
-
-    gap = fvg_high - fvg_low
-
-    if gap < FVG_MIN_ATR * atr:
-        return None
-
-    # --------------------------------------------------------
-    # Entry = 50% FVG
-    # --------------------------------------------------------
-
-    entry = (
-        fvg_low + fvg_high
-    ) / 2
-
-    sweep_low = c["low"]
-
-    sl_distance = (
-        entry - sweep_low
-    )
-
-    if sl_distance <= 0:
-        return None
-
-    sl_atr = sl_distance / atr
-
-    if sl_atr < MIN_SL_ATR:
-        return None
-
-    if sl_atr > MAX_SL_ATR:
-        return None
-
-    stop = sweep_low
-
-    target = (
-        entry
-        + sl_distance * RR
-    )
-
-    return {
-        "side": "LONG",
-        "entry": entry,
-        "stop": stop,
-        "target": target,
-        "atr": atr,
-        "score": 0
-    }
-
-
-def short_signal(candles, i):
-
-    if i < max(
-        SWEEP_LOOKBACK,
-        MSS_LOOKBACK,
-        VOLUME_LOOKBACK
-    ) + 3:
-        return None
-
-    c = candles[i]
-
-    atr = c["atr"]
-
-    if atr is None:
-        return None
-
-    # --------------------------------------------------------
-    # 1. Liquidity Sweep
-    # --------------------------------------------------------
-
-    prior_high = previous_swing_high(
-        candles,
-        i,
-        SWEEP_LOOKBACK
-    )
-
-    if prior_high is None:
-        return None
-
-    sweep = (
-        c["high"] > prior_high
-        and c["close"] < prior_high
-    )
-
-    if not sweep:
-        return None
-
-    # --------------------------------------------------------
-    # 2. MSS
-    # --------------------------------------------------------
-
-    mss_level = previous_swing_low(
-        candles,
-        i,
-        MSS_LOOKBACK
-    )
-
-    if mss_level is None:
-        return None
-
-    if c["close"] >= mss_level:
-        return None
-
-    # --------------------------------------------------------
-    # 3. Displacement
-    # --------------------------------------------------------
-
-    body = abs(
-        c["close"] - c["open"]
-    )
-
-    if body < DISPLACEMENT_ATR * atr:
-        return None
-
-    if c["close"] >= c["open"]:
-        return None
-
-    # --------------------------------------------------------
-    # 4. Volume
-    # --------------------------------------------------------
-
-    if c["avg_volume"] is None:
-        return None
-
-    if c["volume"] < (
-        c["avg_volume"]
-        * VOLUME_MULTIPLIER
-    ):
-        return None
-
-    # --------------------------------------------------------
-    # 5. Bearish FVG
-    # current high < candle two bars ago low
-    # --------------------------------------------------------
-
-    if i < 2:
-        return None
-
-    fvg_high = candles[i - 2]["low"]
-    fvg_low = c["high"]
-
-    gap = fvg_high - fvg_low
-
-    if gap < FVG_MIN_ATR * atr:
-        return None
-
-    entry = (
-        fvg_low + fvg_high
-    ) / 2
-
-    sweep_high = c["high"]
-
-    sl_distance = (
-        sweep_high - entry
-    )
-
-    if sl_distance <= 0:
-        return None
-
-    sl_atr = sl_distance / atr
-
-    if sl_atr < MIN_SL_ATR:
-        return None
-
-    if sl_atr > MAX_SL_ATR:
-        return None
-
-    stop = sweep_high
-
-    target = (
-        entry
-        - sl_distance * RR
-    )
-
-    return {
-        "side": "SHORT",
-        "entry": entry,
-        "stop": stop,
-        "target": target,
-        "atr": atr,
-        "score": 0
-    }
-
-
-# ============================================================
-# 1H FILTER
-# ============================================================
-
-def get_bias(c):
+    price = closes[-1]
 
     if (
-        c["ema20"] is None
-        or c["ema50"] is None
-        or c["ema200"] is None
-        or c["rsi"] is None
-        or c["adx"] is None
-        or c["vwap"] is None
+        e20 is None
+        or e50 is None
+        or e200 is None
+        or current_rsi is None
     ):
         return None
 
-    # LONG
-    if (
-        c["ema20"] > c["ema50"]
-        and c["ema50"] > c["ema200"]
-        and c["close"] > c["ema20"]
-        and c["adx"] >= ADX_MIN
-        and LONG_RSI_MIN <= c["rsi"] <= LONG_RSI_MAX
-        and c["close"] > c["vwap"]
-    ):
+    # Strong bullish trend
+    long_bias = (
+        e20 > e50
+        and e50 > e200
+        and price > e20
+        and current_adx >= 20
+        and 50 <= current_rsi <= 70
+    )
+
+    # Strong bearish trend
+    short_bias = (
+        e20 < e50
+        and e50 < e200
+        and price < e20
+        and current_adx >= 20
+        and 30 <= current_rsi <= 50
+    )
+
+    if long_bias:
         return "LONG"
 
-    # SHORT
-    if (
-        c["ema20"] < c["ema50"]
-        and c["ema50"] < c["ema200"]
-        and c["close"] < c["ema20"]
-        and c["adx"] >= ADX_MIN
-        and SHORT_RSI_MIN <= c["rsi"] <= SHORT_RSI_MAX
-        and c["close"] < c["vwap"]
-    ):
+    if short_bias:
         return "SHORT"
 
     return None
 
 
 # ============================================================
-# TRADE SIMULATION
+# LIQUIDITY SWEEP
 # ============================================================
 
-def simulate_trade(
-    candles,
-    start_index,
-    signal
-):
+def liquidity_sweep(candles, i, direction):
 
-    side = signal["side"]
+    if i < 5:
+        return False
 
-    entry = signal["entry"]
-    stop = signal["stop"]
-    target = signal["target"]
+    current = candles[i]
+    previous = candles[i - 1]
 
-    # We enter only when price returns to FVG.
-    # Search future candles for entry touch.
+    recent = candles[i - 5:i]
 
-    for j in range(
-        start_index + 1,
-        len(candles)
-    ):
+    recent_high = max(
+        x["high"] for x in recent
+    )
 
-        c = candles[j]
+    recent_low = min(
+        x["low"] for x in recent
+    )
 
-        high = c["high"]
-        low = c["low"]
+    if direction == "LONG":
 
-        # ----------------------------------------------------
-        # LONG ENTRY
-        # ----------------------------------------------------
+        # Sweep previous low then bullish recovery
+        return (
+            previous["low"] <= recent_low
+            and current["close"] > previous["high"]
+            and current["close"] > current["open"]
+        )
 
-        if side == "LONG":
+    if direction == "SHORT":
 
-            if low <= entry <= high:
+        # Sweep previous high then bearish recovery
+        return (
+            previous["high"] >= recent_high
+            and current["close"] < previous["low"]
+            and current["close"] < current["open"]
+        )
 
-                # Apply slippage
-                actual_entry = (
-                    entry * (1 + SLIPPAGE)
-                )
+    return False
 
-                risk = (
-                    actual_entry - stop
-                )
 
-                actual_target = (
-                    actual_entry
-                    + risk * RR
-                )
+# ============================================================
+# BREAKOUT / DISPLACEMENT
+# ============================================================
 
-                for k in range(
-                    j,
-                    len(candles)
-                ):
+def displacement(candles, i, direction):
 
-                    bar = candles[k]
+    if i < 20:
+        return False
 
-                    hit_sl = (
-                        bar["low"]
-                        <= stop
-                    )
+    c = candles[i]
 
-                    hit_tp = (
-                        bar["high"]
-                        >= actual_target
-                    )
+    ranges = [
+        x["high"] - x["low"]
+        for x in candles[i - 20:i]
+    ]
 
-                    # Conservative rule:
-                    # if both occur same candle -> SL
-                    if hit_sl and hit_tp:
+    avg_range = (
+        sum(ranges) / len(ranges)
+        if ranges else 0
+    )
 
-                        return {
-                            "result": "LOSS",
-                            "r": -1.0,
-                            "entry": actual_entry,
-                            "exit": stop,
-                            "entry_index": j,
-                            "exit_index": k
-                        }
+    current_range = c["high"] - c["low"]
 
-                    if hit_sl:
+    if avg_range == 0:
+        return False
 
-                        return {
-                            "result": "LOSS",
-                            "r": -1.0,
-                            "entry": actual_entry,
-                            "exit": stop,
-                            "entry_index": j,
-                            "exit_index": k
-                        }
+    strong_move = current_range >= avg_range * 1.2
 
-                    if hit_tp:
+    if direction == "LONG":
 
-                        return {
-                            "result": "WIN",
-                            "r": RR,
-                            "entry": actual_entry,
-                            "exit": actual_target,
-                            "entry_index": j,
-                            "exit_index": k
-                        }
+        return (
+            strong_move
+            and c["close"] > c["open"]
+        )
 
-                return None
+    if direction == "SHORT":
 
-        # ----------------------------------------------------
-        # SHORT ENTRY
-        # ----------------------------------------------------
+        return (
+            strong_move
+            and c["close"] < c["open"]
+        )
 
-        else:
+    return False
 
-            if low <= entry <= high:
 
-                actual_entry = (
-                    entry * (1 - SLIPPAGE)
-                )
+# ============================================================
+# VOLUME CONFIRMATION
+# ============================================================
 
-                risk = (
-                    stop - actual_entry
-                )
+def volume_confirmation(candles, i):
 
-                actual_target = (
-                    actual_entry
-                    - risk * RR
-                )
+    if i < 20:
+        return False
 
-                for k in range(
-                    j,
-                    len(candles)
-                ):
+    current_volume = candles[i]["volume"]
 
-                    bar = candles[k]
+    avg_volume = sum(
+        x["volume"]
+        for x in candles[i - 20:i]
+    ) / 20
 
-                    hit_sl = (
-                        bar["high"]
-                        >= stop
-                    )
+    if avg_volume == 0:
+        return False
 
-                    hit_tp = (
-                        bar["low"]
-                        <= actual_target
-                    )
+    return current_volume >= avg_volume * 1.10
 
-                    if hit_sl and hit_tp:
 
-                        return {
-                            "result": "LOSS",
-                            "r": -1.0,
-                            "entry": actual_entry,
-                            "exit": stop,
-                            "entry_index": j,
-                            "exit_index": k
-                        }
+# ============================================================
+# ENTRY SIGNAL
+# ============================================================
 
-                    if hit_sl:
+def entry_signal(candles, i, direction):
 
-                        return {
-                            "result": "LOSS",
-                            "r": -1.0,
-                            "entry": actual_entry,
-                            "exit": stop,
-                            "entry_index": j,
-                            "exit_index": k
-                        }
+    if i < 25:
+        return None
 
-                    if hit_tp:
+    sweep = liquidity_sweep(
+        candles,
+        i - 1,
+        direction
+    )
 
-                        return {
-                            "result": "WIN",
-                            "r": RR,
-                            "entry": actual_entry,
-                            "exit": actual_target,
-                            "entry_index": j,
-                            "exit_index": k
-                        }
+    move = displacement(
+        candles,
+        i,
+        direction
+    )
 
-                return None
+    volume_ok = volume_confirmation(
+        candles,
+        i
+    )
+
+    if not sweep:
+        return None
+
+    if not move:
+        return None
+
+    if not volume_ok:
+        return None
+
+    current = candles[i]
+    previous = candles[i - 1]
+
+    atr_value = atr(
+        candles[:i + 1],
+        ATR_PERIOD
+    )
+
+    if atr_value <= 0:
+        return None
+
+    if direction == "LONG":
+
+        entry = current["close"]
+
+        stop = (
+            previous["low"]
+            - atr_value * 0.5
+        )
+
+        risk = entry - stop
+
+        if risk <= 0:
+            return None
+
+        # Prevent abnormal SL
+        if risk < entry * 0.002:
+            return None
+
+        if risk > entry * 0.04:
+            return None
+
+        target = (
+            entry
+            + risk * TARGET_RR
+        )
+
+        return {
+            "direction": "LONG",
+            "entry": entry,
+            "stop": stop,
+            "target": target
+        }
+
+    if direction == "SHORT":
+
+        entry = current["close"]
+
+        stop = (
+            previous["high"]
+            + atr_value * 0.5
+        )
+
+        risk = stop - entry
+
+        if risk <= 0:
+            return None
+
+        if risk < entry * 0.002:
+            return None
+
+        if risk > entry * 0.04:
+            return None
+
+        target = (
+            entry
+            - risk * TARGET_RR
+        )
+
+        return {
+            "direction": "SHORT",
+            "entry": entry,
+            "stop": stop,
+            "target": target
+        }
 
     return None
 
 
 # ============================================================
-# BACKTEST ONE SYMBOL
+# BACKTEST
 # ============================================================
 
-def backtest_symbol(symbol, start_ms, end_ms):
+def run_symbol(symbol_name, candles_1h, candles_15m):
 
-    print("\n" + "=" * 70)
-    print("DOWNLOADING:", symbol)
-    print("=" * 70)
+    if len(candles_1h) < 220:
+        print(
+            f"[!] {symbol_name}: "
+            f"Not enough 1H data"
+        )
+        return None
 
-    candles_1h = get_klines(
-        symbol,
-        "1h",
-        start_ms,
-        end_ms
-    )
-
-    candles_15m = get_klines(
-        symbol,
-        "15m",
-        start_ms,
-        end_ms
-    )
-
-    print(
-        "1H candles:",
-        len(candles_1h)
-    )
-
-    print(
-        "15M candles:",
-        len(candles_15m)
-    )
-
-    if len(candles_1h) < 300:
-        print("Not enough 1H data.")
-        return []
-
-    if len(candles_15m) < 1000:
-        print("Not enough 15M data.")
-        return []
-
-    print("Calculating indicators...")
-
-    prepare_1h(candles_1h)
-    prepare_15m(candles_15m)
+    if len(candles_15m) < 100:
+        print(
+            f"[!] {symbol_name}: "
+            f"Not enough 15M data"
+        )
+        return None
 
     trades = []
 
-    daily_trades = defaultdict(int)
-    daily_r = defaultdict(float)
+    wins = 0
+    losses = 0
 
-    i = 250
+    longs = 0
+    shorts = 0
 
-    while i < len(candles_15m) - 10:
+    balance_change = 0.0
 
-        c15 = candles_15m[i]
+    daily_trades = {}
+    daily_r = {}
 
-        timestamp = c15["time"]
+    in_position_until = 0
 
-        dt = datetime.fromtimestamp(
-            timestamp / 1000,
+    # Start only where enough 15M history exists
+    for i in range(30, len(candles_15m) - 1):
+
+        if i < in_position_until:
+            continue
+
+        candle = candles_15m[i]
+
+        ts = candle["timestamp"]
+
+        date_key = datetime.fromtimestamp(
+            ts / 1000,
             tz=timezone.utc
+        ).strftime("%Y-%m-%d")
+
+        daily_trades.setdefault(
+            date_key,
+            0
         )
 
-        day = dt.date()
+        daily_r.setdefault(
+            date_key,
+            0.0
+        )
 
         # Daily limits
-        if daily_trades[day] >= MAX_TRADES_PER_DAY:
-            i += 1
+        if daily_trades[date_key] >= MAX_TRADES_PER_DAY:
             continue
 
-        if daily_r[day] <= MAX_DAILY_LOSS_R:
-            i += 1
+        if daily_r[date_key] <= MAX_DAILY_LOSS_R:
             continue
 
-        # ----------------------------------------------------
-        # 1H FILTER
-        # ----------------------------------------------------
-
-        idx_1h = find_1h_context(
+        bias = get_1h_bias(
             candles_1h,
-            timestamp
+            ts
         )
-
-        if idx_1h is None:
-            i += 1
-            continue
-
-        c1h = candles_1h[idx_1h]
-
-        bias = get_bias(c1h)
 
         if bias is None:
-            i += 1
             continue
 
-        # ----------------------------------------------------
-        # SIGNAL
-        # ----------------------------------------------------
-
-        if bias == "LONG":
-
-            signal = long_signal(
-                candles_15m,
-                i
-            )
-
-        else:
-
-            signal = short_signal(
-                candles_15m,
-                i
-            )
-
-        if signal is None:
-            i += 1
-            continue
-
-        # ----------------------------------------------------
-        # SIMULATE
-        # ----------------------------------------------------
-
-        result = simulate_trade(
+        signal = entry_signal(
             candles_15m,
             i,
-            signal
+            bias
         )
 
-        if result is None:
-            i += 1
+        if signal is None:
             continue
 
-        entry_index = result["entry_index"]
-        exit_index = result["exit_index"]
+        entry = signal["entry"]
+        stop = signal["stop"]
+        target = signal["target"]
 
-        entry_candle = candles_15m[
-            entry_index
-        ]
+        direction = signal["direction"]
 
-        exit_candle = candles_15m[
-            exit_index
-        ]
+        result = None
+        exit_index = None
+        exit_price = None
 
-        entry_time = datetime.fromtimestamp(
-            entry_candle["time"] / 1000,
-            tz=timezone.utc
-        )
+        for j in range(i + 1, len(candles_15m)):
 
-        exit_time = datetime.fromtimestamp(
-            exit_candle["time"] / 1000,
-            tz=timezone.utc
-        )
+            future = candles_15m[j]
 
-        # Fees in R terms.
-        # Approximate round-trip fee based on price movement.
-        fee_r = (
-            2 * TAKER_FEE
-        ) / max(
-            abs(
-                result["entry"]
-                - signal["stop"]
-            )
-            / result["entry"],
-            1e-9
-        )
+            if direction == "LONG":
 
-        net_r = result["r"] - fee_r
+                # Conservative:
+                # if both TP and SL occur in same candle,
+                # SL is assumed first.
+                if future["low"] <= stop:
 
-        trade = {
-            "symbol": symbol,
-            "side": signal["side"],
-            "signal_time": dt.isoformat(),
-            "entry_time": entry_time.isoformat(),
-            "exit_time": exit_time.isoformat(),
-            "entry": result["entry"],
-            "stop": signal["stop"],
-            "target": signal["target"],
-            "exit": result["exit"],
-            "gross_r": result["r"],
-            "fee_r": fee_r,
-            "net_r": net_r,
-            "result": (
-                "WIN"
-                if net_r > 0
-                else "LOSS"
-            )
-        }
+                    result = "LOSS"
+                    exit_price = stop
+                    exit_index = j
+                    break
 
-        trades.append(trade)
+                if future["high"] >= target:
 
-        daily_trades[day] += 1
-        daily_r[day] += net_r
+                    result = "WIN"
+                    exit_price = target
+                    exit_index = j
+                    break
 
-        # Jump to exit candle to avoid overlapping positions
-        i = max(
-            i + 1,
-            exit_index + 1
-        )
+            else:
 
-    return trades
+                if future["high"] >= stop:
 
+                    result = "LOSS"
+                    exit_price = stop
+                    exit_index = j
+                    break
 
-# ============================================================
-# STATISTICS
-# ============================================================
+                if future["low"] <= target:
 
-def calculate_stats(trades):
+                    result = "WIN"
+                    exit_price = target
+                    exit_index = j
+                    break
 
-    if not trades:
-        return {
-            "trades": 0
-        }
+        if result is None:
+            continue
 
-    wins = [
-        t for t in trades
-        if t["net_r"] > 0
-    ]
+        daily_trades[date_key] += 1
 
-    losses = [
-        t for t in trades
-        if t["net_r"] <= 0
-    ]
+        if direction == "LONG":
+            longs += 1
+        else:
+            shorts += 1
 
-    total_r = sum(
-        t["net_r"]
-        for t in trades
-    )
+        if result == "WIN":
 
-    win_rate = (
-        len(wins)
-        / len(trades)
-        * 100
-    )
-
-    gross_profit = sum(
-        t["net_r"]
-        for t in wins
-    )
-
-    gross_loss = abs(
-        sum(
-            t["net_r"]
-            for t in losses
-        )
-    )
-
-    if gross_loss > 0:
-        profit_factor = (
-            gross_profit
-            / gross_loss
-        )
-    else:
-        profit_factor = float("inf")
-
-    # Equity curve in R
-    equity = 0.0
-    peak = 0.0
-    max_dd = 0.0
-
-    for t in trades:
-
-        equity += t["net_r"]
-
-        if equity > peak:
-            peak = equity
-
-        dd = peak - equity
-
-        if dd > max_dd:
-            max_dd = dd
-
-    # Consecutive losses
-    max_consecutive_losses = 0
-    current_losses = 0
-
-    for t in trades:
-
-        if t["net_r"] <= 0:
-
-            current_losses += 1
-
-            max_consecutive_losses = max(
-                max_consecutive_losses,
-                current_losses
+            wins += 1
+            r_result = TARGET_RR
+            balance_change += (
+                RISK_PER_TRADE
+                * TARGET_RR
             )
 
         else:
-            current_losses = 0
 
-    # Average R
-    avg_r = (
-        total_r
-        / len(trades)
-    )
+            losses += 1
+            r_result = -1.0
+            balance_change -= RISK_PER_TRADE
 
-    # Average trades/day
-    days = set()
+        daily_r[date_key] += r_result
 
-    for t in trades:
+        trades.append({
+            "symbol": symbol_name,
+            "direction": direction,
+            "entry_time": datetime.fromtimestamp(
+                entry / 1000000000,
+                tz=timezone.utc
+            ).isoformat()
+            if False else datetime.fromtimestamp(
+                candles_15m[i]["timestamp"] / 1000,
+                tz=timezone.utc
+            ).isoformat(),
+            "entry": entry,
+            "stop": stop,
+            "target": target,
+            "result": result,
+            "r": r_result,
+            "exit_time": datetime.fromtimestamp(
+                candles_15m[exit_index]["timestamp"] / 1000,
+                tz=timezone.utc
+            ).isoformat(),
+            "exit": exit_price
+        })
 
-        d = t["entry_time"][:10]
-        days.add(d)
+        in_position_until = exit_index + 1
 
-    avg_trades_day = (
-        len(trades)
-        / max(len(days), 1)
-    )
+    total = wins + losses
 
-    # Expectancy
-    expectancy = (
-        (win_rate / 100) * RR
-        - ((100 - win_rate) / 100)
+    win_rate = (
+        wins / total * 100
+        if total > 0
+        else 0
     )
 
     return {
-        "trades": len(trades),
-        "wins": len(wins),
-        "losses": len(losses),
+        "symbol": symbol_name,
+        "trades": total,
+        "longs": longs,
+        "shorts": shorts,
+        "wins": wins,
+        "losses": losses,
         "win_rate": win_rate,
-        "total_r": total_r,
-        "profit_factor": profit_factor,
-        "max_drawdown_r": max_dd,
-        "max_consecutive_losses":
-            max_consecutive_losses,
-        "average_r": avg_r,
-        "average_trades_day":
-            avg_trades_day,
-        "expectancy_r":
-            expectancy
+        "pnl": balance_change,
+        "trades_data": trades
     }
-
-
-# ============================================================
-# PRINT STATS
-# ============================================================
-
-def print_stats(title, stats):
-
-    print("\n")
-    print("=" * 70)
-    print(title)
-    print("=" * 70)
-
-    if stats["trades"] == 0:
-
-        print("NO TRADES")
-
-        return
-
-    print(
-        "Trades:",
-        stats["trades"]
-    )
-
-    print(
-        "Wins:",
-        stats["wins"]
-    )
-
-    print(
-        "Losses:",
-        stats["losses"]
-    )
-
-    print(
-        "Win Rate:",
-        f"{stats['win_rate']:.2f}%"
-    )
-
-    print(
-        "Total R:",
-        f"{stats['total_r']:.2f}"
-    )
-
-    print(
-        "Profit Factor:",
-        f"{stats['profit_factor']:.2f}"
-    )
-
-    print(
-        "Max Drawdown:",
-        f"{stats['max_drawdown_r']:.2f}R"
-    )
-
-    print(
-        "Max Consecutive Losses:",
-        stats["max_consecutive_losses"]
-    )
-
-    print(
-        "Average R:",
-        f"{stats['average_r']:.4f}"
-    )
-
-    print(
-        "Average Trades/Day:",
-        f"{stats['average_trades_day']:.2f}"
-    )
-
-    print(
-        "Theoretical Expectancy:",
-        f"{stats['expectancy_r']:.4f}R"
-    )
-
-
-# ============================================================
-# SAVE CSV
-# ============================================================
-
-def save_trades(trades):
-
-    if not trades:
-        return
-
-    fields = list(
-        trades[0].keys()
-    )
-
-    with open(
-        TRADES_FILE,
-        "w",
-        newline="",
-        encoding="utf-8"
-    ) as f:
-
-        writer = csv.DictWriter(
-            f,
-            fieldnames=fields
-        )
-
-        writer.writeheader()
-
-        writer.writerows(trades)
-
-
-def save_summary(rows):
-
-    if not rows:
-        return
-
-    fields = list(
-        rows[0].keys()
-    )
-
-    with open(
-        SUMMARY_FILE,
-        "w",
-        newline="",
-        encoding="utf-8"
-    ) as f:
-
-        writer = csv.DictWriter(
-            f,
-            fieldnames=fields
-        )
-
-        writer.writeheader()
-
-        writer.writerows(rows)
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def main():
+def run_backtest():
 
-    now = datetime.now(
-        timezone.utc
-    )
-
-    end = now
-
-    start = now - timedelta(
-        days=DAYS
-    )
-
-    start_ms = int(
-        start.timestamp() * 1000
-    )
-
-    end_ms = int(
-        end.timestamp() * 1000
-    )
-
-    print("\n")
-    print("#" * 70)
-    print("WHALE FLOW PRO")
-    print("BINANCE FUTURES 1-YEAR BACKTEST")
-    print("#" * 70)
-
+    print()
+    print("=" * 70)
+    print("              WHALE FLOW PRO")
+    print("          YAHOO FINANCE BACKTEST")
+    print("=" * 70)
+    print()
+    print("1H  = TREND FILTER")
+    print("15M = ENTRY")
+    print("RR  = 1:2")
+    print("Capital = $1,000")
+    print("Risk / Trade = $25")
+    print()
     print(
-        "Period:",
-        start.isoformat(),
-        "->",
-        end.isoformat()
+        "IMPORTANT: Yahoo 15M historical data "
+        "is limited, so the 15M test period "
+        "will NOT be a full year."
     )
+    print("=" * 70)
+    print()
 
-    print(
-        "Symbols:",
-        ", ".join(SYMBOLS)
-    )
+    all_results = []
 
-    print(
-        "RR:",
-        f"1:{RR}"
-    )
+    for symbol_name, yahoo_symbol in SYMBOLS.items():
 
-    print(
-        "Max trades/day:",
-        MAX_TRADES_PER_DAY
-    )
+        print()
+        print("=" * 70)
+        print(f"                 {symbol_name}")
+        print("=" * 70)
 
-    print(
-        "Max daily loss:",
-        MAX_DAILY_LOSS_R,
-        "R"
-    )
+        candles_1h = fetch_yahoo(
+            yahoo_symbol,
+            "1h",
+            TREND_RANGE
+        )
 
-    all_trades = []
-    summary_rows = []
+        time.sleep(1)
 
-    # --------------------------------------------------------
-    # EACH SYMBOL
-    # --------------------------------------------------------
+        candles_15m = fetch_yahoo(
+            yahoo_symbol,
+            "15m",
+            ENTRY_RANGE
+        )
 
-    for symbol in SYMBOLS:
-
-        try:
-
-            trades = backtest_symbol(
-                symbol,
-                start_ms,
-                end_ms
-            )
-
-            all_trades.extend(
-                trades
-            )
-
-            stats = calculate_stats(
-                trades
-            )
-
-            print_stats(
-                symbol,
-                stats
-            )
-
-            row = {
-                "symbol": symbol,
-                **stats
-            }
-
-            summary_rows.append(row)
-
-        except Exception as e:
-
+        if not candles_1h or not candles_15m:
             print(
-                "\nERROR IN",
-                symbol,
-                ":",
-                e
+                f"[!] Skipping {symbol_name}"
             )
+            continue
 
-    # --------------------------------------------------------
-    # COMBINED
-    # --------------------------------------------------------
+        result = run_symbol(
+            symbol_name,
+            candles_1h,
+            candles_15m
+        )
 
-    combined = calculate_stats(
-        all_trades
+        if result is None:
+            continue
+
+        all_results.append(result)
+
+        print()
+        print(
+            f"{symbol_name} RESULTS"
+        )
+        print("-" * 50)
+        print(
+            f"Total Trades : {result['trades']}"
+        )
+        print(
+            f"Long Trades  : {result['longs']}"
+        )
+        print(
+            f"Short Trades : {result['shorts']}"
+        )
+        print(
+            f"Wins         : {result['wins']}"
+        )
+        print(
+            f"Losses       : {result['losses']}"
+        )
+        print(
+            f"Win Rate     : "
+            f"{result['win_rate']:.2f}%"
+        )
+        print(
+            f"P/L          : "
+            f"${result['pnl']:.2f}"
+        )
+
+    # ========================================================
+    # AGGREGATED
+    # ========================================================
+
+    total_trades = sum(
+        x["trades"]
+        for x in all_results
     )
 
-    print_stats(
-        "ALL 4 COINS COMBINED",
-        combined
+    total_longs = sum(
+        x["longs"]
+        for x in all_results
     )
 
-    summary_rows.append({
-        "symbol": "ALL",
-        **combined
-    })
-
-    # --------------------------------------------------------
-    # LONG / SHORT
-    # --------------------------------------------------------
-
-    longs = [
-        t for t in all_trades
-        if t["side"] == "LONG"
-    ]
-
-    shorts = [
-        t for t in all_trades
-        if t["side"] == "SHORT"
-    ]
-
-    print_stats(
-        "LONG ONLY",
-        calculate_stats(longs)
+    total_shorts = sum(
+        x["shorts"]
+        for x in all_results
     )
 
-    print_stats(
-        "SHORT ONLY",
-        calculate_stats(shorts)
+    total_wins = sum(
+        x["wins"]
+        for x in all_results
     )
 
-    # --------------------------------------------------------
-    # SAVE
-    # --------------------------------------------------------
-
-    save_trades(
-        all_trades
+    total_losses = sum(
+        x["losses"]
+        for x in all_results
     )
 
-    save_summary(
-        summary_rows
+    total_pnl = sum(
+        x["pnl"]
+        for x in all_results
     )
 
-    print("\n")
+    overall_win_rate = (
+        total_wins
+        / total_trades
+        * 100
+        if total_trades > 0
+        else 0
+    )
+
+    final_balance = (
+        INITIAL_BALANCE
+        + total_pnl
+    )
+
+    print()
+    print()
+    print("=" * 70)
+    print("              AGGREGATED RESULTS")
+    print("=" * 70)
+
+    print(
+        f"Total Trades       : {total_trades}"
+    )
+
+    print(
+        f"Total Longs        : {total_longs}"
+    )
+
+    print(
+        f"Total Shorts       : {total_shorts}"
+    )
+
+    print(
+        f"Winning Trades     : {total_wins}"
+    )
+
+    print(
+        f"Losing Trades      : {total_losses}"
+    )
+
+    print(
+        f"Overall Win Rate   : "
+        f"{overall_win_rate:.2f}%"
+    )
+
+    print(
+        f"Total P/L          : "
+        f"${total_pnl:.2f}"
+    )
+
+    print(
+        f"Final Balance      : "
+        f"${final_balance:.2f}"
+    )
+
+    print("=" * 70)
+
+    print()
+    print("PER-SYMBOL SUMMARY")
+    print("-" * 70)
+
+    for result in all_results:
+
+        print(
+            f"{result['symbol']:5} | "
+            f"Trades: {result['trades']:4} | "
+            f"Long: {result['longs']:4} | "
+            f"Short: {result['shorts']:4} | "
+            f"Win: {result['wins']:4} | "
+            f"Loss: {result['losses']:4} | "
+            f"WR: {result['win_rate']:6.2f}%"
+        )
+
+    print()
     print("=" * 70)
     print("BACKTEST FINISHED")
     print("=" * 70)
-
-    print(
-        "Trades file:",
-        TRADES_FILE
-    )
-
-    print(
-        "Summary file:",
-        SUMMARY_FILE
-    )
-
-    print("\nIMPORTANT:")
-    print(
-        "A 70% win rate is NOT assumed."
-    )
-
-    print(
-        "The backtest must prove whether the"
-        " strategy reaches it."
-    )
+    print()
 
 
 if __name__ == "__main__":
-    main()
+    run_backtest()
