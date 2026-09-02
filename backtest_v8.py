@@ -1,4 +1,3 @@
-_backtest()
 import json
 import urllib.request
 from datetime import datetime, timezone
@@ -25,6 +24,7 @@ EMA_SLOW = 200
 
 RSI_PERIOD = 14
 ATR_PERIOD = 14
+ADX_PERIOD = 14
 
 # 1H trend
 ADX_MIN = 18.0
@@ -226,7 +226,7 @@ def adx(candles, period=14):
 
     result = [None] * len(candles)
 
-    if len(candles) < period * 2:
+    if len(candles) < period * 2 + 1:
         return result
 
     tr = [0] * len(candles)
@@ -421,3 +421,574 @@ def get_bias(candle):
 # ============================================================
 # MAP 15M -> LAST COMPLETED 1H
 # ============================================================
+
+def get_last_completed_1h(candles_1h, ts):
+
+    target = hour_timestamp(ts) - 3600
+
+    selected = None
+
+    for candle in candles_1h:
+
+        if candle["time"] <= target:
+            selected = candle
+        else:
+            break
+
+    return selected
+
+
+# ============================================================
+# BREAKOUT DETECTION
+# ============================================================
+
+def get_breakout(candles, index, direction):
+
+    if index < BREAKOUT_LOOKBACK:
+        return None
+
+    previous = candles[
+        index - BREAKOUT_LOOKBACK:index
+    ]
+
+    if direction == "LONG":
+
+        resistance = max(
+            x["high"] for x in previous
+        )
+
+        if candles[index]["close"] > resistance:
+
+            return resistance
+
+    elif direction == "SHORT":
+
+        support = min(
+            x["low"] for x in previous
+        )
+
+        if candles[index]["close"] < support:
+
+            return support
+
+    return None
+
+
+# ============================================================
+# BACKTEST ONE SYMBOL
+# ============================================================
+
+def backtest_symbol(symbol, yahoo_symbol):
+
+    print("")
+    print("=" * 60)
+    print(symbol)
+    print("=" * 60)
+
+    print("Downloading 1H data...")
+
+    candles_1h = fetch_yahoo(
+        yahoo_symbol,
+        "1h",
+        "1y"
+    )
+
+    print(
+        "1H candles:",
+        len(candles_1h)
+    )
+
+    print("Downloading 15M data...")
+
+    candles_15m = fetch_yahoo(
+        yahoo_symbol,
+        "15m",
+        "60d"
+    )
+
+    print(
+        "15M candles:",
+        len(candles_15m)
+    )
+
+    if len(candles_1h) < 250:
+        print("Not enough 1H data.")
+        return []
+
+    if len(candles_15m) < 100:
+        print("Not enough 15M data.")
+        return []
+
+    candles_1h = prepare_1h(candles_1h)
+
+    trades = []
+
+    position = None
+    pending = None
+
+    for i in range(
+        BREAKOUT_LOOKBACK + 1,
+        len(candles_15m)
+    ):
+
+        candle = candles_15m[i]
+
+        # ----------------------------------------------------
+        # MANAGE OPEN POSITION
+        # ----------------------------------------------------
+
+        if position is not None:
+
+            position["bars"] += 1
+
+            high = candle["high"]
+            low = candle["low"]
+
+            result = None
+
+            if position["direction"] == "LONG":
+
+                # Conservative: SL first if both touched
+                if low <= position["sl"]:
+                    result = -1.0
+
+                elif high >= position["tp"]:
+                    result = RR
+
+            else:
+
+                # Conservative: SL first if both touched
+                if high >= position["sl"]:
+                    result = -1.0
+
+                elif low <= position["tp"]:
+                    result = RR
+
+            if result is not None:
+
+                trades.append({
+                    "direction": position["direction"],
+                    "entry": position["entry"],
+                    "sl": position["sl"],
+                    "tp": position["tp"],
+                    "result_r": result,
+                    "entry_time": position["entry_time"],
+                    "exit_time": candle["time"]
+                })
+
+                position = None
+
+                # Do not open another position
+                # on the same candle
+                continue
+
+            # Maximum holding period
+            if position["bars"] >= MAX_HOLD_BARS:
+
+                trades.append({
+                    "direction": position["direction"],
+                    "entry": position["entry"],
+                    "sl": position["sl"],
+                    "tp": position["tp"],
+                    "result_r": 0.0,
+                    "entry_time": position["entry_time"],
+                    "exit_time": candle["time"]
+                })
+
+                position = None
+
+                continue
+
+        # ----------------------------------------------------
+        # FIND 1H BIAS
+        # ----------------------------------------------------
+
+        h1 = get_last_completed_1h(
+            candles_1h,
+            candle["time"]
+        )
+
+        if h1 is None:
+            continue
+
+        bias = get_bias(h1)
+
+        if bias is None:
+            pending = None
+            continue
+
+        # ----------------------------------------------------
+        # NEW BREAKOUT
+        # ----------------------------------------------------
+
+        breakout = get_breakout(
+            candles_15m,
+            i,
+            bias
+        )
+
+        if breakout is not None:
+
+            pending = {
+                "direction": bias,
+                "level": breakout,
+                "bars_left": PULLBACK_LOOKBACK
+            }
+
+            continue
+
+        # ----------------------------------------------------
+        # PENDING PULLBACK
+        # ----------------------------------------------------
+
+        if pending is not None:
+
+            # Cancel if bias changed
+            if pending["direction"] != bias:
+
+                pending = None
+
+            else:
+
+                direction = pending["direction"]
+                level = pending["level"]
+
+                # LONG PULLBACK
+                if direction == "LONG":
+
+                    retest = (
+                        candle["low"] <= level
+                        and candle["close"] > level
+                    )
+
+                    if retest:
+
+                        entry = candle["close"]
+
+                        atr_value = h1["atr"]
+
+                        if atr_value is not None and atr_value > 0:
+
+                            structure_sl = candle["low"]
+
+                            atr_sl = (
+                                entry
+                                - (SL_ATR_MULT * atr_value)
+                            )
+
+                            sl = min(
+                                structure_sl,
+                                atr_sl
+                            )
+
+                            risk = entry - sl
+
+                            if risk > 0:
+
+                                tp = (
+                                    entry
+                                    + (risk * RR)
+                                )
+
+                                position = {
+                                    "direction": "LONG",
+                                    "entry": entry,
+                                    "sl": sl,
+                                    "tp": tp,
+                                    "entry_time": candle["time"],
+                                    "bars": 0
+                                }
+
+                                pending = None
+
+                                continue
+
+                # SHORT PULLBACK
+                else:
+
+                    retest = (
+                        candle["high"] >= level
+                        and candle["close"] < level
+                    )
+
+                    if retest:
+
+                        entry = candle["close"]
+
+                        atr_value = h1["atr"]
+
+                        if atr_value is not None and atr_value > 0:
+
+                            structure_sl = candle["high"]
+
+                            atr_sl = (
+                                entry
+                                + (SL_ATR_MULT * atr_value)
+                            )
+
+                            sl = max(
+                                structure_sl,
+                                atr_sl
+                            )
+
+                            risk = sl - entry
+
+                            if risk > 0:
+
+                                tp = (
+                                    entry
+                                    - (risk * RR)
+                                )
+
+                                position = {
+                                    "direction": "SHORT",
+                                    "entry": entry,
+                                    "sl": sl,
+                                    "tp": tp,
+                                    "entry_time": candle["time"],
+                                    "bars": 0
+                                }
+
+                                pending = None
+
+                                continue
+
+                pending["bars_left"] -= 1
+
+                if pending["bars_left"] <= 0:
+
+                    pending = None
+
+    return trades
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+def calculate_stats(trades):
+
+    total = len(trades)
+
+    wins = sum(
+        1 for x in trades
+        if x["result_r"] > 0
+    )
+
+    losses = sum(
+        1 for x in trades
+        if x["result_r"] < 0
+    )
+
+    long_trades = sum(
+        1 for x in trades
+        if x["direction"] == "LONG"
+    )
+
+    short_trades = sum(
+        1 for x in trades
+        if x["direction"] == "SHORT"
+    )
+
+    win_rate = (
+        (wins / total) * 100
+        if total > 0
+        else 0
+    )
+
+    net_r = sum(
+        x["result_r"]
+        for x in trades
+    )
+
+    gross_profit = sum(
+        x["result_r"]
+        for x in trades
+        if x["result_r"] > 0
+    )
+
+    gross_loss = abs(sum(
+        x["result_r"]
+        for x in trades
+        if x["result_r"] < 0
+    ))
+
+    if gross_loss > 0:
+        profit_factor = (
+            gross_profit / gross_loss
+        )
+    else:
+        profit_factor = math.inf
+
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "long": long_trades,
+        "short": short_trades,
+        "win_rate": win_rate,
+        "net_r": net_r,
+        "profit_factor": profit_factor
+    }
+
+
+# ============================================================
+# MAIN BACKTEST
+# ============================================================
+
+def _backtest():
+
+    print("")
+    print("=" * 60)
+    print("NEW STRATEGY BACKTEST")
+    print("1H TREND + 15M BREAKOUT/PULLBACK")
+    print("YAHOO FINANCE DATA")
+    print("=" * 60)
+
+    all_trades = []
+
+    results = {}
+
+    for symbol, yahoo_symbol in SYMBOLS.items():
+
+        try:
+
+            trades = backtest_symbol(
+                symbol,
+                yahoo_symbol
+            )
+
+            stats = calculate_stats(trades)
+
+            results[symbol] = stats
+
+            all_trades.extend(trades)
+
+            print("")
+            print(symbol)
+            print("-" * 40)
+
+            print(
+                f"Total Trades : {stats['total']}"
+            )
+
+            print(
+                f"Long Trades  : {stats['long']}"
+            )
+
+            print(
+                f"Short Trades : {stats['short']}"
+            )
+
+            print(
+                f"Wins         : {stats['wins']}"
+            )
+
+            print(
+                f"Losses       : {stats['losses']}"
+            )
+
+            print(
+                f"Win Rate     : {stats['win_rate']:.2f}%"
+            )
+
+            print(
+                f"Net R        : {stats['net_r']:.2f}"
+            )
+
+            if math.isinf(stats["profit_factor"]):
+
+                print(
+                    "Profit Factor: INF"
+                )
+
+            else:
+
+                print(
+                    f"Profit Factor: "
+                    f"{stats['profit_factor']:.2f}"
+                )
+
+        except Exception as e:
+
+            print("")
+            print(
+                f"{symbol} ERROR: {e}"
+            )
+
+    # ========================================================
+    # TOTAL PORTFOLIO
+    # ========================================================
+
+    total_stats = calculate_stats(
+        all_trades
+    )
+
+    print("")
+    print("=" * 40)
+    print("TOTAL PORTFOLIO RESULT")
+    print("=" * 40)
+    print("")
+
+    print(
+        f"TOTAL TRADES : "
+        f"{total_stats['total']}"
+    )
+
+    print(
+        f"TOTAL LONG   : "
+        f"{total_stats['long']}"
+    )
+
+    print(
+        f"TOTAL SHORT  : "
+        f"{total_stats['short']}"
+    )
+
+    print(
+        f"TOTAL WINS   : "
+        f"{total_stats['wins']}"
+    )
+
+    print(
+        f"TOTAL LOSSES : "
+        f"{total_stats['losses']}"
+    )
+
+    print(
+        f"TOTAL WINRATE: "
+        f"{total_stats['win_rate']:.2f}%"
+    )
+
+    print(
+        f"TOTAL NET R  : "
+        f"{total_stats['net_r']:.2f}"
+    )
+
+    if math.isinf(
+        total_stats["profit_factor"]
+    ):
+
+        print(
+            "PROFIT FACTOR: INF"
+        )
+
+    else:
+
+        print(
+            f"PROFIT FACTOR: "
+            f"{total_stats['profit_factor']:.2f}"
+        )
+
+    print("")
+    print("=" * 40)
+    print("BACKTEST FINISHED")
+    print("=" * 40)
+
+
+# ============================================================
+# PROGRAM ENTRY
+# ============================================================
+
+if __name__ == "__main__":
+    _backtest()
