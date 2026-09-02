@@ -73,7 +73,7 @@ def _backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - MARKET SL/TP & 1:2 RR TARGET  ")
+    print(" SCORE HUNTER PRO - OPTIMIZED 1:2 RR & HIGH WIN   ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -102,24 +102,24 @@ def _backtest():
             rsi = calculate_rsi(sub, 14)
             trade_taken = False
 
-            # فیلتر حفظ حجم معاملات
+            # فیلتر قدرت روند برای جلوگیری از ورود در بازار رِنج و پرنویز
             trend_strength = abs(ema20 - ema50) / c["close"]
-            if trend_strength < 0.0009:
+            if trend_strength < 0.0011:
                 continue
 
             candle_range = c["high"] - c["low"]
             if candle_range == 0:
                 continue
 
-            # --- شورت با حد ضرر و حد سود ساختاری بازار (RR = 1:2) ---
+            # --- شورت با حد ضرر و حد سود ساختاری بازار (RR = 1:2) و فیلتر مومنتوم قوی‌تر ---
             is_down_trend = ema20 < ema50
             body_ratio_short = (c["open"] - c["close"]) / candle_range
-            is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.32) and (c["close"] < ema20) and (rsi < 49)
+            is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.38) and (c["close"] < ema20) and (rsi < 45)
 
             if is_down_trend and is_short:
                 entry_price = c["close"]
                 recent_high = max(sub[-1]["high"], sub[-2]["high"], sub[-3]["high"])
-                stop_loss = recent_high + (entry_price * 0.0008)
+                stop_loss = recent_high + (entry_price * 0.001)
                 risk_dist = stop_loss - entry_price
 
                 if 0 < (risk_dist / entry_price) <= 0.035:
@@ -149,16 +149,16 @@ def _backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ با حد ضرر و حد سود ساختاری بازار (RR = 1:2) ---
+            # --- لانگ با حد ضرر و حد سود ساختاری بازار (RR = 1:2) و فیلتر مومنتوم قوی‌تر ---
             if not trade_taken:
                 is_up_trend = ema20 > ema50
                 body_ratio_long = (c["close"] - c["open"]) / candle_range
-                is_long = (c["close"] > c["open"]) and (body_ratio_long > 0.32) and (c["close"] > ema20) and (rsi > 51)
+                is_long = (c["close"] > c["open"]) and (body_ratio_long > 0.38) and (c["close"] > ema20) and (rsi > 55)
 
                 if is_up_trend and is_long:
                     entry_price = c["close"]
                     recent_low = min(sub[-1]["low"], sub[-2]["low"], sub[-3]["low"])
-                    stop_loss = recent_low - (entry_price * 0.0008)
+                    stop_loss = recent_low - (entry_price * 0.001)
                     risk_dist = entry_price - stop_loss
 
                     if 0 < (risk_dist / entry_price) <= 0.035:
@@ -195,7 +195,7 @@ def _backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED MARKET-BASED 1:2 RESULTS         ")
+    print("      AGGREGATED OPTIMIZED 1:2 RESULTS            ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
