@@ -2,12 +2,11 @@ import json
 import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
-TIMEFRAME = "1h"
-TARGET_RR = 2.0  # ریسک به ریوارد ثابت ۱ به ۲
+TIMEFRAME = "15m"
+TARGET_RR = 2.0  # ریسک به ریوارد ثابت و غیرقابل تغییر ۱ به ۲
 
-def fetch_1h_klines_yahoo(symbol, limit=8800):
-    # دریافت داده‌های یک‌ساله با تایم‌فریم ۱ ساعته (حداکثر بازه مجاز یاهو برای 1h)
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=365d"
+def fetch_15m_klines_yahoo(symbol, limit=8800):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=15m&range=60d"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
@@ -59,12 +58,12 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - SMC V31 (1-YEAR BACKTEST)     ")
+    print(" SCORE HUNTER PRO - ORDER BLOCK & MSS V32         ")
     print("==================================================")
 
     for symbol in SYMBOLS:
         try:
-            candles = fetch_1h_klines_yahoo(symbol, limit=8800)
+            candles = fetch_15m_klines_yahoo(symbol, limit=8800)
         except Exception as err:
             print(err)
             continue
@@ -76,16 +75,17 @@ def run_backtest():
         symbol_shorts = 0
         skip_until = 0
 
-        for i in range(50, len(candles) - 10):
+        for i in range(40, len(candles) - 10):
             if i < skip_until:
                 continue
 
             sub = candles[:i+1]
-            c = sub[-2]       
-            prev_c = sub[-3]
+            c = sub[-2]       # کندل فعلی تریگر
+            prev_c = sub[-3]  # کندل قبلی
+            prev2_c = sub[-4] # کندل قبل‌تر برای تشخیص Order Block
 
-            # پیدا کردن سقف و کف‌های استخری نقدینگی در بازه گذشته
-            lookback_slice = sub[-30:-2]
+            # استخرهای نقدینگی در ۳۰ کندل گذشته
+            lookback_slice = sub[-32:-2]
             recent_high = max([x["high"] for x in lookback_slice])
             recent_low = min([x["low"] for x in lookback_slice])
 
@@ -94,28 +94,29 @@ def run_backtest():
             if candle_range == 0:
                 continue
 
-            # فیلتر حجم نهنگی دست‌نخورده
+            # تاییدیه حجم سنگین نهنگی
             recent_volumes = [x["volume"] for x in sub[-22:-2]]
             avg_volume = sum(recent_volumes) / len(recent_volumes) if recent_volumes else 1.0
-            is_institutional_volume = c["volume"] > (avg_volume * 2.2)
-
-            if not is_institutional_volume:
+            if c["volume"] <= (avg_volume * 1.8):
                 continue
 
             current_risk_amount = balance * risk_percentage
 
-            # --- لانگ اسمارت مانی ---
-            is_sweep_low = prev_c["low"] <= recent_low and c["close"] > prev_c["high"] and c["close"] > c["open"]
+            # --- ستاپ لانگ: هانت کف + بازگشت ساختاری صعودی (MSS) به سمت Order Block صعودی ---
+            # (کندل قبل کف قبلی را هانت کرده، و کندل فعلی با قدرت به بالای آخرین سقفِ نزولی شلیک شده)
+            is_sweep_low = prev_c["low"] <= recent_low
+            is_bullish_mss = c["close"] > prev_c["high"] and c["close"] > c["open"]
 
-            if is_sweep_low:
+            if is_sweep_low and is_bullish_mss:
+                # ورود روی بازگشت به ناحیه سفارش (Order Block داخلی یا قیمت پایانی کندل قبل)
                 entry_price = c["close"]
-                stop_loss = min(prev_c["low"], c["low"]) - (entry_price * 0.0005)
+                stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.0004)
                 risk_dist = entry_price - stop_loss
 
-                if 0.0005 * entry_price <= risk_dist <= 0.02 * entry_price:
+                if 0.0005 * entry_price <= risk_dist <= 0.012 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 12, len(candles) - 1)
+                    end_idx = min(i + 8, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -139,18 +140,19 @@ def run_backtest():
                     elif trade_lost: 
                         losses += 1; balance -= current_risk_amount
 
-            # --- شورت اسمارت مانی ---
-            is_sweep_high = prev_c["high"] >= recent_high and c["close"] < prev_c["low"] and c["close"] < c["open"]
+            # --- ستاپ شورت: هانت سقف + بازگشت ساختاری نزولی (MSS) به سمت Order Block نزولی ---
+            is_sweep_high = prev_c["high"] >= recent_high
+            is_bearish_mss = c["close"] < prev_c["low"] and c["close"] < c["open"]
 
-            if not trade_taken and is_sweep_high:
+            if not trade_taken and is_sweep_high and is_bearish_mss:
                 entry_price = c["close"]
-                stop_loss = max(prev_c["high"], c["high"]) + (entry_price * 0.0005)
+                stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.0004)
                 risk_dist = stop_loss - entry_price
 
-                if 0.0005 * entry_price <= risk_dist <= 0.02 * entry_price:
+                if 0.0005 * entry_price <= risk_dist <= 0.012 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 12, len(candles) - 1)
+                    end_idx = min(i + 8, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -181,7 +183,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED SMC 1-YEAR RESULTS               ")
+    print("      AGGREGATED V32 SMC ORDER BLOCK RESULTS      ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
