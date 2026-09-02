@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading 1-year elite data for {symbol_key}...")
+        print(f"[*] Downloading 1-year Ichimoku data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -45,24 +45,33 @@ def fetch_yahoo_one_year(symbol_key):
         print(f"[!] Error fetching data for {symbol_key}: {e}")
     return []
 
-def calculate_ema(candles, period):
-    if len(candles) < period: return candles[-1]["close"]
-    multiplier = 2 / (period + 1)
-    ema = sum(x["close"] for x in candles[:period]) / period
-    for c in candles[period:]:
-        ema = (c["close"] - ema) * multiplier + ema
-    return ema
-
-def calculate_rsi(candles, period=14):
-    if len(candles) < period + 1: return 50.0
-    gains, losses = 0.0, 0.0
-    for i in range(1, period + 1):
-        diff = candles[-i]["close"] - candles[-i-1]["close"]
-        if diff >= 0: gains += diff
-        else: losses -= diff
-    if losses == 0: return 100.0
-    rs = (gains / period) / (losses / period)
-    return 100.0 - (100.0 / (1.0 + rs))
+def calculate_ichimoku_levels(sub_candles):
+    # ایچیموکو استاندارد: Tenkan (9), Kijun (26), Senkou B (52)
+    if len(sub_candles) < 52:
+        return None
+    
+    # 9 کندل اخیر
+    nine_highs = [c["high"] for c in sub_candles[-9:]]
+    nine_lows = [c["low"] for c in sub_candles[-9:]]
+    tenkan = (max(nine_highs) + min(nine_lows)) / 2
+    
+    # 26 کندل اخیر
+    26_highs = [c["high"] for c in sub_candles[-26:]]
+    26_lows = [c["low"] for c in sub_candles[-26:]]
+    kijun = (max(26_highs) + min(26_lows)) / 2
+    
+    # 52 کندل اخیر برای لبه ابر
+    52_highs = [c["high"] for c in sub_candles[-52:]]
+    52_lows = [c["low"] for c in sub_candles[-52:]]
+    senkou_a = (tenkan + kijun) / 2
+    senkou_b = (max(52_highs) + min(52_lows)) / 2
+    
+    return {
+        "tenkan": tenkan,
+        "kijun": kijun,
+        "senkou_a": senkou_a,
+        "senkou_b": senkou_b
+    }
 
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1: return candles[-1]["high"] - candles[-1]["low"]
@@ -72,13 +81,6 @@ def calculate_atr(candles, period=14):
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-period:]) / period
 
-def calculate_adx_proxy(candles, period=14):
-    if len(candles) < period + 2: return 25.0
-    moves = [abs(candles[-i]["close"] - candles[-i-1]["close"]) for i in range(1, len(candles[-period:]))]
-    avg_move = sum(moves) / len(moves) if moves else 1.0
-    total_range = candles[-1]["high"] - candles[-1]["low"]
-    return min(100.0, max(10.0, (avg_move / (total_range if total_range > 0 else 1.0)) * 50 + 20))
-
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
@@ -86,71 +88,67 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - ELITE FILTER (SCORE >= 10)  ")
+    print("   SCORE HUNTER PRO - ICHIMOKU PRO (INSTITUTIONAL)")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
-        if not candles or len(candles) < 500: continue
+        if not candles or len(candles) < 100: continue
         
-        print(f"[*] Running elite strict backtest for {symbol_key}...")
+        print(f"[*] Running Ichimoku Pro backtest for {symbol_key}...")
         wins, losses, symbol_trades, skip_until = 0, 0, 0, 0
 
-        for i in range(200, len(candles) - 1):
+        for i in range(60, len(candles) - 30):
             if i < skip_until: continue
 
             sub = candles[:i+1]
-            c = sub[-2]; prev_c = sub[-3]; prev2_c = sub[-4]
-
-            ema50 = calculate_ema(sub, 50)
-            ema200 = calculate_ema(sub, 200)
-            rsi = calculate_rsi(sub, 14)
-            adx = calculate_adx_proxy(sub, 14)
-            atr = calculate_atr(sub, 14)
-
-            candle_range = c["high"] - c["low"]
-            if candle_range == 0 or atr == 0: continue
+            c = sub[-2]
+            prev_c = sub[-3]
             
-            buying_pressure = (c["close"] - c["open"]) / candle_range
-            vol_avg = sum(x["volume"] for x in sub[-15:-2]) / 14 if len(sub) >= 15 else 1.0
-            volume_expansion = c["volume"] > (vol_avg * 1.1)
+            ichi = calculate_ichimoku_levels(sub)
+            if not ichichi_valid := ichi: continue
+            
+            atr = calculate_atr(sub, 14)
+            if atr == 0: continue
 
-            recent_highs = max(x["high"] for x in sub[-20:-2])
-            recent_lows = min(x["low"] for x in sub[-20:-2])
+            tenkan = ichi["tenkan"]
+            kijun = ichi["kijun"]
+            s_a = ichi["senkou_a"]
+            s_b = ichi["senkou_b"]
+            
+            cloud_top = max(s_a, s_b)
+            cloud_bottom = min(s_a, s_b)
 
-            long_score, short_score = 0, 0
+            # تاییدیه حرفه‌ای چیکو اسپن (Chikou Span Confirmation - مقایسه قیمت الان با ۲۶ کندل قبل)
+            chikou_current_price = c["close"]
+            price_26_ago = sub[-28]["close"] # حدود 26 کندل عقب‌تر
+            chikou_bullish = chikou_current_price > price_26_ago
+            chikou_bearish = chikou_current_price < price_26_ago
 
-            # لایه‌های امتیازدهی دقیق‌تر
-            if c["close"] > ema50: long_score += 2
-            if ema50 > ema200: long_score += 2
-            if c["close"] < ema50: short_score += 2
-            if ema50 < ema200: short_score += 2
+            # شرایط حرفه‌ای ایچیموکو برای لانگ:
+            # ۱. قیمت بالای ابر (Cloud Top)
+            # ۲. تنکان بالاتر از کیوجسن (TK Bullish Cross)
+            # ۳. تاییدیه چیکو اسپن
+            is_long = (c["close"] > cloud_top) and (tenkan > kijun) and chikou_bullish and (c["close"] > tenkan)
 
-            if adx > 25: 
-                long_score += 1; short_score += 1
-            if 48 < rsi < 68: long_score += 1
-            if 32 < rsi < 52: short_score += 1
+            # شرایط حرفه‌ای ایچیموکو برای شورت:
+            # ۱. قیمت زیر ابر (Cloud Bottom)
+            # ۲. تنکان پایین‌تر از کیوجسن (TK Bearish Cross)
+            # ۳. تاییدیه چیکو اسپن
+            is_short = (c["close"] < cloud_bottom) and (tenkan < kijun) and chikou_bearish and (c["close"] < tenkan)
 
-            if buying_pressure > 0.4: long_score += 2
-            if buying_pressure < -0.4: short_score += 2
-            if volume_expansion: 
-                long_score += 1; short_score += 1
-
-            if c["close"] > recent_highs: long_score += 2
-            if c["close"] < recent_lows: short_score += 2
-
-            # آستانه سخت‌گیرانه روی امتیاز 10 یا 11 (فقط सेटअपهای فوق‌العاده تمیز)
             trade_taken = False
 
-            if long_score >= 10:
+            if is_long:
                 entry_price = c["close"]
-                stop_loss = min(prev_c["low"], prev2_c["low"]) - (atr * 0.25)
+                # استاپ لاس حرفه‌ای پشت کیوجسن یا لبه ابر
+                stop_loss = min(kijun, cloud_bottom) - (atr * 0.2)
                 risk_dist = entry_price - stop_loss
 
-                if 0 < (risk_dist / entry_price) <= 0.035:
+                if 0 < (risk_dist / entry_price) <= 0.04:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 36, len(candles) - 1)
+                    end_idx = min(i + 48, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -167,15 +165,16 @@ def run_backtest():
                     if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
                     elif trade_lost: losses += 1; balance -= risk_amount
 
-            if not trade_taken and short_score >= 10:
+            if not trade_taken and is_short:
                 entry_price = c["close"]
-                stop_loss = max(prev_c["high"], prev2_c["high"]) + (atr * 0.25)
+                # استاپ لاس حرفه‌ای بالای کیوجسن یا لبه ابر
+                stop_loss = max(kijun, cloud_top) + (atr * 0.2)
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.035:
+                if 0 < (risk_dist / entry_price) <= 0.04:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 36, len(candles) - 1)
+                    end_idx = min(i + 48, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -199,7 +198,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED ELITE BACKTEST RESULTS           ")
+    print("      AGGREGATED ICHIMOKU PRO RESULTS             ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
