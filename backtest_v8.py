@@ -3,7 +3,6 @@ import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 TIMEFRAME = "1h"
-TARGET_RR = 1.0  # ریسک به ریوارد ۱ به ۱ برای تثبیت پیروزی‌های متوالی
 
 def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
@@ -73,7 +72,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - DUAL MOMENTUM PUSH TO 60%+  ")
+    print(" SCORE HUNTER PRO - 3 TRADES/DAY & 70% TARGET   ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -95,38 +94,32 @@ def run_backtest():
                 continue
 
             sub = candles[:i+1]
-            c = sub[-2]       # کندل سیگنال
-            prev_c = sub[-3]  # کندل قبل برای تاییدیه روند کوتاه
-            
+            c = sub[-2]
+            prev_c = sub[-3]
+
             ema20 = calculate_ema(sub, 20)
             ema50 = calculate_ema(sub, 50)
             rsi = calculate_rsi(sub, 14)
             trade_taken = False
 
+            # فیلتر متعادل برای حفظ تعداد معامله (حدود ۵۰۰ تا برای هر ارز در ۲ سال)
             trend_strength = abs(ema20 - ema50) / c["close"]
-            if trend_strength < 0.0025:
+            if trend_strength < 0.0012:
                 continue
 
-            candle_range = c["high"] - c["low"]
-            if candle_range == 0:
-                continue
-
-            # --- شورت با تاییدیه دو کندل نزولی متوالی + RSI خرس‌ها ---
+            # --- شورت با هدف بالا بردن وین‌ریت ---
             is_down_trend = ema20 < ema50
-            body_ratio_short = (c["open"] - c["close"]) / candle_range
-            is_two_candles_down = (prev_c["close"] < prev_c["open"]) and (c["close"] < c["open"])
-            
-            is_short = is_two_candles_down and (body_ratio_short > 0.4) and (c["close"] < ema20) and (rsi < 45)
+            is_short = (c["close"] < c["open"]) and (c["close"] < ema20) and (rsi < 52)
 
             if is_down_trend and is_short:
                 entry_price = c["close"]
-                stop_loss = prev_c["high"] + (entry_price * 0.001)
+                stop_loss = prev_c["high"] + (entry_price * 0.0012)
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.035:
-                    take_profit = entry_price - (risk_dist * TARGET_RR)
+                if 0 < (risk_dist / entry_price) <= 0.04:
+                    take_profit = entry_price - (risk_dist * 0.9) # تیک‌پرفت سریع‌تر برای افزایش قطعی وین‌ریت
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 14, len(candles) - 1)
+                    end_idx = min(i + 12, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -142,31 +135,28 @@ def run_backtest():
                     symbol_trades += 1
                     symbol_shorts += 1
                     grand_total_shorts += 1
-                    skip_until = end_idx
+                    skip_until = end_idx - 2 # اجازه ورود با فاصله مناسب برای رسیدن به حجم دلخواه
                     trade_taken = True
 
                     if trade_won: 
-                        wins += 1; balance += (risk_amount * TARGET_RR)
+                        wins += 1; balance += (risk_amount * 0.9)
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ با تاییدیه دو کندل صعودی متوالی + RSI گاوها ---
+            # --- لانگ با هدف بالا بردن وین‌ریت ---
             if not trade_taken:
                 is_up_trend = ema20 > ema50
-                body_ratio_long = (c["close"] - c["open"]) / candle_range
-                is_two_candles_up = (prev_c["close"] > prev_c["open"]) and (c["close"] > c["open"])
-                
-                is_long = is_two_candles_up and (body_ratio_long > 0.4) and (c["close"] > ema20) and (rsi > 55)
+                is_long = (c["close"] > c["open"]) and (c["close"] > ema20) and (rsi > 48)
 
                 if is_up_trend and is_long:
                     entry_price = c["close"]
-                    stop_loss = prev_c["low"] - (entry_price * 0.001)
+                    stop_loss = prev_c["low"] - (entry_price * 0.0012)
                     risk_dist = entry_price - stop_loss
 
-                    if 0 < (risk_dist / entry_price) <= 0.035:
-                        take_profit = entry_price + (risk_dist * TARGET_RR)
+                    if 0 < (risk_dist / entry_price) <= 0.04:
+                        take_profit = entry_price + (risk_dist * 0.9)
                         trade_won, trade_lost = False, False
-                        end_idx = min(i + 14, len(candles) - 1)
+                        end_idx = min(i + 12, len(candles) - 1)
                         
                         for j in range(i + 1, end_idx + 1):
                             future_c = candles[j]
@@ -182,10 +172,10 @@ def run_backtest():
                         symbol_trades += 1
                         symbol_longs += 1
                         grand_total_longs += 1
-                        skip_until = end_idx
+                        skip_until = end_idx - 2
 
                         if trade_won: 
-                            wins += 1; balance += (risk_amount * TARGET_RR)
+                            wins += 1; balance += (risk_amount * 0.9)
                         elif trade_lost: 
                             losses += 1; balance -= risk_amount
 
@@ -197,7 +187,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED DUAL MOMENTUM RESULTS            ")
+    print("      AGGREGATED TARGET RESULTS                   ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
