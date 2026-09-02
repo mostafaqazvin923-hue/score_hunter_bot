@@ -1,4 +1,3 @@
-_backtest()
 import json
 import urllib.request
 
@@ -62,7 +61,7 @@ def calculate_rsi(candles, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def run_backtest():
+def _backtest():
     initial_balance = 1000.0
     balance = initial_balance
     risk_amount = 25.0  # ریسک ثابت پایه برای ارزیابی دقیق تعداد برد و باخت
@@ -103,7 +102,7 @@ def run_backtest():
             rsi = calculate_rsi(sub, 14)
             trade_taken = False
 
-            # فیلتر حفظ حجم معاملات (حفظ فرکانس بالا)
+            # فیلتر حفظ حجم معاملات
             trend_strength = abs(ema20 - ema50) / c["close"]
             if trend_strength < 0.0009:
                 continue
@@ -119,13 +118,12 @@ def run_backtest():
 
             if is_down_trend and is_short:
                 entry_price = c["close"]
-                # حد ضرر ساختاری بر اساس بالاترین سقفِ ۳ کندل اخیر بازار (مقاومت واقعی ساختار)
                 recent_high = max(sub[-1]["high"], sub[-2]["high"], sub[-3]["high"])
                 stop_loss = recent_high + (entry_price * 0.0008)
                 risk_dist = stop_loss - entry_price
 
                 if 0 < (risk_dist / entry_price) <= 0.035:
-                    take_profit = entry_price - (risk_dist * TARGET_RR)  # دقیقاً دو برابر ریسک (۱ به ۲)
+                    take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 14, len(candles) - 1)
                     
@@ -159,13 +157,12 @@ def run_backtest():
 
                 if is_up_trend and is_long:
                     entry_price = c["close"]
-                    # حد ضرر ساختاری بر اساس پایین‌ترین کفِ ۳ کندل اخیر بازار (حمایت واقعی ساختار)
                     recent_low = min(sub[-1]["low"], sub[-2]["low"], sub[-3]["low"])
                     stop_loss = recent_low - (entry_price * 0.0008)
                     risk_dist = entry_price - stop_loss
 
                     if 0 < (risk_dist / entry_price) <= 0.035:
-                        take_profit = entry_price + (risk_dist * TARGET_RR)  # دقیقاً دو برابر ریسک (۱ به ۲)
+                        take_profit = entry_price + (risk_dist * TARGET_RR)
                         trade_won, trade_lost = False, False
                         end_idx = min(i + 14, len(candles) - 1)
                         
@@ -210,4 +207,4 @@ def run_backtest():
     print("==================================================\n")
 
 if __name__ == "__main__":
-    run_backtest()
+    _backtest()
