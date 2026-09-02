@@ -72,7 +72,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - 3 TRADES/DAY & 70% TARGET   ")
+    print(" SCORE HUNTER PRO - PRESERVING VOLUME & 70% WIN   ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -102,22 +102,26 @@ def run_backtest():
             rsi = calculate_rsi(sub, 14)
             trade_taken = False
 
-            # فیلتر متعادل برای حفظ تعداد معامله (حدود ۵۰۰ تا برای هر ارز در ۲ سال)
             trend_strength = abs(ema20 - ema50) / c["close"]
             if trend_strength < 0.0012:
                 continue
 
-            # --- شورت با هدف بالا بردن وین‌ریت ---
+            candle_range = c["high"] - c["low"]
+            if candle_range == 0:
+                continue
+
+            # --- شورت با فیلتر بدنه برای حذف فیک‌اوت‌ها ---
             is_down_trend = ema20 < ema50
-            is_short = (c["close"] < c["open"]) and (c["close"] < ema20) and (rsi < 52)
+            body_ratio_short = (c["open"] - c["close"]) / candle_range
+            is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.35) and (c["close"] < ema20) and (rsi < 50)
 
             if is_down_trend and is_short:
                 entry_price = c["close"]
-                stop_loss = prev_c["high"] + (entry_price * 0.0012)
+                stop_loss = prev_c["high"] + (entry_price * 0.001)
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.04:
-                    take_profit = entry_price - (risk_dist * 0.9) # تیک‌پرفت سریع‌تر برای افزایش قطعی وین‌ریت
+                if 0 < (risk_dist / entry_price) <= 0.035:
+                    take_profit = entry_price - (risk_dist * 0.85) # هدف بسته‌تر برای صید قطعی وین‌ریت
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 12, len(candles) - 1)
                     
@@ -135,26 +139,27 @@ def run_backtest():
                     symbol_trades += 1
                     symbol_shorts += 1
                     grand_total_shorts += 1
-                    skip_until = end_idx - 2 # اجازه ورود با فاصله مناسب برای رسیدن به حجم دلخواه
+                    skip_until = end_idx - 2
                     trade_taken = True
 
                     if trade_won: 
-                        wins += 1; balance += (risk_amount * 0.9)
+                        wins += 1; balance += (risk_amount * 0.85)
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ با هدف بالا بردن وین‌ریت ---
+            # --- لانگ با فیلتر بدنه برای حذف فیک‌اوت‌ها ---
             if not trade_taken:
                 is_up_trend = ema20 > ema50
-                is_long = (c["close"] > c["open"]) and (c["close"] > ema20) and (rsi > 48)
+                body_ratio_long = (c["close"] - c["open"]) / candle_range
+                is_long = (c["close"] > c["open"]) and (body_ratio_long > 0.35) and (c["close"] > ema20) and (rsi > 50)
 
                 if is_up_trend and is_long:
                     entry_price = c["close"]
-                    stop_loss = prev_c["low"] - (entry_price * 0.0012)
+                    stop_loss = prev_c["low"] - (entry_price * 0.001)
                     risk_dist = entry_price - stop_loss
 
-                    if 0 < (risk_dist / entry_price) <= 0.04:
-                        take_profit = entry_price + (risk_dist * 0.9)
+                    if 0 < (risk_dist / entry_price) <= 0.035:
+                        take_profit = entry_price + (risk_dist * 0.85)
                         trade_won, trade_lost = False, False
                         end_idx = min(i + 12, len(candles) - 1)
                         
@@ -175,7 +180,7 @@ def run_backtest():
                         skip_until = end_idx - 2
 
                         if trade_won: 
-                            wins += 1; balance += (risk_amount * 0.9)
+                            wins += 1; balance += (risk_amount * 0.85)
                         elif trade_lost: 
                             losses += 1; balance -= risk_amount
 
@@ -187,7 +192,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED TARGET RESULTS                   ")
+    print("      AGGREGATED WIN-RATE BOOST RESULTS           ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
