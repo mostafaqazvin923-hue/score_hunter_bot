@@ -1,48 +1,63 @@
 import json
 import urllib.request
-import math
+import time
 
-# جفت ارزهای استاندارد در صرافی کراکن (بیت‌کوین با XBT نشان داده می‌شود)
-SYMBOLS = ["XBTUSD", "ETHUSD", "SOLUSD", "XRPUSD"]
-INTERVAL = 60  # کندل 1 ساعته
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+INTERVAL = "1h"
 TARGET_RR = 2.0
 
-def fetch_kraken_klines(symbol):
-    url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval={INTERVAL}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            raw = response.read().decode("utf-8")
-            payload = json.loads(raw)
-            if payload.get("error"):
-                print(f"[!] Kraken API Error for {symbol}: {payload['error']}")
-                return []
-            
-            result = payload.get("result", {})
-            # پیدا کردن کلید اصلی جفت ارز در پاسخ کراکن
-            pair_key = [k for k in result.keys() if k != "last"]
-            if not pair_key:
-                return []
-            
-            rows = result[pair_key[0]]
-            candles = []
-            for row in rows:
-                if isinstance(row, list) and len(row) >= 7:
+def fetch_binance_full_year(symbol):
+    all_candles = []
+    # یک سال معادل حدود 8760 کندل 1 ساعته است. بایننس در هر درخواست حداکثر 1000 کندل می‌دهد.
+    # برای گرفتن یک سال کامل، به صورت حلقه عقب‌گرد (Pagination) درخواست می‌فرستیم.
+    end_time = int(time.time() * 1000)
+    # شروع از یک سال پیش (365 روز * 24 ساعت * 3600 ثانیه * 1000 میلی‌ثانیه)
+    start_time_limit = end_time - (365 * 24 * 3600 * 1000)
+    
+    current_end = end_time
+    print(f"[*] Downloading 1-year historical data for {symbol} from Binance...")
+
+    while True:
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={INTERVAL}&limit=1000&endTime={current_end}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                raw = response.read().decode("utf-8")
+                rows = json.loads(raw)
+                if not rows:
+                    break
+                
+                batch_candles = []
+                for row in rows:
                     ts = int(row[0])
                     op = float(row[1])
                     hi = float(row[2])
                     lo = float(row[3])
                     cl = float(row[4])
-                    vol = float(row[6]) # حجم معاملات در کراکن
-                    candles.append({
+                    vol = float(row[5])
+                    batch_candles.append({
                         "timestamp": ts, "open": op, "high": hi, 
                         "low": lo, "close": cl, "volume": vol
                     })
-            candles.sort(key=lambda x: x["timestamp"])
-            return candles
-    except Exception as e:
-        print(f"[!] Error fetching Kraken data for {symbol}: {e}")
-    return []
+                
+                # مرتب‌سازی و اضافه کردن به لیست کل
+                batch_candles.sort(key=lambda x: x["timestamp"])
+                all_candles = batch_candles + all_candles
+                
+                # تنظیم بازه برای درخواست بعدی (قبلی‌تر)
+                oldest_ts = batch_candles[0]["timestamp"]
+                if oldest_ts <= start_time_limit or len(rows) < 1000:
+                    break
+                current_end = oldest_ts - 1
+                time.sleep(0.2) # جلوگیری از بلاک شدن توسط سرور
+        except Exception as e:
+            print(f"[!] Error fetching Binance data for {symbol}: {e}")
+            break
+
+    # فیلتر کردن دقیقاً یک سال گذشته و مرتب‌سازی نهایی
+    all_candles = [c for c in all_candles if c["timestamp"] >= start_time_limit]
+    all_candles.sort(key=lambda x: x["timestamp"])
+    return all_candles
 
 def calculate_ema(candles, period):
     if len(candles) < period:
@@ -98,16 +113,16 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - 3-LAYER WHALE (KRAKEN)      ")
+    print("   SCORE HUNTER PRO - 3-LAYER WHALE (BINANCE 1Y)  ")
     print("==================================================")
 
     for symbol in SYMBOLS:
-        print(f"\n[*] Running strict backtest for {symbol} on Kraken...")
-        candles = fetch_kraken_klines(symbol)
-        if not candles:
-            print(f"[!] Failed to get data for {symbol}")
+        candles = fetch_binance_full_year(symbol)
+        if not candles or len(candles) < 500:
+            print(f"[!] Insufficient data for {symbol}")
             continue
         
+        print(f"[*] Loaded {len(candles)} candles for {symbol}. Running backtest...")
         wins = 0
         losses = 0
         symbol_trades = 0
@@ -207,7 +222,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED KRAKEN BACKTEST RESULTS          ")
+    print("      AGGREGATED 1-YEAR TRUE BACKTEST RESULTS     ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
