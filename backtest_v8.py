@@ -1,6 +1,6 @@
 import json
 import urllib.request
-import time
+import math
 
 SYMBOLS = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD", "XRPUSDT": "XRP-USD"}
 TARGET_RR = 2.0
@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading 1-year Smart Money Data for {symbol_key}...")
+        print(f"[*] Downloading Institutional VWAP Data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -53,13 +53,23 @@ def calculate_atr(candles, period=14):
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-period:]) / period
 
-def calculate_ema(closes, period=50):
-    if len(closes) < period: return closes[-1]
-    multiplier = 2 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for price in closes[period:]:
-        ema = (price - ema) * multiplier + ema
-    return ema
+def calculate_vwap_bands(sub_candles, period=20):
+    if len(sub_candles) < period:
+        return sub_candles[-1]["close"], sub_candles[-1]["close"], sub_candles[-1]["close"]
+    
+    window = sub_candles[-period:]
+    cum_vol_price = sum(((x["high"] + x["low"] + x["close"]) / 3) * x["volume"] for x in window)
+    cum_vol = sum(x["volume"] for x in window)
+    
+    vwap = (cum_vol_price / cum_vol) if cum_vol > 0 else window[-1]["close"]
+    
+    # محاسبه انحراف معیار برای تعیین باندهای بالایی و پایینی نهنگی
+    variance = sum(x["volume"] * ((x["close"] - vwap) ** 2) for x in window) / cum_vol if cum_vol > 0 else 0
+    stdev = math.sqrt(variance) if variance > 0 else window[-1]["close"] * 0.01
+    
+    upper_band = vwap + (1.5 * stdev)
+    lower_band = vwap - (1.5 * stdev)
+    return vwap, upper_band, lower_band
 
 def run_backtest():
     initial_balance = 1000.0
@@ -68,52 +78,41 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - SMART MONEY V9 (FIXED)      ")
+    print("   SCORE HUNTER PRO - VWAP MEAN REVERSION V10     ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
         if not candles or len(candles) < 100: continue
         
-        print(f"[*] Running V9 Backtest for {symbol_key}...")
+        print(f"[*] Running V10 Institutional backtest for {symbol_key}...")
         wins, losses, symbol_trades = 0, 0, 0
         in_position_until = 0
 
         for i in range(50, len(candles) - 30):
-            # قانون قفل معامله روی هر ارز تا روشن شدن تکلیف پوزیشن قبلی
             if i < in_position_until: 
                 continue
 
             sub = candles[:i+1]
-            closes = [x["close"] for x in sub]
-            
-            c = sub[-1]       # کندل تاییدیه
-            prev_c = sub[-2]  # کندل نفوذ (Sweep)
+            c = sub[-1]
+            prev_c = sub[-2]
             
             atr = calculate_atr(sub, 14)
-            ema_50 = calculate_ema(closes, 50)
+            vwap, upper_band, lower_band = calculate_vwap_bands(sub, 20)
             if atr == 0: continue
 
-            # تعیین روند کلی با EMA
-            is_uptrend = c["close"] > ema_50
-            is_downtrend = c["close"] < ema_50
-
-            # نواحی اسوینگ برای تشخیص شکار نقدینگی (Liquidity Sweep)
-            recent_swing_low = min(x["low"] for x in sub[-15:-2])
-            recent_swing_high = max(x["high"] for x in sub[-15:-2])
-
-            # شرایط تمیز و بدون باگ برای ورود اسمارت مانی
-            bullish_setup = is_uptrend and (prev_c["low"] < recent_swing_low) and (c["close"] > c["open"]) and (c["close"] > prev_c["high"])
-            bearish_setup = is_downtrend and (prev_c["high"] > recent_swing_high) and (c["close"] < c["open"]) and (c["close"] < prev_c["low"])
+            # استراتژی نهنگی: خرید در باند پایین (اشباع فروش و بازگشت به سمت میانگین VWAP) و فروش در باند بالا
+            buy_signal = (prev_c["low"] <= lower_band) and (c["close"] > prev_c["high"]) and (c["close"] > c["open"])
+            sell_signal = (prev_c["high"] >= upper_band) and (c["close"] < prev_c["low"]) and (c["close"] < c["open"])
 
             trade_taken = False
 
-            if bullish_setup:
+            if buy_signal:
                 entry_price = c["close"]
-                stop_loss = recent_swing_low - (atr * 0.3)
+                stop_loss = prev_c["low"] - (atr * 0.5)
                 risk_dist = entry_price - stop_loss
 
-                if 0.001 * entry_price <= risk_dist <= 0.04 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
@@ -140,12 +139,12 @@ def run_backtest():
                         losses += 1
                         balance -= risk_amount
 
-            elif bearish_setup and not trade_taken:
+            elif sell_signal and not trade_taken:
                 entry_price = c["close"]
-                stop_loss = recent_swing_high + (atr * 0.3)
+                stop_loss = prev_c["high"] + (atr * 0.5)
                 risk_dist = stop_loss - entry_price
 
-                if 0.001 * entry_price <= risk_dist <= 0.04 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
@@ -179,7 +178,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED SMART MONEY V9 RESULTS           ")
+    print("      AGGREGATED VWAP V10 RESULTS                 ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
