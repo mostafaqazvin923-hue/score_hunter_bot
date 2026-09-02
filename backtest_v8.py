@@ -2,54 +2,55 @@ import json
 import urllib.request
 import math
 
-SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
-TIMEFRAME = "1h"
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+TIMEFRAME = "1hour"
 TARGET_RR = 2.0
 
-def fetch_historical_klines(symbol, limit=8800):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
+def fetch_coinex_klines(symbol, limit=8800):
+    url = f"https://api.coinex.com/v2/spot/kline?market={symbol}&period={TIMEFRAME}&limit={limit}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
-            result = payload.get("chart", {}).get("result", [])
-            if not result:
-                raise ValueError("Empty result")
-            
-            data = result[0]
-            timestamps = data.get("timestamp", [])
-            quotes = data.get("indicators", {}).get("quote", [{}])[0]
-            opens = quotes.get("open", [])
-            highs = quotes.get("high", [])
-            lows = quotes.get("low", [])
-            closes = quotes.get("close", [])
-            volumes = quotes.get("volume", [])
-            
-            candles = []
-            for idx in range(len(timestamps)):
-                op, hi, lo, cl, ts = opens[idx], highs[idx], lows[idx], closes[idx], timestamps[idx]
-                vol = volumes[idx] if idx < len(volumes) and volumes[idx] is not None else 1000.0
-                if op is None or hi is None or lo is None or cl is None:
-                    continue
-                candles.append({
-                    "timestamp": int(ts), "open": float(op), "high": float(hi), 
-                    "low": float(lo), "close": float(cl), "volume": float(vol)
-                })
-            candles.sort(key=lambda x: x["timestamp"])
-            if len(candles) > 0:
-                return candles[-limit:]
+            if isinstance(payload, dict) and payload.get("code") == 0:
+                rows = payload.get("data", [])
+                candles = []
+                for row in rows:
+                    if isinstance(row, dict):
+                        ts = int(float(row.get("created_at", row.get("time", 0))))
+                        op = float(row.get("open", 0))
+                        hi = float(row.get("high", 0))
+                        lo = float(row.get("low", 0))
+                        cl = float(row.get("close", 0))
+                        vol = float(row.get("volume", 0.0))
+                    elif isinstance(row, list) and len(row) >= 6:
+                        ts = int(float(row[0]))
+                        op = float(row[1])
+                        cl = float(row[2])
+                        hi = float(row[3])
+                        lo = float(row[4])
+                        vol = float(row[5]) if len(row) > 5 else 0.0
+                    else:
+                        continue
+                    candles.append({
+                        "timestamp": ts, "open": op, "high": hi, 
+                        "low": lo, "close": cl, "volume": vol
+                    })
+                candles.sort(key=lambda x: x["timestamp"])
+                if len(candles) > 100:
+                    return candles
     except Exception as e:
-        print(f"Error fetching data for {symbol}: {e}")
-    raise ValueError(f"Could not fetch real historical data for {symbol}.")
+        print(f"[!] Error fetching Coinex data for {symbol}: {e}")
+    raise ValueError(f"[!] Could not fetch real data from Coinex for {symbol}. Check connection.")
 
-def calculate_ema(candles, period=200):
+def calculate_ema(candles, period):
     if len(candles) < period:
         return candles[-1]["close"]
     multiplier = 2 / (period + 1)
     ema = sum(x["close"] for x in candles[:period]) / period
-    for candle in candles[period:]:
-        ema = (candle["close"] - ema) * multiplier + ema
+    for c in candles[period:]:
+        ema = (c["close"] - ema) * multiplier + ema
     return ema
 
 def calculate_rsi(candles, period=14):
@@ -64,22 +65,47 @@ def calculate_rsi(candles, period=14):
     rs = (gains / period) / (losses / period)
     return 100.0 - (100.0 / (1.0 + rs))
 
+def calculate_atr(candles, period=14):
+    if len(candles) < period + 1:
+        return candles[-1]["high"] - candles[-1]["low"]
+    trs = []
+    for i in range(1, len(candles)):
+        h = candles[i]["high"]
+        l = candles[i]["low"]
+        pc = candles[i-1]["close"]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    return sum(trs[-period:]) / period
+
+def calculate_adx_proxy(candles, period=14):
+    if len(candles) < period + 2:
+        return 25.0
+    # محاسبه تقریب قدرت روند بر اساس دامنه و جهت حرکات
+    moves = []
+    for i in range(1, len(candles[-period:])):
+        diff = candles[-i]["close"] - candles[-i-1]["close"]
+        moves.append(abs(diff))
+    avg_move = sum(moves) / len(moves) if moves else 1.0
+    total_range = candles[-1]["high"] - candles[-1]["low"]
+    return min(100.0, max(10.0, (avg_move / (total_range if total_range > 0 else 1.0)) * 50 + 20))
+
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
     risk_amount = 25.0
+    
     total_wins = 0
     total_losses = 0
     grand_total_trades = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - TREND FILTERED INSTITUTIONAL")
+    print("   SCORE HUNTER PRO - 3-LAYER WHALE SYSTEM (COINEX)")
     print("==================================================")
 
     for symbol in SYMBOLS:
-        print(f"\n[*] Running trend-filtered backtest for {symbol}...")
+        print(f"\n[*] Running 1-year backtest for {symbol} on Coinex...")
         try:
-            candles = fetch_historical_klines(symbol, limit=8800)
+            candles = fetch_coinex_klines(symbol, limit=8800)
         except Exception as err:
             print(err)
             continue
@@ -93,32 +119,43 @@ def run_backtest():
             if i < skip_until:
                 continue
 
-            sub_candles = candles[:i+1]
-            c = sub_candles[-2]
-            prev_c = sub_candles[-3]
-            prev2_c = sub_candles[-4]
+            sub = candles[:i+1]
+            c = sub[-2]
+            prev_c = sub[-3]
+            prev2_c = sub_candles = sub[-4]
 
-            ema_200 = calculate_ema(sub_candles, 200)
-            current_rsi = calculate_rsi(sub_candles)
+            # لایه ۱: روند (EMA 50 / 200 + ساختار)
+            ema50 = calculate_ema(sub, 50)
+            ema200 = calculate_ema(sub, 200)
             
-            avg_vol = sum(x["volume"] for x in sub_candles[-15:-2]) / 14
-            is_volume_confirmed = c["volume"] > (avg_vol * 1.1)
+            # لایه ۲: مومنتوم، قدرت و نوسان (RSI, ADX, ATR)
+            rsi = calculate_rsi(sub, 14)
+            adx = calculate_adx_proxy(sub, 14)
+            atr = calculate_atr(sub, 14)
 
-            recent_highs = max(x["high"] for x in sub_candles[-20:-2])
-            recent_lows = min(x["low"] for x in sub_candles[-20:-2])
+            # لایه ۳: جریان سفارشات و نقدینگی (CVD Proxy مبتنی بر فشار حجم درون‌کندلی)
+            candle_range = c["high"] - c["low"]
+            if candle_range == 0 or atr == 0:
+                continue
             
-            is_bullish_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.5
-            is_bearish_bos = c["close"] < recent_lows and (c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.5
+            buying_pressure = (c["close"] - c["open"]) / candle_range
+            vol_avg = sum(x["volume"] for x in sub[-15:-2]) / 14 if len(sub) >= 15 else 1.0
+            cvd_confirmed = c["volume"] > (vol_avg * 1.05)
+
+            recent_highs = max(x["high"] for x in sub[-20:-2])
+            recent_lows = min(x["low"] for x in sub[-20:-2])
+
+            is_long = (c["close"] > ema50) and (ema50 > ema200) and (adx > 22) and (45 < rsi < 70) and (buying_pressure > 0.35) and cvd_confirmed and (c["close"] > recent_highs)
+            is_short = (c["close"] < ema50) and (ema50 < ema200) and (adx > 22) and (30 < rsi < 55) and (buying_pressure < -0.35) and cvd_confirmed and (c["close"] < recent_lows)
 
             trade_taken = False
 
-            # فقط در روند صعودی (بالای EMA 200) لانگ می‌گیریم
-            if c["close"] > ema_200 and is_bullish_bos and is_volume_confirmed and (45 < current_rsi < 68):
+            if is_long:
                 entry_price = c["close"]
-                stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.002)
+                stop_loss = min(prev_c["low"], prev2_c["low"]) - (atr * 0.3)
                 risk_dist = entry_price - stop_loss
 
-                if 0 < (risk_dist / entry_price) <= 0.03:
+                if 0 < (risk_dist / entry_price) <= 0.035:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 36, len(candles) - 1)
@@ -135,19 +172,18 @@ def run_backtest():
                         trade_lost = not trade_won
 
                     symbol_trades += 1
-                    skip_until = end_idx
+                    skip_until = end_idx  # قفل کامل معامله تا تعیین تکلیف نهایی
                     trade_taken = True
 
                     if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
                     elif trade_lost: losses += 1; balance -= risk_amount
 
-            # فقط در روند نزولی (پایین EMA 200) شورت می‌گیریم
-            if not trade_taken and c["close"] < ema_200 and is_bearish_bos and is_volume_confirmed and (32 < current_rsi < 55):
+            if not trade_taken and is_short:
                 entry_price = c["close"]
-                stop_loss = max(prev_c["high"], prev2_c["high"]) + (entry_price * 0.002)
+                stop_loss = max(prev_c["high"], prev2_c["high"]) + (atr * 0.3)
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.03:
+                if 0 < (risk_dist / entry_price) <= 0.035:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 36, len(candles) - 1)
@@ -164,7 +200,7 @@ def run_backtest():
                         trade_lost = not trade_won
 
                     symbol_trades += 1
-                    skip_until = end_idx
+                    skip_until = end_idx  # قفل کامل معامله تا تعیین تکلیف نهایی
 
                     if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
                     elif trade_lost: losses += 1; balance -= risk_amount
@@ -177,7 +213,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED TREND-FILTERED RESULTS           ")
+    print("      AGGREGATED 3-LAYER WHALE BACKTEST RESULTS   ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
