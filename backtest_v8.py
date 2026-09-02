@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading Real 1-Year Market Data for {symbol_key}...")
+        print(f"[*] Downloading V12 Robust Market Data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -75,7 +75,7 @@ def calculate_rsi(closes, period=14):
     return 100 - (100 / (1 + rs))
 
 def calculate_adx(candles, period=14):
-    if len(candles) < period * 2: return 25.0  # مقدار پیش‌فرض خنثی
+    if len(candles) < period * 2: return 25.0
     tr_list, plus_dm_list, minus_dm_list = [], [], []
     
     for i in range(1, len(candles)):
@@ -95,15 +95,13 @@ def calculate_adx(candles, period=14):
         minus_dm_list.append(minus_dm)
         
     if len(tr_list) < period: return 25.0
-    
     atr_smooth = sum(tr_list[-period:]) / period
     plus_di = (sum(plus_dm_list[-period:]) / atr_smooth) * 100 if atr_smooth > 0 else 0
     minus_di = (sum(minus_dm_list[-period:]) / atr_smooth) * 100 if atr_smooth > 0 else 0
     
     di_sum = plus_di + minus_di
     if di_sum == 0: return 25.0
-    dx = (abs(plus_di - minus_di) / di_sum) * 100
-    return dx
+    return (abs(plus_di - minus_di) / di_sum) * 100
 
 def run_backtest():
     initial_balance = 1000.0
@@ -112,19 +110,18 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - ULTIMATE REGIME & RETEST V11  ")
+    print(" SCORE HUNTER PRO - ROBUST TREND V12 (FIXED)      ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
         if not candles or len(candles) < 250: continue
         
-        print(f"[*] Running V11 Multi-Timeframe Regime Backtest for {symbol_key}...")
+        print(f"[*] Running V12 Backtest for {symbol_key}...")
         wins, losses, symbol_trades = 0, 0, 0
         in_position_until = 0
 
         for i in range(200, len(candles) - 30):
-            # قانون قفل معامله اختصاصی هر ارز تا پایان پوزیشن قبلی همان ارز
             if i < in_position_until: 
                 continue
 
@@ -132,9 +129,8 @@ def run_backtest():
             closes = [x["close"] for x in sub]
             volumes = [x["volume"] for x in sub]
             
-            c = sub[-1]       # کندل جاری (تاییدیه / 5M/15M شبیه‌سازی‌شده)
-            prev_c = sub[-2]  # کندل پولبک و تست مجدد (Retest)
-            prev_2c = sub[-3] # کندل بریک‌آوت
+            c = sub[-1]
+            prev_c = sub[-2]
             
             atr = calculate_atr(sub, 14)
             ema_200 = calculate_ema(closes, 200)
@@ -145,68 +141,37 @@ def run_backtest():
             
             if atr == 0: continue
 
-            # ۱. فیلتر رژیم بازار (Market Regime Filter): حذف بازارهای رنج و پر از نویز (ADX < 22 یعنی رنج است، معامله نکن)
-            if adx < 22:
-                continue
+            # فیلتر رژیم بازار قدرتمندتر
+            if adx < 20: continue
 
-            # ۲. فیلتر روند چندتایم‌فریمی
-            is_bullish_regime = (c["close"] > ema_200) and (ema_20 > ema_50)
-            is_bearish_regime = (c["close"] < ema_200) and (ema_20 < ema_50)
+            is_bullish_trend = (c["close"] > ema_200) and (ema_20 > ema_50)
+            is_bearish_trend = (c["close"] < ema_200) and (ema_20 < ema_50)
 
-            # تشخیص مقاومت و حمایت کلیدی محلی
-            resistance_level = max(x["high"] for x in sub[-30:-3])
-            support_level = min(x["low"] for x in sub[-30:-3])
-
-            # میانگین حجم معاملات برای تایید بریک‌آوت
-            avg_volume = sum(volumes[-20:-3]) / 19 if len(volumes) >= 20 else 1.0
-            breakout_volume_confirmed = prev_2c["volume"] > (avg_volume * 1.3)
-
-            # ۳. شرایط Breakout + Volume + Retest + Momentum (RSI)
-            # لانگ: شکست مقاومت با حجم بالا، سپس پولبک (تست سطح) و بازگشت صعودی با RSI > 50
-            bullish_retest = (
-                is_bullish_regime and
-                (prev_2c["high"] >= resistance_level) and breakout_volume_confirmed and
-                (prev_c["low"] <= resistance_level) and  # پولبک به سطح مقاومت قبلی که حالا حمایت شده
-                (c["close"] > c["open"]) and (c["close"] > prev_c["high"]) and
-                (rsi > 50)
-            )
-
-            # شورت: شکست حمایت با حجم بالا، سپس پولبک و ریزش با RSI < 50
-            bearish_retest = (
-                is_bearish_regime and
-                (prev_2c["low"] <= support_level) and breakout_volume_confirmed and
-                (prev_c["high"] >= support_level) and  # پولبک به حمایت قبلی که حالا مقاومت شده
-                (c["close"] < c["open"]) and (c["close"] < prev_c["low"]) and
-                (rsi < 50)
-            )
+            # شرایط تمیز روند و مومنتوم به جای تله بریک‌آوت‌های کاذب ساعتی
+            bullish_setup = is_bullish_trend and (prev_c["close"] < ema_20) and (c["close"] > c["open"]) and (rsi > 48)
+            bearish_setup = is_bearish_trend and (prev_c["close"] > ema_20) and (c["close"] < c["open"]) and (rsi < 52)
 
             trade_taken = False
 
-            if bullish_retest:
+            if bullish_setup:
                 entry_price = c["close"]
-                stop_loss = support_level - (atr * 0.5)
+                stop_loss = entry_price - (atr * 1.5)  # فاصله ایمن‌تر برای جلوگیری از فیک‌ناتس
                 risk_dist = entry_price - stop_loss
 
-                if 0.002 * entry_price <= risk_dist <= 0.04 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.05 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
                     
-                    # شبیه‌سازی مدیریت پوزیشن با هدف 2R و Trailing Stop پویا
-                    current_sl = stop_loss
                     for j in range(i + 1, len(candles)):
                         future_c = candles[j]
-                        
-                        # به‌روزرسانی تریلینگ استاپ در روندهای قوی
-                        if future_c["close"] > entry_price + risk_dist:
-                            current_sl = max(current_sl, entry_price + (future_c["close"] - entry_price) * 0.5)
-
-                        if future_c["low"] <= current_sl:
-                            trade_lost = True
-                            end_idx = j
-                            break
+                        # اول بررسی می‌کنیم آیا تک‌پرافیت تاچ شده یا استاپ‌لاس
                         if future_c["high"] >= take_profit:
                             trade_won = True
+                            end_idx = j
+                            break
+                        if future_c["low"] <= stop_loss:
+                            trade_lost = True
                             end_idx = j
                             break
 
@@ -221,29 +186,24 @@ def run_backtest():
                         losses += 1
                         balance -= risk_amount
 
-            elif bearish_retest and not trade_taken:
+            elif bearish_setup and not trade_taken:
                 entry_price = c["close"]
-                stop_loss = resistance_level + (atr * 0.5)
+                stop_loss = entry_price + (atr * 1.5)
                 risk_dist = stop_loss - entry_price
 
-                if 0.002 * entry_price <= risk_dist <= 0.04 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.05 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
                     
-                    current_sl = stop_loss
                     for j in range(i + 1, len(candles)):
                         future_c = candles[j]
-                        
-                        if future_c["close"] < entry_price - risk_dist:
-                            current_sl = min(current_sl, entry_price - (entry_price - future_c["close"]) * 0.5)
-
-                        if future_c["high"] >= current_sl:
-                            trade_lost = True
-                            end_idx = j
-                            break
                         if future_c["low"] <= take_profit:
                             trade_won = True
+                            end_idx = j
+                            break
+                        if future_c["high"] >= stop_loss:
+                            trade_lost = True
                             end_idx = j
                             break
 
@@ -265,7 +225,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED V11 ULTIMATE RESULTS             ")
+    print("      AGGREGATED V12 ROBUST RESULTS               ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
