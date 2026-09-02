@@ -2,7 +2,7 @@ import json
 import urllib.request
 import time
 
-# نمادها در یاهو فایننس
+# استفاده از دیتای یاهو فایننس برای دسترسی پایدار به یک سال کامل تاریخچه (بدون خطای تحریم)
 SYMBOLS = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD", "XRPUSDT": "XRP-USD"}
 TARGET_RR = 2.0
 
@@ -12,7 +12,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading 1-year historical data for {symbol_key}...")
+        print(f"[*] Downloading 1-year institutional data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -33,7 +33,6 @@ def fetch_yahoo_one_year(symbol_key):
             
             candles = []
             for i in range(len(timestamps)):
-                # فیلتر کردن مقادیر None یا ناقص
                 if (
                     i < len(opens) and i < len(highs) and i < len(lows) and i < len(closes) and i < len(volumes) and
                     opens[i] is not None and highs[i] is not None and lows[i] is not None and closes[i] is not None
@@ -107,7 +106,7 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - 1-YEAR TRUE BACKTEST        ")
+    print("   SCORE HUNTER PRO - INSTITUTIONAL SCORE SYSTEM  ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
@@ -116,7 +115,7 @@ def run_backtest():
             print(f"[!] Insufficient data for {symbol_key}")
             continue
         
-        print(f"[*] Loaded {len(candles)} candles for {symbol_key}. Running backtest...")
+        print(f"[*] Loaded {len(candles)} candles for {symbol_key}. Running institutional backtest...")
         wins = 0
         losses = 0
         symbol_trades = 0
@@ -131,6 +130,7 @@ def run_backtest():
             prev_c = sub[-3]
             prev2_c = sub[-4]
 
+            # لایه‌های تحلیل فنی و نهنگی
             ema50 = calculate_ema(sub, 50)
             ema200 = calculate_ema(sub, 200)
             rsi = calculate_rsi(sub, 14)
@@ -143,25 +143,51 @@ def run_backtest():
             
             buying_pressure = (c["close"] - c["open"]) / candle_range
             vol_avg = sum(x["volume"] for x in sub[-15:-2]) / 14 if len(sub) >= 15 else 1.0
-            cvd_confirmed = c["volume"] > (vol_avg * 1.02)
+            volume_expansion = c["volume"] > vol_avg
 
             recent_highs = max(x["high"] for x in sub[-20:-2])
             recent_lows = min(x["low"] for x in sub[-20:-2])
 
-            is_long = (c["close"] > ema50) and (ema50 > ema200) and (adx > 20) and (42 < rsi < 72) and (buying_pressure > 0.3) and cvd_confirmed and (c["close"] > recent_highs)
-            is_short = (c["close"] < ema50) and (ema50 < ema200) and (adx > 20) and (28 < rsi < 58) and (buying_pressure < -0.3) and cvd_confirmed and (c["close"] < recent_lows)
+            # سیستم امتیازدهی هوشمند (Institutional Score System)
+            long_score = 0
+            short_score = 0
 
+            # 1. لایه روند (Trend)
+            if c["close"] > ema50: long_score += 2
+            if ema50 > ema200: long_score += 2
+            if c["close"] < ema50: short_score += 2
+            if ema50 < ema200: short_score += 2
+
+            # 2. لایه قدرت روند و مومنتوم (ADX & RSI)
+            if adx > 22: 
+                long_score += 1
+                short_score += 1
+            if 45 < rsi < 70: long_score += 1
+            if 30 < rsi < 55: short_score += 1
+
+            # 3. لایه جریان سفارشات و فشار خرید/فروش (Order Flow / Pressure)
+            if buying_pressure > 0.35: long_score += 2
+            if buying_pressure < -0.35: short_score += 2
+            if volume_expansion: 
+                long_score += 1
+                short_score += 1
+
+            # 4. لایه ساختار بازار و شکست سطح (Market Structure / Breakout)
+            if c["close"] > recent_highs: long_score += 2
+            if c["close"] < recent_lows: short_score += 2
+
+            # حد نصاب امتیاز برای ورود تایید شده (A+ Setup: امتیاز >= 8 از حداکثر 10)
             trade_taken = False
 
-            if is_long:
+            if long_score >= 8:
                 entry_price = c["close"]
-                stop_loss = min(prev_c["low"], prev2_c["low"]) - (atr * 0.25)
+                stop_loss = min(prev_c["low"], prev2_c["low"]) - (atr * 0.3)
                 risk_dist = entry_price - stop_loss
 
                 if 0 < (risk_dist / entry_price) <= 0.04:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 36, len(candles) - 1)
+                    end_idx = min(i + 48, len(candles) - 1)  # گستره زمانی کمی بیشتر برای هدف‌گیری حرفه‌ای‌تر
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -181,15 +207,15 @@ def run_backtest():
                     if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
                     elif trade_lost: losses += 1; balance -= risk_amount
 
-            if not trade_taken and is_short:
+            if not trade_taken and short_score >= 8:
                 entry_price = c["close"]
-                stop_loss = max(prev_c["high"], prev2_c["high"]) + (atr * 0.25)
+                stop_loss = max(prev_c["high"], prev2_c["high"]) + (atr * 0.3)
                 risk_dist = stop_loss - entry_price
 
                 if 0 < (risk_dist / entry_price) <= 0.04:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 36, len(candles) - 1)
+                    end_idx = min(i + 48, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -216,7 +242,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED 1-YEAR TRUE BACKTEST RESULTS     ")
+    print("   AGGREGATED INSTITUTIONAL SCORE BACKTEST RESULTS")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
