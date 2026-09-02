@@ -3,7 +3,7 @@ import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 TIMEFRAME = "1h"
-TARGET_RR = 1.0  # ریسک به ریوارد ۱ به ۱ برای تثبیت وین‌ریت بالا
+TARGET_RR = 1.0  # ریسک به ریوارد ۱ به ۱ برای تثبیت پیروزی‌های متوالی
 
 def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
@@ -73,7 +73,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - BODY STRENGTH PUSH TO 60%+  ")
+    print(" SCORE HUNTER PRO - DUAL MOMENTUM PUSH TO 60%+  ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -95,26 +95,28 @@ def run_backtest():
                 continue
 
             sub = candles[:i+1]
-            c = sub[-2]
-            prev_c = sub[-3]
-
+            c = sub[-2]       # کندل سیگنال
+            prev_c = sub[-3]  # کندل قبل برای تاییدیه روند کوتاه
+            
             ema20 = calculate_ema(sub, 20)
             ema50 = calculate_ema(sub, 50)
             rsi = calculate_rsi(sub, 14)
             trade_taken = False
 
             trend_strength = abs(ema20 - ema50) / c["close"]
-            if trend_strength < 0.002:
+            if trend_strength < 0.0025:
                 continue
 
             candle_range = c["high"] - c["low"]
             if candle_range == 0:
                 continue
 
-            # --- شورت با فیلتر قدرت بدنه کندل ---
+            # --- شورت با تاییدیه دو کندل نزولی متوالی + RSI خرس‌ها ---
             is_down_trend = ema20 < ema50
             body_ratio_short = (c["open"] - c["close"]) / candle_range
-            is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.45) and (c["close"] < ema20) and (rsi < 48)
+            is_two_candles_down = (prev_c["close"] < prev_c["open"]) and (c["close"] < c["open"])
+            
+            is_short = is_two_candles_down and (body_ratio_short > 0.4) and (c["close"] < ema20) and (rsi < 45)
 
             if is_down_trend and is_short:
                 entry_price = c["close"]
@@ -148,11 +150,13 @@ def run_backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ با فیلتر قدرت بدنه کندل ---
+            # --- لانگ با تاییدیه دو کندل صعودی متوالی + RSI گاوها ---
             if not trade_taken:
                 is_up_trend = ema20 > ema50
                 body_ratio_long = (c["close"] - c["open"]) / candle_range
-                is_long = (c["close"] > c["open"]) and (body_ratio_long > 0.45) and (c["close"] > ema20) and (rsi > 52)
+                is_two_candles_up = (prev_c["close"] > prev_c["open"]) and (c["close"] > c["open"])
+                
+                is_long = is_two_candles_up and (body_ratio_long > 0.4) and (c["close"] > ema20) and (rsi > 55)
 
                 if is_up_trend and is_long:
                     entry_price = c["close"]
@@ -193,7 +197,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED BODY STRENGTH RESULTS            ")
+    print("      AGGREGATED DUAL MOMENTUM RESULTS            ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
