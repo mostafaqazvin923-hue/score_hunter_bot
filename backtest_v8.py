@@ -2,45 +2,57 @@ import json
 import urllib.request
 import math
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
-TIMEFRAME = "1hour"
+SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
+TIMEFRAME = "1h"
 TARGET_RR = 2.0
 
 def fetch_historical_klines(symbol, limit=8800):
-    url = f"https://api.coinex.com/v2/spot/kline?market={symbol}&period={TIMEFRAME}&limit={limit}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-BACKTEST"})
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
-            if isinstance(payload, dict) and payload.get("code") == 0:
-                rows = payload.get("data", [])
-                candles = []
-                for row in rows:
-                    if isinstance(row, dict):
-                        ts = int(float(row.get("created_at", row.get("time", 0))))
-                        op = float(row.get("open", 0))
-                        hi = float(row.get("high", 0))
-                        lo = float(row.get("low", 0))
-                        cl = float(row.get("close", 0))
-                        vol = float(row.get("volume", 1.0))
-                    elif isinstance(row, list) and len(row) >= 6:
-                        ts = int(float(row[0]))
-                        op = float(row[1])
-                        cl = float(row[2])
-                        hi = float(row[3])
-                        lo = float(row[4])
-                        vol = float(row[5]) if len(row) > 5 else 1.0
-                    else:
-                        continue
-                    candles.append({"timestamp": ts, "open": op, "high": hi, "low": lo, "close": cl, "volume": vol})
-                candles.sort(key=lambda x: x["timestamp"])
-                if len(candles) > 0:
-                    return candles
+            result = payload.get("chart", {}).get("result", [])
+            if not result:
+                raise ValueError("Empty result")
+            
+            data = result[0]
+            timestamps = data.get("timestamp", [])
+            quotes = data.get("indicators", {}).get("quote", [{}])[0]
+            opens = quotes.get("open", [])
+            highs = quotes.get("high", [])
+            lows = quotes.get("low", [])
+            closes = quotes.get("close", [])
+            volumes = quotes.get("volume", [])
+            
+            candles = []
+            for idx in range(len(timestamps)):
+                op = opens[idx]
+                hi = highs[idx]
+                lo = lows[idx]
+                cl = closes[idx]
+                ts = timestamps[idx]
+                vol = volumes[idx] if idx < len(volumes) and volumes[idx] is not None else 1000.0
+                
+                if op is None or hi is None or lo is None or cl is None:
+                    continue
+                candles.append({
+                    "timestamp": int(ts), 
+                    "open": float(op), 
+                    "high": float(hi), 
+                    "low": float(lo), 
+                    "close": float(cl),
+                    "volume": float(vol)
+                })
+            
+            candles.sort(key=lambda x: x["timestamp"])
+            if len(candles) > 0:
+                return candles[-limit:]
     except Exception as e:
         print(f"Error fetching data for {symbol}: {e}")
     
-    raise ValueError(f"Could not fetch real historical data for {symbol}. Check your internet connection.")
+    raise ValueError(f"Could not fetch real historical data for {symbol}.")
 
 def calculate_rsi(candles, period=14):
     if len(candles) < period + 1:
@@ -93,8 +105,8 @@ def run_backtest():
             prev2_c = sub_candles[-4]
 
             # فیلتر حجم برای تایید ورود واقعی
-            avg_vol = sum(x["volume"] for x in sub_candles[-15:-2]) / 14
-            is_volume_confirmed = c["volume"] > (avg_vol * 1.05)
+            avg_vol = sum(x["volume"] for x in sub_candles[-15:-2]) / 14 if len(sub_candles) >= 15 else 1.0
+            is_volume_confirmed = c["volume"] > (avg_vol * 1.05) if avg_vol > 0 else True
 
             # ساختار BOS و FVG صعودی
             recent_highs = max(x["high"] for x in sub_candles[-15:-2])
