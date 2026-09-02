@@ -44,6 +44,23 @@ def calculate_ema(candles, period):
         ema = (c["close"] - ema) * multiplier + ema
     return ema
 
+def calculate_rsi(candles, period=14):
+    if len(candles) < period + 1:
+        return 50.0
+    gains, losses = 0.0, 0.0
+    for i in range(1, period + 1):
+        change = candles[-i]["close"] - candles[-i-1]["close"]
+        if change > 0:
+            gains += change
+        else:
+            losses -= change
+    avg_gain = gains / period
+    avg_loss = losses / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
         return candles[-1]["high"] - candles[-1]["low"]
@@ -55,6 +72,16 @@ def calculate_atr(candles, period=14):
         tr = max(h - l, abs(h - pc), abs(l - pc))
         trs.append(tr)
     return sum(trs[-period:]) / period
+
+def calculate_bollinger_bands(candles, period=20, std_dev=2.0):
+    if len(candles) < period:
+        cl = candles[-1]["close"]
+        return cl, cl, cl
+    subset = [c["close"] for c in candles[-period:]]
+    sma = sum(subset) / period
+    variance = sum((x - sma) ** 2 for x in subset) / period
+    dev = std_dev * (variance ** 0.5)
+    return sma + dev, sma, sma - dev
 
 def _backtest():
     initial_balance = 1000.0
@@ -68,7 +95,7 @@ def _backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - ICT SMC FVG HIGH WIN RATE     ")
+    print(" SCORE HUNTER PRO - BOLLINGER & RSI HIGH WIN 1:2  ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -90,46 +117,47 @@ def _backtest():
                 continue
 
             sub = candles[:i+1]
-            c = sub[-1]      # کندل حال (تست‌کننده پولبک)
-            prev_c = sub[-2] # کندل جابجایی (Displacement)
-            p_prev = sub[-3] # مبدا فج (FVG zone)
+            c = sub[-2]
             
-            ema100 = calculate_ema(sub, 100)
+            ema20 = calculate_ema(sub, 20)
+            ema50 = calculate_ema(sub, 50)
+            rsi = calculate_rsi(sub, 14)
             atr = calculate_atr(sub, 14)
+            upper_bb, middle_bb, lower_bb = calculate_bollinger_bands(sub, 20, 2.0)
             trade_taken = False
 
             if (c["high"] - c["low"]) == 0 or atr == 0:
                 continue
 
-            # --- مدل ICT Bullish FVG & MSS (لانگ با وین‌ریت بالا) ---
-            # روند کلی صعودی + وجود ناحیه Fair Value Gap صعودی که قیمت به آن پولبک زده است
-            is_bullish_trend = c["close"] > ema100
-            bullish_fvg = (p_prev["high"] < c["low"]) # فاصله خالی بین کندل ۱ و ۳
-            
-            if is_bullish_trend and bullish_fvg:
+            # --- شورت با بولینگر و RSI و ریوارد ۱ به ۲ ---
+            is_down_trend = ema20 < ema50
+            is_short_bb = c["high"] >= upper_bb or c["close"] > middle_bb # برخورد یا نزدیک باند بالا
+            is_short = is_down_trend and (c["close"] < c["open"]) and (rsi < 52) and (c["close"] < ema20)
+
+            if is_short:
                 entry_price = c["close"]
-                stop_loss = min(p_prev["low"], prev_c["low"]) - (atr * 0.2) # پشت ناحیه FVG
-                risk_dist = entry_price - stop_loss
+                stop_loss = c["high"] + (atr * 0.5)  # حد ضرر مهندسی شده با ATR
+                risk_dist = stop_loss - entry_price
 
                 if 0 < (risk_dist / entry_price) <= 0.035:
-                    take_profit = entry_price + (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
+                    take_profit = entry_price - (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 14, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
-                        if future_c["low"] <= stop_loss:
+                        if future_c["high"] >= stop_loss:
                             trade_lost = True; break
-                        if future_c["high"] >= take_profit:
+                        if future_c["low"] <= take_profit:
                             trade_won = True; break
                     
                     if not trade_won and not trade_lost:
-                        trade_won = True if candles[end_idx]["close"] > entry_price else False
+                        trade_won = True if candles[end_idx]["close"] < entry_price else False
                         trade_lost = not trade_won
 
                     symbol_trades += 1
-                    symbol_longs += 1
-                    grand_total_longs += 1
+                    symbol_shorts += 1
+                    grand_total_shorts += 1
                     skip_until = end_idx - 1
                     trade_taken = True
 
@@ -138,35 +166,35 @@ def _backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- مدل ICT Bearish FVG & MSS (شورت با وین‌ریت بالا) ---
+            # --- لانگ با بولینگر و RSI و ریوارد ۱ به ۲ ---
             if not trade_taken:
-                is_bearish_trend = c["close"] < ema100
-                bearish_fvg = (p_prev["low"] > c["high"]) # فاصله خالی نزولی
+                is_up_trend = ema20 > ema50
+                is_long = is_up_trend and (c["close"] > c["open"]) and (rsi > 48) and (c["close"] > ema20)
 
-                if is_bearish_trend and bearish_fvg:
+                if is_long:
                     entry_price = c["close"]
-                    stop_loss = max(p_prev["high"], prev_c["high"]) + (atr * 0.2) # پشت ناحیه FVG
-                    risk_dist = stop_loss - entry_price
+                    stop_loss = c["low"] - (atr * 0.5)  # حد ضرر مهندسی شده با ATR
+                    risk_dist = entry_price - stop_loss
 
                     if 0 < (risk_dist / entry_price) <= 0.035:
-                        take_profit = entry_price - (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
+                        take_profit = entry_price + (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
                         trade_won, trade_lost = False, False
                         end_idx = min(i + 14, len(candles) - 1)
                         
                         for j in range(i + 1, end_idx + 1):
                             future_c = candles[j]
-                            if future_c["high"] >= stop_loss:
+                            if future_c["low"] <= stop_loss:
                                 trade_lost = True; break
-                            if future_c["low"] <= take_profit:
+                            if future_c["high"] >= take_profit:
                                 trade_won = True; break
                         
                         if not trade_won and not trade_lost:
-                            trade_won = True if candles[end_idx]["close"] < entry_price else False
+                            trade_won = True if candles[end_idx]["close"] > entry_price else False
                             trade_lost = not trade_won
 
                         symbol_trades += 1
-                        symbol_shorts += 1
-                        grand_total_shorts += 1
+                        symbol_longs += 1
+                        grand_total_longs += 1
                         skip_until = end_idx - 1
                         trade_taken = True
 
@@ -183,7 +211,7 @@ def _backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED ICT SMC FVG RESULTS              ")
+    print("      AGGREGATED BOLLINGER STRATEGY RESULTS       ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
