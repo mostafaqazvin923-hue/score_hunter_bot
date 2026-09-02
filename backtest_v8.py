@@ -73,7 +73,6 @@ def calculate_metrics(candles, period=14):
     current_vol = candles[-1]["volume"]
     vol_ratio = (current_vol / avg_vol) if avg_vol > 0 else 1.0
 
-    # محاسبه RSI دقیق
     gains, losses = 0.0, 0.0
     for i in range(1, period + 1):
         change = candles[-i]["close"] - candles[-i-1]["close"]
@@ -103,7 +102,7 @@ def _backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - INSTITUTIONAL VOLUME OPT 1:2  ")
+    print(" SCORE HUNTER PRO - INSTITUTIONAL TARGET 2200     ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -127,9 +126,9 @@ def _backtest():
             sub = candles[:i+1]
             c = sub[-2]
             
-            ema15 = calculate_ema(sub, 15)
-            ema45 = calculate_ema(sub, 45)
-            ema200 = calculate_ema(sub, 200) # روند کلان بازار
+            ema12 = calculate_ema(sub, 12)
+            ema36 = calculate_ema(sub, 36)
+            ema150 = calculate_ema(sub, 150)
             atr = calculate_atr(sub, 14)
             vol_ratio, rsi = calculate_metrics(sub, 14)
             trade_taken = False
@@ -137,26 +136,25 @@ def _backtest():
             if (c["high"] - c["low"]) == 0 or atr == 0:
                 continue
 
-            # فیلتر بهینه‌شده حجم و مومنتوم برای بازیابی حجم معاملات (~۲۲۰۰ معامله) همراه با دقت بالا
-            if vol_ratio < 1.05:
+            if vol_ratio < 1.02:
                 continue
 
             candle_range = c["high"] - c["low"]
 
-            # --- شورت به سبک نهنگی با تاییدیه روند کلان و حجم (RR = 1:2) ---
-            is_macro_down = (c["close"] < ema200) and (ema15 < ema45)
+            # --- شورت نهنگی بهینه‌شده برای افزایش تعداد معاملات و دقت بالا ---
+            is_macro_down = (c["close"] < ema150) and (ema12 < ema36)
             body_ratio_short = (c["open"] - c["close"]) / candle_range if candle_range > 0 else 0
-            is_short = is_macro_down and (c["close"] < c["open"]) and (body_ratio_short > 0.38) and (rsi < 48)
+            is_short = is_macro_down and (c["close"] < c["open"]) and (body_ratio_short > 0.35) and (rsi < 50)
 
             if is_short:
                 entry_price = c["close"]
-                stop_loss = c["high"] + (atr * 0.3)  # حد ضرر مهندسی‌شده پشت سویینگ
+                stop_loss = c["high"] + (atr * 0.28)
                 risk_dist = stop_loss - entry_price
 
                 if 0 < (risk_dist / entry_price) <= 0.035:
-                    take_profit = entry_price - (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
+                    take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 14, len(candles) - 1)
+                    end_idx = min(i + 12, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -172,7 +170,7 @@ def _backtest():
                     symbol_trades += 1
                     symbol_shorts += 1
                     grand_total_shorts += 1
-                    skip_until = end_idx - 1
+                    skip_until = i + 3  # کاهش زمان قفل برای رسیدن به حجم ۲۲۰۰ معامله
                     trade_taken = True
 
                     if trade_won: 
@@ -180,21 +178,21 @@ def _backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ به سبک نهنگی با تاییدیه روند کلان و حجم (RR = 1:2) ---
+            # --- لانگ نهنگی بهینه‌شده برای افزایش تعداد معاملات و دقت بالا ---
             if not trade_taken:
-                is_macro_up = (c["close"] > ema200) and (ema15 > ema45)
+                is_macro_up = (c["close"] > ema150) and (ema12 > ema36)
                 body_ratio_long = (c["close"] - c["open"]) / candle_range if candle_range > 0 else 0
-                is_long = is_macro_up and (c["close"] > c["open"]) and (body_ratio_long > 0.38) and (rsi > 52)
+                is_long = is_macro_up and (c["close"] > c["open"]) and (body_ratio_long > 0.35) and (rsi > 50)
 
                 if is_long:
                     entry_price = c["close"]
-                    stop_loss = c["low"] - (atr * 0.3)  # حد ضرر مهندسی‌شده پشت سویینگ
+                    stop_loss = c["low"] - (atr * 0.28)
                     risk_dist = entry_price - stop_loss
 
                     if 0 < (risk_dist / entry_price) <= 0.035:
-                        take_profit = entry_price + (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
+                        take_profit = entry_price + (risk_dist * TARGET_RR)
                         trade_won, trade_lost = False, False
-                        end_idx = min(i + 14, len(candles) - 1)
+                        end_idx = min(i + 12, len(candles) - 1)
                         
                         for j in range(i + 1, end_idx + 1):
                             future_c = candles[j]
@@ -210,7 +208,7 @@ def _backtest():
                         symbol_trades += 1
                         symbol_longs += 1
                         grand_total_longs += 1
-                        skip_until = end_idx - 1
+                        skip_until = i + 3  # کاهش زمان قفل برای رسیدن به حجم ۲۲۰۰ معامله
                         trade_taken = True
 
                         if trade_won: 
@@ -226,7 +224,7 @@ def _backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED OPTIMIZED VOLUME RESULTS         ")
+    print("      AGGREGATED TARGET 2200 RESULTS              ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
