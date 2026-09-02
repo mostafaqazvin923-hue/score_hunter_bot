@@ -3,10 +3,9 @@ import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 TIMEFRAME = "15m"
-TARGET_RR = 1.5  # ریسک به ریوارد ایده‌ал برای اسکالپ با وین‌ریت بالا
+TARGET_RR = 1.6  # بهینه‌سازی ضریب ریسک به ریوارد
 
 def fetch_15m_klines_yahoo(symbol, limit=8800):
-    # دانلود کندل‌های ۱۵ دقیقه از یاهو فایننس (حداکثر بازه قابل پشتیبانی برای 15m حدود 60 روز است)
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=15m&range=60d"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
@@ -56,8 +55,24 @@ def calculate_ema(closes, period):
         ema = (p - ema) * multiplier + ema
     return ema
 
+def calculate_rsi(candles, period=14):
+    if len(candles) < period + 1:
+        return 50.0
+    gains, losses = 0.0, 0.0
+    for i in range(1, period + 1):
+        change = candles[-i]["close"] - candles[-i-1]["close"]
+        if change > 0:
+            gains += change
+        else:
+            losses -= change
+    avg_gain = gains / period
+    avg_loss = losses / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
 def calculate_vwap_proxy(candles, period=20):
-    # شبیه‌سازی دقیق VWAP محلی بر اساس حجم و قیمت میانگین (Typical Price)
     if len(candles) < period:
         sub = candles
     else:
@@ -73,7 +88,7 @@ def calculate_vwap_proxy(candles, period=20):
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
-    risk_percentage = 0.015  # ریسک امن ۱.۵ درصدی برای اسکالپ
+    risk_percentage = 0.015
     
     total_wins = 0
     total_losses = 0
@@ -82,7 +97,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - 15M VWAP SCALPER V26          ")
+    print(" SCORE HUNTER PRO - 15M VWAP SCALPER V27 (PRO)    ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -105,22 +120,30 @@ def run_backtest():
 
             sub = candles[:i+1]
             closes = [x["close"] for x in sub]
-            c = sub[-2]       # کندل سیگنال ۱۵ دقیقه
+            c = sub[-2]       # کندل سیگنال
             prev_c = sub[-3]
 
             ema9 = calculate_ema(closes, 9)
             ema21 = calculate_ema(closes, 21)
             vwap = calculate_vwap_proxy(sub, 20)
+            rsi = calculate_rsi(sub, 14)
             trade_taken = False
 
             candle_range = c["high"] - c["low"]
             if candle_range == 0:
                 continue
 
+            # فیلتر حجم: حجم کندل باید بالاتر از میانگین ۲۰ کندل اخیر باشد
+            recent_volumes = [x["volume"] for x in sub[-22:-2]]
+            avg_volume = sum(recent_volumes) / len(recent_volumes) if recent_volumes else 1.0
+            if c["volume"] <= avg_volume:
+                continue
+
             current_risk_amount = balance * risk_percentage
 
-            # --- تریگر لانگ (قیمت بالای VWAP و کراس صعودی EMAها با مومنتوم بدنه) ---
-            is_long_setup = (c["close"] > vwap) and (ema9 > ema21) and (c["close"] > c["open"]) and ((c["close"] - c["open"]) / candle_range > 0.4)
+            # --- لانگ با فیلتر حجم و RSI امن (بین ۴۵ تا ۷۵) ---
+            is_long_setup = (c["close"] > vwap) and (ema9 > ema21) and (c["close"] > c["open"]) and \
+                            ((c["close"] - c["open"]) / candle_range > 0.4) and (45 < rsi < 75)
 
             if is_long_setup:
                 entry_price = c["close"]
@@ -130,7 +153,7 @@ def run_backtest():
                 if 0.001 * entry_price <= risk_dist <= 0.015 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 8, len(candles) - 1)  # تسویه سریع در تایم ۱۵ دقیقه
+                    end_idx = min(i + 8, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -154,8 +177,9 @@ def run_backtest():
                     elif trade_lost: 
                         losses += 1; balance -= current_risk_amount
 
-            # --- تریگر شورت (قیمت پایین VWAP و کراس نزولی EMAها با مومنتوم بدنه) ---
-            is_short_setup = (c["close"] < vwap) and (ema9 < ema21) and (c["close"] < c["open"]) and ((c["open"] - c["close"]) / candle_range > 0.4)
+            # --- شورت با فیلتر حجم و RSI امن (بین ۲۵ تا ۵۵) ---
+            is_short_setup = (c["close"] < vwap) and (ema9 < ema21) and (c["close"] < c["open"]) and \
+                             ((c["open"] - c["close"]) / candle_range > 0.4) and (25 < rsi < 55)
 
             if not trade_taken and is_short_setup:
                 entry_price = c["close"]
@@ -196,7 +220,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED 15M VWAP SCALPER RESULTS         ")
+    print("      AGGREGATED 15M VWAP SCALPER V27 RESULTS     ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
