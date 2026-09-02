@@ -3,7 +3,7 @@ import urllib.request
 import math
 
 SYMBOLS = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD", "XRPUSDT": "XRP-USD"}
-TARGET_RR = 2.0
+TARGET_RR = 2.0  # دقیقاً دو برابر حد ضرر
 
 def fetch_yahoo_one_year(symbol_key):
     yahoo_symbol = SYMBOLS[symbol_key]
@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading LSOB Market Data for {symbol_key}...")
+        print(f"[*] Downloading SMC V17 Market Data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -53,6 +53,14 @@ def calculate_atr(candles, period=14):
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-period:]) / period
 
+def calculate_ema(closes, period):
+    if len(closes) < period: return closes[-1]
+    multiplier = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
+
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
@@ -60,111 +68,128 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print(" LSOB V16 - INSTITUTIONAL ORDER BLOCK STRATEGY    ")
+    print(" SMC V17 - INSTITUTIONAL SNIPER & RUNWAY CHECK    ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
         if not candles or len(candles) < 250: continue
         
-        print(f"[*] Running LSOB V16 Backtest for {symbol_key}...")
+        print(f"[*] Running SMC V17 Backtest for {symbol_key}...")
         wins, losses, symbol_trades = 0, 0, 0
         in_position_until = 0
 
-        for i in range(50, len(candles) - 30):
+        for i in range(200, len(candles) - 30):
             if i < in_position_until: 
                 continue
 
             sub = candles[:i+1]
-            c = sub[-1]      # کندل جاری (تست بلوک سفارش)
-            prev = sub[-2]   # کندل ایمپالس (حرکت ناگهانی نهنگی)
+            closes = [x["close"] for x in sub]
+            volumes = [x["volume"] for x in sub]
+            
+            c = sub[-1]      # کندل فعلی (ورود روی پولبک به بلوک سفارش)
+            prev = sub[-2]   # کندل ایمپالس (شکست ساختار / BOS)
             prev2 = sub[-3]  # کندل شکار نقدینگی (Sweep)
 
             atr = calculate_atr(sub, 14)
+            ema_200 = calculate_ema(closes, 200) # فیلتر روند کلان مؤسساتی
             if atr == 0: continue
 
-            # تعیین سقف و کف محلی برای تشخیص شکار نقدینگی
-            recent_high = max(x["high"] for x in sub[-30:-3])
-            recent_low = min(x["low"] for x in sub[-30:-3])
+            # تعیین سطوح ساختاری برای بررسی فضای مسیر (Runway)
+            recent_highs = [x["high"] for x in sub[-60:-3]]
+            recent_lows = [x["low"] for x in sub[-60:-3]]
+            major_resistance = max(recent_highs) if recent_highs else c["high"] * 1.05
+            major_support = min(recent_lows) if recent_lows else c["low"] * 0.95
 
-            avg_vol = sum(x["volume"] for x in sub[-20:-3]) / 17 if len(sub) >= 20 else 1.0
-            volume_surge = prev["volume"] > (avg_vol * 1.5)
+            # تشخیص نواحی کلیدی نقدینگی محلی
+            swing_low_market = min(x["low"] for x in sub[-40:-3])
+            swing_high_market = max(x["high"] for x in sub[-40:-3])
 
-            # ۱. ستاپ لانگ: قیمت کفِ قبلی را جارو کرده (پایین‌تر از کف رفته و برگشته)، بعد با حجم بالا صعود کرده
-            sweep_low = prev2["low"] < recent_low and prev2["close"] > recent_low
-            bullish_mss = sweep_low and volume_surge and (prev["close"] > prev["open"])
-            
-            # ۲. ستاپ شورت: قیمت سقفِ قبلی را جارو کرده (بالاتر از سقف رفته و برگشته)، بعد با حجم بالا ریزش کرده
-            sweep_high = prev2["high"] > recent_high and prev2["close"] < recent_high
-            bearish_mss = sweep_high and volume_surge and (prev["close"] < prev["open"])
+            avg_vol = sum(volumes[-25:-3]) / 22 if len(volumes) >= 25 else 1.0
+            volume_spike = prev["volume"] > (avg_vol * 1.6) # حجم نهنگی
+
+            # 1. ستاپ اسمارت مانی لانگ: قیمت کف قبلی را جارو کرده، با حجم بالا به سمت بالا پولک زده و بالای روند 200 است
+            sweep_low = prev2["low"] <= swing_low_market and prev2["close"] > swing_low_market
+            bullish_smc = sweep_low and volume_spike and (prev["close"] > prev["open"]) and (c["close"] > ema_200)
+
+            # 2. ستاپ اسمارت مانی شورت: قیمت سقف قبلی را جارو کرده، با حجم بالا ریخته و زیر روند 200 است
+            sweep_high = prev2["high"] >= swing_high_market and prev2["close"] < swing_high_market
+            bearish_smc = sweep_high and volume_spike and (prev["close"] < prev["open"]) and (c["close"] < ema_200)
 
             trade_taken = False
 
-            if bullish_mss:
-                # ورود روی بلوک سفارش (Order Block - کندل نزولیِ قبل از حرکت صعودی)
+            if bullish_smc:
                 entry_price = c["close"]
-                stop_loss = recent_low - (atr * 0.5)  # پشت سطح جارو شده با فاصله ایمن
+                stop_loss = swing_low_market - (atr * 0.3) # پشت استاپ‌های جاروشده
                 risk_dist = entry_price - stop_loss
 
-                if 0.002 * entry_price <= risk_dist <= 0.05 * entry_price:
+                if 0.003 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     
-                    trade_won, trade_lost = False, False
-                    end_idx = len(candles) - 1
-                    
-                    for j in range(i + 1, len(candles)):
-                        future_c = candles[j]
-                        if future_c["high"] >= take_profit:
-                            trade_won = True
-                            end_idx = j
-                            break
-                        if future_c["low"] <= stop_loss:
-                            trade_lost = True
-                            end_idx = j
-                            break
+                    # فیلتر فضای مسیر (Runway Check): آیا مقاومت سنگینی مانع رسیدن به هدف 2R است؟
+                    has_enough_room = major_resistance >= (take_profit - (risk_dist * 0.1))
 
-                    symbol_trades += 1
-                    in_position_until = end_idx + 1
-                    trade_taken = True
-                    
-                    if trade_won: 
-                        wins += 1
-                        balance += (risk_amount * TARGET_RR)
-                    elif trade_lost: 
-                        losses += 1
-                        balance -= risk_amount
+                    if has_enough_room:
+                        trade_won, trade_lost = False, False
+                        end_idx = len(candles) - 1
+                        
+                        for j in range(i + 1, len(candles)):
+                            future_c = candles[j]
+                            if future_c["high"] >= take_profit:
+                                trade_won = True
+                                end_idx = j
+                                break
+                            if future_c["low"] <= stop_loss:
+                                trade_lost = True
+                                end_idx = j
+                                break
 
-            elif bearish_mss and not trade_taken:
+                        symbol_trades += 1
+                        in_position_until = end_idx + 1
+                        trade_taken = True
+                        
+                        if trade_won: 
+                            wins += 1
+                            balance += (risk_amount * TARGET_RR)
+                        elif trade_lost: 
+                            losses += 1
+                            balance -= risk_amount
+
+            elif bearish_smc and not trade_taken:
                 entry_price = c["close"]
-                stop_loss = recent_high + (atr * 0.5)
+                stop_loss = swing_high_market + (atr * 0.3)
                 risk_dist = stop_loss - entry_price
 
-                if 0.002 * entry_price <= risk_dist <= 0.05 * entry_price:
+                if 0.003 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     
-                    trade_won, trade_lost = False, False
-                    end_idx = len(candles) - 1
-                    
-                    for j in range(i + 1, len(candles)):
-                        future_c = candles[j]
-                        if future_c["low"] <= take_profit:
-                            trade_won = True
-                            end_idx = j
-                            break
-                        if future_c["high"] >= stop_loss:
-                            trade_lost = True
-                            end_idx = j
-                            break
+                    # فیلتر فضای مسیر برای شورت
+                    has_enough_room = major_support <= (take_profit + (risk_dist * 0.1))
 
-                    symbol_trades += 1
-                    in_position_until = end_idx + 1
-                    
-                    if trade_won: 
-                        wins += 1
-                        balance += (risk_amount * TARGET_RR)
-                    elif trade_lost: 
-                        losses += 1
-                        balance -= risk_amount
+                    if has_enough_room:
+                        trade_won, trade_lost = False, False
+                        end_idx = len(candles) - 1
+                        
+                        for j in range(i + 1, len(candles)):
+                            future_c = candles[j]
+                            if future_c["low"] <= take_profit:
+                                trade_won = True
+                                end_idx = j
+                                break
+                            if future_c["high"] >= stop_loss:
+                                trade_lost = True
+                                end_idx = j
+                                break
+
+                        symbol_trades += 1
+                        in_position_until = end_idx + 1
+                        
+                        if trade_won: 
+                            wins += 1
+                            balance += (risk_amount * TARGET_RR)
+                        elif trade_lost: 
+                            losses += 1
+                            balance -= risk_amount
 
         total_wins += wins
         total_losses += losses
@@ -174,7 +199,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED LSOB V16 RESULTS                 ")
+    print("      AGGREGATED SMC V17 SNIPER RESULTS           ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
