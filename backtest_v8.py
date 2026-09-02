@@ -3,7 +3,7 @@ import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 TIMEFRAME = "1h"
-TARGET_RR = 1.0  # ریسک به ریوارد ۱ به ۱ برای صید حداکثری وین‌ریت و تیک‌پرفت سریع
+TARGET_RR = 1.0  # ریسک به ریوارد ۱ به ۱ برای تثبیت وین‌ریت بالا
 
 def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
@@ -73,7 +73,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - BALANCED FREQUENCY & WIN-RATE ")
+    print(" SCORE HUNTER PRO - BODY STRENGTH PUSH TO 60%+  ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -103,14 +103,18 @@ def run_backtest():
             rsi = calculate_rsi(sub, 14)
             trade_taken = False
 
-            # فیلتر روند متعادل برای ایجاد حجم مناسب معتناوب (۲ تا ۳ معامله در روز کل)
             trend_strength = abs(ema20 - ema50) / c["close"]
             if trend_strength < 0.002:
                 continue
 
-            # --- شورت متعادل ---
+            candle_range = c["high"] - c["low"]
+            if candle_range == 0:
+                continue
+
+            # --- شورت با فیلتر قدرت بدنه کندل ---
             is_down_trend = ema20 < ema50
-            is_short = (c["close"] < c["open"]) and (c["close"] < ema20) and (rsi < 50)
+            body_ratio_short = (c["open"] - c["close"]) / candle_range
+            is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.45) and (c["close"] < ema20) and (rsi < 48)
 
             if is_down_trend and is_short:
                 entry_price = c["close"]
@@ -136,7 +140,7 @@ def run_backtest():
                     symbol_trades += 1
                     symbol_shorts += 1
                     grand_total_shorts += 1
-                    skip_until = end_idx  # پرش به انتهای معامله برای جلوگیری از تداخل فشرده
+                    skip_until = end_idx
                     trade_taken = True
 
                     if trade_won: 
@@ -144,10 +148,11 @@ def run_backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ متعادل ---
+            # --- لانگ با فیلتر قدرت بدنه کندل ---
             if not trade_taken:
                 is_up_trend = ema20 > ema50
-                is_long = (c["close"] > c["open"]) and (c["close"] > ema20) and (rsi > 50)
+                body_ratio_long = (c["close"] - c["open"]) / candle_range
+                is_long = (c["close"] > c["open"]) and (body_ratio_long > 0.45) and (c["close"] > ema20) and (rsi > 52)
 
                 if is_up_trend and is_long:
                     entry_price = c["close"]
@@ -188,7 +193,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED BALANCED RESULTS                 ")
+    print("      AGGREGATED BODY STRENGTH RESULTS            ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
