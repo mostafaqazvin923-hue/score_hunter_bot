@@ -6,8 +6,9 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 TIMEFRAME = "1hour"
 TARGET_RR = 2.0
 
-def fetch_coinex_klines(symbol, limit=8800):
-    url = f"https://api.coinex.com/v2/spot/kline?market={symbol}&period={TIMEFRAME}&limit={limit}"
+def fetch_coinex_klines(symbol, limit=1000):
+    # استفاده از اندپوینت پایدار و رسمی V1 صرافی کوینکس
+    url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type={TIMEFRAME}&limit={limit}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
@@ -17,32 +18,23 @@ def fetch_coinex_klines(symbol, limit=8800):
                 rows = payload.get("data", [])
                 candles = []
                 for row in rows:
-                    if isinstance(row, dict):
-                        ts = int(float(row.get("created_at", row.get("time", 0))))
-                        op = float(row.get("open", 0))
-                        hi = float(row.get("high", 0))
-                        lo = float(row.get("low", 0))
-                        cl = float(row.get("close", 0))
-                        vol = float(row.get("volume", 0.0))
-                    elif isinstance(row, list) and len(row) >= 6:
+                    if isinstance(row, list) and len(row) >= 6:
                         ts = int(float(row[0]))
                         op = float(row[1])
                         cl = float(row[2])
                         hi = float(row[3])
                         lo = float(row[4])
                         vol = float(row[5]) if len(row) > 5 else 0.0
-                    else:
-                        continue
-                    candles.append({
-                        "timestamp": ts, "open": op, "high": hi, 
-                        "low": lo, "close": cl, "volume": vol
-                    })
+                        candles.append({
+                            "timestamp": ts, "open": op, "high": hi, 
+                            "low": lo, "close": cl, "volume": vol
+                        })
                 candles.sort(key=lambda x: x["timestamp"])
-                if len(candles) > 100:
+                if len(candles) > 50:
                     return candles
     except Exception as e:
         print(f"[!] Error fetching Coinex data for {symbol}: {e}")
-    raise ValueError(f"[!] Could not fetch real data from Coinex for {symbol}. Check connection.")
+    raise ValueError(f"[!] Could not fetch real data from Coinex for {symbol}.")
 
 def calculate_ema(candles, period):
     if len(candles) < period:
@@ -80,7 +72,6 @@ def calculate_atr(candles, period=14):
 def calculate_adx_proxy(candles, period=14):
     if len(candles) < period + 2:
         return 25.0
-    # محاسبه تقریب قدرت روند بر اساس دامنه و جهت حرکات
     moves = []
     for i in range(1, len(candles[-period:])):
         diff = candles[-i]["close"] - candles[-i-1]["close"]
@@ -103,9 +94,9 @@ def run_backtest():
     print("==================================================")
 
     for symbol in SYMBOLS:
-        print(f"\n[*] Running 1-year backtest for {symbol} on Coinex...")
+        print(f"\n[*] Running backtest for {symbol} on Coinex...")
         try:
-            candles = fetch_coinex_klines(symbol, limit=8800)
+            candles = fetch_coinex_klines(symbol, limit=1000)
         except Exception as err:
             print(err)
             continue
@@ -122,7 +113,7 @@ def run_backtest():
             sub = candles[:i+1]
             c = sub[-2]
             prev_c = sub[-3]
-            prev2_c = sub_candles = sub[-4]
+            prev2_c = sub[-4]
 
             # لایه ۱: روند (EMA 50 / 200 + ساختار)
             ema50 = calculate_ema(sub, 50)
@@ -133,7 +124,7 @@ def run_backtest():
             adx = calculate_adx_proxy(sub, 14)
             atr = calculate_atr(sub, 14)
 
-            # لایه ۳: جریان سفارشات و نقدینگی (CVD Proxy مبتنی بر فشار حجم درون‌کندلی)
+            # لایه ۳: جریان سفارشات و نقدینگی (CVD & Volume Proxy)
             candle_range = c["high"] - c["low"]
             if candle_range == 0 or atr == 0:
                 continue
@@ -192,7 +183,7 @@ def run_backtest():
                         future_c = candles[j]
                         if future_c["high"] >= stop_loss:
                             trade_lost = True; end_idx = j; break
-                        if future_c["low"] <= take_profit:
+                        if future_c["low"] >= take_profit:
                             trade_won = True; end_idx = j; break
                     
                     if not trade_won and not trade_lost:
