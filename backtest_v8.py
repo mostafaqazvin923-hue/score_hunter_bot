@@ -68,7 +68,7 @@ def _backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - INSTITUTIONAL ORDER FLOW 1:2  ")
+    print(" SCORE HUNTER PRO - ICT SMC FVG HIGH WIN RATE     ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -90,50 +90,46 @@ def _backtest():
                 continue
 
             sub = candles[:i+1]
-            c = sub[-2]
-            prev_c = sub[-3]
+            c = sub[-1]      # کندل حال (تست‌کننده پولبک)
+            prev_c = sub[-2] # کندل جابجایی (Displacement)
+            p_prev = sub[-3] # مبدا فج (FVG zone)
             
-            ema50 = calculate_ema(sub, 50)
-            ema200 = calculate_ema(sub, 200) # جهت روند کلان نهنگی
+            ema100 = calculate_ema(sub, 100)
             atr = calculate_atr(sub, 14)
             trade_taken = False
 
-            candle_range = c["high"] - c["low"]
-            if candle_range == 0 or atr == 0:
+            if (c["high"] - c["low"]) == 0 or atr == 0:
                 continue
 
-            body_size = abs(c["close"] - c["open"])
-            body_ratio = body_size / candle_range
-
-            # --- شورت به سبک جریان سفارشات و دیسپلیسمنت موسساتی (RR = 1:2) ---
-            is_macro_down = (c["close"] < ema50) and (ema50 < ema200)
-            is_short_displacement = (c["close"] < c["open"]) and (body_ratio > 0.45) and (c["close"] < prev_c["low"])
-
-            if is_macro_down and is_short_displacement:
+            # --- مدل ICT Bullish FVG & MSS (لانگ با وین‌ریت بالا) ---
+            # روند کلی صعودی + وجود ناحیه Fair Value Gap صعودی که قیمت به آن پولبک زده است
+            is_bullish_trend = c["close"] > ema100
+            bullish_fvg = (p_prev["high"] < c["low"]) # فاصله خالی بین کندل ۱ و ۳
+            
+            if is_bullish_trend and bullish_fvg:
                 entry_price = c["close"]
-                recent_high = max(sub[-1]["high"], sub[-2]["high"], sub[-3]["high"], sub[-4]["high"])
-                stop_loss = recent_high + (atr * 0.25)
-                risk_dist = stop_loss - entry_price
+                stop_loss = min(p_prev["low"], prev_c["low"]) - (atr * 0.2) # پشت ناحیه FVG
+                risk_dist = entry_price - stop_loss
 
                 if 0 < (risk_dist / entry_price) <= 0.035:
-                    take_profit = entry_price - (risk_dist * TARGET_RR)
+                    take_profit = entry_price + (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 14, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
-                        if future_c["high"] >= stop_loss:
+                        if future_c["low"] <= stop_loss:
                             trade_lost = True; break
-                        if future_c["low"] <= take_profit:
+                        if future_c["high"] >= take_profit:
                             trade_won = True; break
                     
                     if not trade_won and not trade_lost:
-                        trade_won = True if candles[end_idx]["close"] < entry_price else False
+                        trade_won = True if candles[end_idx]["close"] > entry_price else False
                         trade_lost = not trade_won
 
                     symbol_trades += 1
-                    symbol_shorts += 1
-                    grand_total_shorts += 1
+                    symbol_longs += 1
+                    grand_total_longs += 1
                     skip_until = end_idx - 1
                     trade_taken = True
 
@@ -142,36 +138,35 @@ def _backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ به سبک جریان سفارشات و دیسپلیسمنت موسساتی (RR = 1:2) ---
+            # --- مدل ICT Bearish FVG & MSS (شورت با وین‌ریت بالا) ---
             if not trade_taken:
-                is_macro_up = (c["close"] > ema50) and (ema50 > ema200)
-                is_long_displacement = (c["close"] > c["open"]) and (body_ratio > 0.45) and (c["close"] > prev_c["high"])
+                is_bearish_trend = c["close"] < ema100
+                bearish_fvg = (p_prev["low"] > c["high"]) # فاصله خالی نزولی
 
-                if is_macro_up and is_long_displacement:
+                if is_bearish_trend and bearish_fvg:
                     entry_price = c["close"]
-                    recent_low = min(sub[-1]["low"], sub[-2]["low"], sub[-3]["low"], sub[-4]["low"])
-                    stop_loss = recent_low - (atr * 0.25)
-                    risk_dist = entry_price - stop_loss
+                    stop_loss = max(p_prev["high"], prev_c["high"]) + (atr * 0.2) # پشت ناحیه FVG
+                    risk_dist = stop_loss - entry_price
 
                     if 0 < (risk_dist / entry_price) <= 0.035:
-                        take_profit = entry_price + (risk_dist * TARGET_RR)
+                        take_profit = entry_price - (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
                         trade_won, trade_lost = False, False
                         end_idx = min(i + 14, len(candles) - 1)
                         
                         for j in range(i + 1, end_idx + 1):
                             future_c = candles[j]
-                            if future_c["low"] <= stop_loss:
+                            if future_c["high"] >= stop_loss:
                                 trade_lost = True; break
-                            if future_c["high"] >= take_profit:
+                            if future_c["low"] <= take_profit:
                                 trade_won = True; break
                         
                         if not trade_won and not trade_lost:
-                            trade_won = True if candles[end_idx]["close"] > entry_price else False
+                            trade_won = True if candles[end_idx]["close"] < entry_price else False
                             trade_lost = not trade_won
 
                         symbol_trades += 1
-                        symbol_longs += 1
-                        grand_total_longs += 1
+                        symbol_shorts += 1
+                        grand_total_shorts += 1
                         skip_until = end_idx - 1
                         trade_taken = True
 
@@ -188,7 +183,7 @@ def _backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("   AGGREGATED INSTITUTIONAL ORDER FLOW RESULTS    ")
+    print("      AGGREGATED ICT SMC FVG RESULTS              ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
