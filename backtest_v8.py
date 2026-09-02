@@ -2,10 +2,12 @@ import json
 import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
-TARGET_RR = 2.0  # ریسک به ریوارد ثابت ۱ به ۲ به درخواست شما
+TIMEFRAME = "1h"
+TARGET_RR = 2.0  # ریسک به ریوارد ثابت ۱ به ۲
 
-def fetch_15m_klines_yahoo(symbol, limit=8800):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=15m&range=60d"
+def fetch_1h_klines_yahoo(symbol, limit=8800):
+    # دریافت داده‌های یک‌ساله با تایم‌فریم ۱ ساعته (حداکثر بازه مجاز یاهو برای 1h)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=365d"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
@@ -57,12 +59,12 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - SMART MONEY CONCEPTS V31      ")
+    print(" SCORE HUNTER PRO - SMC V31 (1-YEAR BACKTEST)     ")
     print("==================================================")
 
     for symbol in SYMBOLS:
         try:
-            candles = fetch_15m_klines_yahoo(symbol, limit=8800)
+            candles = fetch_1h_klines_yahoo(symbol, limit=8800)
         except Exception as err:
             print(err)
             continue
@@ -74,16 +76,15 @@ def run_backtest():
         symbol_shorts = 0
         skip_until = 0
 
-        # نیاز به تاریخچه برای پیدا کردن سقف و کف‌های استخری (Liquidity Pools)
         for i in range(50, len(candles) - 10):
             if i < skip_until:
                 continue
 
             sub = candles[:i+1]
-            c = sub[-2]       # کندل سیگنال
+            c = sub[-2]       
             prev_c = sub[-3]
 
-            # پیدا کردن سقف و کف‌های ماژور قبلی (جایی که استاپ تریدرها انجا تجمع کرده)
+            # پیدا کردن سقف و کف‌های استخری نقدینگی در بازه گذشته
             lookback_slice = sub[-30:-2]
             recent_high = max([x["high"] for x in lookback_slice])
             recent_low = min([x["low"] for x in lookback_slice])
@@ -93,7 +94,7 @@ def run_backtest():
             if candle_range == 0:
                 continue
 
-            # تاییدیه حجم نهنگی (حجم باید به شدت بالا باشد تا ورود پول هوشمند را نشان دهد)
+            # فیلتر حجم نهنگی دست‌نخورده
             recent_volumes = [x["volume"] for x in sub[-22:-2]]
             avg_volume = sum(recent_volumes) / len(recent_volumes) if recent_volumes else 1.0
             is_institutional_volume = c["volume"] > (avg_volume * 2.2)
@@ -103,7 +104,7 @@ def run_backtest():
 
             current_risk_amount = balance * risk_percentage
 
-            # --- ستاپ لانگ اسمارت مانی: جارو شدن کفِ نقدینگی (Liquidity Sweep) و بازگشت قوی صعودی ---
+            # --- لانگ اسمارت مانی ---
             is_sweep_low = prev_c["low"] <= recent_low and c["close"] > prev_c["high"] and c["close"] > c["open"]
 
             if is_sweep_low:
@@ -111,10 +112,10 @@ def run_backtest():
                 stop_loss = min(prev_c["low"], c["low"]) - (entry_price * 0.0005)
                 risk_dist = entry_price - stop_loss
 
-                if 0.0005 * entry_price <= risk_dist <= 0.015 * entry_price:
+                if 0.0005 * entry_price <= risk_dist <= 0.02 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 8, len(candles) - 1)
+                    end_idx = min(i + 12, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -138,7 +139,7 @@ def run_backtest():
                     elif trade_lost: 
                         losses += 1; balance -= current_risk_amount
 
-            # --- ستاپ شورت اسمارت مانی: جارو شدن سقفِ نقدینگی (Liquidity Sweep) و ریزش قوی نزولی ---
+            # --- شورت اسمارت مانی ---
             is_sweep_high = prev_c["high"] >= recent_high and c["close"] < prev_c["low"] and c["close"] < c["open"]
 
             if not trade_taken and is_sweep_high:
@@ -146,10 +147,10 @@ def run_backtest():
                 stop_loss = max(prev_c["high"], c["high"]) + (entry_price * 0.0005)
                 risk_dist = stop_loss - entry_price
 
-                if 0.0005 * entry_price <= risk_dist <= 0.015 * entry_price:
+                if 0.0005 * entry_price <= risk_dist <= 0.02 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 8, len(candles) - 1)
+                    end_idx = min(i + 12, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -180,7 +181,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED SMC V31 RESULTS                  ")
+    print("      AGGREGATED SMC 1-YEAR RESULTS               ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
