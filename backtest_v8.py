@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading 1-year ICT Smart Money Data for {symbol_key}...")
+        print(f"[*] Downloading 1-year Smart Money Data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -53,6 +53,14 @@ def calculate_atr(candles, period=14):
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-period:]) / period
 
+def calculate_ema(closes, period=50):
+    if len(closes) < period: return closes[-1]
+    multiplier = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
+
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
@@ -60,51 +68,52 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - ICT SMART MONEY V8 (FVG)    ")
+    print("   SCORE HUNTER PRO - SMART MONEY V9 (FIXED)      ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
-        if not candles or len(candles) < 50: continue
+        if not candles or len(candles) < 100: continue
         
-        print(f"[*] Running ICT FVG backtest for {symbol_key}...")
+        print(f"[*] Running V9 Backtest for {symbol_key}...")
         wins, losses, symbol_trades = 0, 0, 0
         in_position_until = 0
 
-        for i in range(30, len(candles) - 30):
+        for i in range(50, len(candles) - 30):
             # قانون قفل معامله روی هر ارز تا روشن شدن تکلیف پوزیشن قبلی
             if i < in_position_until: 
                 continue
 
             sub = candles[:i+1]
-            c = sub[-1]       # کندل جاری (تاییدیه)
+            closes = [x["close"] for x in sub]
+            
+            c = sub[-1]       # کندل تاییدیه
             prev_c = sub[-2]  # کندل نفوذ (Sweep)
-            prev_2c = sub[-3] # کندل قبل‌تر برای تشکیل FVG
             
             atr = calculate_atr(sub, 14)
+            ema_50 = calculate_ema(closes, 50)
             if atr == 0: continue
 
-            # شناسایی سقف و کف‌های اسوینگ برای لیکوئیدیتی سویپ
-            recent_swing_high = max(x["high"] for x in sub[-20:-2])
-            recent_swing_low = min(x["low"] for x in sub[-20:-2])
+            # تعیین روند کلی با EMA
+            is_uptrend = c["close"] > ema_50
+            is_downtrend = c["close"] < ema_50
 
-            # ۱. شکار نقدینگی (Liquidity Sweep) + ۲. تغییر ساختار (MSS)
-            bullish_sweep_mss = (prev_c["low"] <= recent_swing_low) and (c["close"] > c["open"]) and (c["close"] > prev_c["high"])
-            bearish_sweep_mss = (prev_c["high"] >= recent_swing_high) and (c["close"] < c["open"]) and (c["close"] < prev_c["low"])
+            # نواحی اسوینگ برای تشخیص شکار نقدینگی (Liquidity Sweep)
+            recent_swing_low = min(x["low"] for x in sub[-15:-2])
+            recent_swing_high = max(x["high"] for x in sub[-15:-2])
 
-            # ۳. تشخیص Fair Value Gap (نامتعادلی نهنگی)
-            # در حالت صعودی: فاصله بینهای کینگ‌دلار
-            bullish_fvg = (prev_c["low"] > prev_2c["high"])
-            bearish_fvg = (prev_c["high"] < prev_2c["low"])
+            # شرایط تمیز و بدون باگ برای ورود اسمارت مانی
+            bullish_setup = is_uptrend and (prev_c["low"] < recent_swing_low) and (c["close"] > c["open"]) and (c["close"] > prev_c["high"])
+            bearish_setup = is_downtrend and (prev_c["high"] > recent_swing_high) and (c["close"] < c["open"]) and (c["close"] < prev_c["low"])
 
             trade_taken = False
 
-            if bullish_sweep_mss and bullish_fvg:
+            if bullish_setup:
                 entry_price = c["close"]
-                stop_loss = recent_swing_low - (atr * 0.2)
+                stop_loss = recent_swing_low - (atr * 0.3)
                 risk_dist = entry_price - stop_loss
 
-                if 0.001 * entry_price <= risk_dist <= 0.035 * entry_price:
+                if 0.001 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
@@ -131,12 +140,12 @@ def run_backtest():
                         losses += 1
                         balance -= risk_amount
 
-            elif bearish_sweep_mss and bearish_fvg and not trade_taken:
+            elif bearish_setup and not trade_taken:
                 entry_price = c["close"]
-                stop_loss = recent_swing_high + (atr * 0.2)
+                stop_loss = recent_swing_high + (atr * 0.3)
                 risk_dist = stop_loss - entry_price
 
-                if 0.001 * entry_price <= risk_dist <= 0.035 * entry_price:
+                if 0.001 * entry_price <= risk_dist <= 0.04 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
@@ -170,7 +179,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED ICT SMART MONEY V8 RESULTS       ")
+    print("      AGGREGATED SMART MONEY V9 RESULTS           ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
