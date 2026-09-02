@@ -1,39 +1,47 @@
 import json
 import urllib.request
-import time
+import math
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
-TIMEFRAME = "1hour"
+# جفت ارزهای استاندارد در صرافی کراکن (بیت‌کوین با XBT نشان داده می‌شود)
+SYMBOLS = ["XBTUSD", "ETHUSD", "SOLUSD", "XRPUSD"]
+INTERVAL = 60  # کندل 1 ساعته
 TARGET_RR = 2.0
 
-def fetch_coinex_full_year(symbol):
-    all_candles = []
-    # کوینکس حداکثر 1000 کندل در هر درخواست می‌دهد. برای یک سال (8760 کندل) باید در چند مرحله بگیریم.
-    # به جای درخواست پیچیده، از حداکثر لیمیت پایدار استفاده می‌کنیم یا سوییچ می‌کنیم روی دیتای کامل‌تر.
-    url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type={TIMEFRAME}&limit=1000"
+def fetch_kraken_klines(symbol):
+    url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval={INTERVAL}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
-            if isinstance(payload, dict) and payload.get("code") == 0:
-                rows = payload.get("data", [])
-                for row in rows:
-                    if isinstance(row, list) and len(row) >= 6:
-                        ts = int(float(row[0]))
-                        op = float(row[1])
-                        cl = float(row[2])
-                        hi = float(row[3])
-                        lo = float(row[4])
-                        vol = float(row[5]) if len(row) > 5 else 0.0
-                        all_candles.append({
-                            "timestamp": ts, "open": op, "high": hi, 
-                            "low": lo, "close": cl, "volume": vol
-                        })
-                all_candles.sort(key=lambda x: x["timestamp"])
-                return all_candles
+            if payload.get("error"):
+                print(f"[!] Kraken API Error for {symbol}: {payload['error']}")
+                return []
+            
+            result = payload.get("result", {})
+            # پیدا کردن کلید اصلی جفت ارز در پاسخ کراکن
+            pair_key = [k for k in result.keys() if k != "last"]
+            if not pair_key:
+                return []
+            
+            rows = result[pair_key[0]]
+            candles = []
+            for row in rows:
+                if isinstance(row, list) and len(row) >= 7:
+                    ts = int(row[0])
+                    op = float(row[1])
+                    hi = float(row[2])
+                    lo = float(row[3])
+                    cl = float(row[4])
+                    vol = float(row[6]) # حجم معاملات در کراکن
+                    candles.append({
+                        "timestamp": ts, "open": op, "high": hi, 
+                        "low": lo, "close": cl, "volume": vol
+                    })
+            candles.sort(key=lambda x: x["timestamp"])
+            return candles
     except Exception as e:
-        print(f"[!] Error fetching Coinex data for {symbol}: {e}")
+        print(f"[!] Error fetching Kraken data for {symbol}: {e}")
     return []
 
 def calculate_ema(candles, period):
@@ -90,12 +98,12 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - 3-LAYER WHALE (COINEX 1000C)")
+    print("   SCORE HUNTER PRO - 3-LAYER WHALE (KRAKEN)      ")
     print("==================================================")
 
     for symbol in SYMBOLS:
-        print(f"\n[*] Running strict backtest for {symbol}...")
-        candles = fetch_coinex_full_year(symbol)
+        print(f"\n[*] Running strict backtest for {symbol} on Kraken...")
+        candles = fetch_kraken_klines(symbol)
         if not candles:
             print(f"[!] Failed to get data for {symbol}")
             continue
@@ -199,7 +207,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED BACKTEST RESULTS (FIXED)         ")
+    print("      AGGREGATED KRAKEN BACKTEST RESULTS          ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
