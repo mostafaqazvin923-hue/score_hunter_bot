@@ -3,7 +3,7 @@ import urllib.request
 import time
 
 SYMBOLS = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD", "XRPUSDT": "XRP-USD"}
-TARGET_RR = 2.0
+TARGET_RR = 2.5  # افزایش ریسک به ریوارد برای جبران تعداد معاملات کمتر
 
 def fetch_yahoo_one_year(symbol_key):
     yahoo_symbol = SYMBOLS[symbol_key]
@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading 1-year Ichimoku data for {symbol_key}...")
+        print(f"[*] Downloading 1-year Ichimoku Pullback data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -46,9 +46,7 @@ def fetch_yahoo_one_year(symbol_key):
     return []
 
 def calculate_ichimoku_levels(sub_candles):
-    if len(sub_candles) < 52:
-        return None
-    
+    if len(sub_candles) < 52: return None
     nine_highs = [c["high"] for c in sub_candles[-9:]]
     nine_lows = [c["low"] for c in sub_candles[-9:]]
     tenkan = (max(nine_highs) + min(nine_lows)) / 2
@@ -62,12 +60,7 @@ def calculate_ichimoku_levels(sub_candles):
     senkou_a = (tenkan + kijun) / 2
     senkou_b = (max(highs_52) + min(lows_52)) / 2
     
-    return {
-        "tenkan": tenkan,
-        "kijun": kijun,
-        "senkou_a": senkou_a,
-        "senkou_b": senkou_b
-    }
+    return {"tenkan": tenkan, "kijun": kijun, "senkou_a": senkou_a, "senkou_b": senkou_b}
 
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1: return candles[-1]["high"] - candles[-1]["low"]
@@ -84,14 +77,14 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - ICHIMOKU PRO (INSTITUTIONAL)")
+    print("   SCORE HUNTER PRO - ICHIMOKU PULLBACK PRO       ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
         if not candles or len(candles) < 100: continue
         
-        print(f"[*] Running Ichimoku Pro backtest for {symbol_key}...")
+        print(f"[*] Running Ichimoku Pullback backtest for {symbol_key}...")
         wins, losses, symbol_trades, skip_until = 0, 0, 0, 0
 
         for i in range(60, len(candles) - 30):
@@ -99,6 +92,7 @@ def run_backtest():
 
             sub = candles[:i+1]
             c = sub[-2]
+            prev_c = sub[-3]
             
             ichi = calculate_ichimoku_levels(sub)
             if not ichi: continue
@@ -114,22 +108,23 @@ def run_backtest():
             cloud_top = max(s_a, s_b)
             cloud_bottom = min(s_a, s_b)
 
-            chikou_current_price = c["close"]
-            price_26_ago = sub[-28]["close"]
-            chikou_bullish = chikou_current_price > price_26_ago
-            chikou_bearish = chikou_current_price < price_26_ago
+            # بررسی حجم برای تاییدیه ورود پول هوشمند
+            vol_avg = sum(x["volume"] for x in sub[-15:-2]) / 14 if len(sub) >= 15 else 1.0
+            volume_expansion = c["volume"] > (vol_avg * 1.2)
 
-            is_long = (c["close"] > cloud_top) and (tenkan > kijun) and chikou_bullish and (c["close"] > tenkan)
-            is_short = (c["close"] < cloud_bottom) and (tenkan < kijun) and chikou_bearish and (c["close"] < tenkan)
+            # استراتژی پولبک حرفه‌ای: قیمت باید بالای ابر باشد، اما به خط کیوجسن یا تنکان نزدیک شده و سپس ریجکت شده باشد (Bounce)
+            # یعنی در کندل قبلی یا فعلی قیمت به تنکان/کیوجسن نزدیک شده و الان با کندل قدرتمند صعودی بسته شده است.
+            bullish_bounce = (c["close"] > cloud_top) and (tenkan > kijun) and (prev_c["low"] <= kijun or prev_c["low"] <= tenkan) and (c["close"] > c["open"]) and volume_expansion
+            bearish_bounce = (c["close"] < cloud_bottom) and (tenkan < kijun) and (prev_c["high"] >= kijun or prev_c["high"] >= tenkan) and (c["close"] < c["open"]) and volume_expansion
 
             trade_taken = False
 
-            if is_long:
+            if bullish_bounce:
                 entry_price = c["close"]
-                stop_loss = min(kijun, cloud_bottom) - (atr * 0.2)
+                stop_loss = kijun - (atr * 0.3)
                 risk_dist = entry_price - stop_loss
 
-                if 0 < (risk_dist / entry_price) <= 0.04:
+                if 0 < (risk_dist / entry_price) <= 0.035:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 48, len(candles) - 1)
@@ -144,17 +139,17 @@ def run_backtest():
                         trade_lost = not trade_won
 
                     symbol_trades += 1
-                    skip_until = end_idx
+                    skip_until = end_idx + 12 # فاصله بین معاملات برای جلوگیری از تکرار
                     trade_taken = True
                     if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
                     elif trade_lost: losses += 1; balance -= risk_amount
 
-            if not trade_taken and is_short:
+            if not trade_taken and bearish_bounce:
                 entry_price = c["close"]
-                stop_loss = max(kijun, cloud_top) + (atr * 0.2)
+                stop_loss = kijun + (atr * 0.3)
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.04:
+                if 0 < (risk_dist / entry_price) <= 0.035:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 48, len(candles) - 1)
@@ -169,7 +164,7 @@ def run_backtest():
                         trade_lost = not trade_won
 
                     symbol_trades += 1
-                    skip_until = end_idx
+                    skip_until = end_idx + 12
                     if trade_won: wins += 1; balance += (risk_amount * TARGET_RR)
                     elif trade_lost: losses += 1; balance -= risk_amount
 
@@ -181,7 +176,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED ICHIMOKU PRO RESULTS             ")
+    print("      AGGREGATED PULLBACK PRO RESULTS             ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
