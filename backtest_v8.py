@@ -11,7 +11,7 @@ def fetch_yahoo_one_year(symbol_key):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        print(f"[*] Downloading 1-year Institutional Data for {symbol_key}...")
+        print(f"[*] Downloading 1-year Elite Data for {symbol_key}...")
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -81,14 +81,14 @@ def run_backtest():
     total_wins, total_losses, grand_total_trades = 0, 0, 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - INSTITUTIONAL V5 (70% W.R)  ")
+    print("   SCORE HUNTER PRO - ELITE V6 (HIGH WIN-RATE)    ")
     print("==================================================")
 
     for symbol_key in SYMBOLS.keys():
         candles = fetch_yahoo_one_year(symbol_key)
         if not candles or len(candles) < 200: continue
         
-        print(f"[*] Running V5 High-Precision backtest for {symbol_key}...")
+        print(f"[*] Running V6 Elite backtest for {symbol_key}...")
         wins, losses, symbol_trades = 0, 0, 0
         in_position_until = 0
 
@@ -105,31 +105,53 @@ def run_backtest():
             prev_c = sub[-2]
             
             atr = calculate_atr(sub, 14)
+            ema_50 = calculate_ema(closes, 50)
             ema_200 = calculate_ema(closes, 200)
             rsi = calculate_rsi(closes, 14)
             avg_vol = sum(volumes[-20:]) / 20
             
             if atr == 0: continue
 
-            # فیلتر روند اصلی با EMA 200
-            is_uptrend = c["close"] > ema_200
-            is_downtrend = c["close"] < ema_200
+            # فیلتر روند قدرتمند دوگانه
+            strong_uptrend = (c["close"] > ema_50) and (ema_50 > ema_200)
+            strong_downtrend = (c["close"] < ema_50) and (ema_50 < ema_200)
+
+            # قدرت بدنه کندل نسبت به کل رنج آن
+            candle_body = abs(c["close"] - c["open"])
+            candle_range = c["high"] - c["low"]
+            if candle_range == 0: continue
+            body_ratio = candle_body / candle_range
 
             recent_swing_high = max(x["high"] for x in sub[-20:-1])
             recent_swing_low = min(x["low"] for x in sub[-20:-1])
 
-            # شرایط ورود سخت‌گیرانه برای هدف گرفتن وین‌ریت بالا
-            buy_signal = is_uptrend and (prev_c["low"] <= recent_swing_low * 1.002) and (c["close"] > c["open"]) and (rsi < 48) and (c["volume"] > avg_vol)
-            sell_signal = is_downtrend and (prev_c["high"] >= recent_swing_high * 0.998) and (c["close"] < c["open"]) and (rsi > 52) and (c["volume"] > avg_vol)
+            # شرایط ورود الگوهای نهنگی با فیلترهای سخت‌گیرانه مومنتوم و حجم
+            buy_signal = (
+                strong_uptrend and 
+                (prev_c["low"] <= recent_swing_low * 1.003) and 
+                (c["close"] > c["open"]) and 
+                (body_ratio >= 0.55) and
+                (rsi < 45) and 
+                (c["volume"] > avg_vol * 1.3)
+            )
+
+            sell_signal = (
+                strong_downtrend and 
+                (prev_c["high"] >= recent_swing_high * 0.997) and 
+                (c["close"] < c["open"]) and 
+                (body_ratio >= 0.55) and
+                (rsi > 55) and 
+                (c["volume"] > avg_vol * 1.3)
+            )
 
             trade_taken = False
 
             if buy_signal:
                 entry_price = c["close"]
-                stop_loss = recent_swing_low - (atr * 0.4)
+                stop_loss = recent_swing_low - (atr * 0.3)
                 risk_dist = entry_price - stop_loss
 
-                if 0.002 * entry_price <= risk_dist <= 0.035 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.03 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
@@ -158,10 +180,10 @@ def run_backtest():
 
             elif sell_signal and not trade_taken:
                 entry_price = c["close"]
-                stop_loss = recent_swing_high + (atr * 0.4)
+                stop_loss = recent_swing_high + (atr * 0.3)
                 risk_dist = stop_loss - entry_price
 
-                if 0.002 * entry_price <= risk_dist <= 0.035 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.03 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
                     end_idx = len(candles) - 1
@@ -195,7 +217,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED V5 HIGH-PRECISION RESULTS        ")
+    print("      AGGREGATED ELITE V6 RESULTS                 ")
     print("==================================================")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
