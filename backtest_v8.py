@@ -43,14 +43,30 @@ def fetch_real_klines_yahoo(symbol, limit=8800):
         print(f"[!] Error fetching {symbol}: {e}")
     raise ValueError(f"[!] Could not fetch data for {symbol}.")
 
-def calculate_ema(candles, period):
+def calculate_vwap_and_bands(candles, period=24):
     if len(candles) < period:
-        return candles[-1]["close"]
-    multiplier = 2 / (period + 1)
-    ema = sum(x["close"] for x in candles[:period]) / period
-    for c in candles[period:]:
-        ema = (c["close"] - ema) * multiplier + ema
-    return ema
+        sub = candles
+    else:
+        sub = candles[-period:]
+    
+    cumulative_pv = 0.0
+    cumulative_vol = 0.0
+    typical_prices = []
+    
+    for c in sub:
+        tp = (c["high"] + c["low"] + c["close"]) / 3.0
+        typical_prices.append(tp)
+        vol = c["volume"] if c["volume"] > 0 else 1.0
+        cumulative_pv += tp * vol
+        cumulative_vol += vol
+        
+    vwap = (cumulative_pv / cumulative_vol) if cumulative_vol > 0 else sub[-1]["close"]
+    
+    # محاسبه انحراف استاندارد برای باندهای نهنگی VWAP
+    variance = sum((tp - vwap) ** 2 for tp in typical_prices) / len(typical_prices)
+    std_dev = variance ** 0.5
+    
+    return vwap, vwap + (std_dev * 1.2), vwap - (std_dev * 1.2)
 
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
@@ -64,32 +80,6 @@ def calculate_atr(candles, period=14):
         trs.append(tr)
     return sum(trs[-period:]) / period
 
-def calculate_metrics(candles, period=14):
-    if len(candles) < period + 2:
-        return 1.0, 50.0
-    
-    vols = [c["volume"] for c in candles[-period:]]
-    avg_vol = sum(vols) / len(vols) if len(vols) > 0 else 1.0
-    current_vol = candles[-1]["volume"]
-    vol_ratio = (current_vol / avg_vol) if avg_vol > 0 else 1.0
-
-    gains, losses = 0.0, 0.0
-    for i in range(1, period + 1):
-        change = candles[-i]["close"] - candles[-i-1]["close"]
-        if change > 0:
-            gains += change
-        else:
-            losses -= change
-    avg_gain = gains / period
-    avg_loss = losses / period
-    if avg_loss == 0:
-        rsi = 100.0
-    else:
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-
-    return vol_ratio, rsi
-
 def _backtest():
     initial_balance = 1000.0
     balance = initial_balance
@@ -102,7 +92,7 @@ def _backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - INSTITUTIONAL TARGET 2200     ")
+    print(" SCORE HUNTER PRO - INSTITUTIONAL VWAP QUANT      ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -126,29 +116,21 @@ def _backtest():
             sub = candles[:i+1]
             c = sub[-2]
             
-            ema12 = calculate_ema(sub, 12)
-            ema36 = calculate_ema(sub, 36)
-            ema150 = calculate_ema(sub, 150)
+            vwap, upper_band, lower_band = calculate_vwap_and_bands(sub, 24)
             atr = calculate_atr(sub, 14)
-            vol_ratio, rsi = calculate_metrics(sub, 14)
             trade_taken = False
 
-            if (c["high"] - c["low"]) == 0 or atr == 0:
-                continue
-
-            if vol_ratio < 1.02:
-                continue
-
             candle_range = c["high"] - c["low"]
+            if candle_range == 0 or atr == 0:
+                continue
 
-            # --- شورت نهنگی بهینه‌شده برای افزایش تعداد معاملات و دقت بالا ---
-            is_macro_down = (c["close"] < ema150) and (ema12 < ema36)
-            body_ratio_short = (c["open"] - c["close"]) / candle_range if candle_range > 0 else 0
-            is_short = is_macro_down and (c["close"] < c["open"]) and (body_ratio_short > 0.35) and (rsi < 50)
+            # --- شورت نهنگی مبتنی بر شکست باند پایین VWAP با حجم و مومنتوم ---
+            body_ratio_short = (c["open"] - c["close"]) / candle_range
+            is_short = (c["close"] < vwap) and (c["close"] < c["open"]) and (body_ratio_short > 0.35) and (c["close"] <= lower_band + (atr * 0.5))
 
             if is_short:
                 entry_price = c["close"]
-                stop_loss = c["high"] + (atr * 0.28)
+                stop_loss = c["high"] + (atr * 0.3)
                 risk_dist = stop_loss - entry_price
 
                 if 0 < (risk_dist / entry_price) <= 0.035:
@@ -170,7 +152,7 @@ def _backtest():
                     symbol_trades += 1
                     symbol_shorts += 1
                     grand_total_shorts += 1
-                    skip_until = i + 3  # کاهش زمان قفل برای رسیدن به حجم ۲۲۰۰ معامله
+                    skip_until = i + 3
                     trade_taken = True
 
                     if trade_won: 
@@ -178,15 +160,14 @@ def _backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ نهنگی بهینه‌شده برای افزایش تعداد معاملات و دقت بالا ---
+            # --- لانگ نهنگی مبتنی بر شکست باند بالای VWAP با حجم و مومنتوم ---
             if not trade_taken:
-                is_macro_up = (c["close"] > ema150) and (ema12 > ema36)
-                body_ratio_long = (c["close"] - c["open"]) / candle_range if candle_range > 0 else 0
-                is_long = is_macro_up and (c["close"] > c["open"]) and (body_ratio_long > 0.35) and (rsi > 50)
+                body_ratio_long = (c["close"] - c["open"]) / candle_range
+                is_long = (c["close"] > vwap) and (c["close"] > c["open"]) and (body_ratio_long > 0.35) and (c["close"] >= upper_band - (atr * 0.5))
 
                 if is_long:
                     entry_price = c["close"]
-                    stop_loss = c["low"] - (atr * 0.28)
+                    stop_loss = c["low"] - (atr * 0.3)
                     risk_dist = entry_price - stop_loss
 
                     if 0 < (risk_dist / entry_price) <= 0.035:
@@ -208,7 +189,7 @@ def _backtest():
                         symbol_trades += 1
                         symbol_longs += 1
                         grand_total_longs += 1
-                        skip_until = i + 3  # کاهش زمان قفل برای رسیدن به حجم ۲۲۰۰ معامله
+                        skip_until = i + 3
                         trade_taken = True
 
                         if trade_won: 
@@ -224,7 +205,7 @@ def _backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED TARGET 2200 RESULTS              ")
+    print("      AGGREGATED VWAP QUANT RESULTS               ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
