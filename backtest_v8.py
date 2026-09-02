@@ -20,13 +20,21 @@ def fetch_real_klines_yahoo(symbol, limit=8800):
             timestamps = data.get("timestamp", [])
             quotes = data.get("indicators", {}).get("quote", [{}])[0]
             opens, highs, lows, closes = quotes.get("open", []), quotes.get("high", []), quotes.get("low", []), quotes.get("close", [])
+            volumes = quotes.get("volume", [])
             
             candles = []
             for idx in range(len(timestamps)):
-                op, hi, lo, cl, ts = opens[idx], highs[idx], lows[idx], closes[idx], timestamps[idx]
+                op, hi, lo, cl, vol, ts = opens[idx], highs[idx], lows[idx], closes[idx], volumes[idx], timestamps[idx]
                 if op is None or hi is None or lo is None or cl is None:
                     continue
-                candles.append({"timestamp": int(ts), "open": float(op), "high": float(hi), "low": float(lo), "close": float(cl)})
+                candles.append({
+                    "timestamp": int(ts), 
+                    "open": float(op), 
+                    "high": float(hi), 
+                    "low": float(lo), 
+                    "close": float(cl),
+                    "volume": float(vol) if vol else 0.0
+                })
             
             candles.sort(key=lambda x: x["timestamp"])
             if len(candles) > 100:
@@ -44,23 +52,6 @@ def calculate_ema(candles, period):
         ema = (c["close"] - ema) * multiplier + ema
     return ema
 
-def calculate_rsi(candles, period=14):
-    if len(candles) < period + 1:
-        return 50.0
-    gains, losses = 0.0, 0.0
-    for i in range(1, period + 1):
-        change = candles[-i]["close"] - candles[-i-1]["close"]
-        if change > 0:
-            gains += change
-        else:
-            losses -= change
-    avg_gain = gains / period
-    avg_loss = losses / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
         return candles[-1]["high"] - candles[-1]["low"]
@@ -73,15 +64,44 @@ def calculate_atr(candles, period=14):
         trs.append(tr)
     return sum(trs[-period:]) / period
 
-def calculate_bollinger_bands(candles, period=20, std_dev=2.0):
-    if len(candles) < period:
-        cl = candles[-1]["close"]
-        return cl, cl, cl
-    subset = [c["close"] for c in candles[-period:]]
-    sma = sum(subset) / period
-    variance = sum((x - sma) ** 2 for x in subset) / period
-    dev = std_dev * (variance ** 0.5)
-    return sma + dev, sma, sma - dev
+def calculate_adx_and_volume(candles, period=14):
+    if len(candles) < period + 2:
+        return 20.0, 1.0
+    
+    # Volume surge ratio
+    vols = [c["volume"] for c in candles[-period:]]
+    avg_vol = sum(vols) / len(vols) if len(vols) > 0 else 1.0
+    current_vol = candles[-1]["volume"]
+    vol_ratio = (current_vol / avg_vol) if avg_vol > 0 else 1.0
+
+    # Simplified powerful trend strength (ADX proxy using directional movement)
+    tr_sum = 0.0
+    plus_dm_sum = 0.0
+    minus_dm_sum = 0.0
+    
+    for i in range(1, period + 1):
+        h = candles[-i]["high"]
+        l = candles[-i]["low"]
+        ph = candles[-i-1]["high"]
+        pl = candles[-i-1]["low"]
+        
+        tr_sum += max(h - l, abs(h - candles[-i-1]["close"]), abs(l - candles[-i-1]["close"]))
+        
+        up_move = h - ph
+        down_move = pl - l
+        
+        plus_dm_sum += up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm_sum += down_move if (down_move > up_move and down_move > 0) else 0.0
+
+    if tr_sum == 0:
+        return 20.0, vol_ratio
+        
+    plus_di = (plus_dm_sum / tr_sum) * 100
+    minus_di = (minus_dm_sum / tr_sum) * 100
+    sum_di = plus_di + minus_di
+    
+    adx = (abs(plus_di - minus_di) / sum_di * 100) if sum_di > 0 else 20.0
+    return adx, vol_ratio
 
 def _backtest():
     initial_balance = 1000.0
@@ -95,7 +115,7 @@ def _backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - BOLLINGER & RSI HIGH WIN 1:2  ")
+    print(" SCORE HUNTER PRO - INSTITUTIONAL QUANT ADX MODEL ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -121,22 +141,26 @@ def _backtest():
             
             ema20 = calculate_ema(sub, 20)
             ema50 = calculate_ema(sub, 50)
-            rsi = calculate_rsi(sub, 14)
             atr = calculate_atr(sub, 14)
-            upper_bb, middle_bb, lower_bb = calculate_bollinger_bands(sub, 20, 2.0)
+            adx, vol_ratio = calculate_adx_and_volume(sub, 14)
             trade_taken = False
 
             if (c["high"] - c["low"]) == 0 or atr == 0:
                 continue
 
-            # --- شورت با بولینگر و RSI و ریوارد ۱ به ۲ ---
+            # فیلتر طلایی نهنگی: فقط وقتی روند قوی است (ADX > 22) و حجم سنگین وارد شده (Volume Surge)
+            if adx < 22 or vol_ratio < 1.25:
+                continue
+
+            # --- شورت نهنگی با تاییدیه حجم و روند (RR = 1:2) ---
             is_down_trend = ema20 < ema50
-            is_short_bb = c["high"] >= upper_bb or c["close"] > middle_bb # برخورد یا نزدیک باند بالا
-            is_short = is_down_trend and (c["close"] < c["open"]) and (rsi < 52) and (c["close"] < ema20)
+            candle_range = c["high"] - c["low"]
+            body_ratio_short = (c["open"] - c["close"]) / candle_range if candle_range > 0 else 0
+            is_short = is_down_trend and (c["close"] < c["open"]) and (body_ratio_short > 0.4) and (c["close"] < ema20)
 
             if is_short:
                 entry_price = c["close"]
-                stop_loss = c["high"] + (atr * 0.5)  # حد ضرر مهندسی شده با ATR
+                stop_loss = c["high"] + (atr * 0.35)  # حد ضرر مهندسی شده با بافر ATR
                 risk_dist = stop_loss - entry_price
 
                 if 0 < (risk_dist / entry_price) <= 0.035:
@@ -166,14 +190,16 @@ def _backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ با بولینگر و RSI و ریوارد ۱ به ۲ ---
+            # --- لانگ نهنگی با تاییدیه حجم و روند (RR = 1:2) ---
             if not trade_taken:
                 is_up_trend = ema20 > ema50
-                is_long = is_up_trend and (c["close"] > c["open"]) and (rsi > 48) and (c["close"] > ema20)
+                candle_range = c["high"] - c["low"]
+                body_ratio_long = (c["close"] - c["open"]) / candle_range if candle_range > 0 else 0
+                is_long = is_up_trend and (c["close"] > c["open"]) and (body_ratio_long > 0.4) and (c["close"] > ema20)
 
                 if is_long:
                     entry_price = c["close"]
-                    stop_loss = c["low"] - (atr * 0.5)  # حد ضرر مهندسی شده با ATR
+                    stop_loss = c["low"] - (atr * 0.35)  # حد ضرر مهندسی شده با بافر ATR
                     risk_dist = entry_price - stop_loss
 
                     if 0 < (risk_dist / entry_price) <= 0.035:
@@ -211,7 +237,7 @@ def _backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED BOLLINGER STRATEGY RESULTS       ")
+    print("      AGGREGATED INSTITUTIONAL ADX RESULTS        ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
