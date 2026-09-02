@@ -63,7 +63,7 @@ def calculate_rsi(candles, period=14):
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
-    risk_amount = 25.0
+    risk_percentage = 0.025  # ریسک ۲.۵ درصدی پویا از کل بالانس برای ایجاد سود مرکب
     
     total_wins = 0
     total_losses = 0
@@ -72,7 +72,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - PRESERVING VOLUME & 70% WIN   ")
+    print(" SCORE HUNTER PRO - COMPOUND GROWTH & HIGH WIN    ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -110,7 +110,10 @@ def run_backtest():
             if candle_range == 0:
                 continue
 
-            # --- شورت با فیلتر بدنه برای حذف فیک‌اوت‌ها ---
+            # محاسبه ریسک پویای بر اساس موجودی فعلی حساب
+            current_risk_amount = balance * risk_percentage
+
+            # --- شورت با فیلتر بدنه ---
             is_down_trend = ema20 < ema50
             body_ratio_short = (c["open"] - c["close"]) / candle_range
             is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.35) and (c["close"] < ema20) and (rsi < 50)
@@ -121,7 +124,7 @@ def run_backtest():
                 risk_dist = stop_loss - entry_price
 
                 if 0 < (risk_dist / entry_price) <= 0.035:
-                    take_profit = entry_price - (risk_dist * 0.85) # هدف بسته‌تر برای صید قطعی وین‌ریت
+                    take_profit = entry_price - (risk_dist * 0.85)
                     trade_won, trade_lost = False, False
                     end_idx = min(i + 12, len(candles) - 1)
                     
@@ -143,11 +146,11 @@ def run_backtest():
                     trade_taken = True
 
                     if trade_won: 
-                        wins += 1; balance += (risk_amount * 0.85)
+                        wins += 1; balance += (current_risk_amount * 0.85)
                     elif trade_lost: 
-                        losses += 1; balance -= risk_amount
+                        losses += 1; balance -= current_risk_amount
 
-            # --- لانگ با فیلتر بدنه برای حذف فیک‌اوت‌ها ---
+            # --- لانگ با فیلتر بدنه ---
             if not trade_taken:
                 is_up_trend = ema20 > ema50
                 body_ratio_long = (c["close"] - c["open"]) / candle_range
@@ -180,9 +183,9 @@ def run_backtest():
                         skip_until = end_idx - 2
 
                         if trade_won: 
-                            wins += 1; balance += (risk_amount * 0.85)
+                            wins += 1; balance += (current_risk_amount * 0.85)
                         elif trade_lost: 
-                            losses += 1; balance -= risk_amount
+                            losses += 1; balance -= current_risk_amount
 
         total_wins += wins
         total_losses += losses
@@ -192,8 +195,8 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED WIN-RATE BOOST RESULTS           ")
-    print("==================================================")
+    print("      AGGREGATED COMPOUND GROWTH RESULTS          ")
+    print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
     print(f"  - Total Shorts     : {grand_total_shorts}")
