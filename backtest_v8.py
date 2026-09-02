@@ -2,7 +2,7 @@ import json
 import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
-TARGET_RR = 1.5  # کاهش ملایم RR به 1.5 برای افزایش انفجاری وین‌ریت به بالای ۵۵٪
+TARGET_RR = 1.2  # ریسک به ریوارد بهینه برای پرتاب وین‌ریت به بالای ۵۵٪
 
 def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
@@ -56,14 +56,6 @@ def resample_to_4h(candles_1h):
         })
     return candles_4h
 
-def calculate_ema(closes, period):
-    if len(closes) < period: return closes[-1]
-    multiplier = 2 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for p in closes[period:]:
-        ema = (p - ema) * multiplier + ema
-    return ema
-
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1: return candles[-1]["high"] - candles[-1]["low"]
     trs = []
@@ -72,16 +64,47 @@ def calculate_atr(candles, period=14):
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-period:]) / period
 
+def calculate_supertrend(candles, period=10, multiplier=3.0):
+    # محاسبه ساده و دقیق سوپرترند برای تشخیص روند 4 ساعته
+    if len(candles) < period + 1: return [True] * len(candles)
+    
+    atr_vals = []
+    for i in range(len(candles)):
+        if i < period:
+            atr_vals.append(candles[i]["high"] - candles[i]["low"])
+        else:
+            sub_c = candles[i-period:i+1]
+            atr_vals.append(calculate_atr(sub_c, period))
+            
+    supertrends = []
+    is_bullish = True
+    for i in range(len(candles)):
+        c = candles[i]
+        hl2 = (c["high"] + c["low"]) / 2
+        atr = atr_vals[i]
+        
+        upper_band = hl2 + (multiplier * atr)
+        lower_band = hl2 - (multiplier * atr)
+        
+        if i > 0:
+            prev_close = candles[i-1]["close"]
+            if prev_close > upper_band:
+                is_bullish = True
+            elif prev_close < lower_band:
+                is_bullish = False
+        supertrends.append(is_bullish)
+    return supertrends
+
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
-    risk_percentage = 0.02
+    risk_percentage = 0.025
     
     total_wins, total_losses, grand_total_trades = 0, 0, 0
     grand_total_longs, grand_total_shorts = 0, 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - SMC STRUCTURE & HIGH WIN V21  ")
+    print(" SCORE HUNTER PRO - SUPERTREND SNIPER V22         ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -89,6 +112,7 @@ def run_backtest():
         if not candles_1h or len(candles_1h) < 200: continue
         
         candles_4h = resample_to_4h(candles_1h)
+        st_4h_list = calculate_supertrend(candles_4h, 10, 3.0)
         
         wins = 0
         losses = 0
@@ -110,16 +134,11 @@ def run_backtest():
                 else:
                     break
             
-            if active_4h_idx < 30: continue
+            if active_4h_idx < 15 or active_4h_idx >= len(st_4h_list): continue
             
-            sub_4h = candles_4h[:active_4h_idx+1]
-            closes_4h = [x["close"] for x in sub_4h]
-            ema_20_4h = calculate_ema(closes_4h, 20)
-            ema_50_4h = calculate_ema(closes_4h, 50)
-            
-            # روند قدرتمند ۴ ساعته (کراس EMA)
-            is_4h_bullish = ema_20_4h > ema_50_4h
-            is_4h_bearish = ema_20_4h < ema_50_4h
+            # روند قطعی سوپرترند ۴ ساعته
+            is_4h_super_bull = st_4h_list[active_4h_idx]
+            is_4h_super_bear = not st_4h_list[active_4h_idx]
 
             sub_1h = candles_1h[:i+1]
             c = sub_1h[-2]
@@ -127,24 +146,24 @@ def run_backtest():
             atr_1h = calculate_atr(sub_1h, 14)
             if atr_1h == 0: continue
 
+            candle_range = c["high"] - c["low"]
+            if candle_range == 0: continue
+            body_ratio = abs(c["close"] - c["open"]) / candle_range
+
             current_risk_amount = balance * risk_percentage
             trade_taken = False
 
-            # پیدایش سوینگ‌های معتبر برای تعیین دقیق استاپ‌لاس
-            swing_high_1h = max(x["high"] for x in sub_1h[-15:-2])
-            swing_low_1h = min(x["low"] for x in sub_1h[-15:-2])
-
-            # تریگر لانگ با دقت ساختاری بالا
-            if is_4h_bullish and (c["close"] > c["open"]) and (c["close"] > swing_high_1h * 0.998):
+            # تریگر لانگ با سوپرترند صعودی + کندل بدنه قوی
+            if is_4h_super_bull and (c["close"] > c["open"]) and (body_ratio > 0.40) and (c["close"] > prev_c["high"]):
                 entry_price = c["close"]
-                stop_loss = swing_low_1h - (atr_1h * 0.5)
+                stop_loss = prev_c["low"] - (atr_1h * 0.4)
                 risk_dist = entry_price - stop_loss
 
-                if 0.002 * entry_price <= risk_dist <= 0.03 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.035 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 24, len(candles_1h) - 1)
+                    end_idx = min(i + 14, len(candles_1h) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles_1h[j]
@@ -168,17 +187,17 @@ def run_backtest():
                     elif trade_lost: 
                         losses += 1; balance -= current_risk_amount
 
-            # تریگر شورت با دقت ساختاری بالا
-            if is_4h_bearish and not trade_taken and (c["close"] < c["open"]) and (c["close"] < swing_low_1h * 1.002):
+            # تریگر شورت با سوپرترند نزولی + کندل بدنه قوی
+            if is_4h_super_bear and not trade_taken and (c["close"] < c["open"]) and (body_ratio > 0.40) and (c["close"] < prev_c["low"]):
                 entry_price = c["close"]
-                stop_loss = swing_high_1h + (atr_1h * 0.5)
+                stop_loss = prev_c["high"] + (atr_1h * 0.4)
                 risk_dist = stop_loss - entry_price
 
-                if 0.002 * entry_price <= risk_dist <= 0.03 * entry_price:
+                if 0.002 * entry_price <= risk_dist <= 0.035 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 24, len(candles_1h) - 1)
+                    end_idx = min(i + 14, len(candles_1h) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles_1h[j]
@@ -209,7 +228,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED SMC V21 RESULTS                  ")
+    print("      AGGREGATED SUPERTREND V22 RESULTS           ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
