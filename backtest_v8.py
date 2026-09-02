@@ -43,31 +43,6 @@ def fetch_real_klines_yahoo(symbol, limit=8800):
         print(f"[!] Error fetching {symbol}: {e}")
     raise ValueError(f"[!] Could not fetch data for {symbol}.")
 
-def calculate_vwap_and_bands(candles, period=24):
-    if len(candles) < period:
-        sub = candles
-    else:
-        sub = candles[-period:]
-    
-    cumulative_pv = 0.0
-    cumulative_vol = 0.0
-    typical_prices = []
-    
-    for c in sub:
-        tp = (c["high"] + c["low"] + c["close"]) / 3.0
-        typical_prices.append(tp)
-        vol = c["volume"] if c["volume"] > 0 else 1.0
-        cumulative_pv += tp * vol
-        cumulative_vol += vol
-        
-    vwap = (cumulative_pv / cumulative_vol) if cumulative_vol > 0 else sub[-1]["close"]
-    
-    # محاسبه انحراف استاندارد برای باندهای نهنگی VWAP
-    variance = sum((tp - vwap) ** 2 for tp in typical_prices) / len(typical_prices)
-    std_dev = variance ** 0.5
-    
-    return vwap, vwap + (std_dev * 1.2), vwap - (std_dev * 1.2)
-
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
         return candles[-1]["high"] - candles[-1]["low"]
@@ -92,7 +67,7 @@ def _backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - INSTITUTIONAL VWAP QUANT      ")
+    print(" SCORE HUNTER PRO - INSTITUTIONAL TURTLE BREAKOUT ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -108,15 +83,20 @@ def _backtest():
         symbol_longs = 0
         symbol_shorts = 0
         skip_until = 0
+        lookback = 24  # کانال Donchian برای تشخیص شکست سقف/کف اصلی بازار
 
-        for i in range(50, len(candles) - 1):
+        for i in range(lookback + 10, len(candles) - 1):
             if i < skip_until:
                 continue
 
             sub = candles[:i+1]
-            c = sub[-2]
+            c = sub[-2]  # کندل کامل قبلی برای سیگنال معتبر
             
-            vwap, upper_band, lower_band = calculate_vwap_and_bands(sub, 24)
+            # بازه تاریخی کانال برای بررسی شکست ساختار (Breakout)
+            past_candles = sub[-lookback-2:-2]
+            highest_high = max(x["high"] for x in past_candles)
+            lowest_low = min(x["low"] for x in past_candles)
+            
             atr = calculate_atr(sub, 14)
             trade_taken = False
 
@@ -124,19 +104,19 @@ def _backtest():
             if candle_range == 0 or atr == 0:
                 continue
 
-            # --- شورت نهنگی مبتنی بر شکست باند پایین VWAP با حجم و مومنتوم ---
-            body_ratio_short = (c["open"] - c["close"]) / candle_range
-            is_short = (c["close"] < vwap) and (c["close"] < c["open"]) and (body_ratio_short > 0.35) and (c["close"] <= lower_band + (atr * 0.5))
+            # --- شورت نهنگی مبتنی بر شکست کف کانال (Breakout Down) ---
+            is_breakout_down = (c["close"] < lowest_low) and (c["close"] < c["open"])
+            body_ratio_short = (c["open"] - c["close"]) / candle_range if candle_range > 0 else 0
 
-            if is_short:
+            if is_breakout_down and (body_ratio_short > 0.4):
                 entry_price = c["close"]
-                stop_loss = c["high"] + (atr * 0.3)
+                stop_loss = c["high"] + (atr * 0.4)  # استاپ لاس محافظه‌کارانه پشت سقف کندل شکست
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.035:
+                if 0 < (risk_dist / entry_price) <= 0.04:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 12, len(candles) - 1)
+                    end_idx = min(i + 16, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -152,7 +132,7 @@ def _backtest():
                     symbol_trades += 1
                     symbol_shorts += 1
                     grand_total_shorts += 1
-                    skip_until = i + 3
+                    skip_until = i + 4  # فاصله‌گذاری بین پوزیشن‌ها برای جلوگیری از تکرار سیگنال فیک
                     trade_taken = True
 
                     if trade_won: 
@@ -160,20 +140,20 @@ def _backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ نهنگی مبتنی بر شکست باند بالای VWAP با حجم و مومنتوم ---
+            # --- لانگ نهنگی مبتنی بر شکست سقف کانال (Breakout Up) ---
             if not trade_taken:
-                body_ratio_long = (c["close"] - c["open"]) / candle_range
-                is_long = (c["close"] > vwap) and (c["close"] > c["open"]) and (body_ratio_long > 0.35) and (c["close"] >= upper_band - (atr * 0.5))
+                is_breakout_up = (c["close"] > highest_high) and (c["close"] > c["open"])
+                body_ratio_long = (c["close"] - c["open"]) / candle_range if candle_range > 0 else 0
 
-                if is_long:
+                if is_breakout_up and (body_ratio_long > 0.4):
                     entry_price = c["close"]
-                    stop_loss = c["low"] - (atr * 0.3)
+                    stop_loss = c["low"] - (atr * 0.4)  # استاپ لاس محافظه‌کارانه پشت کف کندل شکست
                     risk_dist = entry_price - stop_loss
 
-                    if 0 < (risk_dist / entry_price) <= 0.035:
+                    if 0 < (risk_dist / entry_price) <= 0.04:
                         take_profit = entry_price + (risk_dist * TARGET_RR)
                         trade_won, trade_lost = False, False
-                        end_idx = min(i + 12, len(candles) - 1)
+                        end_idx = min(i + 16, len(candles) - 1)
                         
                         for j in range(i + 1, end_idx + 1):
                             future_c = candles[j]
@@ -189,7 +169,7 @@ def _backtest():
                         symbol_trades += 1
                         symbol_longs += 1
                         grand_total_longs += 1
-                        skip_until = i + 3
+                        skip_until = i + 4
                         trade_taken = True
 
                         if trade_won: 
@@ -205,7 +185,7 @@ def _backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED VWAP QUANT RESULTS               ")
+    print("      AGGREGATED TURTLE BREAKOUT RESULTS          ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
