@@ -9,6 +9,11 @@ def fetch_real_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=730d"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
+        with urllib.request.urlopen(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30) as response:
+            # Fixing the request call to match standard urllib syntax
+            pass
+        # Using standard robust fetch
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
@@ -44,22 +49,17 @@ def calculate_ema(candles, period):
         ema = (c["close"] - ema) * multiplier + ema
     return ema
 
-def calculate_rsi(candles, period=14):
+def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
-        return 50.0
-    gains, losses = 0.0, 0.0
-    for i in range(1, period + 1):
-        change = candles[-i]["close"] - candles[-i-1]["close"]
-        if change > 0:
-            gains += change
-        else:
-            losses -= change
-    avg_gain = gains / period
-    avg_loss = losses / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+        return candles[-1]["high"] - candles[-1]["low"]
+    trs = []
+    for i in range(1, len(candles)):
+        h = candles[i]["high"]
+        l = candles[i]["low"]
+        pc = candles[i-1]["close"]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    return sum(trs[-period:]) / period
 
 def _backtest():
     initial_balance = 1000.0
@@ -73,7 +73,7 @@ def _backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - IMPULSE MOMENTUM 1:2 MODEL    ")
+    print(" SCORE HUNTER PRO - INSTITUTIONAL ORDER FLOW 1:2  ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -90,39 +90,42 @@ def _backtest():
         symbol_shorts = 0
         skip_until = 0
 
-        for i in range(30, len(candles) - 1):
+        for i in range(50, len(candles) - 1):
             if i < skip_until:
                 continue
 
             sub = candles[:i+1]
             c = sub[-2]
+            prev_c = sub[-3]
             
-            ema10 = calculate_ema(sub, 10)
-            ema30 = calculate_ema(sub, 30)
-            rsi = calculate_rsi(sub, 14)
+            ema50 = calculate_ema(sub, 50)
+            ema200 = calculate_ema(sub, 200) # جهت روند کلان نهنگی
+            atr = calculate_atr(sub, 14)
             trade_taken = False
 
             candle_range = c["high"] - c["low"]
-            if candle_range == 0:
+            if candle_range == 0 or atr == 0:
                 continue
 
-            # --- شورت مومنتوم با حد ضرر و سود ساختاری (RR = 1:2) ---
-            is_down_trend = ema10 < ema30
-            body_size = c["open"] - c["close"]
-            body_ratio_short = body_size / candle_range
-            
-            # شرط ورود: بدنه قوی، جهت روند نزولی، بسته شدن زیر EMA10 و تایید RSI
-            is_short = (c["close"] < c["open"]) and (body_ratio_short > 0.45) and (c["close"] < ema10) and (rsi < 48)
+            body_size = abs(c["close"] - c["open"])
+            body_ratio = body_size / candle_range
 
-            if is_down_trend and is_short:
+            # --- شورت به سبک جریان سفارشات و دیسپلیسمنت موسساتی (RR = 1:2) ---
+            # روند کلان نزولی + کندل دیسپلیسمنت قوی به سمت پایین که ساختار را می‌شکند
+            is_macro_down = (c["close"] < ema50) and (ema50 < ema200)
+            is_short_displacement = (c["close"] < c["open"]) and (body_ratio > 0.45) and (c["close"] < prev_c["low"])
+
+            if is_macro_down and is_short_displacement:
                 entry_price = c["close"]
-                stop_loss = c["high"] + (entry_price * 0.001)  # سقف کندل فعلی به عنوان حد ضرر ساختاری
+                # حد ضرر ساختاری پشت بالاترین نقطه سویینگ اخیر با بافر ATR
+                recent_high = max(sub[-1]["high"], sub[-2]["high"], sub[-3]["high"], sub[-4]["high"])
+                stop_loss = recent_high + (atr * 0.25)
                 risk_dist = stop_loss - entry_price
 
-                if 0 < (risk_dist / entry_price) <= 0.03:
+                if 0 < (risk_dist / entry_price) <= 0.035:
                     take_profit = entry_price - (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 12, len(candles) - 1)
+                    end_idx = min(i + 14, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -146,23 +149,22 @@ def _backtest():
                     elif trade_lost: 
                         losses += 1; balance -= risk_amount
 
-            # --- لانگ مومنتوم با حد ضرر و سود ساختاری (RR = 1:2) ---
+            # --- لانگ به سبک جریان سفارشات و دیسپلیسمنت موسساتی (RR = 1:2) ---
             if not trade_taken:
-                is_up_trend = ema10 > ema30
-                body_size = c["close"] - c["open"]
-                body_ratio_long = body_size / candle_range
-                
-                is_long = (c["close"] > c["open"]) and (body_ratio_long > 0.45) and (c["close"] > ema10) and (rsi > 52)
+                is_macro_up = (c["close"] > ema50) and (ema50 > ema200)
+                is_long_displacement = (c["close"] > c["open"]) and (body_ratio > 0.45) and (c["close"] > prev_c["high"])
 
-                if is_up_trend and is_long:
+                if is_macro_up and is_long_displacement:
                     entry_price = c["close"]
-                    stop_loss = c["low"] - (entry_price * 0.001)  # کف کندل فعلی به عنوان حد ضرر ساختاری
+                    # حد ضرر ساختاری پشت پایین‌ترین نقطه سویینگ اخیر با بافر ATR
+                    recent_low = min(sub[-1]["low"], sub[-2]["low"], sub[-3]["low"], sub[-4]["low"])
+                    stop_loss = recent_low - (atr * 0.25)
                     risk_dist = entry_price - stop_loss
 
-                    if 0 < (risk_dist / entry_price) <= 0.03:
+                    if 0 < (risk_dist / entry_price) <= 0.035:
                         take_profit = entry_price + (risk_dist * TARGET_RR)  # دقیقاً ۱ به ۲
                         trade_won, trade_lost = False, False
-                        end_idx = min(i + 12, len(candles) - 1)
+                        end_idx = min(i + 14, len(candles) - 1)
                         
                         for j in range(i + 1, end_idx + 1):
                             future_c = candles[j]
@@ -179,6 +181,7 @@ def _backtest():
                         symbol_longs += 1
                         grand_total_longs += 1
                         skip_until = end_idx - 1
+                        trade_taken = True
 
                         if trade_won: 
                             wins += 1; balance += (risk_amount * TARGET_RR)
@@ -193,7 +196,7 @@ def _backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED IMPULSE MOMENTUM RESULTS         ")
+    print("   AGGREGATED INSTITUTIONAL ORDER FLOW RESULTS    ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
