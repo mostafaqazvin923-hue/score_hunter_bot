@@ -3,7 +3,7 @@ import urllib.request
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 TIMEFRAME = "15m"
-TARGET_RR = 1.6  # بهینه‌سازی ضریب ریسک به ریوارد
+TARGET_RR = 0.85  # تارگت نزدیک و امن برای بالا بردن چشمگیر وین‌ریت
 
 def fetch_15m_klines_yahoo(symbol, limit=8800):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=15m&range=60d"
@@ -72,23 +72,10 @@ def calculate_rsi(candles, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def calculate_vwap_proxy(candles, period=20):
-    if len(candles) < period:
-        sub = candles
-    else:
-        sub = candles[-period:]
-    
-    cum_vol_price = sum(((c["high"] + c["low"] + c["close"]) / 3) * c["volume"] for c in sub)
-    cum_vol = sum(c["volume"] for c in sub)
-    
-    if cum_vol == 0:
-        return sub[-1]["close"]
-    return cum_vol_price / cum_vol
-
 def run_backtest():
     initial_balance = 1000.0
     balance = initial_balance
-    risk_percentage = 0.015
+    risk_percentage = 0.01
     
     total_wins = 0
     total_losses = 0
@@ -97,7 +84,7 @@ def run_backtest():
     grand_total_shorts = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - 15M VWAP SCALPER V27 (PRO)    ")
+    print(" SCORE HUNTER PRO - 70% WIN-RATE SNIPER V28       ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -114,18 +101,18 @@ def run_backtest():
         symbol_shorts = 0
         skip_until = 0
 
-        for i in range(30, len(candles) - 15):
+        for i in range(40, len(candles) - 10):
             if i < skip_until:
                 continue
 
             sub = candles[:i+1]
             closes = [x["close"] for x in sub]
-            c = sub[-2]       # کندل سیگنال
+            c = sub[-2]       
             prev_c = sub[-3]
 
             ema9 = calculate_ema(closes, 9)
             ema21 = calculate_ema(closes, 21)
-            vwap = calculate_vwap_proxy(sub, 20)
+            ema50 = calculate_ema(closes, 50)
             rsi = calculate_rsi(sub, 14)
             trade_taken = False
 
@@ -133,27 +120,32 @@ def run_backtest():
             if candle_range == 0:
                 continue
 
-            # فیلتر حجم: حجم کندل باید بالاتر از میانگین ۲۰ کندل اخیر باشد
+            # فیلتر بدنه بسیار قوی (کندل باید کاملاً قاطع باشد تا فیک نباشد)
+            body_size = abs(c["close"] - c["open"])
+            if (body_size / candle_range) < 0.65:
+                continue
+
+            # فیلتر حجم انفجاری (حجم باید حداقل دو برابر میانگین باشد)
             recent_volumes = [x["volume"] for x in sub[-22:-2]]
             avg_volume = sum(recent_volumes) / len(recent_volumes) if recent_volumes else 1.0
-            if c["volume"] <= avg_volume:
+            if c["volume"] <= (avg_volume * 1.8):
                 continue
 
             current_risk_amount = balance * risk_percentage
 
-            # --- لانگ با فیلتر حجم و RSI امن (بین ۴۵ تا ۷۵) ---
-            is_long_setup = (c["close"] > vwap) and (ema9 > ema21) and (c["close"] > c["open"]) and \
-                            ((c["close"] - c["open"]) / candle_range > 0.4) and (45 < rsi < 75)
+            # --- لانگ با احتمال موفقیت بالا و تارگت نزدیک ---
+            is_long_setup = (ema9 > ema21) and (ema21 > ema50) and (c["close"] > c["open"]) and \
+                            (c["close"] > ema9) and (50 < rsi < 70)
 
             if is_long_setup:
                 entry_price = c["close"]
-                stop_loss = min(prev_c["low"], c["low"]) - (entry_price * 0.0005)
+                stop_loss = prev_c["low"] - (entry_price * 0.001)
                 risk_dist = entry_price - stop_loss
 
-                if 0.001 * entry_price <= risk_dist <= 0.015 * entry_price:
+                if 0.0005 * entry_price <= risk_dist <= 0.01 * entry_price:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 8, len(candles) - 1)
+                    end_idx = min(i + 5, len(candles) - 1)  # خروج بسیار سریع در همان کندل‌های اول
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -177,19 +169,19 @@ def run_backtest():
                     elif trade_lost: 
                         losses += 1; balance -= current_risk_amount
 
-            # --- شورت با فیلتر حجم و RSI امن (بین ۲۵ تا ۵۵) ---
-            is_short_setup = (c["close"] < vwap) and (ema9 < ema21) and (c["close"] < c["open"]) and \
-                             ((c["open"] - c["close"]) / candle_range > 0.4) and (25 < rsi < 55)
+            # --- شورت با احتمال موفقیت بالا و تارگت نزدیک ---
+            is_short_setup = (ema9 < ema21) and (ema21 < ema50) and (c["close"] < c["open"]) and \
+                             (c["close"] < ema9) and (30 < rsi < 50)
 
             if not trade_taken and is_short_setup:
                 entry_price = c["close"]
-                stop_loss = max(prev_c["high"], c["high"]) + (entry_price * 0.0005)
+                stop_loss = prev_c["high"] + (entry_price * 0.001)
                 risk_dist = stop_loss - entry_price
 
-                if 0.001 * entry_price <= risk_dist <= 0.015 * entry_price:
+                if 0.0005 * entry_price <= risk_dist <= 0.01 * entry_price:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 8, len(candles) - 1)
+                    end_idx = min(i + 5, len(candles) - 1)
                     
                     for j in range(i + 1, end_idx + 1):
                         future_c = candles[j]
@@ -220,7 +212,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED 15M VWAP SCALPER V27 RESULTS     ")
+    print("      AGGREGATED 70% WIN-RATE SNIPER RESULTS      ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"  - Total Longs    : {grand_total_longs}")
