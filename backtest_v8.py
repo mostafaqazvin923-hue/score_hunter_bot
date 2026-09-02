@@ -3,32 +3,37 @@ import urllib.request
 import time
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
-INTERVAL = "1h"
+INTERVAL = "60"  # کندل 1 ساعته در بای‌بیت
 TARGET_RR = 2.0
 
-def fetch_binance_full_year(symbol):
+def fetch_bybit_full_year(symbol):
     all_candles = []
-    # یک سال معادل حدود 8760 کندل 1 ساعته است. بایننس در هر درخواست حداکثر 1000 کندل می‌دهد.
-    # برای گرفتن یک سال کامل، به صورت حلقه عقب‌گرد (Pagination) درخواست می‌فرستیم.
+    # بای‌بیت در هر درخواست حداکثر 1000 کندل می‌دهد. با لوپ عقب‌گرد (Pagination) یک سال کامل (8760 کندل) را می‌گیریم.
     end_time = int(time.time() * 1000)
-    # شروع از یک سال پیش (365 روز * 24 ساعت * 3600 ثانیه * 1000 میلی‌ثانیه)
     start_time_limit = end_time - (365 * 24 * 3600 * 1000)
     
     current_end = end_time
-    print(f"[*] Downloading 1-year historical data for {symbol} from Binance...")
+    print(f"[*] Downloading 1-year historical data for {symbol} from Bybit...")
 
     while True:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={INTERVAL}&limit=1000&endTime={current_end}"
+        url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval={INTERVAL}&limit=1000&end={current_end}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         try:
             with urllib.request.urlopen(req, timeout=30) as response:
                 raw = response.read().decode("utf-8")
-                rows = json.loads(raw)
-                if not rows:
+                payload = json.loads(raw)
+                
+                if payload.get("retCode") != 0:
+                    print(f"[!] Bybit API Error: {payload.get('retMsg')}")
+                    break
+                
+                list_data = payload.get("result", {}).get("list", [])
+                if not list_data:
                     break
                 
                 batch_candles = []
-                for row in rows:
+                for row in list_data:
+                    # ساختار بای‌بیت: [startTime, open, high, low, close, volume, turnover]
                     ts = int(row[0])
                     op = float(row[1])
                     hi = float(row[2])
@@ -40,21 +45,20 @@ def fetch_binance_full_year(symbol):
                         "low": lo, "close": cl, "volume": vol
                     })
                 
-                # مرتب‌سازی و اضافه کردن به لیست کل
+                # بای‌بیت داده‌ها را از جدید به قدیم برمی‌گرداند
                 batch_candles.sort(key=lambda x: x["timestamp"])
                 all_candles = batch_candles + all_candles
                 
-                # تنظیم بازه برای درخواست بعدی (قبلی‌تر)
                 oldest_ts = batch_candles[0]["timestamp"]
-                if oldest_ts <= start_time_limit or len(rows) < 1000:
+                if oldest_ts <= start_time_limit or len(list_data) < 1000:
                     break
                 current_end = oldest_ts - 1
-                time.sleep(0.2) # جلوگیری از بلاک شدن توسط سرور
+                time.sleep(0.1)
         except Exception as e:
-            print(f"[!] Error fetching Binance data for {symbol}: {e}")
+            print(f"[!] Error fetching Bybit data for {symbol}: {e}")
             break
 
-    # فیلتر کردن دقیقاً یک سال گذشته و مرتب‌سازی نهایی
+    # فیلتر دقیق یک سال گذشته
     all_candles = [c for c in all_candles if c["timestamp"] >= start_time_limit]
     all_candles.sort(key=lambda x: x["timestamp"])
     return all_candles
@@ -113,11 +117,11 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print("   SCORE HUNTER PRO - 3-LAYER WHALE (BINANCE 1Y)  ")
+    print("   SCORE HUNTER PRO - 3-LAYER WHALE (BYBIT 1Y)    ")
     print("==================================================")
 
     for symbol in SYMBOLS:
-        candles = fetch_binance_full_year(symbol)
+        candles = fetch_bybit_full_year(symbol)
         if not candles or len(candles) < 500:
             print(f"[!] Insufficient data for {symbol}")
             continue
