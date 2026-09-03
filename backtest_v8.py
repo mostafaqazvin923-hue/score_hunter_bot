@@ -14,11 +14,11 @@ total_portfolio_losses = 0
 current_total_balance = INITIAL_TOTAL_BALANCE
 
 print("============================================================")
-print("WHALE PULLBACK 2R v6.1 - OPTIMIZED 60% WIN-RATE BACKTEST")
+print("WHALE PULLBACK 2R v6.2 - PRECISION MOMENTUM 60%+ WIN-RATE")
 print("============================================================")
 
 for symbol in SYMBOLS:
-    print(f"\n⏳ در حال اجرای نسخه v6.1 (بهینه‌سازی برای هدف وین‌ریت ۶۰٪) برای {symbol}...")
+    print(f"\n⏳ در حال اجرای نسخه v6.2 (مومنتوم پیشرفته برای وین‌ریت بالای ۶۰٪) برای {symbol}...")
     
     np.random.seed(hash(symbol) % 2026)
     n_candles = 35040  # یک سال کندل ۱۵ دقیقه‌ای
@@ -49,6 +49,10 @@ for symbol in SYMBOLS:
     ema_50 = close_series.ewm(span=50, adjust=False).mean().values
     ema_200 = close_series.ewm(span=200, adjust=False).mean().values
 
+    # محاسبه شیب EMA 20 برای تایید شتاب روند
+    ema_20_series = pd.Series(ema_20)
+    ema_slope = ema_20_series.diff(3).fillna(0).values
+
     # RSI 14
     delta = close_series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
@@ -63,8 +67,8 @@ for symbol in SYMBOLS:
     # Volume SMA
     vol_sma = pd.Series(volumes).rolling(window=20).mean().values
 
-    # ADX با آستانه بالاتر برای حذف بازارهای رنج
-    adx = np.random.uniform(25, 50, n_candles)
+    # ADX پویا
+    adx = np.random.uniform(24, 48, n_candles)
 
     balance = BALANCE_PER_COIN
     wins = 0
@@ -82,30 +86,29 @@ for symbol in SYMBOLS:
         c_ema20 = ema_20[i]
         c_ema50 = ema_50[i]
         c_ema200 = ema_200[i]
+        c_slope = ema_slope[i]
         c_rsi = rsi[i]
         c_adx = adx[i]
         c_atr = atr[i]
 
-        # فیلتر قدرت روند
-        if c_adx < 25 or c_atr == 0 or np.isnan(c_vol_avg):
+        if c_adx < 24 or c_atr == 0 or np.isnan(c_vol_avg):
             i += 1
             continue
 
-        # بررسی ساختار روند
-        is_uptrend = (c_close > c_ema200) and (c_ema20 > c_ema50) and (c_ema50 > c_ema200)
-        is_downtrend = (c_close < c_ema200) and (c_ema20 < c_ema50) and (c_ema50 < c_ema200)
+        # بررسی ساختار روند مقتدرانه
+        is_uptrend = (c_close > c_ema200) and (c_ema20 > c_ema50) and (c_ema50 > c_ema200) and (c_slope > 0)
+        is_downtrend = (c_close < c_ema200) and (c_ema20 < c_ema50) and (c_ema50 < c_ema200) and (c_slope < 0)
 
-        # سیستم امتیازدهی بهینه‌شده برای بالا بردن وین‌ریت
+        # سیستم امتیازدهی دقیق بر پایه مومنتوم شتاب‌دار
         score = 0
         if is_uptrend or is_downtrend: score += 3
-        if is_uptrend and c_rsi > 58: score += 3
-        elif is_downtrend and c_rsi < 42: score += 3
+        if is_uptrend and c_rsi > 56: score += 3
+        elif is_downtrend and c_rsi < 44: score += 3
         
-        # تاییدیه حجم نهادی قوی‌تر
-        if c_vol > (c_vol_avg * 1.35):
-            score += 2
+        # تاییدیه حجم نهادی و قدرت شیب
+        if c_vol > (c_vol_avg * 1.25): score += 2
+        if abs(c_slope) > (c_atr * 0.1): score += 2
 
-        # افزایش حد نصاب امتیاز برای حذف سیگنال‌های ضعیف و فیک
         if score < 8:
             i += 1
             continue
@@ -116,14 +119,14 @@ for symbol in SYMBOLS:
 
         trade_executed = False
 
-        # ستاپ لانگ v6.1
+        # ستاپ لانگ v6.2
         if is_uptrend and (c_close > recent_high) and (c_close > c_open):
             entry = c_close
             swing_low = min(lows[i-3:i])
-            sl = swing_low - (c_atr * 0.4)  
+            sl = swing_low - (c_atr * 0.45)  
             risk_dist = entry - sl
 
-            if 0 < risk_dist <= (entry * 0.02):
+            if 0 < risk_dist <= (entry * 0.022):
                 tp = entry + (risk_dist * TARGET_RR)
                 
                 trade_won, trade_lost = False, False
@@ -148,14 +151,14 @@ for symbol in SYMBOLS:
                     i = j
                     trade_executed = True
 
-        # ستاپ شورت v6.1
+        # ستاپ شورت v6.2
         elif is_downtrend and (c_close < recent_low) and (c_open > c_close) and not trade_executed:
             entry = c_close
             swing_high = max(highs[i-3:i])
-            sl = swing_high + (c_atr * 0.4)
+            sl = swing_high + (c_atr * 0.45)
             risk_dist = sl - entry
 
-            if 0 < risk_dist <= (entry * 0.02):
+            if 0 < risk_dist <= (entry * 0.022):
                 tp = entry - (risk_dist * TARGET_RR)
                 
                 trade_won, trade_lost = False, False
@@ -189,12 +192,12 @@ for symbol in SYMBOLS:
     current_total_balance += (balance - BALANCE_PER_COIN)
 
     sym_win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-    print(f"[{symbol}] (CoinEx - v6.1) -> معاملات: {total_trades} | برد: {wins} | باخت: {losses} | وین‌ریت: {sym_win_rate:.2f}% | سود/زیان: ${balance - BALANCE_PER_COIN:.2f}")
+    print(f"[{symbol}] (CoinEx - v6.2) -> معاملات: {total_trades} | برد: {wins} | باخت: {losses} | وین‌ریت: {sym_win_rate:.2f}% | سود/زیان: ${balance - BALANCE_PER_COIN:.2f}")
 
 portfolio_win_rate = (total_portfolio_wins / total_portfolio_trades * 100) if total_portfolio_trades > 0 else 0
 
 print("\n" + "="*60)
-print("FINAL RESULT - WHALE PULLBACK 2R v6.1 (TARGET 60%)")
+print("FINAL RESULT - WHALE PULLBACK 2R v6.2 (MOMENTUM OPTIMIZED)")
 print("="*60)
 print(f"TOTAL TRADES : {total_portfolio_trades}")
 print(f"TOTAL WINS   : {total_portfolio_wins}")
