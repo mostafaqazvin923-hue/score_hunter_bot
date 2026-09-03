@@ -1,15 +1,13 @@
-import ccxt
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import time
 
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
+# نمادها در یاهو فایننس با ساختار USD هستند
+SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 INITIAL_TOTAL_BALANCE = 1000.0
 BALANCE_PER_COIN = INITIAL_TOTAL_BALANCE / len(SYMBOLS)
 TARGET_RR = 2.0
 RISK_PERCENTAGE = 0.01
-
-exchange = ccxt.coinex({'enableRateLimit': True})
 
 # ساخت بازه‌های ماهانه از سپتامبر 2025 تا سپتامبر 2026
 months = pd.date_range(start='2025-09-01', end='2026-09-01', freq='MS')
@@ -17,10 +15,9 @@ months = pd.date_range(start='2025-09-01', end='2026-09-01', freq='MS')
 grand_total_trades = 0
 grand_total_wins = 0
 grand_total_losses = 0
-current_total_balance = INITIAL_TOTAL_BALANCE
 
 print("============================================================")
-print("WHALE PULLBACK - MONTH-BY-MONTH REAL COINEX BACKTEST (1h)")
+print("WHALE PULLBACK - MONTH-BY-MONTH YAHOO FINANCE BACKTEST")
 print("============================================================")
 
 for symbol in SYMBOLS:
@@ -31,142 +28,124 @@ for symbol in SYMBOLS:
         start_date = months[i]
         end_date = months[i+1]
         
-        since = exchange.parse8601(start_date.strftime('%Y-%m-%dT%H:%M:%SZ'))
-        end_ts = exchange.parse8601(end_date.strftime('%Y-%m-%dT%H:%M:%SZ'))
-        
-        all_ohlcv = []
-        current_since = since
-        
-        # دریافت داده‌های ماهانه با تایم‌فریم 1h برای پوشش کامل تاریخچه
-        while current_since < end_ts:
-            try:
-                ohlcv = exchange.fetch_ohlcv(symbol, '1h', since=current_since, limit=1000)
-                if not ohlcv:
-                    break
-                
-                filtered_ohlcv = [c for c in ohlcv if c[0] < end_ts]
-                if not filtered_ohlcv:
-                    break
-                    
-                all_ohlcv.extend(filtered_ohlcv)
-                current_since = ohlcv[-1][0] + 1
-                
-                if len(ohlcv) < 1000:
-                    break
-                time.sleep(exchange.rateLimit / 1000)
-            except Exception as e:
-                time.sleep(3)
-                continue
-                
-        if len(all_ohlcv) < 200:
-            continue
+        try:
+            # دانلود داده‌های ساعتی یا روزانه با بازه مشخص از یاهو
+            df = yf.download(symbol, start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), interval='1h', progress=False)
             
-        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        
-        closes = df['close'].values
-        highs = df['high'].values
-        lows = df['low'].values
-        opens = df['open'].values
-        volumes = df['volume'].values
-        
-        # اندیکاتورها
-        close_series = pd.Series(closes)
-        ema_20 = close_series.ewm(span=20, adjust=False).mean().values
-        ema_50 = close_series.ewm(span=50, adjust=False).mean().values
-        ema_200 = close_series.ewm(span=200, adjust=False).mean().values
-        
-        tr = np.maximum(highs - lows, np.maximum(abs(highs - np.roll(closes, 1)), abs(lows - np.roll(closes, 1))))
-        atr = pd.Series(tr).rolling(window=14).mean().fillna(value=0).values
-        vol_sma = pd.Series(volumes).rolling(window=20).mean().values
-        
-        m_wins, m_losses, m_trades = 0, 0, 0
-        i_idx = 200
-        cooldown = 0
-
-        while i_idx < len(df) - 30:
-            if cooldown > 0:
-                cooldown -= 1
-                i_idx += 1
+            if df.empty or len(df) < 50:
                 continue
+                
+            # پاکسازی فرمت ستون‌ها در صورت چندسطحی بودن در yfinance جدید
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+                
+            closes = df['Close'].values
+            highs = df['High'].values
+            lows = df['Low'].values
+            opens = df['Open'].values
+            volumes = df['Volume'].values
+            
+            # اندیکاتورها
+            close_series = pd.Series(closes)
+            ema_20 = close_series.ewm(span=20, adjust=False).mean().values
+            ema_50 = close_series.ewm(span=50, adjust=False).mean().values
+            ema_200 = close_series.ewm(span=200, adjust=False).mean().values
+            
+            tr = np.maximum(highs - lows, np.maximum(abs(highs - np.roll(closes, 1)), abs(lows - np.roll(closes, 1))))
+            atr = pd.Series(tr).rolling(window=14).mean().fillna(value=0).values
+            vol_sma = pd.Series(volumes).rolling(window=20).mean().values
+            
+            m_wins, m_losses, m_trades = 0, 0, 0
+            idx = 50
+            cooldown = 0
 
-            c_close, c_open, c_high, c_low = closes[i_idx], opens[i_idx], highs[i_idx], lows[i_idx]
-            c_vol, c_vol_avg = volumes[i_idx], vol_sma[i_idx]
-            c_ema20, c_ema50, c_ema200 = ema_20[i_idx], ema_50[i_idx], ema_200[i_idx]
-            c_atr = atr[i_idx]
+            while idx < len(df) - 24:
+                if cooldown > 0:
+                    cooldown -= 1
+                    idx += 1
+                    continue
 
-            if c_atr == 0 or np.isnan(c_vol_avg):
-                i_idx += 1
-                continue
+                c_close, c_open, c_high, c_low = closes[idx], opens[idx], highs[idx], lows[idx]
+                c_vol, c_vol_avg = volumes[idx], vol_sma[idx]
+                c_ema20, c_ema50, c_ema200 = ema_20[idx], ema_50[idx], ema_200[idx]
+                c_atr = atr[idx]
 
-            is_uptrend = (c_close > c_ema200) and (c_ema20 > c_ema50)
-            is_downtrend = (c_close < c_ema200) and (c_ema20 < c_ema50)
+                if c_atr == 0 or np.isnan(c_vol_avg):
+                    idx += 1
+                    continue
 
-            if not is_uptrend and not is_downtrend:
-                i_idx += 1
-                continue
+                # شرایط روند (همان منطق روانِ تست اولیه)
+                is_uptrend = (c_close > c_ema200) and (c_ema20 > c_ema50)
+                is_downtrend = (c_close < c_ema200) and (c_ema20 < c_ema50)
 
-            lookback = 10
-            recent_high = max(highs[i_idx-lookback:i_idx])
-            recent_low = min(lows[i_idx-lookback:i_idx])
-            trade_executed = False
+                if not is_uptrend and not is_downtrend:
+                    idx += 1
+                    continue
 
-            # لانگ
-            if is_uptrend and (c_close > recent_high) and (c_vol > c_vol_avg):
-                entry = c_close
-                sl = min(lows[i_idx-3:i_idx+1]) - (c_atr * 0.5)
-                risk_dist = entry - sl
-                if risk_dist > 0:
-                    tp = entry + (risk_dist * TARGET_RR)
-                    won, lost = False, False
-                    for j in range(i_idx + 1, min(i_idx + 24, len(df))):
-                        if highs[j] >= tp: won = True; break
-                        if lows[j] <= sl: lost = True; break
-                    if won or lost:
-                        m_trades += 1
-                        grand_total_trades += 1
-                        risk_amount = symbol_balance * RISK_PERCENTAGE
-                        if won:
-                            m_wins += 1; grand_total_wins += 1
-                            symbol_balance += (risk_amount * TARGET_RR)
-                        else:
-                            m_losses += 1; grand_total_losses += 1
-                            symbol_balance -= risk_amount
-                        i_idx = j; cooldown = 3; trade_executed = True
+                lookback = 10
+                recent_high = max(highs[idx-lookback:idx])
+                recent_low = min(lows[idx-lookback:idx])
+                trade_executed = False
 
-            # شورت
-            elif is_downtrend and (c_close < recent_low) and (c_vol > c_vol_avg) and not trade_executed:
-                entry = c_close
-                sl = max(highs[i_idx-3:i_idx+1]) + (c_atr * 0.5)
-                risk_dist = sl - entry
-                if risk_dist > 0:
-                    tp = entry - (risk_dist * TARGET_RR)
-                    won, lost = False, False
-                    for j in range(i_idx + 1, min(i_idx + 24, len(df))):
-                        if lows[j] <= tp: won = True; break
-                        if highs[j] >= sl: lost = True; break
-                    if won or lost:
-                        m_trades += 1
-                        grand_total_trades += 1
-                        risk_amount = symbol_balance * RISK_PERCENTAGE
-                        if won:
-                            m_wins += 1; grand_total_wins += 1
-                            symbol_balance += (risk_amount * TARGET_RR)
-                        else:
-                            m_losses += 1; grand_total_losses += 1
-                            symbol_balance -= risk_amount
-                        i_idx = j; cooldown = 3; trade_executed = True
+                # لانگ
+                if is_uptrend and (c_close > recent_high) and (c_vol > c_vol_avg):
+                    entry = c_close
+                    sl = min(lows[idx-3:idx+1]) - (c_atr * 0.5)
+                    risk_dist = entry - sl
+                    if risk_dist > 0:
+                        tp = entry + (risk_dist * TARGET_RR)
+                        won, lost = False, False
+                        for j in range(idx + 1, min(idx + 24, len(df))):
+                            if highs[j] >= tp: won = True; break
+                            if lows[j] <= sl: lost = True; break
+                        if won or lost:
+                            m_trades += 1
+                            grand_total_trades += 1
+                            risk_amount = symbol_balance * RISK_PERCENTAGE
+                            if won:
+                                m_wins += 1; grand_total_wins += 1
+                                symbol_balance += (risk_amount * TARGET_RR)
+                            else:
+                                m_losses += 1; grand_total_losses += 1
+                                symbol_balance -= risk_amount
+                            idx = j; cooldown = 3; trade_executed = True
 
-            if not trade_executed:
-                i_idx += 1
+                # شورت
+                elif is_downtrend and (c_close < recent_low) and (c_vol > c_vol_avg) and not trade_executed:
+                    entry = c_close
+                    sl = max(highs[idx-3:idx+1]) + (c_atr * 0.5)
+                    risk_dist = sl - entry
+                    if risk_dist > 0:
+                        tp = entry - (risk_dist * TARGET_RR)
+                        won, lost = False, False
+                        for j in range(idx + 1, min(idx + 24, len(df))):
+                            if lows[j] <= tp: won = True; break
+                            if highs[j] >= sl: lost = True; break
+                        if won or lost:
+                            m_trades += 1
+                            grand_total_trades += 1
+                            risk_amount = symbol_balance * RISK_PERCENTAGE
+                            if won:
+                                m_wins += 1; grand_total_wins += 1
+                                symbol_balance += (risk_amount * TARGET_RR)
+                            else:
+                                m_losses += 1; grand_total_losses += 1
+                                symbol_balance -= risk_amount
+                            idx = j; cooldown = 3; trade_executed = True
 
-        if m_trades > 0:
-            print(f"    ماه {start_date.strftime('%Y-%m')} -> معاملات: {m_trades} | برد: {m_wins} | باخت: {m_losses}")
+                if not trade_executed:
+                    idx += 1
+
+            if m_trades > 0:
+                print(f"    ماه {start_date.strftime('%Y-%m')} -> معاملات: {m_trades} | برد: {m_wins} | باخت: {m_losses}")
+
+        except Exception as e:
+            continue
 
 overall_win_rate = (grand_total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
 print("\n" + "="*60)
-print("FINAL 1-YEAR AGGREGATED RESULT (1h TIMEFRAME)")
+print("FINAL 1-YEAR AGGREGATED RESULT (YAHOO FINANCE)")
 print("="*60)
 print(f"TOTAL TRADES : {grand_total_trades}")
 print(f"TOTAL WINS   : {grand_total_wins}")
