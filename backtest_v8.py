@@ -18,11 +18,11 @@ total_short_wins = 0
 current_total_balance = INITIAL_TOTAL_BALANCE
 
 print("============================================================")
-print("WHALE PULLBACK v10 - BREAK-EVEN & FULL TARGET OPTIMized")
+print("WHALE PULLBACK 2R v11 - CLEAN BREAK-EVEN OPTIMIZED")
 print("============================================================")
 
 for symbol in SYMBOLS:
-    print(f"\n⏳ در حال اجرای نسخه v10 (ایده ریسک‌فری هوشمند) برای {symbol}...")
+    print(f"\n⏳ در حال اجرای نسخه v11 (ثبات وین‌ریت بالا + ریسک‌فری تمیز) برای {symbol}...")
     
     np.random.seed(hash(symbol) % 2026)
     n_candles = 35040  # یک سال کندل ۱۵ دقیقه‌ای
@@ -62,7 +62,7 @@ for symbol in SYMBOLS:
     atr = pd.Series(tr).rolling(window=14).mean().fillna(value=0).values
 
     vol_sma = pd.Series(volumes).rolling(window=20).mean().values
-    adx = np.random.uniform(25, 50, n_candles)
+    adx = np.random.uniform(23, 46, n_candles)
 
     balance = BALANCE_PER_COIN
     wins = 0
@@ -90,7 +90,7 @@ for symbol in SYMBOLS:
         c_adx = adx[i]
         c_atr = atr[i]
 
-        if c_adx < 25 or c_atr == 0 or np.isnan(c_vol_avg):
+        if c_adx < 23 or c_atr == 0 or np.isnan(c_vol_avg):
             i += 1
             continue
 
@@ -99,11 +99,11 @@ for symbol in SYMBOLS:
 
         score = 0
         if is_uptrend or is_downtrend: score += 3
-        if is_uptrend and c_rsi > 58: score += 3
-        elif is_downtrend and c_rsi < 42: score += 3
-        if c_vol > (c_vol_avg * 1.3): score += 2
+        if is_uptrend and c_rsi > 55: score += 2
+        elif is_downtrend and c_rsi < 45: score += 2
+        if c_vol > (c_vol_avg * 1.2): score += 2
 
-        if score < 8:
+        if score < 7:
             i += 1
             continue
 
@@ -113,106 +113,94 @@ for symbol in SYMBOLS:
 
         trade_executed = False
 
-        # ستاپ لانگ v10 (با ایده ریسک‌فری کامل در RR 1 و پوزیشن کامل تا RR 2)
+        # ستاپ لانگ v11 با منطق پایدار و ریسک‌فری تمیز
         if is_uptrend and (c_close > recent_high) and (c_close > c_open):
             entry = c_close
             swing_low = min(lows[i-3:i])
-            sl = swing_low - (c_atr * 0.4)
+            sl = swing_low - (c_atr * 0.5)
             risk_dist = entry - sl
 
-            if 0 < risk_dist <= (entry * 0.02):
-                tp_1 = entry + risk_dist         # هدف اول برای انتقال SL به نقطه ورود (Break-even)
-                tp_2 = entry + (risk_dist * TARGET_RR) # هدف نهایی روی RR 2
+            if 0 < risk_dist <= (entry * 0.025):
+                tp_1 = entry + risk_dist         # هدف اول برای فعال‌سازی ریسک‌فری (Break-even)
+                tp_2 = entry + (risk_dist * TARGET_RR) # هدف نهایی RR 2
                 
-                trade_won, trade_lost = False, False
+                trade_result = "LOSS"  # پیش‌فرض باخت
                 current_sl = sl
                 
                 for j in range(i + 1, min(i + 24, len(df))):
-                    # بررسی برخورد با حد ضرر (یا نقطه ورود ریسک‌فری شده)
-                    if lows[j] <= current_sl:
-                        # اگر SL روی نقطه ورود بوده، معامله نه برد است و نه باخت (سربه-سر / رد می‌شود)
-                        break
-                    
-                    # بررسی رسیدن به RR 1 برای ریسک‌فری کردن
-                    if highs[j] >= tp_1 and current_sl < entry:
-                        current_sl = entry  # انتقال دقیق حد ضرر به قیمت ورود
-                    
-                    # بررسی رسیدن به هدف نهایی RR 2
                     if highs[j] >= tp_2:
-                        trade_won = True
+                        trade_result = "WIN"
+                        break
+                    if not (current_sl == entry) and highs[j] >= tp_1:
+                        current_sl = entry  # ریسک‌فری شدن
+                    if lows[j] <= current_sl:
+                        if current_sl == entry:
+                            trade_result = "BE"  # سربه-سر (بدون سود و زیان)
+                        else:
+                            trade_result = "LOSS"
                         break
 
-                # ثبت نتیجه (اگر trade_won باشد سود کامل RR 2 وگرنه اگر ریسک‌فری شده باشد بدون ضرر رد می‌شود)
-                if trade_won or current_sl == entry:
-                    total_trades += 1
-                    sym_long_trades += 1
-                    total_long_trades += 1
-                    risk_amount = balance * RISK_PERCENTAGE
-                    if trade_won:
-                        wins += 1
-                        sym_long_wins += 1
-                        total_long_wins += 1
-                        balance += (risk_amount * TARGET_RR)  # سود کامل ۱ به ۲
-                    # اگر ریسک‌فری شده باشد، balance تغییری نمی‌کند (نه سود، نه ضرر)
-                    
-                    i = j
-                    trade_executed = True
-                else:
-                    # اگر به نقطه ورود یا RR1 نرسیده و مستقیم خورده به SL اولیه
-                    total_trades += 1
-                    sym_long_trades += 1
-                    total_long_trades += 1
-                    losses += 1
-                    balance -= (balance * RISK_PERCENTAGE)
-                    i = j
-                    trade_executed = True
+                total_trades += 1
+                sym_long_trades += 1
+                total_long_trades += 1
+                risk_amount = balance * RISK_PERCENTAGE
 
-        # ستاپ شورت v10 (با ایده ریسک‌فری کامل در RR 1)
+                if trade_result == "WIN":
+                    wins += 1
+                    sym_long_wins += 1
+                    total_long_wins += 1
+                    balance += (risk_amount * TARGET_RR)
+                elif trade_result == "LOSS":
+                    losses += 1
+                    balance -= risk_amount
+                # اگر BE باشد، balance تغییری نمی‌کند
+                
+                i = j
+                trade_executed = True
+
+        # ستاپ شورت v11 با منطق پایدار و ریسک‌فری تمیز
         elif is_downtrend and (c_close < recent_low) and (c_open > c_close) and not trade_executed:
             entry = c_close
             swing_high = max(highs[i-3:i])
-            sl = swing_high + (c_atr * 0.4)
+            sl = swing_high + (c_atr * 0.5)
             risk_dist = sl - entry
 
-            if 0 < risk_dist <= (entry * 0.02):
+            if 0 < risk_dist <= (entry * 0.025):
                 tp_1 = entry - risk_dist
                 tp_2 = entry - (risk_dist * TARGET_RR)
                 
-                trade_won, trade_lost = False, False
+                trade_result = "LOSS"
                 current_sl = sl
                 
                 for j in range(i + 1, min(i + 24, len(df))):
-                    if highs[j] >= current_sl:
-                        break
-                    
-                    if lows[j] <= tp_1 and current_sl > entry:
-                        current_sl = entry
-                    
                     if lows[j] <= tp_2:
-                        trade_won = True
+                        trade_result = "WIN"
+                        break
+                    if not (current_sl == entry) and lows[j] <= tp_1:
+                        current_sl = entry
+                    if highs[j] >= current_sl:
+                        if current_sl == entry:
+                            trade_result = "BE"
+                        else:
+                            trade_result = "LOSS"
                         break
 
-                if trade_won or current_sl == entry:
-                    total_trades += 1
-                    sym_short_trades += 1
-                    total_short_trades += 1
-                    risk_amount = balance * RISK_PERCENTAGE
-                    if trade_won:
-                        wins += 1
-                        sym_short_wins += 1
-                        total_short_wins += 1
-                        balance += (risk_amount * TARGET_RR)
-                    
-                    i = j
-                    trade_executed = True
-                else:
-                    total_trades += 1
-                    sym_short_trades += 1
-                    total_short_trades += 1
+                total_trades += 1
+                sym_short_trades += 1
+                total_short_trades += 1
+                risk_amount = balance * RISK_PERCENTAGE
+
+                if trade_result == "WIN":
+                    wins += 1
+                    sym_short_wins += 1
+                    total_short_wins += 1
+                    balance += (risk_amount * TARGET_RR)
+                elif trade_result == "LOSS":
                     losses += 1
-                    balance -= (balance * RISK_PERCENTAGE)
-                    i = j
-                    trade_executed = True
+                    balance -= risk_amount
+                
+                i = j
+                trade_executed = True
 
         if not trade_executed:
             i += 1
@@ -223,14 +211,14 @@ for symbol in SYMBOLS:
     current_total_balance += (balance - BALANCE_PER_COIN)
 
     sym_win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-    print(f"[{symbol}] (CoinEx - v10) -> معاملات: {total_trades} (لانگ: {sym_long_trades}, شورت: {sym_short_trades}) | وین‌ریت: {sym_win_rate:.2f}% | سود: ${balance - BALANCE_PER_COIN:.2f}")
+    print(f"[{symbol}] (CoinEx - v11) -> معاملات: {total_trades} (لانگ: {sym_long_trades}, شورت: {sym_short_trades}) | وین‌ریت: {sym_win_rate:.2f}% | سود: ${balance - BALANCE_PER_COIN:.2f}")
 
 portfolio_win_rate = (total_portfolio_wins / total_portfolio_trades * 100) if total_portfolio_trades > 0 else 0
 long_win_rate = (total_long_wins / total_long_trades * 100) if total_long_trades > 0 else 0
 short_win_rate = (total_short_wins / total_short_trades * 100) if total_short_trades > 0 else 0
 
 print("\n" + "="*60)
-print("FINAL RESULT - WHALE PULLBACK 2R v10 (BREAK-EVEN IDEAL)")
+print("FINAL RESULT - WHALE PULLBACK 2R v11 (CLEAN BREAK-EVEN)")
 print("="*60)
 print(f"TOTAL TRADES  : {total_portfolio_trades}")
 print(f"  - LONG TRADES  : {total_long_trades} (موفق: {total_long_wins} | وین‌ریت: {long_win_rate:.2f}%)")
