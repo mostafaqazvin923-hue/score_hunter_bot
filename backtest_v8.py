@@ -14,11 +14,11 @@ total_portfolio_losses = 0
 current_total_balance = INITIAL_TOTAL_BALANCE
 
 print("============================================================")
-print("WHALE PULLBACK 2R v3 - HIGH WIN-RATE FILTERED BACKTEST")
+print("WHALE PULLBACK 2R v4 - ELITE WIN-RATE OPTIMIZED BACKTEST")
 print("============================================================")
 
 for symbol in SYMBOLS:
-    print(f"\n⏳ در حال دریافت و اعمال فیلترهای سخت‌گیرانه وین‌ریت بالا برای {symbol}...")
+    print(f"\n⏳ در حال اجرای نسخه v4 (بهینه‌سازی پولبک و وین‌ریت بالا) برای {symbol}...")
     
     np.random.seed(hash(symbol) % 2026)
     n_candles = 35040  # یک سال کندل ۱۵ دقیقه‌ای
@@ -60,11 +60,11 @@ for symbol in SYMBOLS:
     tr = np.maximum(highs - lows, np.maximum(abs(highs - np.roll(closes, 1)), abs(lows - np.roll(closes, 1))))
     atr = pd.Series(tr).rolling(window=14).mean().fillna(value=0).values
 
-    # Volume SMA برای تایید حجم نهادی
+    # Volume SMA
     vol_sma = pd.Series(volumes).rolling(window=20).mean().values
 
-    # ADX شبیه‌سازی‌شده قوی‌تر برای شناسایی روندهای واقعی
-    adx = np.random.uniform(22, 45, n_candles)
+    # ADX قوی‌تر
+    adx = np.random.uniform(24, 48, n_candles)
 
     balance = BALANCE_PER_COIN
     wins = 0
@@ -86,48 +86,44 @@ for symbol in SYMBOLS:
         c_adx = adx[i]
         c_atr = atr[i]
 
-        # فیلتر طلایی عدم معامله در رنج
-        if c_adx < 22 or c_atr == 0 or np.isnan(c_vol_avg):
+        if c_adx < 24 or c_atr == 0 or np.isnan(c_vol_avg):
             i += 1
             continue
 
-        # سیستم امتیازدهی سخت‌گیرانه (حداقل امتیاز برای ورود)
-        score = 0
-        
-        # 1. تایید روند قدرتمند
+        # فیلتر دقیق روند
         is_uptrend = (c_close > c_ema200) and (c_ema20 > c_ema50) and (c_ema50 > c_ema200)
         is_downtrend = (c_close < c_ema200) and (c_ema20 < c_ema50) and (c_ema50 < c_ema200)
+
+        # سیستم امتیازدهی پیشرفته v4 (تایید پولبک به EMA 20)
+        score = 0
+        if is_uptrend or is_downtrend: score += 3
+        if is_uptrend and c_rsi > 58: score += 2
+        elif is_downtrend and c_rsi < 42: score += 2
         
-        if is_uptrend or is_downtrend:
-            score += 3
+        if c_vol > (c_vol_avg * 1.3): score += 2  # تایید حجم نهادی سنگینتر
 
-        # 2. فیلتر RSI دقیق
-        if is_uptrend and c_rsi > 55: score += 2
-        elif is_downtrend and c_rsi < 45: score += 2
+        # شرط طلایی پولبک تمیز به نواحی کلیدی EMA
+        is_clean_pullback_long = is_uptrend and (c_low <= c_ema20 * 1.002) and (c_close > c_ema20)
+        is_clean_pullback_short = is_downtrend and (c_high >= c_ema20 * 0.998) and (c_close < c_ema20)
 
-        # 3. فیلتر حجم بالا (تایید حضور نهادی)
-        if c_vol > (c_vol_avg * 1.25):
-            score += 2
-
-        # اگر امتیاز به حد نصاب (حداقل 7 از 7 برای ورود تراز اول) نرسد، معامله کورکورانه حذف می‌شود
-        if score < 7:
+        if score < 7 or not (is_clean_pullback_long or is_clean_pullback_short):
             i += 1
             continue
 
-        lookback = 12
+        lookback = 10
         recent_high = max(highs[i-lookback:i])
         recent_low = min(lows[i-lookback:i])
 
         trade_executed = False
 
-        # ستاپ لانگ با وین‌ریت بالا
-        if is_uptrend and (c_close > recent_high) and (c_close > c_open):
+        # ستاپ لانگ v4
+        if is_clean_pullback_long and (c_close > c_open):
             entry = c_close
             swing_low = min(lows[i-3:i])
-            sl = swing_low - (c_atr * 0.5)
+            sl = swing_low - (c_atr * 0.4)
             risk_dist = entry - sl
 
-            if 0 < risk_dist <= (entry * 0.025):
+            if 0 < risk_dist <= (entry * 0.02):
                 tp = entry + (risk_dist * TARGET_RR) # RR کاملا ثابت ۱ به ۲
                 
                 trade_won, trade_lost = False, False
@@ -152,14 +148,14 @@ for symbol in SYMBOLS:
                     i = j
                     trade_executed = True
 
-        # ستاپ شورت با وین‌ریت بالا
-        elif is_downtrend and (c_close < recent_low) and (c_open > c_close) and not trade_executed:
+        # ستاپ شورت v4
+        elif is_clean_pullback_short and (c_open > c_close) and not trade_executed:
             entry = c_close
             swing_high = max(highs[i-3:i])
-            sl = swing_high + (c_atr * 0.5)
+            sl = swing_high + (c_atr * 0.4)
             risk_dist = sl - entry
 
-            if 0 < risk_dist <= (entry * 0.025):
+            if 0 < risk_dist <= (entry * 0.02):
                 tp = entry - (risk_dist * TARGET_RR) # RR کاملا ثابت ۱ به ۲
                 
                 trade_won, trade_lost = False, False
@@ -193,12 +189,12 @@ for symbol in SYMBOLS:
     current_total_balance += (balance - BALANCE_PER_COIN)
 
     sym_win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-    print(f"[{symbol}] (CoinEx - v3) -> معاملات: {total_trades} | برد: {wins} | باخت: {losses} | وین‌ریت: {sym_win_rate:.2f}% | سود/زیان: ${balance - BALANCE_PER_COIN:.2f}")
+    print(f"[{symbol}] (CoinEx - v4) -> معاملات: {total_trades} | برد: {wins} | باخت: {losses} | وین‌ریت: {sym_win_rate:.2f}% | سود/زیان: ${balance - BALANCE_PER_COIN:.2f}")
 
 portfolio_win_rate = (total_portfolio_wins / total_portfolio_trades * 100) if total_portfolio_trades > 0 else 0
 
 print("\n" + "="*60)
-print("FINAL RESULT - WHALE PULLBACK 2R v3 (HIGH WIN-RATE)")
+print("FINAL RESULT - WHALE PULLBACK 2R v4 (ELITE)")
 print("="*60)
 print(f"TOTAL TRADES : {total_portfolio_trades}")
 print(f"TOTAL WINS   : {total_portfolio_wins}")
