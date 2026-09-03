@@ -3,7 +3,7 @@ import urllib.request
 import time
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
-TARGET_RR = 2.0  # قفل شده روی ۱ به ۲ طبق درخواست شما
+TARGET_RR = 2.0  # قفل شده روی ۱ به ۲ به دستور شما
 
 def fetch_1year_15m_auto(symbol):
     all_candles = {}
@@ -83,7 +83,7 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - V13.0 (SMC BOS + ORDER BLOCK) ")
+    print(" SCORE HUNTER PRO - V14.0 (INSTITUTIONAL SQUEEZE) ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -95,7 +95,8 @@ def run_backtest():
             continue
         
         closes = [c["close"] for c in candles]
-        ema_200 = calculate_ema(closes, 200)
+        volumes = [c["volume"] for c in candles]
+        ema_150 = calculate_ema(closes, 150)
         atr_vals = calculate_atr(candles, 14)
 
         wins = 0
@@ -103,29 +104,31 @@ def run_backtest():
         symbol_trades = 0
         skip_until = 0
 
-        # فیلتر سخت‌گیرانه ساختار بازار برای بالا بردن چشمگیر وین‌ریت
-        for i in range(200, len(candles) - 40):
+        for i in range(150, len(candles) - 40):
             if i < skip_until:
                 continue
 
             c = candles[i]
             prev = candles[i-1]
             prev2 = candles[i-2]
-            trend = ema_200[i]
+            trend = ema_150[i]
             atr = atr_vals[i]
+
+            # میانگین حجم ۲۰ کندل گذشته برای تشخیص حجم نهادی
+            avg_vol = sum(volumes[i-20:i]) / 20 if i >= 20 else volumes[i]
 
             current_risk_amount = balance * risk_percentage
             trade_taken = False
 
-            # تاییدیه ساختار صعودی (Bullish BOS + Order Block Retest)
-            is_macro_bullish = c["close"] > trend
-            is_bullish_bos = c["close"] > max(prev["high"], prev2["high"])
-            # بررسی پولبک تمیز به محدوده تقاضا
-            is_order_block_zone = c["low"] <= (prev["low"] + prev["high"]) / 2
+            # فیلتر سخت‌گیرانه فشردگی و انفجار صعودی (Bullish Squeeze Breakout)
+            is_bullish_trend = c["close"] > trend
+            is_volume_spike = c["volume"] > (avg_vol * 1.5) # حجم حداقل ۵۰ درصد بالاتر از میانگین
+            is_price_expansion = (c["close"] - c["open"]) > (atr * 0.8) # کندل قدرتمند صعودی
+            is_breakout = c["close"] > max(prev["high"], prev2["high"])
 
-            if is_macro_bullish and is_bullish_bos and is_order_block_zone and atr > 0:
+            if is_bullish_trend and is_volume_spike and is_price_expansion and is_breakout and atr > 0:
                 entry_price = c["close"]
-                stop_loss = entry_price - (atr * 1.5)  # حد ضرر ایمن مبتنی بر نوسان واقعی ATR
+                stop_loss = entry_price - (atr * 1.2) # استاپ تایتل و مهندسی شده با ATR
                 risk_dist = entry_price - stop_loss
 
                 if risk_dist > 0:
@@ -142,7 +145,7 @@ def run_backtest():
 
                     if trade_won or trade_lost:
                         symbol_trades += 1
-                        skip_until = j + 10 # فاصله گذاری بین معاملات برای کنترل تعداد سیگنال روزانه
+                        skip_until = j + 15 # جلوگیری از اورتریدینگ و فیلتر سیگنال‌های اضافی
                         trade_taken = True
                         if trade_won:
                             wins += 1
@@ -151,14 +154,14 @@ def run_backtest():
                             losses += 1
                             balance -= current_risk_amount
 
-            # تاییدیه ساختار نزولی (Bearish BOS + Order Block Retest)
-            is_macro_bearish = c["close"] < trend
-            is_bearish_bos = c["close"] < min(prev["low"], prev2["low"])
-            is_bearish_ob_zone = c["high"] >= (prev["low"] + prev["high"]) / 2
+            # فیلتر سخت‌گیرانه فشردگی و انفجار نزولی (Bearish Squeeze Breakdown)
+            is_bearish_trend = c["close"] < trend
+            is_bearish_expansion = (prev["open"] - c["close"]) > (atr * 0.8)
+            is_bearish_breakout = c["close"] < min(prev["low"], prev2["low"])
 
-            if not trade_taken and is_macro_bearish and is_bearish_bos and is_bearish_ob_zone and atr > 0:
+            if not trade_taken and is_bearish_trend and is_volume_spike and is_bearish_expansion and is_bearish_breakout and atr > 0:
                 entry_price = c["close"]
-                stop_loss = entry_price + (atr * 1.5)
+                stop_loss = entry_price + (atr * 1.2)
                 risk_dist = stop_loss - entry_price
 
                 if risk_dist > 0:
@@ -175,7 +178,7 @@ def run_backtest():
 
                     if trade_won or trade_lost:
                         symbol_trades += 1
-                        skip_until = j + 10
+                        skip_until = j + 15
                         if trade_won:
                             wins += 1
                             balance += (current_risk_amount * TARGET_RR)
@@ -191,7 +194,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED V13.0 RESULTS                    ")
+    print("      AGGREGATED V14.0 RESULTS                    ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
