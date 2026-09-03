@@ -70,7 +70,7 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - SMC WHALE SETUP (1-YEAR)    ")
+    print(" SCORE HUNTER PRO - SMC WHALE SETUP (FIXED)       ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -82,7 +82,7 @@ def run_backtest():
             continue
         
         closes = [c["close"] for c in candles]
-        emas_200 = calculate_ema(closes, 200) # فیلتر جهت روند کلان نهنگ‌ها
+        emas_200 = calculate_ema(closes, 200)
 
         wins = 0
         losses = 0
@@ -98,15 +98,17 @@ def run_backtest():
             prev2_c = candles[i-2]
             trend_ema = emas_200[i]
 
-            # پیدا کردن سقف و کف‌های محدوده نقدینگی (۲۰ کندل قبل)
-            lookback = candles[i-20:i]
+            # اصلاح بازه نگاه به گذشته برای جلوگیری از خودارزیابی
+            lookback = candles[i-25:i-2]
+            if not lookback:
+                continue
             liquidity_high = max([x["high"] for x in lookback])
             liquidity_low = min([x["low"] for x in lookback])
 
             current_risk_amount = balance * risk_percentage
             trade_taken = False
 
-            # --- ستاپ لانگ (شکار نقدینگی کف + تاییدیه شکست ساختار صعودی + همراستا با روند) ---
+            # --- ستاپ لانگ ---
             is_sweep_low = prev_c["low"] < liquidity_low
             is_mss_bullish = c["close"] > prev_c["high"] and c["close"] > c["open"]
             is_above_trend = c["close"] > trend_ema
@@ -137,7 +139,7 @@ def run_backtest():
                         else:
                             losses += 1; balance -= current_risk_amount
 
-            # --- ستاپ شورت (شکار نقدینگی سقف + تاییدیه شکست ساختار نزولی + همراستا با روند) ---
+            # --- ستاپ شورت ---
             is_sweep_high = prev_c["high"] > liquidity_high
             is_mss_bearish = c["close"] < prev_c["low"] and c["close"] < c["open"]
             is_below_trend = c["close"] < trend_ema
