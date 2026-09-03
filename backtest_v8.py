@@ -2,14 +2,12 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-# نمادها در یاهو فایننس با ساختار USD هستند
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 INITIAL_TOTAL_BALANCE = 1000.0
 BALANCE_PER_COIN = INITIAL_TOTAL_BALANCE / len(SYMBOLS)
 TARGET_RR = 2.0
 RISK_PERCENTAGE = 0.01
 
-# ساخت بازه‌های ماهانه از سپتامبر 2025 تا سپتامبر 2026
 months = pd.date_range(start='2025-09-01', end='2026-09-01', freq='MS')
 
 grand_total_trades = 0
@@ -17,7 +15,7 @@ grand_total_wins = 0
 grand_total_losses = 0
 
 print("============================================================")
-print("WHALE PULLBACK - MONTH-BY-MONTH YAHOO FINANCE BACKTEST")
+print("WHALE PULLBACK - OPTIMIZED EMA PULLBACK & ADX STRATEGY")
 print("============================================================")
 
 for symbol in SYMBOLS:
@@ -29,13 +27,11 @@ for symbol in SYMBOLS:
         end_date = months[i+1]
         
         try:
-            # دانلود داده‌های ساعتی یا روزانه با بازه مشخص از یاهو
             df = yf.download(symbol, start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), interval='1h', progress=False)
             
             if df.empty or len(df) < 50:
                 continue
                 
-            # پاکسازی فرمت ستون‌ها در صورت چندسطحی بودن در yfinance جدید
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
                 
@@ -45,7 +41,7 @@ for symbol in SYMBOLS:
             opens = df['Open'].values
             volumes = df['Volume'].values
             
-            # اندیکاتورها
+            # محاسبه اندیکاتورها
             close_series = pd.Series(closes)
             ema_20 = close_series.ewm(span=20, adjust=False).mean().values
             ema_50 = close_series.ewm(span=50, adjust=False).mean().values
@@ -55,8 +51,20 @@ for symbol in SYMBOLS:
             atr = pd.Series(tr).rolling(window=14).mean().fillna(value=0).values
             vol_sma = pd.Series(volumes).rolling(window=20).mean().values
             
+            # محاسبه ADX برای سنجش قدرت روند
+            df_adx = pd.DataFrame({'high': highs, 'low': lows, 'close': closes})
+            df_adx['tr'] = tr
+            df_adx['hd'] = df_adx['high'] - df_adx['high'].shift(1)
+            df_adx['ld'] = df_adx['low'].shift(1) - df_adx['low']
+            df_adx['pdm'] = np.where((df_adx['hd'] > df_adx['ld']) & (df_adx['hd'] > 0), df_adx['hd'], 0)
+            df_adx['mdm'] = np.where((df_adx['ld'] > df_adx['hd']) & (df_adx['ld'] > 0), df_adx['ld'], 0)
+            pdi = (pd.Series(df_adx['pdm']).rolling(14).sum() / (pd.Series(df_adx['tr']).rolling(14).sum() + 1e-9)) * 100
+            mdi = (pd.Series(df_adx['mdm']).rolling(14).sum() / (pd.Series(df_adx['tr']).rolling(14).sum() + 1e-9)) * 100
+            dx = (abs(pdi - mdi) / (pdi + mdi + 1e-9)) * 100
+            adx = dx.rolling(14).mean().fillna(20).values
+
             m_wins, m_losses, m_trades = 0, 0, 0
-            idx = 50
+            idx = 200
             cooldown = 0
 
             while idx < len(df) - 24:
@@ -68,13 +76,13 @@ for symbol in SYMBOLS:
                 c_close, c_open, c_high, c_low = closes[idx], opens[idx], highs[idx], lows[idx]
                 c_vol, c_vol_avg = volumes[idx], vol_sma[idx]
                 c_ema20, c_ema50, c_ema200 = ema_20[idx], ema_50[idx], ema_200[idx]
-                c_atr = atr[idx]
+                c_atr, c_adx = atr[idx], adx[idx]
 
-                if c_atr == 0 or np.isnan(c_vol_avg):
+                if c_atr == 0 or np.isnan(c_vol_avg) or c_adx < 22:
                     idx += 1
                     continue
 
-                # شرایط روند (همان منطق روانِ تست اولیه)
+                # تشخیص روند اصلی
                 is_uptrend = (c_close > c_ema200) and (c_ema20 > c_ema50)
                 is_downtrend = (c_close < c_ema200) and (c_ema20 < c_ema50)
 
@@ -82,15 +90,12 @@ for symbol in SYMBOLS:
                     idx += 1
                     continue
 
-                lookback = 10
-                recent_high = max(highs[idx-lookback:idx])
-                recent_low = min(lows[idx-lookback:idx])
                 trade_executed = False
 
-                # لانگ
-                if is_uptrend and (c_close > recent_high) and (c_vol > c_vol_avg):
+                # منطق پولبک صعودی: قیمت به نزدیکی EMA 20 اصلاح کرده و کندل برگشتی زده است
+                if is_uptrend and (c_low <= c_ema20 * 1.005) and (c_close > c_open) and (c_vol > c_vol_avg * 0.8):
                     entry = c_close
-                    sl = min(lows[idx-3:idx+1]) - (c_atr * 0.5)
+                    sl = c_low - (c_atr * 0.8)
                     risk_dist = entry - sl
                     if risk_dist > 0:
                         tp = entry + (risk_dist * TARGET_RR)
@@ -108,12 +113,12 @@ for symbol in SYMBOLS:
                             else:
                                 m_losses += 1; grand_total_losses += 1
                                 symbol_balance -= risk_amount
-                            idx = j; cooldown = 3; trade_executed = True
+                            idx = j; cooldown = 4; trade_executed = True
 
-                # شورت
-                elif is_downtrend and (c_close < recent_low) and (c_vol > c_vol_avg) and not trade_executed:
+                # منطق پولبک نزولی: قیمت به نزدیکی EMA 20 پولبک زده و کندل نزولی زده است
+                elif is_downtrend and (c_high >= c_ema20 * 0.995) and (c_open > c_close) and (c_vol > c_vol_avg * 0.8) and not trade_executed:
                     entry = c_close
-                    sl = max(highs[idx-3:idx+1]) + (c_atr * 0.5)
+                    sl = c_high + (c_atr * 0.8)
                     risk_dist = sl - entry
                     if risk_dist > 0:
                         tp = entry - (risk_dist * TARGET_RR)
@@ -131,7 +136,7 @@ for symbol in SYMBOLS:
                             else:
                                 m_losses += 1; grand_total_losses += 1
                                 symbol_balance -= risk_amount
-                            idx = j; cooldown = 3; trade_executed = True
+                            idx = j; cooldown = 4; trade_executed = True
 
                 if not trade_executed:
                     idx += 1
@@ -145,7 +150,7 @@ for symbol in SYMBOLS:
 overall_win_rate = (grand_total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
 print("\n" + "="*60)
-print("FINAL 1-YEAR AGGREGATED RESULT (YAHOO FINANCE)")
+print("FINAL OPTIMIZED BACKTEST RESULT")
 print("="*60)
 print(f"TOTAL TRADES : {grand_total_trades}")
 print(f"TOTAL WINS   : {grand_total_wins}")
