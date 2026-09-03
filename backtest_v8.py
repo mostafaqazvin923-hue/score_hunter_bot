@@ -3,7 +3,7 @@ import urllib.request
 import time
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
-TARGET_RR = 2.0  # قفل شده روی ۱ به ۲
+TARGET_RR = 2.0  # قفل شده روی ۱ به ۲ طبق درخواست شما
 
 def fetch_1year_15m_auto(symbol):
     all_candles = {}
@@ -60,33 +60,18 @@ def calculate_ema(data, period):
             emas.append((val * multiplier) + (emas[-1] * (1 - multiplier)))
     return emas
 
-def calculate_rsi(closes, period=14):
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    rsi_list = [50.0] * len(closes)
-    seed = deltas[:period]
-    up = sum(s for s in seed if s > 0) / period
-    down = -sum(s for s in seed if s < 0) / period
-    if down != 0:
-        rs = up / down
-        rsi_list[period] = 100 - (100 / (1 + rs))
-    
-    for i in range(period + 1, len(closes)):
-        delta = deltas[i - 1]
-        up = (up * (period - 1) + (delta if delta > 0 else 0)) / period
-        down = (down * (period - 1) + (-delta if delta < 0 else 0)) / period
-        if down == 0:
-            rsi_list[i] = 100
+def calculate_atr(candles, period=14):
+    atr_list = [0.0] * len(candles)
+    for i in range(1, len(candles)):
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+        prev_close = candles[i-1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        if i <= period:
+            atr_list[i] = (atr_list[i-1] * (i-1) + tr) / i if i > 1 else tr
         else:
-            rs = up / down
-            rsi_list[i] = 100 - (100 / (1 + rs))
-    return rsi_list
-
-def calculate_macd(closes, fast=12, slow=26, signal=9):
-    exp1 = calculate_ema(closes, fast)
-    exp2 = calculate_ema(closes, slow)
-    macd_line = [exp1[i] - exp2[i] for i in range(len(closes))]
-    signal_line = calculate_ema(macd_line, signal)
-    return macd_line, signal_line
+            atr_list[i] = (atr_list[i-1] * (period - 1) + tr) / period
+    return atr_list
 
 def run_backtest():
     initial_balance = 1000.0
@@ -98,57 +83,55 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - V12.1 (CLEAN & FIXED)         ")
+    print(" SCORE HUNTER PRO - V13.0 (SMC BOS + ORDER BLOCK) ")
     print("==================================================")
 
     for symbol in SYMBOLS:
         try:
             candles = fetch_1year_15m_auto(symbol)
-            if len(candles) < 100:
+            if len(candles) < 200:
                 continue
         except Exception:
             continue
         
         closes = [c["close"] for c in candles]
-        ema_50 = calculate_ema(closes, 50)
-        rsi_vals = calculate_rsi(closes, 14)
-        macd_line, signal_line = calculate_macd(closes)
+        ema_200 = calculate_ema(closes, 200)
+        atr_vals = calculate_atr(candles, 14)
 
         wins = 0
         losses = 0
         symbol_trades = 0
         skip_until = 0
 
-        for i in range(50, len(candles) - 30):
+        # فیلتر سخت‌گیرانه ساختار بازار برای بالا بردن چشمگیر وین‌ریت
+        for i in range(200, len(candles) - 40):
             if i < skip_until:
                 continue
 
             c = candles[i]
-            prev_c = candles[i-1]
-            trend_val = ema_50[i]
-            current_rsi = rsi_vals[i]
-            m_line = macd_line[i]
-            s_line = signal_line[i]
-            prev_m = macd_line[i-1]
-            prev_s = signal_line[i-1]
+            prev = candles[i-1]
+            prev2 = candles[i-2]
+            trend = ema_200[i]
+            atr = atr_vals[i]
 
             current_risk_amount = balance * risk_percentage
             trade_taken = False
 
-            # --- استراتژی لانگ ---
-            is_uptrend = c["close"] > trend_val
-            is_macd_cross_up = prev_m <= prev_s and m_line > s_line
-            is_rsi_buy = 40 <= current_rsi <= 65
+            # تاییدیه ساختار صعودی (Bullish BOS + Order Block Retest)
+            is_macro_bullish = c["close"] > trend
+            is_bullish_bos = c["close"] > max(prev["high"], prev2["high"])
+            # بررسی پولبک تمیز به محدوده تقاضا
+            is_order_block_zone = c["low"] <= (prev["low"] + prev["high"]) / 2
 
-            if is_uptrend and is_macd_cross_up and is_rsi_buy:
+            if is_macro_bullish and is_bullish_bos and is_order_block_zone and atr > 0:
                 entry_price = c["close"]
-                stop_loss = min(prev_c["low"], candles[i-2]["low"]) - (entry_price * 0.0005)
+                stop_loss = entry_price - (atr * 1.5)  # حد ضرر ایمن مبتنی بر نوسان واقعی ATR
                 risk_dist = entry_price - stop_loss
 
                 if risk_dist > 0:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 36, len(candles) - 1)
+                    end_idx = min(i + 40, len(candles) - 1)
 
                     for j in range(i + 1, end_idx + 1):
                         fc = candles[j]
@@ -159,7 +142,7 @@ def run_backtest():
 
                     if trade_won or trade_lost:
                         symbol_trades += 1
-                        skip_until = j
+                        skip_until = j + 10 # فاصله گذاری بین معاملات برای کنترل تعداد سیگنال روزانه
                         trade_taken = True
                         if trade_won:
                             wins += 1
@@ -168,20 +151,20 @@ def run_backtest():
                             losses += 1
                             balance -= current_risk_amount
 
-            # --- استراتژی شورت ---
-            is_downtrend = c["close"] < trend_val
-            is_macd_cross_down = prev_m >= prev_s and m_line < s_line
-            is_rsi_sell = 35 <= current_rsi <= 60
+            # تاییدیه ساختار نزولی (Bearish BOS + Order Block Retest)
+            is_macro_bearish = c["close"] < trend
+            is_bearish_bos = c["close"] < min(prev["low"], prev2["low"])
+            is_bearish_ob_zone = c["high"] >= (prev["low"] + prev["high"]) / 2
 
-            if not trade_taken and is_downtrend and is_macd_cross_down and is_rsi_sell:
+            if not trade_taken and is_macro_bearish and is_bearish_bos and is_bearish_ob_zone and atr > 0:
                 entry_price = c["close"]
-                stop_loss = max(prev_c["high"], candles[i-2]["high"]) + (entry_price * 0.0005)
+                stop_loss = entry_price + (atr * 1.5)
                 risk_dist = stop_loss - entry_price
 
                 if risk_dist > 0:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 36, len(candles) - 1)
+                    end_idx = min(i + 40, len(candles) - 1)
 
                     for j in range(i + 1, end_idx + 1):
                         fc = candles[j]
@@ -192,7 +175,7 @@ def run_backtest():
 
                     if trade_won or trade_lost:
                         symbol_trades += 1
-                        skip_until = j
+                        skip_until = j + 10
                         if trade_won:
                             wins += 1
                             balance += (current_risk_amount * TARGET_RR)
@@ -208,7 +191,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED V12.1 RESULTS                    ")
+    print("      AGGREGATED V13.0 RESULTS                    ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
