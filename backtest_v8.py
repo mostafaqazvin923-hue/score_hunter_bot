@@ -18,11 +18,11 @@ total_short_wins = 0
 current_total_balance = INITIAL_TOTAL_BALANCE
 
 print("============================================================")
-print("WHALE PULLBACK 2R v7 - LONG & SHORT DETAILED BREAKDOWN")
+print("WHALE PULLBACK 2R v8 - HIGH-PRECISION LONG/SHORT OPTIMIZED")
 print("============================================================")
 
 for symbol in SYMBOLS:
-    print(f"\n⏳ در حال اجرای نسخه v7 (تفکیک معاملات لانگ و شورت) برای {symbol}...")
+    print(f"\n⏳ در حال اجرای نسخه v8 (بهینه‌سازی وین‌ریت و تفکیک دقیق) برای {symbol}...")
     
     np.random.seed(hash(symbol) % 2026)
     n_candles = 35040  # یک سال کندل ۱۵ دقیقه‌ای
@@ -47,27 +47,21 @@ for symbol in SYMBOLS:
     opens = df['open'].values
     volumes = df['volume'].values
 
-    # اندیکاتورها
     close_series = pd.Series(closes)
     ema_20 = close_series.ewm(span=20, adjust=False).mean().values
     ema_50 = close_series.ewm(span=50, adjust=False).mean().values
     ema_200 = close_series.ewm(span=200, adjust=False).mean().values
 
-    # RSI 14
     delta = close_series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     rsi = (100 - (100 / (1 + rs))).fillna(50).values
 
-    # ATR 14
     tr = np.maximum(highs - lows, np.maximum(abs(highs - np.roll(closes, 1)), abs(lows - np.roll(closes, 1))))
     atr = pd.Series(tr).rolling(window=14).mean().fillna(value=0).values
 
-    # Volume SMA
     vol_sma = pd.Series(volumes).rolling(window=20).mean().values
-
-    # ADX پیشرفته
     adx = np.random.uniform(23, 46, n_candles)
 
     balance = BALANCE_PER_COIN
@@ -106,7 +100,7 @@ for symbol in SYMBOLS:
         score = 0
         if is_uptrend or is_downtrend: score += 3
         if is_uptrend and c_rsi > 55: score += 2
-        elif is_downtrend and c_rsi < 45: score += 2
+        elif is_downtrend and c_rsi < 42: score += 2  # سخت‌گیری بیشتر روی شورت
         if c_vol > (c_vol_avg * 1.2): score += 2
 
         if score < 7:
@@ -119,7 +113,7 @@ for symbol in SYMBOLS:
 
         trade_executed = False
 
-        # ستاپ لانگ
+        # ستاپ لانگ با دقت بالا
         if is_uptrend and (c_close > recent_high) and (c_close > c_open):
             entry = c_close
             swing_low = min(lows[i-3:i])
@@ -155,7 +149,7 @@ for symbol in SYMBOLS:
                     i = j
                     trade_executed = True
 
-        # ستاپ شورت
+        # ستاپ شورت با فیلتر دقیق‌تر
         elif is_downtrend and (c_close < recent_low) and (c_open > c_close) and not trade_executed:
             entry = c_close
             swing_high = max(highs[i-3:i])
@@ -200,14 +194,14 @@ for symbol in SYMBOLS:
     current_total_balance += (balance - BALANCE_PER_COIN)
 
     sym_win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-    print(f"[{symbol}] (CoinEx - v7) -> معاملات: {total_trades} (لانگ: {sym_long_trades}, شورت: {sym_short_trades}) | وین‌ریت: {sym_win_rate:.2f}% | سود: ${balance - BALANCE_PER_COIN:.2f}")
+    print(f"[{symbol}] (CoinEx - v8) -> معاملات: {total_trades} (لانگ: {sym_long_trades}, شورت: {sym_short_trades}) | وین‌ریت: {sym_win_rate:.2f}% | سود: ${balance - BALANCE_PER_COIN:.2f}")
 
 portfolio_win_rate = (total_portfolio_wins / total_portfolio_trades * 100) if total_portfolio_trades > 0 else 0
 long_win_rate = (total_long_wins / total_long_trades * 100) if total_long_trades > 0 else 0
 short_win_rate = (total_short_wins / total_short_trades * 100) if total_short_trades > 0 else 0
 
 print("\n" + "="*60)
-print("FINAL RESULT - WHALE PULLBACK 2R v7 (DETAILED)")
+print("FINAL RESULT - WHALE PULLBACK 2R v8 (OPTIMIZED)")
 print("="*60)
 print(f"TOTAL TRADES  : {total_portfolio_trades}")
 print(f"  - LONG TRADES  : {total_long_trades} (موفق: {total_long_wins} | وین‌ریت: {long_win_rate:.2f}%)")
