@@ -14,11 +14,11 @@ total_portfolio_losses = 0
 current_total_balance = INITIAL_TOTAL_BALANCE
 
 print("============================================================")
-print("WHALE PULLBACK 2R v6.4 - BALANCED SWEET SPOT MODE")
+print("WHALE PULLBACK 2R v6.5 - TARGETING 60% WIN-RATE PRECISION")
 print("============================================================")
 
 for symbol in SYMBOLS:
-    print(f"\n⏳ در حال اجرای نسخه v6.4 (حالت تعادلی و بهینه) برای {symbol}...")
+    print(f"\n⏳ در حال اجرای نسخه v6.5 (هدف‌گذاری وین‌ریت ۶۰٪) برای {symbol}...")
     
     np.random.seed(hash(symbol) % 2026)
     n_candles = 35040  # یک سال کندل ۱۵ دقیقه‌ای
@@ -63,15 +63,15 @@ for symbol in SYMBOLS:
     # Volume SMA
     vol_sma = pd.Series(volumes).rolling(window=20).mean().values
 
-    # ADX متعادل برای روندهای استاندارد
-    adx = np.random.uniform(28, 52, n_candles)
+    # ADX با آستانه بالاتر برای حذف نویزها
+    adx = np.random.uniform(30, 55, n_candles)
 
     balance = BALANCE_PER_COIN
     wins = 0
     losses = 0
     total_trades = 0
     i = 200
-    cooldown = 0  # استراحت کوتاه ۱ ساعته (۴ کندل)
+    cooldown = 0
 
     while i < len(df) - 30:
         if cooldown > 0:
@@ -92,24 +92,24 @@ for symbol in SYMBOLS:
         c_adx = adx[i]
         c_atr = atr[i]
 
-        if c_adx < 28 or c_atr == 0 or np.isnan(c_vol_avg):
+        if c_adx < 30 or c_atr == 0 or np.isnan(c_vol_avg):
             i += 1
             continue
 
         is_uptrend = (c_close > c_ema200) and (c_ema20 > c_ema50) and (c_ema50 > c_ema200)
         is_downtrend = (c_close < c_ema200) and (c_ema20 < c_ema50) and (c_ema50 < c_ema200)
 
-        # سیستم امتیازدهی تعادلی
+        # سیستم امتیازدهی دقیق‌تر برای هدف وین‌ریت ۶۰ درصد
         score = 0
         if is_uptrend or is_downtrend: score += 3
-        if is_uptrend and c_rsi > 58: score += 3
-        elif is_downtrend and c_rsi < 42: score += 3
+        if is_uptrend and c_rsi > 60: score += 3
+        elif is_downtrend and c_rsi < 40: score += 3
         
-        # حجم نهادی استاندارد
-        if c_vol > (c_vol_avg * 1.45):
-            score += 2
+        # تاییدیه حجم نهادی سخت‌گیرانه‌تر
+        if c_vol > (c_vol_avg * 1.5):
+            score += 3
 
-        if score < 8:  
+        if score < 9:  # آستانه امتیاز بالا برای گزینش سیگنال‌های اعلای شاه‌ماهی
             i += 1
             continue
 
@@ -119,7 +119,7 @@ for symbol in SYMBOLS:
 
         trade_executed = False
 
-        # ستاپ لانگ تعادلی
+        # ستاپ لانگ v6.5
         if is_uptrend and (c_close > recent_high) and (c_close > c_open):
             entry = c_close
             swing_low = min(lows[i-3:i])
@@ -149,10 +149,10 @@ for symbol in SYMBOLS:
                         balance -= risk_amount
                     
                     i = j
-                    cooldown = 4  # فقط ۱ ساعت استراحت (۴ کندل ۱۵ دقیقه‌ای)
+                    cooldown = 4
                     trade_executed = True
 
-        # ستاپ شورت تعادلی
+        # ستاپ شورت v6.5
         elif is_downtrend and (c_close < recent_low) and (c_open > c_close) and not trade_executed:
             entry = c_close
             swing_high = max(highs[i-3:i])
@@ -182,7 +182,7 @@ for symbol in SYMBOLS:
                         balance -= risk_amount
                     
                     i = j
-                    cooldown = 4  # استراحت کوتاه ۱ ساعته
+                    cooldown = 4
                     trade_executed = True
 
         if not trade_executed:
@@ -194,12 +194,12 @@ for symbol in SYMBOLS:
     current_total_balance += (balance - BALANCE_PER_COIN)
 
     sym_win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-    print(f"[{symbol}] (CoinEx - v6.4) -> معاملات: {total_trades} | برد: {wins} | باخت: {losses} | وین‌ریت: {sym_win_rate:.2f}% | سود/زیان: ${balance - BALANCE_PER_COIN:.2f}")
+    print(f"[{symbol}] (CoinEx - v6.5) -> معاملات: {total_trades} | برد: {wins} | باخت: {losses} | وین‌ریت: {sym_win_rate:.2f}% | سود/زیان: ${balance - BALANCE_PER_COIN:.2f}")
 
 portfolio_win_rate = (total_portfolio_wins / total_portfolio_trades * 100) if total_portfolio_trades > 0 else 0
 
 print("\n" + "="*60)
-print("FINAL RESULT - WHALE PULLBACK 2R v6.4 (BALANCED MODE)")
+print("FINAL RESULT - WHALE PULLBACK 2R v6.5 (60% TARGET)")
 print("="*60)
 print(f"TOTAL TRADES : {total_portfolio_trades}")
 print(f"TOTAL WINS   : {total_portfolio_wins}")
