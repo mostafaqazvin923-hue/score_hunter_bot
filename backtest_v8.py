@@ -34,7 +34,6 @@ for symbol_key, symbol_binance in SYMBOLS.items():
         year = dt.year
         month = f"{dt.month:02d}"
         
-        # لینک فایل ماهانه‌ی ۱۵ دقیقه در بایننس ویزن
         url = f"https://data.binance.vision/data/spot/monthly/klines/{symbol_binance}/15m/{symbol_binance}-15m-{year}-{month}.zip"
         
         try:
@@ -56,16 +55,20 @@ for symbol_key, symbol_binance in SYMBOLS.items():
         # ترکیب تمام ماه‌ها به یک فایل یک‌ساله
         final_df = pd.concat(all_dfs, ignore_index=True)
         
-        # پاکسازی و رفع خطای تبدیل تاریخ (جلوگیری از OutOfBoundsDatetime)
-        final_df['Timestamp'] = pd.to_datetime(final_df['Timestamp'], unit='ms', errors='coerce')
-        final_df.dropna(subset=['Timestamp'], inplace=True)
-        
-        # اطمینان از عددی بودن ستون‌های قیمت و حجم
-        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        # تبدیل امن ستون‌ها به عدد
+        for col in ['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']:
             final_df[col] = pd.to_numeric(final_df[col], errors='coerce')
-        final_df.dropna(inplace=True)
         
-        final_df.rename(columns={'Timestamp': 'Date'}, inplace=True)
+        # حذف ردیف‌هایی که واقعاً مقدارشان خالی است (نه کل دیتا)
+        final_df.dropna(subset=['Timestamp', 'Close'], inplace=True)
+        
+        # تبدیل استاندارد تایم‌استمپ میلی‌ثانیه به تاریخ
+        final_df['Date'] = pd.to_datetime(final_df['Timestamp'], unit='ms')
+        
+        # مرتب‌سازی ستون‌ها و حذف ستون اضافی Timestamp
+        final_df = final_df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        final_df.sort_values('Date', inplace=True)
+        final_df.reset_index(drop=True, inplace=True)
         
         # ذخیره نهایی به صورت CSV محلی
         final_df.to_csv(filename, index=False)
