@@ -3,7 +3,7 @@ import requests
 import zipfile
 import io
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 
 SYMBOLS = {
     "BTC-USD": "BTCUSDT",
@@ -12,12 +12,11 @@ SYMBOLS = {
     "XRP-USD": "XRPUSDT"
 }
 
-end_date = datetime.now()
-start_date = end_date - timedelta(days=365)
-months = pd.date_range(start=start_date, end=end_date, freq='MS')
+# بازه زمانی امن: از اکتبر 2025 تا پایان جولای 2026 (که در آرشیو بایننس کاملاً موجود هستند)
+months = pd.date_range(start="2025-10-01", end="2026-07-01", freq='MS')
 
 print("============================================================")
-print("📥 دانلود داده‌های واقعی یک‌ساله ۱۵ دقیقه‌ای از آرشیو بایننس")
+print("📥 دانلود داده‌های ۱۵ دقیقه‌ای با بازه زمانی معتبر از بایننس")
 print("============================================================")
 
 for symbol_key, symbol_binance in SYMBOLS.items():
@@ -41,7 +40,6 @@ for symbol_key, symbol_binance in SYMBOLS.items():
                     df_month = pd.read_csv(io.BytesIO(csv_bytes), header=None, usecols=[0, 1, 2, 3, 4, 5],
                                           names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
                     
-                    # پاکسازی و اعتبارسنجیِ ماهانه (جلوگیری از انتقال خطا به کل دیتا)
                     df_month['Timestamp'] = pd.to_numeric(df_month['Timestamp'], errors='coerce')
                     for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                         df_month[col] = pd.to_numeric(df_month[col], errors='coerce')
@@ -52,9 +50,9 @@ for symbol_key, symbol_binance in SYMBOLS.items():
                     
                     if not df_month.empty:
                         all_dfs.append(df_month[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']])
-                        print(f"  ✔️ ماه {year}-{month} پاکسازی و اضافه شد ({len(df_month)} کندل سالم).")
+                        print(f"  ✔️ ماه {year}-{month} با موفقیت خوانده شد ({len(df_month)} کندل).")
             else:
-                print(f"  ⚠️ ماه {year}-{month} موجود نبود.")
+                print(f"  ⚠️ ماه {year}-{month} در آرشیو نبود.")
         except Exception as e:
             print(f"  ❌ خطا در دانلود ماه {year}-{month}: {e}")
             
@@ -64,8 +62,8 @@ for symbol_key, symbol_binance in SYMBOLS.items():
         final_df.reset_index(drop=True, inplace=True)
         
         final_df.to_csv(filename, index=False)
-        print(f"✅ فایل نهایی {filename} با موفقیت ساخته شد! (تعداد کل کندل‌ها: {len(final_df)})")
+        print(f"✅ فایل نهایی {filename} ساخته شد! (تعداد کل کندل‌ها: {len(final_df)})")
     else:
         print(f"❌ هیچ داده‌ای برای {symbol_key} دریافت نشد.")
 
-print("\n✨ دانلود و آماده‌سازی تمام فایل‌ها با موفقیت به پایان رسید.")
+print("\n✨ آماده‌سازی فایل‌ها کامل شد.")
