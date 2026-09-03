@@ -60,6 +60,27 @@ def calculate_ema(data, period):
             emas.append((val * multiplier) + (emas[-1] * (1 - multiplier)))
     return emas
 
+def calculate_rsi(closes, period=14):
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    rsi_list = [50.0] * len(closes)
+    seed = deltas[:period]
+    up = sum(s for s in seed if s > 0) / period
+    down = -sum(s for s in seed if s < 0) / period
+    if down != 0:
+        rs = up / down
+        rsi_list[period] = 100 - (100 / (1 + rs))
+    
+    for i in range(period + 1, len(closes)):
+        delta = deltas[i - 1]
+        up = (up * (period - 1) + (delta if delta > 0 else 0)) / period
+        down = (down * (period - 1) + (-delta if delta < 0 else 0)) / period
+        if down == 0:
+            rsi_list[i] = 100
+        else:
+            rs = up / down
+            rsi_list[i] = 100 - (100 / (1 + rs))
+    return rsi_list
+
 def calculate_atr(candles, period=14):
     atr_list = [0.0] * len(candles)
     for i in range(1, len(candles)):
@@ -83,7 +104,7 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - V14.0 (INSTITUTIONAL SQUEEZE) ")
+    print(" SCORE HUNTER PRO - V15.0 (ELITE SNIPER MODE)     ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -96,7 +117,9 @@ def run_backtest():
         
         closes = [c["close"] for c in candles]
         volumes = [c["volume"] for c in candles]
-        ema_150 = calculate_ema(closes, 150)
+        ema_50 = calculate_ema(closes, 50)
+        ema_200 = calculate_ema(closes, 200)
+        rsi_vals = calculate_rsi(closes, 14)
         atr_vals = calculate_atr(candles, 14)
 
         wins = 0
@@ -104,37 +127,36 @@ def run_backtest():
         symbol_trades = 0
         skip_until = 0
 
-        for i in range(150, len(candles) - 40):
+        for i in range(200, len(candles) - 50):
             if i < skip_until:
                 continue
 
             c = candles[i]
             prev = candles[i-1]
-            prev2 = candles[i-2]
-            trend = ema_150[i]
+            trend_fast = ema_50[i]
+            trend_slow = ema_200[i]
+            rsi = rsi_vals[i]
             atr = atr_vals[i]
-
-            # میانگین حجم ۲۰ کندل گذشته برای تشخیص حجم نهادی
-            avg_vol = sum(volumes[i-20:i]) / 20 if i >= 20 else volumes[i]
+            avg_vol = sum(volumes[i-30:i]) / 30 if i >= 30 else volumes[i]
 
             current_risk_amount = balance * risk_percentage
             trade_taken = False
 
-            # فیلتر سخت‌گیرانه فشردگی و انفجار صعودی (Bullish Squeeze Breakout)
-            is_bullish_trend = c["close"] > trend
-            is_volume_spike = c["volume"] > (avg_vol * 1.5) # حجم حداقل ۵۰ درصد بالاتر از میانگین
-            is_price_expansion = (c["close"] - c["open"]) > (atr * 0.8) # کندل قدرتمند صعودی
-            is_breakout = c["close"] > max(prev["high"], prev2["high"])
+            # فیلترهای به‌شدت سنگین برای شکار قطعی روند صعودی
+            is_super_uptrend = (c["close"] > trend_fast) and (trend_fast > trend_slow)
+            is_volume_elite = c["volume"] > (avg_vol * 1.8) # حجم خریداران کاملاً نهادی
+            is_rsi_perfect = 48 <= rsi <= 62 # نقطه تعادل بی‌نقص برای ادامه‌دهی روند
+            is_clean_breakout = c["close"] > prev["high"] and (c["close"] - c["open"]) > (atr * 0.5)
 
-            if is_bullish_trend and is_volume_spike and is_price_expansion and is_breakout and atr > 0:
+            if is_super_uptrend and is_volume_elite and is_rsi_perfect and is_clean_breakout and atr > 0:
                 entry_price = c["close"]
-                stop_loss = entry_price - (atr * 1.2) # استاپ تایتل و مهندسی شده با ATR
+                stop_loss = entry_price - (atr * 2.0) # استاپ ایمن در برابر نویز
                 risk_dist = entry_price - stop_loss
 
                 if risk_dist > 0:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 40, len(candles) - 1)
+                    end_idx = min(i + 50, len(candles) - 1)
 
                     for j in range(i + 1, end_idx + 1):
                         fc = candles[j]
@@ -145,7 +167,7 @@ def run_backtest():
 
                     if trade_won or trade_lost:
                         symbol_trades += 1
-                        skip_until = j + 15 # جلوگیری از اورتریدینگ و فیلتر سیگنال‌های اضافی
+                        skip_until = j + 25 # فاصله طولانی بین تریدها برای جلوگیری از شکست متوالی
                         trade_taken = True
                         if trade_won:
                             wins += 1
@@ -154,20 +176,20 @@ def run_backtest():
                             losses += 1
                             balance -= current_risk_amount
 
-            # فیلتر سخت‌گیرانه فشردگی و انفجار نزولی (Bearish Squeeze Breakdown)
-            is_bearish_trend = c["close"] < trend
-            is_bearish_expansion = (prev["open"] - c["close"]) > (atr * 0.8)
-            is_bearish_breakout = c["close"] < min(prev["low"], prev2["low"])
+            # فیلترهای فوق‌العاده سنگین برای روند نزولی
+            is_super_downtrend = (c["close"] < trend_fast) and (trend_fast < trend_slow)
+            is_rsi_sell_perfect = 38 <= rsi <= 52
+            is_clean_breakdown = c["close"] < prev["low"] and (prev["open"] - c["close"]) > (atr * 0.5)
 
-            if not trade_taken and is_bearish_trend and is_volume_spike and is_bearish_expansion and is_bearish_breakout and atr > 0:
+            if not trade_taken and is_super_downtrend and is_volume_elite and is_rsi_sell_perfect and is_clean_breakdown and atr > 0:
                 entry_price = c["close"]
-                stop_loss = entry_price + (atr * 1.2)
+                stop_loss = entry_price + (atr * 2.0)
                 risk_dist = stop_loss - entry_price
 
                 if risk_dist > 0:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 40, len(candles) - 1)
+                    end_idx = min(i + 50, len(candles) - 1)
 
                     for j in range(i + 1, end_idx + 1):
                         fc = candles[j]
@@ -178,7 +200,7 @@ def run_backtest():
 
                     if trade_won or trade_lost:
                         symbol_trades += 1
-                        skip_until = j + 15
+                        skip_until = j + 25
                         if trade_won:
                             wins += 1
                             balance += (current_risk_amount * TARGET_RR)
@@ -194,7 +216,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED V14.0 RESULTS                    ")
+    print("      AGGREGATED V15.0 ELITE RESULTS              ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
