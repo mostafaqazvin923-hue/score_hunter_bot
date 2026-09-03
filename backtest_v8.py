@@ -3,12 +3,22 @@ import urllib.request
 import time
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
-TARGET_RR = 2.0  # قفل شده روی ۱ به ۲ به دستور شما
+TARGET_RR = 2.0  # قفل شده روی ۱ به ۲
 
 def fetch_1year_15m_auto(symbol):
     all_candles = {}
     ranges = ["59d", "118d", "177d", "236d", "295d", "354d"]
     
+    for r in ranges:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=15m&range={r}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response: # اصلاح برای پایتون استاندارد
+                pass
+        except:
+            pass
+            
+    # استفاده از روش ایمن دریافت داده
     for r in ranges:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=15m&range={r}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
@@ -50,37 +60,6 @@ def fetch_1year_15m_auto(symbol):
     candles.sort(key=lambda x: x["timestamp"])
     return candles
 
-def calculate_ema(data, period):
-    emas = []
-    multiplier = 2 / (period + 1)
-    for i, val in enumerate(data):
-        if i == 0:
-            emas.append(val)
-        else:
-            emas.append((val * multiplier) + (emas[-1] * (1 - multiplier)))
-    return emas
-
-def calculate_rsi(closes, period=14):
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    rsi_list = [50.0] * len(closes)
-    seed = deltas[:period]
-    up = sum(s for s in seed if s > 0) / period
-    down = -sum(s for s in seed if s < 0) / period
-    if down != 0:
-        rs = up / down
-        rsi_list[period] = 100 - (100 / (1 + rs))
-    
-    for i in range(period + 1, len(closes)):
-        delta = deltas[i - 1]
-        up = (up * (period - 1) + (delta if delta > 0 else 0)) / period
-        down = (down * (period - 1) + (-delta if delta < 0 else 0)) / period
-        if down == 0:
-            rsi_list[i] = 100
-        else:
-            rs = up / down
-            rsi_list[i] = 100 - (100 / (1 + rs))
-    return rsi_list
-
 def calculate_atr(candles, period=14):
     atr_list = [0.0] * len(candles)
     for i in range(1, len(candles)):
@@ -104,59 +83,55 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - V15.0 (ELITE SNIPER MODE)     ")
+    print(" SCORE HUNTER PRO - V16.0 (LIQUIDITY SWEEP / WHALE)")
     print("==================================================")
 
     for symbol in SYMBOLS:
         try:
             candles = fetch_1year_15m_auto(symbol)
-            if len(candles) < 200:
+            if len(candles) < 100:
                 continue
         except Exception:
             continue
         
-        closes = [c["close"] for c in candles]
-        volumes = [c["volume"] for c in candles]
-        ema_50 = calculate_ema(closes, 50)
-        ema_200 = calculate_ema(closes, 200)
-        rsi_vals = calculate_rsi(closes, 14)
         atr_vals = calculate_atr(candles, 14)
-
         wins = 0
         losses = 0
         symbol_trades = 0
         skip_until = 0
 
-        for i in range(200, len(candles) - 50):
+        lookback = 20 # بازه برای پیدا کردن سقف و کف کلیدی نقدینگی
+
+        for i in range(lookback, len(candles) - 40):
             if i < skip_until:
                 continue
 
             c = candles[i]
             prev = candles[i-1]
-            trend_fast = ema_50[i]
-            trend_slow = ema_200[i]
-            rsi = rsi_vals[i]
             atr = atr_vals[i]
-            avg_vol = sum(volumes[i-30:i]) / 30 if i >= 30 else volumes[i]
+
+            # پیدا کردن بالاترین سقف و پایین‌ترین کف در ۲۰ کندل گذشته (استخر نقدینگی خرده‌فروشان)
+            recent_slice = candles[i-lookback:i]
+            swing_high = max(item["high"] for item in recent_slice)
+            swing_low = min(item["low"] for item in recent_slice)
 
             current_risk_amount = balance * risk_percentage
             trade_taken = False
 
-            # فیلترهای به‌شدت سنگین برای شکار قطعی روند صعودی
-            is_super_uptrend = (c["close"] > trend_fast) and (trend_fast > trend_slow)
-            is_volume_elite = c["volume"] > (avg_vol * 1.8) # حجم خریداران کاملاً نهادی
-            is_rsi_perfect = 48 <= rsi <= 62 # نقطه تعادل بی‌نقص برای ادامه‌دهی روند
-            is_clean_breakout = c["close"] > prev["high"] and (c["close"] - c["open"]) > (atr * 0.5)
+            # مدل ۱: استاپ‌هانت کف و بازگشت صعودی (Bullish Liquidity Sweep / Spring)
+            # قیمت کف قبلی را با فتیله سوراخ کرده (استاپ‌ها را زده) ولی بسته شدن کندل بالای کف قبلی است
+            is_sweep_low = prev["low"] < swing_low and c["close"] > swing_low
+            is_bullish_rejection = c["close"] > c["open"] and (c["close"] - c["open"]) > (atr * 0.4)
 
-            if is_super_uptrend and is_volume_elite and is_rsi_perfect and is_clean_breakout and atr > 0:
+            if is_sweep_low and is_bullish_rejection and atr > 0:
                 entry_price = c["close"]
-                stop_loss = entry_price - (atr * 2.0) # استاپ ایمن در برابر نویز
+                stop_loss = prev["low"] - (atr * 0.5) # کمی پایین‌تر از فتیله نفوذی نهادینه‌شده
                 risk_dist = entry_price - stop_loss
 
                 if risk_dist > 0:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 50, len(candles) - 1)
+                    end_idx = min(i + 40, len(candles) - 1)
 
                     for j in range(i + 1, end_idx + 1):
                         fc = candles[j]
@@ -167,7 +142,7 @@ def run_backtest():
 
                     if trade_won or trade_lost:
                         symbol_trades += 1
-                        skip_until = j + 25 # فاصله طولانی بین تریدها برای جلوگیری از شکست متوالی
+                        skip_until = j + 10
                         trade_taken = True
                         if trade_won:
                             wins += 1
@@ -176,20 +151,19 @@ def run_backtest():
                             losses += 1
                             balance -= current_risk_amount
 
-            # فیلترهای فوق‌العاده سنگین برای روند نزولی
-            is_super_downtrend = (c["close"] < trend_fast) and (trend_fast < trend_slow)
-            is_rsi_sell_perfect = 38 <= rsi <= 52
-            is_clean_breakdown = c["close"] < prev["low"] and (prev["open"] - c["close"]) > (atr * 0.5)
+            # مدل ۲: استاپ‌هانت سقف و بازگشت نزولی (Bearish Liquidity Sweep / Upthrust)
+            is_sweep_high = prev["high"] > swing_high and c["close"] < swing_high
+            is_bearish_rejection = c["open"] > c["close"] and (c["open"] - c["close"]) > (atr * 0.4)
 
-            if not trade_taken and is_super_downtrend and is_volume_elite and is_rsi_sell_perfect and is_clean_breakdown and atr > 0:
+            if not trade_taken and is_sweep_high and is_bearish_rejection and atr > 0:
                 entry_price = c["close"]
-                stop_loss = entry_price + (atr * 2.0)
+                stop_loss = prev["high"] + (atr * 0.5)
                 risk_dist = stop_loss - entry_price
 
                 if risk_dist > 0:
                     take_profit = entry_price - (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 50, len(candles) - 1)
+                    end_idx = min(i + 40, len(candles) - 1)
 
                     for j in range(i + 1, end_idx + 1):
                         fc = candles[j]
@@ -200,7 +174,7 @@ def run_backtest():
 
                     if trade_won or trade_lost:
                         symbol_trades += 1
-                        skip_until = j + 25
+                        skip_until = j + 10
                         if trade_won:
                             wins += 1
                             balance += (current_risk_amount * TARGET_RR)
@@ -216,7 +190,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED V15.0 ELITE RESULTS              ")
+    print("      AGGREGATED V16.0 WHALE RESULTS              ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
