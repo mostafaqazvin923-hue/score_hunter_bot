@@ -13,7 +13,7 @@ SYMBOLS = {
     "XRP-USD": "XRPUSDT"
 }
 
-# بازه زمانی: یک سال گذشته (مثلا از سپتامبر ۲۰۲۵ تا سپتامبر ۲۰۲۶)
+# بازه زمانی: یک سال گذشته
 end_date = datetime.now()
 start_date = end_date - timedelta(days=365)
 
@@ -43,21 +43,28 @@ for symbol_key, symbol_binance in SYMBOLS.items():
                 with zipfile.ZipFile(io.BytesIO(response.content)) as z:
                     csv_filename = z.namelist()[0]
                     with z.open(csv_filename) as f:
-                        # بایننس هدر ندارد، نام ستون‌ها را دستی تعریف می‌کنیم
                         df_month = pd.read_csv(f, header=None, usecols=[0, 1, 2, 3, 4, 5],
                                               names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
                         all_dfs.append(df_month)
                 print(f"  ✔️ ماه {year}-{month} دانلود شد.")
             else:
-                print(f"  ⚠️ ماه {year}-{month} موجود نبود (یا لینک تغییر کرده).")
+                print(f"  ⚠️ ماه {year}-{month} موجود نبود (یا هنوز در آرشیو آپلود نشده).")
         except Exception as e:
             print(f"  ❌ خطا در دانلود ماه {year}-{month}: {e}")
             
     if all_dfs:
         # ترکیب تمام ماه‌ها به یک فایل یک‌ساله
         final_df = pd.concat(all_dfs, ignore_index=True)
-        # تبدیل Timestamp به تاریخ خوانا
-        final_df['Timestamp'] = pd.to_datetime(final_df['Timestamp'], unit='ms')
+        
+        # پاکسازی و رفع خطای تبدیل تاریخ (جلوگیری از OutOfBoundsDatetime)
+        final_df['Timestamp'] = pd.to_datetime(final_df['Timestamp'], unit='ms', errors='coerce')
+        final_df.dropna(subset=['Timestamp'], inplace=True)
+        
+        # اطمینان از عددی بودن ستون‌های قیمت و حجم
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            final_df[col] = pd.to_numeric(final_df[col], errors='coerce')
+        final_df.dropna(inplace=True)
+        
         final_df.rename(columns={'Timestamp': 'Date'}, inplace=True)
         
         # ذخیره نهایی به صورت CSV محلی
@@ -66,4 +73,4 @@ for symbol_key, symbol_binance in SYMBOLS.items():
     else:
         print(f"❌ هیچ داده‌ای برای {symbol_key} دریافت نشد.")
 
-print("\n✨ دانلود تمام فایل‌ها به پایان رسید. حالا می‌توانید اسکریپت بک‌تست را اجرا کنید.")
+print("\n✨ دانلود و آماده‌سازی تمام فایل‌ها با موفقیت به پایان رسید.")
