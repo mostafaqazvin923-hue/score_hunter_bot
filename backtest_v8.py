@@ -47,30 +47,27 @@ for symbol_key, symbol_binance in SYMBOLS.items():
                         all_dfs.append(df_month)
                 print(f"  ✔️ ماه {year}-{month} دانلود شد.")
             else:
-                print(f"  ⚠️ ماه {year}-{month} موجود نبود (یا هنوز در آرشیو آپلود نشده).")
+                print(f"  ⚠️ ماه {year}-{month} موجود نبود.")
         except Exception as e:
             print(f"  ❌ خطا در دانلود ماه {year}-{month}: {e}")
             
     if all_dfs:
-        # ترکیب تمام ماه‌ها به یک فایل یک‌ساله
         final_df = pd.concat(all_dfs, ignore_index=True)
         
         # تبدیل امن ستون‌ها به عدد
         for col in ['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']:
             final_df[col] = pd.to_numeric(final_df[col], errors='coerce')
         
-        # حذف ردیف‌هایی که واقعاً مقدارشان خالی است (نه کل دیتا)
         final_df.dropna(subset=['Timestamp', 'Close'], inplace=True)
         
-        # تبدیل استاندارد تایم‌استمپ میلی‌ثانیه به تاریخ
-        final_df['Date'] = pd.to_datetime(final_df['Timestamp'], unit='ms')
+        # استفاده از errors='coerce' برای حذف قطعی تاریخ‌های نامعتبر و خروج از محدودیت
+        final_df['Date'] = pd.to_datetime(final_df['Timestamp'], unit='ms', errors='coerce')
+        final_df.dropna(subset=['Date'], inplace=True)
         
-        # مرتب‌سازی ستون‌ها و حذف ستون اضافی Timestamp
         final_df = final_df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
         final_df.sort_values('Date', inplace=True)
         final_df.reset_index(drop=True, inplace=True)
         
-        # ذخیره نهایی به صورت CSV محلی
         final_df.to_csv(filename, index=False)
         print(f"✅ فایل نهایی {filename} با موفقیت ساخته شد! (تعداد کل کندل‌ها: {len(final_df)})")
     else:
