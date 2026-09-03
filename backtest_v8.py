@@ -40,9 +40,19 @@ for symbol_key, symbol_binance in SYMBOLS.items():
                     csv_bytes = z.read(csv_filename)
                     df_month = pd.read_csv(io.BytesIO(csv_bytes), header=None, usecols=[0, 1, 2, 3, 4, 5],
                                           names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                    
+                    # پاکسازی و اعتبارسنجیِ ماهانه (جلوگیری از انتقال خطا به کل دیتا)
+                    df_month['Timestamp'] = pd.to_numeric(df_month['Timestamp'], errors='coerce')
+                    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                        df_month[col] = pd.to_numeric(df_month[col], errors='coerce')
+                        
+                    df_month.dropna(subset=['Timestamp', 'Close'], inplace=True)
+                    df_month['Date'] = pd.to_datetime(df_month['Timestamp'], unit='ms', errors='coerce')
+                    df_month.dropna(subset=['Date'], inplace=True)
+                    
                     if not df_month.empty:
-                        all_dfs.append(df_month)
-                        print(f"  ✔️ ماه {year}-{month} خوانده شد ({len(df_month)} کندل).")
+                        all_dfs.append(df_month[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']])
+                        print(f"  ✔️ ماه {year}-{month} پاکسازی و اضافه شد ({len(df_month)} کندل سالم).")
             else:
                 print(f"  ⚠️ ماه {year}-{month} موجود نبود.")
         except Exception as e:
@@ -50,17 +60,6 @@ for symbol_key, symbol_binance in SYMBOLS.items():
             
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
-        
-        # تبدیل امن تاریخ بدون حذف داده‌های سالم
-        final_df['Date'] = pd.to_datetime(final_df['Timestamp'], unit='ms', errors='coerce')
-        
-        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-            final_df[col] = pd.to_numeric(final_df[col], errors='coerce')
-            
-        # فقط سطرهایی که تاریخ یا قیمت‌شان واقعاً خالی است حذف شوند
-        final_df.dropna(subset=['Date', 'Close'], inplace=True)
-        
-        final_df = final_df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
         final_df.sort_values('Date', inplace=True)
         final_df.reset_index(drop=True, inplace=True)
         
@@ -69,4 +68,4 @@ for symbol_key, symbol_binance in SYMBOLS.items():
     else:
         print(f"❌ هیچ داده‌ای برای {symbol_key} دریافت نشد.")
 
-print("\n✨ دانلود و آماده‌سازی تمام فایل‌ها به پایان رسید.")
+print("\n✨ دانلود و آماده‌سازی تمام فایل‌ها با موفقیت به پایان رسید.")
