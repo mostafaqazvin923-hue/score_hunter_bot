@@ -1,8 +1,9 @@
+import os
+import yfinance as yf
 import pandas as pd
 import numpy as np
 
-# فرض کنید فایل‌های CSV با این نام‌ها کنار اسکریپت شما قرار دارند
-# مثل: BTC_15m.csv, ETH_15m.csv و...
+# دیکشنری نمادها و نام فایل‌های محلی
 FILES = {
     "BTC-USD": "BTC_15m.csv",
     "ETH-USD": "ETH_15m.csv",
@@ -16,25 +17,42 @@ TARGET_RR = 2.0  # ریسک به ریوارد ۱ به ۲ ثابت
 RISK_PERCENTAGE = 0.01
 
 print("============================================================")
-print("WHALE TRAP BACKTEST ON 15-MINUTE LOCAL CSV DATA (RR 1:2)")
+print("WHALE TRAP 15m BACKTEST (AUTO-DOWNLOAD LOCAL CSV & RUN)")
 print("============================================================")
+
+# مرحله ۱: بررسی و دانلود خودکار فایل‌ها اگر وجود نداشته باشند
+for symbol, filename in FILES.items():
+    if not os.path.exists(filename):
+        print(f"📥 در حال دانلود داده‌های ۱۵ دقیقه‌ای برای {symbol}...")
+        try:
+            # دانلود داده‌های ۶۰ روز گذشته در تایم‌فریم ۱۵ دقیقه (حداکثر محدودیت یاهو برای ۱۵ دقیقه)
+            df_dl = yf.download(symbol, period="60d", interval="15m", progress=False)
+            if not df_dl.empty:
+                if isinstance(df_dl.columns, pd.MultiIndex):
+                    df_dl.columns = df_dl.columns.droplevel(1)
+                df_dl.to_csv(filename)
+                print(f"✅ فایل {filename} با موفقیت ذخیره شد.")
+            else:
+                print(f"⚠️ نتوانست داده‌ای برای {symbol} دانلود کند.")
+        except Exception as e:
+            print(f"❌ خطا در دانلود {symbol}: {e}")
 
 grand_total_trades = 0
 grand_total_wins = 0
 grand_total_losses = 0
 
+# مرحله ۲: اجرای بک‌تست روی فایل‌های محلی
 for symbol, filename in FILES.items():
-    print(f"\n🔹 در حال بررسی فایل محلی برای نماد: {symbol}")
+    if not os.path.exists(filename):
+        continue
+        
+    print(f"\n🔹 در حال پردازش بک‌تست برای: {symbol}")
     
     try:
-        # خواندن داده‌ها مستقیم از فایل لوکال بدون نیاز به اینترنت و صرافی
         df = pd.read_csv(filename)
-        
-        # استانداردسازی نام ستون‌ها (بسته به فرمت فایل، معمولا Open, High, Low, Close, Volume هستند)
         df.columns = [c.capitalize() for c in df.columns]
         
-        if df.empty or len(df) < 100:
-            print(f"    ⚠️ فایل {filename} خالی است یا داده‌ی کافی ندارد.")
+        if df.empty or len(df) < 50:
             continue
             
         closes = df['Close'].values
@@ -49,7 +67,7 @@ for symbol, filename in FILES.items():
 
         symbol_balance = BALANCE_PER_COIN
         m_wins, m_losses, m_trades = 0, 0, 0
-        idx = 50  # شروع از کندل پنجاهم برای محاسبه درست اندیکاتورها
+        idx = 50
         cooldown = 0
 
         while idx < len(df) - 50:
@@ -66,14 +84,13 @@ for symbol, filename in FILES.items():
                 idx += 1
                 continue
 
-            # در تایم ۱۵ دقیقه، نگاه به ۵۰ کندل اخیر برای پیدا کردن محدوده نقدینگی (سقف و کف)
             lookback = 50
             swing_high = max(highs[idx-lookback:idx])
             swing_low = min(lows[idx-lookback:idx])
 
             trade_executed = False
 
-            # 1. تله نهنگ صعودی در تایم ۱۵ دقیقه (Long)
+            # 1. تله نهنگ صعودی (Long)
             if (c_low < swing_low) and (c_close > swing_low) and (c_close > c_open) and (c_vol > c_vol_avg * 1.3):
                 entry = c_close
                 sl = c_low - (c_atr * 0.3)
@@ -83,7 +100,6 @@ for symbol, filename in FILES.items():
                     tp = entry + (risk_dist * TARGET_RR)
                     won, lost = False, False
                     
-                    # بررسی کندل‌های آینده در تایم ۱۵ دقیقه (مثلا تا ۷۰ کندل جلوتر)
                     for j in range(idx + 1, min(idx + 70, len(df))):
                         if highs[j] >= tp:
                             won = True
@@ -105,10 +121,10 @@ for symbol, filename in FILES.items():
                             grand_total_losses += 1
                             symbol_balance -= risk_amount
                         idx = j
-                        cooldown = 12  # وقفه کوتاه بین معاملات در تایم ۱۵ دقیقه
+                        cooldown = 12
                         trade_executed = True
 
-            # 2. تله نهنگ نزولی در تایم ۱۵ دقیقه (Short)
+            # 2. تله نهنگ نزولی (Short)
             elif (c_high > swing_high) and (c_close < swing_high) and (c_open > c_close) and (c_vol > c_vol_avg * 1.3) and not trade_executed:
                 entry = c_close
                 sl = c_high + (c_atr * 0.3)
@@ -148,12 +164,12 @@ for symbol, filename in FILES.items():
         print(f"    📊 نتایج {symbol} -> معاملات: {m_trades} | برد: {m_wins} | باخت: {m_losses}")
 
     except Exception as e:
-        print(f"    ❌ خطا در خواندن فایل {filename}: {e}")
+        print(f"    ❌ خطا در پردازش فایل {filename}: {e}")
 
 overall_win_rate = (grand_total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
 print("\n" + "="*60)
-print("FINAL 15m LOCAL CSV BACKTEST RESULT (RR 1:2)")
+print("FINAL 15m AUTOMATED BACKTEST RESULT (RR 1:2)")
 print("="*60)
 print(f"TOTAL TRADES : {grand_total_trades}")
 print(f"TOTAL WINS   : {grand_total_wins}")
