@@ -12,11 +12,16 @@ SYMBOLS = {
     "XRP-USD": "XRPUSDT"
 }
 
-# بازه زمانی امن: از اکتبر 2025 تا پایان جولای 2026 (که در آرشیو بایننس کاملاً موجود هستند)
+# بازه زمانی امن: از اکتبر 2025 تا پایان جولای 2026
 months = pd.date_range(start="2025-10-01", end="2026-07-01", freq='MS')
 
+# هدر مرورگر برای جلوگیری از بلاک شدن توسط سرور بایننس
+headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
+
 print("============================================================")
-print("📥 دانلود داده‌های ۱۵ دقیقه‌ای با بازه زمانی معتبر از بایننس")
+print("📥 دانلود داده‌های ۱۵ دقیقه‌ای از بایننس با هدر امن مرورگر")
 print("============================================================")
 
 for symbol_key, symbol_binance in SYMBOLS.items():
@@ -32,7 +37,7 @@ for symbol_key, symbol_binance in SYMBOLS.items():
         url = f"https://data.binance.vision/data/spot/monthly/klines/{symbol_binance}/15m/{symbol_binance}-15m-{year}-{month}.zip"
         
         try:
-            response = requests.get(url, timeout=15)
+            response = requests.get(url, headers=headers, timeout=15)
             if response.status_code == 200:
                 with zipfile.ZipFile(io.BytesIO(response.content)) as z:
                     csv_filename = z.namelist()[0]
@@ -50,9 +55,9 @@ for symbol_key, symbol_binance in SYMBOLS.items():
                     
                     if not df_month.empty:
                         all_dfs.append(df_month[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']])
-                        print(f"  ✔️ ماه {year}-{month} با موفقیت خوانده شد ({len(df_month)} کندل).")
+                        print(f"  ✔️ ماه {year}-{month} با موفقیت دانلود شد ({len(df_month)} کندل).")
             else:
-                print(f"  ⚠️ ماه {year}-{month} در آرشیو نبود.")
+                print(f"  ⚠️ ماه {year}-{month} در دسترس نبود (کد خطا: {response.status_code})")
         except Exception as e:
             print(f"  ❌ خطا در دانلود ماه {year}-{month}: {e}")
             
