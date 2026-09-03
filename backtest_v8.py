@@ -41,13 +41,13 @@ for symbol_key, symbol_binance in SYMBOLS.items():
             if response.status_code == 200:
                 with zipfile.ZipFile(io.BytesIO(response.content)) as z:
                     csv_filename = z.namelist()[0]
-                    with z.open(csv_filename) as f:
-                        # اصلاح باینری به متن با TextIOWrapper برای خواندن صحیح CSV
-                        text_stream = io.TextIOWrapper(f, encoding='utf-8')
-                        df_month = pd.read_csv(text_stream, header=None, usecols=[0, 1, 2, 3, 4, 5],
-                                              names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                    # استفاده از روش امن z.read و BytesIO برای جلوگیری از افت داده
+                    csv_bytes = z.read(csv_filename)
+                    df_month = pd.read_csv(io.BytesIO(csv_bytes), header=None, usecols=[0, 1, 2, 3, 4, 5],
+                                          names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                    if not df_month.empty:
                         all_dfs.append(df_month)
-                print(f"  ✔️ ماه {year}-{month} دانلود و خوانده شد.")
+                        print(f"  ✔️ ماه {year}-{month} خوانده شد ({len(df_month)} کندل).")
             else:
                 print(f"  ⚠️ ماه {year}-{month} موجود نبود.")
         except Exception as e:
