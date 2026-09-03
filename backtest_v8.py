@@ -1,8 +1,8 @@
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta
 
-# 1. بررسی و نصب خودکار ccxt در صورت نیاز
 try:
     import ccxt
 except ImportError:
@@ -13,7 +13,6 @@ except ImportError:
 import pandas as pd
 import numpy as np
 
-# 2. دانلود خودکار داده‌ها از صرافی کراکن
 exchange = ccxt.kraken({'enableRateLimit': True})
 SYMBOLS = {
     "BTC": "BTC/USD",
@@ -22,42 +21,59 @@ SYMBOLS = {
     "XRP": "XRP/USD"
 }
 
+# بازه زمانی: دقیقا یک سال گذشته تا امروز
+start_date = datetime.now() - timedelta(days=365)
+since_timestamp = int(start_date.timestamp() * 1000)
+
 print("============================================================")
-print("📥 دریافت داده‌های ۱۵ دقیقه‌ای واقعی از صرافی کراکن")
+print("📥 دانلود داده‌های یک‌ساله واقعی ۱۵ دقیقه‌ای (با پوشش کامل ۳۶۵ روز)")
 print("============================================================")
 
 for symbol, kraken_symbol in SYMBOLS.items():
     filename = f"{symbol}_15m.csv"
-    print(f"🔹 در حال دریافت داده‌های {symbol}...")
-    try:
-        ohlcv = exchange.fetch_ohlcv(kraken_symbol, timeframe='15m', limit=2000)
-        if ohlcv:
-            df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-            df['Date'] = pd.to_datetime(df['Timestamp'], unit='ms')
-            df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-            df.dropna(inplace=True)
-            df.sort_values('Date', inplace=True)
-            df.reset_index(drop=True, inplace=True)
-            df.to_csv(filename, index=False)
-            print(f"  ✔️ فایل {filename} ساخته شد ({len(df)} کندل).")
-    except Exception as e:
-        print(f"  ❌ خطا در دریافت {symbol}: {e}")
+    print(f"🔹 در حال دریافت تاریخچه کامل یک‌ساله {symbol}...")
+    
+    all_ohlcv = []
+    current_since = since_timestamp
+    
+    while current_since < exchange.milliseconds():
+        try:
+            ohlcv = exchange.fetch_ohlcv(kraken_symbol, timeframe='15m', since=current_since, limit=720)
+            if not ohlcv:
+                break
+            current_since = ohlcv[-1][0] + 1
+            all_ohlcv.extend(ohlcv)
+        except Exception as e:
+            print(f"  ❌ خطا در دریافت بخش‌پذیر داده‌ها: {e}")
+            break
+            
+    if all_ohlcv:
+        df = pd.DataFrame(all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        df['Date'] = pd.to_datetime(df['Timestamp'], unit='ms')
+        df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        df.dropna(inplace=True)
+        df.drop_duplicates(subset=['Date'], inplace=True)
+        df.sort_values('Date', inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        
+        df.to_csv(filename, index=False)
+        print(f"  ✔️ فایل {filename} با موفقیت ساخته شد (تعداد کل کندل‌های یک‌ساله: {len(df)})")
+    else:
+        print(f"  ❌ هیچ داده‌ای برای {symbol} دریافت نشد.")
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست استراتژی تله‌ی نهنگ + فیلتر روند")
+print("🚀 اجرای موتور بک‌تست روی داده‌های واقعی یک‌ساله")
 print("============================================================")
 
 for symbol in SYMBOLS.keys():
     filename = f"{symbol}_15m.csv"
     if not os.path.exists(filename):
-        print(f"\n⚠️ فایل {filename} یافت نشد.")
         continue
         
-    print(f"\n🔹 تحلیل و بک‌تست روی {symbol}...")
     df = pd.read_csv(filename)
     df['Date'] = pd.to_datetime(df['Date'])
     
-    # فیلتر روند (SMA 200) و سطوح نقدینگی
+    # اندیکاتورها روی تایم فریم یکساله
     df['SMA_200'] = df['Close'].rolling(window=200).mean()
     df['Prev_High'] = df['High'].shift(1).rolling(window=20).max()
     df['Prev_Low'] = df['Low'].shift(1).rolling(window=20).min()
@@ -82,31 +98,24 @@ for symbol in SYMBOLS.keys():
             entry_time = current['Date']
             side = 'LONG' if is_long_trap else 'SHORT'
             
-            if side == 'LONG':
-                sl = entry_price * (1 - sl_pct)
-                tp = entry_price * (1 + tp_pct)
-            else:
-                sl = entry_price * (1 + sl_pct)
-                tp = entry_price * (1 - tp_pct)
+            sl = entry_price * (1 - sl_pct) if side == 'LONG' else entry_price * (1 + sl_pct)
+            tp = entry_price * (1 + tp_pct) if side == 'LONG' else entry_price * (1 - tp_pct)
                 
             outcome = 'OPEN'
             for j in range(i + 1, min(i + 50, len(df))):
                 future_candle = df.iloc[j]
-                high = future_candle['High']
-                low = future_candle['Low']
-                
                 if side == 'LONG':
-                    if low <= sl:
+                    if future_candle['Low'] <= sl:
                         outcome = 'LOSS'
                         break
-                    elif high >= tp:
+                    elif future_candle['High'] >= tp:
                         outcome = 'WIN'
                         break
                 else:
-                    if high >= sl:
+                    if future_candle['High'] >= sl:
                         outcome = 'LOSS'
                         break
-                    elif low <= tp:
+                    elif future_candle['Low'] <= tp:
                         outcome = 'WIN'
                         break
             
@@ -126,11 +135,11 @@ for symbol in SYMBOLS.keys():
         win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
         net_profit = (wins * 2) - losses
         
-        print(f"📊 نتایج نهایی برای {symbol}:")
-        print(f"   - تعداد معاملات: {total_trades} | برنده: {wins} | بازنده: {losses}")
-        print(f"   - **وین‌ریت (Win Rate):** {win_rate:.2f}%")
+        print(f"📊 نتایج یک‌ساله برای {symbol}:")
+        print(f"   - تعداد کل معاملات یک‌ساله: {total_trades} | برنده: {wins} | بازنده: {losses}")
+        print(f"   - **وین‌ریت واقعی (Win Rate):** {win_rate:.2f}%")
         print(f"   - امتیاز عملکرد (Profit Score): {net_profit}")
     else:
-        print(f"⚠️ معامله‌ای با شرایط فیلتر روند روی {symbol} ثبت نشد.")
+        print(f"⚠️ معامله‌ای ثبت نشد.")
 
-print("\n✨ بک‌تست به اتمام رسید.")
+print("\n✨ بک‌تست یک‌ساله به اتمام رسید.")
