@@ -3,7 +3,7 @@ import urllib.request
 import time
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
-TARGET_RR = 2.0  # قفل شده روی ۱ به ۲ به درخواست شما
+TARGET_RR = 2.0  # قفل شده روی ۱ به ۲
 
 def fetch_1year_15m_auto(symbol):
     all_candles = {}
@@ -98,7 +98,7 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - HIGH WINRATE V12.0 (CONFLUENCE)")
+    print(" SCORE HUNTER PRO - V12.1 (CLEAN & FIXED)         ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -135,9 +135,9 @@ def run_backtest():
             current_risk_amount = balance * risk_percentage
             trade_taken = False
 
-            # --- استراتژی لانگ (روند صعودی + تقاطع مکدی صعودی + RSI مناسب) ---
+            # --- استراتژی لانگ ---
             is_uptrend = c["close"] > trend_val
-            is_macd_cross_up = prev_m <= prev_s and m_line > s_line and m_line < 0 # پایین خط صفر برای پرش بزرگ
+            is_macd_cross_up = prev_m <= prev_s and m_line > s_line
             is_rsi_buy = 40 <= current_rsi <= 65
 
             if is_uptrend and is_macd_cross_up and is_rsi_buy:
@@ -162,13 +162,15 @@ def run_backtest():
                         skip_until = j
                         trade_taken = True
                         if trade_won:
-                            wins += 1; balance += (current_risk_amount * TARGET_RR)
+                            wins += 1
+                            balance += (current_risk_amount * TARGET_RR)
                         else:
-                            losses += 1; balance -= current_risk_amount
+                            losses += 1
+                            balance -= current_risk_amount
 
-            # --- استراتژی شورت (روند نزولی + تقاطع مکدی نزولی + RSI مناسب) ---
+            # --- استراتژی شورت ---
             is_downtrend = c["close"] < trend_val
-            is_macd_cross_down = prev_m >= prev_s and m_line < s_line and m_line > 0
+            is_macd_cross_down = prev_m >= prev_s and m_line < s_line
             is_rsi_sell = 35 <= current_rsi <= 60
 
             if not trade_taken and is_downtrend and is_macd_cross_down and is_rsi_sell:
@@ -192,9 +194,11 @@ def run_backtest():
                         symbol_trades += 1
                         skip_until = j
                         if trade_won:
-                            wins += 1; balance += (current_risk_amount * TARGET_RR)
+                            wins += 1
+                            balance += (current_risk_amount * TARGET_RR)
                         else:
-                            losses += 1; balance -= current_risk_space if 'risk_space' in locals() else losses -= current_risk_amount # safe fallback
+                            losses += 1
+                            balance -= current_risk_amount
 
         total_wins += wins
         total_losses += losses
@@ -204,7 +208,7 @@ def run_backtest():
     win_rate = (total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
     print("\n==================================================")
-    print("      AGGREGATED HIGH WINRATE V12.0 RESULTS       ")
+    print("      AGGREGATED V12.1 RESULTS                    ")
     print("==================================================\n")
     print(f"Total Trades       : {grand_total_trades}")
     print(f"Winning Trades     : {total_wins}")
