@@ -15,7 +15,7 @@ grand_total_wins = 0
 grand_total_losses = 0
 
 print("============================================================")
-print("WHALE PULLBACK - OPTIMIZED EMA PULLBACK & ADX STRATEGY")
+print("WHALE PULLBACK - OPTIMIZED WITH RSI FILTER")
 print("============================================================")
 
 for symbol in SYMBOLS:
@@ -51,7 +51,7 @@ for symbol in SYMBOLS:
             atr = pd.Series(tr).rolling(window=14).mean().fillna(value=0).values
             vol_sma = pd.Series(volumes).rolling(window=20).mean().values
             
-            # محاسبه ADX برای سنجش قدرت روند
+            # محاسبه ADX
             df_adx = pd.DataFrame({'high': highs, 'low': lows, 'close': closes})
             df_adx['tr'] = tr
             df_adx['hd'] = df_adx['high'] - df_adx['high'].shift(1)
@@ -62,6 +62,14 @@ for symbol in SYMBOLS:
             mdi = (pd.Series(df_adx['mdm']).rolling(14).sum() / (pd.Series(df_adx['tr']).rolling(14).sum() + 1e-9)) * 100
             dx = (abs(pdi - mdi) / (pdi + mdi + 1e-9)) * 100
             adx = dx.rolling(14).mean().fillna(20).values
+
+            # محاسبه RSI (دوره 14)
+            delta = close_series.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / (loss + 1e-9)
+            rsi = 100 - (100 / (1 + rs))
+            rsi_values = rsi.fillna(50).values
 
             m_wins, m_losses, m_trades = 0, 0, 0
             idx = 200
@@ -77,12 +85,12 @@ for symbol in SYMBOLS:
                 c_vol, c_vol_avg = volumes[idx], vol_sma[idx]
                 c_ema20, c_ema50, c_ema200 = ema_20[idx], ema_50[idx], ema_200[idx]
                 c_atr, c_adx = atr[idx], adx[idx]
+                c_rsi, prev_rsi = rsi_values[idx], rsi_values[idx-1]
 
                 if c_atr == 0 or np.isnan(c_vol_avg) or c_adx < 22:
                     idx += 1
                     continue
 
-                # تشخیص روند اصلی
                 is_uptrend = (c_close > c_ema200) and (c_ema20 > c_ema50)
                 is_downtrend = (c_close < c_ema200) and (c_ema20 < c_ema50)
 
@@ -92,8 +100,8 @@ for symbol in SYMBOLS:
 
                 trade_executed = False
 
-                # منطق پولبک صعودی: قیمت به نزدیکی EMA 20 اصلاح کرده و کندل برگشتی زده است
-                if is_uptrend and (c_low <= c_ema20 * 1.005) and (c_close > c_open) and (c_vol > c_vol_avg * 0.8):
+                # شرط لانگ با فیلتر RSI (محدوده سالم پولبک و شروع برگشت صعودی RSI)
+                if is_uptrend and (c_low <= c_ema20 * 1.005) and (c_close > c_open) and (c_vol > c_vol_avg * 0.8) and (40 < c_rsi < 65) and (c_rsi > prev_rsi):
                     entry = c_close
                     sl = c_low - (c_atr * 0.8)
                     risk_dist = entry - sl
@@ -115,8 +123,8 @@ for symbol in SYMBOLS:
                                 symbol_balance -= risk_amount
                             idx = j; cooldown = 4; trade_executed = True
 
-                # منطق پولبک نزولی: قیمت به نزدیکی EMA 20 پولبک زده و کندل نزولی زده است
-                elif is_downtrend and (c_high >= c_ema20 * 0.995) and (c_open > c_close) and (c_vol > c_vol_avg * 0.8) and not trade_executed:
+                # شرط شورت با فیلتر RSI
+                elif is_downtrend and (c_high >= c_ema20 * 0.995) and (c_open > c_close) and (c_vol > c_vol_avg * 0.8) and (35 < c_rsi < 60) and (c_rsi < prev_rsi) and not trade_executed:
                     entry = c_close
                     sl = c_high + (c_atr * 0.8)
                     risk_dist = sl - entry
@@ -150,7 +158,7 @@ for symbol in SYMBOLS:
 overall_win_rate = (grand_total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
 print("\n" + "="*60)
-print("FINAL OPTIMIZED BACKTEST RESULT")
+print("FINAL RSI-OPTIMIZED BACKTEST RESULT")
 print("="*60)
 print(f"TOTAL TRADES : {grand_total_trades}")
 print(f"TOTAL WINS   : {grand_total_wins}")
