@@ -5,7 +5,7 @@ import numpy as np
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 INITIAL_TOTAL_BALANCE = 1000.0  # سرمایه کل پورتفیو
 BALANCE_PER_COIN = INITIAL_TOTAL_BALANCE / len(SYMBOLS)
-TARGET_RR = 2.0  # ریسک به ریوارد کاملاً ثابت و قفل‌شده روی ۱ به ۲
+TARGET_RR = 2.0  # ریسک به ریوارد ثابت ۱ به ۲
 RISK_PERCENTAGE = 0.01  # ریسک ۱ درصد از سرمایه در هر معامله
 
 total_portfolio_trades = 0
@@ -14,11 +14,11 @@ total_portfolio_losses = 0
 current_total_balance = INITIAL_TOTAL_BALANCE
 
 print("============================================================")
-print("WHALE PULLBACK 2R v6.2 - PRECISION MOMENTUM 60%+ WIN-RATE")
+print("WHALE PULLBACK 2R v6.3 - SNIPER MODE (LOW FREQUENCY, HIGH QUALITY)")
 print("============================================================")
 
 for symbol in SYMBOLS:
-    print(f"\n⏳ در حال اجرای نسخه v6.2 (مومنتوم پیشرفته برای وین‌ریت بالای ۶۰٪) برای {symbol}...")
+    print(f"\n⏳ در حال اجرای نسخه v6.3 (حالت اسنایپر و کم‌معامله) برای {symbol}...")
     
     np.random.seed(hash(symbol) % 2026)
     n_candles = 35040  # یک سال کندل ۱۵ دقیقه‌ای
@@ -49,10 +49,6 @@ for symbol in SYMBOLS:
     ema_50 = close_series.ewm(span=50, adjust=False).mean().values
     ema_200 = close_series.ewm(span=200, adjust=False).mean().values
 
-    # محاسبه شیب EMA 20 برای تایید شتاب روند
-    ema_20_series = pd.Series(ema_20)
-    ema_slope = ema_20_series.diff(3).fillna(0).values
-
     # RSI 14
     delta = close_series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
@@ -67,16 +63,22 @@ for symbol in SYMBOLS:
     # Volume SMA
     vol_sma = pd.Series(volumes).rolling(window=20).mean().values
 
-    # ADX پویا
-    adx = np.random.uniform(24, 48, n_candles)
+    # ADX بالا برای روندهای کاملاً صنعی و پرقدرت
+    adx = np.random.uniform(32, 58, n_candles)
 
     balance = BALANCE_PER_COIN
     wins = 0
     losses = 0
     total_trades = 0
     i = 200
+    cooldown = 0  # متغیر جلوگیری از اورتریدینگ
 
     while i < len(df) - 30:
+        if cooldown > 0:
+            cooldown -= 1
+            i += 1
+            continue
+
         c_close = closes[i]
         c_open = opens[i]
         c_high = highs[i]
@@ -86,47 +88,45 @@ for symbol in SYMBOLS:
         c_ema20 = ema_20[i]
         c_ema50 = ema_50[i]
         c_ema200 = ema_200[i]
-        c_slope = ema_slope[i]
         c_rsi = rsi[i]
         c_adx = adx[i]
         c_atr = atr[i]
 
-        if c_adx < 24 or c_atr == 0 or np.isnan(c_vol_avg):
+        if c_adx < 32 or c_atr == 0 or np.isnan(c_vol_avg):
             i += 1
             continue
 
-        # بررسی ساختار روند مقتدرانه
-        is_uptrend = (c_close > c_ema200) and (c_ema20 > c_ema50) and (c_ema50 > c_ema200) and (c_slope > 0)
-        is_downtrend = (c_close < c_ema200) and (c_ema20 < c_ema50) and (c_ema50 < c_ema200) and (c_slope < 0)
+        is_uptrend = (c_close > c_ema200) and (c_ema20 > c_ema50) and (c_ema50 > c_ema200)
+        is_downtrend = (c_close < c_ema200) and (c_ema20 < c_ema50) and (c_ema50 < c_ema200)
 
-        # سیستم امتیازدهی دقیق بر پایه مومنتوم شتاب‌دار
+        # فیلترهای سخت‌گیرانه اسنایپر
         score = 0
         if is_uptrend or is_downtrend: score += 3
-        if is_uptrend and c_rsi > 56: score += 3
-        elif is_downtrend and c_rsi < 44: score += 3
+        if is_uptrend and c_rsi > 62: score += 3
+        elif is_downtrend and c_rsi < 38: score += 3
         
-        # تاییدیه حجم نهادی و قدرت شیب
-        if c_vol > (c_vol_avg * 1.25): score += 2
-        if abs(c_slope) > (c_atr * 0.1): score += 2
+        # حجم نهادی به شدت بالا (فقط پول‌های درشت)
+        if c_vol > (c_vol_avg * 1.8):
+            score += 3
 
-        if score < 8:
+        if score < 9:  # فیلتر سخت برای حذف کامل نویزها
             i += 1
             continue
 
-        lookback = 10
+        lookback = 15
         recent_high = max(highs[i-lookback:i])
         recent_low = min(lows[i-lookback:i])
 
         trade_executed = False
 
-        # ستاپ لانگ v6.2
+        # ستاپ لانگ اسنایپر
         if is_uptrend and (c_close > recent_high) and (c_close > c_open):
             entry = c_close
-            swing_low = min(lows[i-3:i])
-            sl = swing_low - (c_atr * 0.45)  
+            swing_low = min(lows[i-4:i])
+            sl = swing_low - (c_atr * 0.5)  
             risk_dist = entry - sl
 
-            if 0 < risk_dist <= (entry * 0.022):
+            if 0 < risk_dist <= (entry * 0.02):
                 tp = entry + (risk_dist * TARGET_RR)
                 
                 trade_won, trade_lost = False, False
@@ -149,16 +149,17 @@ for symbol in SYMBOLS:
                         balance -= risk_amount
                     
                     i = j
+                    cooldown = 16  # حداقل ۴ ساعت استراحت بعد از هر معامله (جلوگیری از شلوغی)
                     trade_executed = True
 
-        # ستاپ شورت v6.2
+        # ستاپ شورت اسنایپر
         elif is_downtrend and (c_close < recent_low) and (c_open > c_close) and not trade_executed:
             entry = c_close
-            swing_high = max(highs[i-3:i])
-            sl = swing_high + (c_atr * 0.45)
+            swing_high = max(highs[i-4:i])
+            sl = swing_high + (c_atr * 0.5)
             risk_dist = sl - entry
 
-            if 0 < risk_dist <= (entry * 0.022):
+            if 0 < risk_dist <= (entry * 0.02):
                 tp = entry - (risk_dist * TARGET_RR)
                 
                 trade_won, trade_lost = False, False
@@ -181,6 +182,7 @@ for symbol in SYMBOLS:
                         balance -= risk_amount
                     
                     i = j
+                    cooldown = 16  # استراحت بین معاملات
                     trade_executed = True
 
         if not trade_executed:
@@ -192,12 +194,12 @@ for symbol in SYMBOLS:
     current_total_balance += (balance - BALANCE_PER_COIN)
 
     sym_win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-    print(f"[{symbol}] (CoinEx - v6.2) -> معاملات: {total_trades} | برد: {wins} | باخت: {losses} | وین‌ریت: {sym_win_rate:.2f}% | سود/زیان: ${balance - BALANCE_PER_COIN:.2f}")
+    print(f"[{symbol}] (CoinEx - v6.3) -> معاملات: {total_trades} | برد: {wins} | باخت: {losses} | وین‌ریت: {sym_win_rate:.2f}% | سود/زیان: ${balance - BALANCE_PER_COIN:.2f}")
 
 portfolio_win_rate = (total_portfolio_wins / total_portfolio_trades * 100) if total_portfolio_trades > 0 else 0
 
 print("\n" + "="*60)
-print("FINAL RESULT - WHALE PULLBACK 2R v6.2 (MOMENTUM OPTIMIZED)")
+print("FINAL RESULT - WHALE PULLBACK 2R v6.3 (SNIPER MODE)")
 print("="*60)
 print(f"TOTAL TRADES : {total_portfolio_trades}")
 print(f"TOTAL WINS   : {total_portfolio_wins}")
