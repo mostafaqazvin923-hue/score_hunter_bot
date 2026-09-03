@@ -70,7 +70,7 @@ def run_backtest():
     grand_total_trades = 0
 
     print("==================================================")
-    print(" SCORE HUNTER PRO - SMC / WHALE SETUP (1-YEAR)    ")
+    print(" SCORE HUNTER PRO - SMC WHALE SETUP (1-YEAR)    ")
     print("==================================================")
 
     for symbol in SYMBOLS:
@@ -108,18 +108,18 @@ def run_backtest():
 
             # --- ستاپ لانگ (شکار نقدینگی کف + تاییدیه شکست ساختار صعودی + همراستا با روند) ---
             is_sweep_low = prev_c["low"] < liquidity_low
-            is_mss_bullish = c["close"] > prev_c["high"] and c["close']" not in locals() and c["close"] > c["open"]
+            is_mss_bullish = c["close"] > prev_c["high"] and c["close"] > c["open"]
             is_above_trend = c["close"] > trend_ema
 
             if is_above_trend and is_sweep_low and is_mss_bullish:
                 entry_price = c["close"]
-                stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.0002) # استاپ پشت نقدینگی جارو شده
+                stop_loss = min(prev_c["low"], prev2_c["low"]) - (entry_price * 0.0002)
                 risk_dist = entry_price - stop_loss
 
                 if risk_dist > 0:
                     take_profit = entry_price + (risk_dist * TARGET_RR)
                     trade_won, trade_lost = False, False
-                    end_idx = min(i + 48, len(candles) - 1) # اجازه تنفس به قیمت تا ۱۲ ساعت
+                    end_idx = min(i + 48, len(candles) - 1)
 
                     for j in range(i + 1, end_idx + 1):
                         fc = candles[j]
@@ -140,7 +140,7 @@ def run_backtest():
             # --- ستاپ شورت (شکار نقدینگی سقف + تاییدیه شکست ساختار نزولی + همراستا با روند) ---
             is_sweep_high = prev_c["high"] > liquidity_high
             is_mss_bearish = c["close"] < prev_c["low"] and c["close"] < c["open"]
-            is_below_trend = c["close']" not in locals() and c["close"] < trend_ema
+            is_below_trend = c["close"] < trend_ema
 
             if not trade_taken and is_below_trend and is_sweep_high and is_mss_bearish:
                 entry_price = c["close"]
