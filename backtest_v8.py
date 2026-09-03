@@ -42,10 +42,12 @@ for symbol_key, symbol_binance in SYMBOLS.items():
                 with zipfile.ZipFile(io.BytesIO(response.content)) as z:
                     csv_filename = z.namelist()[0]
                     with z.open(csv_filename) as f:
-                        df_month = pd.read_csv(f, header=None, usecols=[0, 1, 2, 3, 4, 5],
+                        # اصلاح باینری به متن با TextIOWrapper برای خواندن صحیح CSV
+                        text_stream = io.TextIOWrapper(f, encoding='utf-8')
+                        df_month = pd.read_csv(text_stream, header=None, usecols=[0, 1, 2, 3, 4, 5],
                                               names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
                         all_dfs.append(df_month)
-                print(f"  ✔️ ماه {year}-{month} دانلود شد.")
+                print(f"  ✔️ ماه {year}-{month} دانلود و خوانده شد.")
             else:
                 print(f"  ⚠️ ماه {year}-{month} موجود نبود.")
         except Exception as e:
@@ -60,7 +62,7 @@ for symbol_key, symbol_binance in SYMBOLS.items():
         
         final_df.dropna(subset=['Timestamp', 'Close'], inplace=True)
         
-        # استفاده از errors='coerce' برای حذف قطعی تاریخ‌های نامعتبر و خروج از محدودیت
+        # تبدیل تایم‌استمپ به تاریخ
         final_df['Date'] = pd.to_datetime(final_df['Timestamp'], unit='ms', errors='coerce')
         final_df.dropna(subset=['Date'], inplace=True)
         
