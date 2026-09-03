@@ -20,7 +20,7 @@ grand_total_losses = 0
 current_total_balance = INITIAL_TOTAL_BALANCE
 
 print("============================================================")
-print("WHALE PULLBACK - MONTH-BY-MONTH REAL COINEX BACKTEST")
+print("WHALE PULLBACK - MONTH-BY-MONTH REAL COINEX BACKTEST (1h)")
 print("============================================================")
 
 for symbol in SYMBOLS:
@@ -37,10 +37,10 @@ for symbol in SYMBOLS:
         all_ohlcv = []
         current_since = since
         
-        # دریافت داده‌های ماهانه به صورت امن و تکه‌تکه برای دور زدن محدودیت صرافی
+        # دریافت داده‌های ماهانه با تایم‌فریم 1h برای پوشش کامل تاریخچه
         while current_since < end_ts:
             try:
-                ohlcv = exchange.fetch_ohlcv(symbol, '15m', since=current_since, limit=1000)
+                ohlcv = exchange.fetch_ohlcv(symbol, '1h', since=current_since, limit=1000)
                 if not ohlcv:
                     break
                 
@@ -81,46 +81,45 @@ for symbol in SYMBOLS:
         vol_sma = pd.Series(volumes).rolling(window=20).mean().values
         
         m_wins, m_losses, m_trades = 0, 0, 0
-        i = 200
+        i_idx = 200
         cooldown = 0
 
-        while i < len(df) - 30:
+        while i_idx < len(df) - 30:
             if cooldown > 0:
                 cooldown -= 1
-                i += 1
+                i_idx += 1
                 continue
 
-            c_close, c_open, c_high, c_low = closes[i], opens[i], highs[i], lows[i]
-            c_vol, c_vol_avg = volumes[i], vol_sma[i]
-            c_ema20, c_ema50, c_ema200 = ema_20[i], ema_50[i], ema_200[i]
-            c_atr = atr[i]
+            c_close, c_open, c_high, c_low = closes[i_idx], opens[i_idx], highs[i_idx], lows[i_idx]
+            c_vol, c_vol_avg = volumes[i_idx], vol_sma[i_idx]
+            c_ema20, c_ema50, c_ema200 = ema_20[i_idx], ema_50[i_idx], ema_200[i_idx]
+            c_atr = atr[i_idx]
 
             if c_atr == 0 or np.isnan(c_vol_avg):
-                i += 1
+                i_idx += 1
                 continue
 
-            # شرایط روند (نسخه روان‌تر)
             is_uptrend = (c_close > c_ema200) and (c_ema20 > c_ema50)
             is_downtrend = (c_close < c_ema200) and (c_ema20 < c_ema50)
 
             if not is_uptrend and not is_downtrend:
-                i += 1
+                i_idx += 1
                 continue
 
             lookback = 10
-            recent_high = max(highs[i-lookback:i])
-            recent_low = min(lows[i-lookback:i])
+            recent_high = max(highs[i_idx-lookback:i_idx])
+            recent_low = min(lows[i_idx-lookback:i_idx])
             trade_executed = False
 
             # لانگ
             if is_uptrend and (c_close > recent_high) and (c_vol > c_vol_avg):
                 entry = c_close
-                sl = min(lows[i-3:i+1]) - (c_atr * 0.5)
+                sl = min(lows[i_idx-3:i_idx+1]) - (c_atr * 0.5)
                 risk_dist = entry - sl
                 if risk_dist > 0:
                     tp = entry + (risk_dist * TARGET_RR)
                     won, lost = False, False
-                    for j in range(i + 1, min(i + 24, len(df))):
+                    for j in range(i_idx + 1, min(i_idx + 24, len(df))):
                         if highs[j] >= tp: won = True; break
                         if lows[j] <= sl: lost = True; break
                     if won or lost:
@@ -133,17 +132,17 @@ for symbol in SYMBOLS:
                         else:
                             m_losses += 1; grand_total_losses += 1
                             symbol_balance -= risk_amount
-                        i = j; cooldown = 3; trade_executed = True
+                        i_idx = j; cooldown = 3; trade_executed = True
 
             # شورت
             elif is_downtrend and (c_close < recent_low) and (c_vol > c_vol_avg) and not trade_executed:
                 entry = c_close
-                sl = max(highs[i-3:i+1]) + (c_atr * 0.5)
+                sl = max(highs[i_idx-3:i_idx+1]) + (c_atr * 0.5)
                 risk_dist = sl - entry
                 if risk_dist > 0:
                     tp = entry - (risk_dist * TARGET_RR)
                     won, lost = False, False
-                    for j in range(i + 1, min(i + 24, len(df))):
+                    for j in range(i_idx + 1, min(i_idx + 24, len(df))):
                         if lows[j] <= tp: won = True; break
                         if highs[j] >= sl: lost = True; break
                     if won or lost:
@@ -156,17 +155,18 @@ for symbol in SYMBOLS:
                         else:
                             m_losses += 1; grand_total_losses += 1
                             symbol_balance -= risk_amount
-                        i = j; cooldown = 3; trade_executed = True
+                        i_idx = j; cooldown = 3; trade_executed = True
 
             if not trade_executed:
-                i += 1
+                i_idx += 1
 
-        print(f"    ماه {start_date.strftime('%Y-%m')} -> معاملات: {m_trades} | برد: {m_wins} | باخت: {m_losses}")
+        if m_trades > 0:
+            print(f"    ماه {start_date.strftime('%Y-%m')} -> معاملات: {m_trades} | برد: {m_wins} | باخت: {m_losses}")
 
 overall_win_rate = (grand_total_wins / grand_total_trades * 100) if grand_total_trades > 0 else 0
 
 print("\n" + "="*60)
-print("FINAL 1-YEAR AGGREGATED RESULT (MONTH-BY-MONTH REAL DATA)")
+print("FINAL 1-YEAR AGGREGATED RESULT (1h TIMEFRAME)")
 print("="*60)
 print(f"TOTAL TRADES : {grand_total_trades}")
 print(f"TOTAL WINS   : {grand_total_wins}")
