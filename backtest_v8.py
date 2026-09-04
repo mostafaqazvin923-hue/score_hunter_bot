@@ -13,8 +13,8 @@ except ImportError:
 import pandas as pd
 import numpy as np
 
-# استفاده از صرافی MEXC برای تایم‌فریم ۱ ساعته
-exchange = ccxt.mexc({'enableRateLimit': True})
+# استفاده از صرافی LBank
+exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
     "BTC": "BTC/USDT",
     "ETH": "ETH/USDT",
@@ -22,17 +22,18 @@ SYMBOLS = {
     "XRP": "XRP/USDT"
 }
 
-# محاسبه بازه زمانی دقیق یک سال گذشته
 start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های یک‌ساله واقعی ۱ ساعته (1h) بدون محدودیت")
+print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته از LBank")
 print("============================================================")
 
-for symbol, mexc_symbol in SYMBOLS.items():
-    filename = f"{symbol}_1h.csv"
-    print(f"🔹 در حال دریافت تاریخچه کامل یک‌ساله {symbol} در تایم‌فریم ۱ ساعته...")
+data_1h = {}
+
+for symbol, lbank_symbol in SYMBOLS.items():
+    filename_1h = f"{symbol}_1h_data.csv"
+    print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
     current_since = since_timestamp
@@ -40,113 +41,245 @@ for symbol, mexc_symbol in SYMBOLS.items():
     
     while current_since < now_timestamp:
         try:
-            # دریافت کندل‌های ۱ ساعته با لیمیت ۱۰۰۰ عددی (هر بار حدود ۴۱ روز)
-            ohlcv = exchange.fetch_ohlcv(mexc_symbol, timeframe='1h', since=current_since, limit=1000)
+            ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', since=current_since, limit=1000)
             if not ohlcv:
                 break
-            
             current_since = ohlcv[-1][0] + 1
             all_ohlcv.extend(ohlcv)
-            
             if len(ohlcv) < 1000:
                 break
         except Exception as e:
-            print(f"  ❌ خطا در دریافت داده‌ها برای {symbol}: {e}")
+            print(f"  ❌ خطا در دریافت داده {symbol}: {e}")
             break
             
     if all_ohlcv:
-        df = pd.DataFrame(all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-        df['Date'] = pd.to_datetime(df['Timestamp'], unit='ms')
-        df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-        df.dropna(inplace=True)
-        df.drop_duplicates(subset=['Date'], inplace=True)
-        df.sort_values('Date', inplace=True)
-        df.reset_index(drop=True, inplace=True)
+        df1h = pd.DataFrame(all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
+        df1h = df1h[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        df1h.dropna(inplace=True)
+        df1h.drop_duplicates(subset=['Date'], inplace=True)
+        df1h.sort_values('Date', inplace=True)
+        df1h.reset_index(drop=True, inplace=True)
         
-        df.to_csv(filename, index=False)
-        print(f"  ✔️ فایل {filename} با موفقیت ساخته شد (تعداد کل کندل‌ها: {len(df)})")
+        # ذخیره فایل 1 ساعته
+        df1h.to_csv(filename_1h, index=False)
+        data_1h[symbol] = df1h
+        print(f"  ✔️ دیتای 1 ساعته {symbol} آماده شد (تعداد کندل: {len(df1h)})")
     else:
-        print(f"  ❌ هیچ داده‌ای برای {symbol} دریافت نشد.")
+        print(f"  ❌ دیتایی برای {symbol} دریافت نشد.")
+
+# تابع کمکی برای محاسبه اندیکاتورهای تکنیکال (RSI و ADX)
+def calculate_indicators(df):
+    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+    
+    # محاسبه RSI (14)
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # محاسبه ساده ATR (14)
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR'] = tr.rolling(window=14).mean()
+    
+    # شبیه‌سازی ADX ساده بر اساس نوسانات جهت‌دار
+    plus_dm = df['High'].diff().clip(lower=0)
+    minus_dm = (-df['Low'].diff()).clip(lower=0)
+    tr14 = tr.rolling(window=14).mean()
+    plus_di = 100 * (plus_dm.rolling(window=14).mean() / tr14)
+    minus_di = 100 * (minus_dm.rolling(window=14).mean() / tr14)
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+    df['ADX'] = dx.rolling(window=14).mean().fillna(20) # مقدار پیش‌فرض امن
+    return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست روی دیتای واقعی یک‌ساله ۱ ساعته")
+print("🚀 اجرای موتور بک‌تست استراتژی HUNTER-X 2R (تجمیع کل پورتفوی)")
 print("============================================================")
 
-for symbol in SYMBOLS.keys():
-    filename = f"{symbol}_1h.csv"
-    if not os.path.exists(filename):
+all_portfolio_trades = []
+
+for symbol, df1h in data_1h.items():
+    if len(df1h) < 300:
         continue
         
-    df = pd.read_csv(filename)
-    df['Date'] = pd.to_datetime(df['Date'])
+    # آماده‌سازی تایم فریم 1 ساعته
+    df1h = calculate_indicators(df1h)
     
-    # فیلتر روند (SMA 200) و سقف/کف‌های ۲۰ دوره‌ای برای تایم‌فریم ۱ ساعته
-    df['SMA_200'] = df['Close'].rolling(window=200).mean()
-    df['Prev_High'] = df['High'].shift(1).rolling(window=20).max()
-    df['Prev_Low'] = df['Low'].shift(1).rolling(window=20).min()
+    # ساخت تایم فریم 4 ساعته با Resample کردن دیتای 1 ساعته
+    df4h = df1h.set_index('Date').resample('4H').agg({
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'Volume': 'sum'
+    }).dropna().reset_index()
     
-    trades = []
-    sl_pct = 0.020  # استاپ لاس مناسب برای تایم‌فریم ۱ ساعته (۲ درصد)
-    tp_pct = 0.045  # حد سود با ریسک به ریوارد حدود 1:2.2 (۴.۵ درصد)
+    df4h = calculate_indicators(df4h)
     
-    for i in range(200, len(df) - 30):
-        current = df.iloc[i]
-        close = current['Close']
-        sma = current['SMA_200']
+    # مپ کردن وضعیت روند 4 ساعته به کندل‌های 1 ساعته
+    df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
+    df4h_indexed = df4h.set_index('Date')
+    
+    for i in range(200, len(df1h) - 40):
+        c1h = df1h.iloc[i]
+        t4h_time = c1h['Date_4H']
         
-        if pd.isna(sma) or pd.isna(current['Prev_High']) or pd.isna(current['Prev_Low']):
+        if t4h_time not in df4h_indexed.index:
             continue
             
-        is_long_trap = (current['Low'] < current['Prev_Low']) and (close > current['Prev_Low']) and (close > sma)
-        is_short_trap = (current['High'] > current['Prev_High']) and (close < current['Prev_High']) and (close < sma)
+        r4h = df4h_indexed.loc[t4h_time]
         
-        if is_long_trap or is_short_trap:
-            entry_price = close
-            entry_time = current['Date']
-            side = 'LONG' if is_long_trap else 'SHORT'
-            
-            sl = entry_price * (1 - sl_pct) if side == 'LONG' else entry_price * (1 + sl_pct)
-            tp = entry_price * (1 + tp_pct) if side == 'LONG' else entry_price * (1 - tp_pct)
-                
-            outcome = 'OPEN'
-            for j in range(i + 1, min(i + 30, len(df))):
-                future_candle = df.iloc[j]
-                if side == 'LONG':
-                    if future_candle['Low'] <= sl:
-                        outcome = 'LOSS'
-                        break
-                    elif future_candle['High'] >= tp:
-                        outcome = 'WIN'
-                        break
-                else:
-                    if future_candle['High'] >= sl:
-                        outcome = 'LOSS'
-                        break
-                    elif future_candle['Low'] <= tp:
-                        outcome = 'WIN'
-                        break
-            
-            if outcome in ['WIN', 'LOSS']:
-                trades.append({
-                    'Time': entry_time,
-                    'Side': side,
-                    'Entry': entry_price,
-                    'Outcome': outcome
-                })
-                
-    if trades:
-        trades_df = pd.DataFrame(trades)
-        total_trades = len(trades_df)
-        wins = len(trades_df[trades_df['Outcome'] == 'WIN'])
-        losses = len(trades_df[trades_df['Outcome'] == 'LOSS'])
-        win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
-        net_profit = (wins * 2.25) - losses
+        # 1. بررسی رژیم بازار در 4H
+        # شرایط LONG در 4H: قیمت بالاى EMA200 و ترتیب صعودی EMAها و شیب مثبت EMA200 و ADX >= 20 و RSI > 52
+        ema20_4h = r4h['EMA_20']
+        ema50_4h = r4h['EMA_50']
+        ema200_4h = r4h['EMA_200']
         
-        print(f"📊 نتایج یک‌ساله ۱ ساعته برای {symbol}:")
-        print(f"   - تعداد کل معاملات: {total_trades} | برنده: {wins} | بازنده: {losses}")
-        print(f"   - **وین‌ریت واقعی (Win Rate):** {win_rate:.2f}%")
-        print(f"   - امتیاز عملکرد (Profit Score): {net_profit:.2f}")
-    else:
-        print(f"⚠️ معامله‌ای ثبت نشد.")
+        # بررسی شیب EMA200 در 4H (مقایسه با 2 کندل 4 ساعته قبل)
+        try:
+            prev_ema200_4h = df4h.loc[df4h['Date'] == t4h_time, 'EMA_200'].values[0] # ساده‌سازی
+            slope_positive = ema200_4h >= prev_ema200_4h
+        except:
+            slope_positive = True
+            
+        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 20) and (r4h['RSI'] > 52)
+        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 20) and (r4h['RSI'] < 48)
+        
+        if not is_long_regime and not is_short_regime:
+            continue
+            
+        # 2. فرآیند ورود در 1H (Breakout & Pullback & Retest)
+        # شناسایی سقف/کف ساختاری 20 کندل 1 ساعته قبل
+.        lookback_slice = df1h.iloc[i-20:i]
+        struct_high = lookback_slice['High'].max()
+        struct_low = lookback_slice['Low'].min()
+        
+        # بررسی Breakout در کندل جاری یا یکی دو کندل اخیر
+        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] > df1h['Volume'].iloc[i-20:i].mean())
+        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] > df1h['Volume'].iloc[i-20:i].mean())
+        
+        if is_long_regime and is_breakout_long:
+            # شبیه‌سازی پولبک و تأیید در کندل‌های بعدی (حداکثر 6 تا 8 کندل)
+            entered = False
+            for p in range(1, 8):
+                if i + p >= len(df1h) - 10:
+                    break
+                p_candle = df1h.iloc[i + p]
+                
+                # پولبک به سطح شکسته‌شده و عدم از دست رفتن آن
+                if p_candle['Low'] <= struct_high * 1.002: 
+                    # کندل تأیید بسته شود در جهت روند
+                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 50:
+                        entry_price = p_candle['Close']
+                        # تعیین SL پشت ساختار پولبک + 0.25 ATR
+                        swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
+                        sl = swing_low_pullback - (0.25 * p_candle['ATR'])
+                        risk = entry_price - sl
+                        
+                        if risk <= 0 or (risk / entry_price) > 0.04: # اگر استاپ بیش از حد بزرگ باشد رد کن
+                            break
+                            
+                        tp = entry_price + (2.0 * risk)
+                        
+                        # فیلتر ساختاری TP: بررسی فضای خالی تا مقاومت مهم بعدی
+                        future_window = df1h.iloc[i+p+1 : i+p+30]['High'].max()
+                        if future_window < tp:
+                            # مقاومت مانع رسیدن به 2R است، معامله لغو
+                            break
+                            
+                        # شبیه‌سازی نتیجه معامله
+                        outcome = 'OPEN'
+                        for j in range(i + p + 1, min(i + p + 40, len(df1h))):
+                            f_c = df1h.iloc[j]
+                            if f_c['Low'] <= sl:
+                                outcome = 'LOSS'
+                                break
+                            elif f_c['High'] >= tp:
+                                outcome = 'WIN'
+                                break
+                                
+                        if outcome in ['WIN', 'LOSS']:
+                            all_portfolio_trades.append({
+                                'Symbol': symbol,
+                                'Side': 'LONG',
+                                'Outcome': outcome
+                            })
+                            entered = True
+                            break
+            if entered:
+                continue
+                
+        elif is_short_regime and is_breakout_short:
+            entered = False
+            for p in range(1, 8):
+                if i + p >= len(df1h) - 10:
+                    break
+                p_candle = df1h.iloc[i + p]
+                
+                if p_candle['High'] >= struct_low * 0.998:
+                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 50:
+                        entry_price = p_candle['Close']
+                        swing_high_pullback = df1h.iloc[i:i+p+1]['High'].max()
+                        sl = swing_high_pullback + (0.25 * p_candle['ATR'])
+                        risk = sl - entry_price
+                        
+                        if risk <= 0 or (risk / entry_price) > 0.04:
+                            break
+                            
+                        tp = entry_price - (2.0 * risk)
+                        
+                        future_window = df1h.iloc[i+p+1 : i+p+30]['Low'].min()
+                        if future_window > tp:
+                            break
+                            
+                        outcome = 'OPEN'
+                        for j in range(i + p + 1, min(i + p + 40, len(df1h))):
+                            f_c = df1h.iloc[j]
+                            if f_c['High'] >= sl:
+                                outcome = 'LOSS'
+                                break
+                            elif f_c['Low'] <= tp:
+                                outcome = 'WIN'
+                                break
+                                
+                        if outcome in ['WIN', 'LOSS']:
+                            all_portfolio_trades.append({
+                                'Symbol': symbol,
+                                'Side': 'SHORT',
+                                'Outcome': outcome
+                            })
+                            entered = True
+                            break
 
-print("\n✨ بک‌تست یک‌ساله ۱ ساعته به اتمام رسید.")
+# محاسبه و چاپ گزارش تجمیعی کل پورتفوی
+print("\n============================================================")
+print("📊 گزارش تجمیعی نهایی استراتژی HUNTER-X 2R روی کل پورتفوی")
+print("============================================================")
+
+if all_portfolio_trades:
+    pf_df = pd.DataFrame(all_portfolio_trades)
+    total_trades = len(pf_df)
+    total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
+    total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
+    portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
+    # با توجه به ریسک به ریوارد ثابت 2R
+    net_profit_score = (total_wins * 2.0) - total_losses
+    
+    print(f"🔸 تعداد کل معاملات کل سبد (پورتفوی): {total_trades}")
+    print(f"🔸 کل معاملات برنده (WIN): {total_wins}")
+    print(f"🔸 کل معاملات بازنده (LOSS): {total_losses}")
+    print(f"🎯 **وین‌ریت تجمیعی کل پورتفوی (Portfolio Win Rate):** {portfolio_win_rate:.2f}%")
+    print(f"💰 امتیاز سودآوری خالص (Net Profit Score): {net_profit_score:.2f}R")
+    
+    print("\nتفکیک عملکرد به تفکیک هر نماد:")
+    print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
+else:
+    print("⚠️ هیچ معامله‌ای با شرایط سخت‌گیرانه این استراتژی ثبت نشد.")
+
+print("\n✨ بک‌تست کل پورتفوی به اتمام رسید.")
