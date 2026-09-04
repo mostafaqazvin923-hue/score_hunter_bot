@@ -1,5 +1,4 @@
 import os
-import time
 import requests
 from datetime import datetime, timedelta
 
@@ -17,6 +16,7 @@ import numpy as np
 # دریافت امن توکن و چت‌آیدی از متغیرهای محیطی گیت‌هاب (Secrets)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+MANUAL_RUN = os.getenv("MANUAL_RUN", "false").lower() == "true"
 
 def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -33,8 +33,9 @@ def send_telegram_message(text):
     except Exception as e:
         print(f"❌ خطا در ارسال پیام تلگرام: {e}")
 
-# ارسال پیام شروع به کار ربات (فقط یک‌بار در ابتدای اجرا)
-send_telegram_message("✅ ربات Score Hunter Pro با موفقیت روی صرافی LBank استارت شد و شروع به کار کرد.")
+# ارسال پیام شروع به کار ربات (فقط در اجرای دستی ارسال می‌شود تا پیام تکراری نفرستد)
+if MANUAL_RUN:
+    send_telegram_message("✅ ربات Score Hunter Pro با موفقیت روی صرافی LBank استارت شد و شروع به کار کرد.")
 
 # اتصال به صرافی LBank با سبد 10 ارزه‌ای تأییدشده
 exchange = ccxt.lbank({'enableRateLimit': True})
@@ -52,7 +53,7 @@ SYMBOLS = {
 }
 
 print("============================================================")
-print("🔍 در حال بررسی بازار و رصد سیگنال‌ها در صرافی LBank...")
+print("🔍 در حال بررسی بازار و رصد سیگنال‌ها روی صرافی LBank (سبد 10 ارز)...")
 print("============================================================")
 
 def calculate_indicators(df):
@@ -81,7 +82,7 @@ def calculate_indicators(df):
     df['ADX'] = dx.rolling(window=14).mean().fillna(20)
     return df
 
-# بررسی آخرین وضعیت هر ارز برای شکار سیگنال و مدیریت قفل هم‌پوشانی
+# بررسی آخرین وضعیت هر ارز برای شکار سیگنال با رعایت دقیق منطق بک‌تست
 for symbol, lbank_symbol in SYMBOLS.items():
     try:
         ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', limit=300)
@@ -108,8 +109,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
         df4h_indexed = df4h.set_index('Date')
         
-        # بررسی کندل آخر برای یافتن ستاپ معاملاتی
-        i = len(df1h) - 5 # بررسی کندل‌های اخیر
+        i = len(df1h) - 5
         c1h = df1h.iloc[i]
         t4h_time = c1h['Date_4H']
         
@@ -153,7 +153,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
                 
                 signal_text = (
                     f"🚀 **سیگنال جدید (LONG)**\n"
-                    f"💎 جفت ارز: `{symbol}USDT`\n"
+                    f"💎 جفت ارز: `{symbol}USDT` (صرافی LBank)\n"
                     f"📍 قیمت ورود: `{entry_price:.4f}`\n"
                     f"🎯 حد سود (TP): `{tp:.4f}` (+{tp_pct:.2f}%)\n"
                     f"🛑 حد ضرر (SL): `{sl:.4f}` (-{sl_pct:.2f}%)\n"
@@ -173,7 +173,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
                 
                 signal_text = (
                     f"📉 **سیگنال جدید (SHORT)**\n"
-                    f"💎 جفت ارز: `{symbol}USDT`\n"
+                    f"💎 جفت ارز: `{symbol}USDT` (صرافی LBank)\n"
                     f"📍 قیمت ورود: `{entry_price:.4f}`\n"
                     f"🎯 حد سود (TP): `{tp:.4f}` (+{tp_pct:.2f}%)\n"
                     f"🛑 حد ضرر (SL): `{sl:.4f}` (-{sl_pct:.2f}%)\n"
