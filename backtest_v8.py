@@ -61,41 +61,36 @@ for symbol, lbank_symbol in SYMBOLS.items():
         df1h.sort_values('Date', inplace=True)
         df1h.reset_index(drop=True, inplace=True)
         
-        # ذخیره فایل 1 ساعته
         df1h.to_csv(filename_1h, index=False)
         data_1h[symbol] = df1h
         print(f"  ✔️ دیتای 1 ساعته {symbol} آماده شد (تعداد کندل: {len(df1h)})")
     else:
         print(f"  ❌ دیتایی برای {symbol} دریافت نشد.")
 
-# تابع کمکی برای محاسبه اندیکاتورهای تکنیکال (RSI و ADX)
 def calculate_indicators(df):
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     
-    # محاسبه RSI (14)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # محاسبه ساده ATR (14)
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
     
-    # شبیه‌سازی ADX ساده بر اساس نوسانات جهت‌دار
     plus_dm = df['High'].diff().clip(lower=0)
     minus_dm = (-df['Low'].diff()).clip(lower=0)
     tr14 = tr.rolling(window=14).mean()
     plus_di = 100 * (plus_dm.rolling(window=14).mean() / tr14)
     minus_di = 100 * (minus_dm.rolling(window=14).mean() / tr14)
     dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-    df['ADX'] = dx.rolling(window=14).mean().fillna(20) # مقدار پیش‌فرض امن
+    df['ADX'] = dx.rolling(window=14).mean().fillna(20)
     return df
 
 print("\n============================================================")
@@ -108,10 +103,8 @@ for symbol, df1h in data_1h.items():
     if len(df1h) < 300:
         continue
         
-    # آماده‌سازی تایم فریم 1 ساعته
     df1h = calculate_indicators(df1h)
     
-    # ساخت تایم فریم 4 ساعته با Resample کردن دیتای 1 ساعته
     df4h = df1h.set_index('Date').resample('4H').agg({
         'Open': 'first',
         'High': 'max',
@@ -122,7 +115,6 @@ for symbol, df1h in data_1h.items():
     
     df4h = calculate_indicators(df4h)
     
-    # مپ کردن وضعیت روند 4 ساعته به کندل‌های 1 ساعته
     df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
     df4h_indexed = df4h.set_index('Date')
     
@@ -135,15 +127,12 @@ for symbol, df1h in data_1h.items():
             
         r4h = df4h_indexed.loc[t4h_time]
         
-        # 1. بررسی رژیم بازار در 4H
-        # شرایط LONG در 4H: قیمت بالاى EMA200 و ترتیب صعودی EMAها و شیب مثبت EMA200 و ADX >= 20 و RSI > 52
         ema20_4h = r4h['EMA_20']
         ema50_4h = r4h['EMA_50']
         ema200_4h = r4h['EMA_200']
         
-        # بررسی شیب EMA200 در 4H (مقایسه با 2 کندل 4 ساعته قبل)
         try:
-            prev_ema200_4h = df4h.loc[df4h['Date'] == t4h_time, 'EMA_200'].values[0] # ساده‌سازی
+            prev_ema200_4h = df4h.loc[df4h['Date'] == t4h_time, 'EMA_200'].values[0]
             slope_positive = ema200_4h >= prev_ema200_4h
         except:
             slope_positive = True
@@ -154,46 +143,36 @@ for symbol, df1h in data_1h.items():
         if not is_long_regime and not is_short_regime:
             continue
             
-        # 2. فرآیند ورود در 1H (Breakout & Pullback & Retest)
-        # شناسایی سقف/کف ساختاری 20 کندل 1 ساعته قبل
-.        lookback_slice = df1h.iloc[i-20:i]
+        lookback_slice = df1h.iloc[i-20:i]
         struct_high = lookback_slice['High'].max()
         struct_low = lookback_slice['Low'].min()
         
-        # بررسی Breakout در کندل جاری یا یکی دو کندل اخیر
         is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] > df1h['Volume'].iloc[i-20:i].mean())
         is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] > df1h['Volume'].iloc[i-20:i].mean())
         
         if is_long_regime and is_breakout_long:
-            # شبیه‌سازی پولبک و تأیید در کندل‌های بعدی (حداکثر 6 تا 8 کندل)
             entered = False
             for p in range(1, 8):
                 if i + p >= len(df1h) - 10:
                     break
                 p_candle = df1h.iloc[i + p]
                 
-                # پولبک به سطح شکسته‌شده و عدم از دست رفتن آن
                 if p_candle['Low'] <= struct_high * 1.002: 
-                    # کندل تأیید بسته شود در جهت روند
                     if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 50:
                         entry_price = p_candle['Close']
-                        # تعیین SL پشت ساختار پولبک + 0.25 ATR
                         swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
                         sl = swing_low_pullback - (0.25 * p_candle['ATR'])
                         risk = entry_price - sl
                         
-                        if risk <= 0 or (risk / entry_price) > 0.04: # اگر استاپ بیش از حد بزرگ باشد رد کن
+                        if risk <= 0 or (risk / entry_price) > 0.04:
                             break
                             
                         tp = entry_price + (2.0 * risk)
                         
-                        # فیلتر ساختاری TP: بررسی فضای خالی تا مقاومت مهم بعدی
                         future_window = df1h.iloc[i+p+1 : i+p+30]['High'].max()
                         if future_window < tp:
-                            # مقاومت مانع رسیدن به 2R است، معامله لغو
                             break
                             
-                        # شبیه‌سازی نتیجه معامله
                         outcome = 'OPEN'
                         for j in range(i + p + 1, min(i + p + 40, len(df1h))):
                             f_c = df1h.iloc[j]
@@ -257,7 +236,6 @@ for symbol, df1h in data_1h.items():
                             entered = True
                             break
 
-# محاسبه و چاپ گزارش تجمیعی کل پورتفوی
 print("\n============================================================")
 print("📊 گزارش تجمیعی نهایی استراتژی HUNTER-X 2R روی کل پورتفوی")
 print("============================================================")
@@ -268,7 +246,6 @@ if all_portfolio_trades:
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
     portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    # با توجه به ریسک به ریوارد ثابت 2R
     net_profit_score = (total_wins * 2.0) - total_losses
     
     print(f"🔸 تعداد کل معاملات کل سبد (پورتفوی): {total_trades}")
