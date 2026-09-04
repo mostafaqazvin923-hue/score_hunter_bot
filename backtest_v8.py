@@ -26,7 +26,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته از LBank")
+print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته از LBank (نسخه بهینه‌شده)")
 print("============================================================")
 
 data_1h = {}
@@ -94,7 +94,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست استراتژی HUNTER-X 2R (تجمیع کل پورتفوی)")
+print("🚀 اجرای موتور بک‌تست بهینه‌شده HUNTER-X 2R (تجمیع کل پورتفوی)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -137,8 +137,9 @@ for symbol, df1h in data_1h.items():
         except:
             slope_positive = True
             
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 20) and (r4h['RSI'] > 52)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 20) and (r4h['RSI'] < 48)
+        # [تنظیم‌شده] آستانه‌های کمی ملایم‌تر برای افزایش تعداد سیگنال‌ها
+        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 18) and (r4h['RSI'] > 50)
+        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 18) and (r4h['RSI'] < 50)
         
         if not is_long_regime and not is_short_regime:
             continue
@@ -147,18 +148,21 @@ for symbol, df1h in data_1h.items():
         struct_high = lookback_slice['High'].max()
         struct_low = lookback_slice['Low'].min()
         
-        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] > df1h['Volume'].iloc[i-20:i].mean())
-        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] > df1h['Volume'].iloc[i-20:i].mean())
+        # [تنظیم‌شده] فیلتر حجم ملایم‌تر (۹۰ درصد میانگین)
+        avg_vol = lookback_slice['Volume'].mean()
+        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 0.9)
+        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 0.9)
         
         if is_long_regime and is_breakout_long:
             entered = False
-            for p in range(1, 8):
+            # [تنظیم‌شده] افزایش پنجره انتظار پولبک تا ۱۲ کندل
+            for p in range(1, 13):
                 if i + p >= len(df1h) - 10:
                     break
                 p_candle = df1h.iloc[i + p]
                 
                 if p_candle['Low'] <= struct_high * 1.002: 
-                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 50:
+                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 48:
                         entry_price = p_candle['Close']
                         swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
                         sl = swing_low_pullback - (0.25 * p_candle['ATR'])
@@ -196,13 +200,13 @@ for symbol, df1h in data_1h.items():
                 
         elif is_short_regime and is_breakout_short:
             entered = False
-            for p in range(1, 8):
+            for p in range(1, 13):
                 if i + p >= len(df1h) - 10:
                     break
                 p_candle = df1h.iloc[i + p]
                 
                 if p_candle['High'] >= struct_low * 0.998:
-                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 50:
+                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 52:
                         entry_price = p_candle['Close']
                         swing_high_pullback = df1h.iloc[i:i+p+1]['High'].max()
                         sl = swing_high_pullback + (0.25 * p_candle['ATR'])
@@ -237,7 +241,7 @@ for symbol, df1h in data_1h.items():
                             break
 
 print("\n============================================================")
-print("📊 گزارش تجمیعی نهایی استراتژی HUNTER-X 2R روی کل پورتفوی")
+print("📊 گزارش تجمیعی نهایی استراتژی HUNTER-X 2R (نسخه بهینه‌شده)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -257,6 +261,6 @@ if all_portfolio_trades:
     print("\nتفکیک عملکرد به تفکیک هر نماد:")
     print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
 else:
-    print("⚠️ هیچ معامله‌ای با شرایط سخت‌گیرانه این استراتژی ثبت نشد.")
+    print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ بک‌تست کل پورتفوی به اتمام رسید.")
+print("\n✨ بک‌تست بهینه‌شده کل پورتفوی به اتمام رسید.")
