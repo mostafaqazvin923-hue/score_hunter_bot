@@ -1,6 +1,7 @@
 import os
+import json
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 
 try:
     import ccxt
@@ -16,6 +17,7 @@ import numpy as np
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MANUAL_RUN = os.getenv("MANUAL_RUN", "false").lower() == "true"
+STATE_FILE = "active_trades_state.json"
 
 def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -32,8 +34,24 @@ def send_telegram_message(text):
     except Exception as e:
         print(f"❌ خطا در ارسال پیام تلگرام: {e}")
 
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=4)
+    except Exception as e:
+        print(f"❌ خطا در ذخیره فایل وضعیت: {e}")
+
 if MANUAL_RUN:
-    send_telegram_message("✅ ربات Score Hunter Pro با موفقیت روی صرافی LBank استارت شد و شروع به کار کرد.")
+    send_telegram_message("✅ ربات Score Hunter Pro با قابلیت مانیتورینگ زنده TP/SL روی LBank استارت شد.")
 
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
@@ -49,9 +67,69 @@ SYMBOLS = {
     "DOT": "DOT/USDT"
 }
 
+active_trades = load_state()
+
 print("============================================================")
-print("🔍 در حال بررسی بازار و رصد سیگنال‌ها روی صرافی LBank (سبد 10 ارز)...")
+print("🔍 در حال بررسی و مانیتورینگ پوزیشن‌های فعال و بازار روی LBank...")
 print("============================================================")
+
+# ۱. مانیتورینگ پوزیشن‌های باز قبلی (بررسی TP و SL)
+symbols_to_remove = []
+for symbol, trade in active_trades.items():
+    lbank_symbol = SYMBOLS.get(symbol)
+    if not lbank_symbol:
+        continue
+    try:
+        ticker = exchange.fetch_ticker(lbank_symbol)
+        current_price = ticker['last']
+        high_price = ticker.get('high', current_price)
+        low_price = ticker.get('low', current_price)
+        
+        direction = trade['direction']
+        tp = trade['tp']
+        sl = trade['sl']
+        entry = trade['entry_price']
+        
+        hit_tp = False
+        hit_sl = False
+        
+        if direction == "LONG":
+            if high_price >= tp:
+                hit_tp = True
+            elif low_price <= sl:
+                hit_sl = True
+        elif direction == "SHORT":
+            if low_price <= tp:
+                hit_tp = True
+            elif high_price >= sl:
+                hit_sl = True
+                
+        if hit_tp:
+            msg = (
+                f"🎯 **حد سود لمس شد (TP Hit)!** 🎉\n"
+                f"💎 جفت ارز: `{symbol}USDT`\n"
+                f"📍 قیمت ورود: `{entry:.4f}`\n"
+                f"🎯 هدف سود: `{tp:.4f}`\n"
+                f"✨ پوزیشن با موفقیت بسته شد."
+            )
+            send_telegram_message(msg)
+            symbols_to_remove.append(symbol)
+        elif hit_sl:
+            msg = (
+                f"🛑 **حد ضرر لمس شد (SL Hit)!**\n"
+                f"💎 جفت ارز: `{symbol}USDT`\n"
+                f"📍 قیمت ورود: `{entry:.4f}`\n"
+                f"🛑 حد ضرر: `{sl:.4f}`\n"
+                f"⚠️ پوزیشن متوقف شد."
+            )
+            send_telegram_message(msg)
+            symbols_to_remove.append(symbol)
+            
+    except Exception as e:
+        print(f"❌ خطا در مانیتورینگ نماد {symbol}: {e}")
+
+for sym in symbols_to_remove:
+    del active_trades[sym]
 
 def calculate_indicators(df):
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -79,7 +157,11 @@ def calculate_indicators(df):
     df['ADX'] = dx.rolling(window=14).mean().fillna(20)
     return df
 
+# ۲. اسکن سیگنال‌های جدید (فقط برای ارزهایی که پوزیشن فعال ندارند)
 for symbol, lbank_symbol in SYMBOLS.items():
+    if symbol in active_trades:
+        continue # قفل همپوشانی: اگر پوزیشن فعالی روی این ارز داریم، سیگنال جدیدی بررسی نمی‌شود
+        
     try:
         ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', limit=300)
         if not ohlcv or len(ohlcv) < 250:
@@ -147,6 +229,15 @@ for symbol, lbank_symbol in SYMBOLS.items():
                 sl_pct = (risk / entry_price) * 100
                 tp_pct = ((tp - entry_price) / entry_price) * 100
                 
+                active_trades[symbol] = {
+                    "symbol": lbank_symbol,
+                    "direction": "LONG",
+                    "entry_price": entry_price,
+                    "tp": tp,
+                    "sl": sl,
+                    "time": str(c1h['Date'])
+                }
+                
                 signal_text = (
                     f"🚀 **سیگنال جدید (LONG)**\n"
                     f"💎 جفت ارز: `{symbol}USDT` (صرافی LBank)\n"
@@ -167,6 +258,15 @@ for symbol, lbank_symbol in SYMBOLS.items():
                 sl_pct = (risk / entry_price) * 100
                 tp_pct = ((entry_price - tp) / entry_price) * 100
                 
+                active_trades[symbol] = {
+                    "symbol": lbank_symbol,
+                    "direction": "SHORT",
+                    "entry_price": entry_price,
+                    "tp": tp,
+                    "sl": sl,
+                    "time": str(c1h['Date'])
+                }
+                
                 signal_text = (
                     f"📉 **سیگنال جدید (SHORT)**\n"
                     f"💎 جفت ارز: `{symbol}USDT` (صرافی LBank)\n"
@@ -180,4 +280,5 @@ for symbol, lbank_symbol in SYMBOLS.items():
     except Exception as e:
         print(f"❌ خطا در پردازش نماد {symbol}: {e}")
 
-print("✨ بررسی بازار و ارسال گزارش به اتمام رسید.")
+save_state(active_trades)
+print("✨ بررسی بازار و مانیتورینگ پوزیشن‌ها به اتمام رسید.")
