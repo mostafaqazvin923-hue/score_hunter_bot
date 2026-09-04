@@ -1,71 +1,77 @@
 import os
-import requests
-import zipfile
-import io
-import pandas as pd
-import numpy as np
+import subprocess
+import sys
 from datetime import datetime, timedelta
 
+try:
+    import ccxt
+except ImportError:
+    print("📦 در حال نصب کتابخانه ccxt...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
+    import ccxt
+
+import pandas as pd
+import numpy as np
+
+# استفاده از صرافی MEXC که روی سرورهای ابری گیت‌هاب مسدود نیست و تاریخچه کامل می‌دهد
+exchange = ccxt.mexc({'enableRateLimit': True})
 SYMBOLS = {
-    "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT",
-    "SOL": "SOLUSDT",
-    "XRP": "XRPUSDT"
+    "BTC": "BTC/USDT",
+    "ETH": "ETH/USDT",
+    "SOL": "SOL/USDT",
+    "XRP": "XRP/USDT"
 }
 
-# بازه زمانی یک‌ساله دقیق از آرشیو ماهانه بایننس (بدون محدودیت API)
-months = pd.date_range(start="2025-09-01", end="2026-08-01", freq='MS')
-headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+# محاسبه بازه زمانی دقیق یک سال گذشته
+start_date = datetime.now() - timedelta(days=365)
+since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود مستقیم داده‌های یک‌ساله کامل ۱۵ دقیقه‌ای از آرشیو عمومی")
+print("📥 دانلود داده‌های یک‌ساله واقعی ۱۵ دقیقه‌ای از MEXC (سازگار با گیت‌هاب)")
 print("============================================================")
 
-for symbol, binance_symbol in SYMBOLS.items():
+for symbol, mexc_symbol in SYMBOLS.items():
     filename = f"{symbol}_15m.csv"
-    print(f"\n🔹 در حال دریافت تاریخچه کامل یک‌ساله {symbol}...")
-    all_dfs = []
+    print(f"🔹 در حال دریافت تاریخچه کامل یک‌ساله {symbol}...")
     
-    for dt in months:
-        year = dt.year
-        month = f"{dt.month:02d}"
-        url = f"https://data.binance.vision/data/spot/monthly/klines/{binance_symbol}/15m/{binance_symbol}-15m-{year}-{month}.zip"
-        
+    all_ohlcv = []
+    current_since = since_timestamp
+    now_timestamp = exchange.milliseconds()
+    
+    while current_since < now_timestamp:
         try:
-            response = requests.get(url, headers=headers, timeout=15)
-            if response.status_code == 200:
-                with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-                    csv_filename = z.namelist()[0]
-                    csv_bytes = z.read(csv_filename)
-                    df_month = pd.read_csv(io.BytesIO(csv_bytes), header=None, usecols=[0, 1, 2, 3, 4, 5],
-                                          names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-                    
-                    df_month['Timestamp'] = pd.to_numeric(df_month['Timestamp'], errors='coerce')
-                    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                        df_month[col] = pd.to_numeric(df_month[col], errors='coerce')
-                        
-                    df_month.dropna(subset=['Timestamp', 'Close'], inplace=True)
-                    df_month['Date'] = pd.to_datetime(df_month['Timestamp'], unit='ms', errors='coerce')
-                    df_month.dropna(subset=['Date'], inplace=True)
-                    
-                    if not df_month.empty:
-                        all_dfs.append(df_month[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']])
-        except Exception:
-            pass
+            # دریافت دسته‌ای کندل‌ها (Pagination)
+            ohlcv = exchange.fetch_ohlcv(mexc_symbol, timeframe='15m', since=current_since, limit=1000)
+            if not ohlcv:
+                break
             
-    if all_dfs:
-        final_df = pd.concat(all_dfs, ignore_index=True)
-        final_df.sort_values('Date', inplace=True)
-        final_df.drop_duplicates(subset=['Date'], inplace=True)
-        final_df.reset_index(drop=True, inplace=True)
+            # بروزرسانی زمان برای درخواست بعدی
+            current_since = ohlcv[-1][0] + 1
+            all_ohlcv.extend(ohlcv)
+            
+            # اگر به زمان حال رسیدیم متوقف شویم
+            if len(ohlcv) < 1000:
+                break
+        except Exception as e:
+            print(f"  ❌ خطا در دریافت بخش‌پذیر داده‌ها برای {symbol}: {e}")
+            break
+            
+    if all_ohlcv:
+        df = pd.DataFrame(all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        df['Date'] = pd.to_datetime(df['Timestamp'], unit='ms')
+        df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        df.dropna(inplace=True)
+        df.drop_duplicates(subset=['Date'], inplace=True)
+        df.sort_values('Date', inplace=True)
+        df.reset_index(drop=True, inplace=True)
         
-        final_df.to_csv(filename, index=False)
-        print(f"  ✔️ فایل {filename} با موفقیت ساخته شد (تعداد کل کندل‌ها: {len(final_df)})")
+        df.to_csv(filename, index=False)
+        print(f"  ✔️ فایل {filename} ساخته شد (تعداد کل کندل‌های یک‌ساله: {len(df)})")
     else:
-        print(f"  ❌ خطا در دریافت داده‌های {symbol}")
+        print(f"  ❌ هیچ داده‌ای برای {symbol} دریافت نشد.")
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست روی داده‌های واقعی ۳۵ هزار کندلی یک‌ساله")
+print("🚀 اجرای موتور بک‌تست روی داده‌های واقعی یک‌ساله")
 print("============================================================")
 
 for symbol in SYMBOLS.keys():
@@ -137,11 +143,11 @@ for symbol in SYMBOLS.keys():
         win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
         net_profit = (wins * 2) - losses
         
-        print(f"📊 نتایج واقعی یک‌ساله برای {symbol}:")
-        print(f"   - تعداد کل معاملات: {total_trades} | برنده: {wins} | بازنده: {losses}")
-        print(f"   - **وین‌ریت نهایی (Win Rate):** {win_rate:.2f}%")
+        print(f"📊 نتایج یک‌ساله برای {symbol}:")
+        print(f"   - تعداد کل معاملات یک‌ساله: {total_trades} | برنده: {wins} | بازنده: {losses}")
+        print(f"   - **وین‌ریت واقعی (Win Rate):** {win_rate:.2f}%")
         print(f"   - امتیاز عملکرد (Profit Score): {net_profit}")
     else:
         print(f"⚠️ معامله‌ای ثبت نشد.")
 
-print("\n✨ بک‌تست یک‌ساله کامل به پایان رسید.")
+print("\n✨ بک‌تست یک‌ساله به اتمام رسید.")
