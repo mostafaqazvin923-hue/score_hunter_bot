@@ -13,20 +13,26 @@ except ImportError:
 import pandas as pd
 import numpy as np
 
-# استفاده از صرافی LBank
+# استفاده از صرافی LBank با سبد گسترش‌یافته (10 ارز برتر و پرواکنش)
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
     "BTC": "BTC/USDT",
     "ETH": "ETH/USDT",
     "SOL": "SOL/USDT",
-    "XRP": "XRP/USDT"
+    "XRP": "XRP/USDT",
+    "ADA": "ADA/USDT",
+    "AVAX": "AVAX/USDT",
+    "LINK": "LINK/USDT",
+    "NEAR": "NEAR/USDT",
+    "SUI": "SUI/USDT",
+    "DOT": "DOT/USDT"
 }
 
 start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته از LBank (نسخه نهایی)")
+print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته (سبد گسترش‌یافته)")
 print("============================================================")
 
 data_1h = {}
@@ -94,7 +100,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست نهایی HUNTER-X 2R (مدیریت پوزیشن و ضد همپوشانی)")
+print("🚀 اجرای موتور بک‌تست نهایی HUNTER-X 2R (با قفل ضد همپوشانی و سبد 10 ارز)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -118,7 +124,6 @@ for symbol, df1h in data_1h.items():
     df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
     df4h_indexed = df4h.set_index('Date')
     
-    # متغیر برای جلوگیری از همپوشانی معاملات روی یک نماد
     locked_until_index = 0
     
     for i in range(200, len(df1h) - 40):
@@ -143,14 +148,12 @@ for symbol, df1h in data_1h.items():
         except:
             slope_positive = True
             
-        # تنظیم هوشمندانه برای شکار سیگنال‌های بیشتر
         is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 16) and (r4h['RSI'] > 50)
         is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 16) and (r4h['RSI'] < 50)
         
         if not is_long_regime and not is_short_regime:
             continue
             
-        # کاهش فاصله ساختاری به 15 کندل برای سرعت عمل بیشتر
         lookback_slice = df1h.iloc[i-15:i]
         struct_high = lookback_slice['High'].max()
         struct_low = lookback_slice['Low'].min()
@@ -252,7 +255,7 @@ for symbol, df1h in data_1h.items():
                             break
 
 print("\n============================================================")
-print("📊 گزارش تجمیعی نهایی ربات HUNTER-X 2R (بدون همپوشانی و پاک‌سازی‌شده)")
+print("📊 گزارش تجمیعی نهایی پورتفوی گسترش‌یافته HUNTER-X 2R")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -274,4 +277,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ بک‌تست نهایی به اتمام رسید.")
+print("\n✨ بک‌تست پورتفوی گسترش‌یافته به اتمام رسید.")
