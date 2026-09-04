@@ -13,7 +13,6 @@ except ImportError:
 import pandas as pd
 import numpy as np
 
-# دریافت امن توکن و چت‌آیدی از متغیرهای محیطی گیت‌هاب (Secrets)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MANUAL_RUN = os.getenv("MANUAL_RUN", "false").lower() == "true"
@@ -33,11 +32,9 @@ def send_telegram_message(text):
     except Exception as e:
         print(f"❌ خطا در ارسال پیام تلگرام: {e}")
 
-# ارسال پیام شروع به کار ربات (فقط در اجرای دستی ارسال می‌شود تا پیام تکراری نفرستد)
 if MANUAL_RUN:
     send_telegram_message("✅ ربات Score Hunter Pro با موفقیت روی صرافی LBank استارت شد و شروع به کار کرد.")
 
-# اتصال به صرافی LBank با سبد 10 ارزه‌ای تأییدشده
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
     "BTC": "BTC/USDT",
@@ -82,7 +79,6 @@ def calculate_indicators(df):
     df['ADX'] = dx.rolling(window=14).mean().fillna(20)
     return df
 
-# بررسی آخرین وضعیت هر ارز برای شکار سیگنال با رعایت دقیق منطق بک‌تست
 for symbol, lbank_symbol in SYMBOLS.items():
     try:
         ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', limit=300)
