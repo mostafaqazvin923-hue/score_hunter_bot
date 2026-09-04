@@ -1,152 +1,187 @@
-import json
-import urllib.request
-import time
 import os
+import time
+import requests
+from datetime import datetime, timedelta
 
-# خواندن خودکار توکن و چت‌آیدی از Environment Variables (بخش تنظیمات/Secrets)
+try:
+    import ccxt
+except ImportError:
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
+    import ccxt
+
+import pandas as pd
+import numpy as np
+
+# دریافت امن توکن و چت‌آیدی از متغیرهای محیطی گیت‌هاب (Secrets)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
-TIMEFRAME = "1hour"
-TARGET_RR = 2.0
-
 def send_telegram_message(text):
-    """ارسال پیام به تلگرام با استفاده از متغیرهای محیطی"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[Error]: توکن یا چت‌آیدی در متغیرهای محیطی یافت نشد!")
+        print("⚠️ توکن یا چت‌آیدی تلگرام تنظیم نشده است.")
         return
-        
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            pass
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"Telegram Error: {e}")
+        print(f"❌ خطا در ارسال پیام تلگرام: {e}")
 
-def fetch_klines(symbol):
-    """دریافت کندل‌ها از صرافی کوینکس"""
-    url = f"https://api.coinex.com/v2/spot/kline?market={symbol}&period={TIMEFRAME}&limit=100"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SCORE-HUNTER-BOT"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            if payload.get("code") == 0:
-                rows = payload.get("data", [])
-                candles = []
-                for row in rows:
-                    if isinstance(row, dict):
-                        ts = int(float(row.get("created_at", row.get("time", 0))))
-                        op = float(row.get("open", 0))
-                        hi = float(row.get("high", 0))
-                        lo = float(row.get("low", 0))
-                        cl = float(row.get("close", 0))
-                        candles.append({"timestamp": ts, "open": op, "high": hi, "low": lo, "close": cl})
-                candles.sort(key=lambda x: x["timestamp"])
-                return candles
-    except Exception as e:
-        print(f"Error fetching {symbol}: {e}")
-    return []
+# ارسال پیام شروع به کار ربات (فقط یک‌بار در ابتدای اجرا)
+send_telegram_message("✅ ربات Score Hunter Pro با موفقیت روی صرافی LBank استارت شد و شروع به کار کرد.")
 
-def calculate_rsi(candles, period=14):
-    if len(candles) < period + 1:
-        return 50.0
-    gains, losses = 0.0, 0.0
-    for i in range(1, period + 1):
-        diff = candles[-i]["close"] - candles[-i-1]["close"]
-        if diff >= 0:
-            gains += diff
-        else:
-            losses -= diff
-    if losses == 0:
-        return 100.0
-    rs = (gains / period) / (losses / period)
-    return 100.0 - (100.0 / (1.0 + rs))
+# اتصال به صرافی LBank با سبد 10 ارزه‌ای تأییدشده
+exchange = ccxt.lbank({'enableRateLimit': True})
+SYMBOLS = {
+    "BTC": "BTC/USDT",
+    "ETH": "ETH/USDT",
+    "SOL": "SOL/USDT",
+    "XRP": "XRP/USDT",
+    "ADA": "ADA/USDT",
+    "AVAX": "AVAX/USDT",
+    "LINK": "LINK/USDT",
+    "NEAR": "NEAR/USDT",
+    "SUI": "SUI/USDT",
+    "DOT": "DOT/USDT"
+}
 
-def evaluate_and_trade():
-    print("[*] Checking market signals on CoinEx...")
+print("============================================================")
+print("🔍 در حال بررسی بازار و رصد سیگنال‌ها در صرافی LBank...")
+print("============================================================")
+
+def calculate_indicators(df):
+    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     
-    for symbol in SYMBOLS:
-        candles = fetch_klines(symbol)
-        if len(candles) < 20:
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR'] = tr.rolling(window=14).mean()
+    
+    plus_dm = df['High'].diff().clip(lower=0)
+    minus_dm = (-df['Low'].diff()).clip(lower=0)
+    tr14 = tr.rolling(window=14).mean()
+    plus_di = 100 * (plus_dm.rolling(window=14).mean() / tr14)
+    minus_di = 100 * (minus_dm.rolling(window=14).mean() / tr14)
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+    df['ADX'] = dx.rolling(window=14).mean().fillna(20)
+    return df
+
+# بررسی آخرین وضعیت هر ارز برای شکار سیگنال و مدیریت قفل هم‌پوشانی
+for symbol, lbank_symbol in SYMBOLS.items():
+    try:
+        ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', limit=300)
+        if not ohlcv or len(ohlcv) < 250:
             continue
             
-        c = candles[-2]
-        prev_c = candles[-3]
-        prev2_c = candles[-4]
+        df1h = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
+        df1h = df1h[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        df1h.dropna(inplace=True)
+        df1h.reset_index(drop=True, inplace=True)
         
-        # بررسی پوزیشن لانگ
-        recent_highs = max(x["high"] for x in candles[-15:-2])
-        is_bullish_bos = c["close"] > recent_highs and (c["close"] - c["open"]) > (c["high"] - c["low"]) * 0.4
-        has_bullish_fvg = prev2_c["high"] < c["low"]
-        current_rsi = calculate_rsi(candles)
+        df1h = calculate_indicators(df1h)
         
-        if is_bullish_bos and has_bullish_fvg and (40 < current_rsi < 70):
-            entry = c["close"]
-            sl = min(prev_c["low"], prev2_c["low"]) - (entry * 0.002)
-            risk_dist = entry - sl
-            if risk_dist <= 0 or (risk_dist / entry) > 0.03:
-                continue
-            tp = entry + (risk_dist * TARGET_RR)
+        df4h = df1h.set_index('Date').resample('4h').agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last',
+            'Volume': 'sum'
+        }).dropna().reset_index()
+        
+        df4h = calculate_indicators(df4h)
+        df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
+        df4h_indexed = df4h.set_index('Date')
+        
+        # بررسی کندل آخر برای یافتن ستاپ معاملاتی
+        i = len(df1h) - 5 # بررسی کندل‌های اخیر
+        c1h = df1h.iloc[i]
+        t4h_time = c1h['Date_4H']
+        
+        if t4h_time not in df4h_indexed.index:
+            continue
             
-            tp_pct = ((tp - entry) / entry) * 100
-            sl_pct = ((entry - sl) / entry) * 100
+        r4h = df4h_indexed.loc[t4h_time]
+        ema20_4h = r4h['EMA_20']
+        ema50_4h = r4h['EMA_50']
+        ema200_4h = r4h['EMA_200']
+        
+        try:
+            prev_ema200_4h = df4h.loc[df4h['Date'] == t4h_time, 'EMA_200'].values[0]
+            slope_positive = ema200_4h >= prev_ema200_4h
+        except:
+            slope_positive = True
             
-            msg = (
-                f"🚀 **سیگنال ورود (LONG)**\n"
-                f"🪙 جفت ارز: `{symbol}`\n"
-                f"📥 قیمت ورود: `{entry}`\n"
-                f"🎯 حد سود (TP): `{tp:.4f}` (+{tp_pct:.2f}% سود)\n"
-                f"🛑 حد ضرر (SL): `{sl:.4f}` (-{sl_pct:.2f}% ضرر)"
-            )
-            print(msg)
+        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 16) and (r4h['RSI'] > 50)
+        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 16) and (r4h['RSI'] < 50)
+        
+        if not is_long_regime and not is_short_regime:
+            continue
             
-            result_msg = (
-                f"✅ **نتیجه معامله (WIN - LONG)**\n"
-                f"🪙 جفت ارز: `{symbol}`\n"
-                f"🎯 TP لمس شد!\n"
-                f"💰 سود کسب شده (بدون لورج): `+{tp_pct:.2f}%`"
-            )
-            send_telegram_message(result_msg)
+        lookback_slice = df1h.iloc[i-15:i]
+        struct_high = lookback_slice['High'].max()
+        struct_low = lookback_slice['Low'].min()
+        avg_vol = lookback_slice['Volume'].mean()
+        
+        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 0.85)
+        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 0.85)
+        
+        if is_long_regime and is_breakout_long:
+            entry_price = c1h['Close']
+            swing_low_pullback = lookback_slice['Low'].min()
+            sl = swing_low_pullback - (0.25 * c1h['ATR'])
+            risk = entry_price - sl
+            if risk > 0 and (risk / entry_price) <= 0.045:
+                tp = entry_price + (2.0 * risk)
+                sl_pct = (risk / entry_price) * 100
+                tp_pct = ((tp - entry_price) / entry_price) * 100
+                
+                signal_text = (
+                    f"🚀 **سیگنال جدید (LONG)**\n"
+                    f"💎 جفت ارز: `{symbol}USDT`\n"
+                    f"📍 قیمت ورود: `{entry_price:.4f}`\n"
+                    f"🎯 حد سود (TP): `{tp:.4f}` (+{tp_pct:.2f}%)\n"
+                    f"🛑 حد ضرر (SL): `{sl:.4f}` (-{sl_pct:.2f}%)\n"
+                    f"⚖️ ریسک به ریوارد: `1:2`"
+                )
+                send_telegram_message(signal_text)
+                
+        elif is_short_regime and is_breakout_short:
+            entry_price = c1h['Close']
+            swing_high_pullback = lookback_slice['High'].max()
+            sl = swing_high_pullback + (0.25 * c1h['ATR'])
+            risk = sl - entry_price
+            if risk > 0 and (risk / entry_price) <= 0.045:
+                tp = entry_price - (2.0 * risk)
+                sl_pct = (risk / entry_price) * 100
+                tp_pct = ((entry_price - tp) / entry_price) * 100
+                
+                signal_text = (
+                    f"📉 **سیگنال جدید (SHORT)**\n"
+                    f"💎 جفت ارز: `{symbol}USDT`\n"
+                    f"📍 قیمت ورود: `{entry_price:.4f}`\n"
+                    f"🎯 حد سود (TP): `{tp:.4f}` (+{tp_pct:.2f}%)\n"
+                    f"🛑 حد ضرر (SL): `{sl:.4f}` (-{sl_pct:.2f}%)\n"
+                    f"⚖️ ریسک به ریوارد: `1:2`"
+                )
+                send_telegram_message(signal_text)
+                
+    except Exception as e:
+        print(f"❌ خطا در پردازش نماد {symbol}: {e}")
 
-        # بررسی پوزیشن شورت
-        recent_lows = min(x["low"] for x in candles[-15:-2])
-        is_bearish_bos = c["close"] < recent_lows and (c["open"] - c["close"]) > (c["high"] - c["low"]) * 0.4
-        has_bearish_fvg = prev2_c["low"] > c["high"]
-        
-        if is_bearish_bos and has_bearish_fvg and (30 < current_rsi < 60):
-            entry = c["close"]
-            sl = max(prev_c["high"], prev2_c["high"]) + (entry * 0.002)
-            risk_dist = sl - entry
-            if risk_dist <= 0 or (risk_dist / entry) > 0.03:
-                continue
-            tp = entry - (risk_dist * TARGET_RR)
-            
-            tp_pct = ((entry - tp) / entry) * 100
-            sl_pct = ((sl - entry) / entry) * 100
-            
-            msg = (
-                f"📉 **سیگنال ورود (SHORT)**\n"
-                f"🪙 جفت ارز: `{symbol}`\n"
-                f"📥 قیمت ورود: `{entry}`\n"
-                f"🎯 حد سود (TP): `{tp:.4f}` (+{tp_pct:.2f}% سود)\n"
-                f"🛑 حد ضرر (SL): `{sl:.4f}` (-{sl_pct:.2f}% ضرر)"
-            )
-            print(msg)
-            
-            result_msg = (
-                f"✅ **نتیجه معامله (WIN - SHORT)**\n"
-                f"🪙 جفت ارز: `{symbol}`\n"
-                f"🎯 TP لمس شد!\n"
-                f"💰 سود کسب شده (بدون لورج): `+{tp_pct:.2f}%`"
-            )
-            send_telegram_message(result_msg)
-
-if __name__ == "__main__":
-    startup_msg = "✅ **ربات Score Hunter Pro با موفقیت روی صرافی کوینکس استارت شد و شروع به کار کرد.**"
-    print(startup_msg)
-    send_telegram_message(startup_msg)
-    
-    evaluate_and_trade()
+print("✨ بررسی بازار و ارسال گزارش به اتمام رسید.")
