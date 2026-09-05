@@ -49,7 +49,6 @@ def save_and_commit_state(state):
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=4)
         
-        # ذخیره خودکار حافظه در گیت‌هاب برای جلوگیری از پاک شدن استیت
         if os.getenv("GITHUB_ACTIONS"):
             subprocess.run(["git", "config", "--global", "user.name", "Bot Memory Keeper"], check=False)
             subprocess.run(["git", "config", "--global", "user.email", "bot@github.com"], check=False)
@@ -85,19 +84,16 @@ print("============================================================")
 print("🔍 مانیتورینگ هوشمند پوزیشن‌ها و اسکن بازار...")
 print("============================================================")
 
-# ۱. مانیتورینگ پوزیشن‌های باز
+# ۱. مانیتورینگ دقیق پوزیشن‌های باز
 symbols_to_remove = []
 for symbol, trade in active_trades.items():
     lbank_symbol = SYMBOLS.get(symbol)
     if not lbank_symbol:
         continue
     try:
-        ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', limit=10)
-        if not ohlcv:
-            continue
-            
-        df_candles = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-        df_candles['Date'] = pd.to_datetime(df_candles['Timestamp'], unit='ms')
+        ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', limit=24)
+        ticker = exchange.fetch_ticker(lbank_symbol)
+        current_price = ticker['last']
         
         trade_time = pd.to_datetime(trade['time'])
         direction = trade['direction']
@@ -105,36 +101,43 @@ for symbol, trade in active_trades.items():
         sl = trade['sl']
         entry = trade['entry_price']
         
-        df_active_period = df_candles[df_candles['Date'] >= trade_time.floor('h')]
-        
         hit_tp = False
         hit_sl = False
         
-        for _, row in df_active_period.iterrows():
-            if direction == "LONG":
-                if row['High'] >= tp:
-                    hit_tp = True
-                    break
-                elif row['Low'] <= sl:
-                    hit_sl = True
-                    break
-            elif direction == "SHORT":
-                if row['Low'] <= tp:
-                    hit_tp = True
-                    break
-                elif row['High'] >= sl:
-                    hit_sl = True
-                    break
-                    
-        ticker = exchange.fetch_ticker(lbank_symbol)
-        current_price = ticker['last']
+        # بررسی قیمت لحظه‌ای بازار به عنوان مطمئن‌ترین روش مانیتورینگ
         if direction == "LONG":
-            if current_price >= tp: hit_tp = True
-            if current_price <= sl: hit_sl = True
+            if current_price >= tp:
+                hit_tp = True
+            elif current_price <= sl:
+                hit_sl = True
         elif direction == "SHORT":
-            if current_price <= tp: hit_tp = True
-            if current_price >= sl: hit_sl = True
+            if current_price <= tp:
+                hit_tp = True
+            elif current_price >= sl:
+                hit_sl = True
                 
+        # بررسی کندل‌های تاریخی ثبت شده در صورت عدم برخورد آنی قیمت لحظه‌ای
+        if not hit_tp and not hit_sl and ohlcv:
+            df_candles = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+            df_candles['Date'] = pd.to_datetime(df_candles['Timestamp'], unit='ms')
+            df_active_period = df_candles[df_candles['Date'] >= trade_time.floor('h')]
+            
+            for _, row in df_active_period.iterrows():
+                if direction == "LONG":
+                    if row['High'] >= tp:
+                        hit_tp = True
+                        break
+                    elif row['Low'] <= sl:
+                        hit_sl = True
+                        break
+                elif direction == "SHORT":
+                    if row['Low'] <= tp:
+                        hit_tp = True
+                        break
+                    elif row['High'] >= sl:
+                        hit_sl = True
+                        break
+                        
         if hit_tp:
             msg = (
                 f"🎯 **حد سود لمس شد (TP Hit)!** 🎉\n"
@@ -321,6 +324,5 @@ for symbol, lbank_symbol in SYMBOLS.items():
     except Exception as e:
         print(f"❌ خطا در پردازش نماد {symbol}: {e}")
 
-# ذخیره و کامیت خودکار در گیت‌هاب برای اینکه حافظه ربات پاک نشود
 save_and_commit_state({"active": active_trades, "cooldown": cooldowns})
 print("✨ پایان اسکن و مانیتورینگ بازار.")
