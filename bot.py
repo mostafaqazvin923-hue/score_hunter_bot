@@ -73,7 +73,7 @@ print("============================================================")
 print("🔍 در حال بررسی و مانیتورینگ پوزیشن‌های فعال و بازار روی LBank...")
 print("============================================================")
 
-# ۱. مانیتورینگ پوزیشن‌های باز قبلی (بررسی TP و SL)
+# ۱. مانیتورینگ پوزیشن‌های باز قبلی (بررسی TP و SL) به تفکیک هر ارز
 symbols_to_remove = []
 for symbol, trade in active_trades.items():
     lbank_symbol = SYMBOLS.get(symbol)
@@ -157,10 +157,11 @@ def calculate_indicators(df):
     df['ADX'] = dx.rolling(window=14).mean().fillna(20)
     return df
 
-# ۲. اسکن سیگنال‌های جدید (فقط برای ارزهایی که پوزیشن فعال ندارند)
+# ۲. اسکن سیگنال‌های جدید (قفل همپوشانی مختصِ هر ارز به صورت جداگانه)
 for symbol, lbank_symbol in SYMBOLS.items():
     if symbol in active_trades:
-        continue # قفل همپوشانی: اگر پوزیشن فعالی روی این ارز داریم، سیگنال جدیدی بررسی نمی‌شود
+        print(f"🔒 نماد {symbol} دارای پوزیشن فعال است؛ اسکن بریک‌آوت رد شد.")
+        continue
         
     try:
         ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', limit=300)
@@ -187,7 +188,8 @@ for symbol, lbank_symbol in SYMBOLS.items():
         df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
         df4h_indexed = df4h.set_index('Date')
         
-        i = len(df1h) - 5
+        # اصلاح: بررسی آخرین کندل کامل یا ماقبل آخر برای رصد به‌موقع بازار
+        i = len(df1h) - 2
         c1h = df1h.iloc[i]
         t4h_time = c1h['Date_4H']
         
