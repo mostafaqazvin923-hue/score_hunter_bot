@@ -79,17 +79,23 @@ print("============================================================")
 print("🔍 در حال بررسی و مانیتورینگ پوزیشن‌های فعال و بازار روی LBank...")
 print("============================================================")
 
-# ۱. مانیتورینگ پوزیشن‌های باز قبلی (بررسی TP و SL) به تفکیک هر ارز
+# ۱. مانیتورینگ دقیق پوزیشن‌های باز قبلی (بررسی TP و SL بر اساس کندل‌های واقعی لایو)
 symbols_to_remove = []
 for symbol, trade in active_trades.items():
     lbank_symbol = SYMBOLS.get(symbol)
     if not lbank_symbol:
         continue
     try:
-        ticker = exchange.fetch_ticker(lbank_symbol)
-        current_price = ticker['last']
-        high_price = ticker.get('high', current_price)
-        low_price = ticker.get('low', current_price)
+        recent_ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', limit=3)
+        if not recent_ohlcv:
+            continue
+            
+        df_recent = pd.DataFrame(recent_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        latest_candle = df_recent.iloc[-1]
+        
+        current_price = latest_candle['Close']
+        high_price = latest_candle['High']
+        low_price = latest_candle['Low']
         
         direction = trade['direction']
         tp = trade['tp']
