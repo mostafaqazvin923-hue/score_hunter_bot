@@ -16,12 +16,16 @@ import numpy as np
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-MANUAL_RUN = os.getenv("MANUAL_RUN", "false").lower() == "true"
+MANUAL_RUN_ENV = os.getenv("MANUAL_RUN", "false")
+MANUAL_RUN = str(MANUAL_RUN_ENV).lower() == "true"
 STATE_FILE = "active_trades_state.json"
+
+print(f"DEBUG -> MANUAL_RUN environment value: {MANUAL_RUN_ENV} (Parsed: {MANUAL_RUN})")
+print(f"DEBUG -> Token exists: {bool(TELEGRAM_BOT_TOKEN)}, Chat ID exists: {bool(TELEGRAM_CHAT_ID)}")
 
 def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ توکن یا چت‌آیدی تلگرام تنظیم نشده است.")
+        print("⚠️ توکن یا چت‌آیدی تلگرام در Secrets تنظیم نشده است.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -30,7 +34,8 @@ def send_telegram_message(text):
         "parse_mode": "Markdown"
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        print(f"Telegram Response Status: {response.status_code}")
     except Exception as e:
         print(f"❌ خطا در ارسال پیام تلگرام: {e}")
 
@@ -51,6 +56,7 @@ def save_state(state):
         print(f"❌ خطا در ذخیره فایل وضعیت: {e}")
 
 if MANUAL_RUN:
+    print("📢 اقدام به ارسال پیام استارت دستی در تلگرام...")
     send_telegram_message("✅ ربات Score Hunter Pro با قابلیت مانیتورینگ زنده TP/SL روی LBank استارت شد.")
 
 exchange = ccxt.lbank({'enableRateLimit': True})
@@ -188,7 +194,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
         df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
         df4h_indexed = df4h.set_index('Date')
         
-        # اصلاح: بررسی آخرین کندل کامل یا ماقبل آخر برای رصد به‌موقع بازار
         i = len(df1h) - 2
         c1h = df1h.iloc[i]
         t4h_time = c1h['Date_4H']
