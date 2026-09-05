@@ -45,8 +45,8 @@ def load_state():
             with open(STATE_FILE, "r") as f:
                 return json.load(f)
         except:
-            return {}
-    return {}
+            return {"active": {}, "cooldown": {}}
+    return {"active": {}, "cooldown": {}}
 
 def save_state(state):
     try:
@@ -57,7 +57,7 @@ def save_state(state):
 
 if MANUAL_RUN:
     print("📢 اقدام به ارسال پیام استارت دستی در تلگرام...")
-    send_telegram_message("✅ ربات Score Hunter Pro با قابلیت مانیتورینگ زنده TP/SL روی LBank استارت شد.")
+    send_telegram_message("✅ ربات Score Hunter Pro با سیستم ضد تکرار کندل روی LBank استارت شد.")
 
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
@@ -73,48 +73,63 @@ SYMBOLS = {
     "DOT": "DOT/USDT"
 }
 
-active_trades = load_state()
+state_data = load_state()
+active_trades = state_data.get("active", {})
+cooldowns = state_data.get("cooldown", {}) # ذخیره آخرین کندل معامله شده برای جلوگیری از تکرار
 
 print("============================================================")
-print("🔍 در حال بررسی و مانیتورینگ پوزیشن‌های فعال و بازار روی LBank...")
+print("🔍 در حال مانیتورینگ دقیق و اسکن هوشمند بازار روی LBank...")
 print("============================================================")
 
-# ۱. مانیتورینگ دقیق پوزیشن‌های باز قبلی (بررسی TP و SL بر اساس کندل‌های واقعی لایو)
+# ۱. مانیتورینگ هوشمند پوزیشن‌های باز (بر اساس شادوها و قیمت لایو)
 symbols_to_remove = []
 for symbol, trade in active_trades.items():
     lbank_symbol = SYMBOLS.get(symbol)
     if not lbank_symbol:
         continue
     try:
-        recent_ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', limit=3)
-        if not recent_ohlcv:
+        ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', limit=10)
+        if not ohlcv:
             continue
             
-        df_recent = pd.DataFrame(recent_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-        latest_candle = df_recent.iloc[-1]
+        df_candles = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        df_candles['Date'] = pd.to_datetime(df_candles['Timestamp'], unit='ms')
         
-        current_price = latest_candle['Close']
-        high_price = latest_candle['High']
-        low_price = latest_candle['Low']
-        
+        trade_time = pd.to_datetime(trade['time'])
         direction = trade['direction']
         tp = trade['tp']
         sl = trade['sl']
         entry = trade['entry_price']
         
+        df_active_period = df_candles[df_candles['Date'] >= trade_time.floor('h')]
+        
         hit_tp = False
         hit_sl = False
         
+        for _, row in df_active_period.iterrows():
+            if direction == "LONG":
+                if row['High'] >= tp:
+                    hit_tp = True
+                    break
+                elif row['Low'] <= sl:
+                    hit_sl = True
+                    break
+            elif direction == "SHORT":
+                if row['Low'] <= tp:
+                    hit_tp = True
+                    break
+                elif row['High'] >= sl:
+                    hit_sl = True
+                    break
+                    
+        ticker = exchange.fetch_ticker(lbank_symbol)
+        current_price = ticker['last']
         if direction == "LONG":
-            if high_price >= tp:
-                hit_tp = True
-            elif low_price <= sl:
-                hit_sl = True
+            if current_price >= tp: hit_tp = True
+            if current_price <= sl: hit_sl = True
         elif direction == "SHORT":
-            if low_price <= tp:
-                hit_tp = True
-            elif high_price >= sl:
-                hit_sl = True
+            if current_price <= tp: hit_tp = True
+            if current_price >= sl: hit_sl = True
                 
         if hit_tp:
             msg = (
@@ -141,7 +156,10 @@ for symbol, trade in active_trades.items():
         print(f"❌ خطا در مانیتورینگ نماد {symbol}: {e}")
 
 for sym in symbols_to_remove:
-    del active_trades[sym]
+    # انتقال به لیست کوکدان (جلوگیری از ورود مجدد روی همان کندل)
+    if sym in active_trades:
+        cooldowns[sym] = active_trades[sym]["time"]
+        del active_trades[sym]
 
 def calculate_indicators(df):
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -169,10 +187,10 @@ def calculate_indicators(df):
     df['ADX'] = dx.rolling(window=14).mean().fillna(20)
     return df
 
-# ۲. اسکن سیگنال‌های جدید (قفل همپوشانی مختصِ هر ارز به صورت جداگانه)
+# ۲. اسکن سیگنال‌های جدید با سیستم ضد تکرار کندل
 for symbol, lbank_symbol in SYMBOLS.items():
     if symbol in active_trades:
-        print(f"🔒 نماد {symbol} دارای پوزیشن فعال است؛ اسکن بریک‌آوت رد شد.")
+        print(f"🔒 نماد {symbol} دارای پوزیشن فعال است؛ اسکن رد شد.")
         continue
         
     try:
@@ -204,6 +222,15 @@ for symbol, lbank_symbol in SYMBOLS.items():
         c1h = df1h.iloc[i]
         t4h_time = c1h['Date_4H']
         
+        # چک کردن سیستم ضد تکرار (اگر این کندل قبلاً معامله شده، رد شو)
+        candle_time_str = str(c1h['Date'])
+        if symbol in cooldowns and cooldowns[symbol] == candle_time_str:
+            print(f"⏳ نماد {symbol} روی این کندل ({candle_time_str}) قبلاً معامله شده؛ در انتظار کندل جدید.")
+            continue
+        elif symbol in cooldowns and cooldowns[symbol] != candle_time_str:
+            # کندل جدید آمده، کوهدان این نماد را پاک کن تا دوباره اجازه سیگنال داشته باشد
+            del cooldowns[symbol]
+
         if t4h_time not in df4h_indexed.index:
             continue
             
@@ -248,7 +275,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
                     "entry_price": entry_price,
                     "tp": tp,
                     "sl": sl,
-                    "time": str(c1h['Date'])
+                    "time": candle_time_str
                 }
                 
                 signal_text = (
@@ -277,7 +304,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
                     "entry_price": entry_price,
                     "tp": tp,
                     "sl": sl,
-                    "time": str(c1h['Date'])
+                    "time": candle_time_str
                 }
                 
                 signal_text = (
@@ -293,5 +320,5 @@ for symbol, lbank_symbol in SYMBOLS.items():
     except Exception as e:
         print(f"❌ خطا در پردازش نماد {symbol}: {e}")
 
-save_state(active_trades)
-print("✨ بررسی بازار و مانیتورینگ پوزیشن‌ها به اتمام رسید.")
+save_state({"active": active_trades, "cooldown": cooldowns})
+print("✨ مانیتورینگ و اسکن بازار با سیستم ضد تکرار به پایان رسید.")
