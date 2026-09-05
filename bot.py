@@ -48,21 +48,12 @@ def save_and_commit_state(state):
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=4)
-        
-        if os.getenv("GITHUB_ACTIONS"):
-            subprocess.run(["git", "config", "--global", "user.name", "Bot Memory Keeper"], check=False)
-            subprocess.run(["git", "config", "--global", "user.email", "bot@github.com"], check=False)
-            subprocess.run(["git", "add", STATE_FILE], check=False)
-            subprocess.run(["git", "commit", "-m", "Auto-update bot state [skip ci]"], check=False)
-            # رفع خطای reject با اضافه کردن pull ری‌بیس
-            subprocess.run(["git", "pull", "origin", "main", "--rebase"], check=False)
-            subprocess.run(["git", "push"], check=False)
-            print("💾 حافظه ربات با موفقیت در گیت‌هاب ذخیره (Commit) شد.")
+        print("💾 حافظه ربات با موفقیت در فایل محلی ذخیره شد.")
     except Exception as e:
-        print(f"❌ خطا در ذخیره یا کامیت فایل وضعیت: {e}")
+        print(f"❌ خطا در ذخیره فایل وضعیت: {e}")
 
 if MANUAL_RUN:
-    send_telegram_message("✅ ربات Score Hunter Pro با سیستم حفظ حافظه ابری روی LBank استارت شد.")
+    send_telegram_message("✅ ربات Score Hunter Pro با سیستم مانیتورینگ روی LBank استارت شد.")
 
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
