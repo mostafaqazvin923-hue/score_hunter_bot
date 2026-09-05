@@ -54,6 +54,8 @@ def save_and_commit_state(state):
             subprocess.run(["git", "config", "--global", "user.email", "bot@github.com"], check=False)
             subprocess.run(["git", "add", STATE_FILE], check=False)
             subprocess.run(["git", "commit", "-m", "Auto-update bot state [skip ci]"], check=False)
+            # رفع خطای reject با اضافه کردن pull ری‌بیس
+            subprocess.run(["git", "pull", "origin", "main", "--rebase"], check=False)
             subprocess.run(["git", "push"], check=False)
             print("💾 حافظه ربات با موفقیت در گیت‌هاب ذخیره (Commit) شد.")
     except Exception as e:
@@ -104,7 +106,7 @@ for symbol, trade in active_trades.items():
         hit_tp = False
         hit_sl = False
         
-        # بررسی قیمت لحظه‌ای بازار به عنوان مطمئن‌ترین روش مانیتورینگ
+        # بررسی قیمت لحظه‌ای بازار
         if direction == "LONG":
             if current_price >= tp:
                 hit_tp = True
@@ -116,7 +118,7 @@ for symbol, trade in active_trades.items():
             elif current_price >= sl:
                 hit_sl = True
                 
-        # بررسی کندل‌های تاریخی ثبت شده در صورت عدم برخورد آنی قیمت لحظه‌ای
+        # بررسی کندل‌های تاریخی در صورت نیاز
         if not hit_tp and not hit_sl and ohlcv:
             df_candles = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
             df_candles['Date'] = pd.to_datetime(df_candles['Timestamp'], unit='ms')
