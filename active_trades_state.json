@@ -2,5 +2,13 @@
     "active_trades": {},
     "last_timestamps": {
         "SOLUSDT": 1788199200000
+    },
+    "LINK": {
+        "symbol": "LINK/USDT",
+        "direction": "LONG",
+        "entry_price": 11.787,
+        "tp": 12.232428571428573,
+        "sl": 11.564285714285715,
+        "time": "2026-09-05 08:00:00"
     }
 }
