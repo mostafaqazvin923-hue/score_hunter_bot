@@ -1,13 +1,13 @@
 import os
 import json
 import requests
+import subprocess
+import sys
 from datetime import datetime
 
 try:
     import ccxt
 except ImportError:
-    import subprocess
-    import sys
     subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
     import ccxt
 
@@ -20,12 +20,9 @@ MANUAL_RUN_ENV = os.getenv("MANUAL_RUN", "false")
 MANUAL_RUN = str(MANUAL_RUN_ENV).lower() == "true"
 STATE_FILE = "active_trades_state.json"
 
-print(f"DEBUG -> MANUAL_RUN environment value: {MANUAL_RUN_ENV} (Parsed: {MANUAL_RUN})")
-print(f"DEBUG -> Token exists: {bool(TELEGRAM_BOT_TOKEN)}, Chat ID exists: {bool(TELEGRAM_CHAT_ID)}")
-
 def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ توکن یا چت‌آیدی تلگرام در Secrets تنظیم نشده است.")
+        print("⚠️ توکن یا چت‌آیدی تلگرام تنظیم نشده است.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -34,8 +31,7 @@ def send_telegram_message(text):
         "parse_mode": "Markdown"
     }
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        print(f"Telegram Response Status: {response.status_code}")
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"❌ خطا در ارسال پیام تلگرام: {e}")
 
@@ -48,16 +44,24 @@ def load_state():
             return {"active": {}, "cooldown": {}}
     return {"active": {}, "cooldown": {}}
 
-def save_state(state):
+def save_and_commit_state(state):
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=4)
+        
+        # ذخیره خودکار حافظه در گیت‌هاب برای جلوگیری از پاک شدن استیت
+        if os.getenv("GITHUB_ACTIONS"):
+            subprocess.run(["git", "config", "--global", "user.name", "Bot Memory Keeper"], check=False)
+            subprocess.run(["git", "config", "--global", "user.email", "bot@github.com"], check=False)
+            subprocess.run(["git", "add", STATE_FILE], check=False)
+            subprocess.run(["git", "commit", "-m", "Auto-update bot state [skip ci]"], check=False)
+            subprocess.run(["git", "push"], check=False)
+            print("💾 حافظه ربات با موفقیت در گیت‌هاب ذخیره (Commit) شد.")
     except Exception as e:
-        print(f"❌ خطا در ذخیره فایل وضعیت: {e}")
+        print(f"❌ خطا در ذخیره یا کامیت فایل وضعیت: {e}")
 
 if MANUAL_RUN:
-    print("📢 اقدام به ارسال پیام استارت دستی در تلگرام...")
-    send_telegram_message("✅ ربات Score Hunter Pro با سیستم ضد تکرار کندل روی LBank استارت شد.")
+    send_telegram_message("✅ ربات Score Hunter Pro با سیستم حفظ حافظه ابری روی LBank استارت شد.")
 
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
@@ -75,13 +79,13 @@ SYMBOLS = {
 
 state_data = load_state()
 active_trades = state_data.get("active", {})
-cooldowns = state_data.get("cooldown", {}) # ذخیره آخرین کندل معامله شده برای جلوگیری از تکرار
+cooldowns = state_data.get("cooldown", {})
 
 print("============================================================")
-print("🔍 در حال مانیتورینگ دقیق و اسکن هوشمند بازار روی LBank...")
+print("🔍 مانیتورینگ هوشمند پوزیشن‌ها و اسکن بازار...")
 print("============================================================")
 
-# ۱. مانیتورینگ هوشمند پوزیشن‌های باز (بر اساس شادوها و قیمت لایو)
+# ۱. مانیتورینگ پوزیشن‌های باز
 symbols_to_remove = []
 for symbol, trade in active_trades.items():
     lbank_symbol = SYMBOLS.get(symbol)
@@ -156,7 +160,6 @@ for symbol, trade in active_trades.items():
         print(f"❌ خطا در مانیتورینگ نماد {symbol}: {e}")
 
 for sym in symbols_to_remove:
-    # انتقال به لیست کوکدان (جلوگیری از ورود مجدد روی همان کندل)
     if sym in active_trades:
         cooldowns[sym] = active_trades[sym]["time"]
         del active_trades[sym]
@@ -187,7 +190,7 @@ def calculate_indicators(df):
     df['ADX'] = dx.rolling(window=14).mean().fillna(20)
     return df
 
-# ۲. اسکن سیگنال‌های جدید با سیستم ضد تکرار کندل
+# ۲. اسکن سیگنال‌های جدید
 for symbol, lbank_symbol in SYMBOLS.items():
     if symbol in active_trades:
         print(f"🔒 نماد {symbol} دارای پوزیشن فعال است؛ اسکن رد شد.")
@@ -222,13 +225,11 @@ for symbol, lbank_symbol in SYMBOLS.items():
         c1h = df1h.iloc[i]
         t4h_time = c1h['Date_4H']
         
-        # چک کردن سیستم ضد تکرار (اگر این کندل قبلاً معامله شده، رد شو)
         candle_time_str = str(c1h['Date'])
         if symbol in cooldowns and cooldowns[symbol] == candle_time_str:
-            print(f"⏳ نماد {symbol} روی این کندل ({candle_time_str}) قبلاً معامله شده؛ در انتظار کندل جدید.")
+            print(f"⏳ نماد {symbol} روی این کندل قبلاً معامله شده است.")
             continue
         elif symbol in cooldowns and cooldowns[symbol] != candle_time_str:
-            # کندل جدید آمده، کوهدان این نماد را پاک کن تا دوباره اجازه سیگنال داشته باشد
             del cooldowns[symbol]
 
         if t4h_time not in df4h_indexed.index:
@@ -320,5 +321,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
     except Exception as e:
         print(f"❌ خطا در پردازش نماد {symbol}: {e}")
 
-save_state({"active": active_trades, "cooldown": cooldowns})
-print("✨ مانیتورینگ و اسکن بازار با سیستم ضد تکرار به پایان رسید.")
+# ذخیره و کامیت خودکار در گیت‌هاب برای اینکه حافظه ربات پاک نشود
+save_and_commit_state({"active": active_trades, "cooldown": cooldowns})
+print("✨ پایان اسکن و مانیتورینگ بازار.")
