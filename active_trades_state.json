@@ -1,13 +1,5 @@
 {
     "active": {
-        "LINK": {
-            "symbol": "LINK/USDT",
-            "direction": "LONG",
-            "entry_price": 11.802,
-            "tp": 12.249928571428573,
-            "sl": 11.578035714285713,
-            "time": "2026-09-05 09:00:00"
-        },
         "SOL": {
             "symbol": "SOL/USDT",
             "direction": "LONG",
@@ -15,14 +7,6 @@
             "tp": 106.89535714285714,
             "sl": 101.38232142857143,
             "time": "2026-09-05 12:00:00"
-        },
-        "BTC": {
-            "symbol": "BTC/USDT",
-            "direction": "LONG",
-            "entry_price": 79805.51,
-            "tp": 80598.01714285715,
-            "sl": 79409.25642857142,
-            "time": "2026-09-05 15:00:00"
         },
         "ETH": {
             "symbol": "ETH/USDT",
