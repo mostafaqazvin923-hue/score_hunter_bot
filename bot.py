@@ -44,16 +44,25 @@ def load_state():
             return {"active": {}, "cooldown": {}}
     return {"active": {}, "cooldown": {}}
 
-def save_and_commit_state(state):
+def save_state(state):
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=4)
-        print("💾 حافظه ربات با موفقیت در فایل محلی ذخیره شد.")
+        
+        # ذخیره و کامیت خودکار امن برای جلوگیری از بازگشت وضعیت پوزیشن‌های بسته شده
+        if os.getenv("GITHUB_ACTIONS"):
+            subprocess.run(["git", "config", "--global", "user.name", "Bot Memory Keeper"], check=False)
+            subprocess.run(["git", "config", "--global", "user.email", "bot@github.com"], check=False)
+            subprocess.run(["git", "add", STATE_FILE], check=False)
+            subprocess.run(["git", "commit", "-m", "Auto-update bot state [skip ci]"], check=False)
+            subprocess.run(["git", "pull", "origin", "main", "--rebase"], check=False)
+            subprocess.run(["git", "push"], check=False)
+            print("💾 حافظه ربات با موفقیت در گیت‌هاب ذخیره شد.")
     except Exception as e:
         print(f"❌ خطا در ذخیره فایل وضعیت: {e}")
 
 if MANUAL_RUN:
-    send_telegram_message("✅ ربات Score Hunter Pro با سیستم مانیتورینگ روی LBank استارت شد.")
+    send_telegram_message("✅ ربات Score Hunter Pro با سیستم ضدتکرار پیام روی LBank استارت شد.")
 
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
@@ -97,7 +106,6 @@ for symbol, trade in active_trades.items():
         hit_tp = False
         hit_sl = False
         
-        # بررسی قیمت لحظه‌ای بازار
         if direction == "LONG":
             if current_price >= tp:
                 hit_tp = True
@@ -109,7 +117,6 @@ for symbol, trade in active_trades.items():
             elif current_price >= sl:
                 hit_sl = True
                 
-        # بررسی کندل‌های تاریخی در صورت نیاز
         if not hit_tp and not hit_sl and ohlcv:
             df_candles = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
             df_candles['Date'] = pd.to_datetime(df_candles['Timestamp'], unit='ms')
@@ -155,10 +162,14 @@ for symbol, trade in active_trades.items():
     except Exception as e:
         print(f"❌ خطا در مانیتورینگ نماد {symbol}: {e}")
 
+# حذف آنی پوزیشن‌های بسته شده از حافظه و اعمال کوئیدون قوی
 for sym in symbols_to_remove:
     if sym in active_trades:
         cooldowns[sym] = active_trades[sym]["time"]
         del active_trades[sym]
+
+# ذخیره فوری وضعیت جدید قبل از رفتن به سراغ اسکن سیگنال‌ها تا حلقه‌ی تکرار قطع شود
+save_state({"active": active_trades, "cooldown": cooldowns})
 
 def calculate_indicators(df):
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -317,5 +328,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
     except Exception as e:
         print(f"❌ خطا در پردازش نماد {symbol}: {e}")
 
-save_and_commit_state({"active": active_trades, "cooldown": cooldowns})
+# ذخیره نهایی وضعیت جدید پوزیشن‌های باز یا سیگنال‌های جدید
+save_state({"active": active_trades, "cooldown": cooldowns})
 print("✨ پایان اسکن و مانیتورینگ بازار.")
