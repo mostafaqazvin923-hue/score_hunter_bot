@@ -1,13 +1,5 @@
 {
     "active": {
-        "SOL": {
-            "symbol": "SOL/USDT",
-            "direction": "LONG",
-            "entry_price": 103.22,
-            "tp": 106.89535714285714,
-            "sl": 101.38232142857143,
-            "time": "2026-09-05 12:00:00"
-        },
         "ETH": {
             "symbol": "ETH/USDT",
             "direction": "LONG",
@@ -17,5 +9,7 @@
             "time": "2026-09-05 16:00:00"
         }
     },
-    "cooldown": {}
+    "cooldown": {
+        "SOL": "2026-09-05 12:00:00"
+    }
 }
