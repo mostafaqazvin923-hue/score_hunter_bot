@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته (نسخه بهینه‌شده)")
+print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته (نسخه پربازده / سیگنال بیشتر)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_optimized_data.csv"
+    filename_1h = f"{symbol}_1h_expanded_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -100,7 +100,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست بهینه‌شده (فیلترهای سخت‌گیرانه‌تر ADX و حجم)")
+print("🚀 اجرای موتور بک‌تست با فیلترهای متعادل‌تر (جهت افزایش تعداد معاملات)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -111,7 +111,8 @@ for symbol, df1h in data_1h.items():
         
     df1h = calculate_indicators(df1h)
     
-    df4h = df1h.set_index('Date').resample('4H').agg({
+    # استفاده از '4h' به جای '4H' جهت رفع هشدار پایتون
+    df4h = df1h.set_index('Date').resample('4h').agg({
         'Open': 'first',
         'High': 'max',
         'Low': 'min',
@@ -148,9 +149,9 @@ for symbol, df1h in data_1h.items():
         except:
             slope_positive = True
             
-        # 💡 تغییرات بهینه‌سازی: افزایش آستانه ADX به 20 و RSI دقیق‌تر
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 20) and (r4h['RSI'] > 55)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 20) and (r4h['RSI'] < 45)
+        # 💡 تغییرات بهینه‌سازی برای افزایش سیگنال: کاهش ADX به 17 و ملایم‌تر کردن RSI
+        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and slope_positive and (r4h['ADX'] >= 17) and (r4h['RSI'] > 50)
+        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (r4h['ADX'] >= 17) and (r4h['RSI'] < 50)
         
         if not is_long_regime and not is_short_regime:
             continue
@@ -160,9 +161,9 @@ for symbol, df1h in data_1h.items():
         struct_low = lookback_slice['Low'].min()
         
         avg_vol = lookback_slice['Volume'].mean()
-        # 💡 تغییرات بهینه‌سازی: افزایش فیلتر حجم به 1.1 برابر میانگین
-        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 1.1)
-        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 1.1)
+        # 💡 تغییرات بهینه‌سازی برای حجم: کاهش ضریب به 0.95 (نزدیک به میانگین)
+        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 0.95)
+        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 0.95)
         
         if is_long_regime and is_breakout_long:
             entered = False
@@ -171,14 +172,14 @@ for symbol, df1h in data_1h.items():
                     break
                 p_candle = df1h.iloc[i + p]
                 
-                if p_candle['Low'] <= struct_high * 1.003: 
-                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 50:
+                if p_candle['Low'] <= struct_high * 1.004: 
+                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 48:
                         entry_price = p_candle['Close']
                         swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
                         sl = swing_low_pullback - (0.25 * p_candle['ATR'])
                         risk = entry_price - sl
                         
-                        if risk <= 0 or (risk / entry_price) > 0.045:
+                        if risk <= 0 or (risk / entry_price) > 0.05:
                             break
                             
                         tp = entry_price + (2.0 * risk)
@@ -218,14 +219,14 @@ for symbol, df1h in data_1h.items():
                     break
                 p_candle = df1h.iloc[i + p]
                 
-                if p_candle['High'] >= struct_low * 0.997:
-                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 50:
+                if p_candle['High'] >= struct_low * 0.996:
+                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 52:
                         entry_price = p_candle['Close']
                         swing_high_pullback = df1h.iloc[i:i+p+1]['High'].max()
                         sl = swing_high_pullback + (0.25 * p_candle['ATR'])
                         risk = sl - entry_price
                         
-                        if risk <= 0 or (risk / entry_price) > 0.045:
+                        if risk <= 0 or (risk / entry_price) > 0.05:
                             break
                             
                         tp = entry_price - (2.0 * risk)
@@ -257,7 +258,7 @@ for symbol, df1h in data_1h.items():
                             break
 
 print("\n============================================================")
-print("📊 گزارش تجمیعی نهایی پورتفوی بهینه‌شده HUNTER-X 2R")
+print("📊 گزارش تجمیعی نهایی پورتفوی (نسخه پرسیگنال)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -279,4 +280,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ بک‌تست بهینه‌شده به اتمام رسید.")
+print("\n✨ بک‌تست پرسیگنال به اتمام رسید.")
