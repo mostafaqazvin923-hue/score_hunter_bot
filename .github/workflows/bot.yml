@@ -2,11 +2,11 @@ name: Run Trading Bot
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # هر ۱۵ دقیقه یکبار
+    - cron: '7,22,37,52 * * * *' # اجرا در دقایق ۷، ۲۲، ۳۷ و ۵۲ هر ساعت (برای فرار از ترافیک و تاخیر)
   workflow_dispatch:
 
 permissions:
-  contents: write  # <--- فقط همین دو خط را اضافه کن تا گیت‌هاب اجازه ذخیره حافظه را بدهد
+  contents: write
 
 jobs:
   run-bot:
