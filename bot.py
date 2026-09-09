@@ -93,6 +93,61 @@ for symbol, trade in active_trades.items():
         sl = trade['sl']
         entry = trade['entry_price']
         
+        # محاسبه درصد سود کل تارگت
+        if direction == "LONG":
+            tp_pct = ((tp - entry) / entry) * 100
+        else:
+            tp_pct = ((entry - tp) / entry) * 100
+            
+        # بررسی و اعمال قابلیت ریسک‌فری خودکار (فقط برای تارگت‌های >= 4 درصد)
+        if tp_pct >= 4.0 and not trade.get("risk_free", False):
+            halfway_reached = False
+            df_active_period = pd.DataFrame()
+            if ohlcv:
+                df_candles = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                df_candles['Date'] = pd.to_datetime(df_candles['Timestamp'], unit='ms')
+                df_active_period = df_candles[df_candles['Date'] >= trade_time.floor('h')]
+            
+            if direction == "LONG":
+                halfway_price = entry + 0.5 * (tp - entry)
+                if current_price >= halfway_price:
+                    halfway_reached = True
+                elif not df_active_period.empty:
+                    if (df_active_period['High'] >= halfway_price).any():
+                        halfway_reached = True
+                        
+                if halfway_reached:
+                    trade['sl'] = entry
+                    trade['risk_free'] = True
+                    msg = (
+                        f"🛡️ **پوزیشن ریسک‌فری شد (Breakeven)!**\n"
+                        f"💎 جفت ارز: `{symbol}USDT`\n"
+                        f"📍 قیمت ورود: `{entry:.4f}`\n"
+                        f"🎯 هدف سود کل: `{tp:.4f}` (+{tp_pct:.2f}%)\n"
+                        f"✨ قیمت به نیمه‌ی راه رسید و حد ضرر روی نقطه‌ی ورود قفل شد."
+                    )
+                    send_telegram_message(msg)
+                    
+            elif direction == "SHORT":
+                halfway_price = entry - 0.5 * (entry - tp)
+                if current_price <= halfway_price:
+                    halfway_reached = True
+                elif not df_active_period.empty:
+                    if (df_active_period['Low'] <= halfway_price).any():
+                        halfway_reached = True
+                        
+                if halfway_reached:
+                    trade['sl'] = entry
+                    trade['risk_free'] = True
+                    msg = (
+                        f"🛡️ **پوزیشن ریسک‌فری شد (Breakeven)!**\n"
+                        f"💎 جفت ارز: `{symbol}USDT`\n"
+                        f"📍 قیمت ورود: `{entry:.4f}`\n"
+                        f"🎯 هدف سود کل: `{tp:.4f}` (+{tp_pct:.2f}%)\n"
+                        f"✨ قیمت به نیمه‌ی راه رسید و حد ضرر روی نقطه‌ی ورود قفل شد."
+                    )
+                    send_telegram_message(msg)
+
         hit_tp = False
         hit_sl = False
         
@@ -139,13 +194,22 @@ for symbol, trade in active_trades.items():
             send_telegram_message(msg)
             symbols_to_remove.append(symbol)
         elif hit_sl:
-            msg = (
-                f"🛑 **حد ضرر لمس شد (SL Hit)!**\n"
-                f"💎 جفت ارز: `{symbol}USDT`\n"
-                f"📍 قیمت ورود: `{entry:.4f}`\n"
-                f"🛑 حد ضرر: `{sl:.4f}`\n"
-                f"⚠️ پوزیشن متوقف شد."
-            )
+            is_breakeven_hit = trade.get("risk_free", False) and (sl == entry)
+            if is_breakeven_hit:
+                msg = (
+                    f"🛡️ **معامله در نقطه سربه‌سر (Breakeven) بسته شد!**\n"
+                    f"💎 جفت ارز: `{symbol}USDT`\n"
+                    f"📍 قیمت ورود: `{entry:.4f}`\n"
+                    f"✨ پوزیشن بدون ضرر خارج شد."
+                )
+            else:
+                msg = (
+                    f"🛑 **حد ضرر لمس شد (SL Hit)!**\n"
+                    f"💎 جفت ارز: `{symbol}USDT`\n"
+                    f"📍 قیمت ورود: `{entry:.4f}`\n"
+                    f"🛑 حد ضرر: `{sl:.4f}`\n"
+                    f"⚠️ پوزیشن متوقف شد."
+                )
             send_telegram_message(msg)
             symbols_to_remove.append(symbol)
             
@@ -204,7 +268,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
         
         df1h = calculate_indicators(df1h)
         
-        # استفاده از '4h' به جای '4H' جهت رفع هشدار پایتون
         df4h = df1h.set_index('Date').resample('4h').agg({
             'Open': 'first',
             'High': 'max',
@@ -242,7 +305,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
         except:
             slope_positive = True
             
-        # اعمال تنظیمات بهینه جدید (ADX روی 17 به همراه عدم سخت‌گیری بیش از حد روی چینش کامل EMAها برای جلوگیری از متوقف شدن در بازار رنج)
         is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and slope_positive and (r4h['ADX'] >= 17) and (r4h['RSI'] > 50)
         is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (r4h['ADX'] >= 17) and (r4h['RSI'] < 50)
         
@@ -254,7 +316,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
         struct_low = lookback_slice['Low'].min()
         avg_vol = lookback_slice['Volume'].mean()
         
-        # اعمال ضریب حجم بهینه شده (0.95)
         is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 0.95)
         is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 0.95)
         
@@ -274,7 +335,8 @@ for symbol, lbank_symbol in SYMBOLS.items():
                     "entry_price": entry_price,
                     "tp": tp,
                     "sl": sl,
-                    "time": candle_time_str
+                    "time": candle_time_str,
+                    "risk_free": False
                 }
                 
                 signal_text = (
@@ -303,7 +365,8 @@ for symbol, lbank_symbol in SYMBOLS.items():
                     "entry_price": entry_price,
                     "tp": tp,
                     "sl": sl,
-                    "time": candle_time_str
+                    "time": candle_time_str,
+                    "risk_free": False
                 }
                 
                 signal_text = (
@@ -319,10 +382,8 @@ for symbol, lbank_symbol in SYMBOLS.items():
     except Exception as e:
         print(f"❌ خطا در پردازش نماد {symbol}: {e}")
 
-# ذخیره نهایی وضعیت جدید پوزیشن‌های باز یا سیگنال‌های جدید
 save_state({"active": active_trades, "cooldown": cooldowns})
 
-# ۳. هارت‌بیت و کامیت اجباری برای جلوگیری از غیرفعال شدن کرون‌جاب گیت‌هاب
 if os.getenv("GITHUB_ACTIONS"):
     try:
         with open("last_run.txt", "w") as f:
