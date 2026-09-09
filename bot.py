@@ -73,7 +73,7 @@ active_trades = state_data.get("active", {})
 cooldowns = state_data.get("cooldown", {})
 
 print("============================================================")
-print("🔍 مانیتورینگ هوشمند پوزیشن‌ها و اسکن بازار...")
+print("🔍 مانیتورینگ هوشمند پوزیشن‌ها و اسکن بازار (نسخه پرسیگنال بهینه)...")
 print("============================================================")
 
 # ۱. مانیتورینگ دقیق پوزیشن‌های باز
@@ -204,6 +204,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         
         df1h = calculate_indicators(df1h)
         
+        # استفاده از '4h' به جای '4H' جهت رفع هشدار پایتون
         df4h = df1h.set_index('Date').resample('4h').agg({
             'Open': 'first',
             'High': 'max',
@@ -241,8 +242,9 @@ for symbol, lbank_symbol in SYMBOLS.items():
         except:
             slope_positive = True
             
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 16) and (r4h['RSI'] > 50)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 16) and (r4h['RSI'] < 50)
+        # اعمال تنظیمات بهینه جدید (ADX روی 17 به همراه عدم سخت‌گیری بیش از حد روی چینش کامل EMAها برای جلوگیری از متوقف شدن در بازار رنج)
+        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and slope_positive and (r4h['ADX'] >= 17) and (r4h['RSI'] > 50)
+        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (r4h['ADX'] >= 17) and (r4h['RSI'] < 50)
         
         if not is_long_regime and not is_short_regime:
             continue
@@ -252,15 +254,16 @@ for symbol, lbank_symbol in SYMBOLS.items():
         struct_low = lookback_slice['Low'].min()
         avg_vol = lookback_slice['Volume'].mean()
         
-        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 0.85)
-        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 0.85)
+        # اعمال ضریب حجم بهینه شده (0.95)
+        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 0.95)
+        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 0.95)
         
         if is_long_regime and is_breakout_long:
             entry_price = c1h['Close']
             swing_low_pullback = lookback_slice['Low'].min()
             sl = swing_low_pullback - (0.25 * c1h['ATR'])
             risk = entry_price - sl
-            if risk > 0 and (risk / entry_price) <= 0.045:
+            if risk > 0 and (risk / entry_price) <= 0.05:
                 tp = entry_price + (2.0 * risk)
                 sl_pct = (risk / entry_price) * 100
                 tp_pct = ((tp - entry_price) / entry_price) * 100
@@ -289,7 +292,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
             swing_high_pullback = lookback_slice['High'].max()
             sl = swing_high_pullback + (0.25 * c1h['ATR'])
             risk = sl - entry_price
-            if risk > 0 and (risk / entry_price) <= 0.045:
+            if risk > 0 and (risk / entry_price) <= 0.05:
                 tp = entry_price - (2.0 * risk)
                 sl_pct = (risk / entry_price) * 100
                 tp_pct = ((entry_price - tp) / entry_price) * 100
