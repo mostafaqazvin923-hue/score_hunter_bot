@@ -48,16 +48,6 @@ def save_state(state):
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=4)
-        
-        # ذخیره و کامیت خودکار امن برای جلوگیری از بازگشت وضعیت پوزیشن‌های بسته شده
-        if os.getenv("GITHUB_ACTIONS"):
-            subprocess.run(["git", "config", "--global", "user.name", "Bot Memory Keeper"], check=False)
-            subprocess.run(["git", "config", "--global", "user.email", "bot@github.com"], check=False)
-            subprocess.run(["git", "add", STATE_FILE], check=False)
-            subprocess.run(["git", "commit", "-m", "Auto-update bot state [skip ci]"], check=False)
-            subprocess.run(["git", "pull", "origin", "main", "--rebase"], check=False)
-            subprocess.run(["git", "push"], check=False)
-            print("💾 حافظه ربات با موفقیت در گیت‌هاب ذخیره شد.")
     except Exception as e:
         print(f"❌ خطا در ذخیره فایل وضعیت: {e}")
 
@@ -162,13 +152,11 @@ for symbol, trade in active_trades.items():
     except Exception as e:
         print(f"❌ خطا در مانیتورینگ نماد {symbol}: {e}")
 
-# حذف آنی پوزیشن‌های بسته شده از حافظه و اعمال کوئیدون قوی
 for sym in symbols_to_remove:
     if sym in active_trades:
         cooldowns[sym] = active_trades[sym]["time"]
         del active_trades[sym]
 
-# ذخیره فوری وضعیت جدید قبل از رفتن به سراغ اسکن سیگنال‌ها تا حلقه‌ی تکرار قطع شود
 save_state({"active": active_trades, "cooldown": cooldowns})
 
 def calculate_indicators(df):
@@ -330,4 +318,21 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
 # ذخیره نهایی وضعیت جدید پوزیشن‌های باز یا سیگنال‌های جدید
 save_state({"active": active_trades, "cooldown": cooldowns})
+
+# ۳. هارت‌بیت و کامیت اجباری برای جلوگیری از غیرفعال شدن کرون‌جاب گیت‌هاب
+if os.getenv("GITHUB_ACTIONS"):
+    try:
+        with open("last_run.txt", "w") as f:
+            f.write(f"Last bot run timestamp: {datetime.utcnow()} UTC")
+        
+        subprocess.run(["git", "config", "--global", "user.name", "Bot Heartbeat Keeper"], check=False)
+        subprocess.run(["git", "config", "--global", "user.email", "bot@github.com"], check=False)
+        subprocess.run(["git", "add", STATE_FILE, "last_run.txt"], check=False)
+        subprocess.run(["git", "commit", "-m", "Auto-update state and heartbeat [skip ci]"], check=False)
+        subprocess.run(["git", "pull", "origin", "main", "--rebase"], check=False)
+        subprocess.run(["git", "push"], check=False)
+        print("💾 حافظه ربات و هارت‌بیت با موفقیت در گیت‌هاب ذخیره شدند.")
+    except Exception as e:
+        print(f"❌ خطا در آپدیت گیت‌هاب: {e}")
+
 print("✨ پایان اسکن و مانیتورینگ بازار.")
