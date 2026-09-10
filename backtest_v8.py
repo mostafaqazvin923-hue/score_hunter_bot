@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای سیستم HUNTER-X V3.1 (فریوئنسی بهینه‌شده)")
+print("📥 دانلود داده‌ها برای سیستم HUNTER-X V3.2 CLEAN (بدون Look-ahead)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_v3_1_data.csv"
+    filename_1h = f"{symbol}_1h_v3_2_clean_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -102,7 +102,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست HUNTER-X V3.1")
+print("🚀 اجرای موتور بک‌تست HUNTER-X V3.2 CLEAN (بدون هیچ‌گونه نگاه به آینده)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -113,6 +113,7 @@ for symbol, df1h in data_1h.items():
         
     df1h = calculate_indicators(df1h)
     
+    # ساخت تایم‌فریم 4 ساعته استاندارد
     df4h = df1h.set_index('Date').resample('4h').agg({
         'Open': 'first',
         'High': 'max',
@@ -123,9 +124,7 @@ for symbol, df1h in data_1h.items():
     
     df4h = calculate_indicators(df4h)
     
-    df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
     df4h_indexed = df4h.set_index('Date')
-    
     locked_until_index = 0
     
     for i in range(100, len(df1h) - 40):
@@ -133,20 +132,25 @@ for symbol, df1h in data_1h.items():
             continue
             
         c1h = df1h.iloc[i]
-        t4h_time = c1h['Date_4H']
+        current_time = c1h['Date']
         
-        if t4h_time not in df4h_indexed.index:
+        # تضمین استفاده از آخرین کندل 4 ساعته کاملاً بسته‌شده (حداقل 4 ساعت عقب‌تر از زمان فعلی)
+        closed_4h_time = current_time - timedelta(hours=4)
+        available_4h = df4h[df4h['Date'] <= closed_4h_time]
+        
+        if available_4h.empty:
             continue
             
-        r4h = df4h_indexed.loc[t4h_time]
+        r4h = available_4h.iloc[-1]
         
         ema20_4h = r4h['EMA_20']
         ema50_4h = r4h['EMA_50']
         ema200_4h = r4h['EMA_200']
         
+        # شیب واقعی EMA200 با مقایسه با کندل 4 ساعته ماقبلِ آن (بدون مقایسه با خودش)
         try:
-            prev_ema200_4h = df4h.loc[df4h['Date'] == t4h_time, 'EMA_200'].values[0]
-            slope_positive = ema200_4h >= prev_ema200_4h
+            prev_r4h = available_4h.iloc[-2]
+            slope_positive = ema200_4h >= prev_r4h['EMA_200']
         except:
             slope_positive = True
             
@@ -156,7 +160,7 @@ for symbol, df1h in data_1h.items():
         if not is_long_context and not is_short_context:
             continue
             
-        # افزایش پنجره جستجوی سوئینگ به 60 کندل برای دیدن ساختارهای بزرگ‌تر
+        # بررسی سوئینگ‌پوینت‌ها فقط با دیتای گذشته (تا کندل قبل از i)
         window = df1h.iloc[i-60:i]
         if len(window) < 15:
             continue
@@ -185,7 +189,6 @@ for symbol, df1h in data_1h.items():
                 if total_range == 0:
                     continue
                     
-                # تنظیمات بهینه‌شده و روان‌تر برای افزایش فرکانس
                 is_displacement = (body_size >= 0.50 * total_range) and \
                                   (total_range >= 1.0 * p_candle['ATR']) and \
                                   (p_candle['Volume'] >= 1.0 * p_candle['Vol_MA'])
@@ -194,7 +197,6 @@ for symbol, df1h in data_1h.items():
                     for r_idx in range(p + 1, min(p + 10, len(df1h) - i)):
                         retest_candle = df1h.iloc[i + r_idx]
                         
-                        # بازتر کردن محدوده Retest
                         if retest_candle['Low'] <= last_swing_high * 1.005 and retest_candle['Close'] > retest_candle['Open']:
                             entry_price = retest_candle['Close']
                             sl = last_swing_low - (0.25 * retest_candle['ATR'])
@@ -205,10 +207,8 @@ for symbol, df1h in data_1h.items():
                                 
                             tp = entry_price + (2.0 * risk)
                             
-                            future_slice = df1h.iloc[i + r_idx + 1 : i + r_idx + 25]
-                            if not future_slice.empty and (future_slice['High'].max() < entry_price + 1.2 * risk):
-                                break
-                                
+                            # [حذف کامل future_slice بدون هیچ بررسی آینده]
+                            
                             outcome = 'OPEN'
                             exit_idx = i + r_idx
                             for j in range(i + r_idx, min(i + r_idx + 40, len(df1h))):
@@ -265,10 +265,6 @@ for symbol, df1h in data_1h.items():
                                 
                             tp = entry_price - (2.0 * risk)
                             
-                            future_slice = df1h.iloc[i + r_idx + 1 : i + r_idx + 25]
-                            if not future_slice.empty and (future_slice['Low'].min() > entry_price - 1.2 * risk):
-                                break
-                                
                             outcome = 'OPEN'
                             exit_idx = i + r_idx
                             for j in range(i + r_idx, min(i + r_idx + 40, len(df1h))):
@@ -294,7 +290,7 @@ for symbol, df1h in data_1h.items():
                         break
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی (HUNTER-X V3.1)")
+print("📊 گزارش نهایی پورتفوی (HUNTER-X V3.2 CLEAN)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -316,4 +312,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ بک‌تست نسخه V3.1 به اتمام رسید.")
+print("\n✨ بک‌تست نسخه V3.2 CLEAN به اتمام رسید.")
