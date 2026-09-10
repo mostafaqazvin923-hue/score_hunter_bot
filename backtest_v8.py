@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته (نسخه اصلاح‌شده سالم)")
+print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته (نسخه ریسک‌فری پویا)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_clean_data.csv"
+    filename_1h = f"{symbol}_1h_rf_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -101,7 +101,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست سالم (بدون Look-ahead Bias)")
+print("🚀 اجرای موتور بک‌تست با منطق ریسک‌فری و مدیریت سرمایه پویا")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -149,9 +149,8 @@ for symbol, df1h in data_1h.items():
         except:
             slope_positive = True
             
-        # شرایط رژیم بازار (همان نسخه بهینه‌شده قبلی)
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 20) and (r4h['RSI'] > 55)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 20) and (r4h['RSI'] < 45)
+        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 20) and (50 < r4h['RSI'] < 75)
+        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 20) and (25 < r4h['RSI'] < 50)
         
         if not is_long_regime and not is_short_regime:
             continue
@@ -171,8 +170,9 @@ for symbol, df1h in data_1h.items():
                     break
                 p_candle = df1h.iloc[i + p]
                 
+                # فیلتر پولبک تاییدیه
                 if p_candle['Low'] <= struct_high * 1.003: 
-                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 50:
+                    if p_candle['Close'] > p_candle['Open'] and (50 < p_candle['RSI'] < 75):
                         entry_price = p_candle['Close']
                         swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
                         sl = swing_low_pullback - (0.25 * p_candle['ATR'])
@@ -182,22 +182,33 @@ for symbol, df1h in data_1h.items():
                             break
                             
                         tp = entry_price + (2.0 * risk)
-                        
-                        # 🚫 حذف کامل future_window (تقلب ممنوع!)
+                        half_tp = entry_price + (1.0 * risk) # سطح ریسک‌فری (سود 1R)
                         
                         outcome = 'OPEN'
                         exit_idx = i + p + 1
+                        is_risk_free = False
+                        
                         for j in range(i + p + 1, min(i + p + 40, len(df1h))):
                             f_c = df1h.iloc[j]
                             exit_idx = j
+                            
+                            # فعالسازی ریسک‌فری اگر قیمت به نصف مسیر رسید
+                            if not is_risk_free:
+                                if f_c['High'] >= half_tp:
+                                    sl = entry_price  # قفل کردن روی نقطه ورود
+                                    is_risk_free = True
+                            
                             if f_c['Low'] <= sl:
-                                outcome = 'LOSS'
+                                if is_risk_free:
+                                    outcome = 'BE'  # سر به سر بدون ضرر
+                                else:
+                                    outcome = 'LOSS'
                                 break
                             elif f_c['High'] >= tp:
                                 outcome = 'WIN'
                                 break
                                 
-                        if outcome in ['WIN', 'LOSS']:
+                        if outcome in ['WIN', 'LOSS', 'BE']:
                             all_portfolio_trades.append({
                                 'Symbol': symbol,
                                 'Side': 'LONG',
@@ -217,7 +228,7 @@ for symbol, df1h in data_1h.items():
                 p_candle = df1h.iloc[i + p]
                 
                 if p_candle['High'] >= struct_low * 0.997:
-                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 50:
+                    if p_candle['Close'] < p_candle['Open'] and (25 < p_candle['RSI'] < 50):
                         entry_price = p_candle['Close']
                         swing_high_pullback = df1h.iloc[i:i+p+1]['High'].max()
                         sl = swing_high_pullback + (0.25 * p_candle['ATR'])
@@ -227,22 +238,32 @@ for symbol, df1h in data_1h.items():
                             break
                             
                         tp = entry_price - (2.0 * risk)
-                        
-                        # 🚫 حذف کامل future_window (تقلب ممنوع!)
+                        half_tp = entry_price - (1.0 * risk) # سطح ریسک‌فری شورت
                         
                         outcome = 'OPEN'
                         exit_idx = i + p + 1
+                        is_risk_free = False
+                        
                         for j in range(i + p + 1, min(i + p + 40, len(df1h))):
                             f_c = df1h.iloc[j]
                             exit_idx = j
+                            
+                            if not is_risk_free:
+                                if f_c['Low'] <= half_tp:
+                                    sl = entry_price
+                                    is_risk_free = True
+                                    
                             if f_c['High'] >= sl:
-                                outcome = 'LOSS'
+                                if is_risk_free:
+                                    outcome = 'BE'
+                                else:
+                                    outcome = 'LOSS'
                                 break
                             elif f_c['Low'] <= tp:
                                 outcome = 'WIN'
                                 break
                                 
-                        if outcome in ['WIN', 'LOSS']:
+                        if outcome in ['WIN', 'LOSS', 'BE']:
                             all_portfolio_trades.append({
                                 'Symbol': symbol,
                                 'Side': 'SHORT',
@@ -253,7 +274,7 @@ for symbol, df1h in data_1h.items():
                             break
 
 print("\n============================================================")
-print("📊 گزارش تجمیعی نهایی پورتفوی (نسخه کاملاً سالم و واقعی)")
+print("📊 گزارش تجمیعی نهایی پورتفوی (با سیستم ریسک‌فری و خروج پاک)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -261,13 +282,20 @@ if all_portfolio_trades:
     total_trades = len(pf_df)
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
-    portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
+    total_bes = len(pf_df[pf_df['Outcome'] == 'BE'])
+    
+    # محاسبه وین‌ریت واقعی بر اساس معاملات قطعی (برد و باخت اصلی بدون در نظر گرفتن سر به سرها)
+    decisive_trades = total_wins + total_losses
+    true_win_rate = (total_wins / decisive_trades) * 100 if decisive_trades > 0 else 0
+    
+    # امتیاز سود خالص (بردها ضربدر 2 منهای باخت‌ها، سر به سرها تاثیر منفی ندارند)
     net_profit_score = (total_wins * 2.0) - total_losses
     
-    print(f"🔸 تعداد کل معاملات کل سبد (پورتفوی): {total_trades}")
-    print(f"🔸 کل معاملات برنده (WIN): {total_wins}")
-    print(f"🔸 کل معاملات بازنده (LOSS): {total_losses}")
-    print(f"🎯 **وین‌ریت تجمیعی کل پورتفوی (Portfolio Win Rate):** {portfolio_win_rate:.2f}%")
+    print(f"🔸 تعداد کل معاملات پورتفوی: {total_trades}")
+    print(f"🔸 معاملات برنده (WIN): {total_wins}")
+    print(f"🔸 معاملات سر به سر (BE - ریسک‌فری): {total_bes}")
+    print(f"🔸 معاملات بازنده قطعی (LOSS): {total_losses}")
+    print(f"🎯 **وین‌ریت واقعی (بدون احتساب سر به‌ سرها):** {true_win_rate:.2f}%")
     print(f"💰 امتیاز سودآوری خالص (Net Profit Score): {net_profit_score:.2f}R")
     
     print("\nتفکیک عملکرد به تفکیک هر نماد:")
@@ -275,4 +303,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ بک‌تست سالم به اتمام رسید.")
+print("\n✨ بک‌تست ریسک‌فری به اتمام رسید.")
