@@ -1,15 +1,12 @@
-name: Run Trading Bot
+name: Score Hunter Bot
 
 on:
   schedule:
-    - cron: '7,22,37,52 * * * *' # اجرا در دقایق ۷، ۲۲، ۳۷ و ۵۲ هر ساعت (برای فرار از ترافیک و تاخیر)
+    - cron: '5 * * * *' # اجرا در دقیقه‌ی ۵ هر ساعت (برای اطمینان از بسته شدن کامل کندل)
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  run-bot:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -22,12 +19,13 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install ccxt pandas numpy requests
 
-      - name: Run Bot Script
+      - name: Run Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MANUAL_RUN: "false"
+          GITHUB_ACTIONS: true
         run: |
           python bot.py
