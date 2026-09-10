@@ -1,13 +1,5 @@
 {
     "active": {
-        "AVAX": {
-            "symbol": "AVAX/USDT",
-            "direction": "LONG",
-            "entry_price": 7.802,
-            "tp": 8.353892857142856,
-            "sl": 7.526053571428571,
-            "time": "2026-09-06 20:00:00"
-        },
         "BTC": {
             "symbol": "BTC/USDT",
             "direction": "SHORT",
