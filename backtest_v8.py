@@ -31,13 +31,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای سیستم HUNTER-X V8 (Clean & Strict)")
+print("📥 دانلود داده‌ها برای سیستم HUNTER-X V9 (Corrected & Clean)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_v8_data.csv"
+    filename_1h = f"{symbol}_1h_v9_corrected_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -76,22 +76,31 @@ def calculate_indicators(df):
     df = df.copy()
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Low'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
+    
+    plus_dm = df['High'].diff().clip(lower=0)
+    minus_dm = (-df['Low'].diff()).clip(lower=0)
+    tr14 = tr.rolling(window=14).mean()
+    plus_di = 100 * (plus_dm.rolling(window=14).mean() / tr14)
+    minus_di = 100 * (minus_dm.rolling(window=14).mean() / tr14)
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+    df['ADX'] = dx.rolling(window=14).mean().fillna(20)
     df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست حرفه‌ای HUNTER-X V8")
+print("🚀 اجرای موتور بک‌تست اصلاح‌شده HUNTER-X V9")
 print("============================================================")
 
 all_trades = []
-COMMISSION_RATE = 0.0006 # 0.06% کارمزد واقعی
-SLIPPAGE_RATE = 0.0004   # 0.04% اسلیپیج واقعی
+COMMISSION_RATE = 0.0008 # 0.08% کارمزد کل رفت‌وبرگشت (بدون ضرب در 2 اضافی)
+SLIPPAGE_RATE = 0.0004   # 0.04% اسلیپیج
 
 for symbol, df1h in data_1h.items():
     if len(df1h) < 300:
@@ -99,7 +108,7 @@ for symbol, df1h in data_1h.items():
         
     df1h = calculate_indicators(df1h)
     
-    # ساخت تایم‌فریم 4 ساعته کاملاً ایزوله بدون نشت
+    # ساخت تایم‌فریم 4 ساعته کاملاً ایزوله
     df4h = df1h.set_index('Date').resample('4h').agg({
         'Open': 'first',
         'High': 'max',
@@ -110,142 +119,252 @@ for symbol, df1h in data_1h.items():
     
     df4h = calculate_indicators(df4h)
     
-    # تفکیک 80٪ In-Sample و 20٪ Out-of-Sample
+    # تفکیک 80% In-Sample و 20% Out-of-Sample
     split_idx = int(len(df1h) * 0.8)
     locked_until_index = 0
     
-    for i in range(100, len(df1h) - 40):
+    i = 200
+    while i < len(df1h) - 40:
         if i < locked_until_index:
+            i += 1
             continue
             
         c1h = df1h.iloc[i]
-        prev_c1h = df1h.iloc[i-1]
         current_time = c1h['Date']
         data_sample = "OOS" if i >= split_idx else "IS"
         
-        # استخراج رژیم 4 ساعته بدون Look-ahead (فقط کندل‌های بسته‌شده قبلی)
+        # 1️⃣ فیلتر اصلی 4H (بدون لوک‌آهد)
         closed_4h_time = current_time - timedelta(hours=4)
         available_4h = df4h[df4h['Date'] <= closed_4h_time]
         if available_4h.empty:
+            i += 1
             continue
             
         r4h = available_4h.iloc[-1]
-        is_long_regime = r4h['Close'] > r4h['EMA_50']
-        is_short_regime = r4h['Close'] < r4h['EMA_50']
+        try:
+            prev_r4h = available_4h.iloc[-2]
+            ema200_slope_up = r4h['EMA_200'] >= prev_r4h['EMA_200']
+            ema200_slope_down = r4h['EMA_200'] <= prev_r4h['EMA_200']
+        except:
+            ema200_slope_up = True
+            ema200_slope_down = True
+            
+        is_long_regime = (r4h['Close'] > r4h['EMA_200']) and (r4h['EMA_50'] > r4h['EMA_200']) and \
+                         (r4h['EMA_20'] > r4h['EMA_50']) and (r4h['ADX'] >= 18) and ema200_slope_up
+                         
+        is_short_regime = (r4h['Close'] < r4h['EMA_200']) and (r4h['EMA_50'] < r4h['EMA_200']) and \
+                          (r4h['EMA_20'] < r4h['EMA_50']) and (r4h['ADX'] >= 18) and ema200_slope_down
+                          
+        if not is_long_regime and not is_short_regime:
+            i += 1
+            continue
+            
+        # 2️⃣ پیدا کردن Impulse روی 1H
+        body_size = abs(c1h['Close'] - c1h['Open'])
+        total_range = c1h['High'] - c1h['Low']
+        if total_range == 0:
+            i += 1
+            continue
+            
+        is_long_impulse = is_long_regime and (c1h['Close'] > c1h['Open']) and \
+                          (body_size >= 0.55 * c1h['ATR']) and (total_range >= 1.0 * c1h['ATR']) and \
+                          (c1h['Close'] >= c1h['Low'] + 0.75 * total_range) and (c1h['Volume'] >= c1h['Vol_MA'])
+                          
+        is_short_impulse = is_short_regime and (c1h['Close'] < c1h['Open']) and \
+                           (body_size >= 0.55 * c1h['ATR']) and (total_range >= 1.0 * c1h['ATR']) and \
+                           (c1h['Close'] <= c1h['High'] - 0.75 * total_range) and (c1h['Volume'] >= c1h['Vol_MA'])
+                           
+        if not is_long_impulse and not is_short_impulse:
+            i += 1
+            continue
+            
+        impulse_idx = i
+        impulse_candle = c1h
+        impulse_range = impulse_candle['High'] - impulse_candle['Low']
         
-        # شرایط LONG: قیمت در 1 ساعت روی EMA20 حمایت شده و کندل صعودی بسته شده
-        if is_long_regime:
-            # پولبک به حوالی EMA20 در چند کندل اخیر
-            recent_touched_ema = any(df1h.iloc[i-3:i]['Low'] <= df1h.iloc[i-3:i]['EMA_20'])
-            is_continuation = (c1h['Close'] > c1h['Open']) and (c1h['Close'] > prev_c1h['High']) and (c1h['Volume'] >= 0.8 * c1h['Vol_MA'])
+        # محاسبه سطوح فیبوناچی 50% تا 61.8%
+        if is_long_impulse:
+            fib_50 = impulse_candle['High'] - 0.5 * impulse_range
+            fib_618 = impulse_candle['High'] - 0.618 * impulse_range
+        else:
+            fib_50 = impulse_candle['Low'] + 0.5 * impulse_range
+            fib_618 = impulse_candle['Low'] + 0.618 * impulse_range
+        
+        # 3️⃣ & 4️⃣ بررسی Pullback و Reclaim در 1 تا 6 کندل بعد
+        found_setup = False
+        pullback_low = float('inf')
+        pullback_high = float('-inf')
+        reclaim_idx = -1
+        
+        for p_offset in range(1, 7):
+            curr_idx = impulse_idx + p_offset
+            if curr_idx >= len(df1h) - 10:
+                break
+            p_candle = df1h.iloc[curr_idx]
             
-            if recent_touched_ema and is_continuation:
-                raw_entry = c1h['Close']
-                entry_price = raw_entry * (1 + SLIPPAGE_RATE)
-                
-                # تعیین SL پشت ساختار محلی (کمترین قیمت ۵ کندل اخیر)
-                sl = df1h.iloc[i-5:i]['Low'].min() - (0.2 * c1h['ATR'])
-                risk = entry_price - sl
-                
-                if (risk >= 0.5 * c1h['ATR']) and (risk <= 3.0 * c1h['ATR']) and (risk / entry_price <= 0.05):
-                    tp = entry_price + (2.0 * risk)
-                    
-                    outcome = 'OPEN'
-                    exit_idx = i
-                    max_favorable = 0
-                    max_adverse = 0
-                    
-                    for j in range(i + 1, min(i + 50, len(df1h))):
-                        f_c = df1h.iloc[j]
-                        exit_idx = j
-                        
-                        cur_mfe = f_c['High'] - entry_price
-                        cur_mae = entry_price - f_c['Low']
-                        if cur_mfe > max_favorable: max_favorable = cur_mfe
-                        if cur_mae > max_adverse: max_adverse = cur_mae
-                        
-                        if f_c['Low'] <= sl:
-                            outcome = 'LOSS'
-                            break
-                        elif f_c['High'] >= tp:
-                            outcome = 'WIN'
-                            break
-                            
-                    if outcome in ['WIN', 'LOSS']:
-                        net_R = 2.0 if outcome == 'WIN' else -1.0
-                        net_R -= (COMMISSION_RATE * 2)
-                        
-                        all_trades.append({
-                            'Symbol': symbol,
-                            'Side': 'LONG',
-                            'Sample': data_sample,
-                            'Outcome': outcome,
-                            'NetR': net_R,
-                            'Date': c1h['Date'],
-                            'MFE': max_favorable / risk,
-                            'MAE': max_adverse / risk
-                        })
-                        locked_until_index = exit_idx
-                        
-        # شرایط SHORT: قیمت به EMA20 پولبک زده و کندل نزولی تایید داده
-        elif is_short_regime:
-            recent_touched_ema = any(df1h.iloc[i-3:i]['High'] >= df1h.iloc[i-3:i]['EMA_20'])
-            is_continuation = (c1h['Close'] < c1h['Open']) and (c1h['Close'] < prev_c1h['Low']) and (c1h['Volume'] >= 0.8 * c1h['Vol_MA'])
+            if p_candle['Low'] < pullback_low: pullback_low = p_candle['Low']
+            if p_candle['High'] > pullback_high: pullback_high = p_candle['High']
             
-            if recent_touched_ema and is_continuation:
-                raw_entry = c1h['Close']
-                entry_price = raw_entry * (1 - SLIPPAGE_RATE)
+            if is_long_impulse:
+                if p_candle['Close'] < impulse_candle['Low']:
+                    break
                 
-                sl = df1h.iloc[i-5:i]['High'].max() + (0.2 * c1h['ATR'])
-                risk = sl - entry_price
+                # شرط ناحیه فیبو (بین 50 تا 61.8 درصد) یا برخورد به EMA20
+                touched_fib_zone = (p_candle['Low'] <= fib_50) and (p_candle['Low'] >= fib_618)
+                touched_pullback_zone = touched_fib_zone or (p_candle['Low'] <= p_candle['EMA_20'])
                 
-                if (risk >= 0.5 * c1h['ATR']) and (risk <= 3.0 * c1h['ATR']) and (risk / entry_price <= 0.05):
-                    tp = entry_price - (2.0 * risk)
+                prev_p = df1h.iloc[curr_idx - 1]
+                is_reclaim = (p_candle['Close'] > p_candle['Open']) and \
+                             (p_candle['Close'] > prev_p['High']) and \
+                             (p_candle['Close'] > p_candle['EMA_20']) and \
+                             (p_candle['Volume'] >= 0.9 * p_candle['Vol_MA'])
+                             
+                if touched_pullback_zone and is_reclaim:
+                    reclaim_idx = curr_idx
+                    found_setup = True
+                    break
                     
-                    outcome = 'OPEN'
-                    exit_idx = i
-                    max_favorable = 0
-                    max_adverse = 0
+            elif is_short_impulse:
+                if p_candle['Close'] > impulse_candle['High']:
+                    break
                     
-                    for j in range(i + 1, min(i + 50, len(df1h))):
-                        f_c = df1h.iloc[j]
-                        exit_idx = j
-                        
-                        cur_mfe = entry_price - f_c['Low']
-                        cur_mae = f_c['High'] - entry_price
-                        if cur_mfe > max_favorable: max_favorable = cur_mfe
-                        if cur_mae > max_adverse: max_adverse = cur_mae
-                        
-                        if f_c['High'] >= sl:
-                            outcome = 'LOSS'
-                            break
-                        elif f_c['Low'] <= tp:
-                            outcome = 'WIN'
-                            break
-                            
-                    if outcome in ['WIN', 'LOSS']:
-                        net_R = 2.0 if outcome == 'WIN' else -1.0
-                        net_R -= (COMMISSION_RATE * 2)
-                        
-                        all_trades.append({
-                            'Symbol': symbol,
-                            'Side': 'SHORT',
-                            'Sample': data_sample,
-                            'Outcome': outcome,
-                            'NetR': net_R,
-                            'Date': c1h['Date'],
-                            'MFE': max_favorable / risk,
-                            'MAE': max_adverse / risk
-                        })
-                        locked_until_index = exit_idx
+                touched_fib_zone = (p_candle['High'] >= fib_50) and (p_candle['High'] <= fib_618)
+                touched_pullback_zone = touched_fib_zone or (p_candle['High'] >= p_candle['EMA_20'])
+                
+                prev_p = df1h.iloc[curr_idx - 1]
+                is_reclaim = (p_candle['Close'] < p_candle['Open']) and \
+                             (p_candle['Close'] < prev_p['Low']) and \
+                             (p_candle['Close'] < p_candle['EMA_20']) and \
+                             (p_candle['Volume'] >= 0.9 * p_candle['Vol_MA'])
+                             
+                if touched_pullback_zone and is_reclaim:
+                    reclaim_idx = curr_idx
+                    found_setup = True
+                    break
+                    
+        if not found_setup or reclaim_idx + 1 >= len(df1h):
+            i += 1
+            continue
+            
+        # 5️⃣ ورود در Open کندل 1H بعدی
+        entry_candle_idx = reclaim_idx + 1
+        entry_candle = df1h.iloc[entry_candle_idx]
+        
+        if is_long_impulse:
+            entry_price = entry_candle['Open'] * (1 + SLIPPAGE_RATE)
+            sl = pullback_low - (0.25 * entry_candle['ATR'])
+            risk = entry_price - sl
+            
+            if not (0.5 * entry_candle['ATR'] <= risk <= 2.0 * entry_candle['ATR']):
+                i = entry_candle_idx
+                continue
+                
+            tp = entry_price + (2.0 * risk)
+            
+            outcome = 'OPEN'
+            exit_idx = entry_candle_idx
+            max_favorable = 0
+            max_adverse = 0
+            
+            for j in range(entry_candle_idx, min(entry_candle_idx + 50, len(df1h))):
+                f_c = df1h.iloc[j]
+                exit_idx = j
+                
+                cur_mfe = f_c['High'] - entry_price
+                cur_mae = entry_price - f_c['Low']
+                if cur_mfe > max_favorable: max_favorable = cur_mfe
+                if cur_mae > max_adverse: max_adverse = cur_mae
+                
+                hit_tp = f_c['High'] >= tp
+                hit_sl = f_c['Low'] <= sl
+                
+                if hit_sl:
+                    outcome = 'LOSS'
+                    break
+                elif hit_tp:
+                    outcome = 'WIN'
+                    break
+                    
+            if outcome in ['WIN', 'LOSS']:
+                net_R = 2.0 if outcome == 'WIN' else -1.0
+                net_R -= COMMISSION_RATE # کسر کارمزد صحیح (بدون ضرب در 2 اضافی)
+                
+                all_trades.append({
+                    'Symbol': symbol,
+                    'Side': 'LONG',
+                    'Sample': data_sample,
+                    'Outcome': outcome,
+                    'NetR': net_R,
+                    'Date': entry_candle['Date'],
+                    'MFE': max_favorable / risk,
+                    'MAE': max_adverse / risk
+                })
+                locked_until_index = max(exit_idx + 6, entry_candle_idx + 6)
+                i = locked_until_index
+                continue
+                
+        elif is_short_impulse:
+            entry_price = entry_candle['Open'] * (1 - SLIPPAGE_RATE)
+            sl = pullback_high + (0.25 * entry_candle['ATR'])
+            risk = sl - entry_price
+            
+            if not (0.5 * entry_candle['ATR'] <= risk <= 2.0 * entry_candle['ATR']):
+                i = entry_candle_idx
+                continue
+                
+            tp = entry_price - (2.0 * risk)
+            
+            outcome = 'OPEN'
+            exit_idx = entry_candle_idx
+            max_favorable = 0
+            max_adverse = 0
+            
+            for j in range(entry_candle_idx, min(entry_candle_idx + 50, len(df1h))):
+                f_c = df1h.iloc[j]
+                exit_idx = j
+                
+                cur_mfe = entry_price - f_c['Low']
+                cur_mae = f_c['High'] - entry_price
+                if cur_mfe > max_favorable: max_favorable = cur_mfe
+                if cur_mae > max_adverse: max_adverse = cur_mae
+                
+                hit_tp = f_c['Low'] <= tp
+                hit_sl = f_c['High'] >= sl
+                
+                if hit_sl:
+                    outcome = 'LOSS'
+                    break
+                elif hit_tp:
+                    outcome = 'WIN'
+                    break
+                    
+            if outcome in ['WIN', 'LOSS']:
+                net_R = 2.0 if outcome == 'WIN' else -1.0
+                net_R -= COMMISSION_RATE
+                
+                all_trades.append({
+                    'Symbol': symbol,
+                    'Side': 'SHORT',
+                    'Sample': data_sample,
+                    'Outcome': outcome,
+                    'NetR': net_R,
+                    'Date': entry_candle['Date'],
+                    'MFE': max_favorable / risk,
+                    'MAE': max_adverse / risk
+                })
+                locked_until_index = max(exit_idx + 6, entry_candle_idx + 6)
+                i = locked_until_index
+                continue
+                
+        i += 1
 
 print("\n============================================================")
-print("📊 گزارش جامع و حرفه‌ای سیستم HUNTER-X V8")
+print("📊 گزارش جامع و حرفه‌ای سیستم HUNTER-X V9 (Corrected)")
 print("============================================================")
 
 if all_trades:
     tdf = pd.DataFrame(all_trades)
-    tdf.to_csv("detailed_trades_v8.csv", index=False)
+    tdf.to_csv("detailed_trades_v9_corrected.csv", index=False)
     
     for sample_type in ['IS', 'OOS']:
         sample_df = tdf[tdf['Sample'] == sample_type]
@@ -278,9 +397,9 @@ if all_trades:
         print(f"📉 Max Drawdown: {max_dd:.2f}R")
         print(f"📈 میانگین MFE: {sample_df['MFE'].mean():.2f}R | میانگین MAE: {sample_df['MAE'].mean():.2f}R")
         
-    print("\n--- عملکرد تفکیکی نمادها (کل پورتفوی) ---")
+    print("\n--- عملکرد تفکیکی نمادها و سمت‌ها (کل پورتفوی) ---")
     print(tdf.groupby(['Symbol', 'Side'])['Outcome'].value_counts().unstack(fill_value=0))
 else:
     print("⚠️ هیچ معامله‌ای ثبت نشد.")
 
-print("\n✨ بک‌تست V8 به پایان رسید.")
+print("\n✨ بک‌تست V9 اصلاح‌شده به پایان رسید.")
