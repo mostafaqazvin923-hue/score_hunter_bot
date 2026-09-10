@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای ستاپ تک‌تیرانداز (Sniper Pullback V2)")
+print("📥 دانلود داده‌ها برای ستاپ تک‌تیرانداز با فیلتر شتاب RSI (Sniper V3)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_sniper_strategy.csv"
+    filename_1h = f"{symbol}_1h_sniper_v3.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -78,7 +78,14 @@ def calculate_indicators(df):
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     
-    # ATR برای فیلتر نوسان بازار
+    # RSI برای تایید مومنتوم
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # ATR و حجم
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Low'].shift())
@@ -89,7 +96,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست ستاپ تک‌تیرانداز (فیلترهای سخت‌گیرانه)")
+print("🚀 اجرای موتور بک‌تست Sniper V3 (با فیلتر RSI)")
 print("============================================================")
 
 all_trades = []
@@ -121,6 +128,7 @@ for symbol, df1h in data_1h.items():
             continue
             
         c1h = df1h.iloc[i]
+        prev_c1h = df1h.iloc[i-1]
         current_time = c1h['Date']
         
         # دسترسی به کندل 4 ساعته کاملاً بسته‌شده
@@ -135,7 +143,6 @@ for symbol, df1h in data_1h.items():
         if pd.isna(r4h['EMA_200']) or pd.isna(prev_r4h['EMA_200']):
             continue
             
-        # بررسی شیب EMA200 در 4H
         ema200_slope_positive = r4h['EMA_200'] >= prev_r4h['EMA_200']
         ema200_slope_negative = r4h['EMA_200'] <= prev_r4h['EMA_200']
         
@@ -145,13 +152,11 @@ for symbol, df1h in data_1h.items():
         if not is_long_regime and not is_short_regime:
             continue
             
-        # فیلتر نوسان 1H
         if pd.isna(c1h['ATR']) or pd.isna(c1h['ATR_MA']) or c1h['ATR_MA'] == 0:
             continue
         if c1h['ATR'] < c1h['ATR_MA'] * 0.9: 
             continue
             
-        # بررسی الگو در 1H با فیلترهای سخت‌گیرانه (پولبک واقعی + حجم بالا + بدنه بزرگ)
         recent_1h = df1h.iloc[i-6:i+1]
         if len(recent_1h) < 7:
             continue
@@ -160,17 +165,15 @@ for symbol, df1h in data_1h.items():
             body_size = c1h['Close'] - c1h['Open']
             avg_recent_body = (recent_1h['Close'] - recent_1h['Open']).abs().mean()
             
-            # شرایط سخت‌گیرانه برای لانگ:
-            # ۱. کندل جاری باید سبز و با بدنه حداقل 1.2 برابر میانگین باشد
-            # ۲. حجم معامله حداقل 1.4 برابر میانگین حجم باشد
-            # ۳. پولبک واقعی: حداقل 2 کندل از 4 کندل قبل نزولی بوده باشند (اصلاح عمقی‌تر)
             is_strong_body = (c1h['Close'] > c1h['Open']) and (body_size >= 1.2 * avg_recent_body)
             has_volume_spike = c1h['Volume'] >= 1.4 * c1h['Vol_MA']
-            
             red_candles_in_pullback = (recent_1h.iloc[-5:-1]['Close'] < recent_1h.iloc[-5:-1]['Open']).sum()
             has_deep_pullback = red_candles_in_pullback >= 2
             
-            if is_strong_body and has_volume_spike and has_deep_pullback:
+            # ✨ فیلتر جدید مومنتوم RSI: RSI بالای 52 و در حال صعود نسبت به کندل قبل
+            has_momentum = (c1h['RSI'] > 52) and (c1h['RSI'] > prev_c1h['RSI'])
+            
+            if is_strong_body and has_volume_spike and has_deep_pullback and has_momentum:
                 entry_candle_idx = i + 1
                 if entry_candle_idx >= len(df1h):
                     break
@@ -213,7 +216,6 @@ for symbol, df1h in data_1h.items():
                         'NetR': net_R,
                         'Date': entry_candle['Date']
                     })
-                    # قفل کردن همپوشانی + 5 کندل استراحت (Cooldown)
                     locked_until_index = exit_idx + 6
                     continue
                     
@@ -223,11 +225,13 @@ for symbol, df1h in data_1h.items():
             
             is_strong_body = (c1h['Close'] < c1h['Open']) and (body_size >= 1.2 * avg_recent_body)
             has_volume_spike = c1h['Volume'] >= 1.4 * c1h['Vol_MA']
-            
             green_candles_in_pullback = (recent_1h.iloc[-5:-1]['Close'] > recent_1h.iloc[-5:-1]['Open']).sum()
             has_deep_pullback = green_candles_in_pullback >= 2
             
-            if is_strong_body and has_volume_spike and has_deep_pullback:
+            # ✨ فیلتر جدید مومنتوم RSI برای شورت: RSI زیر 48 و در حال نزول
+            has_momentum = (c1h['RSI'] < 48) and (c1h['RSI'] < prev_c1h['RSI'])
+            
+            if is_strong_body and has_volume_spike and has_deep_pullback and has_momentum:
                 entry_candle_idx = i + 1
                 if entry_candle_idx >= len(df1h):
                     break
@@ -274,7 +278,7 @@ for symbol, df1h in data_1h.items():
                     continue
 
 print("\n============================================================")
-print("📊 گزارش عملکرد ستاپ تک‌تیرانداز (Sniper V2)")
+print("📊 گزارش عملکرد Sniper V3 (با فیلتر مومنتوم RSI)")
 print("============================================================")
 
 if all_trades:
