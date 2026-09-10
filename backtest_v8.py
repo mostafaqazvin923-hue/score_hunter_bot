@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای ستاپ جدید Pullback & Continuation")
+print("📥 دانلود داده‌ها برای ستاپ تک‌تیرانداز (Sniper Pullback V2)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_pullback_strategy.csv"
+    filename_1h = f"{symbol}_1h_sniper_strategy.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -85,10 +85,11 @@ def calculate_indicators(df):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
     df['ATR_MA'] = df['ATR'].rolling(window=50).mean()
+    df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست ستاپ پولبک و ادامه روند (بدون Look-ahead)")
+print("🚀 اجرای موتور بک‌تست ستاپ تک‌تیرانداز (فیلترهای سخت‌گیرانه)")
 print("============================================================")
 
 all_trades = []
@@ -144,32 +145,32 @@ for symbol, df1h in data_1h.items():
         if not is_long_regime and not is_short_regime:
             continue
             
-        # فیلتر نوسان 1H (اطمینان از اینکه بازار مرده نیست و نوسان کافی دارد)
+        # فیلتر نوسان 1H
         if pd.isna(c1h['ATR']) or pd.isna(c1h['ATR_MA']) or c1h['ATR_MA'] == 0:
             continue
-        if c1h['ATR'] < c1h['ATR_MA'] * 0.8: # بازار خیلی کم‌نوسان است
+        if c1h['ATR'] < c1h['ATR_MA'] * 0.9: 
             continue
             
-        # بررسی الگو در 1H: حرکت قوی + پولبک + کندل تأیید
-        # نگاه به 5 کندل اخیر 1H برای تشخیص پولبک و حرکت قوی
-        recent_1h = df1h.iloc[i-5:i+1]
-        if len(recent_1h) < 6:
+        # بررسی الگو در 1H با فیلترهای سخت‌گیرانه (پولبک واقعی + حجم بالا + بدنه بزرگ)
+        recent_1h = df1h.iloc[i-6:i+1]
+        if len(recent_1h) < 7:
             continue
             
-        # تعریف حرکت قوی: یکی از کندل‌های قبلی بدنه بزرگ رو به جلو داشته
-        # تعریف پولبک: چند کندل اصلاحی کوچک‌تر خلاف جهت روند
         if is_long_regime:
-            # بررسی اینکه آیا کندل جاری یک کندل تأیید صعودی است (Close > Open با بدنه مناسب)
             body_size = c1h['Close'] - c1h['Open']
             avg_recent_body = (recent_1h['Close'] - recent_1h['Open']).abs().mean()
             
-            is_bullish_confirmation = (c1h['Close'] > c1h['Open']) and (body_size >= 0.6 * avg_recent_body)
+            # شرایط سخت‌گیرانه برای لانگ:
+            # ۱. کندل جاری باید سبز و با بدنه حداقل 1.2 برابر میانگین باشد
+            # ۲. حجم معامله حداقل 1.4 برابر میانگین حجم باشد
+            # ۳. پولبک واقعی: حداقل 2 کندل از 4 کندل قبل نزولی بوده باشند (اصلاح عمقی‌تر)
+            is_strong_body = (c1h['Close'] > c1h['Open']) and (body_size >= 1.2 * avg_recent_body)
+            has_volume_spike = c1h['Volume'] >= 1.4 * c1h['Vol_MA']
             
-            # پولبک کنترل‌شده: حداقل یکی از کندل‌های قبل نزولی بوده یا Low پایین‌تر زده اما ساختار روند 1H نشسته
-            has_recent_pullback = recent_1h.iloc[-3]['Close'] < recent_1h.iloc[-4]['Close'] or \
-                                  recent_1h.iloc[-2]['Close'] < recent_1h.iloc[-3]['Close']
-                                  
-            if is_bullish_confirmation and has_recent_pullback:
+            red_candles_in_pullback = (recent_1h.iloc[-5:-1]['Close'] < recent_1h.iloc[-5:-1]['Open']).sum()
+            has_deep_pullback = red_candles_in_pullback >= 2
+            
+            if is_strong_body and has_volume_spike and has_deep_pullback:
                 entry_candle_idx = i + 1
                 if entry_candle_idx >= len(df1h):
                     break
@@ -185,7 +186,7 @@ for symbol, df1h in data_1h.items():
                 exit_idx = entry_candle_idx
                 executed_exit_price = 0
                 
-                for j in range(entry_candle_idx, min(entry_candle_idx + 50, len(df1h))):
+                for j in range(entry_candle_idx, min(entry_candle_idx + 60, len(df1h))):
                     f_c = df1h.iloc[j]
                     exit_idx = j
                     
@@ -212,18 +213,21 @@ for symbol, df1h in data_1h.items():
                         'NetR': net_R,
                         'Date': entry_candle['Date']
                     })
-                    locked_until_index = exit_idx + 1
+                    # قفل کردن همپوشانی + 5 کندل استراحت (Cooldown)
+                    locked_until_index = exit_idx + 6
                     continue
                     
         elif is_short_regime:
             body_size = c1h['Open'] - c1h['Close']
             avg_recent_body = (recent_1h['Open'] - recent_1h['Close']).abs().mean()
             
-            is_bearish_confirmation = (c1h['Close'] < c1h['Open']) and (body_size >= 0.6 * avg_recent_body)
-            has_recent_pullback = recent_1h.iloc[-3]['Close'] > recent_1h.iloc[-4]['Close'] or \
-                                  recent_1h.iloc[-2]['Close'] > recent_1h.iloc[-3]['Close']
-                                  
-            if is_bearish_confirmation and has_recent_pullback:
+            is_strong_body = (c1h['Close'] < c1h['Open']) and (body_size >= 1.2 * avg_recent_body)
+            has_volume_spike = c1h['Volume'] >= 1.4 * c1h['Vol_MA']
+            
+            green_candles_in_pullback = (recent_1h.iloc[-5:-1]['Close'] > recent_1h.iloc[-5:-1]['Open']).sum()
+            has_deep_pullback = green_candles_in_pullback >= 2
+            
+            if is_strong_body and has_volume_spike and has_deep_pullback:
                 entry_candle_idx = i + 1
                 if entry_candle_idx >= len(df1h):
                     break
@@ -239,7 +243,7 @@ for symbol, df1h in data_1h.items():
                 exit_idx = entry_candle_idx
                 executed_exit_price = 0
                 
-                for j in range(entry_candle_idx, min(entry_candle_idx + 50, len(df1h))):
+                for j in range(entry_candle_idx, min(entry_candle_idx + 60, len(df1h))):
                     f_c = df1h.iloc[j]
                     exit_idx = j
                     
@@ -266,11 +270,11 @@ for symbol, df1h in data_1h.items():
                         'NetR': net_R,
                         'Date': entry_candle['Date']
                     })
-                    locked_until_index = exit_idx + 1
+                    locked_until_index = exit_idx + 6
                     continue
 
 print("\n============================================================")
-print("📊 گزارش عملکرد ستاپ پولبک و ادامه روند")
+print("📊 گزارش عملکرد ستاپ تک‌تیرانداز (Sniper V2)")
 print("============================================================")
 
 if all_trades:
