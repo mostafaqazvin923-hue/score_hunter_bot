@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای سیستم پیشرفته HUNTER-X V3 (Structure + Liquidity)")
+print("📥 دانلود داده‌ها برای سیستم HUNTER-X V3.1 (فریوئنسی بهینه‌شده)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_v3_data.csv"
+    filename_1h = f"{symbol}_1h_v3_1_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -102,7 +102,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست HUNTER-X V3 (Structure + Liquidity + MSS)")
+print("🚀 اجرای موتور بک‌تست HUNTER-X V3.1")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -113,7 +113,6 @@ for symbol, df1h in data_1h.items():
         
     df1h = calculate_indicators(df1h)
     
-    # ساخت تایم‌فریم 4 ساعته استاندارد و بدون نگاه به آینده
     df4h = df1h.set_index('Date').resample('4h').agg({
         'Open': 'first',
         'High': 'max',
@@ -151,20 +150,19 @@ for symbol, df1h in data_1h.items():
         except:
             slope_positive = True
             
-        # محیط بازار 4 ساعته
-        is_long_context = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and slope_positive and (r4h['ADX'] >= 20)
-        is_short_context = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (r4h['ADX'] >= 20)
+        is_long_context = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and slope_positive and (r4h['ADX'] >= 18)
+        is_short_context = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (r4h['ADX'] >= 18)
         
         if not is_long_context and not is_short_context:
             continue
             
-        # پیدا کردن آخرین Swing High و Swing Low معتبر در گذشته (بدون Look-ahead)
-        window = df1h.iloc[i-30:i]
-        if len(window) < 10:
+        # افزایش پنجره جستجوی سوئینگ به 60 کندل برای دیدن ساختارهای بزرگ‌تر
+        window = df1h.iloc[i-60:i]
+        if len(window) < 15:
             continue
             
         swing_lows = window[(window['Low'] <= window['Low'].shift(1)) & (window['Low'] <= window['Low'].shift(-1)) & (window['Low'] <= window['Low'].shift(2)) & (window['Low'] <= window['Low'].shift(-2))]
-        swing_highs = window[(window['High'] >= window['High'].shift(1)) & (window['High'] >= window['High'].shift(-1)) & (window['High'] >= window['High'].shift(2)) & (window['High'] >= window['High'].shift(-2))]
+        swing_highs = window[(window['High'] >= window['High'].shift(1)) & (window['High'] >= window['High'].shift(-1)) & (window['High'] >= window['High'].shift(-2)) & (window['High'] >= window['High'].shift(-2))]
         
         if swing_lows.empty or swing_highs.empty:
             continue
@@ -172,34 +170,32 @@ for symbol, df1h in data_1h.items():
         last_swing_low = swing_lows['Low'].iloc[-1]
         last_swing_high = swing_highs['High'].iloc[-1]
         
-        # مرحله 2: Liquidity Sweep (قیمت از اسوینگ عبور کرده ولی داخل بسته شده)
         is_long_sweep = (c1h['Low'] < last_swing_low) and (c1h['Close'] > last_swing_low)
         is_short_sweep = (c1h['High'] > last_swing_high) and (c1h['Close'] < last_swing_high)
         
         if is_long_context and is_long_sweep:
-            # مرحله 3، 4، 5: جستجوی MSS (شکست آخرین اسوینگ های) + Displacement + Retest
             entered = False
             for p in range(1, 12):
                 if i + p >= len(df1h) - 10:
                     break
                 p_candle = df1h.iloc[i + p]
                 
-                # فیلتر Displacement و MSS (شکست اسوینگ های قبلی با کندل پرقدرت)
                 body_size = abs(p_candle['Close'] - p_candle['Open'])
                 total_range = p_candle['High'] - p_candle['Low']
                 if total_range == 0:
                     continue
                     
-                is_displacement = (body_size >= 0.55 * total_range) and \
-                                  (total_range > 1.1 * p_candle['ATR']) and \
-                                  (p_candle['Volume'] > 1.1 * p_candle['Vol_MA'])
+                # تنظیمات بهینه‌شده و روان‌تر برای افزایش فرکانس
+                is_displacement = (body_size >= 0.50 * total_range) and \
+                                  (total_range >= 1.0 * p_candle['ATR']) and \
+                                  (p_candle['Volume'] >= 1.0 * p_candle['Vol_MA'])
                                   
                 if is_displacement and (p_candle['Close'] > last_swing_high):
-                    # مرحله 5: Retest ناحیه شکسته شده در کندل‌های بعدی
-                    for r_idx in range(p + 1, min(p + 8, len(df1h) - i)):
+                    for r_idx in range(p + 1, min(p + 10, len(df1h) - i)):
                         retest_candle = df1h.iloc[i + r_idx]
                         
-                        if retest_candle['Low'] <= last_swing_high * 1.003 and retest_candle['Close'] > retest_candle['Open']:
+                        # بازتر کردن محدوده Retest
+                        if retest_candle['Low'] <= last_swing_high * 1.005 and retest_candle['Close'] > retest_candle['Open']:
                             entry_price = retest_candle['Close']
                             sl = last_swing_low - (0.25 * retest_candle['ATR'])
                             risk = entry_price - sl
@@ -209,10 +205,8 @@ for symbol, df1h in data_1h.items():
                                 
                             tp = entry_price + (2.0 * risk)
                             
-                            # مرحله 7: فیلتر فاصله تا مقاومت بعدی (بررسی اینکه آیا مانع مهمی قبل از TP هست یا نه)
                             future_slice = df1h.iloc[i + r_idx + 1 : i + r_idx + 25]
                             if not future_slice.empty and (future_slice['High'].max() < entry_price + 1.2 * risk):
-                                # مقاومت سنگینی جلو را گرفته، معامله رد می‌شود
                                 break
                                 
                             outcome = 'OPEN'
@@ -253,15 +247,15 @@ for symbol, df1h in data_1h.items():
                 if total_range == 0:
                     continue
                     
-                is_displacement = (body_size >= 0.55 * total_range) and \
-                                  (total_range > 1.1 * p_candle['ATR']) and \
-                                  (p_candle['Volume'] > 1.1 * p_candle['Vol_MA'])
+                is_displacement = (body_size >= 0.50 * total_range) and \
+                                  (total_range >= 1.0 * p_candle['ATR']) and \
+                                  (p_candle['Volume'] >= 1.0 * p_candle['Vol_MA'])
                                   
                 if is_displacement and (p_candle['Close'] < last_swing_low):
-                    for r_idx in range(p + 1, min(p + 8, len(df1h) - i)):
+                    for r_idx in range(p + 1, min(p + 10, len(df1h) - i)):
                         retest_candle = df1h.iloc[i + r_idx]
                         
-                        if retest_candle['High'] >= last_swing_low * 0.997 and retest_candle['Close'] < retest_candle['Open']:
+                        if retest_candle['High'] >= last_swing_low * 0.995 and retest_candle['Close'] < retest_candle['Open']:
                             entry_price = retest_candle['Close']
                             sl = last_swing_high + (0.25 * retest_candle['ATR'])
                             risk = sl - entry_price
@@ -300,7 +294,7 @@ for symbol, df1h in data_1h.items():
                         break
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی (HUNTER-X V3 - Structure & Liquidity)")
+print("📊 گزارش نهایی پورتفوی (HUNTER-X V3.1)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -322,4 +316,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ بک‌تست نسخه V3 به اتمام رسید.")
+print("\n✨ بک‌تست نسخه V3.1 به اتمام رسید.")
