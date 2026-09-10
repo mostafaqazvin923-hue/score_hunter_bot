@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته (نسخه ریسک‌فری پویا)")
+print("📥 دانلود داده‌ها و اجرای استراتژی پولبک به روند (Trend Pullback Pro)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_rf_data.csv"
+    filename_1h = f"{symbol}_1h_pullback_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -101,7 +101,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست با منطق ریسک‌فری و مدیریت سرمایه پویا")
+print("🚀 اجرای موتور بک‌تست Trend Pullback (ورود در اصلاح روند)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -143,138 +143,83 @@ for symbol, df1h in data_1h.items():
         ema50_4h = r4h['EMA_50']
         ema200_4h = r4h['EMA_200']
         
-        try:
-            prev_ema200_4h = df4h.loc[df4h['Date'] == t4h_time, 'EMA_200'].values[0]
-            slope_positive = ema200_4h >= prev_ema200_4h
-        except:
-            slope_positive = True
-            
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 20) and (50 < r4h['RSI'] < 75)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 20) and (25 < r4h['RSI'] < 50)
+        # رژیم روند صعودی و نزولی قدرتمند در تایم فریم 4 ساعته
+        is_uptrend = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (r4h['ADX'] >= 22)
+        is_downtrend = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (r4h['ADX'] >= 22)
         
-        if not is_long_regime and not is_short_regime:
+        if not is_uptrend and not is_downtrend:
             continue
             
-        lookback_slice = df1h.iloc[i-15:i]
-        struct_high = lookback_slice['High'].max()
-        struct_low = lookback_slice['Low'].min()
+        # شرط پولبک: قیمت در 1 ساعته به ناحیه حمایتی بین EMA 20 و EMA 50 نزدیک شده باشد
+        c1_close = c1h['Close']
+        c1_ema20 = c1h['EMA_20']
+        c1_ema50 = c1h['EMA_50']
         
-        avg_vol = lookback_slice['Volume'].mean()
-        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 1.1)
-        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 1.1)
+        is_pullback_long = is_uptrend and (c1h['Low'] <= c1_ema20) and (c1_close > c1_ema50) and (40 <= c1h['RSI'] <= 60)
+        is_pullback_short = is_downtrend and (c1h['High'] >= c1_ema20) and (c1_close < c1_ema50) and (40 <= c1h['RSI'] <= 60)
         
-        if is_long_regime and is_breakout_long:
-            entered = False
-            for p in range(1, 14):
-                if i + p >= len(df1h) - 10:
-                    break
-                p_candle = df1h.iloc[i + p]
-                
-                # فیلتر پولبک تاییدیه
-                if p_candle['Low'] <= struct_high * 1.003: 
-                    if p_candle['Close'] > p_candle['Open'] and (50 < p_candle['RSI'] < 75):
-                        entry_price = p_candle['Close']
-                        swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
-                        sl = swing_low_pullback - (0.25 * p_candle['ATR'])
-                        risk = entry_price - sl
-                        
-                        if risk <= 0 or (risk / entry_price) > 0.045:
-                            break
-                            
-                        tp = entry_price + (2.0 * risk)
-                        half_tp = entry_price + (1.0 * risk) # سطح ریسک‌فری (سود 1R)
-                        
-                        outcome = 'OPEN'
-                        exit_idx = i + p + 1
-                        is_risk_free = False
-                        
-                        for j in range(i + p + 1, min(i + p + 40, len(df1h))):
-                            f_c = df1h.iloc[j]
-                            exit_idx = j
-                            
-                            # فعالسازی ریسک‌فری اگر قیمت به نصف مسیر رسید
-                            if not is_risk_free:
-                                if f_c['High'] >= half_tp:
-                                    sl = entry_price  # قفل کردن روی نقطه ورود
-                                    is_risk_free = True
-                            
-                            if f_c['Low'] <= sl:
-                                if is_risk_free:
-                                    outcome = 'BE'  # سر به سر بدون ضرر
-                                else:
-                                    outcome = 'LOSS'
-                                break
-                            elif f_c['High'] >= tp:
-                                outcome = 'WIN'
-                                break
-                                
-                        if outcome in ['WIN', 'LOSS', 'BE']:
-                            all_portfolio_trades.append({
-                                'Symbol': symbol,
-                                'Side': 'LONG',
-                                'Outcome': outcome
-                            })
-                            locked_until_index = exit_idx
-                            entered = True
-                            break
-            if entered:
+        if is_pullback_long:
+            entry_price = c1_close
+            sl = c1h['Low'] - (1.0 * c1h['ATR'])
+            risk = entry_price - sl
+            
+            if risk <= 0 or (risk / entry_price) > 0.045:
                 continue
                 
-        elif is_short_regime and is_breakout_short:
-            entered = False
-            for p in range(1, 14):
-                if i + p >= len(df1h) - 10:
+            tp = entry_price + (2.0 * risk)
+            
+            outcome = 'OPEN'
+            exit_idx = i + 1
+            for j in range(i + 1, min(i + 40, len(df1h))):
+                f_c = df1h.iloc[j]
+                exit_idx = j
+                if f_c['Low'] <= sl:
+                    outcome = 'LOSS'
                     break
-                p_candle = df1h.iloc[i + p]
+                elif f_c['High'] >= tp:
+                    outcome = 'WIN'
+                    break
+                    
+            if outcome in ['WIN', 'LOSS']:
+                all_portfolio_trades.append({
+                    'Symbol': symbol,
+                    'Side': 'LONG',
+                    'Outcome': outcome
+                })
+                locked_until_index = exit_idx
                 
-                if p_candle['High'] >= struct_low * 0.997:
-                    if p_candle['Close'] < p_candle['Open'] and (25 < p_candle['RSI'] < 50):
-                        entry_price = p_candle['Close']
-                        swing_high_pullback = df1h.iloc[i:i+p+1]['High'].max()
-                        sl = swing_high_pullback + (0.25 * p_candle['ATR'])
-                        risk = sl - entry_price
-                        
-                        if risk <= 0 or (risk / entry_price) > 0.045:
-                            break
-                            
-                        tp = entry_price - (2.0 * risk)
-                        half_tp = entry_price - (1.0 * risk) # سطح ریسک‌فری شورت
-                        
-                        outcome = 'OPEN'
-                        exit_idx = i + p + 1
-                        is_risk_free = False
-                        
-                        for j in range(i + p + 1, min(i + p + 40, len(df1h))):
-                            f_c = df1h.iloc[j]
-                            exit_idx = j
-                            
-                            if not is_risk_free:
-                                if f_c['Low'] <= half_tp:
-                                    sl = entry_price
-                                    is_risk_free = True
-                                    
-                            if f_c['High'] >= sl:
-                                if is_risk_free:
-                                    outcome = 'BE'
-                                else:
-                                    outcome = 'LOSS'
-                                break
-                            elif f_c['Low'] <= tp:
-                                outcome = 'WIN'
-                                break
-                                
-                        if outcome in ['WIN', 'LOSS', 'BE']:
-                            all_portfolio_trades.append({
-                                'Symbol': symbol,
-                                'Side': 'SHORT',
-                                'Outcome': outcome
-                            })
-                            locked_until_index = exit_idx
-                            entered = True
-                            break
+        elif is_pullback_short:
+            entry_price = c1_close
+            sl = c1h['High'] + (1.0 * c1h['ATR'])
+            risk = sl - entry_price
+            
+            if risk <= 0 or (risk / entry_price) > 0.045:
+                continue
+                
+            tp = entry_price - (2.0 * risk)
+            
+            outcome = 'OPEN'
+            exit_idx = i + 1
+            for j in range(i + 1, min(i + 40, len(df1h))):
+                f_c = df1h.iloc[j]
+                exit_idx = j
+                if f_c['High'] >= sl:
+                    outcome = 'LOSS'
+                    break
+                elif f_c['Low'] <= tp:
+                    outcome = 'WIN'
+                    break
+                    
+            if outcome in ['WIN', 'LOSS']:
+                all_portfolio_trades.append({
+                    'Symbol': symbol,
+                    'Side': 'SHORT',
+                    'Outcome': outcome
+                })
+                locked_until_index = exit_idx
 
 print("\n============================================================")
-print("📊 گزارش تجمیعی نهایی پورتفوی (با سیستم ریسک‌فری و خروج پاک)")
+print("📊 گزارش نهایی استراتژی پولبک به روند (Trend Pullback)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -282,20 +227,13 @@ if all_portfolio_trades:
     total_trades = len(pf_df)
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
-    total_bes = len(pf_df[pf_df['Outcome'] == 'BE'])
-    
-    # محاسبه وین‌ریت واقعی بر اساس معاملات قطعی (برد و باخت اصلی بدون در نظر گرفتن سر به سرها)
-    decisive_trades = total_wins + total_losses
-    true_win_rate = (total_wins / decisive_trades) * 100 if decisive_trades > 0 else 0
-    
-    # امتیاز سود خالص (بردها ضربدر 2 منهای باخت‌ها، سر به سرها تاثیر منفی ندارند)
+    portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
     net_profit_score = (total_wins * 2.0) - total_losses
     
     print(f"🔸 تعداد کل معاملات پورتفوی: {total_trades}")
-    print(f"🔸 معاملات برنده (WIN): {total_wins}")
-    print(f"🔸 معاملات سر به سر (BE - ریسک‌فری): {total_bes}")
-    print(f"🔸 معاملات بازنده قطعی (LOSS): {total_losses}")
-    print(f"🎯 **وین‌ریت واقعی (بدون احتساب سر به‌ سرها):** {true_win_rate:.2f}%")
+    print(f"🔸 کل معاملات برنده (WIN): {total_wins}")
+    print(f"🔸 کل معاملات بازنده (LOSS): {total_losses}")
+    print(f"🎯 **وین‌ریت واقعی:** {portfolio_win_rate:.2f}%")
     print(f"💰 امتیاز سودآوری خالص (Net Profit Score): {net_profit_score:.2f}R")
     
     print("\nتفکیک عملکرد به تفکیک هر نماد:")
@@ -303,4 +241,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ بک‌تست ریسک‌فری به اتمام رسید.")
+print("\n✨ تست به اتمام رسید.")
