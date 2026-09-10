@@ -31,13 +31,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای سیستم HUNTER-X V6 (Stateful Structure + Pullback)")
+print("📥 دانلود داده‌ها برای سیستم HUNTER-X V7 (Compression + Expansion)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_v6_data.csv"
+    filename_1h = f"{symbol}_1h_v7_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -74,7 +74,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
 def calculate_indicators(df):
     df = df.copy()
-    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     
@@ -83,6 +82,10 @@ def calculate_indicators(df):
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
+    
+    # اندیکاتور فشردگی (Bollinger Bands Width یا ATR Ratio)
+    df['ATR_MA'] = df['ATR'].rolling(window=20).mean()
+    df['Compression'] = df['ATR'] < (df['ATR_MA'] * 0.8) # نشانه‌ی فشردگی نوسان
     
     plus_dm = df['High'].diff().clip(lower=0)
     minus_dm = (-df['Low'].diff()).clip(lower=0)
@@ -95,10 +98,12 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست HUNTER-X V6")
+print("🚀 اجرای موتور بک‌تست پیشرفته HUNTER-X V7")
 print("============================================================")
 
-all_detailed_trades = []
+all_trades = []
+COMMISSION_RATE = 0.0008 # 0.08% کارمزد رفت و برگشت کل
+SLIPPAGE_RATE = 0.0005   # 0.05% اسلیپیج
 
 for symbol, df1h in data_1h.items():
     if len(df1h) < 300:
@@ -116,19 +121,9 @@ for symbol, df1h in data_1h.items():
     
     df4h = calculate_indicators(df4h)
     
-    # شناسایی پیوت‌های Stateful بدون Look-ahead (با تاخیر 2 کندل تایید)
-    df1h['Pivot_High'] = np.nan
-    df1h['Pivot_Low'] = np.nan
+    # جداسازی In-Sample (80%) و Out-of-Sample (20%)
+    split_idx = int(len(df1h) * 0.8)
     
-    highs = df1h['High'].values
-    lows = df1h['Low'].values
-    
-    for i in range(2, len(df1h) - 2):
-        if highs[i] >= highs[i-1] and highs[i] >= highs[i-2] and highs[i] >= highs[i+1] and highs[i] >= highs[i+2]:
-            df1h.loc[i+2, 'Pivot_High'] = highs[i] # ثبت دقیقاً بعد از 2 کندل تأیید
-        if lows[i] <= lows[i-1] and lows[i] <= lows[i-2] and lows[i] <= lows[i+1] and lows[i] <= lows[i+2]:
-            df1h.loc[i+2, 'Pivot_Low'] = lows[i]
-            
     locked_until_index = 0
     
     for i in range(200, len(df1h) - 40):
@@ -138,6 +133,9 @@ for symbol, df1h in data_1h.items():
         c1h = df1h.iloc[i]
         prev_c1h = df1h.iloc[i-1]
         current_time = c1h['Date']
+        
+        # تعیین بخش داده (In-Sample یا OOS)
+        data_sample = "OOS" if i >= split_idx else "IS"
         
         # رژیم 4 ساعته بدون Look-ahead
         closed_4h_time = current_time - timedelta(hours=4)
@@ -154,159 +152,171 @@ for symbol, df1h in data_1h.items():
             ema200_slope_up = True
             ema200_slope_down = True
             
-        is_long_regime = (r4h['Close'] > r4h['EMA_200']) and ema200_slope_up and (r4h['ADX'] >= 20)
-        is_short_regime = (r4h['Close'] < r4h['EMA_200']) and ema200_slope_down and (r4h['ADX'] >= 20)
+        is_long_regime = (r4h['Close'] > r4h['EMA_200']) and ema200_slope_up and (r4h['ADX'] >= 22)
+        is_short_regime = (r4h['Close'] < r4h['EMA_200']) and ema200_slope_down and (r4h['ADX'] >= 22)
         
         if not is_long_regime and not is_short_regime:
             continue
             
-        # استخراج آخرین پیوت‌های ثبت‌شده تا لحظه جاری (کاملاً Stateful و بدون آینده‌نگری)
-        history_slice = df1h.iloc[:i]
-        valid_pivots_high = history_slice['Pivot_High'].dropna()
-        valid_pivots_low = history_slice['Pivot_Low'].dropna()
-        
-        if valid_pivots_high.empty or valid_pivots_low.empty:
+        # بررسی فشردگی نوسان در کندل‌های قبل (آیا اخیراً فشرده بوده؟)
+        recent_compression = df1h.iloc[i-5:i]['Compression'].any()
+        if not recent_compression:
             continue
             
-        last_ph = valid_pivots_high.iloc[-1]
-        last_pl = valid_pivots_low.iloc[-1]
-        
-        # فیلتر حجم ثانویه
-        volume_ok = c1h['Volume'] >= (c1h['Vol_MA'] * 1.0)
-        
-        # شرایط LONG: شکست ساختار صعودی + پولبک
-        if is_long_regime and volume_ok:
-            # بررسی اینکه آیا شکستِ سقف قبلی رخ داده و الان پولبک به آن زده شده
-            body_size = abs(c1h['Close'] - c1h['Open'])
-            total_range = c1h['High'] - c1h['Low']
-            if total_range == 0:
-                continue
-                
-            is_breakout = (c1h['Close'] > last_ph) and (body_size >= 0.5 * total_range)
+        # انفجار بریک‌آوت (Expansion): حجم بالا + ATR بالا + بدنه قوی
+        body_size = abs(c1h['Close'] - c1h['Open'])
+        total_range = c1h['High'] - c1h['Low']
+        if total_range == 0:
+            continue
             
-            # جستجوی پولبک و کندل Continuation در چند کندل اخیر
-            for r_idx in range(1, 6):
-                if i + r_idx >= len(df1h) - 10:
-                    break
-                retest_candle = df1h.iloc[i + r_idx]
-                
-                # پولبک به حوالی سطح شکسته‌شده (last_ph) و تایید با کندل صعودی
-                if retest_candle['Low'] <= last_ph * 1.005 and retest_candle['Close'] > retest_candle['Open']:
-                    entry_price = retest_candle['Close']
-                    sl = last_pl - (0.25 * retest_candle['ATR'])
-                    risk = entry_price - sl
-                    
-                    if (risk >= 0.5 * retest_candle['ATR']) and (risk <= 2.5 * retest_candle['ATR']) and (risk / entry_price <= 0.05):
-                        tp = entry_price + (2.0 * risk)
-                        
-                        outcome = 'OPEN'
-                        exit_idx = i + r_idx
-                        max_favorable = 0
-                        max_adverse = 0
-                        
-                        for j in range(i + r_idx, min(i + r_idx + 50, len(df1h))):
-                            f_c = df1h.iloc[j]
-                            exit_idx = j
-                            
-                            current_mfe = f_c['High'] - entry_price
-                            current_mae = entry_price - f_c['Low']
-                            if current_mfe > max_favorable: max_favorable = current_mfe
-                            if current_mae > max_adverse: max_adverse = current_mae
-                            
-                            if f_c['Low'] <= sl:
-                                outcome = 'LOSS'
-                                break
-                            elif f_c['High'] >= tp:
-                                outcome = 'WIN'
-                                break
-                                
-                        if outcome in ['WIN', 'LOSS']:
-                            all_detailed_trades.append({
-                                'Symbol': symbol,
-                                'Side': 'LONG',
-                                'Outcome': outcome,
-                                'MFE': max_favorable / risk,
-                                'MAE': max_adverse / risk
-                            })
-                            locked_until_index = exit_idx
-                            break
-                            
-        # شرایط SHORT: شکست ساختار نزولی + پولبک
-        elif is_short_regime and volume_ok:
-            body_size = abs(c1h['Close'] - c1h['Open'])
-            total_range = c1h['High'] - c1h['Low']
-            if total_range == 0:
-                continue
-                
-            is_breakout = (c1h['Close'] < last_pl) and (body_size >= 0.5 * total_range)
+        is_expansion = (body_size >= 0.6 * total_range) and \
+                       (total_range >= 1.3 * c1h['ATR']) and \
+                       (c1h['Volume'] >= 1.3 * c1h['Vol_MA'])
+                       
+        if not is_expansion:
+            continue
             
-            for r_idx in range(1, 6):
-                if i + r_idx >= len(df1h) - 10:
-                    break
-                retest_candle = df1h.iloc[i + r_idx]
+        # محدوده معاملاتی گذشته برای تعیین استابلاستر ساختاری
+        window = df1h.iloc[i-30:i]
+        recent_high = window['High'].max()
+        recent_low = window['Low'].min()
+        
+        # شرایط LONG
+        if is_long_regime and (c1h['Close'] > recent_high):
+            raw_entry = c1h['Close']
+            entry_price = raw_entry * (1 + SLIPPAGE_RATE)
+            sl = recent_low - (0.5 * c1h['ATR'])
+            risk = entry_price - sl
+            
+            if (risk >= 0.5 * c1h['ATR']) and (risk <= 2.5 * c1h['ATR']) and (risk / entry_price <= 0.05):
+                tp = entry_price + (2.0 * risk)
                 
-                if retest_candle['High'] >= last_pl * 0.995 and retest_candle['Close'] < retest_candle['Open']:
-                    entry_price = retest_candle['Close']
-                    sl = last_ph + (0.25 * retest_candle['ATR'])
-                    risk = sl - entry_price
+                outcome = 'OPEN'
+                exit_idx = i
+                max_favorable = 0
+                max_adverse = 0
+                
+                for j in range(i, min(i + 50, len(df1h))):
+                    f_c = df1h.iloc[j]
+                    exit_idx = j
                     
-                    if (risk >= 0.5 * retest_candle['ATR']) and (risk <= 2.5 * retest_candle['ATR']) and (risk / entry_price <= 0.05):
-                        tp = entry_price - (2.0 * risk)
+                    cur_mfe = f_c['High'] - entry_price
+                    cur_mae = entry_price - f_c['Low']
+                    if cur_mfe > max_favorable: max_favorable = cur_mfe
+                    if cur_mae > max_adverse: max_adverse = cur_mae
+                    
+                    if f_c['Low'] <= sl:
+                        outcome = 'LOSS'
+                        break
+                    elif f_c['High'] >= tp:
+                        outcome = 'WIN'
+                        break
                         
-                        outcome = 'OPEN'
-                        exit_idx = i + r_idx
-                        max_favorable = 0
-                        max_adverse = 0
+                if outcome in ['WIN', 'LOSS']:
+                    net_R = 2.0 if outcome == 'WIN' else -1.0
+                    net_R -= (COMMISSION_RATE * 2) # کسر کارمزد
+                    
+                    all_trades.append({
+                        'Symbol': symbol,
+                        'Side': 'LONG',
+                        'Sample': data_sample,
+                        'Outcome': outcome,
+                        'NetR': net_R,
+                        'Date': c1h['Date'],
+                        'MFE': max_favorable / risk,
+                        'MAE': max_adverse / risk
+                    })
+                    locked_until_index = exit_idx
+                    
+        # شرایط SHORT
+        elif is_short_regime and (c1h['Close'] < recent_low):
+            raw_entry = c1h['Close']
+            entry_price = raw_entry * (1 - SLIPPAGE_RATE)
+            sl = recent_high + (0.5 * c1h['ATR'])
+            risk = sl - entry_price
+            
+            if (risk >= 0.5 * c1h['ATR']) and (risk <= 2.5 * c1h['ATR']) and (risk / entry_price <= 0.05):
+                tp = entry_price - (2.0 * risk)
+                
+                outcome = 'OPEN'
+                exit_idx = i
+                max_favorable = 0
+                max_adverse = 0
+                
+                for j in range(i, min(i + 50, len(df1h))):
+                    f_c = df1h.iloc[j]
+                    exit_idx = j
+                    
+                    cur_mfe = entry_price - f_c['Low']
+                    cur_mae = f_c['High'] - entry_price
+                    if cur_mfe > max_favorable: max_favorable = cur_mfe
+                    if cur_mae > max_adverse: max_adverse = cur_mae
+                    
+                    if f_c['High'] >= sl:
+                        outcome = 'LOSS'
+                        break
+                    elif f_c['Low'] <= tp:
+                        outcome = 'WIN'
+                        break
                         
-                        for j in range(i + r_idx, min(i + r_idx + 50, len(df1h))):
-                            f_c = df1h.iloc[j]
-                            exit_idx = j
-                            
-                            current_mfe = entry_price - f_c['Low']
-                            current_mae = f_c['High'] - entry_price
-                            if current_mfe > max_favorable: max_favorable = current_mfe
-                            if current_mae > max_adverse: max_adverse = current_mae
-                            
-                            if f_c['High'] >= sl:
-                                outcome = 'LOSS'
-                                break
-                            elif f_c['Low'] <= tp:
-                                outcome = 'WIN'
-                                break
-                                
-                        if outcome in ['WIN', 'LOSS']:
-                            all_detailed_trades.append({
-                                'Symbol': symbol,
-                                'Side': 'SHORT',
-                                'Outcome': outcome,
-                                'MFE': max_favorable / risk,
-                                'MAE': max_adverse / risk
-                            })
-                            locked_until_index = exit_idx
-                            break
+                if outcome in ['WIN', 'LOSS']:
+                    net_R = 2.0 if outcome == 'WIN' else -1.0
+                    net_R -= (COMMISSION_RATE * 2)
+                    
+                    all_trades.append({
+                        'Symbol': symbol,
+                        'Side': 'SHORT',
+                        'Sample': data_sample,
+                        'Outcome': outcome,
+                        'NetR': net_R,
+                        'Date': c1h['Date'],
+                        'MFE': max_favorable / risk,
+                        'MAE': max_adverse / risk
+                    })
+                    locked_until_index = exit_idx
 
 print("\n============================================================")
-print("📊 گزارش تفکیکی و جامع نسخه HUNTER-X V6")
+print("📊 گزارش جامع عملکرد HUNTER-X V7")
 print("============================================================")
 
-if all_detailed_trades:
-    trades_df = pd.DataFrame(all_detailed_trades)
-    trades_df.to_csv("detailed_trades_v6.csv", index=False)
+if all_trades:
+    tdf = pd.DataFrame(all_trades)
+    tdf.to_csv("detailed_trades_v7.csv", index=False)
     
-    total_t = len(trades_df)
-    total_w = len(trades_df[trades_df['Outcome'] == 'WIN'])
-    total_l = len(trades_df[trades_df['Outcome'] == 'LOSS'])
-    wr = (total_w / total_t) * 100 if total_t > 0 else 0
-    net_score = (total_w * 2.0) - total_l
-    
-    print(f"🔸 کل معاملات پورتفوی: {total_t} | برد: {total_w} | باخت: {total_l}")
-    print(f"🎯 **وین‌ریت کل:** {wr:.2f}% | سود خالص: {net_score:.2f}R")
-    print(f"📈 میانگین MFE: {trades_df['MFE'].mean():.2f}R | میانگین MAE: {trades_df['MAE'].mean():.2f}R")
-    
-    print("\n--- عملکرد تفکیکی به تفکیک نماد و سمت (Symbol & Side) ---")
-    summary = trades_df.groupby(['Symbol', 'Side'])['Outcome'].value_counts().unstack(fill_value=0)
-    print(summary)
+    for sample_type in ['IS', 'OOS']:
+        sample_df = tdf[tdf['Sample'] == sample_type]
+        print(f"\n--- نتایج بخش {sample_type} (تعداد معاملات: {len(sample_df)}) ---")
+        if sample_df.empty:
+            print("معامله‌ای ثبت نشد.")
+            continue
+            
+        t_count = len(sample_df)
+        w_count = len(sample_df[sample_df['Outcome'] == 'WIN'])
+        l_count = len(sample_df[sample_df['Outcome'] == 'LOSS'])
+        win_rate = (w_count / t_count) * 100
+        
+        gross_profit = sample_df[sample_df['NetR'] > 0]['NetR'].sum()
+        gross_loss = abs(sample_df[sample_df['NetR'] < 0]['NetR'].sum())
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else np.nan
+        
+        expectancy = sample_df['NetR'].mean()
+        total_net_r = sample_df['NetR'].sum()
+        
+        # محاسبه Max Drawdown
+        sample_df = sample_df.sort_values('Date')
+        sample_df['CumulativeR'] = sample_df['NetR'].cumsum()
+        sample_df['Peak'] = sample_df['CumulativeR'].cummax()
+        sample_df['Drawdown'] = sample_df['Peak'] - sample_df['CumulativeR']
+        max_dd = sample_df['Drawdown'].max()
+        
+        print(f"🎯 وین‌ریت: {win_rate:.2f}% | سود خالص: {total_net_r:.2f}R")
+        print(f"⚖️ Profit Factor: {profit_factor:.2f} | Expectancy: {expectancy:.3f}R")
+        print(f"📉 Max Drawdown: {max_dd:.2f}R")
+        print(f"📈 میانگین MFE: {sample_df['MFE'].mean():.2f}R | میانگین MAE: {sample_df['MAE'].mean():.2f}R")
+        
+    print("\n--- عملکرد تفکیکی نمادها کل ---")
+    print(tdf.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
 else:
-    print("⚠️ هیچ معامله‌ای ثبت نشد.")
+    print("⚠️ هیچ معامله‌ای با شرایط جدید ثبت نشد.")
 
-print("\n✨ بک‌تست V6 به پایان رسید و لاگ‌ها ذخیره شدند.")
+print("\n✨ بک‌تست V7 به پایان رسید.")
