@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای سیستم HUNTER-X V3.3 (ثبت جزئیات معاملات)")
+print("📥 دانلود داده‌ها برای سیستم جدید HUNTER-X V4 (Trend Continuation)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_v3_3_data.csv"
+    filename_1h = f"{symbol}_1h_v4_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -102,10 +102,10 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست HUNTER-X V3.3 همراه با ثبت جزئیات (Data Logging)")
+print("🚀 اجرای موتور بک‌تست HUNTER-X V4 (Breakout + Trend Continuation)")
 print("============================================================")
 
-all_detailed_trades = []
+all_portfolio_trades = []
 
 for symbol, df1h in data_1h.items():
     if len(df1h) < 300:
@@ -133,6 +133,7 @@ for symbol, df1h in data_1h.items():
         c1h = df1h.iloc[i]
         current_time = c1h['Date']
         
+        # استفاده از آخرین کندل 4 ساعته کاملاً بسته‌شده
         closed_4h_time = current_time - timedelta(hours=4)
         available_4h = df4h[df4h['Date'] <= closed_4h_time]
         
@@ -151,185 +152,138 @@ for symbol, df1h in data_1h.items():
         except:
             slope_positive = True
             
-        is_long_context = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and slope_positive and (r4h['ADX'] >= 18)
-        is_short_context = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (r4h['ADX'] >= 18)
+        # فیلتر رژیم روند 4 ساعته
+        is_long_context = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and slope_positive and (r4h['ADX'] >= 20)
+        is_short_context = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (r4h['ADX'] >= 20)
         
         if not is_long_context and not is_short_context:
             continue
             
-        window = df1h.iloc[i-60:i]
+        # پیدا کردن سقف و کف مهم در گذشته (بدون Look-ahead)
+        window = df1h.iloc[i-50:i]
         if len(window) < 15:
             continue
             
-        swing_lows = window[(window['Low'] <= window['Low'].shift(1)) & (window['Low'] <= window['Low'].shift(-1)) & (window['Low'] <= window['Low'].shift(2)) & (window['Low'] <= window['Low'].shift(-2))]
-        swing_highs = window[(window['High'] >= window['High'].shift(1)) & (window['High'] >= window['High'].shift(-1)) & (window['High'] >= window['High'].shift(-2)) & (window['High'] >= window['High'].shift(-2))]
+        recent_high = window['High'].max()
+        recent_low = window['Low'].min()
         
-        if swing_lows.empty or swing_highs.empty:
+        # استراتژی V4: بریک‌اوت تاییدشده (شکست سقف برای لانگ، شکست کف برای شورت با حجم و بدنه قوی)
+        body_size = abs(c1h['Close'] - c1h['Open'])
+        total_range = c1h['High'] - c1h['Low']
+        if total_range == 0:
             continue
             
-        last_swing_low = swing_lows['Low'].iloc[-1]
-        last_swing_high = swing_highs['High'].iloc[-1]
-        
-        is_long_sweep = (c1h['Low'] < last_swing_low) and (c1h['Close'] > last_swing_low)
-        is_short_sweep = (c1h['High'] > last_swing_high) and (c1h['Close'] < last_swing_high)
-        
-        if is_long_context and is_long_sweep:
+        is_breakout_candle = (body_size >= 0.55 * total_range) and \
+                             (total_range >= 1.1 * c1h['ATR']) and \
+                             (c1h['Volume'] >= 1.2 * c1h['Vol_MA'])
+                             
+        # شرایط LONG: روند صعودی ۴ ساعته + کندل بریک‌اوت که سقف قبلی را به سمت بالا شکسته‌ است
+        if is_long_context and is_breakout_candle and (c1h['Close'] > recent_high):
+            # منتظر پولبک (Retest) به سطح شکسته‌شده در کندل‌های بعدی می‌مانیم
             entered = False
-            for p in range(1, 12):
-                if i + p >= len(df1h) - 10:
+            for r_idx in range(1, 10):
+                if i + r_idx >= len(df1h) - 10:
                     break
-                p_candle = df1h.iloc[i + p]
+                retest_candle = df1h.iloc[i + r_idx]
                 
-                body_size = abs(p_candle['Close'] - p_candle['Open'])
-                total_range = p_candle['High'] - p_candle['Low']
-                if total_range == 0:
-                    continue
+                # پولبک به حوالی سقف قبلی (شکسته‌شده) با کندل تایید صعودی
+                if retest_candle['Low'] <= recent_high * 1.005 and retest_candle['Close'] > retest_candle['Open']:
+                    entry_price = retest_candle['Close']
+                    sl = recent_high - (0.5 * retest_candle['ATR'])
+                    risk = entry_price - sl
                     
-                is_displacement = (body_size >= 0.50 * total_range) and \
-                                  (total_range >= 1.0 * p_candle['ATR']) and \
-                                  (p_candle['Volume'] >= 1.0 * p_candle['Vol_MA'])
-                                  
-                if is_displacement and (p_candle['Close'] > last_swing_high):
-                    for r_idx in range(p + 1, min(p + 10, len(df1h) - i)):
-                        retest_candle = df1h.iloc[i + r_idx]
+                    if risk <= 0 or (risk / entry_price) > 0.05:
+                        break
                         
-                        if retest_candle['Low'] <= last_swing_high * 1.005 and retest_candle['Close'] > retest_candle['Open']:
-                            entry_price = retest_candle['Close']
-                            sl = last_swing_low - (0.25 * retest_candle['ATR'])
-                            risk = entry_price - sl
+                    tp = entry_price + (2.0 * risk)
+                    
+                    outcome = 'OPEN'
+                    exit_idx = i + r_idx
+                    for j in range(i + r_idx, min(i + r_idx + 40, len(df1h))):
+                        f_c = df1h.iloc[j]
+                        exit_idx = j
+                        if f_c['Low'] <= sl:
+                            outcome = 'LOSS'
+                            break
+                        elif f_c['High'] >= tp:
+                            outcome = 'WIN'
+                            break
                             
-                            if risk <= 0 or (risk / entry_price) > 0.05:
-                                break
-                                
-                            tp = entry_price + (2.0 * risk)
-                            
-                            outcome = 'OPEN'
-                            exit_idx = i + r_idx
-                            exit_time = retest_candle['Date']
-                            for j in range(i + r_idx, min(i + r_idx + 40, len(df1h))):
-                                f_c = df1h.iloc[j]
-                                exit_idx = j
-                                exit_time = f_c['Date']
-                                if f_c['Low'] <= sl:
-                                    outcome = 'LOSS'
-                                    break
-                                elif f_c['High'] >= tp:
-                                    outcome = 'WIN'
-                                    break
-                                    
-                            if outcome in ['WIN', 'LOSS']:
-                                r_val = 2.0 if outcome == 'WIN' else -1.0
-                                all_detailed_trades.append({
-                                    'Symbol': symbol,
-                                    'Side': 'LONG',
-                                    'Sweep_Time': c1h['Date'],
-                                    'Displacement_Time': p_candle['Date'],
-                                    'Retest_Time': retest_candle['Date'],
-                                    'Entry': entry_price,
-                                    'SL': sl,
-                                    'TP': tp,
-                                    'Risk': risk,
-                                    'Exit_Time': exit_time,
-                                    'Outcome': outcome,
-                                    'R_Earned': r_val
-                                })
-                                locked_until_index = exit_idx
-                                entered = True
-                                break
-                    if entered:
+                    if outcome in ['WIN', 'LOSS']:
+                        all_portfolio_trades.append({
+                            'Symbol': symbol,
+                            'Side': 'LONG',
+                            'Outcome': outcome
+                        })
+                        locked_until_index = exit_idx
+                        entered = True
                         break
             if entered:
                 continue
                 
-        elif is_short_context and is_short_sweep:
+        # شرایط SHORT: روند نزولی ۴ ساعته + کندل بریک‌اوت که کف قبلی را به سمت پایین شکسته است
+        elif is_short_context and is_breakout_candle and (c1h['Close'] < recent_low):
             entered = False
-            for p in range(1, 12):
-                if i + p >= len(df1h) - 10:
+            for r_idx in range(1, 10):
+                if i + r_idx >= len(df1h) - 10:
                     break
-                p_candle = df1h.iloc[i + p]
+                retest_candle = df1h.iloc[i + r_idx]
                 
-                body_size = abs(p_candle['Close'] - p_candle['Open'])
-                total_range = p_candle['High'] - p_candle['Low']
-                if total_range == 0:
-                    continue
+                if retest_candle['High'] >= recent_low * 0.995 and retest_candle['Close'] < retest_candle['Open']:
+                    entry_price = retest_candle['Close']
+                    sl = recent_low + (0.5 * retest_candle['ATR'])
+                    risk = sl - entry_price
                     
-                is_displacement = (body_size >= 0.50 * total_range) and \
-                                  (total_range >= 1.0 * p_candle['ATR']) and \
-                                  (p_candle['Volume'] >= 1.0 * p_candle['Vol_MA'])
-                                  
-                if is_displacement and (p_candle['Close'] < last_swing_low):
-                    for r_idx in range(p + 1, min(p + 10, len(df1h) - i)):
-                        retest_candle = df1h.iloc[i + r_idx]
-                        
-                        if retest_candle['High'] >= last_swing_low * 0.995 and retest_candle['Close'] < retest_candle['Open']:
-                            entry_price = retest_candle['Close']
-                            sl = last_swing_high + (0.25 * retest_candle['ATR'])
-                            risk = sl - entry_price
-                            
-                            if risk <= 0 or (risk / entry_price) > 0.05:
-                                break
-                                
-                            tp = entry_price - (2.0 * risk)
-                            
-                            outcome = 'OPEN'
-                            exit_idx = i + r_idx
-                            exit_time = retest_candle['Date']
-                            for j in range(i + r_idx, min(i + r_idx + 40, len(df1h))):
-                                f_c = df1h.iloc[j]
-                                exit_idx = j
-                                exit_time = f_c['Date']
-                                if f_c['High'] >= sl:
-                                    outcome = 'LOSS'
-                                    break
-                                elif f_c['Low'] <= tp:
-                                    outcome = 'WIN'
-                                    break
-                                    
-                            if outcome in ['WIN', 'LOSS']:
-                                r_val = 2.0 if outcome == 'WIN' else -1.0
-                                all_detailed_trades.append({
-                                    'Symbol': symbol,
-                                    'Side': 'SHORT',
-                                    'Sweep_Time': c1h['Date'],
-                                    'Displacement_Time': p_candle['Date'],
-                                    'Retest_Time': retest_candle['Date'],
-                                    'Entry': entry_price,
-                                    'SL': sl,
-                                    'TP': tp,
-                                    'Risk': risk,
-                                    'Exit_Time': exit_time,
-                                    'Outcome': outcome,
-                                    'R_Earned': r_val
-                                })
-                                locked_until_index = exit_idx
-                                entered = True
-                                break
-                    if entered:
+                    if risk <= 0 or (risk / entry_price) > 0.05:
                         break
+                        
+                    tp = entry_price - (2.0 * risk)
+                    
+                    outcome = 'OPEN'
+                    exit_idx = i + r_idx
+                    for j in range(i + r_idx, min(i + r_idx + 40, len(df1h))):
+                        f_c = df1h.iloc[j]
+                        exit_idx = j
+                        if f_c['High'] >= sl:
+                            outcome = 'LOSS'
+                            break
+                        elif f_c['Low'] <= tp:
+                            outcome = 'WIN'
+                            break
+                            
+                    if outcome in ['WIN', 'LOSS']:
+                        all_portfolio_trades.append({
+                            'Symbol': symbol,
+                            'Side': 'SHORT',
+                            'Outcome': outcome
+                        })
+                        locked_until_index = exit_idx
+                        entered = True
+                        break
+            if entered:
+                continue
 
 print("\n============================================================")
-print("📊 گزارش تحلیل و ذخیره‌سازی داده‌ها (HUNTER-X V3.3)")
+print("📊 گزارش نهایی پورتفوی (HUNTER-X V4 - Trend Continuation)")
 print("============================================================")
 
-if all_detailed_trades:
-    logs_df = pd.DataFrame(all_detailed_trades)
-    logs_df.to_csv("detailed_trade_logs.csv", index=False)
-    print("✔️ فایل جزئیات معاملات با نام 'detailed_trade_logs.csv' با موفقیت ذخیره شد.")
+if all_portfolio_trades:
+    pf_df = pd.DataFrame(all_portfolio_trades)
+    total_trades = len(pf_df)
+    total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
+    total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
+    portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
+    net_profit_score = (total_wins * 2.0) - total_losses
     
-    total_trades = len(logs_df)
-    total_wins = len(logs_df[logs_df['Outcome'] == 'WIN'])
-    total_losses = len(logs_df[logs_df['Outcome'] == 'LOSS'])
-    win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    net_r = logs_df['R_Earned'].sum()
+    print(f"🔸 تعداد کل معاملات پورتفوی: {total_trades}")
+    print(f"🔸 کل معاملات برنده (WIN): {total_wins}")
+    print(f"🔸 کل معاملات بازنده (LOSS): {total_losses}")
+    print(f"🎯 **وین‌ریت واقعی:** {portfolio_win_rate:.2f}%")
+    print(f"💰 امتیاز سودآوری خالص (Net Profit Score): {net_profit_score:.2f}R")
     
-    print(f"🔸 تعداد کل معاملات ثبت‌شده: {total_trades}")
-    print(f"🔸 معاملات برنده: {total_wins} | معاملات بازنده: {total_losses}")
-    print(f"🎯 وین‌ریت: {win_rate:.2f}%")
-    print(f"💰 مجموع سود (Net R): {net_r:.2f}R")
-    
-    print("\nعملکرد تفکیکی سمت‌ها (Long vs Short):")
-    print(logs_df.groupby('Side')['Outcome'].value_counts().unstack(fill_value=0))
+    print("\nتفکیک عملکرد به تفکیک هر نماد:")
+    print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
 else:
-    print("⚠️ هیچ معامله‌ای ثبت نشد.")
+    print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ اجرای نسخه V3.3 به پایان رسید.")
+print("\n✨ بک‌تست نسخه V4 به اتمام رسید.")
