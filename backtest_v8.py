@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای سیستم HUNTER-X V3.2 CLEAN (بدون Look-ahead)")
+print("📥 دانلود داده‌ها برای سیستم HUNTER-X V3.3 (ثبت جزئیات معاملات)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_v3_2_clean_data.csv"
+    filename_1h = f"{symbol}_1h_v3_3_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -102,10 +102,10 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست HUNTER-X V3.2 CLEAN (بدون هیچ‌گونه نگاه به آینده)")
+print("🚀 اجرای موتور بک‌تست HUNTER-X V3.3 همراه با ثبت جزئیات (Data Logging)")
 print("============================================================")
 
-all_portfolio_trades = []
+all_detailed_trades = []
 
 for symbol, df1h in data_1h.items():
     if len(df1h) < 300:
@@ -113,7 +113,6 @@ for symbol, df1h in data_1h.items():
         
     df1h = calculate_indicators(df1h)
     
-    # ساخت تایم‌فریم 4 ساعته استاندارد
     df4h = df1h.set_index('Date').resample('4h').agg({
         'Open': 'first',
         'High': 'max',
@@ -123,8 +122,8 @@ for symbol, df1h in data_1h.items():
     }).dropna().reset_index()
     
     df4h = calculate_indicators(df4h)
-    
     df4h_indexed = df4h.set_index('Date')
+    
     locked_until_index = 0
     
     for i in range(100, len(df1h) - 40):
@@ -134,7 +133,6 @@ for symbol, df1h in data_1h.items():
         c1h = df1h.iloc[i]
         current_time = c1h['Date']
         
-        # تضمین استفاده از آخرین کندل 4 ساعته کاملاً بسته‌شده (حداقل 4 ساعت عقب‌تر از زمان فعلی)
         closed_4h_time = current_time - timedelta(hours=4)
         available_4h = df4h[df4h['Date'] <= closed_4h_time]
         
@@ -147,7 +145,6 @@ for symbol, df1h in data_1h.items():
         ema50_4h = r4h['EMA_50']
         ema200_4h = r4h['EMA_200']
         
-        # شیب واقعی EMA200 با مقایسه با کندل 4 ساعته ماقبلِ آن (بدون مقایسه با خودش)
         try:
             prev_r4h = available_4h.iloc[-2]
             slope_positive = ema200_4h >= prev_r4h['EMA_200']
@@ -160,7 +157,6 @@ for symbol, df1h in data_1h.items():
         if not is_long_context and not is_short_context:
             continue
             
-        # بررسی سوئینگ‌پوینت‌ها فقط با دیتای گذشته (تا کندل قبل از i)
         window = df1h.iloc[i-60:i]
         if len(window) < 15:
             continue
@@ -207,13 +203,13 @@ for symbol, df1h in data_1h.items():
                                 
                             tp = entry_price + (2.0 * risk)
                             
-                            # [حذف کامل future_slice بدون هیچ بررسی آینده]
-                            
                             outcome = 'OPEN'
                             exit_idx = i + r_idx
+                            exit_time = retest_candle['Date']
                             for j in range(i + r_idx, min(i + r_idx + 40, len(df1h))):
                                 f_c = df1h.iloc[j]
                                 exit_idx = j
+                                exit_time = f_c['Date']
                                 if f_c['Low'] <= sl:
                                     outcome = 'LOSS'
                                     break
@@ -222,10 +218,20 @@ for symbol, df1h in data_1h.items():
                                     break
                                     
                             if outcome in ['WIN', 'LOSS']:
-                                all_portfolio_trades.append({
+                                r_val = 2.0 if outcome == 'WIN' else -1.0
+                                all_detailed_trades.append({
                                     'Symbol': symbol,
                                     'Side': 'LONG',
-                                    'Outcome': outcome
+                                    'Sweep_Time': c1h['Date'],
+                                    'Displacement_Time': p_candle['Date'],
+                                    'Retest_Time': retest_candle['Date'],
+                                    'Entry': entry_price,
+                                    'SL': sl,
+                                    'TP': tp,
+                                    'Risk': risk,
+                                    'Exit_Time': exit_time,
+                                    'Outcome': outcome,
+                                    'R_Earned': r_val
                                 })
                                 locked_until_index = exit_idx
                                 entered = True
@@ -267,9 +273,11 @@ for symbol, df1h in data_1h.items():
                             
                             outcome = 'OPEN'
                             exit_idx = i + r_idx
+                            exit_time = retest_candle['Date']
                             for j in range(i + r_idx, min(i + r_idx + 40, len(df1h))):
                                 f_c = df1h.iloc[j]
                                 exit_idx = j
+                                exit_time = f_c['Date']
                                 if f_c['High'] >= sl:
                                     outcome = 'LOSS'
                                     break
@@ -278,10 +286,20 @@ for symbol, df1h in data_1h.items():
                                     break
                                     
                             if outcome in ['WIN', 'LOSS']:
-                                all_portfolio_trades.append({
+                                r_val = 2.0 if outcome == 'WIN' else -1.0
+                                all_detailed_trades.append({
                                     'Symbol': symbol,
                                     'Side': 'SHORT',
-                                    'Outcome': outcome
+                                    'Sweep_Time': c1h['Date'],
+                                    'Displacement_Time': p_candle['Date'],
+                                    'Retest_Time': retest_candle['Date'],
+                                    'Entry': entry_price,
+                                    'SL': sl,
+                                    'TP': tp,
+                                    'Risk': risk,
+                                    'Exit_Time': exit_time,
+                                    'Outcome': outcome,
+                                    'R_Earned': r_val
                                 })
                                 locked_until_index = exit_idx
                                 entered = True
@@ -290,26 +308,28 @@ for symbol, df1h in data_1h.items():
                         break
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی (HUNTER-X V3.2 CLEAN)")
+print("📊 گزارش تحلیل و ذخیره‌سازی داده‌ها (HUNTER-X V3.3)")
 print("============================================================")
 
-if all_portfolio_trades:
-    pf_df = pd.DataFrame(all_portfolio_trades)
-    total_trades = len(pf_df)
-    total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
-    total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
-    portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    net_profit_score = (total_wins * 2.0) - total_losses
+if all_detailed_trades:
+    logs_df = pd.DataFrame(all_detailed_trades)
+    logs_df.to_csv("detailed_trade_logs.csv", index=False)
+    print("✔️ فایل جزئیات معاملات با نام 'detailed_trade_logs.csv' با موفقیت ذخیره شد.")
     
-    print(f"🔸 تعداد کل معاملات پورتفوی: {total_trades}")
-    print(f"🔸 کل معاملات برنده (WIN): {total_wins}")
-    print(f"🔸 کل معاملات بازنده (LOSS): {total_losses}")
-    print(f"🎯 **وین‌ریت واقعی:** {portfolio_win_rate:.2f}%")
-    print(f"💰 امتیاز سودآوری خالص (Net Profit Score): {net_profit_score:.2f}R")
+    total_trades = len(logs_df)
+    total_wins = len(logs_df[logs_df['Outcome'] == 'WIN'])
+    total_losses = len(logs_df[logs_df['Outcome'] == 'LOSS'])
+    win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
+    net_r = logs_df['R_Earned'].sum()
     
-    print("\nتفکیک عملکرد به تفکیک هر نماد:")
-    print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
+    print(f"🔸 تعداد کل معاملات ثبت‌شده: {total_trades}")
+    print(f"🔸 معاملات برنده: {total_wins} | معاملات بازنده: {total_losses}")
+    print(f"🎯 وین‌ریت: {win_rate:.2f}%")
+    print(f"💰 مجموع سود (Net R): {net_r:.2f}R")
+    
+    print("\nعملکرد تفکیکی سمت‌ها (Long vs Short):")
+    print(logs_df.groupby('Side')['Outcome'].value_counts().unstack(fill_value=0))
 else:
-    print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
+    print("⚠️ هیچ معامله‌ای ثبت نشد.")
 
-print("\n✨ بک‌تست نسخه V3.2 CLEAN به اتمام رسید.")
+print("\n✨ اجرای نسخه V3.3 به پایان رسید.")
