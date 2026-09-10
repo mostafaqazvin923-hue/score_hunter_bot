@@ -31,13 +31,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای سیستم HUNTER-X V7 (Compression + Expansion)")
+print("📥 دانلود داده‌ها برای سیستم HUNTER-X V7.1 (Optimized)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_v7_data.csv"
+    filename_1h = f"{symbol}_1h_v71_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -83,9 +83,9 @@ def calculate_indicators(df):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
     
-    # اندیکاتور فشردگی (Bollinger Bands Width یا ATR Ratio)
+    # اصلاح ضریب فشردگی برای دریافت سیگنال منطقی
     df['ATR_MA'] = df['ATR'].rolling(window=20).mean()
-    df['Compression'] = df['ATR'] < (df['ATR_MA'] * 0.8) # نشانه‌ی فشردگی نوسان
+    df['Compression'] = df['ATR'] < (df['ATR_MA'] * 0.95) 
     
     plus_dm = df['High'].diff().clip(lower=0)
     minus_dm = (-df['Low'].diff()).clip(lower=0)
@@ -98,12 +98,12 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست پیشرفته HUNTER-X V7")
+print("🚀 اجرای موتور بک‌تست بهینه‌شده HUNTER-X V7.1")
 print("============================================================")
 
 all_trades = []
-COMMISSION_RATE = 0.0008 # 0.08% کارمزد رفت و برگشت کل
-SLIPPAGE_RATE = 0.0005   # 0.05% اسلیپیج
+COMMISSION_RATE = 0.0008 
+SLIPPAGE_RATE = 0.0005   
 
 for symbol, df1h in data_1h.items():
     if len(df1h) < 300:
@@ -121,9 +121,7 @@ for symbol, df1h in data_1h.items():
     
     df4h = calculate_indicators(df4h)
     
-    # جداسازی In-Sample (80%) و Out-of-Sample (20%)
     split_idx = int(len(df1h) * 0.8)
-    
     locked_until_index = 0
     
     for i in range(200, len(df1h) - 40):
@@ -131,13 +129,9 @@ for symbol, df1h in data_1h.items():
             continue
             
         c1h = df1h.iloc[i]
-        prev_c1h = df1h.iloc[i-1]
         current_time = c1h['Date']
-        
-        # تعیین بخش داده (In-Sample یا OOS)
         data_sample = "OOS" if i >= split_idx else "IS"
         
-        # رژیم 4 ساعته بدون Look-ahead
         closed_4h_time = current_time - timedelta(hours=4)
         available_4h = df4h[df4h['Date'] <= closed_4h_time]
         if available_4h.empty:
@@ -152,43 +146,42 @@ for symbol, df1h in data_1h.items():
             ema200_slope_up = True
             ema200_slope_down = True
             
-        is_long_regime = (r4h['Close'] > r4h['EMA_200']) and ema200_slope_up and (r4h['ADX'] >= 22)
-        is_short_regime = (r4h['Close'] < r4h['EMA_200']) and ema200_slope_down and (r4h['ADX'] >= 22)
+        # کاهش آستانه ADX به 18 برای باز شدن دست ربات
+        is_long_regime = (r4h['Close'] > r4h['EMA_200']) and ema200_slope_up and (r4h['ADX'] >= 18)
+        is_short_regime = (r4h['Close'] < r4h['EMA_200']) and ema200_slope_down and (r4h['ADX'] >= 18)
         
         if not is_long_regime and not is_short_regime:
             continue
             
-        # بررسی فشردگی نوسان در کندل‌های قبل (آیا اخیراً فشرده بوده؟)
-        recent_compression = df1h.iloc[i-5:i]['Compression'].any()
+        # بررسی فشردگی در 10 کندل گذشته
+        recent_compression = df1h.iloc[i-10:i]['Compression'].any()
         if not recent_compression:
             continue
             
-        # انفجار بریک‌آوت (Expansion): حجم بالا + ATR بالا + بدنه قوی
         body_size = abs(c1h['Close'] - c1h['Open'])
         total_range = c1h['High'] - c1h['Low']
         if total_range == 0:
             continue
             
-        is_expansion = (body_size >= 0.6 * total_range) and \
-                       (total_range >= 1.3 * c1h['ATR']) and \
-                       (c1h['Volume'] >= 1.3 * c1h['Vol_MA'])
+        # تعدیل ضرایب انبساط
+        is_expansion = (body_size >= 0.5 * total_range) and \
+                       (total_range >= 1.0 * c1h['ATR']) and \
+                       (c1h['Volume'] >= 1.1 * c1h['Vol_MA'])
                        
         if not is_expansion:
             continue
             
-        # محدوده معاملاتی گذشته برای تعیین استابلاستر ساختاری
         window = df1h.iloc[i-30:i]
         recent_high = window['High'].max()
         recent_low = window['Low'].min()
         
-        # شرایط LONG
         if is_long_regime and (c1h['Close'] > recent_high):
             raw_entry = c1h['Close']
             entry_price = raw_entry * (1 + SLIPPAGE_RATE)
             sl = recent_low - (0.5 * c1h['ATR'])
             risk = entry_price - sl
             
-            if (risk >= 0.5 * c1h['ATR']) and (risk <= 2.5 * c1h['ATR']) and (risk / entry_price <= 0.05):
+            if (risk >= 0.4 * c1h['ATR']) and (risk <= 3.0 * c1h['ATR']) and (risk / entry_price <= 0.07):
                 tp = entry_price + (2.0 * risk)
                 
                 outcome = 'OPEN'
@@ -214,7 +207,7 @@ for symbol, df1h in data_1h.items():
                         
                 if outcome in ['WIN', 'LOSS']:
                     net_R = 2.0 if outcome == 'WIN' else -1.0
-                    net_R -= (COMMISSION_RATE * 2) # کسر کارمزد
+                    net_R -= (COMMISSION_RATE * 2)
                     
                     all_trades.append({
                         'Symbol': symbol,
@@ -228,14 +221,13 @@ for symbol, df1h in data_1h.items():
                     })
                     locked_until_index = exit_idx
                     
-        # شرایط SHORT
         elif is_short_regime and (c1h['Close'] < recent_low):
             raw_entry = c1h['Close']
             entry_price = raw_entry * (1 - SLIPPAGE_RATE)
             sl = recent_high + (0.5 * c1h['ATR'])
             risk = sl - entry_price
             
-            if (risk >= 0.5 * c1h['ATR']) and (risk <= 2.5 * c1h['ATR']) and (risk / entry_price <= 0.05):
+            if (risk >= 0.4 * c1h['ATR']) and (risk <= 3.0 * c1h['ATR']) and (risk / entry_price <= 0.07):
                 tp = entry_price - (2.0 * risk)
                 
                 outcome = 'OPEN'
@@ -276,12 +268,12 @@ for symbol, df1h in data_1h.items():
                     locked_until_index = exit_idx
 
 print("\n============================================================")
-print("📊 گزارش جامع عملکرد HUNTER-X V7")
+print("📊 گزارش جامع عملکرد HUNTER-X V7.1")
 print("============================================================")
 
 if all_trades:
     tdf = pd.DataFrame(all_trades)
-    tdf.to_csv("detailed_trades_v7.csv", index=False)
+    tdf.to_csv("detailed_trades_v71.csv", index=False)
     
     for sample_type in ['IS', 'OOS']:
         sample_df = tdf[tdf['Sample'] == sample_type]
@@ -302,7 +294,6 @@ if all_trades:
         expectancy = sample_df['NetR'].mean()
         total_net_r = sample_df['NetR'].sum()
         
-        # محاسبه Max Drawdown
         sample_df = sample_df.sort_values('Date')
         sample_df['CumulativeR'] = sample_df['NetR'].cumsum()
         sample_df['Peak'] = sample_df['CumulativeR'].cummax()
@@ -319,4 +310,4 @@ if all_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط جدید ثبت نشد.")
 
-print("\n✨ بک‌تست V7 به پایان رسید.")
+print("\n✨ بک‌تست V7.1 به پایان رسید.")
