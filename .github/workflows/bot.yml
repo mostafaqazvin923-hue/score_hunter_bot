@@ -2,8 +2,11 @@ name: Score Hunter Bot
 
 on:
   schedule:
-    - cron: '5 * * * *' # اجرا در دقیقه‌ی ۵ هر ساعت (برای اطمینان از بسته شدن کامل کندل)
+    - cron: '0 * * * *' # سر هر ساعت برای پایداری بیشتر
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
