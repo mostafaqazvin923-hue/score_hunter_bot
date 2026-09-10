@@ -76,7 +76,7 @@ print("============================================================")
 print("🔍 مانیتورینگ هوشمند پوزیشن‌ها و اسکن بازار (نسخه پرسیگنال بهینه)...")
 print("============================================================")
 
-# ۱. مانیتورینگ دقیق پوزیشن‌های باز
+# ۱. مانیتورینگ دقیق پوزیشن‌های باز (بدون دخالت ریسک‌فری)
 symbols_to_remove = []
 for symbol, trade in active_trades.items():
     lbank_symbol = SYMBOLS.get(symbol)
@@ -93,61 +93,6 @@ for symbol, trade in active_trades.items():
         sl = trade['sl']
         entry = trade['entry_price']
         
-        # محاسبه درصد سود کل تارگت
-        if direction == "LONG":
-            tp_pct = ((tp - entry) / entry) * 100
-        else:
-            tp_pct = ((entry - tp) / entry) * 100
-            
-        # بررسی و اعمال قابلیت ریسک‌فری خودکار (فقط برای تارگت‌های >= 4 درصد)
-        if tp_pct >= 4.0 and not trade.get("risk_free", False):
-            halfway_reached = False
-            df_active_period = pd.DataFrame()
-            if ohlcv:
-                df_candles = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-                df_candles['Date'] = pd.to_datetime(df_candles['Timestamp'], unit='ms')
-                df_active_period = df_candles[df_candles['Date'] >= trade_time.floor('h')]
-            
-            if direction == "LONG":
-                halfway_price = entry + 0.5 * (tp - entry)
-                if current_price >= halfway_price:
-                    halfway_reached = True
-                elif not df_active_period.empty:
-                    if (df_active_period['High'] >= halfway_price).any():
-                        halfway_reached = True
-                        
-                if halfway_reached:
-                    trade['sl'] = entry
-                    trade['risk_free'] = True
-                    msg = (
-                        f"🛡️ **پوزیشن ریسک‌فری شد (Breakeven)!**\n"
-                        f"💎 جفت ارز: `{symbol}USDT`\n"
-                        f"📍 قیمت ورود: `{entry:.4f}`\n"
-                        f"🎯 هدف سود کل: `{tp:.4f}` (+{tp_pct:.2f}%)\n"
-                        f"✨ قیمت به نیمه‌ی راه رسید و حد ضرر روی نقطه‌ی ورود قفل شد."
-                    )
-                    send_telegram_message(msg)
-                    
-            elif direction == "SHORT":
-                halfway_price = entry - 0.5 * (entry - tp)
-                if current_price <= halfway_price:
-                    halfway_reached = True
-                elif not df_active_period.empty:
-                    if (df_active_period['Low'] <= halfway_price).any():
-                        halfway_reached = True
-                        
-                if halfway_reached:
-                    trade['sl'] = entry
-                    trade['risk_free'] = True
-                    msg = (
-                        f"🛡️ **پوزیشن ریسک‌فری شد (Breakeven)!**\n"
-                        f"💎 جفت ارز: `{symbol}USDT`\n"
-                        f"📍 قیمت ورود: `{entry:.4f}`\n"
-                        f"🎯 هدف سود کل: `{tp:.4f}` (+{tp_pct:.2f}%)\n"
-                        f"✨ قیمت به نیمه‌ی راه رسید و حد ضرر روی نقطه‌ی ورود قفل شد."
-                    )
-                    send_telegram_message(msg)
-
         hit_tp = False
         hit_sl = False
         
@@ -194,22 +139,13 @@ for symbol, trade in active_trades.items():
             send_telegram_message(msg)
             symbols_to_remove.append(symbol)
         elif hit_sl:
-            is_breakeven_hit = trade.get("risk_free", False) and (sl == entry)
-            if is_breakeven_hit:
-                msg = (
-                    f"🛡️ **معامله در نقطه سربه‌سر (Breakeven) بسته شد!**\n"
-                    f"💎 جفت ارز: `{symbol}USDT`\n"
-                    f"📍 قیمت ورود: `{entry:.4f}`\n"
-                    f"✨ پوزیشن بدون ضرر خارج شد."
-                )
-            else:
-                msg = (
-                    f"🛑 **حد ضرر لمس شد (SL Hit)!**\n"
-                    f"💎 جفت ارز: `{symbol}USDT`\n"
-                    f"📍 قیمت ورود: `{entry:.4f}`\n"
-                    f"🛑 حد ضرر: `{sl:.4f}`\n"
-                    f"⚠️ پوزیشن متوقف شد."
-                )
+            msg = (
+                f"🛑 **حد ضرر لمس شد (SL Hit)!**\n"
+                f"💎 جفت ارز: `{symbol}USDT`\n"
+                f"📍 قیمت ورود: `{entry:.4f}`\n"
+                f"🛑 حد ضرر: `{sl:.4f}`\n"
+                f"⚠️ پوزیشن متوقف شد."
+            )
             send_telegram_message(msg)
             symbols_to_remove.append(symbol)
             
@@ -335,8 +271,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
                     "entry_price": entry_price,
                     "tp": tp,
                     "sl": sl,
-                    "time": candle_time_str,
-                    "risk_free": False
+                    "time": candle_time_str
                 }
                 
                 signal_text = (
@@ -365,8 +300,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
                     "entry_price": entry_price,
                     "tp": tp,
                     "sl": sl,
-                    "time": candle_time_str,
-                    "risk_free": False
+                    "time": candle_time_str
                 }
                 
                 signal_text = (
@@ -392,7 +326,6 @@ if os.getenv("GITHUB_ACTIONS"):
         subprocess.run(["git", "config", "--global", "user.name", "Bot Heartbeat Keeper"], check=False)
         subprocess.run(["git", "config", "--global", "user.email", "bot@github.com"], check=False)
         
-        # مراحل مدیریت گیت با استفاده از Stash برای جلوگیری از خطای Unstaged changes
         subprocess.run(["git", "add", STATE_FILE, "last_run.txt"], check=False)
         subprocess.run(["git", "stash"], check=False)
         subprocess.run(["git", "pull", "origin", "main", "--rebase"], check=False)
