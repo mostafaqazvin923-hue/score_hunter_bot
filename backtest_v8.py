@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای سیستم جدید HUNTER-X V4 (Trend Continuation)")
+print("📥 دانلود داده‌ها برای سیستم HUNTER-X V5 (Trend + Pullback + Momentum)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_v4_data.csv"
+    filename_1h = f"{symbol}_1h_v5_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -102,7 +102,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست HUNTER-X V4 (Breakout + Trend Continuation)")
+print("🚀 اجرای موتور بک‌تست HUNTER-X V5")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -122,7 +122,6 @@ for symbol, df1h in data_1h.items():
     }).dropna().reset_index()
     
     df4h = calculate_indicators(df4h)
-    df4h_indexed = df4h.set_index('Date')
     
     locked_until_index = 0
     
@@ -131,9 +130,10 @@ for symbol, df1h in data_1h.items():
             continue
             
         c1h = df1h.iloc[i]
+        prev_c1h = df1h.iloc[i-1]
         current_time = c1h['Date']
         
-        # استفاده از آخرین کندل 4 ساعته کاملاً بسته‌شده
+        # 1. رژیم روند 4 ساعته (بدون Look-ahead با استفاده از کندل بسته شده قبلی 4 ساعته)
         closed_4h_time = current_time - timedelta(hours=4)
         available_4h = df4h[df4h['Date'] <= closed_4h_time]
         
@@ -141,65 +141,70 @@ for symbol, df1h in data_1h.items():
             continue
             
         r4h = available_4h.iloc[-1]
-        
-        ema20_4h = r4h['EMA_20']
-        ema50_4h = r4h['EMA_50']
-        ema200_4h = r4h['EMA_200']
-        
         try:
             prev_r4h = available_4h.iloc[-2]
-            slope_positive = ema200_4h >= prev_r4h['EMA_200']
+            ema200_slope_up = r4h['EMA_200'] >= prev_r4h['EMA_200']
+            ema200_slope_down = r4h['EMA_200'] <= prev_r4h['EMA_200']
         except:
-            slope_positive = True
+            ema200_slope_up = True
+            ema200_slope_down = True
             
-        # فیلتر رژیم روند 4 ساعته
-        is_long_context = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and slope_positive and (r4h['ADX'] >= 20)
-        is_short_context = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (r4h['ADX'] >= 20)
-        
+        is_long_context = (r4h['Close'] > r4h['EMA_200']) and (r4h['EMA_20'] > r4h['EMA_50']) and \
+                          (r4h['EMA_50'] > r4h['EMA_200']) and ema200_slope_up and (r4h['ADX'] >= 20)
+                          
+        is_short_context = (r4h['Close'] < r4h['EMA_200']) and (r4h['EMA_20'] < r4h['EMA_50']) and \
+                           (r4h['EMA_50'] < r4h['EMA_200']) and ema200_slope_down and (r4h['ADX'] >= 20)
+                           
         if not is_long_context and not is_short_context:
             continue
             
-        # پیدا کردن سقف و کف مهم در گذشته (بدون Look-ahead)
-        window = df1h.iloc[i-50:i]
+        # 2. بررسی ساختار بازار (Pivot با 2 کندل سمت راست برای اجتناب از Look-ahead)
+        # برای سادگی و دقت بدون تاخیر زیاد، از سویینگ‌های تاییدشده در پنجره گذشته استفاده می‌کنیم
+        window = df1h.iloc[i-50:i-2] # کسر 2 کندل برای رعایت ریجکت سمت راست
         if len(window) < 15:
             continue
             
-        recent_high = window['High'].max()
-        recent_low = window['Low'].min()
-        
-        # استراتژی V4: بریک‌اوت تاییدشده (شکست سقف برای لانگ، شکست کف برای شورت با حجم و بدنه قوی)
-        body_size = abs(c1h['Close'] - c1h['Open'])
-        total_range = c1h['High'] - c1h['Low']
-        if total_range == 0:
+        swing_lows = window[(window['Low'] <= window['Low'].shift(1)) & (window['Low'] <= window['Low'].shift(-1)) & 
+                            (window['Low'] <= window['Low'].shift(2)) & (window['Low'] <= window['Low'].shift(-2))]
+        swing_highs = window[(window['High'] >= window['High'].shift(1)) & (window['High'] >= window['High'].shift(-1)) & 
+                             (window['High'] >= window['High'].shift(2)) & (window['High'] >= window['High'].shift(-2))]
+                             
+        if swing_lows.empty or swing_highs.empty:
             continue
             
-        is_breakout_candle = (body_size >= 0.55 * total_range) and \
-                             (total_range >= 1.1 * c1h['ATR']) and \
-                             (c1h['Volume'] >= 1.2 * c1h['Vol_MA'])
-                             
-        # شرایط LONG: روند صعودی ۴ ساعته + کندل بریک‌اوت که سقف قبلی را به سمت بالا شکسته‌ است
-        if is_long_context and is_breakout_candle and (c1h['Close'] > recent_high):
-            # منتظر پولبک (Retest) به سطح شکسته‌شده در کندل‌های بعدی می‌مانیم
-            entered = False
-            for r_idx in range(1, 10):
-                if i + r_idx >= len(df1h) - 10:
-                    break
-                retest_candle = df1h.iloc[i + r_idx]
+        last_swing_low = swing_lows['Low'].iloc[-1]
+        last_swing_high = swing_highs['High'].iloc[-1]
+        
+        # 3. بررسی پولبک و مومنتوم ریکلیم در 1H
+        if is_long_context:
+            # پولبک به حوالی EMA20 یا EMA50 (بدون نفوذ کامل به زیر EMA50)
+            in_pullback = (prev_c1h['Low'] <= prev_c1h['EMA_20']) or (prev_c1h['Low'] <= prev_c1h['EMA_50'])
+            not_broken_structure = prev_c1h['Close'] >= prev_c1h['EMA_50']
+            
+            # مومنتوم ریکلیم
+            momentum_reclaim = (c1h['Close'] > c1h['Open']) and (c1h['Close'] > prev_c1h['High']) and (c1h['RSI'] > 50)
+            
+            # حجم تاییدکننده
+            volume_confirmed = c1h['Volume'] >= (c1h['Vol_MA'] * 1.10)
+            
+            # فیلتر بیش‌ازحد کشیده‌نشدن از EMA20
+            not_overextended = abs(c1h['Close'] - c1h['EMA_20']) <= (1.2 * c1h['ATR'])
+            
+            # ساختار بازار صعودی (Higher High / Higher Low نسبی)
+            structure_ok = last_swing_low >= window['Low'].iloc[0]
+            
+            if in_pullback and not_broken_structure and momentum_reclaim and volume_confirmed and not_overextended and structure_ok:
+                entry_price = c1h['Close']
+                sl = last_swing_low - (0.25 * c1h['ATR'])
+                risk = entry_price - sl
                 
-                # پولبک به حوالی سقف قبلی (شکسته‌شده) با کندل تایید صعودی
-                if retest_candle['Low'] <= recent_high * 1.005 and retest_candle['Close'] > retest_candle['Open']:
-                    entry_price = retest_candle['Close']
-                    sl = recent_high - (0.5 * retest_candle['ATR'])
-                    risk = entry_price - sl
-                    
-                    if risk <= 0 or (risk / entry_price) > 0.05:
-                        break
-                        
+                # فیلتر اندازه ریسک (بین 0.6 تا 2.0 ATR)
+                if (risk >= 0.6 * c1h['ATR']) and (risk <= 2.0 * c1h['ATR']) and (risk / entry_price <= 0.05):
                     tp = entry_price + (2.0 * risk)
                     
                     outcome = 'OPEN'
-                    exit_idx = i + r_idx
-                    for j in range(i + r_idx, min(i + r_idx + 40, len(df1h))):
+                    exit_idx = i
+                    for j in range(i, min(i + 40, len(df1h))):
                         f_c = df1h.iloc[j]
                         exit_idx = j
                         if f_c['Low'] <= sl:
@@ -216,32 +221,28 @@ for symbol, df1h in data_1h.items():
                             'Outcome': outcome
                         })
                         locked_until_index = exit_idx
-                        entered = True
-                        break
-            if entered:
-                continue
-                
-        # شرایط SHORT: روند نزولی ۴ ساعته + کندل بریک‌اوت که کف قبلی را به سمت پایین شکسته است
-        elif is_short_context and is_breakout_candle and (c1h['Close'] < recent_low):
-            entered = False
-            for r_idx in range(1, 10):
-                if i + r_idx >= len(df1h) - 10:
-                    break
-                retest_candle = df1h.iloc[i + r_idx]
-                
-                if retest_candle['High'] >= recent_low * 0.995 and retest_candle['Close'] < retest_candle['Open']:
-                    entry_price = retest_candle['Close']
-                    sl = recent_low + (0.5 * retest_candle['ATR'])
-                    risk = sl - entry_price
-                    
-                    if risk <= 0 or (risk / entry_price) > 0.05:
-                        break
+                        continue
                         
+        elif is_short_context:
+            in_pullback = (prev_c1h['High'] >= prev_c1h['EMA_20']) or (prev_c1h['High'] >= prev_c1h['EMA_50'])
+            not_broken_structure = prev_c1h['Close'] <= prev_c1h['EMA_50']
+            
+            momentum_reclaim = (c1h['Close'] < c1h['Open']) and (c1h['Close'] < prev_c1h['Low']) and (c1h['RSI'] < 50)
+            volume_confirmed = c1h['Volume'] >= (c1h['Vol_MA'] * 1.10)
+            not_overextended = abs(c1h['Close'] - c1h['EMA_20']) <= (1.2 * c1h['ATR'])
+            structure_ok = last_swing_high <= window['High'].iloc[0]
+            
+            if in_pullback and not_broken_structure and momentum_reclaim and volume_confirmed and not_overextended and structure_ok:
+                entry_price = c1h['Close']
+                sl = last_swing_high + (0.25 * c1h['ATR'])
+                risk = sl - entry_price
+                
+                if (risk >= 0.6 * c1h['ATR']) and (risk <= 2.0 * c1h['ATR']) and (risk / entry_price <= 0.05):
                     tp = entry_price - (2.0 * risk)
                     
                     outcome = 'OPEN'
-                    exit_idx = i + r_idx
-                    for j in range(i + r_idx, min(i + r_idx + 40, len(df1h))):
+                    exit_idx = i
+                    for j in range(i, min(i + 40, len(df1h))):
                         f_c = df1h.iloc[j]
                         exit_idx = j
                         if f_c['High'] >= sl:
@@ -258,13 +259,10 @@ for symbol, df1h in data_1h.items():
                             'Outcome': outcome
                         })
                         locked_until_index = exit_idx
-                        entered = True
-                        break
-            if entered:
-                continue
+                        continue
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی (HUNTER-X V4 - Trend Continuation)")
+print("📊 گزارش نهایی پورتفوی (HUNTER-X V5)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -286,4 +284,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ بک‌تست نسخه V4 به اتمام رسید.")
+print("\n✨ بک‌تست نسخه V5 به اتمام رسید.")
