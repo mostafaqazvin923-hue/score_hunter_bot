@@ -219,7 +219,7 @@ for symbol, trade in active_trades.items():
 for sym in symbols_to_remove:
     if sym in active_trades:
         cooldowns[sym] = active_trades[sym]["time"]
-        del active_trades[sym]
+        del active_trades[symbol] # اصلاح جزئی کلید حذف
 
 save_state({"active": active_trades, "cooldown": cooldowns})
 
@@ -391,10 +391,15 @@ if os.getenv("GITHUB_ACTIONS"):
         
         subprocess.run(["git", "config", "--global", "user.name", "Bot Heartbeat Keeper"], check=False)
         subprocess.run(["git", "config", "--global", "user.email", "bot@github.com"], check=False)
+        
+        # ابتدا پول‌گرفتن و به‌روزرسانی برای جلوگیری از Conflict
+        subprocess.run(["git", "pull", "origin", "main", "--rebase"], check=False)
+        
+        # سپس افزودن، کامیت و پوش کردن تغییرات
         subprocess.run(["git", "add", STATE_FILE, "last_run.txt"], check=False)
         subprocess.run(["git", "commit", "-m", "Auto-update state and heartbeat [skip ci]"], check=False)
-        subprocess.run(["git", "pull", "origin", "main", "--rebase"], check=False)
         subprocess.run(["git", "push"], check=False)
+        
         print("💾 حافظه ربات و هارت‌بیت با موفقیت در گیت‌هاب ذخیره شدند.")
     except Exception as e:
         print(f"❌ خطا در آپدیت گیت‌هاب: {e}")
