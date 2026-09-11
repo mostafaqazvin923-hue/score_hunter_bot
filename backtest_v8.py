@@ -19,7 +19,7 @@ exchange = ccxt.lbank({
     'options': {'defaultType': 'swap'}
 })
 
-# لیست ۳۰ ارز نهایی، یکتا و کاملاً پاکسازی‌شده
+# لیست ۳۰ ارز نهایی، پاکسازی‌شده (بدون JUP و STX، با جایگزینی FIL و XLM)
 SYMBOLS = {
     "BTC": "BTC/USDT",
     "ETH": "ETH/USDT",
@@ -48,9 +48,9 @@ SYMBOLS = {
     "CRV": "CRV/USDT",
     "PENDLE": "PENDLE/USDT",
     "AAVE": "AAVE/USDT",
-    "STX": "STX/USDT",
-    "JUP": "JUP/USDT",
-    "GRT": "GRT/USDT"
+    "GRT": "GRT/USDT",
+    "FIL": "FIL/USDT",  # جایگزین مطمئن و پایدار
+    "XLM": "XLM/USDT"   # جایگزین مطمئن و پایدار
 }
 
 start_date = datetime.now() - timedelta(days=365)
@@ -140,7 +140,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست روی پورتفوی فوق‌العاده بهینه‌شده LBank")
+print("🚀 اجرای موتور بک‌تست روی پورتفوی نهایی LBank")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -296,7 +296,7 @@ for symbol, df1h in data_1h.items():
                             break
 
 print("\n============================================================")
-print("📊 گزارش تجمیعی نهایی پورتفوی بهینه‌شده LBank")
+print("📊 گزارش تجمیعی نهایی پورتفوی ل‌بانک")
 print("============================================================")
 
 if all_portfolio_trades:
