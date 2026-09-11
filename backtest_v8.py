@@ -13,7 +13,7 @@ except ImportError:
 import pandas as pd
 import numpy as np
 
-# اتصال به صرافی LBank و تعریف سبد 10 ارز
+# 1. اتصال به صرافی LBank و تعریف سبد 10 ارز
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
     "BTC": "BTC/USDT",
@@ -73,42 +73,23 @@ for symbol, lbank_symbol in SYMBOLS.items():
     else:
         print(f"  ❌ دیتایی برای {symbol} دریافت نشد.")
 
-# تابع محاسبه اندیکاتورهای پیشرفته (شامل ADX برای سنجش قدرت روند)
+# تابع محاسبه اندیکاتورهای ساختاری (EMA و ATR)
 def calculate_indicators(df):
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     
-    df['BB_Middle'] = df['Close'].rolling(window=20).mean()
-    bb_std = df['Close'].rolling(window=20).std()
-    df['BB_Upper'] = df['BB_Middle'] + (bb_std * 2.0)
-    df['BB_Lower'] = df['BB_Middle'] - (bb_std * 2.0)
-    
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
+    # محاسبه ATR برای حد ضرر داینامیک
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
     
-    # محاسبه ADX برای فیلتر کردن بازارهای رِنج و ضعیف
-    plus_dm = df['High'].diff().clip(lower=0)
-    minus_dm = (-df['Low'].diff()).clip(lower=0)
-    tr14 = tr.rolling(window=14).mean()
-    plus_di = 100 * (plus_dm.rolling(window=14).mean() / (tr14 + 1e-9))
-    minus_di = 100 * (minus_dm.rolling(window=14).mean() / (tr14 + 1e-9))
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-    df['ADX'] = dx.rolling(window=14).mean().fillna(20)
-    
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست بهینه‌شده با فیلترهای سخت‌گیرانه وین‌ریت بالا")
+print("🚀 اجرای موتور بک‌تست تخصصی (ریسک به ریوارد 1 به 2 - ساختار پولبک EMA)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -119,7 +100,7 @@ for symbol, df1h in data_1h.items():
         
     df1h = calculate_indicators(df1h)
     
-    # استفاده از '4h' به جای '4H' طبق استانداردهای جدید پانداس
+    # ساخت تایم‌فریم 4 ساعته برای روند کلان
     df4h = df1h.set_index('Date').resample('4h').agg({
         'Open': 'first',
         'High': 'max',
@@ -147,32 +128,31 @@ for symbol, df1h in data_1h.items():
             
         r4h = df4h_indexed.loc[t4h_time]
         
-        ema20_4h = r4h['EMA_20']
-        ema50_4h = r4h['EMA_50']
-        ema200_4h = r4h['EMA_200']
-        
-        # فیلتر روند سخت‌گیرانه 4 ساعته همراه با ADX بالا (روند قدرتمند)
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (r4h['ADX'] > 25)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (r4h['ADX'] > 25)
+        # تشخیص روند صعودی و نزولی در ۴ ساعته
+        is_long_regime = (r4h['Close'] > r4h['EMA_200']) and (r4h['EMA_20'] > r4h['EMA_50'])
+        is_short_regime = (r4h['Close'] < r4h['EMA_200']) and (r4h['EMA_20'] < r4h['EMA_50'])
         
         if not is_long_regime and not is_short_regime:
             continue
             
-        # فیلتر حجم و تاییدیه پولبک دقیق در 1 ساعته
+        # منطق ورود: پولبک قیمت به محدوده EMA 20 در تایم‌فریم 1 ساعته همراه با تاییدیه حجم
         avg_vol = df1h.iloc[i-20:i]['Volume'].mean()
-        is_volume_confirmed = c1h['Volume'] > (avg_vol * 1.2)
+        is_volume_ok = c1h['Volume'] > (avg_vol * 1.1)
         
-        is_long_trigger = (c1h['Low'] <= c1h['BB_Lower']) and (c1h['RSI'] < 30) and is_volume_confirmed
-        is_short_trigger = (c1h['High'] >= c1h['BB_Upper']) and (c1h['RSI'] > 70) and is_volume_confirmed
+        # لانگ: قیمت به نزدیکی EMA 20 پولبک زده و کندل صعودی بسته شود
+        is_long_trigger = (c1h['Low'] <= c1h['EMA_20']) and (c1h['Close'] > c1h['Open']) and is_volume_ok
+        # شورت: قیمت به نزدیکی EMA 20 پولبک زده و کندل نزولی بسته شود
+        is_short_trigger = (c1h['High'] >= c1h['EMA_20']) and (c1h['Close'] < c1h['Open']) and is_volume_ok
         
         if is_long_regime and is_long_trigger:
             entry_price = c1h['Close']
-            sl = c1h['Low'] - (1.5 * c1h['ATR'])
+            sl = c1h['Low'] - (1.2 * c1h['ATR'])
             risk = entry_price - sl
             
             if risk <= 0:
                 continue
                 
+            # ریوارد ثابت 1 به 2 دقیق
             tp = entry_price + (2.0 * risk)
             
             outcome = 'OPEN'
@@ -197,12 +177,13 @@ for symbol, df1h in data_1h.items():
                 
         elif is_short_regime and is_short_trigger:
             entry_price = c1h['Close']
-            sl = c1h['High'] + (1.5 * c1h['ATR'])
+            sl = c1h['High'] + (1.2 * c1h['ATR'])
             risk = sl - entry_price
             
             if risk <= 0:
                 continue
                 
+            # ریوارد ثابت 1 به 2 دقیق
             tp = entry_price - (2.0 * risk)
             
             outcome = 'OPEN'
@@ -226,7 +207,7 @@ for symbol, df1h in data_1h.items():
                 locked_until_index = exit_idx
 
 print("\n============================================================")
-print("📊 گزارش نهایی بک‌تست بهینه‌شده پورتفوی ارز دیجیتال")
+print("📊 گزارش نهایی بک‌تست ریوارد 1 به 2 (سبد LBank)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -248,4 +229,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط تعیین شده ثبت نشد.")
 
-print("\n✨ بک‌تست بهینه‌شده با موفقیت به پایان رسید.")
+print("\n✨ بک‌تست تخصصی با موفقیت به پایان رسید.")
