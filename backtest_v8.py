@@ -16,11 +16,10 @@ import numpy as np
 # ============================================================
 # منبع دیتای تاریخی برای بک‌تست
 # ============================================================
-# چون بایننس محدوده IP سرورهای GitHub Actions را هم مسدود می‌کند (خطای 451)،
-# به‌جای وابستگی به یک صرافی، لیستی از صرافی‌ها را به ترتیب امتحان می‌کنیم و
-# اولین موردی که واقعاً دیتا برگرداند مبنای بک‌تست قرار می‌گیرد. اجرای زنده
-# همچنان می‌تواند روی LBank باشد؛ این‌ها فقط برای گرفتن تاریخچه قیمت هستند.
-CANDIDATE_DATA_EXCHANGES = ['kucoin', 'okx', 'bybit', 'gateio', 'mexc', 'bitget']
+# LBank برای تایم‌فریم‌های 1h/4h آرشیو کامل یک‌ساله می‌دهد (طبق تست خودت)،
+# پس همان صرافی اصلی است. صرافی‌های دیگر فقط به‌عنوان پشتیبان (fallback) نگه
+# داشته شده‌اند، برای مواقعی که LBank موقتاً پاسخ ندهد.
+CANDIDATE_DATA_EXCHANGES = ['lbank', 'kucoin', 'okx', 'bybit', 'gateio', 'mexc', 'bitget']
 _exchange_instances = {}
 
 
@@ -44,34 +43,33 @@ SYMBOLS = {
     "DOT": "DOT/USDT"
 }
 
-TIMEFRAME = '15m'
+TIMEFRAME = '1h'          # ورودها روی 1 ساعته، تایید روند روی 4 ساعته (رزمپل‌شده از همین دیتا)
 DAYS_BACK = 365
 COMMISSION_RATE = 0.0008          # کارمزد کل رفت‌وبرگشت (تقریبی)
 COMMISSION_PER_SIDE = COMMISSION_RATE / 2
 SLIPPAGE_RATE = 0.04 / 100        # اسلیپیج تخمینی هر ضلع
 
-# ---------------- مقیاس‌دهی پارامترهای مبتنی بر «بازه زمانی واقعی» ----------------
-# چون از 1h به 15m رفتیم (۴ برابر کندل بیشتر در واحد زمان)، پارامترهایی که معنای
-# "طول یک بازه تقویمی" دارند (نه اندیکاتورهای استاندارد مثل RSI/BB) را ۴ برابر
-# می‌کنیم تا همان "پنجره زمانی" قبلی حفظ شود؛ در غیر این صورت فیلترها عملاً شل‌تر
-# می‌شدند بدون اینکه واقعاً تصمیم گرفته باشیم شل‌ترشان کنیم.
-TF_SCALE = 4
+TF_SCALE = 1               # روی 1 ساعته هستیم، نیازی به مقیاس‌دهی اضافه نیست
 
 # ---------------- پارامترهای استراتژی ----------------
-BB_PERIOD = 20             # استاندارد اندیکاتور، مستقل از تایم‌فریم
+BB_PERIOD = 20
 BB_STD = 2
-RSI_PERIOD = 14            # استاندارد اندیکاتور، مستقل از تایم‌فریم
-ATR_PERIOD = 14            # استاندارد اندیکاتور، مستقل از تایم‌فریم
+RSI_PERIOD = 14
+ATR_PERIOD = 14
 ATR_MA_PERIOD = 50 * TF_SCALE
 VOL_MA_PERIOD = 20 * TF_SCALE
-VP_WINDOW = 100 * TF_SCALE        # طول پنجره Fixed Range Volume Profile (بازه تقویمی ثابت)
-VP_BINS = 24                      # تعداد باکت‌های قیمتی پروفایل حجم
-VALUE_AREA_PCT = 0.70             # درصد حجم برای تعیین Value Area (VAH/VAL)
-SWING_LOOKBACK = 10 * TF_SCALE    # تعداد کندل برای سقف/کف ساختاری (بازه تقویمی ثابت)
-ADX_PERIOD = 14            # استاندارد اندیکاتور، مستقل از تایم‌فریم
-MAX_HOLD_CANDLES = 60 * TF_SCALE  # حداکثر مدت نگه‌داشتن معامله باز (بازه تقویمی ثابت)
-COOLDOWN_CANDLES = 3 * TF_SCALE   # فاصله امنیتی بعد از بسته‌شدن معامله (جلوگیری از هم‌پوشانی)
+VP_WINDOW = 100 * TF_SCALE
+VP_BINS = 24
+VALUE_AREA_PCT = 0.70
+SWING_LOOKBACK = 10 * TF_SCALE
+ADX_PERIOD = 14
+MAX_HOLD_CANDLES = 60 * TF_SCALE
+COOLDOWN_CANDLES = 3 * TF_SCALE
 MIN_WARMUP = max(250 * TF_SCALE, VP_WINDOW + ATR_MA_PERIOD + 5)
+
+# ---------------- فیلتر روند بالادستی (4 ساعته، مثل کد اولیه) ----------------
+TREND_EMA_FAST = 50
+TREND_EMA_SLOW = 200
 
 
 # ============================================================
@@ -219,6 +217,53 @@ def calculate_volume_profile(df, window=VP_WINDOW, bins=VP_BINS, va_pct=VALUE_AR
     return df
 
 
+def calculate_trend_filter(df1h):
+    """
+    فیلتر روند بالادستی روی تایم‌فریم 4 ساعته (رزمپل‌شده از همان دیتای 1h)،
+    دقیقاً به سبک کد اولیه: EMA50 و EMA200 روی کندل‌های 4 ساعته کاملاً بسته‌شده.
+    از merge_asof با جهت backward استفاده می‌شود تا هر کندل 1h فقط به آخرین
+    کندل 4h که واقعاً تا آن لحظه بسته شده دسترسی داشته باشد — صفر لوک‌آهد.
+    """
+    df1h = df1h.copy().sort_values('Date').reset_index(drop=True)
+
+    df4h = (
+        df1h.set_index('Date')
+        .resample('4h', label='left', closed='left')
+        .agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'})
+        .dropna()
+        .reset_index()
+    )
+    df4h['EMA_FAST'] = df4h['Close'].ewm(span=TREND_EMA_FAST, adjust=False).mean()
+    df4h['EMA_SLOW'] = df4h['Close'].ewm(span=TREND_EMA_SLOW, adjust=False).mean()
+    df4h['EMA_SLOW_PREV'] = df4h['EMA_SLOW'].shift(1)
+    df4h['CLOSE_4H'] = df4h['Close']
+    # کندل 4 ساعته‌ای که از ساعت X شروع شده، فقط از ساعت X+4 به بعد "کاملاً بسته" و قابل استفاده است
+    df4h['AVAILABLE_AT'] = df4h['Date'] + pd.Timedelta(hours=4)
+
+    merge_cols = df4h[['AVAILABLE_AT', 'CLOSE_4H', 'EMA_FAST', 'EMA_SLOW', 'EMA_SLOW_PREV']].sort_values('AVAILABLE_AT')
+
+    merged = pd.merge_asof(
+        df1h, merge_cols,
+        left_on='Date', right_on='AVAILABLE_AT',
+        direction='backward'
+    )
+
+    is_long_regime = (
+        (merged['CLOSE_4H'] > merged['EMA_SLOW'])
+        & (merged['EMA_FAST'] > merged['EMA_SLOW'])
+        & (merged['EMA_SLOW'] >= merged['EMA_SLOW_PREV'])
+    )
+    is_short_regime = (
+        (merged['CLOSE_4H'] < merged['EMA_SLOW'])
+        & (merged['EMA_FAST'] < merged['EMA_SLOW'])
+        & (merged['EMA_SLOW'] <= merged['EMA_SLOW_PREV'])
+    )
+
+    merged['TREND_LONG_OK'] = is_long_regime.fillna(False)
+    merged['TREND_SHORT_OK'] = is_short_regime.fillna(False)
+    return merged
+
+
 def compute_r(entry_price, exit_price, sl_dist, is_long):
     entry_fee = entry_price * COMMISSION_PER_SIDE
     exit_fee = exit_price * COMMISSION_PER_SIDE
@@ -317,6 +362,7 @@ def run_backtest_for_symbol(symbol, df1h):
 
     df = calculate_indicators(df1h)
     df = calculate_volume_profile(df)
+    df = calculate_trend_filter(df)
 
     trades = []
     locked_until_index = 0
@@ -336,35 +382,35 @@ def run_backtest_for_symbol(symbol, df1h):
         if c['ATR_MA'] == 0 or c['ATR'] <= 0:
             continue
 
-        # ---- فیلتر رژیم بازار (جلوگیری از ترید در بازار رنج/پرخطر) ----
+        # ---- فیلتر رژیم بازار (نوسان + حجم + روند 4 ساعته) ----
         atr_ratio = c['ATR'] / c['ATR_MA']
         vol_ok = c['Volume'] >= 0.8 * c['Vol_MA']
-        regime_ok = (0.7 <= atr_ratio <= 2.5) and (c['ADX'] >= 15) and vol_ok
-        if not regime_ok:
-            continue
+        volatility_ok = (0.7 <= atr_ratio <= 2.5) and (c['ADX'] >= 15)
 
         adx_not_extreme = c['ADX'] <= 45
 
-        # ---- شرایط ورود لانگ ----
+        # ---- شرایط ورود لانگ: فقط اگر روند 4 ساعته هم صعودی باشد ----
         long_signal = (
-            c['Low'] <= c['BB_LOWER']
+            volatility_ok and vol_ok and adx_not_extreme
+            and bool(c['TREND_LONG_OK'])
+            and c['Low'] <= c['BB_LOWER']
             and c['Close'] > c['BB_LOWER']
             and c['Close'] <= max(c['POC'], c['VAL'] * 1.01)
             and 25 <= c['RSI'] <= 40
             and c['RSI'] > prev['RSI']
             and c['Close'] > c['Open']
-            and adx_not_extreme
         )
 
-        # ---- شرایط ورود شورت ----
+        # ---- شرایط ورود شورت: فقط اگر روند 4 ساعته هم نزولی باشد ----
         short_signal = (
-            c['High'] >= c['BB_UPPER']
+            volatility_ok and vol_ok and adx_not_extreme
+            and bool(c['TREND_SHORT_OK'])
+            and c['High'] >= c['BB_UPPER']
             and c['Close'] < c['BB_UPPER']
             and c['Close'] >= min(c['POC'], c['VAH'] * 0.99)
             and 60 <= c['RSI'] <= 75
             and c['RSI'] < prev['RSI']
             and c['Close'] < c['Open']
-            and adx_not_extreme
         )
 
         if not long_signal and not short_signal:
@@ -438,9 +484,8 @@ def main():
     since_timestamp = int(start_date.timestamp() * 1000)
 
     print("============================================================")
-    print("📥 دانلود داده‌های یک‌ساله (تایم‌فریم 15 دقیقه)")
+    print("📥 دانلود داده‌های یک‌ساله (تایم‌فریم 1 ساعته)")
     print(f"   ترتیب امتحان صرافی‌ها: {', '.join(CANDIDATE_DATA_EXCHANGES)}")
-    print("   (فقط برای منبع دیتا؛ اجرای زنده می‌تواند روی LBank باشد)")
     print("============================================================")
 
     data_1h = {}
