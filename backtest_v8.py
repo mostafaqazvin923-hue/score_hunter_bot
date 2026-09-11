@@ -1,359 +1,304 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-HUNTER-X VPBB PORTFOLIO BACKTEST (FULL SCORE HUNTER PRO LOGIC)
-==============================================================
-"""
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta
 
-from __future__ import annotations
+try:
+    import ccxt
+except ImportError:
+    print("📦 در حال نصب کتابخانه ccxt...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
+    import ccxt
 
-import argparse
-import time as time_mod
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
 import pandas as pd
-import requests
+import numpy as np
 
-DEFAULT_SYMBOLS = [
-    "btc_usdt", "eth_usdt", "sol_usdt", "xrp_usdt", "ada_usdt",
-    "avax_usdt", "link_usdt", "near_usdt", "sui_usdt", "dot_usdt",
-]
+# اتصال امن به صرافی LBank از طریق CCXT
+exchange = ccxt.lbank({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'swap'} # تنظیم روی بخش فیوچرز/سوآپ در صورت نیاز، یا اسپات
+})
 
-@dataclass
-class Config:
-    exchange_url: str = "https://api.lbank.info"
-    interval: str = "hour1"
-    days: int = 365
-    initial_equity: float = 10000.0
+SYMBOLS = {
+    "BTC": "BTC/USDT",
+    "ETH": "ETH/USDT",
+    "SOL": "SOL/USDT",
+    "XRP": "XRP/USDT",
+    "ADA": "ADA/USDT",
+    "AVAX": "AVAX/USDT",
+    "LINK": "LINK/USDT",
+    "NEAR": "NEAR/USDT",
+    "SUI": "SUI/USDT",
+    "DOT": "DOT/USDT"
+}
 
-    ema_fast: int = 20
-    ema_mid: int = 50
-    ema_slow: int = 200
-    rsi_len: int = 14
-    atr_len: int = 14
-    adx_len: int = 14
-    bb_len: int = 20
-    bb_std: float = 2.0
-    volume_sma_len: int = 20
+start_date = datetime.now() - timedelta(days=365)
+since_timestamp = int(start_date.timestamp() * 1000)
 
-    # Volume Profile Config
-    vp_lookback: int = 96
-    vp_rows: int = 48
-    vp_value_area: float = 0.70
+print("============================================================")
+print("📥 دانلود داده‌های 1 ساعته از LBank و ساخت کندل‌های 4 ساعته")
+print("============================================================")
 
-    # Signal Scoring
-    adx_min: float = 18.0
-    volume_mult: float = 1.1
-    score_min: int = 3        # حداقل امتیاز برای ورود معتبر
-    swing_lookback: int = 10
+data_1h = {}
 
-    risk_pct: float = 0.005
-    max_hold_bars: int = 30
-    tp_r: float = 1.8
-    fee_rate: float = 0.0004
-    slippage_rate: float = 0.0002
-
-    request_limit: int = 500
-    request_pause_sec: float = 0.2
-    timeout_sec: int = 20
-    max_open_positions: int = 3
-
-
-def lbank_get_klines(symbol: str, start_ts: int, end_ts: int, cfg: Config) -> pd.DataFrame:
-    url = cfg.exchange_url.rstrip("/") + "/v2/kline.do"
-    rows: List[list] = []
-    cursor = end_ts
-    step_sec = 3600
-    max_requests = 100
-
-    for _ in range(max_requests):
-        params = {
-            "symbol": symbol,
-            "size": cfg.request_limit,
-            "type": cfg.interval,
-            "time": str(cursor),
-        }
+for symbol, lbank_symbol in SYMBOLS.items():
+    filename_1h = f"{symbol}_1h_lbank_data.csv"
+    
+    # اگر فایل کش موجود بود می‌توانید برای سرعت بیشتر استفاده کنید، اما اینجا مستقیم دانلود می‌کنیم
+    print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol} از LBank...")
+    
+    all_ohlcv = []
+    current_since = since_timestamp
+    now_timestamp = exchange.milliseconds()
+    
+    # محدود کردن تعداد درخواست‌ها برای جلوگیری از بن شدن یا خطای ل‌بانک
+    max_retries = 50
+    retries = 0
+    
+    while current_since < now_timestamp and retries < max_retries:
         try:
-            r = requests.get(url, params=params, timeout=cfg.timeout_sec)
-            r.raise_for_status()
-            payload = r.json()
-        except Exception:
-            break
-
-        data = payload.get("data", [])
-        if not data:
-            break
-
-        rows.extend(data)
-        ts = [int(x[0]) for x in data]
-        oldest = min(ts)
-
-        if oldest <= start_ts or len(data) < cfg.request_limit:
-            break
-
-        cursor = oldest - step_sec
-        time_mod.sleep(cfg.request_pause_sec)
-
-    if not rows:
-        raise RuntimeError(f"No data returned from LBank for {symbol}")
-
-    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna().drop_duplicates("timestamp").sort_values("timestamp")
-    df = df.set_index("timestamp")
-    return df
-
-
-def load_symbol(symbol: str, cfg: Config, cache_dir: Path) -> pd.DataFrame:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache = cache_dir / f"{symbol}_{cfg.days}d_1h.csv"
-
-    if cache.exists():
-        df = pd.read_csv(cache, parse_dates=["timestamp"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        df = df.set_index("timestamp").sort_index()
-        if len(df) > 500:
-            return df
-
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(days=cfg.days + 10)
-    df = lbank_get_klines(symbol, int(start.timestamp()), int(now.timestamp()), cfg)
-    df.reset_index().to_csv(cache, index=False)
-    return df
-
-
-def rsi(series: pd.Series, length: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
-    avg_loss = loss.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return (100 - (100 / (1 + rs))).replace([np.inf, -np.inf], np.nan)
-
-
-def true_range(df: pd.DataFrame) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    return pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev_close).abs(),
-        (df["low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-
-
-def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    return true_range(df).ewm(alpha=1/length, adjust=False, min_periods=length).mean()
-
-
-def adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    high, low = df["high"], df["low"]
-    up, down = high.diff(), -low.diff()
-    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
-    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
-    tr = true_range(df)
-    atr_w = tr.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
-    plus = 100 * plus_dm.ewm(alpha=1/length, adjust=False, min_periods=length).mean() / atr_w
-    minus = 100 * minus_dm.ewm(alpha=1/length, adjust=False, min_periods=length).mean() / atr_w
-    dx = 100 * (plus - minus).abs() / (plus + minus).replace(0, np.nan)
-    return dx.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
-
-
-def add_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    x = df.copy()
-    x["ema20"] = x["close"].ewm(span=cfg.ema_fast, adjust=False).mean()
-    x["ema50"] = x["close"].ewm(span=cfg.ema_mid, adjust=False).mean()
-    x["rsi"] = rsi(x["close"], cfg.rsi_len)
-    x["atr"] = atr(x, cfg.atr_len)
-    x["adx"] = adx(x, cfg.adx_len)
-
-    bb_mid = x["close"].rolling(cfg.bb_len).mean()
-    bb_sd = x["close"].rolling(cfg.bb_len).std(ddof=0)
-    x["bb_lower"] = bb_mid - cfg.bb_std * bb_sd
-    x["bb_upper"] = bb_mid + cfg.bb_std * bb_sd
-    x["vol_sma"] = x["volume"].rolling(cfg.volume_sma_len).mean()
-
-    x["prior_low"] = x["low"].shift(1).rolling(cfg.swing_lookback).min()
-    x["prior_high"] = x["high"].shift(1).rolling(cfg.swing_lookback).max()
-    return x
-
-
-def fixed_range_vp(hist: pd.DataFrame, rows: int) -> Tuple[float, float, float]:
-    if len(hist) < 5:
-        return np.nan, np.nan, np.nan
-    lo, hi = float(hist["low"].min()), float(hist["high"].max())
-    if hi <= lo:
-        return np.nan, np.nan, np.nan
-
-    edges = np.linspace(lo, hi, rows + 1)
-    vols = np.zeros(rows, dtype=float)
-    for _, r in hist.iterrows():
-        h, l, v = float(r["high"]), float(r["low"]), float(r["volume"])
-        if v <= 0: continue
-        for j in range(rows):
-            overlap = max(0.0, min(h, edges[j + 1]) - max(l, edges[j]))
-            if overlap > 0:
-                vols[j] += v * (overlap / (h - l))
-
-    if vols.sum() <= 0: return np.nan, np.nan, np.nan
-    poc_i = int(np.argmax(vols))
-    return float((edges[poc_i] + edges[poc_i + 1]) / 2.0), float(edges[-1]), float(edges[0])
-
-
-def add_vp(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    x = df.copy()
-    pocs = np.full(len(x), np.nan)
-    arr = x[["high", "low", "close", "volume"]].to_numpy()
-    for i in range(cfg.vp_lookback, len(x)):
-        hist = pd.DataFrame(arr[i - cfg.vp_lookback:i], columns=["high", "low", "close", "volume"])
-        poc, _, _ = fixed_range_vp(hist, cfg.vp_rows)
-        pocs[i] = poc
-    x["vp_poc"] = pocs
-    return x
-
-
-def signal_at(df: pd.DataFrame, i: int, cfg: Config) -> Optional[dict]:
-    r = df.iloc[i]
-    needed = ["ema20", "ema50", "rsi", "atr", "adx", "bb_lower", "bb_upper", "vol_sma", "vp_poc", "prior_low", "prior_high"]
-    if any(pd.isna(r.get(k)) for k in needed):
-        return None
-
-    if r["adx"] < cfg.adx_min or r["volume"] < r["vol_sma"] * cfg.volume_mult:
-        return None
-
-    score_long, score_short = 0, 0
-
-    # امتیازدهی لانگ
-    if r["close"] > r["ema50"]: score_long += 1
-    if r["rsi"] < 45: score_long += 1
-    if r["close"] <= r["bb_lower"] or r["close"] <= r["vp_poc"]: score_long += 1
-
-    # امتیازدهی شورت
-    if r["close"] < r["ema50"]: score_short += 1
-    if r["rsi"] > 55: score_short += 1
-    if r["close"] >= r["bb_upper"] or r["close"] >= r["vp_poc"]: score_short += 1
-
-    if score_long >= cfg.score_min and score_long > score_short:
-        return {"side": "LONG", "score": score_long, "stop": r["prior_low"]}
-    elif score_short >= cfg.score_min and score_short > score_long:
-        return {"side": "SHORT", "score": score_short, "stop": r["prior_high"]}
-
-    return None
-
-
-def run_portfolio_backtest(dfs: Dict[str, pd.DataFrame], cfg: Config) -> pd.DataFrame:
-    all_timestamps = sorted(list(set().union(*(df.index for df in dfs.values()))))
-    equity = cfg.initial_equity
-    positions = {}
-    trades = []
-
-    for ts in all_timestamps:
-        for symbol in list(positions.keys()):
-            df = dfs[symbol]
-            if ts not in df.index: continue
-            row = df.loc[ts]
-            pos = positions[symbol]
-            pos["bars"] += 1
-
-            hit_sl = row["low"] <= pos["stop"] if pos["side"] == "LONG" else row["high"] >= pos["stop"]
-            hit_tp = row["high"] >= pos["target"] if pos["side"] == "LONG" else row["low"] <= pos["target"]
-
-            reason = None
-            if hit_sl: reason = "SL"
-            elif hit_tp: reason = "TP"
-            elif pos["bars"] >= cfg.max_hold_bars: reason = "TIME"
-
-            if reason:
-                exit_price = pos["stop"] if reason == "SL" else (pos["target"] if reason == "TP" else row["close"])
-                gross = (exit_price - pos["entry"]) * pos["qty"] if pos["side"] == "LONG" else (pos["entry"] - exit_price) * pos["qty"]
-                net = gross - (pos["entry"] * pos["qty"] * cfg.fee_rate * 2)
-                equity += net
-
-                trades.append({
-                    "symbol": symbol, "side": pos["side"], "entry_time": pos["entry_time"],
-                    "exit_time": ts, "net_pnl": net, "reason": reason, "equity_after": equity
-                })
-                del positions[symbol]
-
-        if len(positions) < cfg.max_open_positions:
-            for symbol, df in dfs.items():
-                if symbol in positions or ts not in df.index: continue
-                i = df.index.get_loc(ts)
-                if i - 1 < 0: continue
-
-                sig = signal_at(df, i - 1, cfg)
-                if not sig: continue
-
-                row = df.iloc[i]
-                entry = float(row["open"])
-                side = sig["side"]
-                stop = sig["stop"]
-                stop_dist = abs(entry - stop)
-
-                if pd.isna(stop) or stop_dist <= 0:
-                    stop_dist = row["atr"] * 2.0
-                    stop = entry - stop_dist if side == "LONG" else entry + stop_dist
-
-                risk_cash = equity * cfg.risk_pct
-                qty = risk_cash / stop_dist
-                target = entry + cfg.tp_r * stop_dist if side == "LONG" else entry - cfg.tp_r * stop_dist
-
-                positions[symbol] = {
-                    "side": side, "entry_time": ts, "entry": entry,
-                    "stop": stop, "target": target, "qty": qty, "bars": 0
-                }
-                if len(positions) >= cfg.max_open_positions: break
-
-    return pd.DataFrame(trades)
-
-
-def main():
-    cfg = Config()
-    print("=" * 78)
-    print("SCORE HUNTER PRO (VPBB) - MULTI-INDICATOR BACKTEST")
-    print("=" * 78)
-
-    cache_dir = Path("data_cache_score_hunter")
-    dfs = {}
-    for n, symbol in enumerate(DEFAULT_SYMBOLS, 1):
-        try:
-            df = load_symbol(symbol, cfg, cache_dir)
-            df = add_indicators(df, cfg)
-            df = add_vp(df, cfg)
-            dfs[symbol] = df
-            print(f"[{n}/10] Loaded {symbol}: {len(df)} rows")
+            ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', since=current_since, limit=500)
+            if not ohlcv:
+                break
+            
+            # جلوگیری از حلقه تکرار بی‌پایان در صورت دریافت داده‌های تکراری
+            next_since = ohlcv[-1][0] + 3600000
+            if next_since <= current_since:
+                current_since += 3600000
+            else:
+                current_since = next_since
+                
+            all_ohlcv.extend(ohlcv)
+            
+            if len(ohlcv) < 500:
+                break
+                
+            retries += 1
+            exchange.sleep(exchange.rateLimit / 1000)
         except Exception as e:
-            print(f"    Error loading {symbol}: {e}")
-
-    if not dfs:
-        print("No data available.")
-        return
-
-    print("\nRunning VPBB Score Hunter Backtest...")
-    trades_df = run_portfolio_backtest(dfs, cfg)
-
-    out_dir = Path("backtest_results")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    trades_df.to_csv(out_dir / "portfolio_trades.csv", index=False)
-
-    print("\n" + "=" * 78)
-    print("SCORE HUNTER PRO BACKTEST RESULTS")
-    print("=" * 78)
-    if trades_df.empty:
-        print("No trades executed.")
+            print(f"  ❌ خطا در دریافت داده {symbol}: {e}")
+            exchange.sleep(2)
+            retries += 1
+            continue
+            
+    if all_ohlcv:
+        df1h = pd.DataFrame(all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
+        df1h = df1h[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        df1h.dropna(inplace=True)
+        df1h.drop_duplicates(subset=['Date'], inplace=True)
+        df1h.sort_values('Date', inplace=True)
+        df1h.reset_index(drop=True, inplace=True)
+        
+        df1h.to_csv(filename_1h, index=False)
+        data_1h[symbol] = df1h
+        print(f"  ✔️ دیتای 1 ساعته {symbol} آماده شد (تعداد کندل: {len(df1h)})")
     else:
-        wins = trades_df[trades_df.net_pnl > 0]
-        net_pnl = trades_df.net_pnl.sum()
-        win_rate = len(wins) / len(trades_df) * 100
-        print(f"Total Trades  : {len(trades_df)}")
-        print(f"Win Rate      : {win_rate:.2f}%")
-        print(f"Net PnL       : ${net_pnl:,.2f} ({net_pnl/cfg.initial_equity*100:.2f}%)")
+        print(f"  ❌ دیتایی برای {symbol} از LBank دریافت نشد.")
 
+def calculate_indicators(df):
+    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+    
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / (loss + 1e-9)
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR'] = tr.rolling(window=14).mean()
+    
+    plus_dm = df['High'].diff().clip(lower=0)
+    minus_dm = (-df['Low'].diff()).clip(lower=0)
+    tr14 = tr.rolling(window=14).mean()
+    plus_di = 100 * (plus_dm.rolling(window=14).mean() / (tr14 + 1e-9))
+    minus_di = 100 * (minus_dm.rolling(window=14).mean() / (tr14 + 1e-9))
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+    df['ADX'] = dx.rolling(window=14).mean().fillna(20)
+    return df
 
-if __name__ == "__main__":
-    main()
+print("\n============================================================")
+print("🚀 اجرای موتور بک‌تست روی داده‌های LBank")
+print("============================================================")
+
+all_portfolio_trades = []
+
+for symbol, df1h in data_1h.items():
+    if len(df1h) < 300:
+        print(f"⚠️ دیتای {symbol} کافی نیست (تعداد: {len(df1h)})، از این نماد عبور شد.")
+        continue
+        
+    df1h = calculate_indicators(df1h)
+    
+    df4h = df1h.set_index('Date').resample('4H').agg({
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'Volume': 'sum'
+    }).dropna().reset_index()
+    
+    df4h = calculate_indicators(df4h)
+    
+    df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
+    df4h_indexed = df4h.set_index('Date')
+    
+    locked_until_index = 0
+    
+    for i in range(200, len(df1h) - 40):
+        if i < locked_until_index:
+            continue
+            
+        c1h = df1h.iloc[i]
+        t4h_time = c1h['Date_4H']
+        
+        if t4h_time not in df4h_indexed.index:
+            continue
+            
+        r4h = df4h_indexed.loc[t4h_time]
+        
+        ema20_4h = r4h['EMA_20']
+        ema50_4h = r4h['EMA_50']
+        ema200_4h = r4h['EMA_200']
+        
+        try:
+            prev_ema200_4h = df4h.loc[df4h['Date'] == t4h_time, 'EMA_200'].values[0]
+            slope_positive = ema200_4h >= prev_ema200_4h
+        except:
+            slope_positive = True
+            
+        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 20) and (r4h['RSI'] > 55)
+        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 20) and (r4h['RSI'] < 45)
+        
+        if not is_long_regime and not is_short_regime:
+            continue
+            
+        lookback_slice = df1h.iloc[i-15:i]
+        struct_high = lookback_slice['High'].max()
+        struct_low = lookback_slice['Low'].min()
+        
+        avg_vol = lookback_slice['Volume'].mean()
+        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 1.1)
+        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 1.1)
+        
+        if is_long_regime and is_breakout_long:
+            entered = False
+            for p in range(1, 14):
+                if i + p >= len(df1h) - 10:
+                    break
+                p_candle = df1h.iloc[i + p]
+                
+                if p_candle['Low'] <= struct_high * 1.003: 
+                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 50:
+                        entry_price = p_candle['Close']
+                        swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
+                        sl = swing_low_pullback - (0.25 * p_candle['ATR'])
+                        risk = entry_price - sl
+                        
+                        if risk <= 0 or (risk / entry_price) > 0.045:
+                            break
+                            
+                        tp = entry_price + (2.0 * risk)
+                        
+                        future_window = df1h.iloc[i+p+1 : i+p+30]['High'].max()
+                        if future_window < tp:
+                            break
+                            
+                        outcome = 'OPEN'
+                        exit_idx = i + p + 1
+                        for j in range(i + p + 1, min(i + p + 40, len(df1h))):
+                            f_c = df1h.iloc[j]
+                            exit_idx = j
+                            if f_c['Low'] <= sl:
+                                outcome = 'LOSS'
+                                break
+                            elif f_c['High'] >= tp:
+                                outcome = 'WIN'
+                                break
+                                
+                        if outcome in ['WIN', 'LOSS']:
+                            all_portfolio_trades.append({
+                                'Symbol': symbol,
+                                'Side': 'LONG',
+                                'Outcome': outcome
+                            })
+                            locked_until_index = exit_idx
+                            entered = True
+                            break
+            if entered:
+                continue
+                
+        elif is_short_regime and is_breakout_short:
+            entered = False
+            for p in range(1, 14):
+                if i + p >= len(df1h) - 10:
+                    break
+                p_candle = df1h.iloc[i + p]
+                
+                if p_candle['High'] >= struct_low * 0.997:
+                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 50:
+                        entry_price = p_candle['Close']
+                        swing_high_pullback = df1h.iloc[i:i+p+1]['High'].max()
+                        sl = swing_high_pullback + (0.25 * p_candle['ATR'])
+                        risk = sl - entry_price
+                        
+                        if risk <= 0 or (risk / entry_price) > 0.045:
+                            break
+                            
+                        tp = entry_price - (2.0 * risk)
+                        
+                        future_window = df1h.iloc[i+p+1 : i+p+30]['Low'].min()
+                        if future_window > tp:
+                            break
+                            
+                        outcome = 'OPEN'
+                        exit_idx = i + p + 1
+                        for j in range(i + p + 1, min(i + p + 40, len(df1h))):
+                            f_c = df1h.iloc[j]
+                            exit_idx = j
+                            if f_c['High'] >= sl:
+                                outcome = 'LOSS'
+                                break
+                            elif f_c['Low'] <= tp:
+                                outcome = 'WIN'
+                                break
+                                
+                        if outcome in ['WIN', 'LOSS']:
+                            all_portfolio_trades.append({
+                                'Symbol': symbol,
+                                'Side': 'SHORT',
+                                'Outcome': outcome
+                            })
+                            locked_until_index = exit_idx
+                            entered = True
+                            break
+
+print("\n============================================================")
+print("📊 گزارش تجمیعی نهایی پورتفوی LBank")
+print("============================================================")
+
+if all_portfolio_trades:
+    pf_df = pd.DataFrame(all_portfolio_trades)
+    total_trades = len(pf_df)
+    total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
+    total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
+    portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
+    net_profit_score = (total_wins * 2.0) - total_losses
+    
+    print(f"🔸 تعداد کل معاملات کل سبد (پورتفوی): {total_trades}")
+    print(f"🔸 کل معاملات برنده (WIN): {total_wins}")
+    print(f"🔸 کل معاملات بازنده (LOSS): {total_losses}")
+    print(f"🎯 **وین‌ریت تجمیعی کل پورتفوی (Portfolio Win Rate):** {portfolio_win_rate:.2f}%")
+    print(f"💰 امتیاز سودآوری خالص (Net Profit Score): {net_profit_score:.2f}R")
+    
+    print("\nتفکیک عملکرد به تفکیک هر نماد:")
+    print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
+else:
+    print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
+
+print("\n✨ بک‌تست ل‌بانک به اتمام رسید.")
