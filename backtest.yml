@@ -21,16 +21,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt pandas numpy
 
-      - name: Verify Backtest File
+      - name: Verify Backtest
         run: |
-          echo "=== Repository Files ==="
+          echo "Repository files:"
           ls -la
-          echo "=== Checking backtest_v8.py ==="
+          echo "Checking backtest_v8.py..."
           test -f backtest_v8.py
-          echo "backtest_v8.py FOUND"
+          echo "OK - backtest_v8.py exists"
 
-      - name: Run Backtest V8
+      - name: Run Backtest
         run: |
-          echo "=== STARTING BACKTEST V8 ==="
           python backtest_v8.py
-          echo "=== BACKTEST FINISHED ==="
