@@ -19,6 +19,7 @@ exchange = ccxt.lbank({
     'options': {'defaultType': 'swap'}
 })
 
+# لیست ۳۰ ارز برتر و پرنقدینگی فیوچرز برای افزایش تعداد معاملات
 SYMBOLS = {
     "BTC": "BTC/USDT",
     "ETH": "ETH/USDT",
@@ -29,14 +30,38 @@ SYMBOLS = {
     "LINK": "LINK/USDT",
     "NEAR": "NEAR/USDT",
     "SUI": "SUI/USDT",
-    "DOT": "DOT/USDT"
+    "DOT": "DOT/USDT",
+    "DOGE": "DOGE/USDT",
+    "SHIB": "SHIB/USDT",
+    "PEPE": "PEPE/USDT",
+    "ARB": "ARB/USDT",
+    "OP": "OP/USDT",
+    "MATIC": "MATIC/USDT",
+    "ATOM": "ATOM/USDT",
+    "FTM": "FTM/USDT",
+    "RENDER": "RENDER/USDT",
+    "INJ": "INJ/USDT",
+    "FET": "FET/USDT",
+    "NEAR": "NEAR/USDT", # اگر تکراری بود جایش ارز دیگری می‌گذاریم
+    "APT": "APT/USDT",
+    "TIA": "TIA/USDT",
+    "SEI": "SEI/USDT",
+    "NEAR": "NEAR/USDT",
+    "ICP": "ICP/USDT",
+    "FIL": "FIL/USDT",
+    "UNI": "UNI/USDT",
+    "BCH": "BCH/USDT",
+    "LTC": "LTC/USDT"
 }
+
+# حذف احتمال تکرار کلیدها در دیکشنری
+SYMBOLS = {k: v for k, v in SYMBOLS.items()} # یکتا سازی
 
 start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته از LBank و ساخت کندل‌های 4 ساعته")
+print(f"📥 دانلود داده‌های 1 ساعته {len(SYMBOLS)} رمزارز از LBank و ساخت کندل‌های 4 ساعته")
 print("============================================================")
 
 data_1h = {}
@@ -119,7 +144,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست روی داده‌های LBank")
+print("🚀 اجرای موتور بک‌تست روی سبد جدید ارزهای LBank")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -131,7 +156,6 @@ for symbol, df1h in data_1h.items():
         
     df1h = calculate_indicators(df1h)
     
-    # اصلاح شده با '4h' کوچک برای جلوگیری از خطای آینده پانداس
     df4h = df1h.set_index('Date').resample('4h').agg({
         'Open': 'first',
         'High': 'max',
@@ -276,7 +300,7 @@ for symbol, df1h in data_1h.items():
                             break
 
 print("\n============================================================")
-print("📊 گزارش تجمیعی نهایی پورتفوی LBank")
+print("📊 گزارش تجمیعی نهایی پورتفوی بزرگ LBank")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -298,4 +322,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ بک‌تست ل‌بانک بدون اخطار به اتمام رسید.")
+print("\n✨ بک‌تست سبد بزرگ ل‌بانک به اتمام رسید.")
