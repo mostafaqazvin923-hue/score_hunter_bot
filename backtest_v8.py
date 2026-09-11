@@ -432,9 +432,12 @@ def run_backtest_for_symbol(symbol, df1h):
                 continue
             sl_price = entry_price - sl_dist
 
-            tp1_price = c['POC'] if c['POC'] > entry_price else c['VAH']
+            tp1_candidate = c['POC'] if c['POC'] > entry_price else c['VAH']
+            tp1_min_dist = 0.75 * sl_dist  # حداقل فاصله TP1 تا ورود، برای جلوگیری از سود جزئی ناچیز
+            tp1_price = max(tp1_candidate, entry_price + tp1_min_dist)
             tp2_r_price = entry_price + 2 * sl_dist
             tp2_price = min(tp2_r_price, c['SWING_HIGH']) if c['SWING_HIGH'] > entry_price else tp2_r_price
+            tp2_price = max(tp2_price, tp1_price + 0.25 * sl_dist)  # اطمینان از فاصله معنادار TP2 نسبت به TP1
 
             if not (sl_price < entry_price < tp1_price < tp2_price):
                 continue
@@ -458,9 +461,12 @@ def run_backtest_for_symbol(symbol, df1h):
                 continue
             sl_price = entry_price + sl_dist
 
-            tp1_price = c['POC'] if c['POC'] < entry_price else c['VAL']
+            tp1_candidate = c['POC'] if c['POC'] < entry_price else c['VAL']
+            tp1_min_dist = 0.75 * sl_dist
+            tp1_price = min(tp1_candidate, entry_price - tp1_min_dist)
             tp2_r_price = entry_price - 2 * sl_dist
             tp2_price = max(tp2_r_price, c['SWING_LOW']) if c['SWING_LOW'] < entry_price else tp2_r_price
+            tp2_price = min(tp2_price, tp1_price - 0.25 * sl_dist)
 
             if not (tp2_price < tp1_price < entry_price < sl_price):
                 continue
