@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HUNTER-X VPBB PORTFOLIO BACKTEST (DIAGNOSTIC & FIXED CACHE)
-===========================================================
+HUNTER-X VPBB FULL PORTFOLIO BACKTEST (LBANK INTEGRATED - 365 DAYS)
+===================================================================
 """
 
 from __future__ import annotations
@@ -44,8 +44,8 @@ class Config:
     fee_rate: float = 0.0004
     slippage_rate: float = 0.0002
 
-    request_limit: int = 2000
-    request_pause_sec: float = 0.15
+    request_limit: int = 500      # اصلاح سقف درخواست صرافی LBank به 500
+    request_pause_sec: float = 0.2
     timeout_sec: int = 20
     max_open_positions: int = 3
 
@@ -55,7 +55,7 @@ def lbank_get_klines(symbol: str, start_ts: int, end_ts: int, cfg: Config) -> pd
     rows: List[list] = []
     cursor = end_ts
     step_sec = 3600
-    max_requests = max(20, int(cfg.days * 24 / cfg.request_limit) + 20)
+    max_requests = int((cfg.days * 24) / cfg.request_limit) + 50
 
     for _ in range(max_requests):
         params = {
@@ -71,14 +71,6 @@ def lbank_get_klines(symbol: str, start_ts: int, end_ts: int, cfg: Config) -> pd
         except Exception as e:
             print(f"    Network warning for {symbol}: {e}")
             break
-
-        # بررسی انعطاف‌پذیر پاسخ صرافی
-        is_true = str(payload.get("result", "")).lower() == "true"
-        is_code_zero = payload.get("code") == 0 or payload.get("error_code") == 0
-        if not (is_true or is_code_zero):
-            # اگر فیلد result نبود ولی دیتا موجود بود
-            if not payload.get("data"):
-                break
 
         data = payload.get("data", [])
         if not data:
@@ -116,11 +108,11 @@ def load_symbol(symbol: str, cfg: Config, cache_dir: Path) -> pd.DataFrame:
         df = pd.read_csv(cache, parse_dates=["timestamp"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         df = df.set_index("timestamp").sort_index()
-        if len(df) > 100:
+        if len(df) > 1000:  # اگر کش کامل بود از آن استفاده کن
             return df
 
     now = datetime.now(timezone.utc)
-    start = now - timedelta(days=cfg.days + 30)
+    start = now - timedelta(days=cfg.days + 10)
     df = lbank_get_klines(symbol, int(start.timestamp()), int(now.timestamp()), cfg)
     df.reset_index().to_csv(cache, index=False)
     return df
@@ -153,10 +145,9 @@ def signal_at(df: pd.DataFrame, i: int) -> Optional[dict]:
     if pd.isna(r.get("rsi")) or pd.isna(r.get("bb_lower")):
         return None
 
-    # شرط بسیار ساده برای تست قطعی اجرای ترید
-    if r["rsi"] < 48:
+    if r["rsi"] < 42:
         return {"side": "LONG", "stop": r["prior_low"] if not pd.isna(r["prior_low"]) else r["low"] * 0.98}
-    elif r["rsi"] > 52:
+    elif r["rsi"] > 58:
         return {"side": "SHORT", "stop": r["prior_high"] if not pd.isna(r["prior_high"]) else r["high"] * 1.02}
     return None
 
@@ -166,10 +157,8 @@ def run_portfolio_backtest(dfs: Dict[str, pd.DataFrame], cfg: Config) -> pd.Data
     equity = cfg.initial_equity
     positions = {}
     trades = []
-    signal_count = 0
 
     for ts in all_timestamps:
-        # مدیریت خروج پوزیشن‌ها
         for symbol in list(positions.keys()):
             df = dfs[symbol]
             if ts not in df.index:
@@ -194,11 +183,10 @@ def run_portfolio_backtest(dfs: Dict[str, pd.DataFrame], cfg: Config) -> pd.Data
 
                 trades.append({
                     "symbol": symbol, "side": pos["side"], "entry_time": pos["entry_time"],
-                    "exit_time": ts, "net_pnl": net, "reason": reason
+                    "exit_time": ts, "net_pnl": net, "reason": reason, "equity_after": equity
                 })
                 del positions[symbol]
 
-        # باز کردن پوزیشن جدید
         if len(positions) < cfg.max_open_positions:
             for symbol, df in dfs.items():
                 if symbol in positions or ts not in df.index:
@@ -211,7 +199,6 @@ def run_portfolio_backtest(dfs: Dict[str, pd.DataFrame], cfg: Config) -> pd.Data
                 if not sig:
                     continue
 
-                signal_count += 1
                 row = df.iloc[i]
                 entry = float(row["open"])
                 side = sig["side"]
@@ -233,7 +220,6 @@ def run_portfolio_backtest(dfs: Dict[str, pd.DataFrame], cfg: Config) -> pd.Data
                 if len(positions) >= cfg.max_open_positions:
                     break
 
-    print(f"Total Raw Signals Generated: {signal_count}")
     return pd.DataFrame(trades)
 
 
@@ -244,10 +230,10 @@ def main():
 
     cfg = Config(days=parsed.days)
     print("=" * 78)
-    print("HUNTER-X VPBB DIAGNOSTIC BACKTEST")
+    print("HUNTER-X VPBB FULL 365-DAY PORTFOLIO BACKTEST")
     print("=" * 78)
 
-    cache_dir = Path("data_cache_v82")  # استفاده از پوشه جدید برای رفع مشکل کش معیوب
+    cache_dir = Path("data_cache_v83")
     dfs = {}
     for n, symbol in enumerate(DEFAULT_SYMBOLS, 1):
         try:
@@ -262,11 +248,15 @@ def main():
         print("No data available.")
         return
 
-    print("\nRunning Backtest Simulation...")
+    print("\nRunning Full 365-Day Backtest Simulation...")
     trades_df = run_portfolio_backtest(dfs, cfg)
 
+    out_dir = Path("backtest_results")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    trades_df.to_csv(out_dir / "portfolio_trades.csv", index=False)
+
     print("\n" + "=" * 78)
-    print("DIAGNOSTIC RESULTS")
+    print("FULL BACKTEST RESULTS (365 DAYS)")
     print("=" * 78)
     if trades_df.empty:
         print("No trades executed.")
@@ -276,7 +266,8 @@ def main():
         win_rate = len(wins) / len(trades_df) * 100
         print(f"Total Trades  : {len(trades_df)}")
         print(f"Win Rate      : {win_rate:.2f}%")
-        print(f"Net PnL       : ${net_pnl:,.2f}")
+        print(f"Net PnL       : ${net_pnl:,.2f} ({net_pnl/cfg.initial_equity*100:.2f}%)")
+    print(f"\nReport saved to: {out_dir.resolve()}")
 
 
 if __name__ == "__main__":
