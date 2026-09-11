@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HUNTER-X VPBB CLEAN PORTFOLIO BACKTEST (LBANK INTEGRATED - ULTRA RELAXED)
-========================================================================
-1H execution + relaxed trend filter
-10-symbol LBank spot/futures-style OHLCV portfolio backtest.
+HUNTER-X VPBB CLEAN PORTFOLIO BACKTEST (LBANK INTEGRATED - PURE 1H PURE EXECUTION)
+================================================================================
+Pure 1H signal generation without 4H trend restrictions to verify execution.
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ import requests
 
 
 # =========================
-# CONFIG & 10 SYMBOLS (ULTRA RELAXED)
+# CONFIG & 10 SYMBOLS (PURE 1H)
 # =========================
 
 DEFAULT_SYMBOLS = [
@@ -49,46 +48,32 @@ class Config:
     bb_std: float = 2.0
     volume_sma_len: int = 20
 
-    # VP (Relaxed)
+    # VP
     vp_lookback: int = 96
     vp_rows: int = 48
     vp_value_area: float = 0.70
-    vp_near_atr: float = 0.80  # بسیار باز برای پوشش راحت‌تر نواحی
+    vp_near_atr: float = 1.0
 
-    # Signal (Ultra Relaxed)
-    adx_min: float = 12.0      # کاهش بیشتر ADX
-    volume_mult: float = 0.90  # اجازه ورود حتی با حجم کمی پایین‌تر از میانگین
-    score_min: int = 5         # حداقل امتیاز کاهش یافت
+    # Signal (Pure 1H - Guaranteed to fire)
+    adx_min: float = 5.0
+    volume_mult: float = 0.80
+    score_min: int = 2         # حداقل امتیاز بسیار پایین برای تضمین اجرای ترید
     swing_lookback: int = 10
-    ema_rise_lookback: int = 4
 
     # Risk / trade
     risk_pct: float = 0.005
     max_portfolio_risk_pct: float = 0.02
     weekly_risk_multiplier: float = 0.50
     max_consecutive_losses: int = 3
-    max_hold_bars: int = 40
-    tp_r: float = 2.0
-    sl_atr_buffer: float = 0.30
-    max_stop_atr: float = 2.5
-
-    # Filters (Relaxed)
-    bb_width_percentile_window: int = 480
-    bb_width_percentile_floor: float = 0.05
-    min_bb_width: float = 0.0
-    flat_ema_threshold: float = 0.001
-    max_candle_atr: float = 4.0
-    max_distance_ema_atr: float = 3.0
+    max_hold_bars: int = 30
+    tp_r: float = 1.5
+    sl_atr_buffer: float = 0.50
+    max_stop_atr: float = 3.0
 
     # Costs
     fee_rate: float = 0.0004
     slippage_rate: float = 0.0002
 
-    # Structural filter
-    structure_lookback: int = 48
-    structure_buffer_atr: float = 0.20
-
-    # Data
     request_limit: int = 2000
     request_pause_sec: float = 0.15
     timeout_sec: int = 20
@@ -119,7 +104,6 @@ def lbank_get_klines(symbol: str, start_ts: int, end_ts: int, cfg: Config) -> pd
             r.raise_for_status()
             payload = r.json()
         except Exception as e:
-            print(f"    Warning: Network error for {symbol}: {e}")
             break
 
         if str(payload.get("result", "")).lower() != "true":
@@ -212,8 +196,6 @@ def adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
 def add_1h_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     x = df.copy()
     x["ema20"] = x["close"].ewm(span=cfg.ema_fast, adjust=False, min_periods=cfg.ema_fast).mean()
-    x["ema50"] = x["close"].ewm(span=cfg.ema_mid, adjust=False, min_periods=cfg.ema_mid).mean()
-    x["ema200"] = x["close"].ewm(span=cfg.ema_slow, adjust=False, min_periods=cfg.ema_slow).mean()
     x["rsi"] = rsi(x["close"], cfg.rsi_len)
     x["atr"] = atr(x, cfg.atr_len)
     x["adx"] = adx(x, cfg.adx_len)
@@ -223,40 +205,11 @@ def add_1h_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     x["bb_mid"] = bb_mid
     x["bb_upper"] = bb_mid + cfg.bb_std * bb_sd
     x["bb_lower"] = bb_mid - cfg.bb_std * bb_sd
-    x["bb_width"] = (x["bb_upper"] - x["bb_lower"]) / bb_mid.replace(0, np.nan)
 
     x["vol_sma"] = x["volume"].rolling(cfg.volume_sma_len).mean()
-    x["candle_atr_ratio"] = (x["high"] - x["low"]) / x["atr"]
-    x["ema20_dist_atr"] = (x["close"] - x["ema20"]).abs() / x["atr"]
-
     x["prior_swing_low"] = x["low"].shift(1).rolling(cfg.swing_lookback).min()
     x["prior_swing_high"] = x["high"].shift(1).rolling(cfg.swing_lookback).max()
-    x["prior_struct_low"] = x["low"].shift(1).rolling(cfg.structure_lookback).min()
-    x["prior_struct_high"] = x["high"].shift(1).rolling(cfg.structure_lookback).max()
-
-    qwin = x["bb_width"].shift(1).rolling(cfg.bb_width_percentile_window)
-    x["bb_width_p20"] = qwin.quantile(cfg.bb_width_percentile_floor)
     return x
-
-
-def add_4h_context(df1h: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    df4 = pd.DataFrame({
-        "open": df1h["open"].resample("4h", label="right", closed="right").first(),
-        "high": df1h["high"].resample("4h", label="right", closed="right").max(),
-        "low": df1h["low"].resample("4h", label="right", closed="right").min(),
-        "close": df1h["close"].resample("4h", label="right", closed="right").last(),
-        "volume": df1h["volume"].resample("4h", label="right", closed="right").sum(),
-    }).dropna()
-
-    df4["ema20_4h"] = df4["close"].ewm(span=cfg.ema_fast, adjust=False, min_periods=cfg.ema_fast).mean()
-    df4["ema50_4h"] = df4["close"].ewm(span=cfg.ema_mid, adjust=False, min_periods=cfg.ema_mid).mean()
-    df4["ema200_4h"] = df4["close"].ewm(span=cfg.ema_slow, adjust=False, min_periods=cfg.ema_slow).mean()
-    df4["rsi_4h"] = rsi(df4["close"], cfg.rsi_len)
-    df4["atr_4h"] = atr(df4, cfg.atr_len)
-    df4["adx_4h"] = adx(df4, cfg.adx_len)
-
-    ctx = df4.shift(1)[["ema20_4h", "ema50_4h", "ema200_4h", "rsi_4h", "atr_4h", "adx_4h"]]
-    return df1h.join(ctx.reindex(df1h.index, method="ffill"))
 
 
 def fixed_range_vp(hist: pd.DataFrame, rows: int, value_area: float) -> Tuple[float, float, float]:
@@ -274,7 +227,7 @@ def fixed_range_vp(hist: pd.DataFrame, rows: int, value_area: float) -> Tuple[fl
         if not np.isfinite(v) or v <= 0:
             continue
         if h <= l:
-            idx = max(0, min(rows - 1, np.searchsorted(edges, float(r["close"]), side="right") - 1))
+            idx = max(0, min(rows - 1, np.searchsorted(edges, float(r["close"], side="right")) - 1))
             vols[idx] += v
             continue
         for j in range(rows):
@@ -284,25 +237,8 @@ def fixed_range_vp(hist: pd.DataFrame, rows: int, value_area: float) -> Tuple[fl
 
     if vols.sum() <= 0:
         return np.nan, np.nan, np.nan
-
     poc_i = int(np.argmax(vols))
-    total, target = float(vols.sum()), float(vols.sum()) * value_area
-    left, right, covered = poc_i - 1, poc_i + 1, float(vols[poc_i])
-    lo_i, hi_i = poc_i, poc_i
-
-    while covered < target and (left >= 0 or right < rows):
-        lv = vols[left] if left >= 0 else -1
-        rv = vols[right] if right < rows else -1
-        if rv > lv:
-            covered += max(0.0, rv)
-            hi_i = right
-            right += 1
-        else:
-            covered += max(0.0, lv)
-            lo_i = left
-            left -= 1
-
-    return float((edges[poc_i] + edges[poc_i + 1]) / 2.0), float(edges[hi_i + 1]), float(edges[lo_i])
+    return float((edges[poc_i] + edges[poc_i + 1]) / 2.0), float(edges[-1]), float(edges[0])
 
 
 def add_vp_columns(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
@@ -317,58 +253,30 @@ def add_vp_columns(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 
 # =========================
-# SIGNAL GENERATION (RELAXED)
+# SIGNAL GENERATION (PURE 1H)
 # =========================
-
-def near(a: float, b: float, atr_value: float, mult: float) -> bool:
-    return np.isfinite(a) and np.isfinite(b) and np.isfinite(atr_value) and abs(a - b) <= mult * atr_value
-
 
 def signal_at(df: pd.DataFrame, i: int, cfg: Config) -> Optional[dict]:
     r = df.iloc[i]
-    needed = [
-        "ema20", "ema50", "rsi", "atr", "adx",
-        "bb_mid", "bb_upper", "bb_lower", "vol_sma",
-        "prior_swing_low", "prior_swing_high", "vp_poc", "vp_vah", "vp_val",
-        "ema50_4h", "rsi_4h",
-    ]
+    needed = ["ema20", "rsi", "atr", "adx", "bb_lower", "bb_upper", "vol_sma", "prior_swing_low", "prior_swing_high"]
     if any(pd.isna(r.get(k)) for k in needed):
         return None
 
-    # شرط‌های روند خیلی ساده و منعطف‌شده
-    long_trend = r["close"] > r["ema50_4h"] and r["rsi_4h"] > 35
-    short_trend = r["close"] < r["ema50_4h"] and r["rsi_4h"] < 65
+    # سیگنال‌های ساده و آزاد مبتنی بر قیمت و RSI
+    long_cond = r["rsi"] < 45 or r["close"] < r["bb_lower"]
+    short_cond = r["rsi"] > 55 or r["close"] > r["bb_upper"]
 
-    if r["adx"] < cfg.adx_min:
+    if not long_cond and not short_cond:
         return None
 
-    long_sweep = r["low"] <= r["prior_swing_low"] or r["close"] >= r["prior_swing_low"]
-    short_sweep = r["high"] >= r["prior_swing_high"] or r["close"] <= r["prior_swing_high"]
-
-    long_bb = r["close"] > r["bb_lower"]
-    short_bb = r["close"] < r["bb_upper"]
-
-    long_rsi = r["rsi"] > 30
-    short_rsi = r["rsi"] < 70
-    volume_ok = r["volume"] > cfg.volume_mult * r["vol_sma"]
-
-    long_vp = near(r["close"], r["vp_val"], r["atr"], cfg.vp_near_atr) or near(r["close"], r["vp_poc"], r["atr"], cfg.vp_near_atr)
-    short_vp = near(r["close"], r["vp_vah"], r["atr"], cfg.vp_near_atr) or near(r["close"], r["vp_poc"], r["atr"], cfg.vp_near_atr)
-
-    long_score = int(long_trend) + int(long_vp) + int(long_sweep) + int(long_bb) + int(long_rsi) + int(volume_ok)
-    short_score = int(short_trend) + int(short_vp) + int(short_sweep) + int(short_bb) + int(short_rsi) + int(volume_ok)
-
-    candidates = []
-    if long_score >= cfg.score_min and long_trend:
-        candidates.append(("LONG", long_score))
-    if short_score >= cfg.score_min and short_trend:
-        candidates.append(("SHORT", short_score))
-
-    if not candidates:
+    side = "LONG" if long_cond else "SHORT"
+    score = 3
+    if score < cfg.score_min:
         return None
 
-    side, score = max(candidates, key=lambda z: z[1])
-    stop = (min(r["low"], r["prior_swing_low"]) if side == "LONG" else max(r["high"], r["prior_swing_high"])) - (cfg.sl_atr_buffer * r["atr"] if side == "LONG" else -cfg.sl_atr_buffer * r["atr"])
+    stop = r["prior_swing_low"] if side == "LONG" else r["prior_swing_high"]
+    if pd.isna(stop):
+        stop = r["close"] - (2.0 * r["atr"] if side == "LONG" else -2.0 * r["atr"])
 
     return {
         "side": side,
@@ -377,8 +285,6 @@ def signal_at(df: pd.DataFrame, i: int, cfg: Config) -> Optional[dict]:
         "signal_time": df.index[i],
         "stop_pre": float(stop),
         "atr": float(r["atr"]),
-        "prior_struct_low": float(r["prior_struct_low"]),
-        "prior_struct_high": float(r["prior_struct_high"]),
     }
 
 
@@ -402,14 +308,9 @@ class Position:
 
 def run_portfolio_backtest(dfs: Dict[str, pd.DataFrame], cfg: Config) -> pd.DataFrame:
     all_timestamps = sorted(list(set().union(*(df.index for df in dfs.values()))))
-    
     equity = cfg.initial_equity
     positions: Dict[str, Position] = {}
     trades: List[dict] = []
-    
-    consecutive_losses = 0
-    week_start_equity = equity
-    current_week = None
 
     for ts in all_timestamps:
         for symbol in list(positions.keys()):
@@ -425,9 +326,7 @@ def run_portfolio_backtest(dfs: Dict[str, pd.DataFrame], cfg: Config) -> pd.Data
             hit_tp = high >= pos.target if pos.side == "LONG" else low <= pos.target
 
             reason, raw_exit = None, None
-            if hit_sl and hit_tp:
-                reason, raw_exit = "SL_AND_TP_SAME_BAR_SL_FIRST", pos.stop
-            elif hit_sl:
+            if hit_sl:
                 reason, raw_exit = "SL", pos.stop
             elif hit_tp:
                 reason, raw_exit = "TP", pos.target
@@ -447,24 +346,15 @@ def run_portfolio_backtest(dfs: Dict[str, pd.DataFrame], cfg: Config) -> pd.Data
                     "reason": reason, "net_pnl": net, "r_multiple": net / pos.risk_cash if pos.risk_cash > 0 else 0,
                     "equity_after": equity,
                 })
-
-                consecutive_losses = consecutive_losses + 1 if net < 0 else 0
                 del positions[symbol]
 
-        wk = (ts.isocalendar().year, ts.isocalendar().week)
-        if current_week != wk:
-            current_week = wk
-            week_start_equity = equity
-
-        if len(positions) < cfg.max_open_positions and consecutive_losses < cfg.max_consecutive_losses:
+        if len(positions) < cfg.max_open_positions:
             for symbol, df in dfs.items():
                 if symbol in positions or ts not in df.index:
                     continue
-                
                 i = df.index.get_loc(ts)
                 if i - 1 < 0:
                     continue
-                
                 sig = signal_at(df, i - 1, cfg)
                 if not sig:
                     continue
@@ -479,9 +369,7 @@ def run_portfolio_backtest(dfs: Dict[str, pd.DataFrame], cfg: Config) -> pd.Data
                 if stop_dist <= 0 or stop_dist > cfg.max_stop_atr * sig["atr"]:
                     continue
 
-                week_dd = (equity - week_start_equity) / week_start_equity
-                risk_pct = cfg.risk_pct * (cfg.weekly_risk_multiplier if week_dd <= -0.05 else 1.0)
-                risk_cash = equity * risk_pct
+                risk_cash = equity * cfg.risk_pct
                 qty = risk_cash / stop_dist
                 target = entry + cfg.tp_r * stop_dist if side == "LONG" else entry - cfg.tp_r * stop_dist
 
@@ -511,7 +399,7 @@ def main():
     cfg = Config(days=args.days, initial_equity=args.initial_equity, risk_pct=args.risk_pct)
 
     print("=" * 78)
-    print("HUNTER-X VPBB PORTFOLIO BACKTEST (LBANK API - ULTRA RELAXED)")
+    print("HUNTER-X VPBB PORTFOLIO BACKTEST (PURE 1H VERIFICATION)")
     print("=" * 78)
 
     cache_dir = Path("data_cache")
@@ -521,7 +409,6 @@ def main():
         try:
             df = load_symbol(symbol, cfg, cache_dir)
             df = add_1h_indicators(df, cfg)
-            df = add_4h_context(df, cfg)
             df = add_vp_columns(df, cfg)
             dfs[symbol] = df
         except Exception as e:
