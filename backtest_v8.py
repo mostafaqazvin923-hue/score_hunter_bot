@@ -16,7 +16,7 @@ import numpy as np
 # اتصال امن به صرافی LBank از طریق CCXT
 exchange = ccxt.lbank({
     'enableRateLimit': True,
-    'options': {'defaultType': 'swap'} # تنظیم روی بخش فیوچرز/سوآپ در صورت نیاز، یا اسپات
+    'options': {'defaultType': 'swap'}
 })
 
 SYMBOLS = {
@@ -43,15 +43,12 @@ data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
     filename_1h = f"{symbol}_1h_lbank_data.csv"
-    
-    # اگر فایل کش موجود بود می‌توانید برای سرعت بیشتر استفاده کنید، اما اینجا مستقیم دانلود می‌کنیم
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol} از LBank...")
     
     all_ohlcv = []
     current_since = since_timestamp
     now_timestamp = exchange.milliseconds()
     
-    # محدود کردن تعداد درخواست‌ها برای جلوگیری از بن شدن یا خطای ل‌بانک
     max_retries = 50
     retries = 0
     
@@ -61,7 +58,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
             if not ohlcv:
                 break
             
-            # جلوگیری از حلقه تکرار بی‌پایان در صورت دریافت داده‌های تکراری
             next_since = ohlcv[-1][0] + 3600000
             if next_since <= current_since:
                 current_since += 3600000
@@ -135,7 +131,8 @@ for symbol, df1h in data_1h.items():
         
     df1h = calculate_indicators(df1h)
     
-    df4h = df1h.set_index('Date').resample('4H').agg({
+    # اصلاح شده با '4h' کوچک برای جلوگیری از خطای آینده پانداس
+    df4h = df1h.set_index('Date').resample('4h').agg({
         'Open': 'first',
         'High': 'max',
         'Low': 'min',
@@ -301,4 +298,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ بک‌تست ل‌بانک به اتمام رسید.")
+print("\n✨ بک‌تست ل‌بانک بدون اخطار به اتمام رسید.")
