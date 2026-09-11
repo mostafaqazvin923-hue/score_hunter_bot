@@ -1,4 +1,4 @@
-name: Run Backtest V8
+name: Run Backtest V5
 
 on:
   workflow_dispatch:
