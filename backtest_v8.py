@@ -19,7 +19,7 @@ exchange = ccxt.lbank({
     'options': {'defaultType': 'swap'}
 })
 
-# لیست ۳۰ ارز نهایی و بهینه‌شده (بدون FIL و FTM، با جایگزینی CRV و PENDLE)
+# لیست ۳۰ ارز نهایی (با حذف SEI و DOGE و جایگزینی AAVE و RUNE)
 SYMBOLS = {
     "BTC": "BTC/USDT",
     "ETH": "ETH/USDT",
@@ -31,7 +31,6 @@ SYMBOLS = {
     "NEAR": "NEAR/USDT",
     "SUI": "SUI/USDT",
     "DOT": "DOT/USDT",
-    "DOGE": "DOGE/USDT",
     "SHIB": "SHIB/USDT",
     "PEPE": "PEPE/USDT",
     "ARB": "ARB/USDT",
@@ -43,14 +42,15 @@ SYMBOLS = {
     "FET": "FET/USDT",
     "APT": "APT/USDT",
     "TIA": "TIA/USDT",
-    "SEI": "SEI/USDT",
     "ICP": "ICP/USDT",
     "UNI": "UNI/USDT",
     "BCH": "BCH/USDT",
     "LTC": "LTC/USDT",
     "AR": "AR/USDT",
     "CRV": "CRV/USDT",
-    "PENDLE": "PENDLE/USDT"
+    "PENDLE": "PENDLE/USDT",
+    "AAVE": "AAVE/USDT",  # جایگزین جدید و پرروند
+    "RUNE": "RUNE/USDT"   # جایگزین جدید و پرروند
 }
 
 start_date = datetime.now() - timedelta(days=365)
@@ -140,7 +140,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست روی پورتفوی جدید و بهینه‌شده LBank")
+print("🚀 اجرای موتور بک‌تست روی پورتفوی جدید LBank")
 print("============================================================")
 
 all_portfolio_trades = []
