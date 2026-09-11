@@ -13,23 +13,8 @@ except ImportError:
 import pandas as pd
 import numpy as np
 
-# ============================================================
-# منبع دیتای تاریخی برای بک‌تست
-# ============================================================
-# LBank برای تایم‌فریم‌های 1h/4h آرشیو کامل یک‌ساله می‌دهد (طبق تست خودت)،
-# پس همان صرافی اصلی است. صرافی‌های دیگر فقط به‌عنوان پشتیبان (fallback) نگه
-# داشته شده‌اند، برای مواقعی که LBank موقتاً پاسخ ندهد.
-CANDIDATE_DATA_EXCHANGES = ['lbank', 'kucoin', 'okx', 'bybit', 'gateio', 'mexc', 'bitget']
-_exchange_instances = {}
-
-
-def get_data_exchange(exchange_id):
-    if exchange_id not in _exchange_instances:
-        exchange_class = getattr(ccxt, exchange_id)
-        _exchange_instances[exchange_id] = exchange_class({'enableRateLimit': True})
-    return _exchange_instances[exchange_id]
-
-
+# 1. اتصال به صرافی LBank و تعریف سبد 10 ارز
+exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
     "BTC": "BTC/USDT",
     "ETH": "ETH/USDT",
@@ -43,530 +28,226 @@ SYMBOLS = {
     "DOT": "DOT/USDT"
 }
 
-TIMEFRAME = '1h'          # ورودها روی 1 ساعته، تایید روند روی 4 ساعته (رزمپل‌شده از همین دیتا)
-DAYS_BACK = 365
-COMMISSION_RATE = 0.0008          # کارمزد کل رفت‌وبرگشت (تقریبی)
-COMMISSION_PER_SIDE = COMMISSION_RATE / 2
-SLIPPAGE_RATE = 0.04 / 100        # اسلیپیج تخمینی هر ضلع
+start_date = datetime.now() - timedelta(days=365)
+since_timestamp = int(start_date.timestamp() * 1000)
 
-TF_SCALE = 1               # روی 1 ساعته هستیم، نیازی به مقیاس‌دهی اضافه نیست
+print("============================================================")
+print("📥 دانلود داده‌های 1 ساعته واقعی از ال‌بنک برای 10 ارز مشخص")
+print("============================================================")
 
-# ---------------- پارامترهای استراتژی ----------------
-BB_PERIOD = 20
-BB_STD = 2
-RSI_PERIOD = 14
-ATR_PERIOD = 14
-ATR_MA_PERIOD = 50 * TF_SCALE
-VOL_MA_PERIOD = 20 * TF_SCALE
-VP_WINDOW = 100 * TF_SCALE
-VP_BINS = 24
-VALUE_AREA_PCT = 0.70
-SWING_LOOKBACK = 10 * TF_SCALE
-ADX_PERIOD = 14
-MAX_HOLD_CANDLES = 60 * TF_SCALE
-COOLDOWN_CANDLES = 3 * TF_SCALE
-MIN_WARMUP = max(250 * TF_SCALE, VP_WINDOW + ATR_MA_PERIOD + 5)
+data_1h = {}
 
-# ---------------- فیلتر روند بالادستی (4 ساعته، مثل کد اولیه) ----------------
-TREND_EMA_FAST = 50
-TREND_EMA_SLOW = 200
-
-
-# ============================================================
-# دریافت داده تاریخی — به ترتیب چند صرافی را امتحان می‌کند تا یکی جواب بدهد
-# ============================================================
-def fetch_ohlcv_full(symbol_ccxt, timeframe, since_ts):
-    for exchange_id in CANDIDATE_DATA_EXCHANGES:
+for symbol, lbank_symbol in SYMBOLS.items():
+    filename_1h = f"{symbol}_1h_lbank_data.csv"
+    print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
+    
+    all_ohlcv = []
+    current_since = since_timestamp
+    now_timestamp = exchange.milliseconds()
+    
+    while current_since < now_timestamp:
         try:
-            ex = get_data_exchange(exchange_id)
-            all_ohlcv = []
-            current_since = since_ts
-            now_ts = ex.milliseconds()
-
-            while current_since < now_ts:
-                ohlcv = ex.fetch_ohlcv(symbol_ccxt, timeframe=timeframe, since=current_since, limit=1000)
-                if not ohlcv:
-                    break
-                current_since = ohlcv[-1][0] + 1
-                all_ohlcv.extend(ohlcv)
-                if len(ohlcv) < 1000:
-                    break
-
-            if len(all_ohlcv) > 200:
-                print(f"    ✔️ دیتا از {exchange_id} دریافت شد ({len(all_ohlcv)} کندل).")
-                return all_ohlcv
-            else:
-                print(f"    ⚠️ {exchange_id}: دیتای کافی برنگشت، رفتن به صرافی بعدی...")
+            ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', since=current_since, limit=1000)
+            if not ohlcv:
+                break
+            current_since = ohlcv[-1][0] + 1
+            all_ohlcv.extend(ohlcv)
+            if len(ohlcv) < 1000:
+                break
         except Exception as e:
-            print(f"    ⚠️ {exchange_id} ناموفق ({type(e).__name__}): {e}")
-            continue
+            print(f"  ❌ خطا در دریافت داده {symbol}: {e}")
+            break
+            
+    if all_ohlcv:
+        df1h = pd.DataFrame(all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
+        df1h = df1h[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        df1h.dropna(inplace=True)
+        df1h.drop_duplicates(subset=['Date'], inplace=True)
+        df1h.sort_values('Date', inplace=True)
+        df1h.reset_index(drop=True, inplace=True)
+        
+        df1h.to_csv(filename_1h, index=False)
+        data_1h[symbol] = df1h
+        print(f"  ✔️ دیتای {symbol} آماده شد (تعداد کندل: {len(df1h)})")
+    else:
+        print(f"  ❌ دیتایی برای {symbol} دریافت نشد.")
 
-    return []
-
-
-# ============================================================
-# اندیکاتورها: Bollinger Bands, RSI, ATR, ADX, Swing High/Low
-# همه بر اساس کندل‌های کاملاً بسته‌شده — بدون لوک‌آهد
-# ============================================================
-def calculate_indicators(df):
-    df = df.copy()
-
-    # Bollinger Bands
-    df['BB_MID'] = df['Close'].rolling(BB_PERIOD).mean()
-    bb_std = df['Close'].rolling(BB_PERIOD).std()
-    df['BB_UPPER'] = df['BB_MID'] + BB_STD * bb_std
-    df['BB_LOWER'] = df['BB_MID'] - BB_STD * bb_std
-
-    # RSI
+# تابع محاسبه اندیکاتورهای تکنیکال (RSI, ATR, EMA, Bollinger Bands)
+fn calculate_indicators(df):
+    # میانگین‌های متحرک
+    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+    
+    # اندیکاتور بولینگر باند (Bollinger Bands)
+    df['BB_Middle'] = df['Close'].rolling(window=20).mean()
+    bb_std = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = df['BB_Middle'] + (bb_std * 2.0)
+    df['BB_Lower'] = df['BB_Middle'] - (bb_std * 2.0)
+    
+    # اندیکاتور RSI
     delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(RSI_PERIOD).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(RSI_PERIOD).mean()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
-
-    # True Range / ATR
+    
+    # اندیکاتور ATR برای مدیریت نوسانات و حد ضرر
     high_low = df['High'] - df['Low']
-    high_close = (df['High'] - df['Close'].shift()).abs()
-    low_close = (df['Low'] - df['Close'].shift()).abs()
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['TR'] = tr
-    df['ATR'] = tr.rolling(ATR_PERIOD).mean()
-    df['ATR_MA'] = df['ATR'].rolling(ATR_MA_PERIOD).mean()
-
-    # Volume MA
-    df['Vol_MA'] = df['Volume'].rolling(VOL_MA_PERIOD).mean()
-
-    # ADX (نسخه ساده‌شده، هم‌راستا با روش محاسبه ATR بالا)
-    up_move = df['High'].diff()
-    down_move = -df['Low'].diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    plus_dm = pd.Series(plus_dm, index=df.index)
-    minus_dm = pd.Series(minus_dm, index=df.index)
-    atr_for_adx = tr.rolling(ADX_PERIOD).mean().replace(0, np.nan)
-    plus_di = 100 * (plus_dm.rolling(ADX_PERIOD).mean() / atr_for_adx)
-    minus_di = 100 * (minus_dm.rolling(ADX_PERIOD).mean() / atr_for_adx)
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    df['ADX'] = dx.rolling(ADX_PERIOD).mean()
-
-    # سقف/کف ساختاری — بر اساس کندل‌های *قبل* از کندل جاری (shift(1)) تا هیچ نگاهی به آینده نباشد
-    df['SWING_LOW'] = df['Low'].shift(1).rolling(SWING_LOOKBACK).min()
-    df['SWING_HIGH'] = df['High'].shift(1).rolling(SWING_LOOKBACK).max()
-
+    df['ATR'] = tr.rolling(window=14).mean()
+    
     return df
 
+print("\n============================================================")
+print("🚀 اجرای موتور بک‌تست پیشرفته (بدون تقلب و مجهز به قفل همپوشانی)")
+print("============================================================")
 
-# ============================================================
-# Fixed Range Volume Profile — محاسبه غلتان (rolling)
-# برای کندل i فقط از کندل‌های i-window ... i-1 استفاده می‌شود (کاملاً بسته‌شده)
-# ============================================================
-def calculate_volume_profile(df, window=VP_WINDOW, bins=VP_BINS, va_pct=VALUE_AREA_PCT):
-    n = len(df)
-    poc = np.full(n, np.nan)
-    vah = np.full(n, np.nan)
-    val = np.full(n, np.nan)
+all_portfolio_trades = []
 
-    closes = df['Close'].values
-    highs = df['High'].values
-    lows = df['Low'].values
-    vols = df['Volume'].values
-
-    for i in range(window, n):
-        w_high = highs[i - window:i]
-        w_low = lows[i - window:i]
-        w_close = closes[i - window:i]
-        w_vol = vols[i - window:i]
-
-        price_max = w_high.max()
-        price_min = w_low.min()
-        if price_max <= price_min:
-            continue
-
-        bin_edges = np.linspace(price_min, price_max, bins + 1)
-        bin_vol = np.zeros(bins)
-        bin_idx = np.clip(np.digitize(w_close, bin_edges) - 1, 0, bins - 1)
-        np.add.at(bin_vol, bin_idx, w_vol)
-
-        total_vol = bin_vol.sum()
-        if total_vol <= 0:
-            continue
-
-        poc_bin = int(np.argmax(bin_vol))
-        poc[i] = (bin_edges[poc_bin] + bin_edges[poc_bin + 1]) / 2
-
-        target_vol = total_vol * va_pct
-        acc_vol = bin_vol[poc_bin]
-        lo_bin = hi_bin = poc_bin
-        while acc_vol < target_vol and (lo_bin > 0 or hi_bin < bins - 1):
-            expand_lo = bin_vol[lo_bin - 1] if lo_bin > 0 else -1
-            expand_hi = bin_vol[hi_bin + 1] if hi_bin < bins - 1 else -1
-            if expand_hi >= expand_lo:
-                hi_bin += 1
-                acc_vol += bin_vol[hi_bin]
-            else:
-                lo_bin -= 1
-                acc_vol += bin_vol[lo_bin]
-
-        val[i] = bin_edges[lo_bin]
-        vah[i] = bin_edges[hi_bin + 1]
-
-    df = df.copy()
-    df['POC'] = poc
-    df['VAH'] = vah
-    df['VAL'] = val
-    return df
-
-
-def calculate_trend_filter(df1h):
-    """
-    فیلتر روند بالادستی روی تایم‌فریم 4 ساعته (رزمپل‌شده از همان دیتای 1h)،
-    دقیقاً به سبک کد اولیه: EMA50 و EMA200 روی کندل‌های 4 ساعته کاملاً بسته‌شده.
-    از merge_asof با جهت backward استفاده می‌شود تا هر کندل 1h فقط به آخرین
-    کندل 4h که واقعاً تا آن لحظه بسته شده دسترسی داشته باشد — صفر لوک‌آهد.
-    """
-    df1h = df1h.copy().sort_values('Date').reset_index(drop=True)
-
-    df4h = (
-        df1h.set_index('Date')
-        .resample('4h', label='left', closed='left')
-        .agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'})
-        .dropna()
-        .reset_index()
-    )
-    df4h['EMA_FAST'] = df4h['Close'].ewm(span=TREND_EMA_FAST, adjust=False).mean()
-    df4h['EMA_SLOW'] = df4h['Close'].ewm(span=TREND_EMA_SLOW, adjust=False).mean()
-    df4h['EMA_SLOW_PREV'] = df4h['EMA_SLOW'].shift(1)
-    df4h['CLOSE_4H'] = df4h['Close']
-    # کندل 4 ساعته‌ای که از ساعت X شروع شده، فقط از ساعت X+4 به بعد "کاملاً بسته" و قابل استفاده است
-    df4h['AVAILABLE_AT'] = df4h['Date'] + pd.Timedelta(hours=4)
-
-    merge_cols = df4h[['AVAILABLE_AT', 'CLOSE_4H', 'EMA_FAST', 'EMA_SLOW', 'EMA_SLOW_PREV']].sort_values('AVAILABLE_AT')
-
-    merged = pd.merge_asof(
-        df1h, merge_cols,
-        left_on='Date', right_on='AVAILABLE_AT',
-        direction='backward'
-    )
-
-    is_long_regime = (
-        (merged['CLOSE_4H'] > merged['EMA_SLOW'])
-        & (merged['EMA_FAST'] > merged['EMA_SLOW'])
-        & (merged['EMA_SLOW'] >= merged['EMA_SLOW_PREV'] * 0.9995)   # تحمل کمی نسبت به شیب صاف/تقریباً صعودی
-    )
-    is_short_regime = (
-        (merged['CLOSE_4H'] < merged['EMA_SLOW'])
-        & (merged['EMA_FAST'] < merged['EMA_SLOW'])
-        & (merged['EMA_SLOW'] <= merged['EMA_SLOW_PREV'] * 1.0005)
-    )
-
-    merged['TREND_LONG_OK'] = is_long_regime.fillna(False)
-    merged['TREND_SHORT_OK'] = is_short_regime.fillna(False)
-    return merged
-
-
-def compute_r(entry_price, exit_price, sl_dist, is_long):
-    entry_fee = entry_price * COMMISSION_PER_SIDE
-    exit_fee = exit_price * COMMISSION_PER_SIDE
-    gross_pnl = (exit_price - entry_price) if is_long else (entry_price - exit_price)
-    net_pnl = gross_pnl - entry_fee - exit_fee
-    return net_pnl / sl_dist
-
-
-# ============================================================
-# شبیه‌سازی معامله دو مرحله‌ای (TP1 پارشیال ۵۰٪ + بریک‌ایون + TP2)
-# فقط کندل‌های بعد از ورود بررسی می‌شوند — بدون لوک‌آهد
-# ============================================================
-def simulate_long_trade(df, entry_idx, entry_price, sl_price, tp1_price, tp2_price, sl_dist):
-    leg1_done = False
-    r1 = 0.0
-    current_sl = sl_price
-    last_idx = min(entry_idx + MAX_HOLD_CANDLES, len(df)) - 1
-
-    for j in range(entry_idx, last_idx + 1):
-        f = df.iloc[j]
-        if not leg1_done:
-            if f['Low'] <= current_sl:
-                exit_price = current_sl * (1 - SLIPPAGE_RATE)
-                return compute_r(entry_price, exit_price, sl_dist, True), j
-            if f['High'] >= tp1_price:
-                exit1_price = tp1_price * (1 - SLIPPAGE_RATE)
-                r1 = compute_r(entry_price, exit1_price, sl_dist, True)
-                leg1_done = True
-                current_sl = entry_price
-                if f['High'] >= tp2_price:
-                    exit2_price = tp2_price * (1 - SLIPPAGE_RATE)
-                    r2 = compute_r(entry_price, exit2_price, sl_dist, True)
-                    return 0.5 * r1 + 0.5 * r2, j
-        else:
-            if f['Low'] <= current_sl:
-                exit2_price = current_sl * (1 - SLIPPAGE_RATE)
-                r2 = compute_r(entry_price, exit2_price, sl_dist, True)
-                return 0.5 * r1 + 0.5 * r2, j
-            if f['High'] >= tp2_price:
-                exit2_price = tp2_price * (1 - SLIPPAGE_RATE)
-                r2 = compute_r(entry_price, exit2_price, sl_dist, True)
-                return 0.5 * r1 + 0.5 * r2, j
-
-    # پایان بازه بدون رسیدن به SL/TP2 → خروج زمانی با قیمت بسته‌شدن آخرین کندل
-    exit_price = df.iloc[last_idx]['Close']
-    if not leg1_done:
-        return compute_r(entry_price, exit_price, sl_dist, True), last_idx
-    r2 = compute_r(entry_price, exit_price, sl_dist, True)
-    return 0.5 * r1 + 0.5 * r2, last_idx
-
-
-def simulate_short_trade(df, entry_idx, entry_price, sl_price, tp1_price, tp2_price, sl_dist):
-    leg1_done = False
-    r1 = 0.0
-    current_sl = sl_price
-    last_idx = min(entry_idx + MAX_HOLD_CANDLES, len(df)) - 1
-
-    for j in range(entry_idx, last_idx + 1):
-        f = df.iloc[j]
-        if not leg1_done:
-            if f['High'] >= current_sl:
-                exit_price = current_sl * (1 + SLIPPAGE_RATE)
-                return compute_r(entry_price, exit_price, sl_dist, False), j
-            if f['Low'] <= tp1_price:
-                exit1_price = tp1_price * (1 + SLIPPAGE_RATE)
-                r1 = compute_r(entry_price, exit1_price, sl_dist, False)
-                leg1_done = True
-                current_sl = entry_price
-                if f['Low'] <= tp2_price:
-                    exit2_price = tp2_price * (1 + SLIPPAGE_RATE)
-                    r2 = compute_r(entry_price, exit2_price, sl_dist, False)
-                    return 0.5 * r1 + 0.5 * r2, j
-        else:
-            if f['High'] >= current_sl:
-                exit2_price = current_sl * (1 + SLIPPAGE_RATE)
-                r2 = compute_r(entry_price, exit2_price, sl_dist, False)
-                return 0.5 * r1 + 0.5 * r2, j
-            if f['Low'] <= tp2_price:
-                exit2_price = tp2_price * (1 + SLIPPAGE_RATE)
-                r2 = compute_r(entry_price, exit2_price, sl_dist, False)
-                return 0.5 * r1 + 0.5 * r2, j
-
-    exit_price = df.iloc[last_idx]['Close']
-    if not leg1_done:
-        return compute_r(entry_price, exit_price, sl_dist, False), last_idx
-    r2 = compute_r(entry_price, exit_price, sl_dist, False)
-    return 0.5 * r1 + 0.5 * r2, last_idx
-
-
-# ============================================================
-# موتور اصلی سیگنال‌یابی و بک‌تست برای هر نماد
-# ============================================================
-def run_backtest_for_symbol(symbol, df1h):
-    if len(df1h) < MIN_WARMUP + MAX_HOLD_CANDLES + 5:
-        return []
-
-    df = calculate_indicators(df1h)
-    df = calculate_volume_profile(df)
-    df = calculate_trend_filter(df)
-
-    trades = []
+for symbol, df1h in data_1h.items():
+    if len(df1h) < 300:
+        continue
+        
+    df1h = calculate_indicators(df1h)
+    
+    # ساخت تایم‌فریم 4 ساعته از روی دیتای 1 ساعته جهت تایید روند کلان
+    df4h = df1h.set_index('Date').resample('4H').agg({
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'Volume': 'sum'
+    }).dropna().reset_index()
+    
+    df4h = calculate_indicators(df4h)
+    
+    df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
+    df4h_indexed = df4h.set_index('Date')
+    
+    # متغیر قفل همپوشانی (Overlap Lock) جهت جلوگیری از باز شدن پوزیشن جدید همزمان
     locked_until_index = 0
-    n = len(df)
-    needed_cols = ['BB_UPPER', 'BB_LOWER', 'BB_MID', 'RSI', 'ATR', 'ATR_MA',
-                   'ADX', 'POC', 'VAH', 'VAL', 'SWING_LOW', 'SWING_HIGH', 'Vol_MA']
-
-    for i in range(MIN_WARMUP, n - MAX_HOLD_CANDLES - 2):
+    
+    for i in range(200, len(df1h) - 40):
+        # بررسی قفل همپوشانی
         if i < locked_until_index:
             continue
-
-        c = df.iloc[i]
-        prev = df.iloc[i - 1]
-
-        if c[needed_cols].isna().any() or pd.isna(prev['RSI']):
+            
+        c1h = df1h.iloc[i]
+        t4h_time = c1h['Date_4H']
+        
+        if t4h_time not in df4h_indexed.index:
             continue
-        if c['ATR_MA'] == 0 or c['ATR'] <= 0:
+            
+        r4h = df4h_indexed.loc[t4h_time]
+        
+        ema20_4h = r4h['EMA_20']
+        ema50_4h = r4h['EMA_50']
+        ema200_4h = r4h['EMA_200']
+        
+        # شرایط روند کلان (Trend Regime)
+        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h)
+        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h)
+        
+        if not is_long_regime and not is_short_regime:
             continue
-
-        # ---- فیلتر رژیم بازار (نوسان + حجم + روند 4 ساعته) ----
-        atr_ratio = c['ATR'] / c['ATR_MA']
-        vol_ok = c['Volume'] >= 0.75 * c['Vol_MA']
-        volatility_ok = (0.65 <= atr_ratio <= 2.7) and (c['ADX'] >= 12)
-
-        adx_not_extreme = c['ADX'] <= 45
-
-        # ---- شرایط ورود لانگ: فقط اگر روند 4 ساعته هم صعودی باشد ----
-        long_signal = (
-            volatility_ok and vol_ok and adx_not_extreme
-            and bool(c['TREND_LONG_OK'])
-            and c['Low'] <= c['BB_LOWER']
-            and c['Close'] > c['BB_LOWER']
-            and c['Close'] <= max(c['POC'], c['VAL'] * 1.02)
-            and 28 <= c['RSI'] <= 45
-            and c['RSI'] > prev['RSI']
-            and c['Close'] > c['Open']
-        )
-
-        # ---- شرایط ورود شورت: فقط اگر روند 4 ساعته هم نزولی باشد ----
-        short_signal = (
-            volatility_ok and vol_ok and adx_not_extreme
-            and bool(c['TREND_SHORT_OK'])
-            and c['High'] >= c['BB_UPPER']
-            and c['Close'] < c['BB_UPPER']
-            and c['Close'] >= min(c['POC'], c['VAH'] * 0.98)
-            and 55 <= c['RSI'] <= 72
-            and c['RSI'] < prev['RSI']
-            and c['Close'] < c['Open']
-        )
-
-        if not long_signal and not short_signal:
-            continue
-
-        entry_idx = i + 1
-        if entry_idx >= n:
-            break
-        entry_candle = df.iloc[entry_idx]
-
-        if long_signal:
-            entry_price = entry_candle['Open'] * (1 + SLIPPAGE_RATE)
-
-            atr_sl_dist = 1.5 * c['ATR']
-            struct_sl_price = c['SWING_LOW'] - 0.2 * c['ATR']
-            struct_sl_dist = entry_price - struct_sl_price
-            sl_dist = struct_sl_dist if 0 < struct_sl_dist < atr_sl_dist else atr_sl_dist
-            if sl_dist <= 0:
+            
+        # بررسی پولبک و تقاطع باندهای بولینگر و RSI در تایم‌فریم 1 ساعته (نقطه ورود)
+        # جلوگیری از تقلب با استفاده صرف از داده‌های گذشته (index تا i)
+        is_long_trigger = (c1h['Low'] <= c1h['BB_Lower']) and (c1h['RSI'] < 35)
+        is_short_trigger = (c1h['High'] >= c1h['BB_Upper']) and (c1h['RSI'] > 65)
+        
+        if is_long_regime and is_long_trigger:
+            entry_price = c1h['Close']
+            # تعیین حد ضرر بر اساس ATR و کف محلی
+            sl = c1h['Low'] - (1.5 * c1h['ATR'])
+            risk = entry_price - sl
+            
+            if risk <= 0:
                 continue
-            sl_price = entry_price - sl_dist
-
-            tp1_candidate = c['POC'] if c['POC'] > entry_price else c['VAH']
-            tp1_min_dist = 0.75 * sl_dist  # حداقل فاصله TP1 تا ورود، برای جلوگیری از سود جزئی ناچیز
-            tp1_price = max(tp1_candidate, entry_price + tp1_min_dist)
-            tp2_r_price = entry_price + 2 * sl_dist
-            tp2_price = min(tp2_r_price, c['SWING_HIGH']) if c['SWING_HIGH'] > entry_price else tp2_r_price
-            tp2_price = max(tp2_price, tp1_price + 0.25 * sl_dist)  # اطمینان از فاصله معنادار TP2 نسبت به TP1
-
-            if not (sl_price < entry_price < tp1_price < tp2_price):
+                
+            # ریسک به ریوارد ۱ به ۲
+            tp = entry_price + (2.0 * risk)
+            
+            # شبیه‌سازی دقیق نتایج در کندل‌های آینده (بدون نگاه به آینده در لحظه تصمیم‌گیری)
+            outcome = 'OPEN'
+            exit_idx = i
+            for j in range(i + 1, min(i + 50, len(df1h))):
+                future_c = df1h.iloc[j]
+                exit_idx = j
+                if future_c['Low'] <= sl:
+                    outcome = 'LOSS'
+                    break
+                elif future_c['High'] >= tp:
+                    outcome = 'WIN'
+                    break
+                    
+            if outcome in ['WIN', 'LOSS']:
+                all_portfolio_trades.append({
+                    'Symbol': symbol,
+                    'Side': 'LONG',
+                    'Outcome': outcome
+                })
+                # فعال‌سازی قفل همپوشانی تا زمان بسته شدن کامل پوزیشن
+                locked_until_index = exit_idx
+                
+        elif is_short_regime and is_short_trigger:
+            entry_price = c1h['Close']
+            # تعیین حد ضرر بر اساس ATR و سقف محلی
+            sl = c1h['High'] + (1.5 * c1h['ATR'])
+            risk = sl - entry_price
+            
+            if risk <= 0:
                 continue
+                
+            # ریسک به ریوارد ۱ به ۲
+            tp = entry_price - (2.0 * risk)
+            
+            outcome = 'OPEN'
+            exit_idx = i
+            for j in range(i + 1, min(i + 50, len(df1h))):
+                future_c = df1h.iloc[j]
+                exit_idx = j
+                if future_c['High'] >= sl:
+                    outcome = 'LOSS'
+                    break
+                elif future_c['Low'] <= tp:
+                    outcome = 'WIN'
+                    break
+                    
+            if outcome in ['WIN', 'LOSS']:
+                all_portfolio_trades.append({
+                    'Symbol': symbol,
+                    'Side': 'SHORT',
+                    'Outcome': outcome
+                })
+                # فعال‌سازی قفل همپوشانی
+                locked_until_index = exit_idx
 
-            net_r, exit_idx = simulate_long_trade(df, entry_idx, entry_price, sl_price, tp1_price, tp2_price, sl_dist)
-            trades.append({
-                'Symbol': symbol, 'Side': 'LONG',
-                'Outcome': 'WIN' if net_r > 0 else 'LOSS',
-                'NetR': net_r, 'Date': entry_candle['Date']
-            })
-            locked_until_index = exit_idx + COOLDOWN_CANDLES
+print("\n============================================================")
+print("📊 گزارش نهایی بک‌تست سبد ارز دیجیتال (LBank Portfolio)")
+print("============================================================")
 
-        elif short_signal:
-            entry_price = entry_candle['Open'] * (1 - SLIPPAGE_RATE)
+if all_portfolio_trades:
+    pf_df = pd.DataFrame(all_portfolio_trades)
+    total_trades = len(pf_df)
+    total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
+    total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
+    portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
+    net_profit_score = (total_wins * 2.0) - total_losses
+    
+    print(f"🔸 تعداد کل معاملات کل سبد: {total_trades}")
+    print(f"🔸 معاملات برنده (WIN): {total_wins}")
+    print(f"🔸 معاملات بازنده (LOSS): {total_losses}")
+    print(f"🎯 **وین‌ریت تجمیعی پورتفوی:** {portfolio_win_rate:.2f}%")
+    print(f"💰 **امتیاز سودآوری خالص (رتبه R):** {net_profit_score:.2f}R")
+    
+    print("\nتفکیک عملکرد به تفکیک هر ارز:")
+    print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
+else:
+    print("⚠️ هیچ معامله‌ای با شرایط تعیین شده ثبت نشد.")
 
-            atr_sl_dist = 1.5 * c['ATR']
-            struct_sl_price = c['SWING_HIGH'] + 0.2 * c['ATR']
-            struct_sl_dist = struct_sl_price - entry_price
-            sl_dist = struct_sl_dist if 0 < struct_sl_dist < atr_sl_dist else atr_sl_dist
-            if sl_dist <= 0:
-                continue
-            sl_price = entry_price + sl_dist
-
-            tp1_candidate = c['POC'] if c['POC'] < entry_price else c['VAL']
-            tp1_min_dist = 0.75 * sl_dist
-            tp1_price = min(tp1_candidate, entry_price - tp1_min_dist)
-            tp2_r_price = entry_price - 2 * sl_dist
-            tp2_price = max(tp2_r_price, c['SWING_LOW']) if c['SWING_LOW'] < entry_price else tp2_r_price
-            tp2_price = min(tp2_price, tp1_price - 0.25 * sl_dist)
-
-            if not (tp2_price < tp1_price < entry_price < sl_price):
-                continue
-
-            net_r, exit_idx = simulate_short_trade(df, entry_idx, entry_price, sl_price, tp1_price, tp2_price, sl_dist)
-            trades.append({
-                'Symbol': symbol, 'Side': 'SHORT',
-                'Outcome': 'WIN' if net_r > 0 else 'LOSS',
-                'NetR': net_r, 'Date': entry_candle['Date']
-            })
-            locked_until_index = exit_idx + COOLDOWN_CANDLES
-
-    return trades
-
-
-# ============================================================
-# اجرای کامل: دانلود داده + بک‌تست + گزارش
-# ============================================================
-def main():
-    start_date = datetime.now() - timedelta(days=DAYS_BACK)
-    since_timestamp = int(start_date.timestamp() * 1000)
-
-    print("============================================================")
-    print("📥 دانلود داده‌های یک‌ساله (تایم‌فریم 1 ساعته)")
-    print(f"   ترتیب امتحان صرافی‌ها: {', '.join(CANDIDATE_DATA_EXCHANGES)}")
-    print("============================================================")
-
-    data_1h = {}
-    for symbol, lbank_symbol in SYMBOLS.items():
-        print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
-        raw = fetch_ohlcv_full(lbank_symbol, TIMEFRAME, since_timestamp)
-        if not raw:
-            print(f"  ❌ دیتایی برای {symbol} دریافت نشد.")
-            continue
-        df = pd.DataFrame(raw, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-        df['Date'] = pd.to_datetime(df['Timestamp'], unit='ms')
-        df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-        df.dropna(inplace=True)
-        df.drop_duplicates(subset=['Date'], inplace=True)
-        df.sort_values('Date', inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        df.to_csv(f"{symbol}_1h_frvp_bb_rsi_atr.csv", index=False)
-        data_1h[symbol] = df
-        print(f"  ✔️ {symbol}: {len(df)} کندل دریافت شد.")
-
-    print("\n============================================================")
-    print("🚀 اجرای بک‌تست ستاپ FRVP + Bollinger + RSI + ATR")
-    print("============================================================")
-
-    all_trades = []
-    for symbol, df1h in data_1h.items():
-        print(f"⏳ در حال پردازش {symbol} ...")
-        trades = run_backtest_for_symbol(symbol, df1h)
-        all_trades.extend(trades)
-        print(f"  ✔️ {symbol}: {len(trades)} معامله ثبت شد.")
-
-    print_report(all_trades)
-
-
-def print_report(all_trades):
-    print("\n============================================================")
-    print("📊 گزارش نهایی عملکرد یک‌ساله")
-    print("============================================================")
-
-    if not all_trades:
-        print("⚠️ هیچ معامله‌ای در این دوره ثبت نشد. پارامترهای فیلتر را بازبینی کنید.")
-        return
-
-    tdf = pd.DataFrame(all_trades)
-    total_trades = len(tdf)
-    longs = int((tdf['Side'] == 'LONG').sum())
-    shorts = int((tdf['Side'] == 'SHORT').sum())
-    wins = int((tdf['Outcome'] == 'WIN').sum())
-    losses = int((tdf['Outcome'] == 'LOSS').sum())
-    win_rate = wins / total_trades * 100
-    total_net_r = tdf['NetR'].sum()
-    avg_r = tdf['NetR'].mean()
-
-    print(f"🎯 تعداد کل معاملات (یک سال / ۱۰ ارز): {total_trades}")
-    print(f"📈 لانگ: {longs}  |  📉 شورت: {shorts}")
-    print(f"🏆 برد: {wins}  |  ❌ باخت: {losses}")
-    print(f"✅ وین‌ریت کل: {win_rate:.2f}%")
-    print(f"💰 مجموع Net R: {total_net_r:.2f}R  |  میانگین هر معامله: {avg_r:.3f}R")
-    print(f"📆 میانگین تعداد معامله در ماه: {total_trades / 12:.1f}")
-
-    print("\n--- تفکیک بر اساس نماد ---")
-    g = tdf.groupby('Symbol').agg(
-        Trades=('Outcome', 'count'),
-        Long=('Side', lambda x: (x == 'LONG').sum()),
-        Short=('Side', lambda x: (x == 'SHORT').sum()),
-        Wins=('Outcome', lambda x: (x == 'WIN').sum()),
-        Losses=('Outcome', lambda x: (x == 'LOSS').sum()),
-        NetR=('NetR', 'sum')
-    )
-    g['WinRate%'] = (g['Wins'] / g['Trades'] * 100).round(2)
-    print(g)
-
-    tdf.to_csv("all_trades_frvp_bb_rsi_atr.csv", index=False)
-    print("\n📁 جزئیات تمام معاملات در فایل all_trades_frvp_bb_rsi_atr.csv ذخیره شد.")
-
-
-if __name__ == "__main__":
-    main()
+print("\n✨ بک‌تست با موفقیت به پایان رسید.")
