@@ -74,7 +74,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         print(f"  ❌ دیتایی برای {symbol} دریافت نشد.")
 
 # تابع محاسبه اندیکاتورهای تکنیکال (RSI, ATR, EMA, Bollinger Bands)
-fn calculate_indicators(df):
+def calculate_indicators(df):
     # میانگین‌های متحرک
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
@@ -156,23 +156,19 @@ for symbol, df1h in data_1h.items():
             continue
             
         # بررسی پولبک و تقاطع باندهای بولینگر و RSI در تایم‌فریم 1 ساعته (نقطه ورود)
-        # جلوگیری از تقلب با استفاده صرف از داده‌های گذشته (index تا i)
         is_long_trigger = (c1h['Low'] <= c1h['BB_Lower']) and (c1h['RSI'] < 35)
         is_short_trigger = (c1h['High'] >= c1h['BB_Upper']) and (c1h['RSI'] > 65)
         
         if is_long_regime and is_long_trigger:
             entry_price = c1h['Close']
-            # تعیین حد ضرر بر اساس ATR و کف محلی
             sl = c1h['Low'] - (1.5 * c1h['ATR'])
             risk = entry_price - sl
             
             if risk <= 0:
                 continue
                 
-            # ریسک به ریوارد ۱ به ۲
             tp = entry_price + (2.0 * risk)
             
-            # شبیه‌سازی دقیق نتایج در کندل‌های آینده (بدون نگاه به آینده در لحظه تصمیم‌گیری)
             outcome = 'OPEN'
             exit_idx = i
             for j in range(i + 1, min(i + 50, len(df1h))):
@@ -191,19 +187,16 @@ for symbol, df1h in data_1h.items():
                     'Side': 'LONG',
                     'Outcome': outcome
                 })
-                # فعال‌سازی قفل همپوشانی تا زمان بسته شدن کامل پوزیشن
                 locked_until_index = exit_idx
                 
         elif is_short_regime and is_short_trigger:
             entry_price = c1h['Close']
-            # تعیین حد ضرر بر اساس ATR و سقف محلی
             sl = c1h['High'] + (1.5 * c1h['ATR'])
             risk = sl - entry_price
             
             if risk <= 0:
                 continue
                 
-            # ریسک به ریوارد ۱ به ۲
             tp = entry_price - (2.0 * risk)
             
             outcome = 'OPEN'
@@ -224,7 +217,6 @@ for symbol, df1h in data_1h.items():
                     'Side': 'SHORT',
                     'Outcome': outcome
                 })
-                # فعال‌سازی قفل همپوشانی
                 locked_until_index = exit_idx
 
 print("\n============================================================")
