@@ -16,7 +16,13 @@ import numpy as np
 # ============================================================
 # تنظیمات کلی
 # ============================================================
-exchange = ccxt.lbank({'enableRateLimit': True})
+# منبع دیتای تاریخی برای بک‌تست: Binance (آرشیو کامل هر تایم‌فریمی رو نگه می‌داره،
+# برخلاف بسیاری از صرافی‌های کوچک‌تر مثل LBank که روی تایم‌فریم‌های پایین فقط
+# چند هفته/ماه اخیر رو ذخیره می‌کنند). اجرای زنده همچنان می‌تواند روی LBank باشد.
+data_exchange = ccxt.binance({'enableRateLimit': True})
+# اگر بعداً خواستی مستقیم از LBank دیتا بگیری (مثلاً برای تایم‌فریم‌های بالاتر
+# مثل 1h/4h که معمولاً آرشیو طولانی‌تری دارند)، همین متغیر را به ccxt.lbank(...) تغییر بده.
+
 SYMBOLS = {
     "BTC": "BTC/USDT",
     "ETH": "ETH/USDT",
@@ -30,39 +36,46 @@ SYMBOLS = {
     "DOT": "DOT/USDT"
 }
 
-TIMEFRAME = '1h'
+TIMEFRAME = '15m'
 DAYS_BACK = 365
 COMMISSION_RATE = 0.0008          # کارمزد کل رفت‌وبرگشت (تقریبی)
 COMMISSION_PER_SIDE = COMMISSION_RATE / 2
 SLIPPAGE_RATE = 0.04 / 100        # اسلیپیج تخمینی هر ضلع
 
+# ---------------- مقیاس‌دهی پارامترهای مبتنی بر «بازه زمانی واقعی» ----------------
+# چون از 1h به 15m رفتیم (۴ برابر کندل بیشتر در واحد زمان)، پارامترهایی که معنای
+# "طول یک بازه تقویمی" دارند (نه اندیکاتورهای استاندارد مثل RSI/BB) را ۴ برابر
+# می‌کنیم تا همان "پنجره زمانی" قبلی حفظ شود؛ در غیر این صورت فیلترها عملاً شل‌تر
+# می‌شدند بدون اینکه واقعاً تصمیم گرفته باشیم شل‌ترشان کنیم.
+TF_SCALE = 4
+
 # ---------------- پارامترهای استراتژی ----------------
-BB_PERIOD = 20
+BB_PERIOD = 20             # استاندارد اندیکاتور، مستقل از تایم‌فریم
 BB_STD = 2
-RSI_PERIOD = 14
-ATR_PERIOD = 14
-ATR_MA_PERIOD = 50
-VOL_MA_PERIOD = 20
-VP_WINDOW = 100            # طول پنجره Fixed Range Volume Profile
-VP_BINS = 24               # تعداد باکت‌های قیمتی پروفایل حجم
-VALUE_AREA_PCT = 0.70      # درصد حجم برای تعیین Value Area (VAH/VAL)
-SWING_LOOKBACK = 10        # تعداد کندل برای سقف/کف ساختاری
-ADX_PERIOD = 14
-MAX_HOLD_CANDLES = 60      # حداکثر کندل نگه‌داشتن معامله باز
-COOLDOWN_CANDLES = 3       # فاصله امنیتی بعد از بسته‌شدن معامله تا سیگنال بعدی (جلوگیری از هم‌پوشانی)
-MIN_WARMUP = max(250, VP_WINDOW + ATR_MA_PERIOD + 5)
+RSI_PERIOD = 14            # استاندارد اندیکاتور، مستقل از تایم‌فریم
+ATR_PERIOD = 14            # استاندارد اندیکاتور، مستقل از تایم‌فریم
+ATR_MA_PERIOD = 50 * TF_SCALE
+VOL_MA_PERIOD = 20 * TF_SCALE
+VP_WINDOW = 100 * TF_SCALE        # طول پنجره Fixed Range Volume Profile (بازه تقویمی ثابت)
+VP_BINS = 24                      # تعداد باکت‌های قیمتی پروفایل حجم
+VALUE_AREA_PCT = 0.70             # درصد حجم برای تعیین Value Area (VAH/VAL)
+SWING_LOOKBACK = 10 * TF_SCALE    # تعداد کندل برای سقف/کف ساختاری (بازه تقویمی ثابت)
+ADX_PERIOD = 14            # استاندارد اندیکاتور، مستقل از تایم‌فریم
+MAX_HOLD_CANDLES = 60 * TF_SCALE  # حداکثر مدت نگه‌داشتن معامله باز (بازه تقویمی ثابت)
+COOLDOWN_CANDLES = 3 * TF_SCALE   # فاصله امنیتی بعد از بسته‌شدن معامله (جلوگیری از هم‌پوشانی)
+MIN_WARMUP = max(250 * TF_SCALE, VP_WINDOW + ATR_MA_PERIOD + 5)
 
 
 # ============================================================
-# دریافت داده از LBank (بدون تغییر نسبت به روش قبلی، صفحه‌بندی‌شده)
+# دریافت داده تاریخی (صفحه‌بندی‌شده، همان روش قبلی) — از data_exchange
 # ============================================================
 def fetch_ohlcv_full(symbol_ccxt, timeframe, since_ts):
     all_ohlcv = []
     current_since = since_ts
-    now_ts = exchange.milliseconds()
+    now_ts = data_exchange.milliseconds()
     while current_since < now_ts:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol_ccxt, timeframe=timeframe, since=current_since, limit=1000)
+            ohlcv = data_exchange.fetch_ohlcv(symbol_ccxt, timeframe=timeframe, since=current_since, limit=1000)
             if not ohlcv:
                 break
             current_since = ohlcv[-1][0] + 1
@@ -407,7 +420,8 @@ def main():
     since_timestamp = int(start_date.timestamp() * 1000)
 
     print("============================================================")
-    print("📥 دانلود داده‌های یک‌ساله از صرافی LBank")
+    print("📥 دانلود داده‌های یک‌ساله (تایم‌فریم 15 دقیقه) از Binance")
+    print("   (منبع دیتا؛ اجرای زنده می‌تواند همچنان روی LBank باشد)")
     print("============================================================")
 
     data_1h = {}
