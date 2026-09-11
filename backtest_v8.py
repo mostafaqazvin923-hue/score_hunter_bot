@@ -14,14 +14,22 @@ import pandas as pd
 import numpy as np
 
 # ============================================================
-# تنظیمات کلی
+# منبع دیتای تاریخی برای بک‌تست
 # ============================================================
-# منبع دیتای تاریخی برای بک‌تست: Binance (آرشیو کامل هر تایم‌فریمی رو نگه می‌داره،
-# برخلاف بسیاری از صرافی‌های کوچک‌تر مثل LBank که روی تایم‌فریم‌های پایین فقط
-# چند هفته/ماه اخیر رو ذخیره می‌کنند). اجرای زنده همچنان می‌تواند روی LBank باشد.
-data_exchange = ccxt.binance({'enableRateLimit': True})
-# اگر بعداً خواستی مستقیم از LBank دیتا بگیری (مثلاً برای تایم‌فریم‌های بالاتر
-# مثل 1h/4h که معمولاً آرشیو طولانی‌تری دارند)، همین متغیر را به ccxt.lbank(...) تغییر بده.
+# چون بایننس محدوده IP سرورهای GitHub Actions را هم مسدود می‌کند (خطای 451)،
+# به‌جای وابستگی به یک صرافی، لیستی از صرافی‌ها را به ترتیب امتحان می‌کنیم و
+# اولین موردی که واقعاً دیتا برگرداند مبنای بک‌تست قرار می‌گیرد. اجرای زنده
+# همچنان می‌تواند روی LBank باشد؛ این‌ها فقط برای گرفتن تاریخچه قیمت هستند.
+CANDIDATE_DATA_EXCHANGES = ['kucoin', 'okx', 'bybit', 'gateio', 'mexc', 'bitget']
+_exchange_instances = {}
+
+
+def get_data_exchange(exchange_id):
+    if exchange_id not in _exchange_instances:
+        exchange_class = getattr(ccxt, exchange_id)
+        _exchange_instances[exchange_id] = exchange_class({'enableRateLimit': True})
+    return _exchange_instances[exchange_id]
+
 
 SYMBOLS = {
     "BTC": "BTC/USDT",
@@ -67,25 +75,35 @@ MIN_WARMUP = max(250 * TF_SCALE, VP_WINDOW + ATR_MA_PERIOD + 5)
 
 
 # ============================================================
-# دریافت داده تاریخی (صفحه‌بندی‌شده، همان روش قبلی) — از data_exchange
+# دریافت داده تاریخی — به ترتیب چند صرافی را امتحان می‌کند تا یکی جواب بدهد
 # ============================================================
 def fetch_ohlcv_full(symbol_ccxt, timeframe, since_ts):
-    all_ohlcv = []
-    current_since = since_ts
-    now_ts = data_exchange.milliseconds()
-    while current_since < now_ts:
+    for exchange_id in CANDIDATE_DATA_EXCHANGES:
         try:
-            ohlcv = data_exchange.fetch_ohlcv(symbol_ccxt, timeframe=timeframe, since=current_since, limit=1000)
-            if not ohlcv:
-                break
-            current_since = ohlcv[-1][0] + 1
-            all_ohlcv.extend(ohlcv)
-            if len(ohlcv) < 1000:
-                break
+            ex = get_data_exchange(exchange_id)
+            all_ohlcv = []
+            current_since = since_ts
+            now_ts = ex.milliseconds()
+
+            while current_since < now_ts:
+                ohlcv = ex.fetch_ohlcv(symbol_ccxt, timeframe=timeframe, since=current_since, limit=1000)
+                if not ohlcv:
+                    break
+                current_since = ohlcv[-1][0] + 1
+                all_ohlcv.extend(ohlcv)
+                if len(ohlcv) < 1000:
+                    break
+
+            if len(all_ohlcv) > 200:
+                print(f"    ✔️ دیتا از {exchange_id} دریافت شد ({len(all_ohlcv)} کندل).")
+                return all_ohlcv
+            else:
+                print(f"    ⚠️ {exchange_id}: دیتای کافی برنگشت، رفتن به صرافی بعدی...")
         except Exception as e:
-            print(f"  ❌ خطا در دریافت داده {symbol_ccxt}: {e}")
-            break
-    return all_ohlcv
+            print(f"    ⚠️ {exchange_id} ناموفق ({type(e).__name__}): {e}")
+            continue
+
+    return []
 
 
 # ============================================================
@@ -420,8 +438,9 @@ def main():
     since_timestamp = int(start_date.timestamp() * 1000)
 
     print("============================================================")
-    print("📥 دانلود داده‌های یک‌ساله (تایم‌فریم 15 دقیقه) از Binance")
-    print("   (منبع دیتا؛ اجرای زنده می‌تواند همچنان روی LBank باشد)")
+    print("📥 دانلود داده‌های یک‌ساله (تایم‌فریم 15 دقیقه)")
+    print(f"   ترتیب امتحان صرافی‌ها: {', '.join(CANDIDATE_DATA_EXCHANGES)}")
+    print("   (فقط برای منبع دیتا؛ اجرای زنده می‌تواند روی LBank باشد)")
     print("============================================================")
 
     data_1h = {}
