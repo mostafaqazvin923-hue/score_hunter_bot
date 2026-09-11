@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HUNTER-X VPBB CLEAN PORTFOLIO BACKTEST (LBANK INTEGRATED - RELAXED FILTERS)
-=========================================================================
-1H execution + last CLOSED 4H trend filter
+HUNTER-X VPBB CLEAN PORTFOLIO BACKTEST (LBANK INTEGRATED - ULTRA RELAXED)
+========================================================================
+1H execution + relaxed trend filter
 10-symbol LBank spot/futures-style OHLCV portfolio backtest.
-Strict anti-lookahead & synchronized global portfolio execution.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ import requests
 
 
 # =========================
-# CONFIG & 10 SYMBOLS (RELAXED)
+# CONFIG & 10 SYMBOLS (ULTRA RELAXED)
 # =========================
 
 DEFAULT_SYMBOLS = [
@@ -50,16 +49,16 @@ class Config:
     bb_std: float = 2.0
     volume_sma_len: int = 20
 
-    # VP
+    # VP (Relaxed)
     vp_lookback: int = 96
     vp_rows: int = 48
     vp_value_area: float = 0.70
-    vp_near_atr: float = 0.40  # کمی بازتر برای پوشش بهتر نواحی
+    vp_near_atr: float = 0.80  # بسیار باز برای پوشش راحت‌تر نواحی
 
-    # Signal (Relaxed for execution)
-    adx_min: float = 15.0      # کاهش از 18 به 15
-    volume_mult: float = 1.05  # کاهش از 1.15 به 1.05
-    score_min: int = 6         # کاهش از 7 به 6 برای گرفتن ترید
+    # Signal (Ultra Relaxed)
+    adx_min: float = 12.0      # کاهش بیشتر ADX
+    volume_mult: float = 0.90  # اجازه ورود حتی با حجم کمی پایین‌تر از میانگین
+    score_min: int = 5         # حداقل امتیاز کاهش یافت
     swing_lookback: int = 10
     ema_rise_lookback: int = 4
 
@@ -70,16 +69,16 @@ class Config:
     max_consecutive_losses: int = 3
     max_hold_bars: int = 40
     tp_r: float = 2.0
-    sl_atr_buffer: float = 0.25
-    max_stop_atr: float = 1.8  # کمی بازتر برای استاپ لاس
+    sl_atr_buffer: float = 0.30
+    max_stop_atr: float = 2.5
 
-    # Filters
+    # Filters (Relaxed)
     bb_width_percentile_window: int = 480
-    bb_width_percentile_floor: float = 0.10  # کمی ملایم‌تر
+    bb_width_percentile_floor: float = 0.05
     min_bb_width: float = 0.0
-    flat_ema_threshold: float = 0.0008       # ملایم‌تر برای فلت نبودن شدید
-    max_candle_atr: float = 3.0
-    max_distance_ema_atr: float = 2.0
+    flat_ema_threshold: float = 0.001
+    max_candle_atr: float = 4.0
+    max_distance_ema_atr: float = 3.0
 
     # Costs
     fee_rate: float = 0.0004
@@ -171,7 +170,7 @@ def load_symbol(symbol: str, cfg: Config, cache_dir: Path) -> pd.DataFrame:
 
 
 # =========================
-# INDICATORS & VP (CAUSAL)
+# INDICATORS & VP
 # =========================
 
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
@@ -318,7 +317,7 @@ def add_vp_columns(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 
 # =========================
-# SIGNAL GENERATION
+# SIGNAL GENERATION (RELAXED)
 # =========================
 
 def near(a: float, b: float, atr_value: float, mult: float) -> bool:
@@ -328,45 +327,36 @@ def near(a: float, b: float, atr_value: float, mult: float) -> bool:
 def signal_at(df: pd.DataFrame, i: int, cfg: Config) -> Optional[dict]:
     r = df.iloc[i]
     needed = [
-        "ema20", "ema50", "ema200", "rsi", "atr", "adx",
+        "ema20", "ema50", "rsi", "atr", "adx",
         "bb_mid", "bb_upper", "bb_lower", "vol_sma",
         "prior_swing_low", "prior_swing_high", "vp_poc", "vp_vah", "vp_val",
-        "ema20_4h", "ema50_4h", "ema200_4h", "rsi_4h", "adx_4h",
+        "ema50_4h", "rsi_4h",
     ]
     if any(pd.isna(r.get(k)) for k in needed):
         return None
 
-    long_trend = r["ema20_4h"] > r["ema50_4h"] > r["ema200_4h"] and r["close"] > r["ema20_4h"] and r["rsi_4h"] > 45
-    short_trend = r["ema20_4h"] < r["ema50_4h"] < r["ema200_4h"] and r["close"] < r["ema20_4h"] and r["rsi_4h"] < 55
+    # شرط‌های روند خیلی ساده و منعطف‌شده
+    long_trend = r["close"] > r["ema50_4h"] and r["rsi_4h"] > 35
+    short_trend = r["close"] < r["ema50_4h"] and r["rsi_4h"] < 65
 
-    ema_rising = r["ema20"] > df.iloc[i - cfg.ema_rise_lookback]["ema20"] if i >= cfg.ema_rise_lookback else True
-    ema_falling = r["ema20"] < df.iloc[i - cfg.ema_rise_lookback]["ema20"] if i >= cfg.ema_rise_lookback else True
-
-    trend_long = r["ema20"] > r["ema50"] and r["close"] > r["ema20"] and r["rsi"] > 45 and ema_rising
-    trend_short = r["ema20"] < r["ema50"] and r["close"] < r["ema20"] and r["rsi"] < 55 and ema_falling
-
-    if r["adx"] < cfg.adx_min or r["adx_4h"] < cfg.adx_min:
-        return None
-    if not np.isfinite(r["bb_width_p20"]) or r["bb_width"] < max(cfg.min_bb_width, r["bb_width_p20"] * 0.8):
-        return None
-    if r["candle_atr_ratio"] > cfg.max_candle_atr or r["ema20_dist_atr"] > cfg.max_distance_ema_atr:
+    if r["adx"] < cfg.adx_min:
         return None
 
-    long_sweep = r["low"] < r["prior_swing_low"] or r["close"] > r["prior_swing_low"]
-    short_sweep = r["high"] > r["prior_swing_high"] or r["close"] < r["prior_swing_high"]
+    long_sweep = r["low"] <= r["prior_swing_low"] or r["close"] >= r["prior_swing_low"]
+    short_sweep = r["high"] >= r["prior_swing_high"] or r["close"] <= r["prior_swing_high"]
 
-    long_bb = r["low"] <= r["bb_upper"] and r["close"] > r["bb_lower"]
-    short_bb = r["high"] >= r["bb_lower"] and r["close"] < r["bb_upper"]
+    long_bb = r["close"] > r["bb_lower"]
+    short_bb = r["close"] < r["bb_upper"]
 
-    long_rsi = r["rsi"] > 40
-    short_rsi = r["rsi"] < 60
+    long_rsi = r["rsi"] > 30
+    short_rsi = r["rsi"] < 70
     volume_ok = r["volume"] > cfg.volume_mult * r["vol_sma"]
 
     long_vp = near(r["close"], r["vp_val"], r["atr"], cfg.vp_near_atr) or near(r["close"], r["vp_poc"], r["atr"], cfg.vp_near_atr)
     short_vp = near(r["close"], r["vp_vah"], r["atr"], cfg.vp_near_atr) or near(r["close"], r["vp_poc"], r["atr"], cfg.vp_near_atr)
 
-    long_score = 2 * int(long_trend) + 2 * int(long_vp) + 2 * int(long_sweep) + int(long_bb) + int(long_rsi) + int(volume_ok) + int(r["adx"] >= cfg.adx_min)
-    short_score = 2 * int(short_trend) + 2 * int(short_vp) + 2 * int(short_sweep) + int(short_bb) + int(short_rsi) + int(volume_ok) + int(r["adx"] >= cfg.adx_min)
+    long_score = int(long_trend) + int(long_vp) + int(long_sweep) + int(long_bb) + int(long_rsi) + int(volume_ok)
+    short_score = int(short_trend) + int(short_vp) + int(short_sweep) + int(short_bb) + int(short_rsi) + int(volume_ok)
 
     candidates = []
     if long_score >= cfg.score_min and long_trend:
@@ -521,7 +511,7 @@ def main():
     cfg = Config(days=args.days, initial_equity=args.initial_equity, risk_pct=args.risk_pct)
 
     print("=" * 78)
-    print("HUNTER-X VPBB PORTFOLIO BACKTEST (LBANK API - RELAXED)")
+    print("HUNTER-X VPBB PORTFOLIO BACKTEST (LBANK API - ULTRA RELAXED)")
     print("=" * 78)
 
     cache_dir = Path("data_cache")
