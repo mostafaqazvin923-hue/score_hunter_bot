@@ -251,12 +251,12 @@ def calculate_trend_filter(df1h):
     is_long_regime = (
         (merged['CLOSE_4H'] > merged['EMA_SLOW'])
         & (merged['EMA_FAST'] > merged['EMA_SLOW'])
-        & (merged['EMA_SLOW'] >= merged['EMA_SLOW_PREV'])
+        & (merged['EMA_SLOW'] >= merged['EMA_SLOW_PREV'] * 0.9995)   # تحمل کمی نسبت به شیب صاف/تقریباً صعودی
     )
     is_short_regime = (
         (merged['CLOSE_4H'] < merged['EMA_SLOW'])
         & (merged['EMA_FAST'] < merged['EMA_SLOW'])
-        & (merged['EMA_SLOW'] <= merged['EMA_SLOW_PREV'])
+        & (merged['EMA_SLOW'] <= merged['EMA_SLOW_PREV'] * 1.0005)
     )
 
     merged['TREND_LONG_OK'] = is_long_regime.fillna(False)
@@ -384,8 +384,8 @@ def run_backtest_for_symbol(symbol, df1h):
 
         # ---- فیلتر رژیم بازار (نوسان + حجم + روند 4 ساعته) ----
         atr_ratio = c['ATR'] / c['ATR_MA']
-        vol_ok = c['Volume'] >= 0.8 * c['Vol_MA']
-        volatility_ok = (0.7 <= atr_ratio <= 2.5) and (c['ADX'] >= 15)
+        vol_ok = c['Volume'] >= 0.75 * c['Vol_MA']
+        volatility_ok = (0.65 <= atr_ratio <= 2.7) and (c['ADX'] >= 12)
 
         adx_not_extreme = c['ADX'] <= 45
 
@@ -395,8 +395,8 @@ def run_backtest_for_symbol(symbol, df1h):
             and bool(c['TREND_LONG_OK'])
             and c['Low'] <= c['BB_LOWER']
             and c['Close'] > c['BB_LOWER']
-            and c['Close'] <= max(c['POC'], c['VAL'] * 1.01)
-            and 25 <= c['RSI'] <= 40
+            and c['Close'] <= max(c['POC'], c['VAL'] * 1.02)
+            and 28 <= c['RSI'] <= 45
             and c['RSI'] > prev['RSI']
             and c['Close'] > c['Open']
         )
@@ -407,8 +407,8 @@ def run_backtest_for_symbol(symbol, df1h):
             and bool(c['TREND_SHORT_OK'])
             and c['High'] >= c['BB_UPPER']
             and c['Close'] < c['BB_UPPER']
-            and c['Close'] >= min(c['POC'], c['VAH'] * 0.99)
-            and 60 <= c['RSI'] <= 75
+            and c['Close'] >= min(c['POC'], c['VAH'] * 0.98)
+            and 55 <= c['RSI'] <= 72
             and c['RSI'] < prev['RSI']
             and c['Close'] < c['Open']
         )
