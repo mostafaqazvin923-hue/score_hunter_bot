@@ -19,7 +19,7 @@ exchange = ccxt.lbank({
     'options': {'defaultType': 'swap'}
 })
 
-# لیست ۳۰ ارز برتر و پرنقدینگی فیوچرز برای افزایش تعداد معاملات
+# لیست ۳۰ ارز برتر و کاملاً یکتا (بدون تکرار و بدون خطا)
 SYMBOLS = {
     "BTC": "BTC/USDT",
     "ETH": "ETH/USDT",
@@ -42,20 +42,16 @@ SYMBOLS = {
     "RENDER": "RENDER/USDT",
     "INJ": "INJ/USDT",
     "FET": "FET/USDT",
-    "NEAR": "NEAR/USDT", # اگر تکراری بود جایش ارز دیگری می‌گذاریم
     "APT": "APT/USDT",
     "TIA": "TIA/USDT",
     "SEI": "SEI/USDT",
-    "NEAR": "NEAR/USDT",
     "ICP": "ICP/USDT",
     "FIL": "FIL/USDT",
     "UNI": "UNI/USDT",
     "BCH": "BCH/USDT",
-    "LTC": "LTC/USDT"
+    "LTC": "LTC/USDT",
+    "AR": "AR/USDT"
 }
-
-# حذف احتمال تکرار کلیدها در دیکشنری
-SYMBOLS = {k: v for k, v in SYMBOLS.items()} # یکتا سازی
 
 start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
@@ -144,7 +140,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست روی سبد جدید ارزهای LBank")
+print("🚀 اجرای موتور بک‌تست روی سبد کامل ۳۰ ارزی LBank")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -300,7 +296,7 @@ for symbol, df1h in data_1h.items():
                             break
 
 print("\n============================================================")
-print("📊 گزارش تجمیعی نهایی پورتفوی بزرگ LBank")
+print("📊 گزارش تجمیعی نهایی پورتفوی ۳۰ ارزی LBank")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -322,4 +318,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ بک‌تست سبد بزرگ ل‌بانک به اتمام رسید.")
+print("\n✨ بک‌تست کامل ۳۰ ارزی ل‌بانک به اتمام رسید.")
