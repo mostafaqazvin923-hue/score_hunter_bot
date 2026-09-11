@@ -1,25 +1,71 @@
 import os
-import subprocess
 import sys
+import subprocess
 from datetime import datetime, timedelta
+
+# ============================================================
+# AUTO INSTALL
+# ============================================================
 
 try:
     import ccxt
 except ImportError:
-    print("📦 در حال نصب کتابخانه ccxt...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
+    print("📦 Installing ccxt...")
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "ccxt"]
+    )
     import ccxt
 
 import pandas as pd
 import numpy as np
 
-# اتصال امن به صرافی LBank از طریق CCXT
-exchange = ccxt.lbank({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'swap'}
-})
 
-# لیست ۲۹ ارز نهایی (بدون FIL و بدون جایگزین)
+# ============================================================
+# CONFIG
+# ============================================================
+
+TIMEFRAME_1H = "1h"
+
+LOOKBACK_DAYS = 365
+
+EMA_FAST = 20
+EMA_MID = 50
+EMA_SLOW = 200
+
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+ADX_PERIOD = 14
+
+STRUCTURE_LOOKBACK = 15
+
+BREAKOUT_VOLUME_MULTIPLIER = 1.10
+
+# Retest tolerance
+RETEST_TOLERANCE = 0.003
+
+# Maximum candles allowed for retest after breakout
+MAX_RETEST_CANDLES = 13
+
+# Stop distance
+ATR_STOP_MULTIPLIER = 0.25
+
+# Maximum allowed risk distance
+MAX_RISK_PERCENT = 0.045
+
+# Risk / Reward
+TARGET_RR = 2.0
+
+# Maximum holding time
+MAX_HOLDING_CANDLES = 40
+
+# Conservative handling:
+# if SL and TP are both touched in same candle => LOSS
+SAME_CANDLE_PRIORITY = "SL"
+
+# ============================================================
+# SYMBOLS
+# ============================================================
+
 SYMBOLS = {
     "BTC": "BTC/USDT",
     "ETH": "ETH/USDT",
@@ -52,269 +98,1391 @@ SYMBOLS = {
     "XLM": "XLM/USDT"
 }
 
-start_date = datetime.now() - timedelta(days=365)
+
+# ============================================================
+# EXCHANGE
+# ============================================================
+
+exchange = ccxt.lbank({
+    "enableRateLimit": True,
+    "options": {
+        "defaultType": "swap"
+    }
+})
+
+
+# ============================================================
+# DOWNLOAD 1H DATA
+# ============================================================
+
+start_date = datetime.utcnow() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
-print("============================================================")
-print(f"📥 دانلود داده‌های 1 ساعته {len(SYMBOLS)} رمزارز از LBank و ساخت کندل‌های 4 ساعته")
-print("============================================================")
+print("=" * 70)
+print(
+    f"📥 Downloading {LOOKBACK_DAYS} days of 1H LBank data "
+    f"for {len(SYMBOLS)} symbols"
+)
+print("=" * 70)
 
 data_1h = {}
 
+
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_lbank_data.csv"
-    print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol} از LBank...")
-    
+
+    print(f"\n🔹 {symbol} -> {lbank_symbol}")
+
     all_ohlcv = []
+
     current_since = since_timestamp
-    now_timestamp = exchange.milliseconds()
-    
-    max_retries = 50
+
+    max_retries = 80
     retries = 0
-    
-    while current_since < now_timestamp and retries < max_retries:
+
+    while retries < max_retries:
+
         try:
-            ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', since=current_since, limit=500)
+
+            now_timestamp = exchange.milliseconds()
+
+            if current_since >= now_timestamp:
+                break
+
+            ohlcv = exchange.fetch_ohlcv(
+                lbank_symbol,
+                timeframe=TIMEFRAME_1H,
+                since=current_since,
+                limit=500
+            )
+
             if not ohlcv:
                 break
-            
-            next_since = ohlcv[-1][0] + 3600000
+
+            all_ohlcv.extend(ohlcv)
+
+            last_timestamp = ohlcv[-1][0]
+
+            next_since = last_timestamp + 3600000
+
             if next_since <= current_since:
                 current_since += 3600000
             else:
                 current_since = next_since
-                
-            all_ohlcv.extend(ohlcv)
-            
+
+            print(
+                f"   received: {len(all_ohlcv)} candles",
+                end="\r"
+            )
+
             if len(ohlcv) < 500:
                 break
-                
-            retries += 1
+
             exchange.sleep(exchange.rateLimit / 1000)
-        except Exception as e:
-            print(f"  ❌ خطا در دریافت داده {symbol}: {e}")
-            exchange.sleep(2)
+
             retries += 1
-            continue
-            
-    if all_ohlcv:
-        df1h = pd.DataFrame(all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-        df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
-        df1h = df1h[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-        df1h.dropna(inplace=True)
-        df1h.drop_duplicates(subset=['Date'], inplace=True)
-        df1h.sort_values('Date', inplace=True)
-        df1h.reset_index(drop=True, inplace=True)
-        
-        df1h.to_csv(filename_1h, index=False)
-        data_1h[symbol] = df1h
-        print(f"  ✔️ دیتای 1 ساعته {symbol} آماده شد (تعداد کندل: {len(df1h)})")
-    else:
-        print(f"  ❌ دیتایی برای {symbol} از LBank دریافت نشد.")
+
+        except Exception as e:
+
+            print(
+                f"\n   ❌ Error {symbol}: {e}"
+            )
+
+            retries += 1
+
+            exchange.sleep(3)
+
+    if not all_ohlcv:
+
+        print(
+            f"\n   ❌ No data for {symbol}"
+        )
+
+        continue
+
+    df = pd.DataFrame(
+        all_ohlcv,
+        columns=[
+            "Timestamp",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume"
+        ]
+    )
+
+    df["Date"] = pd.to_datetime(
+        df["Timestamp"],
+        unit="ms",
+        utc=True
+    )
+
+    df = df[
+        [
+            "Date",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume"
+        ]
+    ]
+
+    df.dropna(inplace=True)
+
+    df.drop_duplicates(
+        subset=["Date"],
+        inplace=True
+    )
+
+    df.sort_values(
+        "Date",
+        inplace=True
+    )
+
+    df.reset_index(
+        drop=True,
+        inplace=True
+    )
+
+    filename = f"{symbol}_1h_lbank_data.csv"
+
+    df.to_csv(
+        filename,
+        index=False
+    )
+
+    data_1h[symbol] = df
+
+    print(
+        f"\n   ✔️ {symbol}: {len(df)} candles"
+    )
+
+
+# ============================================================
+# INDICATORS
+# ============================================================
 
 def calculate_indicators(df):
-    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / (loss + 1e-9)
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['ATR'] = tr.rolling(window=14).mean()
-    
-    plus_dm = df['High'].diff().clip(lower=0)
-    minus_dm = (-df['Low'].diff()).clip(lower=0)
-    tr14 = tr.rolling(window=14).mean()
-    plus_di = 100 * (plus_dm.rolling(window=14).mean() / (tr14 + 1e-9))
-    minus_di = 100 * (minus_dm.rolling(window=14).mean() / (tr14 + 1e-9))
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-    df['ADX'] = dx.rolling(window=14).mean().fillna(20)
+
+    df = df.copy()
+
+    # --------------------------------------------------------
+    # EMA
+    # --------------------------------------------------------
+
+    df["EMA_20"] = (
+        df["Close"]
+        .ewm(
+            span=EMA_FAST,
+            adjust=False
+        )
+        .mean()
+    )
+
+    df["EMA_50"] = (
+        df["Close"]
+        .ewm(
+            span=EMA_MID,
+            adjust=False
+        )
+        .mean()
+    )
+
+    df["EMA_200"] = (
+        df["Close"]
+        .ewm(
+            span=EMA_SLOW,
+            adjust=False
+        )
+        .mean()
+    )
+
+    # --------------------------------------------------------
+    # RSI - Wilder style
+    # --------------------------------------------------------
+
+    delta = df["Close"].diff()
+
+    gain = delta.clip(lower=0)
+
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / RSI_PERIOD,
+        adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / RSI_PERIOD,
+        adjust=False
+    ).mean()
+
+    rs = avg_gain / (
+        avg_loss + 1e-10
+    )
+
+    df["RSI"] = (
+        100 -
+        (100 / (1 + rs))
+    )
+
+    # --------------------------------------------------------
+    # ATR - Wilder
+    # --------------------------------------------------------
+
+    high_low = (
+        df["High"] -
+        df["Low"]
+    )
+
+    high_close = (
+        df["High"] -
+        df["Close"].shift()
+    ).abs()
+
+    low_close = (
+        df["Low"] -
+        df["Close"].shift()
+    ).abs()
+
+    tr = pd.concat(
+        [
+            high_low,
+            high_close,
+            low_close
+        ],
+        axis=1
+    ).max(axis=1)
+
+    df["TR"] = tr
+
+    df["ATR"] = (
+        tr
+        .ewm(
+            alpha=1 / ATR_PERIOD,
+            adjust=False
+        )
+        .mean()
+    )
+
+    # --------------------------------------------------------
+    # ADX
+    # --------------------------------------------------------
+
+    up_move = df["High"].diff()
+
+    down_move = -df["Low"].diff()
+
+    plus_dm = np.where(
+        (up_move > down_move) &
+        (up_move > 0),
+        up_move,
+        0
+    )
+
+    minus_dm = np.where(
+        (down_move > up_move) &
+        (down_move > 0),
+        down_move,
+        0
+    )
+
+    plus_dm = pd.Series(
+        plus_dm,
+        index=df.index
+    )
+
+    minus_dm = pd.Series(
+        minus_dm,
+        index=df.index
+    )
+
+    atr_wilder = (
+        tr
+        .ewm(
+            alpha=1 / ADX_PERIOD,
+            adjust=False
+        )
+        .mean()
+    )
+
+    plus_di = (
+        100 *
+        plus_dm.ewm(
+            alpha=1 / ADX_PERIOD,
+            adjust=False
+        ).mean()
+        /
+        (atr_wilder + 1e-10)
+    )
+
+    minus_di = (
+        100 *
+        minus_dm.ewm(
+            alpha=1 / ADX_PERIOD,
+            adjust=False
+        ).mean()
+        /
+        (atr_wilder + 1e-10)
+    )
+
+    dx = (
+        100 *
+        (plus_di - minus_di).abs()
+        /
+        (
+            plus_di +
+            minus_di +
+            1e-10
+        )
+    )
+
+    df["ADX"] = (
+        dx
+        .ewm(
+            alpha=1 / ADX_PERIOD,
+            adjust=False
+        )
+        .mean()
+    )
+
     return df
 
-print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست روی پورتفوی بهینه‌شده LBank")
-print("============================================================")
 
-all_portfolio_trades = []
+# ============================================================
+# BUILD 4H DATA
+# ============================================================
 
-for symbol, df1h in data_1h.items():
-    if len(df1h) < 300:
-        print(f"⚠️ دیتای {symbol} کافی نیست (تعداد: {len(df1h)})، از این نماد عبور شد.")
-        continue
-        
-    df1h = calculate_indicators(df1h)
-    
-    df4h = df1h.set_index('Date').resample('4h').agg({
-        'Open': 'first',
-        'High': 'max',
-        'Low': 'min',
-        'Close': 'last',
-        'Volume': 'sum'
-    }).dropna().reset_index()
-    
-    df4h = calculate_indicators(df4h)
-    
-    df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
-    df4h_indexed = df4h.set_index('Date')
-    
-    locked_until_index = 0
-    
-    for i in range(200, len(df1h) - 40):
-        if i < locked_until_index:
+def build_4h(df1h):
+
+    temp = (
+        df1h
+        .set_index("Date")
+        .resample("4h", label="left", closed="left")
+        .agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum"
+        })
+        .dropna()
+        .reset_index()
+    )
+
+    temp = calculate_indicators(temp)
+
+    return temp
+
+
+# ============================================================
+# BACKTEST ONE SYMBOL
+# ============================================================
+
+def backtest_symbol(symbol, df1h):
+
+    if len(df1h) < 500:
+
+        print(
+            f"⚠️ {symbol}: insufficient data "
+            f"({len(df1h)})"
+        )
+
+        return []
+
+    df1h = calculate_indicators(
+        df1h.copy()
+    )
+
+    df4h = build_4h(
+        df1h
+    )
+
+    # --------------------------------------------------------
+    # CRITICAL:
+    #
+    # A 4H candle is only usable AFTER it has completely closed.
+    #
+    # For each 1H candle at time t, we use the latest 4H candle
+    # whose CLOSE time is <= t.
+    #
+    # This eliminates 4H look-ahead.
+    # --------------------------------------------------------
+
+    df4h["CloseTime"] = (
+        df4h["Date"] +
+        pd.Timedelta(hours=4)
+    )
+
+    df4h = df4h.sort_values(
+        "CloseTime"
+    )
+
+    df1h = df1h.sort_values(
+        "Date"
+    )
+
+    df1h = pd.merge_asof(
+        df1h,
+        df4h[
+            [
+                "CloseTime",
+                "EMA_20",
+                "EMA_50",
+                "EMA_200",
+                "RSI",
+                "ATR",
+                "ADX",
+                "Close"
+            ]
+        ].rename(
+            columns={
+                "EMA_20": "EMA20_4H",
+                "EMA_50": "EMA50_4H",
+                "EMA_200": "EMA200_4H",
+                "RSI": "RSI_4H",
+                "ATR": "ATR_4H",
+                "ADX": "ADX_4H",
+                "Close": "Close_4H"
+            }
+        ),
+        left_on="Date",
+        right_on="CloseTime",
+        direction="backward"
+    )
+
+    # --------------------------------------------------------
+    # Previous 4H EMA200
+    # --------------------------------------------------------
+
+    df4h["EMA200_PREV"] = (
+        df4h["EMA_200"].shift(1)
+    )
+
+    df4h_prev = df4h[
+        [
+            "CloseTime",
+            "EMA200_PREV"
+        ]
+    ]
+
+    df1h = pd.merge_asof(
+        df1h.sort_values("Date"),
+        df4h_prev.sort_values("CloseTime"),
+        left_on="Date",
+        right_on="CloseTime",
+        direction="backward"
+    )
+
+    trades = []
+
+    locked_until = -1
+
+    # --------------------------------------------------------
+    # Main loop
+    # --------------------------------------------------------
+
+    for i in range(
+        EMA_SLOW + 5,
+        len(df1h) - MAX_HOLDING_CANDLES - 5
+    ):
+
+        if i <= locked_until:
             continue
-            
-        c1h = df1h.iloc[i]
-        t4h_time = c1h['Date_4H']
-        
-        if t4h_time not in df4h_indexed.index:
+
+        c = df1h.iloc[i]
+
+        # ----------------------------------------------------
+        # Need valid closed 4H data
+        # ----------------------------------------------------
+
+        if pd.isna(c["EMA20_4H"]):
             continue
-            
-        r4h = df4h_indexed.loc[t4h_time]
-        
-        ema20_4h = r4h['EMA_20']
-        ema50_4h = r4h['EMA_50']
-        ema200_4h = r4h['EMA_200']
-        
-        try:
-            prev_ema200_4h = df4h.loc[df4h['Date'] == t4h_time, 'EMA_200'].values[0]
-            slope_positive = ema200_4h >= prev_ema200_4h
-        except:
-            slope_positive = True
-            
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 20) and (r4h['RSI'] > 55)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 20) and (r4h['RSI'] < 45)
-        
-        if not is_long_regime and not is_short_regime:
+
+        if pd.isna(c["EMA50_4H"]):
             continue
-            
-        lookback_slice = df1h.iloc[i-15:i]
-        struct_high = lookback_slice['High'].max()
-        struct_low = lookback_slice['Low'].min()
-        
-        avg_vol = lookback_slice['Volume'].mean()
-        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 1.1)
-        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 1.1)
-        
-        if is_long_regime and is_breakout_long:
+
+        if pd.isna(c["EMA200_4H"]):
+            continue
+
+        if pd.isna(c["RSI_4H"]):
+            continue
+
+        if pd.isna(c["ADX_4H"]):
+            continue
+
+        if pd.isna(c["EMA200_PREV"]):
+            continue
+
+        # ----------------------------------------------------
+        # 4H REGIME
+        # ----------------------------------------------------
+
+        slope_positive = (
+            c["EMA200_4H"] >
+            c["EMA200_PREV"]
+        )
+
+        slope_negative = (
+            c["EMA200_4H"] <
+            c["EMA200_PREV"]
+        )
+
+        is_long_regime = (
+            c["Close_4H"] >
+            c["EMA200_4H"]
+            and
+            c["EMA20_4H"] >
+            c["EMA50_4H"]
+            and
+            c["EMA50_4H"] >
+            c["EMA200_4H"]
+            and
+            slope_positive
+            and
+            c["ADX_4H"] >= 20
+            and
+            c["RSI_4H"] > 55
+        )
+
+        is_short_regime = (
+            c["Close_4H"] <
+            c["EMA200_4H"]
+            and
+            c["EMA20_4H"] <
+            c["EMA50_4H"]
+            and
+            c["EMA50_4H"] <
+            c["EMA200_4H"]
+            and
+            slope_negative
+            and
+            c["ADX_4H"] >= 20
+            and
+            c["RSI_4H"] < 45
+        )
+
+        if (
+            not is_long_regime
+            and
+            not is_short_regime
+        ):
+            continue
+
+        # ----------------------------------------------------
+        # 1H STRUCTURE
+        #
+        # IMPORTANT:
+        # Structure excludes current candle.
+        # ----------------------------------------------------
+
+        if i < STRUCTURE_LOOKBACK:
+            continue
+
+        lookback = df1h.iloc[
+            i - STRUCTURE_LOOKBACK:i
+        ]
+
+        struct_high = (
+            lookback["High"].max()
+        )
+
+        struct_low = (
+            lookback["Low"].min()
+        )
+
+        avg_volume = (
+            lookback["Volume"].mean()
+        )
+
+        # ----------------------------------------------------
+        # BREAKOUT
+        # ----------------------------------------------------
+
+        breakout_long = (
+            c["Close"] > struct_high
+            and
+            c["Volume"] >=
+            avg_volume *
+            BREAKOUT_VOLUME_MULTIPLIER
+        )
+
+        breakout_short = (
+            c["Close"] < struct_low
+            and
+            c["Volume"] >=
+            avg_volume *
+            BREAKOUT_VOLUME_MULTIPLIER
+        )
+
+        # ====================================================
+        # LONG
+        # ====================================================
+
+        if (
+            is_long_regime
+            and
+            breakout_long
+        ):
+
+            breakout_idx = i
+
             entered = False
-            for p in range(1, 14):
-                if i + p >= len(df1h) - 10:
+
+            for p in range(
+                1,
+                MAX_RETEST_CANDLES + 1
+            ):
+
+                entry_idx = (
+                    breakout_idx + p
+                )
+
+                if entry_idx >= len(df1h):
                     break
-                p_candle = df1h.iloc[i + p]
-                
-                if p_candle['Low'] <= struct_high * 1.003: 
-                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 50:
-                        entry_price = p_candle['Close']
-                        swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
-                        sl = swing_low_pullback - (0.25 * p_candle['ATR'])
-                        risk = entry_price - sl
-                        
-                        if risk <= 0 or (risk / entry_price) > 0.045:
-                            break
-                            
-                        tp = entry_price + (2.0 * risk)
-                        
-                        future_window = df1h.iloc[i+p+1 : i+p+30]['High'].max()
-                        if future_window < tp:
-                            break
-                            
-                        outcome = 'OPEN'
-                        exit_idx = i + p + 1
-                        for j in range(i + p + 1, min(i + p + 40, len(df1h))):
-                            f_c = df1h.iloc[j]
-                            exit_idx = j
-                            if f_c['Low'] <= sl:
-                                outcome = 'LOSS'
-                                break
-                            elif f_c['High'] >= tp:
-                                outcome = 'WIN'
-                                break
-                                
-                        if outcome in ['WIN', 'LOSS']:
-                            all_portfolio_trades.append({
-                                'Symbol': symbol,
-                                'Side': 'LONG',
-                                'Outcome': outcome
-                            })
-                            locked_until_index = exit_idx
-                            entered = True
-                            break
+
+                pc = df1h.iloc[
+                    entry_idx
+                ]
+
+                # --------------------------------------------
+                # Retest
+                # --------------------------------------------
+
+                retest = (
+                    pc["Low"] <=
+                    struct_high *
+                    (1 + RETEST_TOLERANCE)
+                )
+
+                if not retest:
+                    continue
+
+                # --------------------------------------------
+                # Confirmation
+                # --------------------------------------------
+
+                bullish_confirmation = (
+                    pc["Close"] >
+                    pc["Open"]
+                    and
+                    pc["RSI"] > 50
+                )
+
+                if not bullish_confirmation:
+                    continue
+
+                entry_price = pc["Close"]
+
+                swing_low = (
+                    df1h.iloc[
+                        breakout_idx:
+                        entry_idx + 1
+                    ]["Low"].min()
+                )
+
+                atr = pc["ATR"]
+
+                if pd.isna(atr) or atr <= 0:
+                    continue
+
+                sl = (
+                    swing_low -
+                    ATR_STOP_MULTIPLIER *
+                    atr
+                )
+
+                risk = (
+                    entry_price -
+                    sl
+                )
+
+                risk_percent = (
+                    risk /
+                    entry_price
+                )
+
+                if risk <= 0:
+                    continue
+
+                if (
+                    risk_percent >
+                    MAX_RISK_PERCENT
+                ):
+                    continue
+
+                tp = (
+                    entry_price +
+                    TARGET_RR *
+                    risk
+                )
+
+                # --------------------------------------------
+                # Forward simulation
+                #
+                # This is the ONLY place where future candles
+                # are examined, AFTER entry has been fixed.
+                # --------------------------------------------
+
+                outcome = "OPEN"
+
+                exit_price = np.nan
+
+                exit_idx = None
+
+                max_exit = min(
+                    entry_idx +
+                    MAX_HOLDING_CANDLES,
+                    len(df1h) - 1
+                )
+
+                for j in range(
+                    entry_idx + 1,
+                    max_exit + 1
+                ):
+
+                    fc = df1h.iloc[j]
+
+                    hit_sl = (
+                        fc["Low"] <= sl
+                    )
+
+                    hit_tp = (
+                        fc["High"] >= tp
+                    )
+
+                    if hit_sl and hit_tp:
+
+                        if SAME_CANDLE_PRIORITY == "SL":
+
+                            outcome = "LOSS"
+                            exit_price = sl
+
+                        else:
+
+                            outcome = "WIN"
+                            exit_price = tp
+
+                        exit_idx = j
+
+                        break
+
+                    elif hit_sl:
+
+                        outcome = "LOSS"
+                        exit_price = sl
+                        exit_idx = j
+
+                        break
+
+                    elif hit_tp:
+
+                        outcome = "WIN"
+                        exit_price = tp
+                        exit_idx = j
+
+                        break
+
+                # --------------------------------------------
+                # Max holding exit
+                # --------------------------------------------
+
+                if outcome == "OPEN":
+
+                    exit_idx = max_exit
+
+                    exit_price = (
+                        df1h.iloc[
+                            exit_idx
+                        ]["Close"]
+                    )
+
+                    # Mark-to-market R
+                    pnl_price = (
+                        exit_price -
+                        entry_price
+                    )
+
+                    r_multiple = (
+                        pnl_price /
+                        risk
+                    )
+
+                    outcome = "TIMEOUT"
+
+                else:
+
+                    if outcome == "WIN":
+                        r_multiple = TARGET_RR
+                    else:
+                        r_multiple = -1.0
+
+                trades.append({
+                    "Symbol": symbol,
+                    "Side": "LONG",
+                    "BreakoutTime": c["Date"],
+                    "EntryTime": pc["Date"],
+                    "ExitTime": df1h.iloc[
+                        exit_idx
+                    ]["Date"],
+                    "Entry": entry_price,
+                    "SL": sl,
+                    "TP": tp,
+                    "RiskPercent": risk_percent * 100,
+                    "Outcome": outcome,
+                    "R": r_multiple
+                })
+
+                locked_until = exit_idx
+
+                entered = True
+
+                break
+
             if entered:
                 continue
-                
-        elif is_short_regime and is_breakout_short:
+
+        # ====================================================
+        # SHORT
+        # ====================================================
+
+        if (
+            is_short_regime
+            and
+            breakout_short
+        ):
+
+            breakout_idx = i
+
             entered = False
-            for p in range(1, 14):
-                if i + p >= len(df1h) - 10:
+
+            for p in range(
+                1,
+                MAX_RETEST_CANDLES + 1
+            ):
+
+                entry_idx = (
+                    breakout_idx + p
+                )
+
+                if entry_idx >= len(df1h):
                     break
-                p_candle = df1h.iloc[i + p]
-                
-                if p_candle['High'] >= struct_low * 0.997:
-                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 50:
-                        entry_price = p_candle['Close']
-                        swing_high_pullback = df1h.iloc[i:i+p+1]['High'].max()
-                        sl = swing_high_pullback + (0.25 * p_candle['ATR'])
-                        risk = sl - entry_price
-                        
-                        if risk <= 0 or (risk / entry_price) > 0.045:
-                            break
-                            
-                        tp = entry_price - (2.0 * risk)
-                        
-                        future_window = df1h.iloc[i+p+1 : i+p+30]['Low'].min()
-                        if future_window > tp:
-                            break
-                            
-                        outcome = 'OPEN'
-                        exit_idx = i + p + 1
-                        for j in range(i + p + 1, min(i + p + 40, len(df1h))):
-                            f_c = df1h.iloc[j]
-                            exit_idx = j
-                            if f_c['High'] >= sl:
-                                outcome = 'LOSS'
-                                break
-                            elif f_c['Low'] <= tp:
-                                outcome = 'WIN'
-                                break
-                                
-                        if outcome in ['WIN', 'LOSS']:
-                            all_portfolio_trades.append({
-                                'Symbol': symbol,
-                                'Side': 'SHORT',
-                                'Outcome': outcome
-                            })
-                            locked_until_index = exit_idx
-                            entered = True
-                            break
 
-print("\n============================================================")
-print("📊 گزارش تجمیعی نهایی پورتفوی ل‌بانک")
-print("============================================================")
+                pc = df1h.iloc[
+                    entry_idx
+                ]
 
-if all_portfolio_trades:
-    pf_df = pd.DataFrame(all_portfolio_trades)
-    total_trades = len(pf_df)
-    total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
-    total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
-    portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    net_profit_score = (total_wins * 2.0) - total_losses
-    
-    print(f"🔸 تعداد کل معاملات کل سبد (پورتفوی): {total_trades}")
-    print(f"🔸 کل معاملات برنده (WIN): {total_wins}")
-    print(f"🔸 کل معاملات بازنده (LOSS): {total_losses}")
-    print(f"🎯 **وین‌ریت تجمیعی کل پورتفوی (Portfolio Win Rate):** {portfolio_win_rate:.2f}%")
-    print(f"💰 امتیاز سودآوری خالص (Net Profit Score): {net_profit_score:.2f}R")
-    
-    print("\nتفکیک عملکرد به تفکیک هر نماد:")
-    print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
-else:
-    print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
+                # --------------------------------------------
+                # Retest
+                # --------------------------------------------
 
-print("\n✨ بک‌تست پورتفوی ل‌بانک به اتمام رسید.")
+                retest = (
+                    pc["High"] >=
+                    struct_low *
+                    (1 - RETEST_TOLERANCE)
+                )
+
+                if not retest:
+                    continue
+
+                # --------------------------------------------
+                # Confirmation
+                # --------------------------------------------
+
+                bearish_confirmation = (
+                    pc["Close"] <
+                    pc["Open"]
+                    and
+                    pc["RSI"] < 50
+                )
+
+                if not bearish_confirmation:
+                    continue
+
+                entry_price = pc["Close"]
+
+                swing_high = (
+                    df1h.iloc[
+                        breakout_idx:
+                        entry_idx + 1
+                    ]["High"].max()
+                )
+
+                atr = pc["ATR"]
+
+                if pd.isna(atr) or atr <= 0:
+                    continue
+
+                sl = (
+                    swing_high +
+                    ATR_STOP_MULTIPLIER *
+                    atr
+                )
+
+                risk = (
+                    sl -
+                    entry_price
+                )
+
+                risk_percent = (
+                    risk /
+                    entry_price
+                )
+
+                if risk <= 0:
+                    continue
+
+                if (
+                    risk_percent >
+                    MAX_RISK_PERCENT
+                ):
+                    continue
+
+                tp = (
+                    entry_price -
+                    TARGET_RR *
+                    risk
+                )
+
+                # --------------------------------------------
+                # Forward simulation
+                # --------------------------------------------
+
+                outcome = "OPEN"
+
+                exit_price = np.nan
+
+                exit_idx = None
+
+                max_exit = min(
+                    entry_idx +
+                    MAX_HOLDING_CANDLES,
+                    len(df1h) - 1
+                )
+
+                for j in range(
+                    entry_idx + 1,
+                    max_exit + 1
+                ):
+
+                    fc = df1h.iloc[j]
+
+                    hit_sl = (
+                        fc["High"] >= sl
+                    )
+
+                    hit_tp = (
+                        fc["Low"] <= tp
+                    )
+
+                    if hit_sl and hit_tp:
+
+                        if SAME_CANDLE_PRIORITY == "SL":
+
+                            outcome = "LOSS"
+                            exit_price = sl
+
+                        else:
+
+                            outcome = "WIN"
+                            exit_price = tp
+
+                        exit_idx = j
+
+                        break
+
+                    elif hit_sl:
+
+                        outcome = "LOSS"
+                        exit_price = sl
+                        exit_idx = j
+
+                        break
+
+                    elif hit_tp:
+
+                        outcome = "WIN"
+                        exit_price = tp
+                        exit_idx = j
+
+                        break
+
+                # --------------------------------------------
+                # Max holding exit
+                # --------------------------------------------
+
+                if outcome == "OPEN":
+
+                    exit_idx = max_exit
+
+                    exit_price = (
+                        df1h.iloc[
+                            exit_idx
+                        ]["Close"]
+                    )
+
+                    pnl_price = (
+                        entry_price -
+                        exit_price
+                    )
+
+                    r_multiple = (
+                        pnl_price /
+                        risk
+                    )
+
+                    outcome = "TIMEOUT"
+
+                else:
+
+                    if outcome == "WIN":
+                        r_multiple = TARGET_RR
+                    else:
+                        r_multiple = -1.0
+
+                trades.append({
+                    "Symbol": symbol,
+                    "Side": "SHORT",
+                    "BreakoutTime": c["Date"],
+                    "EntryTime": pc["Date"],
+                    "ExitTime": df1h.iloc[
+                        exit_idx
+                    ]["Date"],
+                    "Entry": entry_price,
+                    "SL": sl,
+                    "TP": tp,
+                    "RiskPercent": risk_percent * 100,
+                    "Outcome": outcome,
+                    "R": r_multiple
+                })
+
+                locked_until = exit_idx
+
+                entered = True
+
+                break
+
+    return trades
+
+
+# ============================================================
+# RUN BACKTEST
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("🚀 HUNTER-X CLEAN V4 BACKTEST")
+print("=" * 70)
+
+all_trades = []
+
+
+for symbol, df in data_1h.items():
+
+    print(
+        f"\n🔍 Backtesting {symbol}..."
+    )
+
+    symbol_trades = backtest_symbol(
+        symbol,
+        df
+    )
+
+    all_trades.extend(
+        symbol_trades
+    )
+
+    print(
+        f"   ✔️ Trades: {len(symbol_trades)}"
+    )
+
+
+# ============================================================
+# RESULTS
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("📊 FINAL PORTFOLIO REPORT")
+print("=" * 70)
+
+
+if not all_trades:
+
+    print(
+        "⚠️ No valid trades found."
+    )
+
+    sys.exit()
+
+
+pf_df = pd.DataFrame(
+    all_trades
+)
+
+# ------------------------------------------------------------
+# Basic statistics
+# ------------------------------------------------------------
+
+total_trades = len(pf_df)
+
+wins = (
+    pf_df["Outcome"] == "WIN"
+).sum()
+
+losses = (
+    pf_df["Outcome"] == "LOSS"
+).sum()
+
+timeouts = (
+    pf_df["Outcome"] == "TIMEOUT"
+).sum()
+
+decisive_trades = (
+    wins + losses
+)
+
+win_rate = (
+    wins /
+    decisive_trades *
+    100
+    if decisive_trades > 0
+    else 0
+)
+
+# ------------------------------------------------------------
+# R statistics
+# ------------------------------------------------------------
+
+total_R = (
+    pf_df["R"].sum()
+)
+
+gross_profit_R = (
+    pf_df.loc[
+        pf_df["R"] > 0,
+        "R"
+    ].sum()
+)
+
+gross_loss_R = abs(
+    pf_df.loc[
+        pf_df["R"] < 0,
+        "R"
+    ].sum()
+)
+
+profit_factor = (
+    gross_profit_R /
+    gross_loss_R
+    if gross_loss_R > 0
+    else np.inf
+)
+
+expectancy_R = (
+    pf_df["R"].mean()
+)
+
+# ------------------------------------------------------------
+# Equity / Drawdown
+# ------------------------------------------------------------
+
+equity = (
+    pf_df["R"]
+    .cumsum()
+)
+
+peak = (
+    equity
+    .cummax()
+)
+
+drawdown = (
+    equity -
+    peak
+)
+
+max_drawdown_R = (
+    drawdown.min()
+)
+
+# ------------------------------------------------------------
+# Average win/loss
+# ------------------------------------------------------------
+
+average_win = (
+    pf_df.loc[
+        pf_df["R"] > 0,
+        "R"
+    ].mean()
+)
+
+average_loss = (
+    pf_df.loc[
+        pf_df["R"] < 0,
+        "R"
+    ].mean()
+)
+
+# ============================================================
+# PRINT
+# ============================================================
+
+print(
+    f"🔸 Total Trades: {total_trades}"
+)
+
+print(
+    f"🟢 Wins: {wins}"
+)
+
+print(
+    f"🔴 Losses: {losses}"
+)
+
+print(
+    f"⏳ Timeouts: {timeouts}"
+)
+
+print(
+    f"🎯 Win Rate: {win_rate:.2f}%"
+)
+
+print(
+    f"💰 Net Profit: {total_R:.2f}R"
+)
+
+print(
+    f"📈 Profit Factor: {profit_factor:.2f}"
+)
+
+print(
+    f"📊 Expectancy: {expectancy_R:.3f}R/trade"
+)
+
+print(
+    f"📉 Max Drawdown: {max_drawdown_R:.2f}R"
+)
+
+print(
+    f"🏆 Average Win: {average_win:.2f}R"
+)
+
+print(
+    f"💔 Average Loss: {average_loss:.2f}R"
+)
+
+
+# ============================================================
+# SYMBOL REPORT
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("📌 PERFORMANCE BY SYMBOL")
+print("=" * 70)
+
+symbol_rows = []
+
+for symbol, group in pf_df.groupby("Symbol"):
+
+    symbol_wins = (
+        group["Outcome"] == "WIN"
+    ).sum()
+
+    symbol_losses = (
+        group["Outcome"] == "LOSS"
+    ).sum()
+
+    symbol_decisive = (
+        symbol_wins +
+        symbol_losses
+    )
+
+    symbol_wr = (
+        symbol_wins /
+        symbol_decisive *
+        100
+        if symbol_decisive > 0
+        else 0
+    )
+
+    symbol_R = (
+        group["R"].sum()
+    )
+
+    symbol_rows.append({
+        "Symbol": symbol,
+        "Trades": len(group),
+        "Wins": symbol_wins,
+        "Losses": symbol_losses,
+        "Timeouts": (
+            group["Outcome"] ==
+            "TIMEOUT"
+        ).sum(),
+        "WinRate": symbol_wr,
+        "NetR": symbol_R
+    })
+
+symbol_report = pd.DataFrame(
+    symbol_rows
+)
+
+symbol_report = symbol_report.sort_values(
+    "NetR",
+    ascending=False
+)
+
+print(
+    symbol_report.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# SAVE RESULTS
+# ============================================================
+
+pf_df.to_csv(
+    "HUNTER_X_CLEAN_V4_ALL_TRADES.csv",
+    index=False
+)
+
+symbol_report.to_csv(
+    "HUNTER_X_CLEAN_V4_SYMBOL_REPORT.csv",
+    index=False
+)
+
+
+# ============================================================
+# FINAL
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("✅ CLEAN BACKTEST COMPLETED")
+print("=" * 70)
+
+print(
+    "📁 HUNTER_X_CLEAN_V4_ALL_TRADES.csv"
+)
+
+print(
+    "📁 HUNTER_X_CLEAN_V4_SYMBOL_REPORT.csv"
+)
+
+print(
+    "\n⚠️ مهم:"
+)
+
+print(
+    "این نسخه قبل از ورود هیچ اطلاعاتی از آینده "
+    "برای تصمیم‌گیری استفاده نمی‌کند."
+)
+
+print(
+    "درصد Win Rate فقط بر اساس معاملات WIN/LOSS "
+    "محاسبه شده و TIMEOUT جداگانه گزارش می‌شود."
+)
