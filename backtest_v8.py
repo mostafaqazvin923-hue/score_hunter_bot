@@ -13,7 +13,7 @@ except ImportError:
 import pandas as pd
 import numpy as np
 
-# صرافی LBank با سبد 10 ارز معتبر
+# صرافی LBank با سبد 10 ارز برتر
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
     "BTC": "BTC/USDT",
@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و ساخت دیتای 4 ساعته همگام")
+print("📥 دانلود داده‌ها برای سیستم فوق‌العاده سخت‌گیر (Hyper-Selective)")
 print("============================================================")
 
 data_1h = {}
@@ -61,7 +61,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
         df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
         df1h.set_index('Date', inplace=True)
         
-        # ساخت کندل‌های 4 ساعته استاندارد برای تعیین روند کلان
         df4h = df1h.resample('4H').agg({
             'Open': 'first',
             'High': 'max',
@@ -74,26 +73,24 @@ for symbol, lbank_symbol in SYMBOLS.items():
         
         data_1h[symbol] = df1h
         data_4h[symbol] = df4h
-        print(f"  ✔️ دیتای {symbol} آماده شد (1 ساعته: {len(df1h)} کندل | 4 ساعته: {len(df4h)} کندل)")
+        print(f"  ✔️ دیتای {symbol} آماده شد.")
 
-def calculate_indicators(df):
+def calculate_hyper_indicators(df):
+    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    return df
-
-def calculate_smart_money_indicators(df):
-    df['Highest_24'] = df['High'].shift(1).rolling(window=24).max()
-    df['Lowest_24'] = df['Low'].shift(1).rolling(window=24).min()
     
+    # ATR برای تعیین حدود دقیق
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
+    
     df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست هوشمند (روند 4H + شکار نقدینگی + ATR پویا)")
+print("🚀 اجرای موتور بک‌تست فوق‌العاده گزینشی (هدف: وین‌ریت بالا)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -108,8 +105,8 @@ for symbol in SYMBOLS.keys():
     if len(df1h) < 300 or len(df4h) < 100:
         continue
         
-    df1h = calculate_smart_money_indicators(df1h)
-    df4h = calculate_indicators(df4h)
+    df1h = calculate_hyper_indicators(df1h)
+    df4h = calculate_hyper_indicators(df4h)
     
     df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
     df4h_indexed = df4h.set_index('Date')
@@ -128,36 +125,34 @@ for symbol in SYMBOLS.keys():
             
         r4h = df4h_indexed.loc[t4h_time]
         
-        # تشخیص روند کلان در تایم‌فریم 4 ساعته با EMA 200
-        is_bullish_macro = r4h['Close'] > r4h['EMA_200']
-        is_bearish_macro = r4h['Close'] < r4h['EMA_200']
+        # فیلتر کلان فوق‌العاده سخت‌گیرانه (تایید قطعی روند در 4H)
+        is_strong_bull = (r4h['Close'] > r4h['EMA_200']) and (r4h['EMA_50'] > r4h['EMA_200'])
+        is_strong_bear = (r4h['Close'] < r4h['EMA_200']) and (r4h['EMA_50'] < r4h['EMA_200'])
         
         atr = c1h['ATR']
         vol_ma = c1h['Vol_MA']
         
-        if pd.isna(atr) or atr <= 0 or c1h['Volume'] < vol_ma * 1.3:
+        # فیلتر حجم انفجاری (حداقل 1.8 برابر میانگین برای تایید ورود پول نهادی واقعی)
+        if pd.isna(atr) or atr <= 0 or c1h['Volume'] < vol_ma * 1.8:
             continue
             
-        highest_24 = c1h['Highest_24']
-        lowest_24 = c1h['Lowest_24']
-        
-        if pd.isna(highest_24) or pd.isna(lowest_24):
+        # بررسی ساختار قیمت در 1 ساعته (باید بدنه کندل خیلی قدرتمند باشد)
+        body_size = abs(c1h['Close'] - c1h['Open'])
+        candle_range = c1h['High'] - c1h['Low']
+        if candle_range == 0:
             continue
             
-        # شرایط ستاپ
-        is_sweep_low = (c1h['Low'] < lowest_24) and (c1h['Close'] > lowest_24) and (c1h['Close'] > c1h['Open'])
-        is_sweep_high = (c1h['High'] > highest_24) and (c1h['Close'] < highest_24) and (c1h['Close'] < c1h['Open'])
+        is_clean_body = (body_size / candle_range) > 0.65  # حداقل 65 درصد کندل بدنه خالص باشد
         
-        # فیلتر حیاتی: تایید جهت با روند کلان 4 ساعته
-        if is_bullish_macro and is_sweep_low:
-            # فقط لانگ در روند صعودی
+        if is_strong_bull and (c1h['Close'] > c1h['Open']) and is_clean_body:
+            # تایید ورود لانگ با بالاترین کیفیت
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            sl = entry_price - (1.5 * atr)
-            tp = entry_price + (3.0 * atr)  # ریسک به ریوارد 1 به 2
+            sl = entry_price - (1.2 * atr)  # استاپ نزدیک و امن پشت ساختار
+            tp = entry_price + (2.4 * atr)  # ریسک به ریوارد دقیق 1 به 2
             
             outcome = None
             exit_idx = entry_idx
@@ -179,17 +174,17 @@ for symbol in SYMBOLS.keys():
                     'Side': 'LONG',
                     'Outcome': outcome
                 })
-                locked_until_index = exit_idx + 1
+                locked_until_index = exit_idx + 3  # استراحت طولانی‌تر برای فیلتر نویزها
                 
-        elif is_bearish_macro and is_sweep_high:
-            # فقط شورت در روند نزولی
+        elif is_strong_bear and (c1h['Close'] < c1h['Open']) and is_clean_body:
+            # تایید ورود شورت با بالاترین کیفیت
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            sl = entry_price + (1.5 * atr)
-            tp = entry_price - (3.0 * atr)  # ریسک به ریوارد 1 به 2
+            sl = entry_price + (1.2 * atr)
+            tp = entry_price - (2.4 * atr)  # ریسک به ریوارد 1 به 2
             
             outcome = None
             exit_idx = entry_idx
@@ -211,10 +206,10 @@ for symbol in SYMBOLS.keys():
                     'Side': 'SHORT',
                     'Outcome': outcome
                 })
-                locked_until_index = exit_idx + 1
+                locked_until_index = exit_idx + 3
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی همگام با روند کلان (Trend-Aligned Liquidity Sweep)")
+print("📊 گزارش نهایی پورتفوی فوق‌العاده گزینشی (Hyper-Selective)")
 print("============================================================")
 
 if all_portfolio_trades:
