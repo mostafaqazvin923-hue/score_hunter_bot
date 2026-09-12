@@ -32,14 +32,14 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و ساخت دیتای 4 ساعته و 1 ساعته همگام")
+print("📥 دانلود داده‌های 1 ساعته و ساخت دیتای 4 ساعته و 1 ساعته (نسخه کم‌حجم و باکیفیت)")
 print("============================================================")
 
 data_1h = {}
 data_4h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_multitf_data.csv"
+    filename_1h = f"{symbol}_1h_strict_data.csv"
     print(f"🔹 در حال دریافت و پردازش دیتای {symbol}...")
     
     all_ohlcv = []
@@ -64,7 +64,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
         df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
         df1h.set_index('Date', inplace=True)
         
-        # ساخت کندل‌های 4 ساعته استاندارد برای تعیین روند کلان
         df4h = df1h.resample('4H').agg({
             'Open': 'first',
             'High': 'max',
@@ -86,10 +85,17 @@ def calculate_indicators(df):
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
+    
+    # محاسبه RSI برای فیلتر مومنتوم
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست حرفه‌ای دوطرفه (روند 4H + پولبک/حجم 1H + TP 2% / SL 1%)")
+print("🚀 اجرای موتور بک‌تست سخت‌گیرانه (روند 4H + تریگر 1H + فیلتر RSI + حجم 1.3x)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -107,16 +113,12 @@ for symbol in SYMBOLS.keys():
     df1h = calculate_indicators(df1h)
     df4h = calculate_indicators(df4h)
     
-    # مپ کردن تاریخ 4 ساعته روی دیتافریم 1 ساعته برای دسترسی سریع به روند کلان
     df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
     df4h_indexed = df4h.set_index('Date')
     
     locked_until_index = 0
     
-    # پیمایش کندل به کندل در تایم‌فریم 1 ساعته
     for i in range(250, len(df1h) - 20):
-        
-        # رعایت کامل قفل پوزیشن (عدم همپوشانی و جلوگیری از سیگنال روی کندل تسویه)
         if i < locked_until_index:
             continue
             
@@ -128,28 +130,23 @@ for symbol in SYMBOLS.keys():
             
         r4h = df4h_indexed.loc[t4h_time]
         
-        # 1. تشخیص جهت روند کلان در تایم‌فریم 4 ساعته
+        # 1. تشخیص جهت روند کلان در تایم‌فریم 4 ساعته با سخت‌گیری بیشتر
         is_long_macro = (r4h['Close'] > r4h['EMA_200']) and (r4h['EMA_20'] > r4h['EMA_50']) and (r4h['EMA_50'] > r4h['EMA_200'])
         is_short_macro = (r4h['Close'] < r4h['EMA_200']) and (r4h['EMA_20'] < r4h['EMA_50']) and (r4h['EMA_50'] < r4h['EMA_200'])
         
         if not is_long_macro and not is_short_macro:
             continue
             
-        # بررسی حجم و فیلتر انرژی در تایم‌فریم 1 ساعته (کندل بسته شده)
-        # حجم کندل فعلی باید بالاتر از میانگین حجم باشد تا حرکت فیک نباشد
-        if c1h['Volume'] < c1h['Vol_MA'] * 1.1:
+        # 2. فیلتر حجم سنگین‌تر (1.3 برابر میانگین) برای حذف نویزها
+        if c1h['Volume'] < c1h['Vol_MA'] * 1.3:
             continue
             
-        # بررسی پولبک و تاییدیه مومنتوم
-        lookback_slice = df1h.iloc[i-5:i]
-        
-        # شرایط لانگ: روند 4 ساعته صعودی + کندل 1 ساعته صعودی قدرتمند بعد از پولبک
         if is_long_macro:
+            # تاییدیه مومنتوم صعودی: کندل قوی + RSI بالاتر از 55
             is_bullish_candle = (c1h['Close'] > c1h['Open']) and ((c1h['High'] - c1h['Close']) < (c1h['Close'] - c1h['Open']))
-            if not is_bullish_candle:
+            if not is_bullish_candle or c1h['RSI'] <= 55:
                 continue
                 
-            # ورود در بازگشایی کندل بعدی (جلوگیری از ورود وسط کندل)
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
@@ -157,18 +154,16 @@ for symbol in SYMBOLS.keys():
             entry_candle = df1h.iloc[entry_idx]
             entry_price = entry_candle['Open']
             
-            tp = entry_price * 1.02  # حد سود ثابت 2 درصد
-            sl = entry_price * 0.99  # حد ضرر ثابت 1 درصد
+            tp = entry_price * 1.02  # حد سود 2 درصد
+            sl = entry_price * 0.99  # حد ضرر 1 درصد
             
             outcome = None
             exit_idx = entry_idx
             
-            # بررسی تحقق هدایت قیمت بدون نگاه به آینده
             for j in range(entry_idx, len(df1h)):
                 f_c = df1h.iloc[j]
                 exit_idx = j
                 
-                # اولویت بررسی حد ضرر برای محافظه‌کاری در بک‌تست
                 if f_c['Low'] <= sl:
                     outcome = 'LOSS'
                     break
@@ -182,13 +177,13 @@ for symbol in SYMBOLS.keys():
                     'Side': 'LONG',
                     'Outcome': outcome
                 })
-                # قفل کردن ربات تا حداقل یک کندل بعد از تسویه کامل معامله
-                locked_until_index = exit_idx + 1
+                # قفل کردن پوزیشن تا کندل‌های بعدی برای کاهش تعداد سیگنال‌های تکراری
+                locked_until_index = exit_idx + 2
                 
-        # شرایط شورت: روند 4 ساعته نزولی + کندل 1 ساعته نزولی قدرتمند
         elif is_short_macro:
+            # تاییدیه مومنتوم نزولی: کندل قوی + RSI پایین‌تر از 45
             is_bearish_candle = (c1h['Close'] < c1h['Open']) and ((c1h['Close'] - c1h['Low']) < (c1h['Open'] - c1h['Close']))
-            if not is_bearish_candle:
+            if not is_bearish_candle or c1h['RSI'] >= 45:
                 continue
                 
             entry_idx = i + 1
@@ -198,8 +193,8 @@ for symbol in SYMBOLS.keys():
             entry_candle = df1h.iloc[entry_idx]
             entry_price = entry_candle['Open']
             
-            tp = entry_price * 0.98  # حد سود ثابت 2 درصد پایین‌تر
-            sl = entry_price * 1.01  # حد ضرر ثابت 1 درصد بالاتر
+            tp = entry_price * 0.98  # حد سود 2 درصد
+            sl = entry_price * 1.01  # حد ضرر 1 درصد
             
             outcome = None
             exit_idx = entry_idx
@@ -221,10 +216,10 @@ for symbol in SYMBOLS.keys():
                     'Side': 'SHORT',
                     'Outcome': outcome
                 })
-                locked_until_index = exit_idx + 1
+                locked_until_index = exit_idx + 2
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی دوطرفه (روند 4H + تریگر 1H + TP 2% / SL 1%)")
+print("📊 گزارش نهایی پورتفوی سخت‌گیرانه (حجم 1.3x + فیلتر RSI + قفل بهینه)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -233,8 +228,6 @@ if all_portfolio_trades:
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
     portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    
-    # ریسک به ریوارد 1 به 2 (سود 2% در برابر ضرر 1%)
     net_profit_score = (total_wins * 2.0) - total_losses
     
     print(f"🔸 تعداد کل معاملات پورتفوی: {total_trades}")
@@ -248,4 +241,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با این شرایط ثبت نشد.")
 
-print("\n✨ پایان بک‌تست یک‌ساله.")
+print("\n✨ پایان بک‌تست سخت‌گیرانه.")
