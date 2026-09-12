@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای سیستم فوق‌العاده سخت‌گیر (Hyper-Selective)")
+print("📥 دانلود داده‌ها برای سیستم مدیریت ریسک پیشرفته (Risk-Free @ 50%)")
 print("============================================================")
 
 data_1h = {}
@@ -75,22 +75,20 @@ for symbol, lbank_symbol in SYMBOLS.items():
         data_4h[symbol] = df4h
         print(f"  ✔️ دیتای {symbol} آماده شد.")
 
-def calculate_hyper_indicators(df):
+def calculate_indicators(df):
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     
-    # ATR برای تعیین حدود دقیق
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
-    
     df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست فوق‌العاده گزینشی (هدف: وین‌ریت بالا)")
+print("🚀 اجرای موتور بک‌تست هوشمند با مکانیزم ریسک‌فری 50 درصدی")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -105,8 +103,8 @@ for symbol in SYMBOLS.keys():
     if len(df1h) < 300 or len(df4h) < 100:
         continue
         
-    df1h = calculate_hyper_indicators(df1h)
-    df4h = calculate_hyper_indicators(df4h)
+    df1h = calculate_indicators(df1h)
+    df4h = calculate_indicators(df4h)
     
     df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
     df4h_indexed = df4h.set_index('Date')
@@ -125,34 +123,31 @@ for symbol in SYMBOLS.keys():
             
         r4h = df4h_indexed.loc[t4h_time]
         
-        # فیلتر کلان فوق‌العاده سخت‌گیرانه (تایید قطعی روند در 4H)
         is_strong_bull = (r4h['Close'] > r4h['EMA_200']) and (r4h['EMA_50'] > r4h['EMA_200'])
         is_strong_bear = (r4h['Close'] < r4h['EMA_200']) and (r4h['EMA_50'] < r4h['EMA_200'])
         
         atr = c1h['ATR']
         vol_ma = c1h['Vol_MA']
         
-        # فیلتر حجم انفجاری (حداقل 1.8 برابر میانگین برای تایید ورود پول نهادی واقعی)
-        if pd.isna(atr) or atr <= 0 or c1h['Volume'] < vol_ma * 1.8:
+        if pd.isna(atr) or atr <= 0 or c1h['Volume'] < vol_ma * 1.5:
             continue
             
-        # بررسی ساختار قیمت در 1 ساعته (باید بدنه کندل خیلی قدرتمند باشد)
         body_size = abs(c1h['Close'] - c1h['Open'])
         candle_range = c1h['High'] - c1h['Low']
-        if candle_range == 0:
+        if candle_range == 0 or (body_size / candle_range) < 0.6:
             continue
             
-        is_clean_body = (body_size / candle_range) > 0.65  # حداقل 65 درصد کندل بدنه خالص باشد
-        
-        if is_strong_bull and (c1h['Close'] > c1h['Open']) and is_clean_body:
-            # تایید ورود لانگ با بالاترین کیفیت
+        if is_strong_bull and (c1h['Close'] > c1h['Open']):
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            sl = entry_price - (1.2 * atr)  # استاپ نزدیک و امن پشت ساختار
-            tp = entry_price + (2.4 * atr)  # ریسک به ریوارد دقیق 1 به 2
+            sl = entry_price - (1.0 * atr)
+            tp = entry_price + (2.0 * atr)  # ریسک به ریوارد منطقی برای سرعت در تاچ شدن
+            
+            half_way = entry_price + (1.0 * atr) # نقطه ۵۰ درصدی مسیر تا TP
+            is_risk_free = False
             
             outcome = None
             exit_idx = entry_idx
@@ -161,30 +156,39 @@ for symbol in SYMBOLS.keys():
                 f_c = df1h.iloc[j]
                 exit_idx = j
                 
+                # بررسی رسیدن به نصف مسیر برای فعال‌سازی ریسک‌فری
+                if not is_risk_free and f_c['High'] >= half_way:
+                    sl = entry_price  # انتقال استاپ به نقطه ورود
+                    is_risk_free = True
+                
+                # بررسی برخورد با حد سود یا حد ضرر
                 if f_c['Low'] <= sl:
-                    outcome = 'LOSS'
+                    # اگر استاپ به نقطه ورود آمده باشد، نتیجه LOSS نیست بلکه BREAKEVEN (بدون ضرر) است
+                    outcome = 'BE' if is_risk_free else 'LOSS'
                     break
                 elif f_c['High'] >= tp:
                     outcome = 'WIN'
                     break
                     
-            if outcome in ['WIN', 'LOSS']:
+            if outcome in ['WIN', 'LOSS', 'BE']:
                 all_portfolio_trades.append({
                     'Symbol': symbol,
                     'Side': 'LONG',
                     'Outcome': outcome
                 })
-                locked_until_index = exit_idx + 3  # استراحت طولانی‌تر برای فیلتر نویزها
+                locked_until_index = exit_idx + 2
                 
-        elif is_strong_bear and (c1h['Close'] < c1h['Open']) and is_clean_body:
-            # تایید ورود شورت با بالاترین کیفیت
+        elif is_strong_bear and (c1h['Close'] < c1h['Open']):
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            sl = entry_price + (1.2 * atr)
-            tp = entry_price - (2.4 * atr)  # ریسک به ریوارد 1 به 2
+            sl = entry_price + (1.0 * atr)
+            tp = entry_price - (2.0 * atr)
+            
+            half_way = entry_price - (1.0 * atr)
+            is_risk_free = False
             
             outcome = None
             exit_idx = entry_idx
@@ -193,23 +197,27 @@ for symbol in SYMBOLS.keys():
                 f_c = df1h.iloc[j]
                 exit_idx = j
                 
+                if not is_risk_free and f_c['Low'] <= half_way:
+                    sl = entry_price
+                    is_risk_free = True
+                
                 if f_c['High'] >= sl:
-                    outcome = 'LOSS'
+                    outcome = 'BE' if is_risk_free else 'LOSS'
                     break
                 elif f_c['Low'] <= tp:
                     outcome = 'WIN'
                     break
                     
-            if outcome in ['WIN', 'LOSS']:
+            if outcome in ['WIN', 'LOSS', 'BE']:
                 all_portfolio_trades.append({
                     'Symbol': symbol,
                     'Side': 'SHORT',
                     'Outcome': outcome
                 })
-                locked_until_index = exit_idx + 3
+                locked_until_index = exit_idx + 2
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی فوق‌العاده گزینشی (Hyper-Selective)")
+print("📊 گزارش نهایی پورتفوی با مکانیزم ریسک‌فری پویا")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -217,18 +225,21 @@ if all_portfolio_trades:
     total_trades = len(pf_df)
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
-    portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    net_profit_score = (total_wins * 2.0) - total_losses
+    total_be = len(pf_df[pf_df['Outcome'] == 'BE'])
+    
+    # وین‌ریت واقعی (بردها تقسیم بر مجموع بردها و باخت‌های واقعی)
+    active_trades = total_wins + total_losses
+    win_rate = (total_wins / active_trades) * 100 if active_trades > 0 else 0
     
     print(f"🔸 تعداد کل معاملات پورتفوی: {total_trades}")
     print(f"🔸 معاملات برنده (WIN): {total_wins}")
-    print(f"🔸 معاملات بازنده (LOSS): {total_losses}")
-    print(f"🎯 **وین‌ریت تجمیعی پورتفوی:** {portfolio_win_rate:.2f}%")
-    print(f"💰 **امتیاز سودآوری خالص (Net Profit Score):** {net_profit_score:.2f}R")
+    print(f"🔸 معاملات سر به سر / بدون ضرر (BE): {total_be}")
+    print(f"🔸 معاملات بازنده قطعی (LOSS): {total_losses}")
+    print(f"🎯 **وین‌ریت واقعی موثر:** {win_rate:.2f}%")
     
     print("\nتفکیک عملکرد به تفکیک هر نماد:")
     print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
 else:
     print("⚠️ هیچ معامله‌ای با این شرایط ثبت نشد.")
 
-print("\n✨ پایان بک‌تست.")
+print("\n✨ پایان بک‌تست ریسک‌فری.")
