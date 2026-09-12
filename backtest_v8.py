@@ -16,9 +16,6 @@ import numpy as np
 # ============================================================
 # منبع دیتای تاریخی برای بک‌تست
 # ============================================================
-# LBank برای تایم‌فریم‌های 1h/4h آرشیو کامل یک‌ساله می‌دهد (طبق تست خودت)،
-# پس همان صرافی اصلی است. صرافی‌های دیگر فقط به‌عنوان پشتیبان (fallback) نگه
-# داشته شده‌اند، برای مواقعی که LBank موقتاً پاسخ ندهد.
 CANDIDATE_DATA_EXCHANGES = ['lbank', 'kucoin', 'okx', 'bybit', 'gateio', 'mexc', 'bitget']
 _exchange_instances = {}
 
@@ -43,39 +40,40 @@ SYMBOLS = {
     "DOT": "DOT/USDT"
 }
 
-TIMEFRAME = '1h'          # ورودها روی 1 ساعته، تایید روند روی 4 ساعته (رزمپل‌شده از همین دیتا)
+TIMEFRAME = '1h'
 DAYS_BACK = 365
-COMMISSION_RATE = 0.0008          # کارمزد کل رفت‌وبرگشت (تقریبی)
+COMMISSION_RATE = 0.0008
 COMMISSION_PER_SIDE = COMMISSION_RATE / 2
-SLIPPAGE_RATE = 0.04 / 100        # اسلیپیج تخمینی هر ضلع
+SLIPPAGE_RATE = 0.04 / 100
 
-TF_SCALE = 1               # روی 1 ساعته هستیم، نیازی به مقیاس‌دهی اضافه نیست
-
-# ---------------- پارامترهای استراتژی ----------------
+# ---------------- پارامترهای اندیکاتور ----------------
 BB_PERIOD = 20
-BB_STD = 2
+BB_STD_MULT = 2.0
 RSI_PERIOD = 14
 ATR_PERIOD = 14
-ATR_MA_PERIOD = 50 * TF_SCALE
-VOL_MA_PERIOD = 20 * TF_SCALE
-VP_WINDOW = 100 * TF_SCALE
+ATR_MA_PERIOD = 50
+VOL_MA_PERIOD = 20
+VP_WINDOW = 100
 VP_BINS = 24
 VALUE_AREA_PCT = 0.70
-SWING_LOOKBACK = 10 * TF_SCALE
+SWING_LOOKBACK = 10
 ADX_PERIOD = 14
-MAX_HOLD_CANDLES = 60 * TF_SCALE
-COOLDOWN_CANDLES = 3 * TF_SCALE
-MIN_WARMUP = max(250 * TF_SCALE, VP_WINDOW + ATR_MA_PERIOD + 5)
+MAX_HOLD_CANDLES = 60
+COOLDOWN_CANDLES = 3
+MIN_WARMUP = max(250, VP_WINDOW + ATR_MA_PERIOD + 5)
 
-# ---------------- فیلتر روند بالادستی (4 ساعته، مثل کد اولیه) ----------------
+# ---------------- آستانه‌ی z-score برای ورود (مطابق تحقیق: نسخه‌ی سخت‌گیرانه‌تر) ----------------
+Z_ENTRY_THRESHOLD = 2.2   # کلاسیک بولینگر 2.0 است؛ کمی سخت‌گیرانه‌تر برای سیگنال‌های باکیفیت‌تر
+
+# ---------------- فیلتر روند بالادستی (4 ساعته) ----------------
 TREND_EMA_FAST = 50
 TREND_EMA_SLOW = 200
 
-# ---------------- فیلتر فاندینگ ریت (سنتیمنت بازار آتی) ----------------
+# ---------------- فیلتر فاندینگ ریت ----------------
 CANDIDATE_FUNDING_EXCHANGES = ['lbank', 'bybit', 'okx', 'gateio', 'mexc', 'bitget', 'kucoin']
-FUNDING_Z_WINDOW = 30            # تعداد دوره‌های فاندینگ اخیر (هر دوره معمولاً ۸ ساعت) برای خط پایه
-FUNDING_Z_LONG_MAX = 0.5         # لانگ: فاندینگ نباید خیلی بالاتر از میانگین اخیرش باشد (ازدحام لانگ = ریسک اسکوئیز نزولی)
-FUNDING_Z_SHORT_MIN = -0.5       # شورت: فاندینگ نباید خیلی پایین‌تر از میانگین اخیرش باشد (ازدحام شورت = ریسک اسکوئیز صعودی)
+FUNDING_Z_WINDOW = 30
+FUNDING_Z_LONG_MAX = 0.5
+FUNDING_Z_SHORT_MIN = -0.5
 _funding_instances = {}
 
 
@@ -86,8 +84,16 @@ def get_funding_exchange(exchange_id):
     return _funding_instances[exchange_id]
 
 
+# ---------------- پارامترهای مدیریت ریسک در سطح پرتفوی (جدید) ----------------
+STARTING_EQUITY = 100.0            # واحد درصدی سرمایه (نه دلار مشخص)
+RISK_PER_TRADE_PCT = 0.01          # ۱٪ از سرمایه‌ی فعلی (نه ثابت) در هر معامله — امکان کامپوند شدن
+MAX_CONCURRENT_POSITIONS = 4       # حداکثر تعداد پوزیشن باز هم‌زمان در کل پرتفوی
+MAX_SAME_DIRECTION_POSITIONS = 3   # حداکثر پوزیشن هم‌جهت هم‌زمان (کنترل هم‌بستگی بین آلت‌کوین‌ها)
+DAILY_LOSS_LIMIT_PCT = 0.03        # اگر ضرر یک روز به ۳٪ سرمایه‌ی ابتدای همان روز رسید، ورود جدید متوقف می‌شود
+
+
 # ============================================================
-# دریافت داده تاریخی — به ترتیب چند صرافی را امتحان می‌کند تا یکی جواب بدهد
+# دریافت داده تاریخی — به ترتیب چند صرافی را امتحان می‌کند
 # ============================================================
 def fetch_ohlcv_full(symbol_ccxt, timeframe, since_ts):
     for exchange_id in CANDIDATE_DATA_EXCHANGES:
@@ -114,43 +120,68 @@ def fetch_ohlcv_full(symbol_ccxt, timeframe, since_ts):
         except Exception as e:
             print(f"    ⚠️ {exchange_id} ناموفق ({type(e).__name__}): {e}")
             continue
+    return []
 
+
+def fetch_funding_rate_full(base_symbol, since_ts):
+    symbol_variants = [base_symbol, f"{base_symbol}:USDT"]
+    for exchange_id in CANDIDATE_FUNDING_EXCHANGES:
+        try:
+            ex = get_funding_exchange(exchange_id)
+            if not ex.has.get('fetchFundingRateHistory'):
+                continue
+            for sym_variant in symbol_variants:
+                try:
+                    all_funding = []
+                    current_since = since_ts
+                    now_ts = ex.milliseconds()
+                    safety_counter = 0
+                    while current_since < now_ts and safety_counter < 200:
+                        batch = ex.fetch_funding_rate_history(sym_variant, since=current_since, limit=200)
+                        if not batch:
+                            break
+                        current_since = batch[-1]['timestamp'] + 1
+                        all_funding.extend(batch)
+                        safety_counter += 1
+                        if len(batch) < 200:
+                            break
+                    if len(all_funding) > 20:
+                        print(f"    ✔️ فاندینگ ریت از {exchange_id} ({sym_variant}) دریافت شد ({len(all_funding)} رکورد).")
+                        return all_funding
+                except Exception:
+                    continue
+        except Exception:
+            continue
     return []
 
 
 # ============================================================
-# اندیکاتورها: Bollinger Bands, RSI, ATR, ADX, Swing High/Low
-# همه بر اساس کندل‌های کاملاً بسته‌شده — بدون لوک‌آهد
+# اندیکاتورها — همه بر اساس کندل‌های کاملاً بسته‌شده، بدون لوک‌آهد
 # ============================================================
 def calculate_indicators(df):
     df = df.copy()
 
-    # Bollinger Bands
     df['BB_MID'] = df['Close'].rolling(BB_PERIOD).mean()
-    bb_std = df['Close'].rolling(BB_PERIOD).std()
-    df['BB_UPPER'] = df['BB_MID'] + BB_STD * bb_std
-    df['BB_LOWER'] = df['BB_MID'] - BB_STD * bb_std
+    df['BB_STD'] = df['Close'].rolling(BB_PERIOD).std()
+    df['BB_UPPER'] = df['BB_MID'] + BB_STD_MULT * df['BB_STD']
+    df['BB_LOWER'] = df['BB_MID'] - BB_STD_MULT * df['BB_STD']
+    # z-score واقعی انحراف قیمت از میانگین — معیار اصلی ورود (به‌جای فقط لمس باند)
+    df['Z_SCORE'] = (df['Close'] - df['BB_MID']) / df['BB_STD'].replace(0, np.nan)
 
-    # RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(RSI_PERIOD).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(RSI_PERIOD).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    # True Range / ATR
     high_low = df['High'] - df['Low']
     high_close = (df['High'] - df['Close'].shift()).abs()
     low_close = (df['Low'] - df['Close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['TR'] = tr
     df['ATR'] = tr.rolling(ATR_PERIOD).mean()
     df['ATR_MA'] = df['ATR'].rolling(ATR_MA_PERIOD).mean()
-
-    # Volume MA
     df['Vol_MA'] = df['Volume'].rolling(VOL_MA_PERIOD).mean()
 
-    # ADX (نسخه ساده‌شده، هم‌راستا با روش محاسبه ATR بالا)
     up_move = df['High'].diff()
     down_move = -df['Low'].diff()
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
@@ -163,7 +194,6 @@ def calculate_indicators(df):
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     df['ADX'] = dx.rolling(ADX_PERIOD).mean()
 
-    # سقف/کف ساختاری — بر اساس کندل‌های *قبل* از کندل جاری (shift(1)) تا هیچ نگاهی به آینده نباشد
     df['SWING_LOW'] = df['Low'].shift(1).rolling(SWING_LOOKBACK).min()
     df['SWING_HIGH'] = df['High'].shift(1).rolling(SWING_LOOKBACK).max()
 
@@ -171,8 +201,7 @@ def calculate_indicators(df):
 
 
 # ============================================================
-# Fixed Range Volume Profile — محاسبه غلتان (rolling)
-# برای کندل i فقط از کندل‌های i-window ... i-1 استفاده می‌شود (کاملاً بسته‌شده)
+# Fixed Range Volume Profile — رولینگ، بدون لوک‌آهد
 # ============================================================
 def calculate_volume_profile(df, window=VP_WINDOW, bins=VP_BINS, va_pct=VALUE_AREA_PCT):
     n = len(df)
@@ -232,12 +261,6 @@ def calculate_volume_profile(df, window=VP_WINDOW, bins=VP_BINS, va_pct=VALUE_AR
 
 
 def calculate_trend_filter(df1h):
-    """
-    فیلتر روند بالادستی روی تایم‌فریم 4 ساعته (رزمپل‌شده از همان دیتای 1h)،
-    دقیقاً به سبک کد اولیه: EMA50 و EMA200 روی کندل‌های 4 ساعته کاملاً بسته‌شده.
-    از merge_asof با جهت backward استفاده می‌شود تا هر کندل 1h فقط به آخرین
-    کندل 4h که واقعاً تا آن لحظه بسته شده دسترسی داشته باشد — صفر لوک‌آهد.
-    """
     df1h = df1h.copy().sort_values('Date').reset_index(drop=True)
 
     df4h = (
@@ -251,7 +274,6 @@ def calculate_trend_filter(df1h):
     df4h['EMA_SLOW'] = df4h['Close'].ewm(span=TREND_EMA_SLOW, adjust=False).mean()
     df4h['EMA_SLOW_PREV'] = df4h['EMA_SLOW'].shift(1)
     df4h['CLOSE_4H'] = df4h['Close']
-    # کندل 4 ساعته‌ای که از ساعت X شروع شده، فقط از ساعت X+4 به بعد "کاملاً بسته" و قابل استفاده است
     df4h['AVAILABLE_AT'] = df4h['Date'] + pd.Timedelta(hours=4)
 
     merge_cols = df4h[['AVAILABLE_AT', 'CLOSE_4H', 'EMA_FAST', 'EMA_SLOW', 'EMA_SLOW_PREV']].sort_values('AVAILABLE_AT')
@@ -265,7 +287,7 @@ def calculate_trend_filter(df1h):
     is_long_regime = (
         (merged['CLOSE_4H'] > merged['EMA_SLOW'])
         & (merged['EMA_FAST'] > merged['EMA_SLOW'])
-        & (merged['EMA_SLOW'] >= merged['EMA_SLOW_PREV'] * 0.9995)   # تحمل کمی نسبت به شیب صاف/تقریباً صعودی
+        & (merged['EMA_SLOW'] >= merged['EMA_SLOW_PREV'] * 0.9995)
     )
     is_short_regime = (
         (merged['CLOSE_4H'] < merged['EMA_SLOW'])
@@ -278,56 +300,7 @@ def calculate_trend_filter(df1h):
     return merged
 
 
-def fetch_funding_rate_full(base_symbol, since_ts):
-    """
-    تلاش برای دریافت تاریخچه فاندینگ ریت از چند صرافی و چند فرمت نماد ممکن
-    (چون فرمت نماد بازار سواپ/فیوچرز بین صرافی‌ها فرق می‌کند).
-    اگر هیچ‌کدام جواب ندهند، لیست خالی برمی‌گرداند و فیلتر فاندینگ برای آن
-    نماد نادیده گرفته می‌شود (نه اینکه کل معاملات آن نماد بلاک شوند).
-    """
-    symbol_variants = [base_symbol, f"{base_symbol}:USDT"]
-
-    for exchange_id in CANDIDATE_FUNDING_EXCHANGES:
-        try:
-            ex = get_funding_exchange(exchange_id)
-            if not ex.has.get('fetchFundingRateHistory'):
-                continue
-
-            for sym_variant in symbol_variants:
-                try:
-                    all_funding = []
-                    current_since = since_ts
-                    now_ts = ex.milliseconds()
-                    safety_counter = 0
-
-                    while current_since < now_ts and safety_counter < 200:
-                        batch = ex.fetch_funding_rate_history(sym_variant, since=current_since, limit=200)
-                        if not batch:
-                            break
-                        current_since = batch[-1]['timestamp'] + 1
-                        all_funding.extend(batch)
-                        safety_counter += 1
-                        if len(batch) < 200:
-                            break
-
-                    if len(all_funding) > 20:
-                        print(f"    ✔️ فاندینگ ریت از {exchange_id} ({sym_variant}) دریافت شد ({len(all_funding)} رکورد).")
-                        return all_funding
-                except Exception:
-                    continue
-        except Exception:
-            continue
-
-    return []
-
-
 def calculate_funding_filter(df1h, funding_records):
-    """
-    ادغام فاندینگ ریت با کندل‌های 1 ساعته (بدون لوک‌آهد؛ فاندینگ همان لحظه‌ی
-    ثبت/پرداختش عمومی و قابل مشاهده است، پس merge_asof با جهت backward درست
-    و کافی است) و محاسبه z-score نسبت به میانگین/انحراف‌معیار غلتان خودش.
-    اگر دیتای فاندینگ موجود نباشد، ستون‌ها NaN می‌مانند و فیلتر بی‌اثر می‌شود.
-    """
     df = df1h.copy()
 
     if not funding_records:
@@ -367,40 +340,13 @@ def compute_r(entry_price, exit_price, sl_dist, is_long):
 
 
 # ============================================================
-# شبیه‌سازی معامله ساده — یک SL و یک TP با نسبت ثابت ریسک‌به‌ریوارد ۱:۲
-# فقط کندل‌های بعد از ورود بررسی می‌شوند — بدون لوک‌آهد
+# فاز ۱: پیش‌محاسبه‌ی سیگنال‌ها برای هر نماد (بدون شبیه‌سازی معامله)
+# خروجی این تابع فقط "کجا سیگنال هست" را مشخص می‌کند؛ تصمیم واقعی برای باز
+# کردن پوزیشن (با توجه به محدودیت‌های کل پرتفوی) در فاز ۲ گرفته می‌شود.
 # ============================================================
-def simulate_trade(df, entry_idx, entry_price, sl_price, tp_price, sl_dist, is_long):
-    last_idx = min(entry_idx + MAX_HOLD_CANDLES, len(df)) - 1
-
-    for j in range(entry_idx, last_idx + 1):
-        f = df.iloc[j]
-        if is_long:
-            if f['Low'] <= sl_price:
-                exit_price = sl_price * (1 - SLIPPAGE_RATE)
-                return compute_r(entry_price, exit_price, sl_dist, True), j
-            if f['High'] >= tp_price:
-                exit_price = tp_price * (1 - SLIPPAGE_RATE)
-                return compute_r(entry_price, exit_price, sl_dist, True), j
-        else:
-            if f['High'] >= sl_price:
-                exit_price = sl_price * (1 + SLIPPAGE_RATE)
-                return compute_r(entry_price, exit_price, sl_dist, False), j
-            if f['Low'] <= tp_price:
-                exit_price = tp_price * (1 + SLIPPAGE_RATE)
-                return compute_r(entry_price, exit_price, sl_dist, False), j
-
-    # پایان بازه بدون رسیدن به SL/TP → خروج زمانی با قیمت بسته‌شدن آخرین کندل
-    exit_price = df.iloc[last_idx]['Close']
-    return compute_r(entry_price, exit_price, sl_dist, is_long), last_idx
-
-
-# ============================================================
-# موتور اصلی سیگنال‌یابی و بک‌تست برای هر نماد
-# ============================================================
-def run_backtest_for_symbol(symbol, df1h, funding_records=None):
+def precompute_signals_for_symbol(symbol, df1h, funding_records=None):
     if len(df1h) < MIN_WARMUP + MAX_HOLD_CANDLES + 5:
-        return []
+        return None
 
     df = calculate_indicators(df1h)
     df = calculate_volume_profile(df)
@@ -408,16 +354,15 @@ def run_backtest_for_symbol(symbol, df1h, funding_records=None):
     df = calculate_funding_filter(df, funding_records or [])
     funding_available = df['FUNDING_Z'].notna().any()
 
-    trades = []
-    locked_until_index = 0
     n = len(df)
-    needed_cols = ['BB_UPPER', 'BB_LOWER', 'BB_MID', 'RSI', 'ATR', 'ATR_MA',
+    long_signal = np.zeros(n, dtype=bool)
+    short_signal = np.zeros(n, dtype=bool)
+    sl_dist_arr = np.full(n, np.nan)
+
+    needed_cols = ['BB_MID', 'BB_STD', 'Z_SCORE', 'RSI', 'ATR', 'ATR_MA',
                    'ADX', 'POC', 'VAH', 'VAL', 'SWING_LOW', 'SWING_HIGH', 'Vol_MA']
 
-    for i in range(MIN_WARMUP, n - MAX_HOLD_CANDLES - 2):
-        if i < locked_until_index:
-            continue
-
+    for i in range(MIN_WARMUP, n - 2):
         c = df.iloc[i]
         prev = df.iloc[i - 1]
 
@@ -426,14 +371,11 @@ def run_backtest_for_symbol(symbol, df1h, funding_records=None):
         if c['ATR_MA'] == 0 or c['ATR'] <= 0:
             continue
 
-        # ---- فیلتر رژیم بازار (نوسان + حجم + روند 4 ساعته) ----
         atr_ratio = c['ATR'] / c['ATR_MA']
         vol_ok = c['Volume'] >= 0.75 * c['Vol_MA']
         volatility_ok = (0.65 <= atr_ratio <= 2.7) and (c['ADX'] >= 12)
-
         adx_not_extreme = c['ADX'] <= 45
 
-        # ---- فیلتر فاندینگ ریت: اگر دیتا موجود نبود، بی‌اثر (True) می‌ماند ----
         if funding_available and not pd.isna(c['FUNDING_Z']):
             funding_ok_long = c['FUNDING_Z'] <= FUNDING_Z_LONG_MAX
             funding_ok_short = c['FUNDING_Z'] >= FUNDING_Z_SHORT_MIN
@@ -441,83 +383,198 @@ def run_backtest_for_symbol(symbol, df1h, funding_records=None):
             funding_ok_long = True
             funding_ok_short = True
 
-        # ---- شرایط ورود لانگ: فقط اگر روند 4 ساعته هم صعودی باشد ----
-        long_signal = (
+        # ---- ورود لانگ: z-score واقعی به‌جای فقط لمس باند ----
+        is_long = (
             volatility_ok and vol_ok and adx_not_extreme and funding_ok_long
             and bool(c['TREND_LONG_OK'])
-            and c['Low'] <= c['BB_LOWER']
-            and c['Close'] > c['BB_LOWER']
+            and c['Z_SCORE'] <= -Z_ENTRY_THRESHOLD
             and c['Close'] <= max(c['POC'], c['VAL'] * 1.02)
             and 28 <= c['RSI'] <= 45
             and c['RSI'] > prev['RSI']
             and c['Close'] > c['Open']
         )
 
-        # ---- شرایط ورود شورت: فقط اگر روند 4 ساعته هم نزولی باشد ----
-        short_signal = (
+        is_short = (
             volatility_ok and vol_ok and adx_not_extreme and funding_ok_short
             and bool(c['TREND_SHORT_OK'])
-            and c['High'] >= c['BB_UPPER']
-            and c['Close'] < c['BB_UPPER']
+            and c['Z_SCORE'] >= Z_ENTRY_THRESHOLD
             and c['Close'] >= min(c['POC'], c['VAH'] * 0.98)
             and 55 <= c['RSI'] <= 72
             and c['RSI'] < prev['RSI']
             and c['Close'] < c['Open']
         )
 
-        if not long_signal and not short_signal:
-            continue
-
-        entry_idx = i + 1
-        if entry_idx >= n:
-            break
-        entry_candle = df.iloc[entry_idx]
-
-        if long_signal:
-            entry_price = entry_candle['Open'] * (1 + SLIPPAGE_RATE)
-
+        if is_long:
             atr_sl_dist = 1.5 * c['ATR']
-            struct_sl_price = c['SWING_LOW'] - 0.2 * c['ATR']
-            struct_sl_dist = entry_price - struct_sl_price
+            struct_sl_dist = c['Close'] - (c['SWING_LOW'] - 0.2 * c['ATR'])
             sl_dist = struct_sl_dist if 0 < struct_sl_dist < atr_sl_dist else atr_sl_dist
-            if sl_dist <= 0:
-                continue
-            sl_price = entry_price - sl_dist
-            tp_price = entry_price + 2 * sl_dist  # نسبت ثابت ریسک‌به‌ریوارد ۱:۲
-
-            net_r, exit_idx = simulate_trade(df, entry_idx, entry_price, sl_price, tp_price, sl_dist, is_long=True)
-            trades.append({
-                'Symbol': symbol, 'Side': 'LONG',
-                'Outcome': 'WIN' if net_r > 0 else 'LOSS',
-                'NetR': net_r, 'Date': entry_candle['Date']
-            })
-            locked_until_index = exit_idx + COOLDOWN_CANDLES
-
-        elif short_signal:
-            entry_price = entry_candle['Open'] * (1 - SLIPPAGE_RATE)
-
+            if sl_dist > 0:
+                long_signal[i] = True
+                sl_dist_arr[i] = sl_dist
+        elif is_short:
             atr_sl_dist = 1.5 * c['ATR']
-            struct_sl_price = c['SWING_HIGH'] + 0.2 * c['ATR']
-            struct_sl_dist = struct_sl_price - entry_price
+            struct_sl_dist = (c['SWING_HIGH'] + 0.2 * c['ATR']) - c['Close']
             sl_dist = struct_sl_dist if 0 < struct_sl_dist < atr_sl_dist else atr_sl_dist
-            if sl_dist <= 0:
-                continue
-            sl_price = entry_price + sl_dist
-            tp_price = entry_price - 2 * sl_dist  # نسبت ثابت ریسک‌به‌ریوارد ۱:۲
+            if sl_dist > 0:
+                short_signal[i] = True
+                sl_dist_arr[i] = sl_dist
 
-            net_r, exit_idx = simulate_trade(df, entry_idx, entry_price, sl_price, tp_price, sl_dist, is_long=False)
-            trades.append({
-                'Symbol': symbol, 'Side': 'SHORT',
-                'Outcome': 'WIN' if net_r > 0 else 'LOSS',
-                'NetR': net_r, 'Date': entry_candle['Date']
-            })
-            locked_until_index = exit_idx + COOLDOWN_CANDLES
-
-    return trades
+    out = df[['Date', 'Open', 'High', 'Low', 'Close']].copy()
+    out['LONG_SIGNAL'] = long_signal
+    out['SHORT_SIGNAL'] = short_signal
+    out['SL_DIST'] = sl_dist_arr
+    return out
 
 
 # ============================================================
-# اجرای کامل: دانلود داده + بک‌تست + گزارش
+# فاز ۲: موتور شبیه‌سازی پرتفوی — یک حساب مشترک برای همه‌ی نمادها
+# با مدیریت ریسک واقعی: سایزینگ پویا بر مبنای سرمایه، محدودیت هم‌بستگی
+# (حداکثر پوزیشن هم‌جهت هم‌زمان)، محدودیت کل پوزیشن باز، و سقف ضرر روزانه.
+# پردازش زمانی-ترتیبی روی خط‌زمان مشترک همه‌ی نمادها — بدون لوک‌آهد.
+# ============================================================
+def run_portfolio_backtest(precomputed):
+    symbols = list(precomputed.keys())
+    if not symbols:
+        return [], []
+
+    all_dates = sorted(set().union(*[set(df['Date']) for df in precomputed.values()]))
+    n_master = len(all_dates)
+
+    arrays = {}
+    for symbol, df in precomputed.items():
+        aligned = df.set_index('Date').reindex(all_dates)
+        arrays[symbol] = {
+            'Open': aligned['Open'].values,
+            'High': aligned['High'].values,
+            'Low': aligned['Low'].values,
+            'Close': aligned['Close'].values,
+            'LONG_SIGNAL': aligned['LONG_SIGNAL'].fillna(False).values,
+            'SHORT_SIGNAL': aligned['SHORT_SIGNAL'].fillna(False).values,
+            'SL_DIST': aligned['SL_DIST'].values,
+        }
+
+    equity = STARTING_EQUITY
+    equity_curve = []
+    open_positions = {}     # symbol -> position dict
+    recently_closed = {}    # symbol -> idx بسته‌شدن (برای cooldown)
+    trades = []
+
+    current_day = None
+    day_start_equity = equity
+    daily_loss = 0.0
+
+    for idx in range(n_master):
+        date_t = all_dates[idx]
+        day = date_t.date() if hasattr(date_t, 'date') else pd.Timestamp(date_t).date()
+        if day != current_day:
+            current_day = day
+            day_start_equity = equity
+            daily_loss = 0.0
+
+        # ---- ۱) بررسی خروج پوزیشن‌های باز ----
+        for symbol in list(open_positions.keys()):
+            pos = open_positions[symbol]
+            arr = arrays[symbol]
+            if idx >= len(arr['High']) or np.isnan(arr['High'][idx]):
+                continue  # کندل این نماد در این لحظه موجود نیست؛ پوزیشن باز می‌ماند
+
+            high = arr['High'][idx]
+            low = arr['Low'][idx]
+            close_p = arr['Close'][idx]
+            exit_price = None
+
+            if pos['side'] == 'LONG':
+                if low <= pos['sl_price']:
+                    exit_price = pos['sl_price'] * (1 - SLIPPAGE_RATE)
+                elif high >= pos['tp_price']:
+                    exit_price = pos['tp_price'] * (1 - SLIPPAGE_RATE)
+            else:
+                if high >= pos['sl_price']:
+                    exit_price = pos['sl_price'] * (1 + SLIPPAGE_RATE)
+                elif low <= pos['tp_price']:
+                    exit_price = pos['tp_price'] * (1 + SLIPPAGE_RATE)
+
+            if exit_price is None and idx >= pos['max_hold_until_idx']:
+                exit_price = close_p  # خروج زمانی
+
+            if exit_price is not None:
+                net_r = compute_r(pos['entry_price'], exit_price, pos['sl_dist'], pos['side'] == 'LONG')
+                pnl_equity = pos['risk_amount'] * net_r
+                equity += pnl_equity
+                if pnl_equity < 0:
+                    daily_loss += -pnl_equity
+                trades.append({
+                    'Symbol': symbol, 'Side': pos['side'],
+                    'Outcome': 'WIN' if net_r > 0 else 'LOSS',
+                    'NetR': net_r, 'PnL_Equity': pnl_equity,
+                    'Date': pos['entry_date'], 'ExitDate': date_t,
+                    'EquityAfter': equity
+                })
+                del open_positions[symbol]
+                recently_closed[symbol] = idx
+
+        equity_curve.append((date_t, equity))
+
+        # ---- ۲) سقف ضرر روزانه ----
+        if daily_loss >= DAILY_LOSS_LIMIT_PCT * day_start_equity:
+            continue  # امروز دیگر پوزیشن جدید باز نمی‌شود
+
+        # ---- ۳) بررسی سیگنال‌های ورود جدید (با رعایت محدودیت‌های پرتفوی) ----
+        current_long_count = sum(1 for p in open_positions.values() if p['side'] == 'LONG')
+        current_short_count = sum(1 for p in open_positions.values() if p['side'] == 'SHORT')
+
+        for symbol in symbols:
+            if len(open_positions) >= MAX_CONCURRENT_POSITIONS:
+                break
+
+            if symbol in open_positions:
+                continue
+            if symbol in recently_closed and (idx - recently_closed[symbol]) < COOLDOWN_CANDLES:
+                continue
+
+            arr = arrays[symbol]
+            if idx >= len(arr['Close']) or np.isnan(arr['Close'][idx]):
+                continue
+
+            entry_idx = idx + 1
+            if entry_idx >= len(arr['Open']) or np.isnan(arr['Open'][entry_idx]):
+                continue
+
+            sl_dist_raw = arr['SL_DIST'][idx]
+            if np.isnan(sl_dist_raw) or sl_dist_raw <= 0:
+                continue
+
+            if arr['LONG_SIGNAL'][idx] and current_long_count < MAX_SAME_DIRECTION_POSITIONS:
+                entry_price = arr['Open'][entry_idx] * (1 + SLIPPAGE_RATE)
+                sl_price = entry_price - sl_dist_raw
+                tp_price = entry_price + 2 * sl_dist_raw
+                risk_amount = equity * RISK_PER_TRADE_PCT
+                open_positions[symbol] = {
+                    'side': 'LONG', 'entry_price': entry_price, 'sl_price': sl_price,
+                    'tp_price': tp_price, 'sl_dist': sl_dist_raw, 'risk_amount': risk_amount,
+                    'entry_date': all_dates[entry_idx] if entry_idx < n_master else date_t,
+                    'max_hold_until_idx': idx + 1 + MAX_HOLD_CANDLES
+                }
+                current_long_count += 1
+
+            elif arr['SHORT_SIGNAL'][idx] and current_short_count < MAX_SAME_DIRECTION_POSITIONS:
+                entry_price = arr['Open'][entry_idx] * (1 - SLIPPAGE_RATE)
+                sl_price = entry_price + sl_dist_raw
+                tp_price = entry_price - 2 * sl_dist_raw
+                risk_amount = equity * RISK_PER_TRADE_PCT
+                open_positions[symbol] = {
+                    'side': 'SHORT', 'entry_price': entry_price, 'sl_price': sl_price,
+                    'tp_price': tp_price, 'sl_dist': sl_dist_raw, 'risk_amount': risk_amount,
+                    'entry_date': all_dates[entry_idx] if entry_idx < n_master else date_t,
+                    'max_hold_until_idx': idx + 1 + MAX_HOLD_CANDLES
+                }
+                current_short_count += 1
+
+    return trades, equity_curve
+
+
+# ============================================================
+# اجرای کامل: دانلود داده + پیش‌محاسبه‌ی سیگنال + شبیه‌سازی پرتفوی + گزارش
 # ============================================================
 def main():
     start_date = datetime.now() - timedelta(days=DAYS_BACK)
@@ -542,12 +599,12 @@ def main():
         df.drop_duplicates(subset=['Date'], inplace=True)
         df.sort_values('Date', inplace=True)
         df.reset_index(drop=True, inplace=True)
-        df.to_csv(f"{symbol}_1h_frvp_bb_rsi_atr.csv", index=False)
+        df.to_csv(f"{symbol}_1h_portfolio_v2.csv", index=False)
         data_1h[symbol] = df
         print(f"  ✔️ {symbol}: {len(df)} کندل دریافت شد.")
 
     print("\n============================================================")
-    print("📥 دریافت تاریخچه فاندینگ ریت (سنتیمنت بازار آتی)")
+    print("📥 دریافت تاریخچه فاندینگ ریت")
     print(f"   ترتیب امتحان صرافی‌ها: {', '.join(CANDIDATE_FUNDING_EXCHANGES)}")
     print("============================================================")
 
@@ -562,22 +619,33 @@ def main():
         funding_data[symbol] = records
 
     print("\n============================================================")
-    print("🚀 اجرای بک‌تست ستاپ FRVP + Bollinger + RSI + ATR + Funding")
+    print("🧮 پیش‌محاسبه‌ی سیگنال‌ها (z-score + BB + RSI + VP + روند + فاندینگ)")
     print("============================================================")
 
-    all_trades = []
+    precomputed = {}
     for symbol, df1h in data_1h.items():
-        print(f"⏳ در حال پردازش {symbol} ...")
-        trades = run_backtest_for_symbol(symbol, df1h, funding_data.get(symbol))
-        all_trades.extend(trades)
-        print(f"  ✔️ {symbol}: {len(trades)} معامله ثبت شد.")
+        sig_df = precompute_signals_for_symbol(symbol, df1h, funding_data.get(symbol))
+        if sig_df is not None:
+            precomputed[symbol] = sig_df
+            n_long = int(sig_df['LONG_SIGNAL'].sum())
+            n_short = int(sig_df['SHORT_SIGNAL'].sum())
+            print(f"  ✔️ {symbol}: {n_long} سیگنال لانگ, {n_short} سیگنال شورت (خام، قبل از اعمال محدودیت پرتفوی)")
 
-    print_report(all_trades)
-
-
-def print_report(all_trades):
     print("\n============================================================")
-    print("📊 گزارش نهایی عملکرد یک‌ساله")
+    print("🚀 اجرای شبیه‌سازی پرتفوی مشترک (با مدیریت ریسک و هم‌بستگی)")
+    print(f"   ریسک هر معامله: {RISK_PER_TRADE_PCT*100:.1f}% از سرمایه | "
+          f"حداکثر پوزیشن هم‌زمان: {MAX_CONCURRENT_POSITIONS} | "
+          f"حداکثر هم‌جهت: {MAX_SAME_DIRECTION_POSITIONS} | "
+          f"سقف ضرر روزانه: {DAILY_LOSS_LIMIT_PCT*100:.1f}%")
+    print("============================================================")
+
+    trades, equity_curve = run_portfolio_backtest(precomputed)
+    print_report(trades, equity_curve)
+
+
+def print_report(all_trades, equity_curve):
+    print("\n============================================================")
+    print("📊 گزارش نهایی عملکرد یک‌ساله (سطح پرتفوی)")
     print("============================================================")
 
     if not all_trades:
@@ -594,12 +662,22 @@ def print_report(all_trades):
     total_net_r = tdf['NetR'].sum()
     avg_r = tdf['NetR'].mean()
 
-    print(f"🎯 تعداد کل معاملات (یک سال / ۱۰ ارز): {total_trades}")
+    final_equity = equity_curve[-1][1] if equity_curve else STARTING_EQUITY
+    total_return_pct = (final_equity / STARTING_EQUITY - 1) * 100
+
+    equity_series = pd.Series([e for _, e in equity_curve])
+    running_max = equity_series.cummax()
+    drawdown = (equity_series - running_max) / running_max * 100
+    max_drawdown = drawdown.min()
+
+    print(f"🎯 تعداد کل معاملات (یک سال / ۱۰ ارز، سطح پرتفوی): {total_trades}")
     print(f"📈 لانگ: {longs}  |  📉 شورت: {shorts}")
     print(f"🏆 برد: {wins}  |  ❌ باخت: {losses}")
     print(f"✅ وین‌ریت کل: {win_rate:.2f}%")
     print(f"💰 مجموع Net R: {total_net_r:.2f}R  |  میانگین هر معامله: {avg_r:.3f}R")
     print(f"📆 میانگین تعداد معامله در ماه: {total_trades / 12:.1f}")
+    print(f"💵 رشد سرمایه (کامپوند، با ریسک {RISK_PER_TRADE_PCT*100:.0f}٪ هر معامله): {total_return_pct:+.2f}%")
+    print(f"📉 بیشینه افت سرمایه (Max Drawdown): {max_drawdown:.2f}%")
 
     print("\n--- تفکیک بر اساس نماد ---")
     g = tdf.groupby('Symbol').agg(
@@ -613,8 +691,8 @@ def print_report(all_trades):
     g['WinRate%'] = (g['Wins'] / g['Trades'] * 100).round(2)
     print(g)
 
-    tdf.to_csv("all_trades_frvp_bb_rsi_atr.csv", index=False)
-    print("\n📁 جزئیات تمام معاملات در فایل all_trades_frvp_bb_rsi_atr.csv ذخیره شد.")
+    tdf.to_csv("all_trades_portfolio_v2.csv", index=False)
+    print("\n📁 جزئیات تمام معاملات در فایل all_trades_portfolio_v2.csv ذخیره شد.")
 
 
 if __name__ == "__main__":
