@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها از صرافی ال‌بنک برای نسخه پیشرفته HUNTER-X PRO V9")
+print("📥 دانلود داده‌ها از صرافی ال‌بنک برای نسخه HUNTER-X PRO V10 (True Liquidity Sweep)")
 print("============================================================")
 
 data_1h = {}
@@ -95,9 +95,9 @@ def calculate_indicators(df):
     df['ATR'] = tr.rolling(window=14).mean()
     df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
     
-    # Donchian Channel 20 (بدون نگاه به آینده)
-    df['Donchian_High'] = df['High'].rolling(window=20).max().shift(1)
-    df['Donchian_Low'] = df['Low'].rolling(window=20).min().shift(1)
+    # سطوح ساختاری برای Liquidity Sweep (بدون نگاه به آینده با shift)
+    df['Recent_Swing_Low'] = df['Low'].rolling(window=20).min().shift(1)
+    df['Recent_Swing_High'] = df['High'].rolling(window=20).max().shift(1)
     
     # ADX 14
     plus_dm = df['High'].diff()
@@ -113,7 +113,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست هوشمند HUNTER-X PRO V9 (سیستم امتیازدهی + ریسک‌فری)")
+print("🚀 اجرای موتور بک‌تست HUNTER-X PRO V10 (مبتنی بر Liquidity Sweep خالص)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -153,64 +153,42 @@ for symbol in SYMBOLS.keys():
         if pd.isna(atr) or atr <= 0:
             continue
             
-        # سیستم امتیازدهی 6 گانه (حداقل 4 امتیاز برای تایید ورود)
-        score_long = 0
-        score_short = 0
+        # فیلترهای روند 4H
+        long_4h = (r4h['EMA_50'] > r4h['EMA_200']) and (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_50_Slope'] > 0) and (r4h['ADX'] > 20) and (r4h['RSI'] > 52)
+        short_4h = (r4h['EMA_50'] < r4h['EMA_200']) and (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_50_Slope'] < 0) and (r4h['ADX'] > 20) and (r4h['RSI'] < 48)
         
-        # 1. امتیاز روند 4H
-        if (r4h['EMA_50'] > r4h['EMA_200']) and (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_50_Slope'] > 0):
-            score_long += 1
-        if (r4h['EMA_50'] < r4h['EMA_200']) and (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_50_Slope'] < 0):
-            score_short += 1
-            
-        # 2. امتیاز قدرت ADX 4H
-        if r4h['ADX'] > 20:
-            score_long += 1
-            score_short += 1
-            
-        # 3. امتیاز مومنتوم RSI 4H
-        if r4h['RSI'] > 52:
-            score_long += 1
-        if r4h['RSI'] < 48:
-            score_short += 1
-            
-        # 4. امتیاز شکست Donchian روی 1H
-        is_donchian_long = c1h['Close'] > c1h['Donchian_High']
-        is_donchian_short = c1h['Close'] < c1h['Donchian_Low']
-        if is_donchian_long:
-            score_long += 1
-        if is_donchian_short:
-            score_short += 1
-            
-        # 5. امتیاز انبساط حجم (Volume Expansion)
-        if c1h['Volume'] >= (1.2 * vol_ma):
-            score_long += 1
-            score_short += 1
-            
-        # 6. امتیاز کندل Displacement (قدرت کندل)
+        # فیلتر حجم و کندل Displacement
+        vol_expansion = c1h['Volume'] >= (1.2 * vol_ma)
         body_size = abs(c1h['Close'] - c1h['Open'])
         candle_range = c1h['High'] - c1h['Low']
-        is_displacement = (candle_range > 0) and ((body_size / candle_range) > 0.55) and (candle_range > (atr * 0.8))
-        if is_displacement:
-            score_long += 1
-            score_short += 1
+        displacement = (candle_range > 0) and ((body_size / candle_range) > 0.55) and (candle_range > (atr * 0.8))
+        
+        if not (vol_expansion and displacement):
+            continue
             
-        # اجرای لانگ (حداقل 4 امتیاز از 6)
-        if score_long >= 4:
+        # منطق اصلی LIQUIDITY SWEEP & RECLAIM
+        # لانگ: قیمت کف قبلی را جارو کرده ولی کندل با قدرت برگشته بالا بسته شده
+        is_long_sweep = (c1h['Low'] < c1h['Recent_Swing_Low']) and (c1h['Close'] > c1h['Recent_Swing_Low'])
+        
+        # شورت: قیمت سقف قبلی را جارو کرده ولی کندل با قدرت برگشته پایین بسته شده
+        is_short_sweep = (c1h['High'] > c1h['Recent_Swing_High']) and (c1h['Close'] < c1h['Recent_Swing_High'])
+        
+        # اجرای لانگ
+        if long_4h and is_long_sweep:
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            recent_low = df1h['Low'].iloc[max(0, i-5):i+1].min()
-            sl = recent_low - (0.2 * atr)
+            # استاپ زیر پایین‌ترین نقطه کندل سوئیپ + بافر ATR
+            sl = c1h['Low'] - (0.2 * atr)
             risk = entry_price - sl
             if risk <= 0:
                 risk = 1.0 * atr
                 sl = entry_price - risk
                 
-            tp = entry_price + (2.0 * risk)
-            half_way = entry_price + (1.0 * risk) # نقطه 50 درصدی برای ریسک‌فری
+            tp = entry_price + (2.0 * risk) # ریسک به ریوارد 1 به 2
+            half_way = entry_price + (1.0 * risk)
             is_risk_free = False
             
             outcome = None
@@ -220,7 +198,6 @@ for symbol in SYMBOLS.keys():
                 f_c = df1h.iloc[j]
                 exit_idx = j
                 
-                # فعال‌سازی ریسک‌فری در نصف مسیر
                 if not is_risk_free and f_c['High'] >= half_way:
                     sl = entry_price
                     is_risk_free = True
@@ -240,15 +217,14 @@ for symbol in SYMBOLS.keys():
                 })
                 locked_until_index = exit_idx + 2
                 
-        # اجرای شورت (حداقل 4 امتیاز از 6)
-        elif score_short >= 4:
+        # اجرای شورت
+        elif short_4h and is_short_sweep:
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            recent_high = df1h['High'].iloc[max(0, i-5):i+1].max()
-            sl = recent_high + (0.2 * atr)
+            sl = c1h['High'] + (0.2 * atr)
             risk = sl - entry_price
             if risk <= 0:
                 risk = 1.0 * atr
@@ -285,7 +261,7 @@ for symbol in SYMBOLS.keys():
                 locked_until_index = exit_idx + 2
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی ستاپ HUNTER-X PRO V9 (امتیازدهی + ریسک‌فری)")
+print("📊 گزارش نهایی پورتفوی ستاپ HUNTER-X PRO V10 (تکمیل اصلاح ریشه‌ای)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -309,4 +285,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با این شرایط ثبت نشد.")
 
-print("\n✨ پایان بک‌تست V9.")
+print("\n✨ پایان بک‌تست V10.")
