@@ -13,7 +13,7 @@ except ImportError:
 import pandas as pd
 import numpy as np
 
-# صرافی LBank با سبد 10 ارز
+# صرافی LBank با سبد 10 ارز معتبر
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
     "BTC": "BTC/USDT",
@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته برای استراتژی شکست محدوده (Breakout)")
+print("📥 دانلود داده‌های 1 ساعته برای ستاپ شکار نقدینگی (Liquidity Sweep)")
 print("============================================================")
 
 data_1h = {}
@@ -62,15 +62,24 @@ for symbol, lbank_symbol in SYMBOLS.items():
         data_1h[symbol] = df1h
         print(f"  ✔️ دیتای {symbol} آماده شد (تعداد کندل: {len(df1h)})")
 
-def calculate_breakout_indicators(df):
-    # کانال Donchian برای تشخیص سقف و کف 24 کندل گذشته (24 ساعت اخیر)
+def calculate_smart_money_indicators(df):
+    # کانال Donchian برای سقف و کف 24 ساعته (24 کندل گذشته)
     df['Highest_24'] = df['High'].shift(1).rolling(window=24).max()
     df['Lowest_24'] = df['Low'].shift(1).rolling(window=24).min()
+    
+    # محاسبه ATR برای حد سود و ضرر پویا
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR'] = tr.rolling(window=14).mean()
+    
+    # میانگین حجم برای تشخیص حجم نهادی
     df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست شکست محدوده باکیفیت بالا (TP 2% / SL 1%)")
+print("🚀 اجرای موتور بک‌تست هوشمند (شکار نقدینگی + ATR پویا + ریسک به ریوارد 1:2)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -79,17 +88,20 @@ for symbol, df1h in data_1h.items():
     if len(df1h) < 100:
         continue
         
-    df1h = calculate_breakout_indicators(df1h)
+    df1h = calculate_smart_money_indicators(df1h)
     locked_until_index = 0
     
     for i in range(50, len(df1h) - 20):
+        # بررسی قفل پوزیشن و بافر پس از تسویه
         if i < locked_until_index:
             continue
             
         c1h = df1h.iloc[i]
+        atr = c1h['ATR']
+        vol_ma = c1h['Vol_MA']
         
-        # فیلتر حجم سنگین (حداقل 1.5 برابر میانگین برای تایید شکست واقعی)
-        if c1h['Volume'] < c1h['Vol_MA'] * 1.5:
+        # فیلتر پیش‌نیاز سلامت بازار (بررسی دسترس‌پذیری نوسان کافی)
+        if pd.isna(atr) or atr <= 0 or c1h['Volume'] < vol_ma * 1.4:
             continue
             
         highest_24 = c1h['Highest_24']
@@ -98,23 +110,26 @@ for symbol, df1h in data_1h.items():
         if pd.isna(highest_24) or pd.isna(lowest_24):
             continue
             
-        # شرایط شکست سقف (لانگ قدرتمند)
-        is_breakout_long = c1h['Close'] > highest_24
-        # شرایط شکست کف (شورت قدرتمند)
-        is_breakout_short = c1h['Close'] < lowest_24
+        # 1. ستاپ لانگ: شکار نقدینگی کف (قیمت پایین‌تر از کف 24 ساعته نفوذ کرده اما به داخل برگشته و بسته شده)
+        is_sweep_low = (c1h['Low'] < lowest_24) and (c1h['Close'] > lowest_24) and (c1h['Close'] > c1h['Open'])
         
-        if not is_breakout_long and not is_breakout_short:
+        # 2. ستاپ شورت: شکار نقدینگی سقف (قیمت بالاتر از سقف 24 ساعته نفوذ کرده اما به داخل برگشته و بسته شده)
+        is_sweep_high = (c1h['High'] > highest_24) and (c1h['Close'] < highest_24) and (c1h['Close'] < c1h['Open'])
+        
+        if not is_sweep_low and not is_sweep_high:
             continue
             
-        if is_breakout_long:
-            # ورود در بازگشایی کندل بعدی
+        if is_sweep_low:
+            # ورود در بازگشایی کندل بعدی (بدون نگاه به آینده)
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            tp = entry_price * 1.02  # حد سود 2 درصد
-            sl = entry_price * 0.99  # حد ضرر 1 درصد
+            
+            # تعیین حد ضرر و حد سود پویا بر اساس ATR (ریسک به ریوارد دقیق 1 به 2)
+            sl = entry_price - (1.5 * atr)
+            tp = entry_price + (3.0 * atr)  # دقیقاً دو برابر فاصله ریسک
             
             outcome = None
             exit_idx = entry_idx
@@ -123,6 +138,7 @@ for symbol, df1h in data_1h.items():
                 f_c = df1h.iloc[j]
                 exit_idx = j
                 
+                # محافظه‌کاری: بررسی اولویت حد ضرر در صورت هم‌پوشانی در یک کندل
                 if f_c['Low'] <= sl:
                     outcome = 'LOSS'
                     break
@@ -136,16 +152,18 @@ for symbol, df1h in data_1h.items():
                     'Side': 'LONG',
                     'Outcome': outcome
                 })
-                locked_until_index = exit_idx + 3  # قفل طولانی‌تر برای جلوگیری از ترید رگباری
+                # قفل کردن ربات تا حداقل یک کندل بعد از تسویه کامل
+                locked_until_index = exit_idx + 1
                 
-        elif is_breakout_short:
+        elif is_sweep_high:
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            tp = entry_price * 0.98  # حد سود 2 درصد
-            sl = entry_price * 1.01  # حد ضرر 1 درصد
+            
+            sl = entry_price + (1.5 * atr)
+            tp = entry_price - (3.0 * atr)  # ریسک به ریوارد 1 به 2
             
             outcome = None
             exit_idx = entry_idx
@@ -167,10 +185,10 @@ for symbol, df1h in data_1h.items():
                     'Side': 'SHORT',
                     'Outcome': outcome
                 })
-                locked_until_index = exit_idx + 3
+                locked_until_index = exit_idx + 1
 
 print("\n============================================================")
-print("📊 گزارش نهایی استراتژی شکست محدوده (Breakout Strategy)")
+print("📊 گزارش نهایی پورتفوی هوشمند (شکار نقدینگی + ATR پویا)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -192,4 +210,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با این شرایط ثبت نشد.")
 
-print("\n✨ پایان بک‌تست.")
+print("\n✨ پایان بک‌تست هوشمند.")
