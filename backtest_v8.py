@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها از صرافی ال‌بنک برای نسخه HUNTER-X PRO V10 (True Liquidity Sweep)")
+print("📥 دانلود داده‌ها برای نسخه ارتقایافته HUNTER-X PRO V11")
 print("============================================================")
 
 data_1h = {}
@@ -95,9 +95,9 @@ def calculate_indicators(df):
     df['ATR'] = tr.rolling(window=14).mean()
     df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
     
-    # سطوح ساختاری برای Liquidity Sweep (بدون نگاه به آینده با shift)
-    df['Recent_Swing_Low'] = df['Low'].rolling(window=20).min().shift(1)
-    df['Recent_Swing_High'] = df['High'].rolling(window=20).max().shift(1)
+    # Donchian Channel 20 (بدون نگاه به آینده با shift)
+    df['Donchian_High'] = df['High'].rolling(window=20).max().shift(1)
+    df['Donchian_Low'] = df['Low'].rolling(window=20).min().shift(1)
     
     # ADX 14
     plus_dm = df['High'].diff()
@@ -113,7 +113,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست HUNTER-X PRO V10 (مبتنی بر Liquidity Sweep خالص)")
+print("🚀 اجرای موتور بک‌تست HUNTER-X PRO V11 (بهینه‌شده برای افزایش وین‌ریت)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -147,49 +147,45 @@ for symbol in SYMBOLS.keys():
             continue
             
         r4h = df4h_indexed.loc[t4h_time]
+        
+        # فیلترهای روند 4H با ADX سخت‌گیرانه‌تر (بالای 25 برای قدرت بیشتر روند)
+        long_4h = (r4h['EMA_50'] > r4h['EMA_200']) and (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_50_Slope'] > 0) and (r4h['ADX'] > 25) and (r4h['RSI'] > 55)
+        short_4h = (r4h['EMA_50'] < r4h['EMA_200']) and (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_50_Slope'] < 0) and (r4h['ADX'] > 25) and (r4h['RSI'] < 45)
+        
         atr = c1h['ATR']
         vol_ma = c1h['Vol_MA']
         
         if pd.isna(atr) or atr <= 0:
             continue
             
-        # فیلترهای روند 4H
-        long_4h = (r4h['EMA_50'] > r4h['EMA_200']) and (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_50_Slope'] > 0) and (r4h['ADX'] > 20) and (r4h['RSI'] > 52)
-        short_4h = (r4h['EMA_50'] < r4h['EMA_200']) and (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_50_Slope'] < 0) and (r4h['ADX'] > 20) and (r4h['RSI'] < 48)
-        
-        # فیلتر حجم و کندل Displacement
-        vol_expansion = c1h['Volume'] >= (1.2 * vol_ma)
+        # بررسی حجم و کندل Displacement با فیلتر دقیق‌تر
+        vol_expansion = c1h['Volume'] >= (1.3 * vol_ma) # سخت‌گیری بیشتر روی حجم
         body_size = abs(c1h['Close'] - c1h['Open'])
         candle_range = c1h['High'] - c1h['Low']
-        displacement = (candle_range > 0) and ((body_size / candle_range) > 0.55) and (candle_range > (atr * 0.8))
+        displacement = (candle_range > 0) and ((body_size / candle_range) > 0.60) and (candle_range > (atr * 0.9))
         
         if not (vol_expansion and displacement):
             continue
             
-        # منطق اصلی LIQUIDITY SWEEP & RECLAIM
-        # لانگ: قیمت کف قبلی را جارو کرده ولی کندل با قدرت برگشته بالا بسته شده
-        is_long_sweep = (c1h['Low'] < c1h['Recent_Swing_Low']) and (c1h['Close'] > c1h['Recent_Swing_Low'])
-        
-        # شورت: قیمت سقف قبلی را جارو کرده ولی کندل با قدرت برگشته پایین بسته شده
-        is_short_sweep = (c1h['High'] > c1h['Recent_Swing_High']) and (c1h['Close'] < c1h['Recent_Swing_High'])
+        # بررسی شکست Donchian روی 1H
+        is_donchian_long_breakout = c1h['Close'] > c1h['Donchian_High']
+        is_donchian_short_breakout = c1h['Close'] < c1h['Donchian_Low']
         
         # اجرای لانگ
-        if long_4h and is_long_sweep:
+        if long_4h and is_donchian_long_breakout:
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            # استاپ زیر پایین‌ترین نقطه کندل سوئیپ + بافر ATR
-            sl = c1h['Low'] - (0.2 * atr)
+            recent_low = df1h['Low'].iloc[max(0, i-5):i+1].min()
+            sl = recent_low - (0.2 * atr)
             risk = entry_price - sl
             if risk <= 0:
                 risk = 1.0 * atr
                 sl = entry_price - risk
                 
-            tp = entry_price + (2.0 * risk) # ریسک به ریوارد 1 به 2
-            half_way = entry_price + (1.0 * risk)
-            is_risk_free = False
+            tp = entry_price + (2.0 * risk)
             
             outcome = None
             exit_idx = entry_idx
@@ -198,18 +194,14 @@ for symbol in SYMBOLS.keys():
                 f_c = df1h.iloc[j]
                 exit_idx = j
                 
-                if not is_risk_free and f_c['High'] >= half_way:
-                    sl = entry_price
-                    is_risk_free = True
-                
                 if f_c['Low'] <= sl:
-                    outcome = 'BE' if is_risk_free else 'LOSS'
+                    outcome = 'LOSS'
                     break
                 elif f_c['High'] >= tp:
                     outcome = 'WIN'
                     break
                     
-            if outcome in ['WIN', 'LOSS', 'BE']:
+            if outcome in ['WIN', 'LOSS']:
                 all_portfolio_trades.append({
                     'Symbol': symbol,
                     'Side': 'LONG',
@@ -218,21 +210,20 @@ for symbol in SYMBOLS.keys():
                 locked_until_index = exit_idx + 2
                 
         # اجرای شورت
-        elif short_4h and is_short_sweep:
+        elif short_4h and is_donchian_short_breakout:
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            sl = c1h['High'] + (0.2 * atr)
+            recent_high = df1h['High'].iloc[max(0, i-5):i+1].max()
+            sl = recent_high + (0.2 * atr)
             risk = sl - entry_price
             if risk <= 0:
                 risk = 1.0 * atr
                 sl = entry_price + risk
                 
             tp = entry_price - (2.0 * risk)
-            half_way = entry_price - (1.0 * risk)
-            is_risk_free = False
             
             outcome = None
             exit_idx = entry_idx
@@ -241,18 +232,14 @@ for symbol in SYMBOLS.keys():
                 f_c = df1h.iloc[j]
                 exit_idx = j
                 
-                if not is_risk_free and f_c['Low'] <= half_way:
-                    sl = entry_price
-                    is_risk_free = True
-                
                 if f_c['High'] >= sl:
-                    outcome = 'BE' if is_risk_free else 'LOSS'
+                    outcome = 'LOSS'
                     break
                 elif f_c['Low'] <= tp:
                     outcome = 'WIN'
                     break
                     
-            if outcome in ['WIN', 'LOSS', 'BE']:
+            if outcome in ['WIN', 'LOSS']:
                 all_portfolio_trades.append({
                     'Symbol': symbol,
                     'Side': 'SHORT',
@@ -261,7 +248,7 @@ for symbol in SYMBOLS.keys():
                 locked_until_index = exit_idx + 2
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی ستاپ HUNTER-X PRO V10 (تکمیل اصلاح ریشه‌ای)")
+print("📊 گزارش نهایی پورتفوی ستاپ HUNTER-X PRO V11 (ارتقایافته)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -269,20 +256,17 @@ if all_portfolio_trades:
     total_trades = len(pf_df)
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
-    total_be = len(pf_df[pf_df['Outcome'] == 'BE'])
     
-    active_trades = total_wins + total_losses
-    win_rate = (total_wins / active_trades) * 100 if active_trades > 0 else 0
+    win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
     
     print(f"🔸 تعداد کل معاملات پورتفوی: {total_trades}")
     print(f"🔸 معاملات برنده (WIN): {total_wins}")
-    print(f"🔸 معاملات سر به سر (BE): {total_be}")
     print(f"🔸 معاملات بازنده (LOSS): {total_losses}")
-    print(f"🎯 **وین‌ریت واقعی موثر:** {win_rate:.2f}%")
+    print(f"🎯 **وین‌ریت کلی:** {win_rate:.2f}%")
     
     print("\nتفکیک عملکرد به تفکیک هر نماد:")
     print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
 else:
     print("⚠️ هیچ معامله‌ای با این شرایط ثبت نشد.")
 
-print("\n✨ پایان بک‌تست V10.")
+print("\n✨ پایان بک‌تست V11.")
