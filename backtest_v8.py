@@ -13,7 +13,7 @@ except ImportError:
 import pandas as pd
 import numpy as np
 
-# اتصال به صرافی LBank با سبد 10 ارز
+# اتصال به صرافی LBank با سبد 10 ارز معتبر
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
     "BTC": "BTC/USDT",
@@ -38,7 +38,7 @@ print("============================================================")
 data_4h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_4h = f"{symbol}_4h_clean_data.csv"
+    filename_4h = f"{symbol}_4h_pro_data.csv"
     print(f"🔹 در حال دریافت و پردازش دیتای {symbol}...")
     
     all_ohlcv = []
@@ -63,7 +63,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
         df1h.set_index('Date', inplace=True)
         
-        # ساخت کندل‌های 4 ساعته بدون نشت داده
+        # تبدیل دقیق 1 ساعته به 4 ساعته بدون نشت داده
         df4h = df1h.resample('4H').agg({
             'Open': 'first',
             'High': 'max',
@@ -78,22 +78,34 @@ for symbol, lbank_symbol in SYMBOLS.items():
     else:
         print(f"  ❌ دیتایی برای {symbol} دریافت نشد.")
 
-def calculate_indicators(df):
+def calculate_advanced_indicators(df):
+    # میانگین‌های متحرک جهت تشخیص روند
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     
+    # محاسبه ATR برای حد ضرر پویا
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
-    df['ATR_Pct'] = df['ATR'] / df['Close']
+    
+    # محاسبه ADX برای سنجش قدرت روند (فیلتر بازار سایدوی)
+    plus_dm = df['High'].diff().clip(lower=0)
+    minus_dm = (-df['Low'].diff()).clip(lower=0)
+    tr14 = df['ATR']
+    plus_di = 100 * (plus_dm.rolling(window=14).mean() / (tr14 + 1e-9))
+    minus_di = 100 * (minus_dm.rolling(window=14).mean() / (tr14 + 1e-9))
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+    df['ADX'] = dx.rolling(window=14).mean().fillna(20)
+    
+    # میانگین حجم
     df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست ایزوله (بدون همپوشانی و بدون نگاه به آینده)")
+print("🚀 اجرای موتور بک‌تست حرفه‌ای (ATR Stop-Loss & ADX Filter)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -102,52 +114,53 @@ for symbol, df4h in data_4h.items():
     if len(df4h) < 250:
         continue
         
-    df4h = calculate_indicators(df4h)
+    df4h = calculate_advanced_indicators(df4h)
     
-    # متغیر قفل پوزیشن
+    # متغیر قفل پوزیشن برای جلوگیری از همپوشانی
     locked_until_index = 0
     
-    for i in range(200, len(df4h) - 10):
+    for i in range(200, len(df4h) - 15):
         
-        # بررسی قفل بودن پوزیشن
+        # اگر پوزیشنی باز است، حق ورود نداریم
         if i < locked_until_index:
             continue
             
         row = df4h.iloc[i]
         
-        # فیلتر نوسان و حجم برای اطمینان از قابلیت تاچ شدن اهداف
-        atr_pct = row['ATR_Pct']
-        is_market_touchable = (0.003 <= atr_pct <= 0.03) and (row['Volume'] >= row['Vol_MA'] * 0.8)
-        
-        if not is_market_touchable:
+        # فیلتر کیفیت بازار: ADX باید بالای 20 باشد تا روند قدرت داشته باشد + حجم مناسب
+        if row['ADX'] < 20 or row['Volume'] < row['Vol_MA'] * 0.8:
             continue
             
         close = row['Close']
         ema20 = row['EMA_20']
         ema50 = row['EMA_50']
         ema200 = row['EMA_200']
+        atr = row['ATR']
         
+        if pd.isna(atr) or atr <= 0:
+            continue
+            
         is_long_trend = (close > ema200) and (ema20 > ema50) and (ema50 > ema200)
         is_short_trend = (close < ema200) and (ema20 < ema50) and (ema50 < ema200)
         
         if not is_long_trend and not is_short_trend:
             continue
             
-        # مدیریت ریسک ثابت: TP = 1% و SL = 0.5%
+        # استراتژی مدیریت ریسک پویا بر اساس ATR (ریسک به ریوارد 1 به 2)
         if is_long_trend:
             entry_price = close
-            tp = entry_price * 1.01
-            sl = entry_price * 0.995
+            sl = entry_price - (1.0 * atr)  # حد ضرر به اندازه 1 برابر ATR
+            tp = entry_price + (2.0 * atr)  # حد سود به اندازه 2 برابر ATR (ریسک به ریوارد 1:2)
             
             outcome = None
             exit_idx = i
             
-            # بررسی کندل‌های آینده
+            # بررسی بدون نگاه به آینده در کندل‌های بعدی
             for j in range(i + 1, len(df4h)):
                 future_candle = df4h.iloc[j]
                 exit_idx = j
                 
-                # اولویت با حد ضرر در صورت برخورد همزمان
+                # اولویت با حد ضرر در صورت برخورد در یک کندل
                 if future_candle['Low'] <= sl:
                     outcome = 'LOSS'
                     break
@@ -161,13 +174,13 @@ for symbol, df4h in data_4h.items():
                     'Side': 'LONG',
                     'Outcome': outcome
                 })
-                # قفل کردن کامل تا حداقل یک کندل بعد از تسویه معامله
-                locked_until_index = exit_idx + 1 
+                # قفل کردن کامل پوزیشن تا حداقل یک کندل بعد از تسویه
+                locked_until_index = exit_idx + 1
                 
         elif is_short_trend:
             entry_price = close
-            tp = entry_price * 0.99
-            sl = entry_price * 1.005
+            sl = entry_price + (1.0 * atr)
+            tp = entry_price - (2.0 * atr)
             
             outcome = None
             exit_idx = i
@@ -192,7 +205,7 @@ for symbol, df4h in data_4h.items():
                 locked_until_index = exit_idx + 1
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی 4 ساعته (کاملاً ایزوله)")
+print("📊 گزارش نهایی پورتفوی حرفه‌ای (بدون نگاه به آینده و بدون همپوشانی)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -212,6 +225,6 @@ if all_portfolio_trades:
     print("\nتفکیک عملکرد به تفکیک هر نماد:")
     print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
 else:
-    print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
+    print("⚠️ هیچ معامله‌ای با این فیلترها ثبت نشد.")
 
 print("\n✨ پایان بک‌تست.")
