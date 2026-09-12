@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای نسخه HUNTER-X PRO V12 (مجهز به Chandelier Trailing Stop)")
+print("📥 دانلود داده‌ها برای نسخه HUNTER-X PRO V13 (استراتژی پولبک به روند - وین‌ریت بالا)")
 print("============================================================")
 
 data_1h = {}
@@ -76,6 +76,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         print(f"  ✔️ دیتای {symbol} آماده شد.")
 
 def calculate_indicators(df):
+    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     df['EMA_50_Slope'] = df['EMA_50'].diff()
@@ -95,10 +96,6 @@ def calculate_indicators(df):
     df['ATR'] = tr.rolling(window=14).mean()
     df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
     
-    # Donchian Channel 20 (بدون نگاه به آینده با shift)
-    df['Donchian_High'] = df['High'].rolling(window=20).max().shift(1)
-    df['Donchian_Low'] = df['Low'].rolling(window=20).min().shift(1)
-    
     # ADX 14
     plus_dm = df['High'].diff()
     minus_dm = df['Low'].diff()
@@ -113,7 +110,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست HUNTER-X PRO V12 (با تریلینگ استاپ Chandelier)")
+print("🚀 اجرای موتور بک‌تست HUNTER-X PRO V13 (استراتژی پولبک به روند)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -148,9 +145,9 @@ for symbol in SYMBOLS.keys():
             
         r4h = df4h_indexed.loc[t4h_time]
         
-        # فیلترهای روند 4H نسخه V11
-        long_4h = (r4h['EMA_50'] > r4h['EMA_200']) and (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_50_Slope'] > 0) and (r4h['ADX'] > 25) and (r4h['RSI'] > 55)
-        short_4h = (r4h['EMA_50'] < r4h['EMA_200']) and (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_50_Slope'] < 0) and (r4h['ADX'] > 25) and (r4h['RSI'] < 45)
+        # روند قدرتمند 4H
+        long_4h = (r4h['EMA_50'] > r4h['EMA_200']) and (r4h['Close'] > r4h['EMA_50']) and (r4h['ADX'] > 22)
+        short_4h = (r4h['EMA_50'] < r4h['EMA_200']) and (r4h['Close'] < r4h['EMA_50']) and (r4h['ADX'] > 22)
         
         atr = c1h['ATR']
         vol_ma = c1h['Vol_MA']
@@ -158,106 +155,92 @@ for symbol in SYMBOLS.keys():
         if pd.isna(atr) or atr <= 0:
             continue
             
-        vol_expansion = c1h['Volume'] >= (1.3 * vol_ma)
-        body_size = abs(c1h['Close'] - c1h['Open'])
-        candle_range = c1h['High'] - c1h['Low']
-        displacement = (candle_range > 0) and ((body_size / candle_range) > 0.60) and (candle_range > (atr * 0.9))
+        # شرایط پولبک و تاییدیه در 1H
+        # برای لانگ: قیمت در روند صعودی اخیرا به سمت میانگین پولبک زده (RSI افت کرده به زیر 50) و حالا کندل صعودی قدرتمند زده است
+        prev_rsi = df1h.iloc[i-1]['RSI'] if i > 0 else 50
+        is_pullback_long = (prev_rsi < 50) and (c1h['RSI'] > prev_rsi) and (c1h['Close'] > c1h['Open']) and (c1h['Volume'] >= 1.2 * vol_ma)
         
-        if not (vol_expansion and displacement):
-            continue
-            
-        is_donchian_long_breakout = c1h['Close'] > c1h['Donchian_High']
-        is_donchian_short_breakout = c1h['Close'] < c1h['Donchian_Low']
+        # برای شورت: قیمت در روند نزولی پولبک صعودی زده (RSI بالای 50 بوده) و حالا کندل نزولی قدرتمند زده است
+        is_pullback_short = (prev_rsi > 50) and (c1h['RSI'] < prev_rsi) and (c1h['Close'] < c1h['Open']) and (c1h['Volume'] >= 1.2 * vol_ma)
         
-        # اجرای لانگ با Chandelier Trailing Stop
-        if long_4h and is_donchian_long_breakout:
+        # اجرای لانگ (Pullback Buy)
+        if long_4h and is_pullback_long:
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            recent_low = df1h['Low'].iloc[max(0, i-5):i+1].min()
-            initial_sl = recent_low - (0.2 * atr)
-            if initial_sl >= entry_price:
-                initial_sl = entry_price - (1.0 * atr)
+            recent_low = df1h['Low'].iloc[max(0, i-4):i+1].min()
+            sl = recent_low - (0.3 * atr)
+            risk = entry_price - sl
+            if risk <= 0:
+                risk = 1.0 * atr
+                sl = entry_price - risk
                 
-            current_sl = initial_sl
-            highest_high = entry_price
+            tp = entry_price + (2.0 * risk) # ریسک به ریوارد 1 به 2
             
-            outcome = 'LOSS'
+            outcome = None
             exit_idx = entry_idx
             
             for j in range(entry_idx, len(df1h)):
                 f_c = df1h.iloc[j]
                 exit_idx = j
                 
-                # به‌روزرسانی بالاترین سقف
-                if f_c['High'] > highest_high:
-                    highest_high = f_c['High']
-                    
-                # محاسبه چاندلر استاپ (3 برابر ATR از بالاترین سقف)
-                if not pd.isna(f_c['ATR']) and f_c['ATR'] > 0:
-                    chandelier_sl = highest_high - (3.0 * f_c['ATR'])
-                    # استاپ فقط رو به بالا حرکت می‌کند
-                    if chandelier_sl > current_sl:
-                        current_sl = chandelier_sl
-                
-                # بررسی برخورد قیمت با استاپ پویا
-                if f_c['Low'] <= current_sl:
-                    # اگر استاپ بالاتر از قیمت ورود باشد یعنی معامله با سود (WIN) بسته شده است
-                    outcome = 'WIN' if current_sl > entry_price else 'LOSS'
+                if f_c['Low'] <= sl:
+                    outcome = 'LOSS'
+                    break
+                elif f_c['High'] >= tp:
+                    outcome = 'WIN'
                     break
                     
-            all_portfolio_trades.append({
-                'Symbol': symbol,
-                'Side': 'LONG',
-                'Outcome': outcome
-            })
-            locked_until_index = exit_idx + 2
+            if outcome in ['WIN', 'LOSS']:
+                all_portfolio_trades.append({
+                    'Symbol': symbol,
+                    'Side': 'LONG',
+                    'Outcome': outcome
+                })
+                locked_until_index = exit_idx + 2
                 
-        # اجرای شورت با Chandelier Trailing Stop
-        elif short_4h and is_donchian_short_breakout:
+        # اجرای شورت (Pullback Sell)
+        elif short_4h and is_pullback_short:
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            recent_high = df1h['High'].iloc[max(0, i-5):i+1].max()
-            initial_sl = recent_high + (0.2 * atr)
-            if initial_sl <= entry_price:
-                initial_sl = entry_price + (1.0 * atr)
+            recent_high = df1h['High'].iloc[max(0, i-4):i+1].max()
+            sl = recent_high + (0.3 * atr)
+            risk = sl - entry_price
+            if risk <= 0:
+                risk = 1.0 * atr
+                sl = entry_price + risk
                 
-            current_sl = initial_sl
-            lowest_low = entry_price
+            tp = entry_price - (2.0 * risk)
             
-            outcome = 'LOSS'
+            outcome = None
             exit_idx = entry_idx
             
             for j in range(entry_idx, len(df1h)):
                 f_c = df1h.iloc[j]
                 exit_idx = j
                 
-                if f_c['Low'] < lowest_low:
-                    lowest_low = f_c['Low']
-                    
-                if not pd.isna(f_c['ATR']) and f_c['ATR'] > 0:
-                    chandelier_sl = lowest_low + (3.0 * f_c['ATR'])
-                    if chandelier_sl < current_sl:
-                        current_sl = chandelier_sl
-                
-                if f_c['High'] >= current_sl:
-                    outcome = 'WIN' if current_sl < entry_price else 'LOSS'
+                if f_c['High'] >= sl:
+                    outcome = 'LOSS'
+                    break
+                elif f_c['Low'] <= tp:
+                    outcome = 'WIN'
                     break
                     
-            all_portfolio_trades.append({
-                'Symbol': symbol,
-                'Side': 'SHORT',
-                'Outcome': outcome
-            })
-            locked_until_index = exit_idx + 2
+            if outcome in ['WIN', 'LOSS']:
+                all_portfolio_trades.append({
+                    'Symbol': symbol,
+                    'Side': 'SHORT',
+                    'Outcome': outcome
+                })
+                locked_until_index = exit_idx + 2
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی ستاپ HUNTER-X PRO V12 (تریلینگ استاپ)")
+print("📊 گزارش نهایی پورتفوی ستاپ HUNTER-X PRO V13 (پولبک به روند)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -278,4 +261,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با این شرایط ثبت نشد.")
 
-print("\n✨ پایان بک‌تست V12.")
+print("\n✨ پایان بک‌تست V13.")
