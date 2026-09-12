@@ -2,22 +2,26 @@
 # 1H Execution + Closed 4H Regime
 # FIXED RR = 1:2
 # NO LOOKAHEAD
+#
+# DATA:
+# LBank via CCXT
+# Full historical pagination
+# 365 DAYS + WARMUP
+# Invalid/short cache is automatically redownloaded
 
 import time
 import argparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import ccxt
 import numpy as np
 import pandas as pd
-import requests
 
 
 # ============================================================
 # CONFIG
 # ============================================================
-
-LBANK_URL = "https://api.lbank.info/v2/kline.do"
 
 SYMBOLS = [
     "btc_usdt",
@@ -55,6 +59,14 @@ SYMBOLS = [
 DAYS = 365
 WARMUP_DAYS = 35
 
+TIMEFRAME = "1h"
+
+# CCXT pagination
+FETCH_LIMIT = 1000
+
+# Minimum acceptable amount of data
+MIN_DATA_RATIO = 0.90
+
 # ============================================================
 # RISK / RR
 # ============================================================
@@ -66,6 +78,15 @@ FEE_RATE = 0.0004
 SLIPPAGE_RATE = 0.0002
 
 MAX_HOLD_BARS = 40
+
+
+# ============================================================
+# CCXT / LBANK
+# ============================================================
+
+exchange = ccxt.lbank({
+    "enableRateLimit": True,
+})
 
 
 # ============================================================
@@ -187,77 +208,173 @@ def adx(df, length=14):
 
 
 # ============================================================
-# DOWNLOAD LBANK
+# SYMBOL CONVERSION
+# ============================================================
+
+def ccxt_symbol(lbank_symbol):
+    """
+    Convert:
+        btc_usdt -> BTC/USDT
+    """
+
+    return lbank_symbol.replace("_", "/").upper()
+
+
+# ============================================================
+# LOAD LBANK MARKETS
+# ============================================================
+
+def load_lbank_markets():
+
+    print("\n🔌 Connecting to LBank through CCXT...")
+
+    exchange.load_markets()
+
+    print(
+        f"✅ LBank markets loaded: "
+        f"{len(exchange.markets)} markets"
+    )
+
+
+# ============================================================
+# DOWNLOAD LBANK THROUGH CCXT
 # ============================================================
 
 def download_lbank(symbol, days):
 
-    print(f"\n📥 Downloading {symbol} ...")
+    ccxt_sym = ccxt_symbol(symbol)
 
-    now = datetime.now(timezone.utc)
-
-    start = now - timedelta(
-        days=days + WARMUP_DAYS
+    print(
+        f"\n📥 Downloading {symbol} "
+        f"({ccxt_sym}) ..."
     )
 
-    start_ts = int(start.timestamp())
-    end_ts = int(now.timestamp())
+    if ccxt_sym not in exchange.markets:
+
+        raise RuntimeError(
+            f"LBank market not found in CCXT: "
+            f"{ccxt_sym}"
+        )
+
+    now_ms = exchange.milliseconds()
+
+    start_ms = (
+        now_ms
+        - int(
+            (days + WARMUP_DAYS)
+            * 24
+            * 60
+            * 60
+            * 1000
+        )
+    )
+
+    expected_candles = (
+        (days + WARMUP_DAYS)
+        * 24
+    )
 
     all_rows = []
 
-    cursor = end_ts
+    since = start_ms
 
-    for _ in range(30):
+    last_seen_timestamp = None
 
-        params = {
-            "symbol": symbol,
-            "size": 2000,
-            "type": "hour1",
-            "time": cursor
-        }
+    max_requests = max(
+        20,
+        int(
+            expected_candles
+            / FETCH_LIMIT
+        ) + 10
+    )
 
-        response = requests.get(
-            LBANK_URL,
-            params=params,
-            timeout=30
-        )
+    for request_number in range(
+        max_requests
+    ):
 
-        response.raise_for_status()
+        try:
 
-        data = response.json()
-
-        if str(
-            data.get("result", "")
-        ).lower() != "true":
-
-            raise RuntimeError(
-                f"LBank error: {data}"
+            candles = exchange.fetch_ohlcv(
+                ccxt_sym,
+                timeframe=TIMEFRAME,
+                since=since,
+                limit=FETCH_LIMIT
             )
 
-        rows = data.get("data", [])
+        except Exception as e:
 
-        if not rows:
+            raise RuntimeError(
+                f"CCXT/LBank OHLCV error for "
+                f"{ccxt_sym}: {e}"
+            )
+
+        if not candles:
             break
 
-        all_rows.extend(rows)
+        all_rows.extend(candles)
 
-        oldest = min(
-            int(row[0])
-            for row in rows
+        first_ts = candles[0][0]
+        last_ts = candles[-1][0]
+
+        print(
+            f"   📦 batch {request_number + 1}: "
+            f"{len(candles)} candles | "
+            f"{pd.to_datetime(first_ts, unit='ms', utc=True)} "
+            f"-> "
+            f"{pd.to_datetime(last_ts, unit='ms', utc=True)}"
         )
 
-        if oldest <= start_ts:
+        # Safety against repeated data
+        if (
+            last_seen_timestamp is not None
+            and last_ts <= last_seen_timestamp
+        ):
+            print(
+                "   ⚠️ Pagination stopped: "
+                "timestamp did not advance."
+            )
             break
 
-        cursor = oldest - 3600
+        last_seen_timestamp = last_ts
 
-        time.sleep(0.15)
+        # We already reached the current time
+        if last_ts >= now_ms:
+            break
+
+        # If exchange returned fewer candles,
+        # it may have reached the end.
+        if len(candles) < FETCH_LIMIT:
+
+            # Still allow one more iteration only
+            # if we haven't reached requested period.
+            next_since = last_ts + 60 * 60 * 1000
+
+            if next_since >= now_ms:
+                break
+
+        # Move to the candle immediately after
+        # the last received candle.
+        since = last_ts + 60 * 60 * 1000
+
+        # CCXT has its own rate limiter.
+        # Small pause adds extra protection.
+        time.sleep(
+            max(
+                0.05,
+                exchange.rateLimit / 1000
+            )
+        )
 
     if not all_rows:
 
         raise RuntimeError(
-            f"No data for {symbol}"
+            f"No OHLCV data returned by LBank "
+            f"for {ccxt_sym}"
         )
+
+    # ========================================================
+    # BUILD DATAFRAME
+    # ========================================================
 
     df = pd.DataFrame(
         all_rows,
@@ -271,9 +388,10 @@ def download_lbank(symbol, days):
         ]
     )
 
+    # Timestamp is already milliseconds from CCXT
     df["timestamp"] = pd.to_datetime(
         df["timestamp"],
-        unit="s",
+        unit="ms",
         utc=True
     )
 
@@ -293,24 +411,204 @@ def download_lbank(symbol, days):
     df = (
         df
         .dropna()
-        .drop_duplicates("timestamp")
+        .drop_duplicates(
+            subset=["timestamp"]
+        )
         .sort_values("timestamp")
     )
 
+    start_time = pd.to_datetime(
+        start_ms,
+        unit="ms",
+        utc=True
+    )
+
+    end_time = pd.to_datetime(
+        now_ms,
+        unit="ms",
+        utc=True
+    )
+
     df = df[
-        (df["timestamp"] >= pd.Timestamp(start))
+        (df["timestamp"] >= start_time)
         &
-        (df["timestamp"] <= pd.Timestamp(now))
+        (df["timestamp"] <= end_time)
     ]
 
-    df = df.set_index("timestamp")
+    df = df.set_index(
+        "timestamp"
+    )
+
+    df = df.sort_index()
+
+    candle_count = len(df)
 
     print(
-        f"📈 {symbol}: {len(df)} candles | "
-        f"{df.index.min()} -> {df.index.max()}"
+        f"📈 {symbol}: "
+        f"{candle_count} candles | "
+        f"{df.index.min()} -> "
+        f"{df.index.max()}"
+    )
+
+    # ========================================================
+    # VALIDATION
+    # ========================================================
+
+    minimum_expected = int(
+        expected_candles
+        * MIN_DATA_RATIO
+    )
+
+    if candle_count < minimum_expected:
+
+        raise RuntimeError(
+            f"INSUFFICIENT DATA for {symbol}: "
+            f"{candle_count} candles received, "
+            f"expected at least "
+            f"{minimum_expected}."
+        )
+
+    # Check approximate time span
+    if len(df) >= 2:
+
+        span_hours = (
+            (
+                df.index.max()
+                - df.index.min()
+            ).total_seconds()
+            / 3600
+        )
+
+        minimum_span_hours = (
+            (days + WARMUP_DAYS)
+            * 24
+            * MIN_DATA_RATIO
+        )
+
+        if span_hours < minimum_span_hours:
+
+            raise RuntimeError(
+                f"INSUFFICIENT TIME SPAN for "
+                f"{symbol}: "
+                f"{span_hours:.1f}h received, "
+                f"expected at least "
+                f"{minimum_span_hours:.1f}h."
+            )
+
+    print(
+        f"   ✅ Valid LBank dataset: "
+        f"{candle_count} candles"
     )
 
     return df
+
+
+# ============================================================
+# CACHE VALIDATION
+# ============================================================
+
+def load_valid_cache(
+    cache_file,
+    days
+):
+
+    if not cache_file.exists():
+
+        return None
+
+    try:
+
+        df = pd.read_csv(
+            cache_file,
+            parse_dates=["timestamp"]
+        )
+
+        if len(df) == 0:
+
+            print(
+                "⚠️ Cache is empty. "
+                "Redownloading..."
+            )
+
+            return None
+
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"],
+            utc=True
+        )
+
+        df = df.set_index(
+            "timestamp"
+        )
+
+        df = df.sort_index()
+
+        expected_candles = (
+            (days + WARMUP_DAYS)
+            * 24
+        )
+
+        minimum_expected = int(
+            expected_candles
+            * MIN_DATA_RATIO
+        )
+
+        # ====================================================
+        # IMPORTANT:
+        # Old broken cache had only ~30 candles.
+        # Do NOT use it.
+        # ====================================================
+
+        if len(df) < minimum_expected:
+
+            print(
+                f"⚠️ Cache rejected: "
+                f"{len(df)} candles only. "
+                f"Expected at least "
+                f"{minimum_expected}."
+            )
+
+            return None
+
+        if len(df) >= 2:
+
+            span_hours = (
+                (
+                    df.index.max()
+                    - df.index.min()
+                ).total_seconds()
+                / 3600
+            )
+
+            minimum_span_hours = (
+                (days + WARMUP_DAYS)
+                * 24
+                * MIN_DATA_RATIO
+            )
+
+            if span_hours < minimum_span_hours:
+
+                print(
+                    f"⚠️ Cache rejected: "
+                    f"only {span_hours:.1f}h span."
+                )
+
+                return None
+
+        print(
+            f"💾 Valid cache loaded: "
+            f"{len(df)} candles"
+        )
+
+        return df
+
+    except Exception as e:
+
+        print(
+            f"⚠️ Cache read failed: {e}"
+        )
+
+        return None
 
 
 # ============================================================
@@ -1139,7 +1437,9 @@ def report(trades):
             "AvgR": group["R"].mean()
         })
 
-    symbol_report = pd.DataFrame(rows)
+    symbol_report = pd.DataFrame(
+        rows
+    )
 
     symbol_report = (
         symbol_report
@@ -1182,8 +1482,6 @@ def report(trades):
 
 def main():
 
-    # FIX:
-    # global must appear BEFORE the first use of DAYS
     global DAYS
 
     parser = argparse.ArgumentParser()
@@ -1207,6 +1505,14 @@ def main():
     )
 
     print(
+        f"Warmup       : {WARMUP_DAYS} days"
+    )
+
+    print(
+        "Data         : LBank via CCXT"
+    )
+
+    print(
         "Timeframes   : 1H + CLOSED 4H"
     )
 
@@ -1224,6 +1530,12 @@ def main():
 
     print("=" * 75)
 
+    # ========================================================
+    # CONNECT TO LBANK
+    # ========================================================
+
+    load_lbank_markets()
+
     all_trades = []
 
     cache_dir = Path(
@@ -1233,6 +1545,10 @@ def main():
     cache_dir.mkdir(
         exist_ok=True
     )
+
+    # ========================================================
+    # SYMBOL LOOP
+    # ========================================================
 
     for index, symbol in enumerate(
         SYMBOLS,
@@ -1250,32 +1566,25 @@ def main():
                 / f"{symbol}_{DAYS}.csv"
             )
 
-            if cache_file.exists():
+            # =================================================
+            # TRY VALID CACHE
+            # =================================================
 
-                df = pd.read_csv(
-                    cache_file,
-                    parse_dates=[
-                        "timestamp"
-                    ]
-                )
+            df = load_valid_cache(
+                cache_file,
+                DAYS
+            )
 
-                df["timestamp"] = (
-                    pd.to_datetime(
-                        df["timestamp"],
-                        utc=True
-                    )
-                )
+            # =================================================
+            # DOWNLOAD IF CACHE INVALID/MISSING
+            # =================================================
 
-                df = df.set_index(
-                    "timestamp"
-                )
+            if df is None:
 
                 print(
-                    f"💾 Cache loaded: "
-                    f"{len(df)} candles"
+                    "📡 Downloading fresh "
+                    "LBank data..."
                 )
-
-            else:
 
                 df = download_lbank(
                     symbol,
@@ -1287,6 +1596,26 @@ def main():
                     index=False
                 )
 
+                print(
+                    f"💾 Cache saved: "
+                    f"{cache_file}"
+                )
+
+            # =================================================
+            # VALIDATE AGAIN
+            # =================================================
+
+            if len(df) < 250:
+
+                raise RuntimeError(
+                    f"Not enough candles for "
+                    f"backtest: {len(df)}"
+                )
+
+            # =================================================
+            # INDICATORS
+            # =================================================
+
             df = prepare_1h(
                 df
             )
@@ -1294,6 +1623,10 @@ def main():
             df = add_4h_context(
                 df
             )
+
+            # =================================================
+            # SIMULATION
+            # =================================================
 
             trades = simulate_symbol(
                 symbol,
@@ -1315,10 +1648,18 @@ def main():
                 f"❌ ERROR {symbol}: {e}"
             )
 
+    # ========================================================
+    # FINAL REPORT
+    # ========================================================
+
     report(
         all_trades
     )
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
