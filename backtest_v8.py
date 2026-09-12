@@ -32,10 +32,11 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته برای ستاپ شکار نقدینگی (Liquidity Sweep)")
+print("📥 دانلود داده‌های 1 ساعته و ساخت دیتای 4 ساعته همگام")
 print("============================================================")
 
 data_1h = {}
+data_4h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
     print(f"🔹 در حال دریافت دیتای {symbol}...")
@@ -59,49 +60,82 @@ for symbol, lbank_symbol in SYMBOLS.items():
         df1h = pd.DataFrame(all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
         df1h.set_index('Date', inplace=True)
+        
+        # ساخت کندل‌های 4 ساعته استاندارد برای تعیین روند کلان
+        df4h = df1h.resample('4H').agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last',
+            'Volume': 'sum'
+        }).dropna().reset_index()
+        
+        df1h.reset_index(inplace=True)
+        
         data_1h[symbol] = df1h
-        print(f"  ✔️ دیتای {symbol} آماده شد (تعداد کندل: {len(df1h)})")
+        data_4h[symbol] = df4h
+        print(f"  ✔️ دیتای {symbol} آماده شد (1 ساعته: {len(df1h)} کندل | 4 ساعته: {len(df4h)} کندل)")
+
+def calculate_indicators(df):
+    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+    return df
 
 def calculate_smart_money_indicators(df):
-    # کانال Donchian برای سقف و کف 24 ساعته (24 کندل گذشته)
     df['Highest_24'] = df['High'].shift(1).rolling(window=24).max()
     df['Lowest_24'] = df['Low'].shift(1).rolling(window=24).min()
     
-    # محاسبه ATR برای حد سود و ضرر پویا
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
-    
-    # میانگین حجم برای تشخیص حجم نهادی
     df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست هوشمند (شکار نقدینگی + ATR پویا + ریسک به ریوارد 1:2)")
+print("🚀 اجرای موتور بک‌تست هوشمند (روند 4H + شکار نقدینگی + ATR پویا)")
 print("============================================================")
 
 all_portfolio_trades = []
 
-for symbol, df1h in data_1h.items():
-    if len(df1h) < 100:
+for symbol in SYMBOLS.keys():
+    if symbol not in data_1h or symbol not in data_4h:
+        continue
+        
+    df1h = data_1h[symbol].copy()
+    df4h = data_4h[symbol].copy()
+    
+    if len(df1h) < 300 or len(df4h) < 100:
         continue
         
     df1h = calculate_smart_money_indicators(df1h)
+    df4h = calculate_indicators(df4h)
+    
+    df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
+    df4h_indexed = df4h.set_index('Date')
+    
     locked_until_index = 0
     
-    for i in range(50, len(df1h) - 20):
-        # بررسی قفل پوزیشن و بافر پس از تسویه
+    for i in range(250, len(df1h) - 20):
         if i < locked_until_index:
             continue
             
         c1h = df1h.iloc[i]
+        t4h_time = c1h['Date_4H']
+        
+        if t4h_time not in df4h_indexed.index:
+            continue
+            
+        r4h = df4h_indexed.loc[t4h_time]
+        
+        # تشخیص روند کلان در تایم‌فریم 4 ساعته با EMA 200
+        is_bullish_macro = r4h['Close'] > r4h['EMA_200']
+        is_bearish_macro = r4h['Close'] < r4h['EMA_200']
+        
         atr = c1h['ATR']
         vol_ma = c1h['Vol_MA']
         
-        # فیلتر پیش‌نیاز سلامت بازار (بررسی دسترس‌پذیری نوسان کافی)
-        if pd.isna(atr) or atr <= 0 or c1h['Volume'] < vol_ma * 1.4:
+        if pd.isna(atr) or atr <= 0 or c1h['Volume'] < vol_ma * 1.3:
             continue
             
         highest_24 = c1h['Highest_24']
@@ -110,26 +144,20 @@ for symbol, df1h in data_1h.items():
         if pd.isna(highest_24) or pd.isna(lowest_24):
             continue
             
-        # 1. ستاپ لانگ: شکار نقدینگی کف (قیمت پایین‌تر از کف 24 ساعته نفوذ کرده اما به داخل برگشته و بسته شده)
+        # شرایط ستاپ
         is_sweep_low = (c1h['Low'] < lowest_24) and (c1h['Close'] > lowest_24) and (c1h['Close'] > c1h['Open'])
-        
-        # 2. ستاپ شورت: شکار نقدینگی سقف (قیمت بالاتر از سقف 24 ساعته نفوذ کرده اما به داخل برگشته و بسته شده)
         is_sweep_high = (c1h['High'] > highest_24) and (c1h['Close'] < highest_24) and (c1h['Close'] < c1h['Open'])
         
-        if not is_sweep_low and not is_sweep_high:
-            continue
-            
-        if is_sweep_low:
-            # ورود در بازگشایی کندل بعدی (بدون نگاه به آینده)
+        # فیلتر حیاتی: تایید جهت با روند کلان 4 ساعته
+        if is_bullish_macro and is_sweep_low:
+            # فقط لانگ در روند صعودی
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            
-            # تعیین حد ضرر و حد سود پویا بر اساس ATR (ریسک به ریوارد دقیق 1 به 2)
             sl = entry_price - (1.5 * atr)
-            tp = entry_price + (3.0 * atr)  # دقیقاً دو برابر فاصله ریسک
+            tp = entry_price + (3.0 * atr)  # ریسک به ریوارد 1 به 2
             
             outcome = None
             exit_idx = entry_idx
@@ -138,7 +166,6 @@ for symbol, df1h in data_1h.items():
                 f_c = df1h.iloc[j]
                 exit_idx = j
                 
-                # محافظه‌کاری: بررسی اولویت حد ضرر در صورت هم‌پوشانی در یک کندل
                 if f_c['Low'] <= sl:
                     outcome = 'LOSS'
                     break
@@ -152,16 +179,15 @@ for symbol, df1h in data_1h.items():
                     'Side': 'LONG',
                     'Outcome': outcome
                 })
-                # قفل کردن ربات تا حداقل یک کندل بعد از تسویه کامل
                 locked_until_index = exit_idx + 1
                 
-        elif is_sweep_high:
+        elif is_bearish_macro and is_sweep_high:
+            # فقط شورت در روند نزولی
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            
             sl = entry_price + (1.5 * atr)
             tp = entry_price - (3.0 * atr)  # ریسک به ریوارد 1 به 2
             
@@ -188,7 +214,7 @@ for symbol, df1h in data_1h.items():
                 locked_until_index = exit_idx + 1
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی هوشمند (شکار نقدینگی + ATR پویا)")
+print("📊 گزارش نهایی پورتفوی همگام با روند کلان (Trend-Aligned Liquidity Sweep)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -210,4 +236,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با این شرایط ثبت نشد.")
 
-print("\n✨ پایان بک‌تست هوشمند.")
+print("\n✨ پایان بک‌تست.")
