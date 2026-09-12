@@ -13,7 +13,7 @@ except ImportError:
 import pandas as pd
 import numpy as np
 
-# اتصال به صرافی LBank با سبد 10 ارز مشخص‌شده
+# اتصال به صرافی LBank با سبد 10 ارز
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
     "BTC": "BTC/USDT",
@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته برای LBank")
+print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته استاندارد")
 print("============================================================")
 
 data_4h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_4h = f"{symbol}_4h_data.csv"
+    filename_4h = f"{symbol}_4h_clean_data.csv"
     print(f"🔹 در حال دریافت و پردازش دیتای {symbol}...")
     
     all_ohlcv = []
@@ -63,7 +63,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
         df1h.set_index('Date', inplace=True)
         
-        # تبدیل دیتای 1 ساعته به 4 ساعته استاندارد
+        # ساخت کندل‌های 4 ساعته بدون نشت داده
         df4h = df1h.resample('4H').agg({
             'Open': 'first',
             'High': 'max',
@@ -83,20 +83,17 @@ def calculate_indicators(df):
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     
-    # محاسبه ATR برای سنجش نوسان و قابلیت تاچ شدن اهداف
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
-    df['ATR_Pct'] = df['ATR'] / df['Close'] # درصد نوسان واقعی قیمت
-    
-    # حجم میانگین
+    df['ATR_Pct'] = df['ATR'] / df['Close']
     df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست اختصاصی 4 ساعته (TP: 1% | SL: 0.5%)")
+print("🚀 اجرای موتور بک‌تست ایزوله (بدون همپوشانی و بدون نگاه به آینده)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -106,23 +103,25 @@ for symbol, df4h in data_4h.items():
         continue
         
     df4h = calculate_indicators(df4h)
+    
+    # متغیر قفل پوزیشن
     locked_until_index = 0
     
-    for i in range(200, len(df4h) - 15):
+    for i in range(200, len(df4h) - 10):
+        
+        # بررسی قفل بودن پوزیشن
         if i < locked_until_index:
             continue
             
         row = df4h.iloc[i]
         
-        # 1. فیلتر شرایط بازار و قابلیت تاچ (بررسی نوسان ATR و حجم معاملات)
-        # بررسی می‌کنیم که آیا نوسان بازار نه آنقدر مرده است که تاچ نشود و نه آنقدر هیجانی که اسلیپیج بالا دهد
+        # فیلتر نوسان و حجم برای اطمینان از قابلیت تاچ شدن اهداف
         atr_pct = row['ATR_Pct']
-        is_market_touchable = (0.003 <= atr_pct <= 0.03) and (row['Volume'] >= row['Vol_MA'] * 0.9)
+        is_market_touchable = (0.003 <= atr_pct <= 0.03) and (row['Volume'] >= row['Vol_MA'] * 0.8)
         
         if not is_market_touchable:
             continue
             
-        # 2. بررسی روند در تایم فریم 4 ساعته
         close = row['Close']
         ema20 = row['EMA_20']
         ema50 = row['EMA_50']
@@ -134,43 +133,46 @@ for symbol, df4h in data_4h.items():
         if not is_long_trend and not is_short_trend:
             continue
             
-        # تنظیمات دقیق ریسک به ریوارد (حد سود 1% و حد ضرر 0.5%)
+        # مدیریت ریسک ثابت: TP = 1% و SL = 0.5%
         if is_long_trend:
             entry_price = close
-            tp = entry_price * 1.01   # حد سود ثابت 1 درصد
-            sl = entry_price * 0.995  # حد ضرر ثابت 0.5 درصد
+            tp = entry_price * 1.01
+            sl = entry_price * 0.995
             
-            outcome = 'OPEN'
+            outcome = None
             exit_idx = i
-            # بررسی کندل‌های بعدی 4 ساعته برای چک کردن تاچ شدن TP یا SL
-            for j in range(i + 1, min(i + 15, len(df4h))):
+            
+            # بررسی کندل‌های آینده
+            for j in range(i + 1, len(df4h)):
                 future_candle = df4h.iloc[j]
                 exit_idx = j
                 
-                # اولویت چک کردن حد ضرر برای احتیاط بیشتر در بک‌تست
+                # اولویت با حد ضرر در صورت برخورد همزمان
                 if future_candle['Low'] <= sl:
                     outcome = 'LOSS'
                     break
                 elif future_candle['High'] >= tp:
                     outcome = 'WIN'
                     break
-                    
+            
             if outcome in ['WIN', 'LOSS']:
                 all_portfolio_trades.append({
                     'Symbol': symbol,
                     'Side': 'LONG',
                     'Outcome': outcome
                 })
-                locked_until_index = exit_idx
+                # قفل کردن کامل تا حداقل یک کندل بعد از تسویه معامله
+                locked_until_index = exit_idx + 1 
                 
         elif is_short_trend:
             entry_price = close
-            tp = entry_price * 0.99   # حد سود ثابت 1 درصد
-            sl = entry_price * 1.005  # حد ضرر ثابت 0.5 درصد
+            tp = entry_price * 0.99
+            sl = entry_price * 1.005
             
-            outcome = 'OPEN'
+            outcome = None
             exit_idx = i
-            for j in range(i + 1, min(i + 15, len(df4h))):
+            
+            for j in range(i + 1, len(df4h)):
                 future_candle = df4h.iloc[j]
                 exit_idx = j
                 
@@ -180,17 +182,17 @@ for symbol, df4h in data_4h.items():
                 elif future_candle['Low'] <= tp:
                     outcome = 'WIN'
                     break
-                    
+            
             if outcome in ['WIN', 'LOSS']:
                 all_portfolio_trades.append({
                     'Symbol': symbol,
                     'Side': 'SHORT',
                     'Outcome': outcome
                 })
-                locked_until_index = exit_idx
+                locked_until_index = exit_idx + 1
 
 print("\n============================================================")
-print("📊 گزارش نهایی بک‌تست پورتفوی 4 ساعته (TP: 1% و SL: 0.5%)")
+print("📊 گزارش نهایی پورتفوی 4 ساعته (کاملاً ایزوله)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -199,8 +201,6 @@ if all_portfolio_trades:
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
     portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    
-    # چون ریوارد 1 به 2 است (سود 1% در برابر ضرر 0.5%): ضریب امتیاز برد 2 است
     net_profit_score = (total_wins * 2.0) - total_losses
     
     print(f"🔸 تعداد کل معاملات پورتفوی: {total_trades}")
@@ -212,6 +212,6 @@ if all_portfolio_trades:
     print("\nتفکیک عملکرد به تفکیک هر نماد:")
     print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
 else:
-    print("⚠️ هیچ معامله‌ای با این شرایط ثبت نشد.")
+    print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ پایان بک‌تست اختصاصی 4 ساعته.")
+print("\n✨ پایان بک‌تست.")
