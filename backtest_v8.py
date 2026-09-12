@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های بازار از صرافی ال‌بنک برای استراتژی HUNTER-X PRO")
+print("📥 دانلود داده‌ها از صرافی ال‌بنک برای نسخه پیشرفته HUNTER-X PRO V9")
 print("============================================================")
 
 data_1h = {}
@@ -95,11 +95,11 @@ def calculate_indicators(df):
     df['ATR'] = tr.rolling(window=14).mean()
     df['Vol_MA'] = df['Volume'].rolling(window=20).mean()
     
-    # Donchian Channel 20 (جلوگیری از نگاه به آینده با shift)
+    # Donchian Channel 20 (بدون نگاه به آینده)
     df['Donchian_High'] = df['High'].rolling(window=20).max().shift(1)
     df['Donchian_Low'] = df['Low'].rolling(window=20).min().shift(1)
     
-    # ADX 14 محاسبات استاندارد
+    # ADX 14
     plus_dm = df['High'].diff()
     minus_dm = df['Low'].diff()
     plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
@@ -113,7 +113,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست استراتژی HUNTER-X PRO بدون نگاه به آینده")
+print("🚀 اجرای موتور بک‌تست هوشمند HUNTER-X PRO V9 (سیستم امتیازدهی + ریسک‌فری)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -147,38 +147,61 @@ for symbol in SYMBOLS.keys():
             continue
             
         r4h = df4h_indexed.loc[t4h_time]
-        
-        # شرایط 4H
-        long_4h = (r4h['EMA_50'] > r4h['EMA_200']) and (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_50_Slope'] > 0) and (r4h['ADX'] > 20) and (r4h['RSI'] > 52)
-        short_4h = (r4h['EMA_50'] < r4h['EMA_200']) and (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_50_Slope'] < 0) and (r4h['ADX'] > 20) and (r4h['RSI'] < 48)
-        
         atr = c1h['ATR']
         vol_ma = c1h['Vol_MA']
         
         if pd.isna(atr) or atr <= 0:
             continue
             
-        # بررسی حجم و کندل Displacement
-        vol_expansion = c1h['Volume'] >= (1.2 * vol_ma)
+        # سیستم امتیازدهی 6 گانه (حداقل 4 امتیاز برای تایید ورود)
+        score_long = 0
+        score_short = 0
+        
+        # 1. امتیاز روند 4H
+        if (r4h['EMA_50'] > r4h['EMA_200']) and (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_50_Slope'] > 0):
+            score_long += 1
+        if (r4h['EMA_50'] < r4h['EMA_200']) and (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_50_Slope'] < 0):
+            score_short += 1
+            
+        # 2. امتیاز قدرت ADX 4H
+        if r4h['ADX'] > 20:
+            score_long += 1
+            score_short += 1
+            
+        # 3. امتیاز مومنتوم RSI 4H
+        if r4h['RSI'] > 52:
+            score_long += 1
+        if r4h['RSI'] < 48:
+            score_short += 1
+            
+        # 4. امتیاز شکست Donchian روی 1H
+        is_donchian_long = c1h['Close'] > c1h['Donchian_High']
+        is_donchian_short = c1h['Close'] < c1h['Donchian_Low']
+        if is_donchian_long:
+            score_long += 1
+        if is_donchian_short:
+            score_short += 1
+            
+        # 5. امتیاز انبساط حجم (Volume Expansion)
+        if c1h['Volume'] >= (1.2 * vol_ma):
+            score_long += 1
+            score_short += 1
+            
+        # 6. امتیاز کندل Displacement (قدرت کندل)
         body_size = abs(c1h['Close'] - c1h['Open'])
         candle_range = c1h['High'] - c1h['Low']
-        displacement = (candle_range > 0) and ((body_size / candle_range) > 0.55) and (candle_range > (atr * 0.8))
-        
-        if not (vol_expansion and displacement):
-            continue
+        is_displacement = (candle_range > 0) and ((body_size / candle_range) > 0.55) and (candle_range > (atr * 0.8))
+        if is_displacement:
+            score_long += 1
+            score_short += 1
             
-        # بررسی شکست Donchian روی 1H
-        is_donchian_long_breakout = c1h['Close'] > c1h['Donchian_High']
-        is_donchian_short_breakout = c1h['Close'] < c1h['Donchian_Low']
-        
-        # اجرای لانگ
-        if long_4h and is_donchian_long_breakout:
-            entry_idx = i + 1  # ورود در اوپن کندل بعدی (بدون نگاه به آینده)
+        # اجرای لانگ (حداقل 4 امتیاز از 6)
+        if score_long >= 4:
+            entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
                 
             entry_price = df1h.iloc[entry_idx]['Open']
-            # استاپ بر اساس ساختار (کف ۵ کندل اخیر) + بافر ATR
             recent_low = df1h['Low'].iloc[max(0, i-5):i+1].min()
             sl = recent_low - (0.2 * atr)
             risk = entry_price - sl
@@ -186,7 +209,9 @@ for symbol in SYMBOLS.keys():
                 risk = 1.0 * atr
                 sl = entry_price - risk
                 
-            tp = entry_price + (2.0 * risk)  # ریسک به ریوارد 1 به 2
+            tp = entry_price + (2.0 * risk)
+            half_way = entry_price + (1.0 * risk) # نقطه 50 درصدی برای ریسک‌فری
+            is_risk_free = False
             
             outcome = None
             exit_idx = entry_idx
@@ -195,23 +220,28 @@ for symbol in SYMBOLS.keys():
                 f_c = df1h.iloc[j]
                 exit_idx = j
                 
+                # فعال‌سازی ریسک‌فری در نصف مسیر
+                if not is_risk_free and f_c['High'] >= half_way:
+                    sl = entry_price
+                    is_risk_free = True
+                
                 if f_c['Low'] <= sl:
-                    outcome = 'LOSS'
+                    outcome = 'BE' if is_risk_free else 'LOSS'
                     break
                 elif f_c['High'] >= tp:
                     outcome = 'WIN'
                     break
                     
-            if outcome in ['WIN', 'LOSS']:
+            if outcome in ['WIN', 'LOSS', 'BE']:
                 all_portfolio_trades.append({
                     'Symbol': symbol,
                     'Side': 'LONG',
                     'Outcome': outcome
                 })
-                locked_until_index = exit_idx + 2  # قفل بودن همپوشانی
+                locked_until_index = exit_idx + 2
                 
-        # اجرای شورت
-        elif short_4h and is_donchian_short_breakout:
+        # اجرای شورت (حداقل 4 امتیاز از 6)
+        elif score_short >= 4:
             entry_idx = i + 1
             if entry_idx >= len(df1h):
                 break
@@ -225,6 +255,8 @@ for symbol in SYMBOLS.keys():
                 sl = entry_price + risk
                 
             tp = entry_price - (2.0 * risk)
+            half_way = entry_price - (1.0 * risk)
+            is_risk_free = False
             
             outcome = None
             exit_idx = entry_idx
@@ -233,14 +265,18 @@ for symbol in SYMBOLS.keys():
                 f_c = df1h.iloc[j]
                 exit_idx = j
                 
+                if not is_risk_free and f_c['Low'] <= half_way:
+                    sl = entry_price
+                    is_risk_free = True
+                
                 if f_c['High'] >= sl:
-                    outcome = 'LOSS'
+                    outcome = 'BE' if is_risk_free else 'LOSS'
                     break
                 elif f_c['Low'] <= tp:
                     outcome = 'WIN'
                     break
                     
-            if outcome in ['WIN', 'LOSS']:
+            if outcome in ['WIN', 'LOSS', 'BE']:
                 all_portfolio_trades.append({
                     'Symbol': symbol,
                     'Side': 'SHORT',
@@ -249,7 +285,7 @@ for symbol in SYMBOLS.keys():
                 locked_until_index = exit_idx + 2
 
 print("\n============================================================")
-print("📊 گزارش نهایی عملکرد پورتفوی ستاپ HUNTER-X PRO")
+print("📊 گزارش نهایی پورتفوی ستاپ HUNTER-X PRO V9 (امتیازدهی + ریسک‌فری)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -257,17 +293,20 @@ if all_portfolio_trades:
     total_trades = len(pf_df)
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
+    total_be = len(pf_df[pf_df['Outcome'] == 'BE'])
     
-    win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
+    active_trades = total_wins + total_losses
+    win_rate = (total_wins / active_trades) * 100 if active_trades > 0 else 0
     
     print(f"🔸 تعداد کل معاملات پورتفوی: {total_trades}")
     print(f"🔸 معاملات برنده (WIN): {total_wins}")
+    print(f"🔸 معاملات سر به سر (BE): {total_be}")
     print(f"🔸 معاملات بازنده (LOSS): {total_losses}")
-    print(f"🎯 **وین‌ریت کلی:** {win_rate:.2f}%")
+    print(f"🎯 **وین‌ریت واقعی موثر:** {win_rate:.2f}%")
     
     print("\nتفکیک عملکرد به تفکیک هر نماد:")
     print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
 else:
-    print("⚠️ هیچ معامله‌ای با این شرایط سخت‌گیرانه ثبت نشد.")
+    print("⚠️ هیچ معامله‌ای با این شرایط ثبت نشد.")
 
-print("\n✨ پایان بک‌تست.")
+print("\n✨ پایان بک‌تست V9.")
