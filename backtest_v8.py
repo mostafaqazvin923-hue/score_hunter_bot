@@ -17,7 +17,6 @@ import numpy as np
 
 # تعریف استراتژی حرفه‌ای با Backtesting.py
 class HunterXStrategy(Strategy):
-    # پارامترهای قابل بهینه‌سازی
     fast_period = 50
     slow_period = 200
     risk_reward = 2.5
@@ -84,7 +83,7 @@ df.drop(columns=['Timestamp'], inplace=True)
 # پاکسازی مقادیر خالی احتمالی
 df.dropna(inplace=True)
 
-print(f"✔️ {len( کندل‌ها = len(df))} کندل ۱ ساعته دریافت شد.")
+print(f"✔️ {len(df)} کندل ۱ ساعته دریافت شد.")
 print("🚀 در حال اجرای موتور محاسباتی Backtesting.py...")
 
 # تنظیمات بک‌تست (سرمایه اولیه 10,000 دلار، کمیسیون استاندارد 0.1 درصد)
