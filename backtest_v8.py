@@ -1,46 +1,59 @@
-import os
-import subprocess
-import sys
-from datetime import datetime, timedelta, timezone
+# ============================================================
+# HUNTER-X 1% 2R — CLEAN LBank 1 YEAR BACKTEST
+# ============================================================
+#
+# هدف:
+#   TP = +1%
+#   SL = -0.50%
+#   RR  = 1:2
+#
+# تایم‌فریم:
+#   1H Entry
+#   4H Trend Filter
+#
+# ویژگی‌های مهم:
+#   - NO LOOKAHEAD
+#   - فقط کندل‌های کاملاً بسته
+#   - Entry در Open کندل بعدی
+#   - بدون Break-Even
+#   - بدون Trailing
+#   - بدون معامله همزمان در Portfolio
+#   - Same Candle TP/SL => SL first (محافظه‌کارانه)
+#   - Timeout جداگانه
+# ============================================================
 
+import os
+import sys
+import subprocess
+import warnings
+from datetime import datetime, timedelta
+
+warnings.filterwarnings("ignore")
+
+# ------------------------------------------------------------
+# Install dependencies
+# ------------------------------------------------------------
 try:
     import ccxt
 except ImportError:
-    print("📦 Installing ccxt...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "ccxt"
+    ])
     import ccxt
 
-import pandas as pd
-import numpy as np
+try:
+    import pandas as pd
+    import numpy as np
+except ImportError:
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "pandas", "numpy"
+    ])
+    import pandas as pd
+    import numpy as np
 
 
 # ============================================================
-# HUNTER-1% v1 — CLEAN LBank 1 YEAR BACKTEST
-#
-# TP = +1.00%
-# SL = -0.50%
-# RR = 1:2
-#
-# TIMEFRAMES:
-# 4H = trend
-# 1H = setup / breakout / retest / entry
-#
-# ANTI LOOK-AHEAD:
-# - فقط 4H بسته‌شده قبلی
-# - breakout فقط با کندل‌های قبلی
-# - retest فقط بعد از breakout
-# - ورود در OPEN کندل بعدی
-# - TP/SL فقط از کندل ورود به بعد
-# - کندل جاری حذف شده
-#
-# OVERLAP:
-# - قفل کامل پوزیشن
-# - فقط یک معامله همزمان در کل پورتفولیو
-# ============================================================
-
-
-# ============================================================
-# CONFIG
+# SETTINGS
 # ============================================================
 
 SYMBOLS = {
@@ -48,196 +61,117 @@ SYMBOLS = {
     "ETH": "ETH/USDT",
     "SOL": "SOL/USDT",
     "XRP": "XRP/USDT",
+    "ADA": "ADA/USDT",
+    "AVAX": "AVAX/USDT",
     "LINK": "LINK/USDT",
+    "NEAR": "NEAR/USDT",
+    "SUI": "SUI/USDT",
+    "DOT": "DOT/USDT",
 }
 
 TIMEFRAME = "1h"
 
-# ------------------------------------------------------------
-# TP / SL
-# ------------------------------------------------------------
+TEST_DAYS = 365
+WARMUP_DAYS = 100
 
-TP_PCT = 0.0100       # +1%
-SL_PCT = 0.0050       # -0.5%
+TP_PCT = 0.0100
+SL_PCT = 0.0050
 
 RR = TP_PCT / SL_PCT
 
+MAX_HOLD_BARS = 24
 
 # ------------------------------------------------------------
-# Indicators
+# Fees
+# ------------------------------------------------------------
+# فقط Fee را در P/L کم می‌کنیم.
+# Slippage مستقیماً در قیمت Entry/Exit اعمال می‌شود.
+# بنابراین Double Count نداریم.
 # ------------------------------------------------------------
 
-EMA_FAST = 20
-EMA_MID = 50
-EMA_SLOW = 200
-
-RSI_LENGTH = 14
-ADX_LENGTH = 14
-ATR_LENGTH = 14
-
-VOLUME_MA_LENGTH = 20
-
-
-# ------------------------------------------------------------
-# Breakout
-# ------------------------------------------------------------
-
-BREAKOUT_LOOKBACK = 20
-
-BREAKOUT_BODY_MIN = 0.55
-
-VOLUME_MULTIPLIER = 1.10
-
-
-# ------------------------------------------------------------
-# Retest
-# ------------------------------------------------------------
-
-RETEST_TOLERANCE = 0.0015      # 0.15%
-
-MAX_RETEST_BARS = 6
-
-
-# ------------------------------------------------------------
-# Volatility
-# ------------------------------------------------------------
-
-MAX_ATR_PERCENT = 0.0075       # 0.75%
-
-
-# ------------------------------------------------------------
-# Score
-# ------------------------------------------------------------
-
-MIN_SCORE = 8
-
-
-# ------------------------------------------------------------
-# Cooldown
-# ------------------------------------------------------------
-
-COOLDOWN_BARS = 3
-
-
-# ------------------------------------------------------------
-# Maximum holding time
-# ------------------------------------------------------------
-
-MAX_HOLDING_BARS = 12
-
-
-# ------------------------------------------------------------
-# Trading costs
-# ------------------------------------------------------------
-
-# LBank Futures taker fee example
 TAKER_FEE = 0.0006
-
-# Assumed slippage
 SLIPPAGE = 0.0002
-
-ROUND_TRIP_COST = 2 * (TAKER_FEE + SLIPPAGE)
-
-
-# If TP and SL happen inside the SAME candle,
-# assume SL happened first.
-CONSERVATIVE_SAME_CANDLE = True
 
 
 # ============================================================
-# LBank CONNECTION
+# LBank
 # ============================================================
 
 exchange = ccxt.lbank({
-    "enableRateLimit": True
+    "enableRateLimit": True,
 })
 
 exchange.load_markets()
 
 
 # ============================================================
-# RSI
+# INDICATORS
 # ============================================================
 
-def calculate_rsi(close, length=14):
+def ema(series, period):
+    return series.ewm(
+        span=period,
+        adjust=False,
+        min_periods=period
+    ).mean()
 
-    delta = close.diff()
+
+def rsi(series, period=14):
+
+    delta = series.diff()
 
     gain = delta.clip(lower=0)
-
     loss = -delta.clip(upper=0)
 
     avg_gain = gain.ewm(
-        alpha=1 / length,
+        alpha=1 / period,
         adjust=False,
-        min_periods=length
+        min_periods=period
     ).mean()
 
     avg_loss = loss.ewm(
-        alpha=1 / length,
+        alpha=1 / period,
         adjust=False,
-        min_periods=length
+        min_periods=period
     ).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
 
-    rsi = 100 - (100 / (1 + rs))
+    result = 100 - (100 / (1 + rs))
 
-    rsi = rsi.where(
-        ~((avg_loss == 0) & (avg_gain > 0)),
-        100
-    )
-
-    rsi = rsi.where(
-        ~((avg_gain == 0) & (avg_loss > 0)),
-        0
-    )
-
-    return rsi
+    return result
 
 
-# ============================================================
-# ATR
-# ============================================================
+def atr(df, period=14):
 
-def calculate_atr(df, length=14):
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
 
-    previous_close = df["Close"].shift(1)
+    prev_close = close.shift(1)
 
-    tr1 = df["High"] - df["Low"]
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
 
-    tr2 = (df["High"] - previous_close).abs()
-
-    tr3 = (df["Low"] - previous_close).abs()
-
-    true_range = pd.concat(
+    tr = pd.concat(
         [tr1, tr2, tr3],
         axis=1
     ).max(axis=1)
 
-    atr = true_range.ewm(
-        alpha=1 / length,
+    return tr.ewm(
+        alpha=1 / period,
         adjust=False,
-        min_periods=length
+        min_periods=period
     ).mean()
 
-    return atr
 
-
-# ============================================================
-# ADX
-# ============================================================
-
-def calculate_adx(df, length=14):
+def adx(df, period=14):
 
     high = df["High"]
-
     low = df["Low"]
 
-    close = df["Close"]
-
     up_move = high.diff()
-
     down_move = -low.diff()
 
     plus_dm = pd.Series(
@@ -260,138 +194,64 @@ def calculate_adx(df, length=14):
         index=df.index
     )
 
-    previous_close = close.shift(1)
-
-    tr = pd.concat(
-        [
-            high - low,
-            (high - previous_close).abs(),
-            (low - previous_close).abs()
-        ],
-        axis=1
-    ).max(axis=1)
-
-    atr = tr.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length
-    ).mean()
+    atr_value = atr(df, period)
 
     plus_di = (
         100 *
         plus_dm.ewm(
-            alpha=1 / length,
+            alpha=1 / period,
             adjust=False,
-            min_periods=length
+            min_periods=period
         ).mean()
-        /
-        atr.replace(0, np.nan)
+        / atr_value
     )
 
     minus_di = (
         100 *
         minus_dm.ewm(
-            alpha=1 / length,
+            alpha=1 / period,
             adjust=False,
-            min_periods=length
+            min_periods=period
         ).mean()
-        /
-        atr.replace(0, np.nan)
+        / atr_value
     )
+
+    denominator = (plus_di + minus_di).replace(0, np.nan)
 
     dx = (
         100 *
         (plus_di - minus_di).abs()
-        /
-        (plus_di + minus_di).replace(0, np.nan)
+        / denominator
     )
 
-    adx = dx.ewm(
-        alpha=1 / length,
+    return dx.ewm(
+        alpha=1 / period,
         adjust=False,
-        min_periods=length
+        min_periods=period
     ).mean()
-
-    return adx
 
 
 # ============================================================
-# INDICATORS
+# DOWNLOAD LBank 1H DATA
 # ============================================================
 
-def add_indicators(df):
+def download_lbank(symbol, days=465):
 
-    df = df.copy()
+    print(f"\n📥 Downloading {symbol} ...")
 
-    df["EMA20"] = df["Close"].ewm(
-        span=EMA_FAST,
-        adjust=False,
-        min_periods=EMA_FAST
-    ).mean()
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(days=days)
 
-    df["EMA50"] = df["Close"].ewm(
-        span=EMA_MID,
-        adjust=False,
-        min_periods=EMA_MID
-    ).mean()
+    since = int(start_time.timestamp() * 1000)
 
-    df["EMA200"] = df["Close"].ewm(
-        span=EMA_SLOW,
-        adjust=False,
-        min_periods=EMA_SLOW
-    ).mean()
+    all_ohlcv = []
 
-    df["RSI"] = calculate_rsi(
-        df["Close"],
-        RSI_LENGTH
-    )
-
-    df["ATR"] = calculate_atr(
-        df,
-        ATR_LENGTH
-    )
-
-    df["ADX"] = calculate_adx(
-        df,
-        ADX_LENGTH
-    )
-
-    df["Volume_MA"] = df["Volume"].rolling(
-        VOLUME_MA_LENGTH,
-        min_periods=VOLUME_MA_LENGTH
-    ).mean()
-
-    return df
-
-
-# ============================================================
-# DOWNLOAD LBank DATA
-# ============================================================
-
-def download_data(symbol):
-
-    print(f"\n📥 Downloading {symbol} from LBank...")
-
-    now_ms = exchange.milliseconds()
-
-    # 20 extra days for indicator warm-up
-    start_date = (
-        datetime.now(timezone.utc)
-        - timedelta(days=385)
-    )
-
-    since = int(
-        start_date.timestamp() * 1000
-    )
-
-    all_data = []
-
-    while since < now_ms:
+    while True:
 
         try:
 
-            candles = exchange.fetch_ohlcv(
-                SYMBOLS[symbol],
+            ohlcv = exchange.fetch_ohlcv(
+                symbol,
                 timeframe="1h",
                 since=since,
                 limit=1000
@@ -399,40 +259,38 @@ def download_data(symbol):
 
         except Exception as e:
 
-            print(
-                f"\n⚠️ Error downloading {symbol}: {e}"
-            )
-
+            print(f"❌ Error downloading {symbol}: {e}")
             break
 
-        if not candles:
+        if not ohlcv:
             break
 
-        all_data.extend(candles)
-
-        last_timestamp = candles[-1][0]
-
-        next_since = last_timestamp + 1
-
-        if next_since <= since:
-            break
-
-        since = next_since
+        all_ohlcv.extend(ohlcv)
 
         print(
-            f"   Candles downloaded: "
-            f"{len(all_data):,}",
-            end="\r"
+            f"\r   Candles downloaded: {len(all_ohlcv)}",
+            end=""
         )
 
-        if len(candles) < 1000:
+        last_timestamp = ohlcv[-1][0]
+
+        new_since = last_timestamp + 1
+
+        if new_since <= since:
             break
 
-    if not all_data:
+        since = new_since
+
+        if len(ohlcv) < 1000:
+            break
+
+    print()
+
+    if not all_ohlcv:
         return None
 
     df = pd.DataFrame(
-        all_data,
+        all_ohlcv,
         columns=[
             "Timestamp",
             "Open",
@@ -443,2004 +301,1111 @@ def download_data(symbol):
         ]
     )
 
-    # Remove duplicates
-    df = df.drop_duplicates(
-        subset="Timestamp"
-    )
-
-    df = df.sort_values(
-        "Timestamp"
-    )
-
-    df["Date"] = pd.to_datetime(
+    df["Timestamp"] = pd.to_datetime(
         df["Timestamp"],
         unit="ms",
         utc=True
     )
 
-    df = df.set_index("Date")
-
-    # --------------------------------------------------------
-    # REMOVE CURRENTLY FORMING CANDLE
-    # --------------------------------------------------------
-
-    current_hour = pd.Timestamp.now(
-        tz="UTC"
-    ).floor("h")
-
-    df = df[
-        df.index < current_hour
-    ]
-
-    print(
-        f"\n✔️ {symbol}: "
-        f"{len(df):,} CLOSED 1H candles"
+    df = df.drop_duplicates(
+        subset=["Timestamp"]
     )
+
+    df = df.sort_values("Timestamp")
+
+    df = df.set_index("Timestamp")
+
+    # Remove current unfinished 1H candle
+    now = pd.Timestamp.now(tz="UTC")
+
+    current_hour = now.floor("h")
+
+    df = df[df.index < current_hour]
 
     return df
 
 
 # ============================================================
-# BUILD 4H
+# 4H DATA
 # ============================================================
 
-def build_4h(df1h):
+def prepare_4h(df):
 
-    df4h = df1h.resample(
-        "4h",
-        label="left",
-        closed="left"
-    ).agg({
-
+    df4 = df.resample("4h").agg({
         "Open": "first",
-
         "High": "max",
-
         "Low": "min",
-
         "Close": "last",
-
         "Volume": "sum"
+    })
 
-    }).dropna()
+    df4 = df4.dropna()
 
-    df4h = add_indicators(
-        df4h
-    )
+    # Indicators
+    df4["EMA20"] = ema(df4["Close"], 20)
+    df4["EMA50"] = ema(df4["Close"], 50)
+    df4["EMA200"] = ema(df4["Close"], 200)
 
-    return df4h
+    df4["RSI"] = rsi(df4["Close"], 14)
+    df4["ATR"] = atr(df4, 14)
+    df4["ADX"] = adx(df4, 14)
+
+    return df4
 
 
 # ============================================================
-# ATTACH PREVIOUS CLOSED 4H
+# MAP PREVIOUS CLOSED 4H TO EACH 1H CANDLE
 # ============================================================
 
-def attach_previous_4h(
-    df1h,
-    df4h
-):
+def attach_4h(df1, df4):
 
-    df = df1h.copy()
+    htf = df4.copy()
 
-    # VERY IMPORTANT
-    #
-    # At 12:00 the 12-16 4H candle has just started.
-    # Therefore it CANNOT be used.
-    #
-    # We always use the PREVIOUS completed 4H candle.
+    # IMPORTANT:
+    # At 1H candle X we use the PREVIOUS completed 4H candle.
+    htf["HTF_TIME"] = htf.index
 
-    df["4H_Time"] = (
-        df.index.floor("4h")
-        - pd.Timedelta(hours=4)
-    )
+    htf = htf.rename(columns={
+        "Close": "HTF_Close",
+        "EMA20": "HTF_EMA20",
+        "EMA50": "HTF_EMA50",
+        "EMA200": "HTF_EMA200",
+        "RSI": "HTF_RSI",
+        "ADX": "HTF_ADX",
+        "ATR": "HTF_ATR"
+    })
 
-    htf = df4h[
+    htf = htf[
         [
-            "EMA20",
-            "EMA50",
-            "EMA200",
-            "RSI",
-            "ADX",
-            "Close"
-        ]
-    ].copy()
-
-    htf = htf.rename(
-        columns={
-            "EMA20": "HTF_EMA20",
-            "EMA50": "HTF_EMA50",
-            "EMA200": "HTF_EMA200",
-            "RSI": "HTF_RSI",
-            "ADX": "HTF_ADX",
-            "Close": "HTF_Close"
-        }
-    )
-
-    df = df.join(
-        htf,
-        on="4H_Time"
-    )
-
-    return df
-
-
-# ============================================================
-# PREPARE 1H DATA
-# ============================================================
-
-def prepare_1h(df):
-
-    df = add_indicators(df)
-
-    # --------------------------------------------------------
-    # CRITICAL:
-    #
-    # shift(1) means the current candle is NEVER included
-    # when calculating breakout levels.
-    # --------------------------------------------------------
-
-    df["Previous20High"] = (
-        df["High"]
-        .shift(1)
-        .rolling(
-            BREAKOUT_LOOKBACK,
-            min_periods=BREAKOUT_LOOKBACK
-        )
-        .max()
-    )
-
-    df["Previous20Low"] = (
-        df["Low"]
-        .shift(1)
-        .rolling(
-            BREAKOUT_LOOKBACK,
-            min_periods=BREAKOUT_LOOKBACK
-        )
-        .min()
-    )
-
-    df["CandleRange"] = (
-        df["High"] -
-        df["Low"]
-    )
-
-    df["Body"] = (
-        df["Close"] -
-        df["Open"]
-    ).abs()
-
-    df["BodyRatio"] = np.where(
-        df["CandleRange"] > 0,
-
-        df["Body"] /
-        df["CandleRange"],
-
-        0
-    )
-
-    df["ATR_Pct"] = (
-        df["ATR"] /
-        df["Close"]
-    )
-
-    return df
-
-
-# ============================================================
-# LONG SCORE
-# ============================================================
-
-def calculate_long_score(row):
-
-    score = 0
-
-    # 4H close above EMA20
-    if row["HTF_Close"] > row["HTF_EMA20"]:
-        score += 1
-
-    # EMA structure
-    if (
-        row["HTF_EMA20"] >
-        row["HTF_EMA50"] >
-        row["HTF_EMA200"]
-    ):
-        score += 2
-
-    # RSI
-    if row["HTF_RSI"] > 52:
-        score += 1
-
-    # Strong trend
-    if row["HTF_ADX"] > 25:
-        score += 1
-
-    # 1H ADX
-    if row["ADX"] > 20:
-        score += 1
-
-    # Breakout candle
-    if row["BodyRatio"] >= BREAKOUT_BODY_MIN:
-        score += 2
-
-    # Retest confirmation
-    if row["RetestConfirmed"]:
-        score += 2
-
-    # Volume
-    if (
-        row["Volume"] >
-        row["Volume_MA"] *
-        VOLUME_MULTIPLIER
-    ):
-        score += 1
-
-    return score
-
-
-# ============================================================
-# SHORT SCORE
-# ============================================================
-
-def calculate_short_score(row):
-
-    score = 0
-
-    # 4H close below EMA20
-    if row["HTF_Close"] < row["HTF_EMA20"]:
-        score += 1
-
-    # EMA structure
-    if (
-        row["HTF_EMA20"] <
-        row["HTF_EMA50"] <
-        row["HTF_EMA200"]
-    ):
-        score += 2
-
-    # RSI
-    if row["HTF_RSI"] < 48:
-        score += 1
-
-    # Strong trend
-    if row["HTF_ADX"] > 25:
-        score += 1
-
-    # 1H ADX
-    if row["ADX"] > 20:
-        score += 1
-
-    # Breakdown candle
-    if row["BodyRatio"] >= BREAKOUT_BODY_MIN:
-        score += 2
-
-    # Retest
-    if row["RetestConfirmed"]:
-        score += 2
-
-    # Volume
-    if (
-        row["Volume"] >
-        row["Volume_MA"] *
-        VOLUME_MULTIPLIER
-    ):
-        score += 1
-
-    return score
-
-
-# ============================================================
-# RESOLVE TRADE
-# ============================================================
-
-def resolve_trade(
-    df,
-    entry_index,
-    side,
-    entry_price,
-    sl,
-    tp
-):
-
-    last_index = min(
-        len(df) - 1,
-        entry_index + MAX_HOLDING_BARS
-    )
-
-    for j in range(
-        entry_index,
-        last_index + 1
-    ):
-
-        candle = df.iloc[j]
-
-        # ====================================================
-        # LONG
-        # ====================================================
-
-        if side == "LONG":
-
-            hit_sl = (
-                candle["Low"] <= sl
-            )
-
-            hit_tp = (
-                candle["High"] >= tp
-            )
-
-            # BOTH TP AND SL IN SAME CANDLE
-            if hit_sl and hit_tp:
-
-                if CONSERVATIVE_SAME_CANDLE:
-
-                    exit_price = (
-                        sl *
-                        (1 - SLIPPAGE)
-                    )
-
-                    return (
-                        j,
-                        exit_price,
-                        "LOSS"
-                    )
-
-                else:
-
-                    exit_price = (
-                        tp *
-                        (1 - SLIPPAGE)
-                    )
-
-                    return (
-                        j,
-                        exit_price,
-                        "WIN"
-                    )
-
-            # SL
-            if hit_sl:
-
-                exit_price = (
-                    sl *
-                    (1 - SLIPPAGE)
-                )
-
-                return (
-                    j,
-                    exit_price,
-                    "LOSS"
-                )
-
-            # TP
-            if hit_tp:
-
-                exit_price = (
-                    tp *
-                    (1 - SLIPPAGE)
-                )
-
-                return (
-                    j,
-                    exit_price,
-                    "WIN"
-                )
-
-        # ====================================================
-        # SHORT
-        # ====================================================
-
-        else:
-
-            hit_sl = (
-                candle["High"] >= sl
-            )
-
-            hit_tp = (
-                candle["Low"] <= tp
-            )
-
-            # BOTH TP AND SL
-            if hit_sl and hit_tp:
-
-                if CONSERVATIVE_SAME_CANDLE:
-
-                    exit_price = (
-                        sl *
-                        (1 + SLIPPAGE)
-                    )
-
-                    return (
-                        j,
-                        exit_price,
-                        "LOSS"
-                    )
-
-                else:
-
-                    exit_price = (
-                        tp *
-                        (1 + SLIPPAGE)
-                    )
-
-                    return (
-                        j,
-                        exit_price,
-                        "WIN"
-                    )
-
-            # SL
-            if hit_sl:
-
-                exit_price = (
-                    sl *
-                    (1 + SLIPPAGE)
-                )
-
-                return (
-                    j,
-                    exit_price,
-                    "LOSS"
-                )
-
-            # TP
-            if hit_tp:
-
-                exit_price = (
-                    tp *
-                    (1 + SLIPPAGE)
-                )
-
-                return (
-                    j,
-                    exit_price,
-                    "WIN"
-                )
-
-    # ========================================================
-    # TIMEOUT
-    # ========================================================
-
-    exit_idx = last_index
-
-    exit_price = df.iloc[
-        exit_idx
-    ]["Close"]
-
-    if side == "LONG":
-
-        pnl = (
-            exit_price -
-            entry_price
-        ) / entry_price
-
-    else:
-
-        pnl = (
-            entry_price -
-            exit_price
-        ) / entry_price
-
-    if pnl > 0:
-        outcome = "TIMEOUT_PROFIT"
-
-    elif pnl < 0:
-        outcome = "TIMEOUT_LOSS"
-
-    else:
-        outcome = "TIMEOUT_BE"
-
-    return (
-        exit_idx,
-        exit_price,
-        outcome
-    )
-
-
-# ============================================================
-# BACKTEST SINGLE SYMBOL
-# ============================================================
-
-def backtest_symbol(
-    symbol,
-    df
-):
-
-    trades = []
-
-    pending_breakout = None
-
-    i = 0
-
-    while i < len(df) - 1:
-
-        row = df.iloc[i]
-
-        # ====================================================
-        # PENDING BREAKOUT -> WAIT FOR RETEST
-        # ====================================================
-
-        if pending_breakout is not None:
-
-            bars_waiting = (
-                i -
-                pending_breakout[
-                    "breakout_index"
-                ]
-            )
-
-            # Retest took too long
-            if bars_waiting > MAX_RETEST_BARS:
-
-                pending_breakout = None
-
-                i += 1
-
-                continue
-
-            level = (
-                pending_breakout[
-                    "level"
-                ]
-            )
-
-            side = (
-                pending_breakout[
-                    "side"
-                ]
-            )
-
-            # =================================================
-            # LONG RETEST
-            # =================================================
-
-            if side == "LONG":
-
-                touched = (
-                    row["Low"]
-                    <=
-                    level *
-                    (
-                        1 +
-                        RETEST_TOLERANCE
-                    )
-                )
-
-                confirmed = (
-                    touched
-                    and
-                    row["Close"] > level
-                    and
-                    row["Close"] > row["Open"]
-                )
-
-                if confirmed:
-
-                    row = row.copy()
-
-                    row[
-                        "RetestConfirmed"
-                    ] = True
-
-                    score = (
-                        calculate_long_score(
-                            row
-                        )
-                    )
-
-                    valid = (
-
-                        score >= MIN_SCORE
-
-                        and
-                        row["ADX"] > 20
-
-                        and
-                        row["Volume"]
-                        >
-                        row["Volume_MA"]
-                        *
-                        VOLUME_MULTIPLIER
-
-                        and
-                        row["ATR_Pct"]
-                        <=
-                        MAX_ATR_PERCENT
-                    )
-
-                    if valid:
-
-                        entry_index = i + 1
-
-                        if entry_index >= len(df):
-
-                            break
-
-                        entry_candle = (
-                            df.iloc[
-                                entry_index
-                            ]
-                        )
-
-                        # ENTRY ONLY ON NEXT CANDLE OPEN
-                        raw_entry = (
-                            entry_candle["Open"]
-                        )
-
-                        entry_price = (
-                            raw_entry *
-                            (
-                                1 +
-                                SLIPPAGE
-                            )
-                        )
-
-                        tp = (
-                            entry_price *
-                            (
-                                1 +
-                                TP_PCT
-                            )
-                        )
-
-                        sl = (
-                            entry_price *
-                            (
-                                1 -
-                                SL_PCT
-                            )
-                        )
-
-                        (
-                            exit_index,
-                            exit_price,
-                            outcome
-                        ) = resolve_trade(
-
-                            df,
-
-                            entry_index,
-
-                            "LONG",
-
-                            entry_price,
-
-                            sl,
-
-                            tp
-                        )
-
-                        # -------------------------------------
-                        # Return
-                        # -------------------------------------
-
-                        gross_return = (
-                            exit_price -
-                            entry_price
-                        ) / entry_price
-
-                        net_return = (
-                            gross_return -
-                            ROUND_TRIP_COST
-                        )
-
-                        trades.append({
-
-                            "Symbol": symbol,
-
-                            "Side": "LONG",
-
-                            "BreakoutTime":
-                                pending_breakout[
-                                    "breakout_time"
-                                ],
-
-                            "SignalTime":
-                                row.name,
-
-                            "EntryTime":
-                                entry_candle.name,
-
-                            "ExitTime":
-                                df.iloc[
-                                    exit_index
-                                ].name,
-
-                            "Entry":
-                                entry_price,
-
-                            "Exit":
-                                exit_price,
-
-                            "TP":
-                                tp,
-
-                            "SL":
-                                sl,
-
-                            "Score":
-                                score,
-
-                            "Outcome":
-                                outcome,
-
-                            "GrossPct":
-                                gross_return *
-                                100,
-
-                            "NetPct":
-                                net_return *
-                                100,
-
-                            "BarsHeld":
-                                exit_index -
-                                entry_index
-                        })
-
-                        # =================================================
-                        # HARD LOCK
-                        #
-                        # Nothing can be evaluated while this trade
-                        # is open.
-                        # =================================================
-
-                        i = (
-                            exit_index +
-                            COOLDOWN_BARS +
-                            1
-                        )
-
-                        pending_breakout = None
-
-                        continue
-
-                    pending_breakout = None
-
-                    i += 1
-
-                    continue
-
-            # =================================================
-            # SHORT RETEST
-            # =================================================
-
-            else:
-
-                touched = (
-                    row["High"]
-                    >=
-                    level *
-                    (
-                        1 -
-                        RETEST_TOLERANCE
-                    )
-                )
-
-                confirmed = (
-                    touched
-                    and
-                    row["Close"] < level
-                    and
-                    row["Close"] < row["Open"]
-                )
-
-                if confirmed:
-
-                    row = row.copy()
-
-                    row[
-                        "RetestConfirmed"
-                    ] = True
-
-                    score = (
-                        calculate_short_score(
-                            row
-                        )
-                    )
-
-                    valid = (
-
-                        score >= MIN_SCORE
-
-                        and
-                        row["ADX"] > 20
-
-                        and
-                        row["Volume"]
-                        >
-                        row["Volume_MA"]
-                        *
-                        VOLUME_MULTIPLIER
-
-                        and
-                        row["ATR_Pct"]
-                        <=
-                        MAX_ATR_PERCENT
-                    )
-
-                    if valid:
-
-                        entry_index = i + 1
-
-                        if entry_index >= len(df):
-
-                            break
-
-                        entry_candle = (
-                            df.iloc[
-                                entry_index
-                            ]
-                        )
-
-                        # ENTRY NEXT CANDLE OPEN
-                        raw_entry = (
-                            entry_candle["Open"]
-                        )
-
-                        entry_price = (
-                            raw_entry *
-                            (
-                                1 -
-                                SLIPPAGE
-                            )
-                        )
-
-                        tp = (
-                            entry_price *
-                            (
-                                1 -
-                                TP_PCT
-                            )
-                        )
-
-                        sl = (
-                            entry_price *
-                            (
-                                1 +
-                                SL_PCT
-                            )
-                        )
-
-                        (
-                            exit_index,
-                            exit_price,
-                            outcome
-                        ) = resolve_trade(
-
-                            df,
-
-                            entry_index,
-
-                            "SHORT",
-
-                            entry_price,
-
-                            sl,
-
-                            tp
-                        )
-
-                        gross_return = (
-                            entry_price -
-                            exit_price
-                        ) / entry_price
-
-                        net_return = (
-                            gross_return -
-                            ROUND_TRIP_COST
-                        )
-
-                        trades.append({
-
-                            "Symbol": symbol,
-
-                            "Side": "SHORT",
-
-                            "BreakoutTime":
-                                pending_breakout[
-                                    "breakout_time"
-                                ],
-
-                            "SignalTime":
-                                row.name,
-
-                            "EntryTime":
-                                entry_candle.name,
-
-                            "ExitTime":
-                                df.iloc[
-                                    exit_index
-                                ].name,
-
-                            "Entry":
-                                entry_price,
-
-                            "Exit":
-                                exit_price,
-
-                            "TP":
-                                tp,
-
-                            "SL":
-                                sl,
-
-                            "Score":
-                                score,
-
-                            "Outcome":
-                                outcome,
-
-                            "GrossPct":
-                                gross_return *
-                                100,
-
-                            "NetPct":
-                                net_return *
-                                100,
-
-                            "BarsHeld":
-                                exit_index -
-                                entry_index
-                        })
-
-                        # HARD OVERLAP LOCK
-                        i = (
-                            exit_index +
-                            COOLDOWN_BARS +
-                            1
-                        )
-
-                        pending_breakout = None
-
-                        continue
-
-                    pending_breakout = None
-
-                    i += 1
-
-                    continue
-
-            i += 1
-
-            continue
-
-        # ====================================================
-        # NO PENDING BREAKOUT
-        # SEARCH NEW BREAKOUT
-        # ====================================================
-
-        needed = [
-
+            "HTF_Close",
             "HTF_EMA20",
             "HTF_EMA50",
             "HTF_EMA200",
             "HTF_RSI",
             "HTF_ADX",
-            "HTF_Close",
-
-            "ADX",
-            "ATR",
-            "Volume_MA",
-
-            "Previous20High",
-            "Previous20Low"
+            "HTF_ATR"
         ]
+    ]
 
-        if row[needed].isna().any():
+    # Shift by one completed 4H candle
+    htf = htf.shift(1)
+
+    # Map each 1H candle to its 4H bucket
+    df = df1.copy()
+
+    df["HTF_BUCKET"] = df.index.floor("4h")
+
+    htf.index.name = "HTF_BUCKET"
+
+    df = df.join(
+        htf,
+        on="HTF_BUCKET"
+    )
+
+    return df
+
+
+# ============================================================
+# PREPARE 1H INDICATORS
+# ============================================================
+
+def prepare_1h(df):
+
+    df = df.copy()
+
+    df["EMA20"] = ema(df["Close"], 20)
+    df["EMA50"] = ema(df["Close"], 50)
+
+    df["RSI"] = rsi(df["Close"], 14)
+    df["ATR"] = atr(df, 14)
+    df["ADX"] = adx(df, 14)
+
+    df["VOL_MA20"] = (
+        df["Volume"]
+        .rolling(20)
+        .mean()
+    )
+
+    # Previous 20 candles ONLY
+    df["PREV20_HIGH"] = (
+        df["High"]
+        .shift(1)
+        .rolling(20)
+        .max()
+    )
+
+    df["PREV20_LOW"] = (
+        df["Low"]
+        .shift(1)
+        .rolling(20)
+        .min()
+    )
+
+    df["RANGE"] = (
+        df["High"] - df["Low"]
+    )
+
+    df["BODY"] = (
+        df["Close"] - df["Open"]
+    ).abs()
+
+    df["BODY_RATIO"] = (
+        df["BODY"] /
+        df["RANGE"].replace(0, np.nan)
+    )
+
+    return df
+
+
+# ============================================================
+# SIGNAL ENGINE
+# ============================================================
+
+def get_signal(df, i):
+
+    row = df.iloc[i]
+
+    required = [
+        "HTF_Close",
+        "HTF_EMA20",
+        "HTF_EMA50",
+        "HTF_EMA200",
+        "HTF_RSI",
+        "HTF_ADX",
+        "EMA20",
+        "EMA50",
+        "RSI",
+        "ADX",
+        "ATR",
+        "VOL_MA20",
+        "PREV20_HIGH",
+        "PREV20_LOW",
+        "BODY_RATIO"
+    ]
+
+    for col in required:
+
+        if pd.isna(row[col]):
+            return None
+
+    close = row["Close"]
+
+    # --------------------------------------------------------
+    # HTF TREND
+    # --------------------------------------------------------
+
+    long_htf = (
+        row["HTF_EMA20"] >
+        row["HTF_EMA50"] >
+        row["HTF_EMA200"]
+        and
+        row["HTF_Close"] >
+        row["HTF_EMA20"]
+        and
+        row["HTF_RSI"] >= 50
+        and
+        row["HTF_ADX"] >= 15
+    )
+
+    short_htf = (
+        row["HTF_EMA20"] <
+        row["HTF_EMA50"] <
+        row["HTF_EMA200"]
+        and
+        row["HTF_Close"] <
+        row["HTF_EMA20"]
+        and
+        row["HTF_RSI"] <= 50
+        and
+        row["HTF_ADX"] >= 15
+    )
+
+    # --------------------------------------------------------
+    # 1H MOMENTUM
+    # --------------------------------------------------------
+
+    long_momentum = (
+        row["EMA20"] > row["EMA50"]
+        and
+        row["RSI"] >= 50
+        and
+        row["ADX"] >= 15
+    )
+
+    short_momentum = (
+        row["EMA20"] < row["EMA50"]
+        and
+        row["RSI"] <= 50
+        and
+        row["ADX"] >= 15
+    )
+
+    # --------------------------------------------------------
+    # BREAKOUT
+    # --------------------------------------------------------
+
+    long_breakout = (
+        close > row["PREV20_HIGH"]
+        and
+        row["BODY_RATIO"] >= 0.45
+    )
+
+    short_breakout = (
+        close < row["PREV20_LOW"]
+        and
+        row["BODY_RATIO"] >= 0.45
+    )
+
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
+    volume_ok = (
+        row["Volume"] >=
+        row["VOL_MA20"] * 0.90
+    )
+
+    # --------------------------------------------------------
+    # VOLATILITY
+    # --------------------------------------------------------
+
+    atr_pct = (
+        row["ATR"] / close
+    )
+
+    volatility_ok = (
+        atr_pct >= 0.0015
+        and
+        atr_pct <= 0.015
+    )
+
+    # --------------------------------------------------------
+    # LONG
+    # --------------------------------------------------------
+
+    if (
+        long_htf
+        and long_momentum
+        and long_breakout
+        and volume_ok
+        and volatility_ok
+    ):
+        return "LONG"
+
+    # --------------------------------------------------------
+    # SHORT
+    # --------------------------------------------------------
+
+    if (
+        short_htf
+        and short_momentum
+        and short_breakout
+        and volume_ok
+        and volatility_ok
+    ):
+        return "SHORT"
+
+    return None
+
+
+# ============================================================
+# EXECUTE TRADE
+# ============================================================
+
+def execute_trade(df, signal_index, direction, symbol):
+
+    # Entry happens on NEXT candle OPEN
+    if signal_index + 1 >= len(df):
+        return None
+
+    entry_row = df.iloc[signal_index + 1]
+
+    entry_time = df.index[signal_index + 1]
+
+    raw_entry = float(entry_row["Open"])
+
+    # --------------------------------------------------------
+    # Slippage
+    # --------------------------------------------------------
+
+    if direction == "LONG":
+        entry_price = raw_entry * (1 + SLIPPAGE)
+    else:
+        entry_price = raw_entry * (1 - SLIPPAGE)
+
+    # --------------------------------------------------------
+    # TP / SL
+    # --------------------------------------------------------
+
+    if direction == "LONG":
+
+        tp = entry_price * (1 + TP_PCT)
+        sl = entry_price * (1 - SL_PCT)
+
+    else:
+
+        tp = entry_price * (1 - TP_PCT)
+        sl = entry_price * (1 + SL_PCT)
+
+    max_exit_index = min(
+        signal_index + 1 + MAX_HOLD_BARS,
+        len(df) - 1
+    )
+
+    exit_price = None
+    exit_time = None
+    result = None
+
+    bars_held = 0
+
+    # --------------------------------------------------------
+    # Walk forward ONLY
+    # --------------------------------------------------------
+
+    for j in range(
+        signal_index + 1,
+        max_exit_index + 1
+    ):
+
+        candle = df.iloc[j]
+
+        high = float(candle["High"])
+        low = float(candle["Low"])
+
+        bars_held += 1
+
+        if direction == "LONG":
+
+            hit_sl = low <= sl
+            hit_tp = high >= tp
+
+            # Same candle => SL FIRST
+            if hit_sl and hit_tp:
+
+                exit_price = sl * (
+                    1 - SLIPPAGE
+                )
+
+                result = "LOSS"
+
+                exit_time = df.index[j]
+
+                break
+
+            elif hit_sl:
+
+                exit_price = sl * (
+                    1 - SLIPPAGE
+                )
+
+                result = "LOSS"
+
+                exit_time = df.index[j]
+
+                break
+
+            elif hit_tp:
+
+                exit_price = tp * (
+                    1 - SLIPPAGE
+                )
+
+                result = "WIN"
+
+                exit_time = df.index[j]
+
+                break
+
+        else:
+
+            hit_sl = high >= sl
+            hit_tp = low <= tp
+
+            # Same candle => SL FIRST
+            if hit_sl and hit_tp:
+
+                exit_price = sl * (
+                    1 + SLIPPAGE
+                )
+
+                result = "LOSS"
+
+                exit_time = df.index[j]
+
+                break
+
+            elif hit_sl:
+
+                exit_price = sl * (
+                    1 + SLIPPAGE
+                )
+
+                result = "LOSS"
+
+                exit_time = df.index[j]
+
+                break
+
+            elif hit_tp:
+
+                exit_price = tp * (
+                    1 + SLIPPAGE
+                )
+
+                result = "WIN"
+
+                exit_time = df.index[j]
+
+                break
+
+    # --------------------------------------------------------
+    # TIMEOUT
+    # --------------------------------------------------------
+
+    if result is None:
+
+        j = max_exit_index
+
+        exit_time = df.index[j]
+
+        raw_exit = float(
+            df.iloc[j]["Close"]
+        )
+
+        if direction == "LONG":
+
+            exit_price = raw_exit * (
+                1 - SLIPPAGE
+            )
+
+        else:
+
+            exit_price = raw_exit * (
+                1 + SLIPPAGE
+            )
+
+        result = "TIMEOUT"
+
+    # --------------------------------------------------------
+    # Gross return
+    # --------------------------------------------------------
+
+    if direction == "LONG":
+
+        gross_return = (
+            exit_price / entry_price - 1
+        )
+
+    else:
+
+        gross_return = (
+            entry_price / exit_price - 1
+        )
+
+    # --------------------------------------------------------
+    # Fees
+    # --------------------------------------------------------
+
+    total_fee = TAKER_FEE * 2
+
+    net_return = (
+        gross_return - total_fee
+    )
+
+    return {
+        "Symbol": symbol,
+        "Direction": direction,
+        "SignalTime": df.index[signal_index],
+        "EntryTime": entry_time,
+        "ExitTime": exit_time,
+        "Entry": entry_price,
+        "Exit": exit_price,
+        "TP": tp,
+        "SL": sl,
+        "Result": result,
+        "BarsHeld": bars_held,
+        "GrossPct": gross_return * 100,
+        "NetPct": net_return * 100,
+    }
+
+
+# ============================================================
+# GENERATE CANDIDATES
+# ============================================================
+
+def backtest_symbol(df, symbol):
+
+    trades = []
+
+    i = 250
+
+    while i < len(df) - 2:
+
+        signal = get_signal(
+            df,
+            i
+        )
+
+        if signal is None:
 
             i += 1
-
             continue
 
-        # ====================================================
-        # VOLATILITY FILTER
-        # ====================================================
+        trade = execute_trade(
+            df,
+            i,
+            signal,
+            symbol
+        )
 
-        if (
-            row["ATR_Pct"]
-            >
-            MAX_ATR_PERCENT
-        ):
+        if trade is not None:
+
+            trades.append(trade)
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            # After entering a trade, skip until trade exits.
+            # Prevent overlapping trades per symbol.
+            # ------------------------------------------------
+
+            exit_time = trade["ExitTime"]
+
+            future_indices = np.where(
+                df.index >= exit_time
+            )[0]
+
+            if len(future_indices) > 0:
+
+                exit_idx = future_indices[0]
+
+                i = exit_idx + 1
+
+            else:
+
+                i += 1
+
+        else:
 
             i += 1
-
-            continue
-
-        # ====================================================
-        # 4H TREND
-        # ====================================================
-
-        bullish_4h = (
-
-            row["HTF_Close"]
-            >
-            row["HTF_EMA20"]
-
-            and
-
-            row["HTF_EMA20"]
-            >
-            row["HTF_EMA50"]
-
-            and
-
-            row["HTF_EMA50"]
-            >
-            row["HTF_EMA200"]
-
-            and
-
-            row["HTF_RSI"]
-            >
-            52
-
-            and
-
-            row["HTF_ADX"]
-            >
-            18
-        )
-
-        bearish_4h = (
-
-            row["HTF_Close"]
-            <
-            row["HTF_EMA20"]
-
-            and
-
-            row["HTF_EMA20"]
-            <
-            row["HTF_EMA50"]
-
-            and
-
-            row["HTF_EMA50"]
-            <
-            row["HTF_EMA200"]
-
-            and
-
-            row["HTF_RSI"]
-            <
-            48
-
-            and
-
-            row["HTF_ADX"]
-            >
-            18
-        )
-
-        # ====================================================
-        # 1H BREAKOUT
-        # ====================================================
-
-        bullish_breakout = (
-
-            row["Close"]
-            >
-            row["Previous20High"]
-
-            and
-
-            row["Close"]
-            >
-            row["Open"]
-
-            and
-
-            row["BodyRatio"]
-            >=
-            BREAKOUT_BODY_MIN
-
-            and
-
-            row["Volume"]
-            >
-            row["Volume_MA"]
-            *
-            VOLUME_MULTIPLIER
-
-            and
-
-            row["ADX"]
-            >
-            20
-        )
-
-        bearish_breakdown = (
-
-            row["Close"]
-            <
-            row["Previous20Low"]
-
-            and
-
-            row["Close"]
-            <
-            row["Open"]
-
-            and
-
-            row["BodyRatio"]
-            >=
-            BREAKOUT_BODY_MIN
-
-            and
-
-            row["Volume"]
-            >
-            row["Volume_MA"]
-            *
-            VOLUME_MULTIPLIER
-
-            and
-
-            row["ADX"]
-            >
-            20
-        )
-
-        # ====================================================
-        # CREATE LONG PENDING SETUP
-        # ====================================================
-
-        if (
-            bullish_4h
-            and
-            bullish_breakout
-        ):
-
-            pending_breakout = {
-
-                "side":
-                    "LONG",
-
-                "level":
-                    float(
-                        row["Previous20High"]
-                    ),
-
-                "breakout_index":
-                    i,
-
-                "breakout_time":
-                    row.name
-            }
-
-        # ====================================================
-        # CREATE SHORT PENDING SETUP
-        # ====================================================
-
-        elif (
-            bearish_4h
-            and
-            bearish_breakdown
-        ):
-
-            pending_breakout = {
-
-                "side":
-                    "SHORT",
-
-                "level":
-                    float(
-                        row["Previous20Low"]
-                    ),
-
-                "breakout_index":
-                    i,
-
-                "breakout_time":
-                    row.name
-            }
-
-        i += 1
 
     return trades
+
+
+# ============================================================
+# PORTFOLIO LOCK
+# ============================================================
+
+def apply_portfolio_lock(all_trades):
+
+    if not all_trades:
+        return []
+
+    trades = pd.DataFrame(all_trades)
+
+    trades["EntryTime"] = pd.to_datetime(
+        trades["EntryTime"]
+    )
+
+    trades["ExitTime"] = pd.to_datetime(
+        trades["ExitTime"]
+    )
+
+    trades = trades.sort_values(
+        ["EntryTime", "ExitTime"]
+    )
+
+    accepted = []
+
+    portfolio_free_time = None
+
+    for _, trade in trades.iterrows():
+
+        entry_time = trade["EntryTime"]
+
+        if (
+            portfolio_free_time is None
+            or
+            entry_time > portfolio_free_time
+        ):
+
+            accepted.append(
+                trade.to_dict()
+            )
+
+            portfolio_free_time = (
+                trade["ExitTime"]
+            )
+
+    return accepted
+
+
+# ============================================================
+# PERFORMANCE
+# ============================================================
+
+def calculate_metrics(trades):
+
+    if not trades:
+
+        return {
+            "Trades": 0,
+            "Wins": 0,
+            "Losses": 0,
+            "Timeouts": 0,
+            "WinRate": 0,
+            "NetPct": 0,
+            "AvgTradePct": 0,
+            "ProfitFactor": 0,
+            "MaxDD": 0,
+        }
+
+    df = pd.DataFrame(trades)
+
+    wins = int(
+        (df["Result"] == "WIN").sum()
+    )
+
+    losses = int(
+        (df["Result"] == "LOSS").sum()
+    )
+
+    timeouts = int(
+        (df["Result"] == "TIMEOUT").sum()
+    )
+
+    resolved = wins + losses
+
+    if resolved > 0:
+
+        win_rate = (
+            wins / resolved
+        ) * 100
+
+    else:
+
+        win_rate = 0
+
+    net_pct = df["NetPct"].sum()
+
+    avg_trade = df["NetPct"].mean()
+
+    positive = df.loc[
+        df["NetPct"] > 0,
+        "NetPct"
+    ].sum()
+
+    negative = abs(
+        df.loc[
+            df["NetPct"] < 0,
+            "NetPct"
+        ].sum()
+    )
+
+    if negative > 0:
+        profit_factor = (
+            positive / negative
+        )
+    else:
+        profit_factor = float("inf")
+
+    equity = df["NetPct"].cumsum()
+
+    peak = equity.cummax()
+
+    drawdown = equity - peak
+
+    max_dd = drawdown.min()
+
+    return {
+        "Trades": len(df),
+        "Wins": wins,
+        "Losses": losses,
+        "Timeouts": timeouts,
+        "WinRate": win_rate,
+        "NetPct": net_pct,
+        "AvgTradePct": avg_trade,
+        "ProfitFactor": profit_factor,
+        "MaxDD": max_dd,
+    }
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-print("\n")
-print("=" * 72)
-print("🚀 HUNTER-1% v1 — LBank CLEAN BACKTEST")
-print("=" * 72)
+def main():
 
-print(
-    f"🎯 TP = +{TP_PCT * 100:.2f}%"
-)
+    print()
+    print("=" * 70)
+    print("🚀 HUNTER-X 1% 2R — CLEAN LBank BACKTEST")
+    print("=" * 70)
 
-print(
-    f"🛑 SL = -{SL_PCT * 100:.2f}%"
-)
+    print(f"🎯 TP       : {TP_PCT * 100:.2f}%")
+    print(f"🛑 SL       : {SL_PCT * 100:.2f}%")
+    print(f"📐 RR       : 1:{RR:.1f}")
+    print(f"⏱ Timeframe: 1H + 4H")
+    print(f"📅 Test     : {TEST_DAYS} days")
+    print(f"⏳ Max Hold : {MAX_HOLD_BARS} candles")
+    print()
 
-print(
-    f"⚖️ RR = 1:{RR:.1f}"
-)
+    all_candidates = []
 
-print(
-    f"💰 Fee/side = {TAKER_FEE * 100:.3f}%"
-)
+    symbol_results = []
 
-print(
-    f"📉 Slippage/side = {SLIPPAGE * 100:.3f}%"
-)
+    for name, symbol in SYMBOLS.items():
 
-print(
-    f"⭐ Minimum Score = {MIN_SCORE}/11"
-)
+        try:
 
-print(
-    f"📊 Markets = {', '.join(SYMBOLS.keys())}"
-)
+            df = download_lbank(
+                symbol,
+                TEST_DAYS + WARMUP_DAYS
+            )
 
-print(
-    "⏱️ Timeframes = 1H + CLOSED previous 4H"
-)
+            if df is None or len(df) < 500:
 
-print(
-    "🔒 Portfolio overlap = LOCKED"
-)
+                print(
+                    f"⚠️ {name}: insufficient data"
+                )
 
-print(
-    "🚫 Look-ahead = OFF"
-)
+                continue
 
-print("=" * 72)
+            # ------------------------------------------------
+            # 4H
+            # ------------------------------------------------
 
+            df4 = prepare_4h(df)
 
-# ============================================================
-# DOWNLOAD ALL DATA
-# ============================================================
+            # ------------------------------------------------
+            # 1H
+            # ------------------------------------------------
 
-datasets = {}
+            df1 = prepare_1h(df)
 
-for symbol in SYMBOLS:
+            # ------------------------------------------------
+            # Previous closed 4H
+            # ------------------------------------------------
 
-    df1h = download_data(
-        symbol
+            df1 = attach_4h(
+                df1,
+                df4
+            )
+
+            # ------------------------------------------------
+            # Only test last 365 days
+            # ------------------------------------------------
+
+            cutoff = (
+                df1.index.max()
+                - pd.Timedelta(days=TEST_DAYS)
+            )
+
+            df1 = df1[
+                df1.index >= cutoff
+            ].copy()
+
+            print(
+                f"🔎 Testing {name}: "
+                f"{len(df1)} candles"
+            )
+
+            trades = backtest_symbol(
+                df1,
+                name
+            )
+
+            print(
+                f"   Candidate trades: "
+                f"{len(trades)}"
+            )
+
+            all_candidates.extend(
+                trades
+            )
+
+            # Individual symbol result
+            if trades:
+
+                metrics = calculate_metrics(
+                    trades
+                )
+
+                symbol_results.append({
+                    "Symbol": name,
+                    **metrics
+                })
+
+        except Exception as e:
+
+            print(
+                f"\n❌ ERROR {name}: {e}"
+            )
+
+    # ========================================================
+    # PORTFOLIO
+    # ========================================================
+
+    final_trades = apply_portfolio_lock(
+        all_candidates
     )
 
-    if df1h is None:
+    print()
+    print("=" * 70)
+    print("📊 FINAL PORTFOLIO RESULT")
+    print("=" * 70)
 
-        continue
+    metrics = calculate_metrics(
+        final_trades
+    )
 
-    if len(df1h) < 1000:
+    print(
+        f"Total Trades : {metrics['Trades']}"
+    )
+
+    print(
+        f"Wins         : {metrics['Wins']}"
+    )
+
+    print(
+        f"Losses       : {metrics['Losses']}"
+    )
+
+    print(
+        f"Timeouts     : {metrics['Timeouts']}"
+    )
+
+    print(
+        f"Win Rate     : {metrics['WinRate']:.2f}%"
+    )
+
+    print(
+        f"Net Return   : {metrics['NetPct']:.2f}%"
+    )
+
+    print(
+        f"Avg Trade    : {metrics['AvgTradePct']:.3f}%"
+    )
+
+    print(
+        f"Profit Factor: {metrics['ProfitFactor']:.2f}"
+    )
+
+    print(
+        f"Max Drawdown : {metrics['MaxDD']:.2f}%"
+    )
+
+    # ========================================================
+    # TRADES / DAY / YEAR
+    # ========================================================
+
+    if final_trades:
+
+        trade_df = pd.DataFrame(
+            final_trades
+        )
+
+        first_date = pd.to_datetime(
+            trade_df["EntryTime"]
+        ).min()
+
+        last_date = pd.to_datetime(
+            trade_df["EntryTime"]
+        ).max()
+
+        days = (
+            last_date - first_date
+        ).total_seconds() / 86400
+
+        if days > 0:
+
+            trades_per_day = (
+                len(trade_df) / days
+            )
+
+        else:
+
+            trades_per_day = 0
+
+        trades_per_year = (
+            trades_per_day * 365
+        )
+
+        print()
+        print(
+            f"Trades / Day  : "
+            f"{trades_per_day:.2f}"
+        )
 
         print(
-            f"❌ Not enough data for {symbol}"
+            f"Trades / Year : "
+            f"{trades_per_year:.0f}"
         )
 
-        continue
+    # ========================================================
+    # SYMBOL RESULTS
+    # ========================================================
 
-    # Build 4H
-    df4h = build_4h(
-        df1h
-    )
+    print()
+    print("=" * 70)
+    print("📌 PER SYMBOL")
+    print("=" * 70)
 
-    # Attach previous CLOSED 4H
-    df = attach_previous_4h(
-        df1h,
-        df4h
-    )
+    if symbol_results:
 
-    # Indicators + breakout levels
-    df = prepare_1h(
-        df
-    )
-
-    # --------------------------------------------------------
-    # Exactly last 365 days
-    # --------------------------------------------------------
-
-    end_time = df.index.max()
-
-    start_time = (
-        end_time -
-        pd.Timedelta(days=365)
-    )
-
-    df = df[
-        df.index >= start_time
-    ].copy()
-
-    datasets[symbol] = df
-
-    print(
-        f"✔️ {symbol} ready: "
-        f"{len(df):,} 1H candles"
-    )
-
-
-# ============================================================
-# RUN INDIVIDUAL TESTS
-# ============================================================
-
-print("\n")
-print("=" * 72)
-print("🧠 RUNNING BACKTEST")
-print("=" * 72)
-
-
-all_trades = []
-
-
-for symbol, df in datasets.items():
-
-    print(
-        f"\n🔸 Testing {symbol}..."
-    )
-
-    trades = backtest_symbol(
-        symbol,
-        df
-    )
-
-    print(
-        f"   Trades: {len(trades)}"
-    )
-
-    all_trades.extend(
-        trades
-    )
-
-
-# ============================================================
-# IF NOTHING
-# ============================================================
-
-if not all_trades:
-
-    print(
-        "\n⚠️ NO TRADES FOUND."
-    )
-
-    print(
-        "Try MIN_SCORE = 7"
-    )
-
-    sys.exit(0)
-
-
-# ============================================================
-# PORTFOLIO OVERLAP LOCK
-# ============================================================
-
-trades_df = pd.DataFrame(
-    all_trades
-)
-
-trades_df = trades_df.sort_values(
-    "EntryTime"
-).reset_index(
-    drop=True
-)
-
-
-# ============================================================
-# TRUE PORTFOLIO LOCK
-#
-# Only ONE open position across ALL symbols.
-# ============================================================
-
-accepted_trades = []
-
-portfolio_free_time = None
-
-
-for _, trade in trades_df.iterrows():
-
-    entry_time = (
-        trade["EntryTime"]
-    )
-
-    exit_time = (
-        trade["ExitTime"]
-    )
-
-    if (
-        portfolio_free_time is None
-        or
-        entry_time >
-        portfolio_free_time
-    ):
-
-        accepted_trades.append(
-            trade
+        symbol_df = pd.DataFrame(
+            symbol_results
         )
 
-        portfolio_free_time = (
-            exit_time
+        print(
+            symbol_df[
+                [
+                    "Symbol",
+                    "Trades",
+                    "Wins",
+                    "Losses",
+                    "Timeouts",
+                    "WinRate",
+                    "NetPct",
+                    "ProfitFactor"
+                ]
+            ].to_string(
+                index=False
+            )
         )
 
+    # ========================================================
+    # LONG / SHORT
+    # ========================================================
 
-portfolio = pd.DataFrame(
-    accepted_trades
-)
+    if final_trades:
 
-
-# ============================================================
-# FINAL REPORT
-# ============================================================
-
-print("\n")
-print("=" * 72)
-print("📊 FINAL PORTFOLIO REPORT")
-print("=" * 72)
-
-
-if portfolio.empty:
-
-    print(
-        "⚠️ No trades after portfolio overlap lock."
-    )
-
-    sys.exit(0)
-
-
-total = len(
-    portfolio
-)
-
-
-wins = (
-    portfolio["Outcome"]
-    == "WIN"
-).sum()
-
-
-losses = (
-    portfolio["Outcome"]
-    == "LOSS"
-).sum()
-
-
-timeout_profit = (
-    portfolio["Outcome"]
-    ==
-    "TIMEOUT_PROFIT"
-).sum()
-
-
-timeout_loss = (
-    portfolio["Outcome"]
-    ==
-    "TIMEOUT_LOSS"
-).sum()
-
-
-timeout_be = (
-    portfolio["Outcome"]
-    ==
-    "TIMEOUT_BE"
-).sum()
-
-
-# ============================================================
-# STRICT TP/SL WIN RATE
-# ============================================================
-
-decisive = (
-    wins +
-    losses
-)
-
-
-win_rate = (
-
-    wins /
-    decisive *
-    100
-
-    if decisive > 0
-
-    else 0
-)
-
-
-# ============================================================
-# POSITIVE TRADE RATE
-# ============================================================
-
-positive = (
-    portfolio["NetPct"] > 0
-).sum()
-
-
-positive_rate = (
-
-    positive /
-    total *
-    100
-
-    if total > 0
-
-    else 0
-)
-
-
-# ============================================================
-# PROFIT
-# ============================================================
-
-gross_profit = (
-    portfolio[
-        portfolio["NetPct"] > 0
-    ]["NetPct"].sum()
-)
-
-
-gross_loss = abs(
-    portfolio[
-        portfolio["NetPct"] < 0
-    ]["NetPct"].sum()
-)
-
-
-profit_factor = (
-
-    gross_profit /
-    gross_loss
-
-    if gross_loss > 0
-
-    else np.inf
-)
-
-
-net_return = (
-    portfolio["NetPct"].sum()
-)
-
-
-average_trade = (
-    portfolio["NetPct"].mean()
-)
-
-
-# ============================================================
-# MAX DRAWDOWN
-# ============================================================
-
-equity = (
-    portfolio["NetPct"]
-    .cumsum()
-)
-
-peak = (
-    equity
-    .cummax()
-)
-
-drawdown = (
-    equity -
-    peak
-)
-
-max_drawdown = (
-    drawdown.min()
-)
-
-
-# ============================================================
-# LOSING STREAK
-# ============================================================
-
-max_losing_streak = 0
-
-current_losing_streak = 0
-
-
-for outcome in portfolio[
-    "Outcome"
-]:
-
-    if outcome in [
-        "LOSS",
-        "TIMEOUT_LOSS"
-    ]:
-
-        current_losing_streak += 1
-
-        max_losing_streak = max(
-            max_losing_streak,
-            current_losing_streak
+        trade_df = pd.DataFrame(
+            final_trades
         )
 
-    else:
+        print()
+        print("=" * 70)
+        print("📈 LONG / SHORT")
+        print("=" * 70)
 
-        current_losing_streak = 0
+        side_rows = []
 
+        for side in [
+            "LONG",
+            "SHORT"
+        ]:
 
-# ============================================================
-# TRADES / DAY
-# ============================================================
+            x = trade_df[
+                trade_df["Direction"] == side
+            ]
 
-first_trade = (
-    portfolio["EntryTime"].min()
-)
+            if len(x) == 0:
+                continue
 
-last_trade = (
-    portfolio["EntryTime"].max()
-)
+            wins = (
+                x["Result"] == "WIN"
+            ).sum()
 
-days = (
-    last_trade -
-    first_trade
-).total_seconds() / 86400
+            losses = (
+                x["Result"] == "LOSS"
+            ).sum()
 
+            resolved = wins + losses
 
-trades_per_day = (
+            wr = (
+                wins / resolved * 100
+                if resolved > 0
+                else 0
+            )
 
-    total /
-    days
+            side_rows.append({
+                "Side": side,
+                "Trades": len(x),
+                "Wins": wins,
+                "Losses": losses,
+                "Timeouts": (
+                    x["Result"] == "TIMEOUT"
+                ).sum(),
+                "NetPct": x["NetPct"].sum(),
+                "WinRate": wr
+            })
 
-    if days > 0
+        if side_rows:
 
-    else 0
-)
+            print(
+                pd.DataFrame(
+                    side_rows
+                ).to_string(
+                    index=False
+                )
+            )
 
+    # ========================================================
+    # RESULT DISTRIBUTION
+    # ========================================================
 
-trades_per_year = (
-    trades_per_day *
-    365
-)
+    if final_trades:
 
+        print()
+        print("=" * 70)
+        print("🎯 RESULT DISTRIBUTION")
+        print("=" * 70)
 
-# ============================================================
-# PRINT
-# ============================================================
-
-print(
-    f"\n🔸 Total Trades: {total}"
-)
-
-print(
-    f"🟢 WIN: {wins}"
-)
-
-print(
-    f"🔴 LOSS: {losses}"
-)
-
-print(
-    f"🟡 TIMEOUT PROFIT: "
-    f"{timeout_profit}"
-)
-
-print(
-    f"🟠 TIMEOUT LOSS: "
-    f"{timeout_loss}"
-)
-
-print(
-    f"⚪ TIMEOUT BE: "
-    f"{timeout_be}"
-)
-
-print(
-    f"\n🎯 WIN RATE (TP/SL): "
-    f"{win_rate:.2f}%"
-)
-
-print(
-    f"📈 Positive Trade Rate: "
-    f"{positive_rate:.2f}%"
-)
-
-print(
-    f"\n💰 NET RETURN: "
-    f"{net_return:.2f}%"
-)
-
-print(
-    f"📊 Average Trade: "
-    f"{average_trade:.4f}%"
-)
-
-print(
-    f"📊 Profit Factor: "
-    f"{profit_factor:.2f}"
-)
-
-print(
-    f"📉 Max Drawdown: "
-    f"{max_drawdown:.2f}%"
-)
-
-print(
-    f"🔥 Max Losing Streak: "
-    f"{max_losing_streak}"
-)
-
-print(
-    f"📅 Trades / Day: "
-    f"{trades_per_day:.2f}"
-)
-
-print(
-    f"📅 Trades / Year: "
-    f"{trades_per_year:.0f}"
-)
-
-
-# ============================================================
-# SYMBOL PERFORMANCE
-# ============================================================
-
-print("\n")
-print("=" * 72)
-print("📊 PERFORMANCE BY SYMBOL")
-print("=" * 72)
-
-
-symbol_summary = (
-    portfolio
-    .groupby("Symbol")
-    .agg(
-
-        Trades=(
-            "Outcome",
-            "size"
-        ),
-
-        Wins=(
-            "Outcome",
-            lambda x:
-            (x == "WIN").sum()
-        ),
-
-        Losses=(
-            "Outcome",
-            lambda x:
-            (x == "LOSS").sum()
-        ),
-
-        NetPct=(
-            "NetPct",
-            "sum"
-        ),
-
-        AverageTrade=(
-            "NetPct",
-            "mean"
+        result_counts = (
+            pd.DataFrame(final_trades)
+            ["Result"]
+            .value_counts()
         )
-    )
-)
 
-
-symbol_summary["WinRate"] = np.where(
-
-    (
-        symbol_summary["Wins"] +
-        symbol_summary["Losses"]
-    ) > 0,
-
-    symbol_summary["Wins"] /
-    (
-        symbol_summary["Wins"] +
-        symbol_summary["Losses"]
-    ) *
-    100,
-
-    0
-)
-
-
-print(
-    symbol_summary.round(
-        3
-    ).to_string()
-)
-
-
-# ============================================================
-# LONG / SHORT
-# ============================================================
-
-print("\n")
-print("=" * 72)
-print("📊 LONG / SHORT")
-print("=" * 72)
-
-
-side_summary = (
-    portfolio
-    .groupby("Side")
-    .agg(
-
-        Trades=(
-            "Outcome",
-            "size"
-        ),
-
-        Wins=(
-            "Outcome",
-            lambda x:
-            (x == "WIN").sum()
-        ),
-
-        Losses=(
-            "Outcome",
-            lambda x:
-            (x == "LOSS").sum()
-        ),
-
-        NetPct=(
-            "NetPct",
-            "sum"
+        print(
+            result_counts.to_string()
         )
-    )
-)
 
+    # ========================================================
+    # SAVE CSV
+    # ========================================================
 
-side_summary["WinRate"] = np.where(
+    if final_trades:
 
-    (
-        side_summary["Wins"] +
-        side_summary["Losses"]
-    ) > 0,
-
-    side_summary["Wins"] /
-    (
-        side_summary["Wins"] +
-        side_summary["Losses"]
-    ) *
-    100,
-
-    0
-)
-
-
-print(
-    side_summary.round(
-        3
-    ).to_string()
-)
-
-
-# ============================================================
-# SCORE ANALYSIS
-# ============================================================
-
-print("\n")
-print("=" * 72)
-print("⭐ SCORE ANALYSIS")
-print("=" * 72)
-
-
-score_summary = (
-    portfolio
-    .groupby("Score")
-    .agg(
-
-        Trades=(
-            "Outcome",
-            "size"
-        ),
-
-        Wins=(
-            "Outcome",
-            lambda x:
-            (x == "WIN").sum()
-        ),
-
-        Losses=(
-            "Outcome",
-            lambda x:
-            (x == "LOSS").sum()
-        ),
-
-        NetPct=(
-            "NetPct",
-            "sum"
+        result_df = pd.DataFrame(
+            final_trades
         )
-    )
-)
+
+        result_df.to_csv(
+            "hunter_x_1pct_2r_lbank_trades.csv",
+            index=False
+        )
+
+        print()
+        print(
+            "💾 Saved:"
+            " hunter_x_1pct_2r_lbank_trades.csv"
+        )
+
+    # ========================================================
+    # AUDIT
+    # ========================================================
+
+    print()
+    print("=" * 70)
+    print("🔐 ANTI LOOKAHEAD AUDIT")
+    print("=" * 70)
+
+    print("✅ Entry = next candle OPEN")
+    print("✅ Previous 20 candles used for breakout")
+    print("✅ Previous CLOSED 4H used")
+    print("✅ Current unfinished 1H removed")
+    print("✅ No future candle used for signal")
+    print("✅ No overlapping portfolio trades")
+    print("✅ Same candle TP+SL = SL first")
+    print("✅ Timeout counted separately")
+    print("✅ RR = 1:2")
+    print("✅ Slippage not double-counted")
+
+    print()
+    print("=" * 70)
+    print("🏁 BACKTEST FINISHED")
+    print("=" * 70)
 
 
-score_summary["WinRate"] = np.where(
-
-    (
-        score_summary["Wins"] +
-        score_summary["Losses"]
-    ) > 0,
-
-    score_summary["Wins"] /
-    (
-        score_summary["Wins"] +
-        score_summary["Losses"]
-    ) *
-    100,
-
-    0
-)
-
-
-print(
-    score_summary.round(
-        3
-    ).to_string()
-)
-
-
-# ============================================================
-# SAVE TRADE LOG
-# ============================================================
-
-output_file = (
-    "hunter_1pct_v1_lbank_trades.csv"
-)
-
-
-portfolio.to_csv(
-    output_file,
-    index=False
-)
-
-
-print("\n")
-print("=" * 72)
-print(
-    f"💾 Trade log saved: "
-    f"{output_file}"
-)
-print("=" * 72)
-
-
-# ============================================================
-# ANTI LOOK-AHEAD AUDIT
-# ============================================================
-
-print("\n")
-print("=" * 72)
-print("🔒 ANTI-LOOKAHEAD AUDIT")
-print("=" * 72)
-
-print(
-    "✔️ Current unfinished 1H candle excluded"
-)
-
-print(
-    "✔️ 4H uses ONLY previous CLOSED 4H candle"
-)
-
-print(
-    "✔️ Breakout level = previous 20 candles"
-)
-
-print(
-    "✔️ Breakout uses shift(1)"
-)
-
-print(
-    "✔️ Retest starts AFTER breakout"
-)
-
-print(
-    "✔️ Entry = NEXT 1H candle OPEN"
-)
-
-print(
-    "✔️ TP/SL checked AFTER entry only"
-)
-
-print(
-    "✔️ Same-candle TP + SL = LOSS"
-)
-
-print(
-    "✔️ No overlapping portfolio positions"
-)
-
-print(
-    "✔️ Cooldown after completed trade"
-)
-
-print(
-    "✔️ No future candles used for signals"
-)
-
-print("\n✨ BACKTEST COMPLETE.")
+if __name__ == "__main__":
+    main()
