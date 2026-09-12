@@ -55,18 +55,23 @@ SYMBOLS = {
     "DOT": "DOT/USDT"
 }
 
-BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "365"))
+BACKTEST_DAYS = int(
+    os.getenv("BACKTEST_DAYS", "365")
+)
 
 FETCH_LIMIT = 1000
 
+# ============================================================
 # استراتژی
+# ============================================================
+
 TP_PCT = 0.0200
 SL_PCT = 0.0100
 
 # حداکثر زمان نگهداری معامله
 MAX_HOLD_BARS = 24
 
-# کارمزد
+# کارمزد هر طرف
 FEE_RATE = 0.0006
 
 # اسلیپیج هر طرف
@@ -83,7 +88,10 @@ def calculate_indicators(df):
 
     df = df.copy()
 
+    # --------------------------------------------------------
     # EMA
+    # --------------------------------------------------------
+
     df["EMA20"] = df["Close"].ewm(
         span=20,
         adjust=False
@@ -99,7 +107,10 @@ def calculate_indicators(df):
         adjust=False
     ).mean()
 
+    # --------------------------------------------------------
     # RSI
+    # --------------------------------------------------------
+
     delta = df["Close"].diff()
 
     gain = delta.clip(lower=0)
@@ -108,18 +119,30 @@ def calculate_indicators(df):
     avg_gain = gain.rolling(14).mean()
     avg_loss = loss.rolling(14).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = avg_gain / avg_loss.replace(
+        0,
+        np.nan
+    )
 
     df["RSI"] = 100 - (
         100 / (1 + rs)
     )
 
+    # --------------------------------------------------------
     # ATR
+    # --------------------------------------------------------
+
     prev_close = df["Close"].shift(1)
 
     tr1 = df["High"] - df["Low"]
-    tr2 = (df["High"] - prev_close).abs()
-    tr3 = (df["Low"] - prev_close).abs()
+
+    tr2 = (
+        df["High"] - prev_close
+    ).abs()
+
+    tr3 = (
+        df["Low"] - prev_close
+    ).abs()
 
     tr = pd.concat(
         [tr1, tr2, tr3],
@@ -128,10 +151,18 @@ def calculate_indicators(df):
 
     df["ATR"] = tr.rolling(14).mean()
 
+    # --------------------------------------------------------
     # Volume MA
-    df["VOL_MA20"] = df["Volume"].rolling(20).mean()
+    # --------------------------------------------------------
 
-    # Candle body
+    df["VOL_MA20"] = (
+        df["Volume"].rolling(20).mean()
+    )
+
+    # --------------------------------------------------------
+    # Candle Body
+    # --------------------------------------------------------
+
     df["BODY"] = (
         df["Close"] - df["Open"]
     ).abs()
@@ -146,7 +177,10 @@ def calculate_indicators(df):
         0
     )
 
+    # --------------------------------------------------------
     # ADX
+    # --------------------------------------------------------
+
     plus_dm = df["High"].diff()
     minus_dm = -df["Low"].diff()
 
@@ -165,8 +199,8 @@ def calculate_indicators(df):
     atr14 = df["ATR"]
 
     plus_di = (
-        100 *
-        pd.Series(
+        100
+        * pd.Series(
             plus_dm,
             index=df.index
         ).rolling(14).mean()
@@ -174,8 +208,8 @@ def calculate_indicators(df):
     )
 
     minus_di = (
-        100 *
-        pd.Series(
+        100
+        * pd.Series(
             minus_dm,
             index=df.index
         ).rolling(14).mean()
@@ -183,10 +217,13 @@ def calculate_indicators(df):
     )
 
     dx = (
-        100 *
-        (plus_di - minus_di).abs()
+        100
+        * (plus_di - minus_di).abs()
         /
-        (plus_di + minus_di).replace(0, np.nan)
+        (plus_di + minus_di).replace(
+            0,
+            np.nan
+        )
     )
 
     df["ADX"] = dx.rolling(14).mean()
@@ -202,7 +239,9 @@ def fetch_lbank_1h(symbol, days=365):
 
     print("")
     print("=" * 60)
-    print(f"📥 شروع دریافت دیتای {symbol} از LBank")
+    print(
+        f"📥 شروع دریافت دیتای {symbol} از LBank"
+    )
     print("=" * 60)
 
     start_date = (
@@ -230,7 +269,8 @@ def fetch_lbank_1h(symbol, days=365):
 
             print(
                 f"  🔄 درخواست #{request_number} | "
-                f"کندل دریافت‌شده: {len(all_ohlcv)}"
+                f"کندل دریافت‌شده: "
+                f"{len(all_ohlcv)}"
             )
 
             ohlcv = exchange.fetch_ohlcv(
@@ -243,16 +283,21 @@ def fetch_lbank_1h(symbol, days=365):
             if not ohlcv:
 
                 print(
-                    f"  ⚠️ LBank برای {symbol} دیتای بیشتری نداد."
+                    f"  ⚠️ LBank برای {symbol} "
+                    f"دیتای بیشتری نداد."
                 )
 
                 break
 
-            all_ohlcv.extend(ohlcv)
+            all_ohlcv.extend(
+                ohlcv
+            )
 
             last_timestamp = ohlcv[-1][0]
 
-            current_since = last_timestamp + 1
+            current_since = (
+                last_timestamp + 1
+            )
 
             print(
                 f"  ✔️ +{len(ohlcv)} کندل | "
@@ -265,7 +310,8 @@ def fetch_lbank_1h(symbol, days=365):
         except Exception as e:
 
             print(
-                f"  ❌ خطا در دریافت {symbol}: {e}"
+                f"  ❌ خطا در دریافت "
+                f"{symbol}: {e}"
             )
 
             break
@@ -273,12 +319,16 @@ def fetch_lbank_1h(symbol, days=365):
     if not all_ohlcv:
 
         print(
-            f"❌ هیچ دیتایی برای {symbol} دریافت نشد."
+            f"❌ هیچ دیتایی برای "
+            f"{symbol} دریافت نشد."
         )
 
         return None
 
+    # --------------------------------------------------------
     # حذف duplicate
+    # --------------------------------------------------------
+
     unique = {}
 
     for row in all_ohlcv:
@@ -292,7 +342,10 @@ def fetch_lbank_1h(symbol, days=365):
         key=lambda x: x[0]
     )
 
+    # --------------------------------------------------------
     # DataFrame
+    # --------------------------------------------------------
+
     df = pd.DataFrame(
         all_ohlcv,
         columns=[
@@ -305,32 +358,54 @@ def fetch_lbank_1h(symbol, days=365):
         ]
     )
 
+    # مهم:
+    # index را عمداً timezone-naive می‌سازیم
+    # تا تمام مقایسه‌های زمانی یکسان باشند.
     df["Date"] = pd.to_datetime(
         df["Timestamp"],
-        unit="ms"
-    )
+        unit="ms",
+        utc=True
+    ).dt.tz_localize(None)
 
     df.set_index(
         "Date",
         inplace=True
     )
 
+    # --------------------------------------------------------
     # فقط داده موردنیاز
-    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(
-        days=days
+    # --------------------------------------------------------
+
+    # FIX:
+    # هر دو طرف مقایسه timezone-naive هستند.
+    now_naive = (
+        pd.Timestamp.now(tz="UTC")
+        .tz_localize(None)
+    )
+
+    cutoff = (
+        now_naive
+        - pd.Timedelta(days=days)
     )
 
     df = df[
         df.index >= cutoff
     ].copy()
 
+    # --------------------------------------------------------
     # حذف کندل جاری
+    # --------------------------------------------------------
+
     if len(df) > 1:
 
-        current_hour = pd.Timestamp.utcnow().replace(
-            minute=0,
-            second=0,
-            microsecond=0
+        current_hour = (
+            pd.Timestamp.now(tz="UTC")
+            .tz_localize(None)
+            .replace(
+                minute=0,
+                second=0,
+                microsecond=0
+            )
         )
 
         df = df[
@@ -338,6 +413,7 @@ def fetch_lbank_1h(symbol, days=365):
         ].copy()
 
     print("")
+
     print(
         f"  ✅ {symbol} آماده شد | "
         f"{len(df)} کندل 1H"
@@ -359,7 +435,9 @@ def fetch_lbank_1h(symbol, days=365):
 
 def make_4h(df1h):
 
-    df4h = df1h.resample("4h").agg({
+    df4h = df1h.resample(
+        "4h"
+    ).agg({
         "Open": "first",
         "High": "max",
         "Low": "min",
@@ -374,13 +452,17 @@ def make_4h(df1h):
 # اضافه کردن ویژگی 4H قبلی به 1H
 # ============================================================
 
-def attach_previous_4h(df1h, df4h):
+def attach_previous_4h(
+    df1h,
+    df4h
+):
 
     h4 = df4h.copy()
 
-    h4 = calculate_indicators(h4)
+    h4 = calculate_indicators(
+        h4
+    )
 
-    # بسیار مهم:
     # فقط کندل 4H کاملاً بسته‌شده قبلی
     h4_features = h4[
         [
@@ -404,7 +486,10 @@ def attach_previous_4h(df1h, df4h):
         }
     )
 
+    # --------------------------------------------------------
     # زمان کندل 4H
+    # --------------------------------------------------------
+
     h4_features["H4_BUCKET"] = (
         h4_features.index
         .floor("4h")
@@ -418,7 +503,9 @@ def attach_previous_4h(df1h, df4h):
     )
 
     result = result.join(
-        h4_features.set_index("H4_BUCKET"),
+        h4_features.set_index(
+            "H4_BUCKET"
+        ),
         on="H4_BUCKET",
         rsuffix="_H4"
     )
@@ -438,15 +525,15 @@ def simulate_trade(
 ):
 
     if entry_idx >= len(df):
-
         return None
 
-    entry_row = df.iloc[entry_idx]
+    entry_row = df.iloc[
+        entry_idx
+    ]
 
     atr = entry_row["ATR"]
 
     if pd.isna(atr) or atr <= 0:
-
         return None
 
     # --------------------------------------------------------
@@ -463,7 +550,6 @@ def simulate_trade(
             1 + TP_PCT
         )
 
-        # اسلیپیج محافظه‌کارانه
         sl = raw_sl * (
             1 - SLIPPAGE_RATE
         )
@@ -523,8 +609,8 @@ def simulate_trade(
             hit_sl = high >= sl
             hit_tp = low <= tp
 
-        # اگر در یک کندل هر دو لمس شد:
-        # محافظه‌کارانه SL را اول حساب می‌کنیم
+        # برخورد همزمان:
+        # SL اول
         if hit_sl and hit_tp:
 
             outcome = "LOSS"
@@ -579,7 +665,7 @@ def simulate_trade(
             entry_price / exit_price
         ) - 1
 
-    # هزینه ورود + خروج
+    # کارمزد ورود + خروج
     total_cost = (
         FEE_RATE * 2
         + SLIPPAGE_RATE * 2
@@ -593,7 +679,9 @@ def simulate_trade(
     # تبدیل به R
     risk = SL_PCT
 
-    net_r = net_return / risk
+    net_r = (
+        net_return / risk
+    )
 
     return {
         "EntryIndex": entry_idx,
@@ -618,6 +706,7 @@ def backtest_symbol(
 ):
 
     print("")
+
     print(
         f"🚀 بک‌تست {symbol}..."
     )
@@ -643,11 +732,25 @@ def backtest_symbol(
         # داده‌های 4H
         # ----------------------------------------------------
 
-        h4_ema20 = row["H4_EMA20"]
-        h4_ema50 = row["H4_EMA50"]
-        h4_ema200 = row["H4_EMA200"]
-        h4_rsi = row["H4_RSI"]
-        h4_adx = row["H4_ADX"]
+        h4_ema20 = row[
+            "H4_EMA20"
+        ]
+
+        h4_ema50 = row[
+            "H4_EMA50"
+        ]
+
+        h4_ema200 = row[
+            "H4_EMA200"
+        ]
+
+        h4_rsi = row[
+            "H4_RSI"
+        ]
+
+        h4_adx = row[
+            "H4_ADX"
+        ]
 
         if any(
             pd.isna(x)
@@ -695,7 +798,9 @@ def backtest_symbol(
 
         atr = row["ATR"]
 
-        vol_ma = row["VOL_MA20"]
+        vol_ma = row[
+            "VOL_MA20"
+        ]
 
         if (
             pd.isna(atr)
@@ -714,14 +819,19 @@ def backtest_symbol(
             row["BODY_RATIO"] >= 0.50
         )
 
-        if not volume_ok or not body_ok:
+        if (
+            not volume_ok
+            or not body_ok
+        ):
             continue
 
         # ----------------------------------------------------
         # Setup 1: Pullback
         # ----------------------------------------------------
 
-        previous = df.iloc[i - 1]
+        previous = df.iloc[
+            i - 1
+        ]
 
         pullback_long = (
             row["Low"] <= row["EMA20"]
@@ -804,18 +914,26 @@ def backtest_symbol(
                 if trade:
 
                     trade["Symbol"] = symbol
-                    trade["Setup"] = setup
-                    trade["EntryTime"] = df.index[
-                        entry_idx
-                    ]
-                    trade["ExitTime"] = df.index[
-                        trade["ExitIndex"]
-                    ]
 
-                    trades.append(trade)
+                    trade["Setup"] = setup
+
+                    trade["EntryTime"] = (
+                        df.index[entry_idx]
+                    )
+
+                    trade["ExitTime"] = (
+                        df.index[
+                            trade["ExitIndex"]
+                        ]
+                    )
+
+                    trades.append(
+                        trade
+                    )
 
                     locked_until = (
-                        trade["ExitIndex"] + 1
+                        trade["ExitIndex"]
+                        + 1
                     )
 
         # ----------------------------------------------------
@@ -846,18 +964,26 @@ def backtest_symbol(
                 if trade:
 
                     trade["Symbol"] = symbol
-                    trade["Setup"] = setup
-                    trade["EntryTime"] = df.index[
-                        entry_idx
-                    ]
-                    trade["ExitTime"] = df.index[
-                        trade["ExitIndex"]
-                    ]
 
-                    trades.append(trade)
+                    trade["Setup"] = setup
+
+                    trade["EntryTime"] = (
+                        df.index[entry_idx]
+                    )
+
+                    trade["ExitTime"] = (
+                        df.index[
+                            trade["ExitIndex"]
+                        ]
+                    )
+
+                    trades.append(
+                        trade
+                    )
 
                     locked_until = (
-                        trade["ExitIndex"] + 1
+                        trade["ExitIndex"]
+                        + 1
                     )
 
     print(
@@ -875,12 +1001,19 @@ def backtest_symbol(
 def main():
 
     print("")
-    print("=" * 70)
-    print("HUNTER-X V9 — LBank 1H → 4H CLEAN BACKTEST")
+
     print("=" * 70)
 
     print(
-        f"📅 دوره بک‌تست: {BACKTEST_DAYS} روز"
+        "HUNTER-X V9 — "
+        "LBank 1H → 4H CLEAN BACKTEST"
+    )
+
+    print("=" * 70)
+
+    print(
+        f"📅 دوره بک‌تست: "
+        f"{BACKTEST_DAYS} روز"
     )
 
     print(
@@ -892,7 +1025,8 @@ def main():
     )
 
     print(
-        "⏱️ تایم‌فریم بالاتر: 4H ساخته‌شده از 1H"
+        "⏱️ تایم‌فریم بالاتر: "
+        "4H ساخته‌شده از 1H"
     )
 
     print("=" * 70)
@@ -912,14 +1046,14 @@ def main():
         )
 
         if df1h is None:
-
             continue
 
         if len(df1h) < 400:
 
             print(
                 f"⚠️ {symbol}: "
-                f"داده کافی نیست ({len(df1h)})"
+                f"داده کافی نیست "
+                f"({len(df1h)})"
             )
 
             continue
@@ -929,6 +1063,7 @@ def main():
         )
 
         data_1h[symbol] = df1h
+
         data_4h[symbol] = df4h
 
         print(
@@ -949,22 +1084,27 @@ def main():
             continue
 
         print("")
+
         print("-" * 70)
 
         df1h = calculate_indicators(
             data_1h[symbol]
         )
 
-        df4h = data_4h[symbol]
+        df4h = data_4h[
+            symbol
+        ]
 
         df = attach_previous_4h(
             df1h,
             df4h
         )
 
-        symbol_trades = backtest_symbol(
-            symbol,
-            df
+        symbol_trades = (
+            backtest_symbol(
+                symbol,
+                df
+            )
         )
 
         all_trades.extend(
@@ -976,8 +1116,13 @@ def main():
     # --------------------------------------------------------
 
     print("")
+
     print("=" * 70)
-    print("📊 گزارش نهایی HUNTER-X V9")
+
+    print(
+        "📊 گزارش نهایی HUNTER-X V9"
+    )
+
     print("=" * 70)
 
     if not all_trades:
@@ -992,7 +1137,10 @@ def main():
         all_trades
     )
 
+    # --------------------------------------------------------
     # مرتب‌سازی
+    # --------------------------------------------------------
+
     trades_df.sort_values(
         "EntryTime",
         inplace=True
@@ -1000,8 +1148,6 @@ def main():
 
     # --------------------------------------------------------
     # Portfolio Lock
-    #
-    # فقط یک معامله در کل پورتفوی
     # --------------------------------------------------------
 
     accepted = []
@@ -1012,7 +1158,8 @@ def main():
 
         if (
             portfolio_free_time is None
-            or trade["EntryTime"]
+            or
+            trade["EntryTime"]
             >= portfolio_free_time
         ):
 
@@ -1047,19 +1194,22 @@ def main():
 
     wins = len(
         portfolio_df[
-            portfolio_df["Outcome"] == "WIN"
+            portfolio_df["Outcome"]
+            == "WIN"
         ]
     )
 
     losses = len(
         portfolio_df[
-            portfolio_df["Outcome"] == "LOSS"
+            portfolio_df["Outcome"]
+            == "LOSS"
         ]
     )
 
     timeouts = len(
         portfolio_df[
-            portfolio_df["Outcome"] == "TIMEOUT"
+            portfolio_df["Outcome"]
+            == "TIMEOUT"
         ]
     )
 
@@ -1107,7 +1257,9 @@ def main():
 
     peak = equity.cummax()
 
-    drawdown = equity - peak
+    drawdown = (
+        equity - peak
+    )
 
     max_dd = drawdown.min()
 
@@ -1116,12 +1268,15 @@ def main():
     # --------------------------------------------------------
 
     print("")
+
     print(
-        f"🔸 Candidate Trades: {len(trades_df)}"
+        f"🔸 Candidate Trades: "
+        f"{len(trades_df)}"
     )
 
     print(
-        f"🔸 Accepted Trades: {total}"
+        f"🔸 Accepted Trades: "
+        f"{total}"
     )
 
     print(
@@ -1137,23 +1292,28 @@ def main():
     )
 
     print(
-        f"🎯 Win Rate: {win_rate:.2f}%"
+        f"🎯 Win Rate: "
+        f"{win_rate:.2f}%"
     )
 
     print(
-        f"📈 Profit Factor: {profit_factor:.3f}"
+        f"📈 Profit Factor: "
+        f"{profit_factor:.3f}"
     )
 
     print(
-        f"💰 Net R: {total_r:.2f}R"
+        f"💰 Net R: "
+        f"{total_r:.2f}R"
     )
 
     print(
-        f"📊 Average Trade: {avg_r:.3f}R"
+        f"📊 Average Trade: "
+        f"{avg_r:.3f}R"
     )
 
     print(
-        f"📉 Max Drawdown: {max_dd:.2f}R"
+        f"📉 Max Drawdown: "
+        f"{max_dd:.2f}R"
     )
 
     # --------------------------------------------------------
@@ -1162,13 +1322,17 @@ def main():
 
     if len(portfolio_df) > 1:
 
-        first_date = portfolio_df[
-            "EntryTime"
-        ].min()
+        first_date = (
+            portfolio_df[
+                "EntryTime"
+            ].min()
+        )
 
-        last_date = portfolio_df[
-            "EntryTime"
-        ].max()
+        last_date = (
+            portfolio_df[
+                "EntryTime"
+            ].max()
+        )
 
         days = max(
             1,
@@ -1196,31 +1360,41 @@ def main():
     # --------------------------------------------------------
 
     print("")
+
     print("=" * 70)
-    print("📌 عملکرد به تفکیک نماد")
+
+    print(
+        "📌 عملکرد به تفکیک نماد"
+    )
+
     print("=" * 70)
 
     symbol_stats = []
 
-    for symbol, group in portfolio_df.groupby(
-        "Symbol"
+    for symbol, group in (
+        portfolio_df.groupby(
+            "Symbol"
+        )
     ):
 
         sw = len(
             group[
-                group["Outcome"] == "WIN"
+                group["Outcome"]
+                == "WIN"
             ]
         )
 
         sl = len(
             group[
-                group["Outcome"] == "LOSS"
+                group["Outcome"]
+                == "LOSS"
             ]
         )
 
         sto = len(
             group[
-                group["Outcome"] == "TIMEOUT"
+                group["Outcome"]
+                == "TIMEOUT"
             ]
         )
 
@@ -1257,15 +1431,18 @@ def main():
     # --------------------------------------------------------
 
     print("")
+
     print("=" * 70)
-    print("📌 LONG / SHORT")
+
+    print(
+        "📌 LONG / SHORT"
+    )
+
     print("=" * 70)
 
     side_stats = (
         portfolio_df
-        .groupby(
-            "Side"
-        )
+        .groupby("Side")
         .agg(
             Trades=("R", "count"),
             NetR=("R", "sum"),
@@ -1282,15 +1459,18 @@ def main():
     # --------------------------------------------------------
 
     print("")
+
     print("=" * 70)
-    print("📌 SETUP")
+
+    print(
+        "📌 SETUP"
+    )
+
     print("=" * 70)
 
     setup_stats = (
         portfolio_df
-        .groupby(
-            "Setup"
-        )
+        .groupby("Setup")
         .agg(
             Trades=("R", "count"),
             NetR=("R", "sum"),
@@ -1308,9 +1488,11 @@ def main():
 
     portfolio_df[
         "Month"
-    ] = portfolio_df[
-        "EntryTime"
-    ].dt.to_period("M")
+    ] = (
+        portfolio_df[
+            "EntryTime"
+        ].dt.to_period("M")
+    )
 
     monthly = (
         portfolio_df
@@ -1323,8 +1505,13 @@ def main():
     )
 
     print("")
+
     print("=" * 70)
-    print("📅 عملکرد ماهانه")
+
+    print(
+        "📅 عملکرد ماهانه"
+    )
+
     print("=" * 70)
 
     print(
@@ -1341,6 +1528,7 @@ def main():
     )
 
     print("")
+
     print(
         f"💾 فایل معاملات ذخیره شد: "
         f"{OUTPUT_CSV}"
@@ -1351,8 +1539,13 @@ def main():
     # --------------------------------------------------------
 
     print("")
+
     print("=" * 70)
-    print("🔍 ANTI-LOOKAHEAD AUDIT")
+
+    print(
+        "🔍 ANTI-LOOKAHEAD AUDIT"
+    )
+
     print("=" * 70)
 
     print(
@@ -1392,8 +1585,13 @@ def main():
     )
 
     print("")
+
     print("=" * 70)
-    print("✅ پایان بک‌تست")
+
+    print(
+        "✅ پایان بک‌تست"
+    )
+
     print("=" * 70)
 
 
