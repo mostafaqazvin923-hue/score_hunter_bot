@@ -59,11 +59,7 @@ WARMUP_DAYS = 35
 # RISK / RR
 # ============================================================
 
-# هر باخت = -1R
-# هر برد = +2R
 RR = 2.0
-
-# فقط برای محاسبه سایز پوزیشن
 RISK_PER_TRADE = 0.005
 
 FEE_RATE = 0.0004
@@ -191,17 +187,17 @@ def adx(df, length=14):
 
 
 # ============================================================
-# DOWNLOAD LBank
+# DOWNLOAD LBANK
 # ============================================================
 
-def download_lbank(symbol):
+def download_lbank(symbol, days):
 
     print(f"\n📥 Downloading {symbol} ...")
 
     now = datetime.now(timezone.utc)
 
     start = now - timedelta(
-        days=DAYS + WARMUP_DAYS
+        days=days + WARMUP_DAYS
     )
 
     start_ts = int(start.timestamp())
@@ -302,26 +298,12 @@ def download_lbank(symbol):
     )
 
     df = df[
-        (
-            df["timestamp"]
-            >= pd.Timestamp(
-                start,
-                tz="UTC"
-            )
-        )
+        (df["timestamp"] >= pd.Timestamp(start))
         &
-        (
-            df["timestamp"]
-            <= pd.Timestamp(
-                now,
-                tz="UTC"
-            )
-        )
+        (df["timestamp"] <= pd.Timestamp(now))
     ]
 
-    df = df.set_index(
-        "timestamp"
-    )
+    df = df.set_index("timestamp")
 
     print(
         f"📈 {symbol}: {len(df)} candles | "
@@ -389,32 +371,21 @@ def prepare_1h(df):
     x["body_ratio"] = (
         x["body"]
         /
-        x["range"].replace(
-            0,
-            np.nan
-        )
+        x["range"].replace(0, np.nan)
     )
 
     x["close_location"] = (
         (x["close"] - x["low"])
         /
-        x["range"].replace(
-            0,
-            np.nan
-        )
+        x["range"].replace(0, np.nan)
     )
 
     x["candle_atr"] = (
         x["range"]
         /
-        x["atr"].replace(
-            0,
-            np.nan
-        )
+        x["atr"].replace(0, np.nan)
     )
 
-    # IMPORTANT:
-    # فقط کندل‌های قبل از کندل فعلی
     x["prior_low"] = (
         x["low"]
         .shift(1)
@@ -535,13 +506,7 @@ def add_4h_context(df):
         14
     )
 
-    # ========================================================
-    # VERY IMPORTANT
-    #
-    # shift(1) means the 1H candle can ONLY see the previous
-    # CLOSED 4H candle.
-    # ========================================================
-
+    # فقط CLOSED 4H
     context = four[
         [
             "ema20_4h",
@@ -558,9 +523,7 @@ def add_4h_context(df):
         method="ffill"
     )
 
-    return df.join(
-        context
-    )
+    return df.join(context)
 
 
 # ============================================================
@@ -599,192 +562,96 @@ def generate_signal(df, i):
         if pd.isna(row[col]):
             return None
 
-    # ========================================================
-    # 4H TREND
-    # ========================================================
-
     long_4h = (
         row["ema20_4h"]
-        >
-        row["ema50_4h"]
-        >
-        row["ema200_4h"]
-        and
-        row["rsi_4h"] >= 50
-        and
-        row["adx_4h"] >= 18
+        > row["ema50_4h"]
+        > row["ema200_4h"]
+        and row["rsi_4h"] >= 50
+        and row["adx_4h"] >= 18
     )
 
     short_4h = (
         row["ema20_4h"]
-        <
-        row["ema50_4h"]
-        <
-        row["ema200_4h"]
-        and
-        row["rsi_4h"] <= 50
-        and
-        row["adx_4h"] >= 18
+        < row["ema50_4h"]
+        < row["ema200_4h"]
+        and row["rsi_4h"] <= 50
+        and row["adx_4h"] >= 18
     )
 
     if not long_4h and not short_4h:
         return None
 
-    # ========================================================
-    # 1H TREND
-    # ========================================================
-
     long_trend = (
         row["ema20"]
-        >
-        row["ema50"]
-        >
-        row["ema200"]
-        and
-        row["close"]
-        >
-        row["ema50"]
-        and
-        row["ema20"]
-        >
-        prev["ema20"]
+        > row["ema50"]
+        > row["ema200"]
+        and row["close"] > row["ema50"]
+        and row["ema20"] > prev["ema20"]
     )
 
     short_trend = (
         row["ema20"]
-        <
-        row["ema50"]
-        <
-        row["ema200"]
-        and
-        row["close"]
-        <
-        row["ema50"]
-        and
-        row["ema20"]
-        <
-        prev["ema20"]
+        < row["ema50"]
+        < row["ema200"]
+        and row["close"] < row["ema50"]
+        and row["ema20"] < prev["ema20"]
     )
 
     if not long_trend and not short_trend:
         return None
 
-    # ========================================================
-    # ADX
-    # ========================================================
-
     if row["adx"] < 16:
         return None
-
-    # ========================================================
-    # DON'T TRADE HUGE EXHAUSTION CANDLES
-    # ========================================================
 
     if row["candle_atr"] > 2.8:
         return None
 
-    # ========================================================
-    # VOLUME
-    # ========================================================
-
     volume_ok = (
         row["volume"]
-        >=
-        row["volume_ma"] * 1.05
+        >= row["volume_ma"] * 1.05
     )
 
-    # ========================================================
-    # LIQUIDITY SWEEP
-    # ========================================================
-
     long_sweep = (
-        row["low"]
-        <
-        row["prior_low"]
-        and
-        row["close"]
-        >
-        row["prior_low"]
+        row["low"] < row["prior_low"]
+        and row["close"] > row["prior_low"]
     )
 
     short_sweep = (
-        row["high"]
-        >
-        row["prior_high"]
-        and
-        row["close"]
-        <
-        row["prior_high"]
+        row["high"] > row["prior_high"]
+        and row["close"] < row["prior_high"]
     )
-
-    # ========================================================
-    # DISPLACEMENT
-    # ========================================================
 
     bullish_displacement = (
         row["close"] > row["open"]
-        and
-        row["body"]
-        >=
-        0.45 * row["atr"]
-        and
-        row["body_ratio"]
-        >=
-        0.55
-        and
-        row["close_location"]
-        >=
-        0.65
+        and row["body"] >= 0.45 * row["atr"]
+        and row["body_ratio"] >= 0.55
+        and row["close_location"] >= 0.65
     )
 
     bearish_displacement = (
         row["close"] < row["open"]
-        and
-        row["body"]
-        >=
-        0.45 * row["atr"]
-        and
-        row["body_ratio"]
-        >=
-        0.55
-        and
-        row["close_location"]
-        <=
-        0.35
+        and row["body"] >= 0.45 * row["atr"]
+        and row["body_ratio"] >= 0.55
+        and row["close_location"] <= 0.35
     )
-
-    # ========================================================
-    # RSI MOMENTUM
-    # ========================================================
 
     long_rsi = (
         row["rsi"] > 48
-        and
-        row["rsi"] > prev["rsi"]
+        and row["rsi"] > prev["rsi"]
     )
 
     short_rsi = (
         row["rsi"] < 52
-        and
-        row["rsi"] < prev["rsi"]
+        and row["rsi"] < prev["rsi"]
     )
-
-    # ========================================================
-    # LONG
-    # ========================================================
 
     if (
         long_4h
-        and
-        long_trend
-        and
-        long_sweep
-        and
-        bullish_displacement
-        and
-        long_rsi
-        and
-        volume_ok
+        and long_trend
+        and long_sweep
+        and bullish_displacement
+        and long_rsi
+        and volume_ok
     ):
 
         stop = (
@@ -792,8 +659,7 @@ def generate_signal(df, i):
                 row["low"],
                 row["prior_low"]
             )
-            -
-            0.20 * row["atr"]
+            - 0.20 * row["atr"]
         )
 
         return {
@@ -802,22 +668,13 @@ def generate_signal(df, i):
             "score": 10
         }
 
-    # ========================================================
-    # SHORT
-    # ========================================================
-
     if (
         short_4h
-        and
-        short_trend
-        and
-        short_sweep
-        and
-        bearish_displacement
-        and
-        short_rsi
-        and
-        volume_ok
+        and short_trend
+        and short_sweep
+        and bearish_displacement
+        and short_rsi
+        and volume_ok
     ):
 
         stop = (
@@ -825,8 +682,7 @@ def generate_signal(df, i):
                 row["high"],
                 row["prior_high"]
             )
-            +
-            0.20 * row["atr"]
+            + 0.20 * row["atr"]
         )
 
         return {
@@ -874,10 +730,6 @@ def simulate_symbol(
             i += 1
             continue
 
-        # ====================================================
-        # ENTRY = NEXT CANDLE OPEN
-        # ====================================================
-
         entry_index = i + 1
 
         entry_candle = df.iloc[
@@ -890,21 +742,18 @@ def simulate_symbol(
 
         side = signal["side"]
 
-        # Entry slippage
         if side == "LONG":
 
             entry = (
                 raw_entry
-                *
-                (1 + SLIPPAGE_RATE)
+                * (1 + SLIPPAGE_RATE)
             )
 
         else:
 
             entry = (
                 raw_entry
-                *
-                (1 - SLIPPAGE_RATE)
+                * (1 - SLIPPAGE_RATE)
             )
 
         stop = signal["stop"]
@@ -926,54 +775,35 @@ def simulate_symbol(
             i += 1
             continue
 
-        # Don't allow ridiculous stops.
         if risk_distance > (
-            1.6 * float(
-                df.iloc[i]["atr"]
-            )
+            1.6 * float(df.iloc[i]["atr"])
         ):
 
             i += 1
             continue
 
-        # ====================================================
-        # FIXED RR 1:2
-        # ====================================================
-
         if side == "LONG":
 
             target = (
                 entry
-                +
-                RR * risk_distance
+                + RR * risk_distance
             )
 
         else:
 
             target = (
                 entry
-                -
-                RR * risk_distance
+                - RR * risk_distance
             )
-
-        # ====================================================
-        # SIMULATE AFTER ENTRY
-        #
-        # This is NOT lookahead for signal generation.
-        # The signal was already created at candle i.
-        # We are only resolving the trade after entry.
-        # ====================================================
 
         risk_cash = (
             equity
-            *
-            RISK_PER_TRADE
+            * RISK_PER_TRADE
         )
 
         qty = (
             risk_cash
-            /
-            risk_distance
+            / risk_distance
         )
 
         result = None
@@ -992,43 +822,24 @@ def simulate_symbol(
 
             candle = df.iloc[j]
 
-            high = float(
-                candle["high"]
-            )
-
-            low = float(
-                candle["low"]
-            )
+            high = float(candle["high"])
+            low = float(candle["low"])
 
             if side == "LONG":
 
-                hit_sl = (
-                    low <= stop
-                )
-
-                hit_tp = (
-                    high >= target
-                )
+                hit_sl = low <= stop
+                hit_tp = high >= target
 
             else:
 
-                hit_sl = (
-                    high >= stop
-                )
+                hit_sl = high >= stop
+                hit_tp = low <= target
 
-                hit_tp = (
-                    low <= target
-                )
-
-            # Conservative:
-            # If both happen in same candle,
-            # assume SL happened first.
             if hit_sl and hit_tp:
 
                 result = "SL"
                 exit_price = stop
                 exit_index = j
-
                 break
 
             if hit_sl:
@@ -1036,7 +847,6 @@ def simulate_symbol(
                 result = "SL"
                 exit_price = stop
                 exit_index = j
-
                 break
 
             if hit_tp:
@@ -1044,18 +854,11 @@ def simulate_symbol(
                 result = "TP"
                 exit_price = target
                 exit_index = j
-
                 break
-
-        # ====================================================
-        # TIMEOUT
-        # ====================================================
 
         if result is None:
 
-            exit_index = (
-                max_end - 1
-            )
+            exit_index = max_end - 1
 
             exit_price = float(
                 df.iloc[
@@ -1064,10 +867,6 @@ def simulate_symbol(
             )
 
             result = "TIME"
-
-        # ====================================================
-        # EXIT SLIPPAGE
-        # ====================================================
 
         if side == "LONG":
 
@@ -1080,10 +879,6 @@ def simulate_symbol(
             exit_price *= (
                 1 + SLIPPAGE_RATE
             )
-
-        # ====================================================
-        # PNL
-        # ====================================================
 
         if side == "LONG":
 
@@ -1099,33 +894,25 @@ def simulate_symbol(
 
         entry_fee = (
             entry
-            *
-            qty
-            *
-            FEE_RATE
+            * qty
+            * FEE_RATE
         )
 
         exit_fee = (
             abs(exit_price)
-            *
-            qty
-            *
-            FEE_RATE
+            * qty
+            * FEE_RATE
         )
 
         net_pnl = (
             gross_pnl
-            -
-            entry_fee
-            -
-            exit_fee
+            - entry_fee
+            - exit_fee
         )
 
-        # R based on actual net result.
         r_multiple = (
             net_pnl
-            /
-            risk_cash
+            / risk_cash
         )
 
         equity += net_pnl
@@ -1146,19 +933,15 @@ def simulate_symbol(
             "PnL": net_pnl,
             "bars_held": (
                 exit_index
-                -
-                entry_index
-                +
-                1
+                - entry_index
+                + 1
             ),
             "score": signal["score"],
             "equity": equity
         })
 
-        # Never immediately enter on the same exit.
         cooldown = 2
 
-        # Jump to after the trade.
         i = exit_index + 1
 
     return trades
@@ -1178,9 +961,7 @@ def report(trades):
 
         return
 
-    df = pd.DataFrame(
-        trades
-    )
+    df = pd.DataFrame(trades)
 
     wins = df[
         df["result"] == "TP"
@@ -1196,26 +977,21 @@ def report(trades):
 
     wl = (
         len(wins)
-        +
-        len(losses)
+        + len(losses)
     )
 
     win_rate_wl = (
         len(wins)
-        /
-        wl
-        *
-        100
+        / wl
+        * 100
         if wl
         else 0
     )
 
     win_rate_all = (
         len(wins)
-        /
-        len(df)
-        *
-        100
+        / len(df)
+        * 100
     )
 
     net_r = df["R"].sum()
@@ -1232,15 +1008,12 @@ def report(trades):
 
     profit_factor = (
         gross_win
-        /
-        gross_loss
+        / gross_loss
         if gross_loss > 0
         else float("inf")
     )
 
-    expectancy = (
-        df["R"].mean()
-    )
+    expectancy = df["R"].mean()
 
     equity = df[
         "equity"
@@ -1254,8 +1027,7 @@ def report(trades):
 
     max_dd = (
         abs(drawdown.min())
-        *
-        100
+        * 100
     )
 
     print("\n")
@@ -1320,10 +1092,6 @@ def report(trades):
 
     print("=" * 75)
 
-    # ========================================================
-    # SYMBOL REPORT
-    # ========================================================
-
     print("\n📊 SYMBOL REPORT")
 
     rows = []
@@ -1346,8 +1114,7 @@ def report(trades):
 
         wl_count = (
             len(w)
-            +
-            len(l)
+            + len(l)
         )
 
         rows.append({
@@ -1358,27 +1125,21 @@ def report(trades):
             "Timeouts": len(t),
             "WinRate_WL": (
                 len(w)
-                /
-                wl_count
-                *
-                100
+                / wl_count
+                * 100
                 if wl_count
                 else 0
             ),
             "WinRate_All": (
                 len(w)
-                /
-                len(group)
-                *
-                100
+                / len(group)
+                * 100
             ),
             "NetR": group["R"].sum(),
             "AvgR": group["R"].mean()
         })
 
-    symbol_report = pd.DataFrame(
-        rows
-    )
+    symbol_report = pd.DataFrame(rows)
 
     symbol_report = (
         symbol_report
@@ -1394,10 +1155,6 @@ def report(trades):
         )
     )
 
-    # ========================================================
-    # SAVE
-    # ========================================================
-
     df.to_csv(
         "HUNTER_X_CLEAN_V6_TRADES.csv",
         index=False
@@ -1408,9 +1165,7 @@ def report(trades):
         index=False
     )
 
-    print(
-        "\n💾 Saved:"
-    )
+    print("\n💾 Saved:")
 
     print(
         "HUNTER_X_CLEAN_V6_TRADES.csv"
@@ -1427,6 +1182,10 @@ def report(trades):
 
 def main():
 
+    # FIX:
+    # global must appear BEFORE the first use of DAYS
+    global DAYS
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -1436,8 +1195,6 @@ def main():
     )
 
     args = parser.parse_args()
-
-    global DAYS
 
     DAYS = args.days
 
@@ -1490,8 +1247,7 @@ def main():
 
             cache_file = (
                 cache_dir
-                /
-                f"{symbol}_{DAYS}.csv"
+                / f"{symbol}_{DAYS}.csv"
             )
 
             if cache_file.exists():
@@ -1522,15 +1278,11 @@ def main():
             else:
 
                 df = download_lbank(
-                    symbol
+                    symbol,
+                    DAYS
                 )
 
-                df.reset_index().rename(
-                    columns={
-                        "timestamp":
-                        "timestamp"
-                    }
-                ).to_csv(
+                df.reset_index().to_csv(
                     cache_file,
                     index=False
                 )
