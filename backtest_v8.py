@@ -30,7 +30,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها برای استراتژی حرفه‌ای ایچیموکو (ICHIMOKU PRO)')
+print('📥 دریافت داده‌ها برای استراتژی ایچیموکو (همراه با ریسک‌فری و فیوز توقف)')
 print('============================================================')
 
 data_1h = {}
@@ -122,7 +122,7 @@ for symbol, df1h in data_1h.items():
   df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
   processed_data[symbol] = {'1h': df1h, '4h': df4h.set_index('Date')}
 
-print('⚙️ شروع اجرای بک‌تست استراتژی ایچیموکو پرو...')
+print('⚙️ شروع اجرای بک‌تست با قوانین جدید ریسک‌فری و فیوز توقف...')
 
 all_trades = []
 SLIPPAGE = 0.0003
@@ -137,6 +137,7 @@ for symbol, dat in processed_data.items():
   stop_loss = 0.0
   take_profit = 0.0
   entry_index = 0
+  is_breakeven = False
 
   for i in range(60, len(df1h)):
     c1h = df1h.iloc[i]
@@ -147,16 +148,43 @@ for symbol, dat in processed_data.items():
       continue
     r4h = df4h_idx.loc[t4h_time]
 
+    # مدیریت پوزیشن باز همراه با چک کردن ریسک‌فری (۵۰٪ مسیر تا TP)
     if position is not None:
       candles_held = i - entry_index
       if position == 'LONG':
-        if candles_held >= 24 or c1h['Low'] <= stop_loss or c1h['High'] >= take_profit:
-          outcome = 'LOSS' if c1h['Low'] <= stop_loss else 'WIN'
-          r_real = (
-              -1.0 - (FEE_RATE * 2)
-              if outcome == 'LOSS'
-              else 2.0 - (FEE_RATE * 2)
-          )
+        # بررسی ریسک‌فری: اگر High به نصف فاصله TP رسید
+        if not is_breakeven and c1h['High'] >= entry_price + (
+            0.5 * (take_profit - entry_price)
+        ):
+          stop_loss = entry_price  # قفل شدن استاپ روی نقطه ورود
+          is_breakeven = True
+
+        if (
+            candles_held >= 24
+            or c1h['Low'] <= stop_loss
+            or c1h['High'] >= take_profit
+        ):
+          if c1h['High'] >= take_profit:
+            outcome = 'WIN'
+            r_real = 2.0 - (FEE_RATE * 2)
+          elif c1h['Low'] <= stop_loss:
+            outcome = 'WIN' if is_breakeven and stop_loss == entry_price else 'LOSS'
+            r_real = (
+                0.0 - (FEE_RATE * 2)
+                if (is_breakeven and stop_loss == entry_price)
+                else -1.0 - (FEE_RATE * 2)
+            )
+          else:  # Time Stop
+            ret_val = (c1h['Close'] - entry_price) / (
+                entry_price - (stop_loss if stop_loss != entry_price else entry_price - 0.01)
+            )
+            outcome = 'WIN' if c1h['Close'] > entry_price else 'LOSS'
+            r_real = (
+                max(0.0, ret_val) - (FEE_RATE * 2)
+                if outcome == 'WIN'
+                else -1.0 - (FEE_RATE * 2)
+            )
+
           all_trades.append({
               'Timestamp': c1h['Date'],
               'Symbol': symbol,
@@ -165,14 +193,33 @@ for symbol, dat in processed_data.items():
               'Return': r_real,
           })
           position = None
+
       elif position == 'SHORT':
-        if candles_held >= 24 or c1h['High'] >= stop_loss or c1h['Low'] <= take_profit:
-          outcome = 'LOSS' if c1h['High'] >= stop_loss else 'WIN'
-          r_real = (
-              -1.0 - (FEE_RATE * 2)
-              if outcome == 'LOSS'
-              else 2.0 - (FEE_RATE * 2)
-          )
+        if not is_breakeven and c1h['Low'] <= entry_price - (
+            0.5 * (entry_price - take_profit)
+        ):
+          stop_loss = entry_price
+          is_breakeven = True
+
+        if (
+            candles_held >= 24
+            or c1h['High'] >= stop_loss
+            or c1h['Low'] <= take_profit
+        ):
+          if c1h['Low'] <= take_profit:
+            outcome = 'WIN'
+            r_real = 2.0 - (FEE_RATE * 2)
+          elif c1h['High'] >= stop_loss:
+            outcome = 'WIN' if is_breakeven and stop_loss == entry_price else 'LOSS'
+            r_real = (
+                0.0 - (FEE_RATE * 2)
+                if (is_breakeven and stop_loss == entry_price)
+                else -1.0 - (FEE_RATE * 2)
+            )
+          else:
+            outcome = 'WIN' if c1h['Close'] < entry_price else 'LOSS'
+            r_real = 0.0 - (FEE_RATE * 2) if outcome == 'WIN' else -1.0 - (FEE_RATE * 2)
+
           all_trades.append({
               'Timestamp': c1h['Date'],
               'Symbol': symbol,
@@ -182,6 +229,7 @@ for symbol, dat in processed_data.items():
           })
           position = None
 
+    # سیگنال‌های ورود جدید (بدون تغییر در منطق اصلی)
     if position is None:
       cloud_top_1h = max(prev['Senkou_A'], prev['Senkou_B'])
       cloud_bot_1h = min(prev['Senkou_A'], prev['Senkou_B'])
@@ -202,6 +250,7 @@ for symbol, dat in processed_data.items():
             take_profit = entry_price + (2.0 * risk)
             position = 'LONG'
             entry_index = i
+            is_breakeven = False
 
       elif r4h.get('Trend_Short', False) and prev['Close'] < cloud_bot_1h:
         tk_cross_short = (prev['Tenkan'] < prev['Kijun']) and (
@@ -219,56 +268,78 @@ for symbol, dat in processed_data.items():
             take_profit = entry_price - (2.0 * risk)
             position = 'SHORT'
             entry_index = i
+            is_breakeven = False
 
 print('\n============================================================')
-print('📊 گزارش نهایی استراتژی ایچیموکو (ICHIMOKU PRO-TREND)')
+print('📊 گزارش نهایی (با اعمال ریسک‌فری و فیلتر ضرر متوالی)')
 print('============================================================')
 
 if all_trades:
   trades_df = pd.DataFrame(all_trades)
   trades_df.sort_values('Timestamp', inplace=True)
 
-  tot_trades = len(trades_df)
-  tot_wins = len(trades_df[trades_df['Outcome'] == 'WIN'])
-  tot_losses = len(trades_df[trades_df['Outcome'] == 'LOSS'])
-  win_rate = (tot_wins / tot_trades) * 100 if tot_trades > 0 else 0
-  net_r = trades_df['Return'].sum()
+  # اعمال فیلتر توقف ۲۴ ساعته پس از ۳ باخت متوالی در کل پورتفوی
+  filtered_trades = []
+  consecutive_losses = 0
+  pause_until = None
 
-  # محاسبه بیشترین بردهای متوالی و باخت‌های متوالی بر اساس زمان انجام معاملات در کل پورتفوی
-  outcomes = trades_df['Outcome'].tolist()
-  max_wins = 0
-  max_losses = 0
-  curr_wins = 0
-  curr_losses = 0
+  for idx, row in trades_df.iterrows():
+    current_time = row['Timestamp']
 
-  for out in outcomes:
-    if out == 'WIN':
-      curr_wins += 1
-      curr_losses = 0
-      if curr_wins > max_wins:
-        max_wins = curr_wins
+    # اگر در حالت توقف هستیم، بررسی کنیم که آیا زمان توقف به پایان رسیده یا نه
+    if pause_until is not None:
+      if current_time < pause_until:
+        continue  # این معامله به دلیل قانون توقف رد می‌شود
+      else:
+        pause_until = None
+        consecutive_losses = 0
+
+    filtered_trades.append(row)
+
+    if row['Outcome'] == 'LOSS':
+      consecutive_losses += 1
+      if consecutive_losses >= 3:
+        pause_until = current_time + timedelta(hours=24)
+        consecutive_losses = 0
     else:
-      curr_losses += 1
-      curr_wins = 0
-      if curr_losses > max_losses:
-        max_losses = curr_losses
+      consecutive_losses = 0
 
-  print(f'🔸 تعداد کل معاملات پورتفوی: {tot_trades}')
-  print(f'🔸 معاملات برنده (WIN): {tot_wins}')
-  print(f'🔸 معاملات بازنده (LOSS): {tot_losses}')
-  print(f'🔥 **حداکثر سودهای متوالی (Max Consecutive Wins):** {max_wins}')
-  print(
-      f'❄️ **حداکثر ضررهای متوالی (Max Consecutive Losses):** {max_losses}'
-  )
-  print(f'🎯 **وین‌ریت تجمیعی پورتفوی:** {win_rate:.2f}%')
-  print(f'💰 **مجموع بازدهی خالص:** {net_r:.2f}R')
+  if filtered_trades:
+    f_df = pd.DataFrame(filtered_trades)
+    tot_trades = len(f_df)
+    tot_wins = len(f_df[f_df['Outcome'] == 'WIN'])
+    tot_losses = len(f_df[f_df['Outcome'] == 'LOSS'])
+    win_rate = (tot_wins / tot_trades) * 100 if tot_trades > 0 else 0
+    net_r = f_df['Return'].sum()
 
-  print('\nتفکیک عملکرد به تفکیک هر نماد:')
-  print(
-      trades_df.groupby('Symbol')['Outcome']
-      .value_counts()
-      .unstack(fill_value=0)
-  )
+    # محاسبه استریک‌ها روی لیست فیلتر شده
+    outcomes = f_df['Outcome'].tolist()
+    max_wins = 0
+    max_losses = 0
+    curr_wins = 0
+    curr_losses = 0
+
+    for out in outcomes:
+      if out == 'WIN':
+        curr_wins += 1
+        curr_losses = 0
+        if curr_wins > max_wins:
+          max_wins = curr_wins
+      else:
+        curr_losses += 1
+        curr_wins = 0
+        if curr_losses > max_losses:
+          max_losses = curr_losses
+
+    print(f'🔸 تعداد کل معاملات پس از اعمال فیلتر توقف: {tot_trades}')
+    print(f'🔸 معاملات برنده (WIN): {tot_wins}')
+    print(f'🔸 معاملات بازنده (LOSS): {tot_losses}')
+    print(f'🔥 **حداکثر سودهای متوالی:** {max_wins}')
+    print(f'❄️ **حداکثر ضررهای متوالی (کنترل شده با فیوز):** {max_losses}')
+    print(f'🎯 **وین‌ریت تجمیعی پورتفوی:** {win_rate:.2f}%')
+    print(f'💰 **مجموع بازدهی خالص:** {net_r:.2f}R')
+  else:
+    print('⚠️ تمامی معاملات توسط فیلتر توقف مسدود شدند.')
 else:
   print('⚠️ معامله‌ای ثبت نشد.')
 
