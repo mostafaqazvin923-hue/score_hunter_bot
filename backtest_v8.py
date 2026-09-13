@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای سیستم هم‌راستایی چند تایم‌فریمی (MTF Trend + Pullback)")
+print("📥 دانلود داده‌ها برای سیستم MTF Trend + Pullback (نسخه R:R 1:2.5)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_mtf_data.csv"
+    filename_1h = f"{symbol}_1h_mtf_rr25_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -91,7 +91,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور هم‌راستایی روند و پولبک مهندسی‌شده (R:R 1:1)")
+print("🚀 اجرای موتور هم‌راستایی روند و پولبک با R:R 1:2.5")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -102,7 +102,6 @@ for symbol, df1h in data_1h.items():
         
     df1h = calculate_indicators(df1h)
     
-    # ساخت تایم‌فریم 4 ساعته برای تعیین جهت اصلی روند
     df4h = df1h.set_index('Date').resample('4H').agg({
         'Open': 'first',
         'High': 'max',
@@ -129,16 +128,13 @@ for symbol, df1h in data_1h.items():
             
         r4h = df4h_indexed.loc[t4h_time]
         
-        # شرط اصلی: روند 4 ساعته باید کاملاً صعودی یا نزولیِ پرقدرت باشد
         is_4h_bullish = (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_50'] > r4h['EMA_200'])
         is_4h_bearish = (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_50'] < r4h['EMA_200'])
         
         if not is_4h_bullish and not is_4h_bearish:
             continue
             
-        # بررسی پولبک در تایم 1 ساعته به سمت میانگین متحرک 50 (EMA_50) همراه با RSI مناسب
         if is_4h_bullish:
-            # قیمت به محدوده EMA_50 پولبک زده و حالا دارد برمی‌گردد بالا
             is_pullback = (c1h['Low'] <= c1h['EMA_50'] * 1.005) and (c1h['Close'] > c1h['Open']) and (c1h['RSI'] > 45) and (c1h['RSI'] < 65)
             
             if is_pullback:
@@ -149,11 +145,12 @@ for symbol, df1h in data_1h.items():
                 if risk <= 0 or (risk / entry_price) > 0.04:
                     continue
                     
-                tp = entry_price + (1.0 * risk) # ریسک به ریوارد دقیقاً ۱ به ۱
+                # تنظیم ریسک به ریوارد روی 1 به 2.5
+                tp = entry_price + (2.5 * risk)
                 
                 outcome = 'OPEN'
                 exit_idx = i + 1
-                for j in range(i + 1, min(i + 35, len(df1h))):
+                for j in range(i + 1, min(i + 50, len(df1h))):
                     f_c = df1h.iloc[j]
                     exit_idx = j
                     if f_c['Low'] <= sl:
@@ -182,11 +179,12 @@ for symbol, df1h in data_1h.items():
                 if risk <= 0 or (risk / entry_price) > 0.04:
                     continue
                     
-                tp = entry_price - (1.0 * risk) # ریسک به ریوارد دقیقاً ۱ به ۱
+                # تنظیم ریسک به ریوارد روی 1 به 2.5
+                tp = entry_price - (2.5 * risk)
                 
                 outcome = 'OPEN'
                 exit_idx = i + 1
-                for j in range(i + 1, min(i + 35, len(df1h))):
+                for j in range(i + 1, min(i + 50, len(df1h))):
                     f_c = df1h.iloc[j]
                     exit_idx = j
                     if f_c['High'] >= sl:
@@ -205,7 +203,7 @@ for symbol, df1h in data_1h.items():
                     locked_until_index = exit_idx
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی هم‌راستایی روند MTF (R:R 1:1)")
+print("📊 گزارش نهایی پورتفوی MTF با ریسک به ریوارد 1:2.5")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -214,13 +212,14 @@ if all_portfolio_trades:
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
     portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    net_profit_score = (total_wins * 1.0) - total_losses
+    # محاسبه سود خالص با ضریب 2.5R برای هر برد
+    net_profit_score = (total_wins * 2.5) - total_losses
     
     print(f"🔸 تعداد کل معاملات کل سبد (پورتفوی): {total_trades}")
     print(f"🔸 کل معاملات برنده (WIN): {total_wins}")
     print(f"🔸 کل معاملات بازنده (LOSS): {total_losses}")
     print(f"🎯 **وین‌ریت تجمیعی کل پورتفوی (Portfolio Win Rate):** {portfolio_win_rate:.2f}%")
-    print(f"💰 امتیاز سودآوری خالص (Net Profit Score): {net_profit_score:.2f}R")
+    print(f"💰 امتیاز سودآوری خالص (Net Profit Score با R:R 1:2.5): {net_profit_score:.2f}R")
     
     print("\nتفکیک عملکرد به تفکیک هر نماد:")
     print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
