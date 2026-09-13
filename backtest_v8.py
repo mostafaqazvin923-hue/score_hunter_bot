@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته (ریسک به ریوارد ثابت روی 1 به 1.5)")
+print("📥 دانلود داده‌های 1 ساعته با تاییدیه مومنتوم قدرتمند (R:R ثابت 1:1.5)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_fixed_rr_data.csv"
+    filename_1h = f"{symbol}_1h_momentum_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -98,7 +98,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست با ریسک به ریوارد 1:1.5 ثابت")
+print("🚀 اجرای موتور بک‌تست با تاییدیه مومنتوم و R:R ثابت 1:1.5")
 print("============================================================")
 
 all_portfolio_trades = {}
@@ -139,8 +139,8 @@ for symbol, df1h in data_1h.items():
         is_uptrend_4h = (r4h['Close'] > r4h['EMA_200']) and (r4h['EMA_20'] > r4h['EMA_50'])
         is_downtrend_4h = (r4h['Close'] < r4h['EMA_200']) and (r4h['EMA_20'] < r4h['EMA_50'])
         
-        is_long_pullback = is_uptrend_4h and (c1h['Close'] < c1h['BB_Lower']) and (c1h['RSI'] < 30)
-        is_short_pullback = is_downtrend_4h and (c1h['Close'] > c1h['BB_Upper']) and (c1h['RSI'] > 70)
+        is_long_pullback = is_uptrend_4h and (c1h['Close'] < c1h['BB_Lower']) and (c1h['RSI'] < 28)
+        is_short_pullback = is_downtrend_4h and (c1h['Close'] > c1h['BB_Upper']) and (c1h['RSI'] > 72)
         
         if not is_long_pullback and not is_short_pullback:
             continue
@@ -148,7 +148,12 @@ for symbol, df1h in data_1h.items():
         next_c = df1h.iloc[i + 1]
         
         if is_long_pullback:
-            if next_c['Close'] <= next_c['Open']:
+            # تاییدیه مومنتوم قدرتمند: بدنه کندل تایید باید بزرگ‌تر از نصف رنجش باشد و حجم بالا بخورد
+            body_size = abs(next_c['Close'] - next_c['Open'])
+            candle_rng = next_c['High'] - next_c['Low']
+            avg_vol = df1h.iloc[i-15:i]['Volume'].mean()
+            
+            if candle_rng == 0 or (body_size / candle_rng < 0.5) or (next_c['Close'] <= next_c['Open']) or (next_c['Volume'] < avg_vol):
                 continue
                 
             entry_price = next_c['Close']
@@ -187,7 +192,11 @@ for symbol, df1h in data_1h.items():
                     locked_until_index = exit_idx
                     
         elif is_short_pullback:
-            if next_c['Close'] >= next_c['Open']:
+            body_size = abs(next_c['Close'] - next_c['Open'])
+            candle_rng = next_c['High'] - next_c['Low']
+            avg_vol = df1h.iloc[i-15:i]['Volume'].mean()
+            
+            if candle_rng == 0 or (body_size / candle_rng < 0.5) or (next_c['Close'] >= next_c['Open']) or (next_c['Volume'] < avg_vol):
                 continue
                 
             entry_price = next_c['Close']
@@ -229,7 +238,7 @@ for symbol, df1h in data_1h.items():
         all_portfolio_trades[symbol] = symbol_trades
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی با ریسک به ریوارد 1:1.5 ثابت")
+print("📊 گزارش نهایی پورتفوی با تاییدیه مومنتوم و R:R ثابت 1:1.5")
 print("============================================================")
 
 flat_trades = []
@@ -242,7 +251,6 @@ if flat_trades:
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
     win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    # محاسبه سود خالص با ضریب 1.5 برای بردها
     net_profit = (total_wins * 1.5) - total_losses
     
     print(f"🔸 تعداد کل معاملات پورتفو: {total_trades}")
