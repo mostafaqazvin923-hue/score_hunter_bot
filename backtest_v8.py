@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (منطق CHoCH + حجم بالا)")
+print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (نسخه اصلاح‌شده و متعادل)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_choch_data.csv"
+    filename_1h = f"{symbol}_1h_balanced_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -100,7 +100,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست با استراتژی CHoCH + حجم فوق‌سنگین")
+print("🚀 اجرای موتور بک‌تست با منطق اصلاح‌شده و متعادل")
 print("============================================================")
 
 all_portfolio_trades = {}
@@ -111,7 +111,8 @@ for symbol, df1h in data_1h.items():
         
     df1h = calculate_indicators(df1h)
     
-    df4h = df1h.set_index('Date').resample('4H').agg({
+    # استفاده از '4h' به جای '4H' برای جلوگیری از هشدار پانداس
+    df4h = df1h.set_index('Date').resample('4h').agg({
         'Open': 'first',
         'High': 'max',
         'Low': 'min',
@@ -142,9 +143,9 @@ for symbol, df1h in data_1h.items():
         ema50_4h = r4h['EMA_50']
         ema200_4h = r4h['EMA_200']
         
-        # رژیم روند 4 ساعته
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and (r4h['ADX'] >= 25)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 25)
+        # رژیم روند 4 ساعته با ADX مناسب
+        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and (r4h['ADX'] >= 22)
+        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 22)
         
         if not is_long_regime and not is_short_regime:
             continue
@@ -154,19 +155,15 @@ for symbol, df1h in data_1h.items():
         struct_low = lookback_slice['Low'].min()
         avg_vol = lookback_slice['Volume'].mean()
         
-        # 1. مرحله اسویپ نقدینگی در گذشته نزدیک (۱۰ کندل گذشته)
-        recent_slice = df1h.iloc[i-10:i]
-        sweep_low = recent_slice['Low'].min()
-        sweep_high = recent_slice['High'].max()
+        # تشخیص اسویپ نقدینگی در چند کندل اخیر + شکست ساختار با حجم مناسب (1.4 برابر)
+        recent_slice = df1h.iloc[i-8:i]
+        has_swept_low = recent_slice['Low'].min() < struct_low
+        has_swept_high = recent_slice['High'].max() > struct_high
         
-        has_swept_low = sweep_low < struct_low
-        has_swept_high = sweep_high > struct_high
+        is_signal_long = has_swept_low and (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 1.4) and (c1h['RSI'] > 50)
+        is_signal_short = has_swept_high and (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 1.4) and (c1h['RSI'] < 50)
         
-        # 2. تاییدیه CHoCH (تغییر ساختار با حجم فوق‌سنگین >= 2.0 برابر میانگین)
-        is_choch_long = has_swept_low and (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 2.0) and (c1h['RSI'] > 55)
-        is_choch_short = has_swept_high and (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 2.0) and (c1h['RSI'] < 45)
-        
-        if is_long_regime and is_choch_long:
+        if is_long_regime and is_signal_long:
             entry_price = c1h['Close']
             sl = recent_slice['Low'].min() - (0.3 * c1h['ATR'])
             risk = entry_price - sl
@@ -201,7 +198,7 @@ for symbol, df1h in data_1h.items():
                     })
                     locked_until_index = exit_idx
                     
-        elif is_short_regime and is_choch_short:
+        elif is_short_regime and is_signal_short:
             entry_price = c1h['Close']
             sl = recent_slice['High'].max() + (0.3 * c1h['ATR'])
             risk = sl - entry_price
@@ -240,7 +237,7 @@ for symbol, df1h in data_1h.items():
         all_portfolio_trades[symbol] = symbol_trades
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی با منطق CHoCH + حجم فوق‌سنگین")
+print("📊 گزارش نهایی پورتفوی (نسخه اصلاح‌شده و متوازن)")
 print("============================================================")
 
 flat_trades = []
