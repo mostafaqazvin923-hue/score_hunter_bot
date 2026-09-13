@@ -23,7 +23,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای موتور تک‌تیرانداز (Macro Trend + Liquidity Sweep + R:R 1:2.5)")
+print("📥 دانلود داده‌ها برای موتور تک‌تیرانداز (Macro Trend + Liquidity Sweep + R:R 1:2)")
 print("============================================================")
 
 data_1h = {}
@@ -58,7 +58,7 @@ def calculate_indicators(df):
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     return df
 
-print("\n🚀 اجرای موتور تک‌تیرانداز با ریسک به ریوارد ۱ به ۲.۵...")
+print("\n🚀 اجرای موتور تک‌تیرانداز با ریسک به ریوارد ۱ به ۲...")
 
 all_portfolio_trades = []
 
@@ -99,8 +99,8 @@ for symbol, df1h in data_1h.items():
             
             if risk <= 0 or (risk / entry_price) > 0.035: continue
             
-            # تغییر ریسک به ریوارد به ۱ به ۲.۵
-            tp = entry_price + (2.5 * risk)
+            # تنظیم ریسک به ریوارد روی ۱ به ۲
+            tp = entry_price + (2.0 * risk)
             
             outcome = 'OPEN'
             exit_idx = i + 1
@@ -128,8 +128,8 @@ for symbol, df1h in data_1h.items():
             
             if risk <= 0 or (risk / entry_price) > 0.035: continue
             
-            # تغییر ریسک به ریوارد به ۱ به ۲.۵
-            tp = entry_price - (2.5 * risk)
+            # تنظیم ریسک به ریوارد روی ۱ به ۲
+            tp = entry_price - (2.0 * risk)
             
             outcome = 'OPEN'
             exit_idx = i + 1
@@ -148,7 +148,7 @@ for symbol, df1h in data_1h.items():
                 locked_until_index = exit_idx
 
 print("\n============================================================")
-print("📊 گزارش نهایی موتور تک‌تیرانداز (Sniper Macro Liquidity + R:R 1:2.5)")
+print("📊 گزارش نهایی موتور تک‌تیرانداز (Sniper Macro Liquidity + R:R 1:2)")
 print("============================================================")
 if all_portfolio_trades:
     pf_df = pd.DataFrame(all_portfolio_trades)
@@ -156,11 +156,11 @@ if all_portfolio_trades:
     losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
     total = len(pf_df)
     win_rate = (wins / total) * 100 if total > 0 else 0
-    net_score = (wins * 2.5) - losses
+    net_score = (wins * 2.0) - losses
     
     print(pf_df['Outcome'].value_counts())
     print(f"🔸 تعداد کل معاملات: {total}")
     print(f"🎯 وین‌ریت جدید: {win_rate:.2f}%")
-    print(f"💰 امتیاز سود خالص (Net Score با R:R 1:2.5): {net_score:.2f}R")
+    print(f"💰 امتیاز سود خالص (Net Score با R:R 1:2): {net_score:.2f}R")
 else:
     print("معامله‌ای ثبت نشد.")
