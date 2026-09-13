@@ -30,7 +30,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها برای نسخه بهینه‌شده HUNTER-X LBR')
+print('📥 دریافت داده‌ها برای استراتژی حرفه‌ای ایچیموکو (ICHIMOKU PRO)')
 print('============================================================')
 
 data_1h = {}
@@ -67,40 +67,42 @@ for symbol, lbank_symbol in SYMBOLS.items():
     data_1h[symbol] = df1h
 
 
-def calculate_indicators_1h(df):
+def calculate_ichimoku(df):
   df = df.copy()
-  df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-  df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+  # Tenkan-sen (Conversion Line): (9-period high + 9-period low) / 2
+  period9_high = df['High'].rolling(window=9).max()
+  period9_low = df['Low'].rolling(window=9).min()
+  df['Tenkan'] = (period9_high + period9_low) / 2
 
-  df['L20'] = df['Low'].shift(1).rolling(window=20).min()
-  df['H20'] = df['High'].shift(1).rolling(window=20).max()
-  df['H10'] = df['High'].shift(1).rolling(window=10).max()
-  df['L10'] = df['Low'].shift(1).rolling(window=10).min()
+  # Kijun-sen (Base Line): (26-period high + 26-period low) / 2
+  period26_high = df['High'].rolling(window=26).max()
+  period26_low = df['Low'].rolling(window=26).min()
+  df['Kijun'] = (period26_high + period26_low) / 2
 
+  # Senkou Span A (Leading Span A): (Tenkan + Kijun) / 2 shifted 26 periods ahead
+  df['Senkou_A'] = ((df['Tenkan'] + df['Kijun']) / 2).shift(26)
+
+  # Senkou Span B (Leading Span B): (52-period high + 52-period low) / 2 shifted 26 periods ahead
+  period52_high = df['High'].rolling(window=52).max()
+  period52_low = df['Low'].rolling(window=52).min()
+  df['Senkou_B'] = ((period52_high + period52_low) / 2).shift(26)
+
+  # ATR برای مدیریت ریسک
   tr1 = df['High'] - df['Low']
   tr2 = np.abs(df['High'] - df['Close'].shift(1))
   tr3 = np.abs(df['Low'] - df['Close'].shift(1))
-  df['TR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-  df['ATR'] = df['TR'].rolling(window=14).mean()
-
-  vol_ma = df['Volume'].shift(1).rolling(window=20).mean()
-  df['RVOL'] = df['Volume'] / (vol_ma + 1e-9)
-
-  delta = df['Close'].diff()
-  gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-  loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-  rs = gain / (loss + 1e-9)
-  df['RSI'] = 100 - (100 / (1 + rs))
+  df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
   return df
 
 
 processed_data = {}
 for symbol, df1h in data_1h.items():
-  if len(df1h) < 300:
+  if len(df1h) < 100:
     continue
-  df1h = calculate_indicators_1h(df1h)
+  df1h = calculate_ichimoku(df1h)
 
+  # ساخت تایم‌فریم ۴ ساعته ایچیموکو برای تشخیص روند کلان
   df4h = (
       df1h.set_index('Date')
       .resample('4h')
@@ -114,15 +116,19 @@ for symbol, df1h in data_1h.items():
       .dropna()
       .reset_index()
   )
+  df4h = calculate_ichimoku(df4h)
+  df4h['Cloud_Top'] = df4h[['Senkou_A', 'Senkou_B']].max(axis=1)
+  df4h['Cloud_Bottom'] = df4h[['Senkou_A', 'Senkou_B']].min(axis=1)
+  df4h['Trend_Long'] = df4h['Close'] > df4h['Cloud_Top']
+  df4h['Trend_Short'] = df4h['Close'] < df4h['Cloud_Bottom']
 
-  df4h['EMA_50'] = df4h['Close'].ewm(span=50, adjust=False).mean().shift(1)
-  df4h['EMA_200'] = df4h['Close'].ewm(span=200, adjust=False).mean().shift(1)
-  df4h['Close_4H'] = df4h['Close'].shift(1)
+  for col in ['Trend_Long', 'Trend_Short', 'Cloud_Top', 'Cloud_Bottom']:
+    df4h[col] = df4h[col].shift(1)  # جلوگیری از Lookahead
 
   df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
   processed_data[symbol] = {'1h': df1h, '4h': df4h.set_index('Date')}
 
-print('⚙️ شروع اجرای بک‌تست اصلاح‌شده...')
+print('⚙️ شروع اجرای بک‌تست استراتژی ایچیموکو پرو...')
 
 all_trades = []
 SLIPPAGE = 0.0003
@@ -137,12 +143,8 @@ for symbol, dat in processed_data.items():
   stop_loss = 0.0
   take_profit = 0.0
   entry_index = 0
-  active_bos_level = 0.0
-  candles_since_bos = 0
-  waiting_for_retest = False
-  retest_side = None
 
-  for i in range(200, len(df1h)):
+  for i in range(60, len(df1h)):
     c1h = df1h.iloc[i]
     prev = df1h.iloc[i - 1]
     t4h_time = c1h['Date_4H']
@@ -151,6 +153,7 @@ for symbol, dat in processed_data.items():
       continue
     r4h = df4h_idx.loc[t4h_time]
 
+    # مدیریت پوزیشن باز
     if position is not None:
       candles_held = i - entry_index
       if position == 'LONG':
@@ -184,94 +187,52 @@ for symbol, dat in processed_data.items():
           })
           position = None
 
+    # سیگنال‌های ورود جدید
     if position is None:
-      regime_long = (r4h['Close_4H'] > r4h['EMA_200']) and (
-          r4h['EMA_50'] > r4h['EMA_200']
-      )
-      regime_short = (r4h['Close_4H'] < r4h['EMA_200']) and (
-          r4h['EMA_50'] < r4h['EMA_200']
-      )
+      cloud_top_1h = max(prev['Senkou_A'], prev['Senkou_B'])
+      cloud_bot_1h = min(prev['Senkou_A'], prev['Senkou_B'])
 
-      if waiting_for_retest:
-        candles_since_bos += 1
-        if candles_since_bos > 6:
-          waiting_for_retest = False
-        else:
-          if retest_side == 'LONG':
-            retest_zone_high = active_bos_level + (0.35 * prev['ATR'])
-            if prev['Low'] <= retest_zone_high and prev['Close'] > active_bos_level:
-              if (
-                  (prev['Close'] > prev['Open'])
-                  and (prev['RSI'] > 45)
-                  and (prev['RSI'] < 75)
-              ):
-                entry_price = c1h['Open'] * (1 + SLIPPAGE)
-                struct_low = min(prev['Low'], active_bos_level)
-                stop_loss = struct_low - (0.20 * prev['ATR'])
-                sl_dist_pct = (entry_price - stop_loss) / entry_price
+      # شرایط LONG: روند ۴ ساعته صعودی + قیمت بالای ابر ۱ ساعته + تقاطع تنکان و کیجون یا پولبک به کیجون
+      if r4h.get('Trend_Long', False) and prev['Close'] > cloud_top_1h:
+        # Tenkan از بالا قطع می‌کند یا قیمت به کیجون واکنش داده
+        tk_cross_long = (prev['Tenkan'] > prev['Kijun']) and (
+            df1h.iloc[i - 2]['Tenkan'] <= df1h.iloc[i - 2]['Kijun']
+        )
+        if tk_cross_long or (
+            prev['Low'] <= prev['Kijun'] and prev['Close'] > prev['Kijun']
+        ):
+          entry_price = c1h['Open'] * (1 + SLIPPAGE)
+          stop_loss = (
+              min(prev['Low'], cloud_bot_1h) - 0.2 * prev['ATR']
+          )  # استاب زیر ابر یا کف کندل
+          sl_dist_pct = (entry_price - stop_loss) / entry_price
 
-                if 0.003 <= sl_dist_pct <= 0.04:
-                  risk = entry_price - stop_loss
-                  take_profit = entry_price + (2.0 * risk)
-                  position = 'LONG'
-                  entry_index = i
-                  waiting_for_retest = False
+          if 0.003 <= sl_dist_pct <= 0.04:
+            risk = entry_price - stop_loss
+            take_profit = entry_price + (2.0 * risk)
+            position = 'LONG'
+            entry_index = i
 
-          elif retest_side == 'SHORT':
-            retest_zone_low = active_bos_level - (0.35 * prev['ATR'])
-            if prev['High'] >= retest_zone_low and prev['Close'] < active_bos_level:
-              if (
-                  (prev['Close'] < prev['Open'])
-                  and (prev['RSI'] < 55)
-                  and (prev['RSI'] > 25)
-              ):
-                entry_price = c1h['Open'] * (1 - SLIPPAGE)
-                struct_high = max(prev['High'], active_bos_level)
-                stop_loss = struct_high + (0.20 * prev['ATR'])
-                sl_dist_pct = (stop_loss - entry_price) / entry_price
+      # شرایط SHORT: روند ۴ ساعته نزولی + قیمت زیر ابر ۱ ساعته + تقاطع نزولی تنکان و کیجون
+      elif r4h.get('Trend_Short', False) and prev['Close'] < cloud_bot_1h:
+        tk_cross_short = (prev['Tenkan'] < prev['Kijun']) and (
+            df1h.iloc[i - 2]['Tenkan'] >= df1h.iloc[i - 2]['Kijun']
+        )
+        if tk_cross_short or (
+            prev['High'] >= prev['Kijun'] and prev['Close'] < prev['Kijun']
+        ):
+          entry_price = c1h['Open'] * (1 - SLIPPAGE)
+          stop_loss = max(prev['High'], cloud_top_1h) + 0.2 * prev['ATR']
+          sl_dist_pct = (stop_loss - entry_price) / entry_price
 
-                if 0.003 <= sl_dist_pct <= 0.04:
-                  risk = stop_loss - entry_price
-                  take_profit = entry_price - (2.0 * risk)
-                  position = 'SHORT'
-                  entry_index = i
-                  waiting_for_retest = False
-
-      if not waiting_for_retest:
-        if regime_long:
-          sweep_long = (prev['Low'] < prev['L20']) and (
-              prev['Close'] > prev['L20']
-          )
-          bos_long = (
-              sweep_long
-              and (prev['Close'] > prev['H10'])
-              and (prev['Close'] > prev['Open'])
-              and (prev['RVOL'] >= 1.0)
-          )
-          if bos_long:
-            active_bos_level = prev['H10']
-            candles_since_bos = 0
-            waiting_for_retest = True
-            retest_side = 'LONG'
-
-        elif regime_short:
-          sweep_short = (prev['High'] > prev['H20']) and (
-              prev['Close'] < prev['H20']
-          )
-          bos_short = (
-              sweep_short
-              and (prev['Close'] < prev['L10'])
-              and (prev['Close'] < prev['Open'])
-              and (prev['RVOL'] >= 1.0)
-          )
-          if bos_short:
-            active_bos_level = prev['L10']
-            candles_since_bos = 0
-            waiting_for_retest = True
-            retest_side = 'SHORT'
+          if 0.003 <= sl_dist_pct <= 0.04:
+            risk = stop_loss - entry_price
+            take_profit = entry_price - (2.0 * risk)
+            position = 'SHORT'
+            entry_index = i
 
 print('\n============================================================')
-print('📊 گزارش نهایی عملکرد پورتفوی (نسخه بهینه‌شده)')
+print('📊 گزارش نهایی استراتژی ایچیموکو (ICHIMOKU PRO-TREND)')
 print('============================================================')
 
 if all_trades:
