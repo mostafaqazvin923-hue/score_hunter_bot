@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 
 exchange = ccxt.lbank({'enableRateLimit': True})
+
+# حذف SUI و NEAR و اضافه کردن DOGE و ARB به عنوان ارزهای روندپذیرتر
 SYMBOLS = {
     'BTC': 'BTC/USDT',
     'ETH': 'ETH/USDT',
@@ -21,8 +23,8 @@ SYMBOLS = {
     'ADA': 'ADA/USDT',
     'AVAX': 'AVAX/USDT',
     'LINK': 'LINK/USDT',
-    'NEAR': 'NEAR/USDT',
-    'SUI': 'SUI/USDT',
+    'DOGE': 'DOGE/USDT',
+    'ARB': 'ARB/USDT',
     'DOT': 'DOT/USDT',
 }
 
@@ -30,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها برای استراتژی ایچیموکو (محدودیت پوزیشن همزمان)')
+print('📥 دریافت داده‌ها (با جایگزینی ارزهای قوی‌تر DOGE و ARB)')
 print('============================================================')
 
 data_1h = {}
@@ -122,7 +124,7 @@ for symbol, df1h in data_1h.items():
   df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
   processed_data[symbol] = {'1h': df1h, '4h': df4h.set_index('Date')}
 
-print('⚙️ شروع اجرای بک‌تست با اعمال محدودیت پوزیشن همزمان...')
+print('⚙️ شروع اجرای بک‌تست با سبد جدید ارزها...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -277,9 +279,7 @@ for ts in sorted_timestamps:
           continue
 
 print('\n============================================================')
-print(
-    '📊 گزارش جامع پورتفوی (با سقف ۳ پوزیشن همزمان و مدارشکن ضرر‌های متوالی)'
-)
+print('📊 گزارش جامع پورتفوی (با ارزهای جدید و بهینه‌سازی شده)')
 print('============================================================')
 
 if all_trades:
