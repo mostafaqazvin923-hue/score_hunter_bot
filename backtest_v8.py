@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای سیستم MTF Trend + Pullback (نسخه R:R 1:2.5)")
+print("📥 دانلود داده‌ها برای موتور اسمارت‌مانی و اسویپ نقدینگی (Liquidity Sweep)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_mtf_rr25_data.csv"
+    filename_1h = f"{symbol}_1h_smart_money_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -73,84 +73,63 @@ for symbol, lbank_symbol in SYMBOLS.items():
     else:
         print(f"  ❌ دیتایی برای {symbol} دریافت نشد.")
 
-def calculate_indicators(df):
-    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
+def calculate_atr(df):
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
+    df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور هم‌راستایی روند و پولبک با R:R 1:2.5")
+print("🚀 اجرای موتور اسمارت‌مانی (Liquidity Sweep & Structure Shift)")
 print("============================================================")
 
 all_portfolio_trades = []
 
 for symbol, df1h in data_1h.items():
-    if len(df1h) < 300:
+    if len(df1h) < 100:
         continue
         
-    df1h = calculate_indicators(df1h)
-    
-    df4h = df1h.set_index('Date').resample('4H').agg({
-        'Open': 'first',
-        'High': 'max',
-        'Low': 'min',
-        'Close': 'last',
-        'Volume': 'sum'
-    }).dropna().reset_index()
-    
-    df4h = calculate_indicators(df4h)
-    df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
-    df4h_indexed = df4h.set_index('Date')
-    
+    df1h = calculate_atr(df1h)
     locked_until_index = 0
     
-    for i in range(200, len(df1h) - 40):
+    # بررسی ساختار در پنجره‌های متوالی
+    for i in range(30, len(df1h) - 40):
         if i < locked_until_index:
             continue
             
-        c1h = df1h.iloc[i]
-        t4h_time = c1h['Date_4H']
+        c = df1h.iloc[i]
+        prev_c = df1h.iloc[i-1]
         
-        if t4h_time not in df4h_indexed.index:
-            continue
-            
-        r4h = df4h_indexed.loc[t4h_time]
+        # تعیین محدوده استخر نقدینگی در 24 کندل گذشته
+        lookback = df1h.iloc[i-24:i]
+        liq_high = lookback['High'].max()
+        liq_low = lookback['Low'].min()
         
-        is_4h_bullish = (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_50'] > r4h['EMA_200'])
-        is_4h_bearish = (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_50'] < r4h['EMA_200'])
+        # 1. سناریوی لیکویید شدن کف (Bearish Sweep / Fake Breakdown -> Bullish Reversal)
+        # قیمت به زیر کف قبلی نفوذ کرده (Low < liq_low) اما سریع برگشته و Close بالای کف قبلی بسته شده
+        is_low_swept = (df1h.iloc[i-1]['Low'] < liq_low) or (c['Low'] < liq_low)
+        bullish_sweep = is_low_swept and (c['Close'] > liq_low) and (c['Close'] > c['Open']) and (c['Volume'] > c['Volume_MA'] * 1.2)
         
-        if not is_4h_bullish and not is_4h_bearish:
-            continue
+        # 2. سناریوی لیکویید شدن سقف (Bullish Sweep / Fake Breakout -> Bearish Reversal)
+        is_high_swept = (df1h.iloc[i-1]['High'] > liq_high) or (c['High'] > liq_high)
+        bearish_sweep = is_high_swept and (c['Close'] < liq_high) and (c['Close'] < c['Open']) and (c['Volume'] > c['Volume_MA'] * 1.2)
+        
+        if bullish_sweep:
+            entry_price = c['Close']
+            # استاپ لاس پشت کندل اسویپ شده قرار می‌گیرد
+            sl = min(c['Low'], df1h.iloc[i-1]['Low']) - (0.3 * c['ATR'])
+            risk = entry_price - sl
             
-        if is_4h_bullish:
-            is_pullback = (c1h['Low'] <= c1h['EMA_50'] * 1.005) and (c1h['Close'] > c1h['Open']) and (c1h['RSI'] > 45) and (c1h['RSI'] < 65)
-            
-            if is_pullback:
-                entry_price = c1h['Close']
-                sl = c1h['Low'] - (1.0 * c1h['ATR'])
-                risk = entry_price - sl
-                
-                if risk <= 0 or (risk / entry_price) > 0.04:
-                    continue
-                    
-                # تنظیم ریسک به ریوارد روی 1 به 2.5
-                tp = entry_price + (2.5 * risk)
+            if risk > 0 and (risk / entry_price) <= 0.04:
+                # ریسک به ریوارد پویا 1 به 2
+                tp = entry_price + (2.0 * risk)
                 
                 outcome = 'OPEN'
                 exit_idx = i + 1
-                for j in range(i + 1, min(i + 50, len(df1h))):
+                for j in range(i + 1, min(i + 40, len(df1h))):
                     f_c = df1h.iloc[j]
                     exit_idx = j
                     if f_c['Low'] <= sl:
@@ -168,23 +147,17 @@ for symbol, df1h in data_1h.items():
                     })
                     locked_until_index = exit_idx
                     
-        elif is_4h_bearish:
-            is_pullback = (c1h['High'] >= c1h['EMA_50'] * 0.995) and (c1h['Close'] < c1h['Open']) and (c1h['RSI'] < 55) and (c1h['RSI'] > 35)
+        elif bearish_sweep:
+            entry_price = c['Close']
+            sl = max(c['High'], df1h.iloc[i-1]['High']) + (0.3 * c['ATR'])
+            risk = sl - entry_price
             
-            if is_pullback:
-                entry_price = c1h['Close']
-                sl = c1h['High'] + (1.0 * c1h['ATR'])
-                risk = sl - entry_price
-                
-                if risk <= 0 or (risk / entry_price) > 0.04:
-                    continue
-                    
-                # تنظیم ریسک به ریوارد روی 1 به 2.5
-                tp = entry_price - (2.5 * risk)
+            if risk > 0 and (risk / entry_price) <= 0.04:
+                tp = entry_price - (2.0 * risk)
                 
                 outcome = 'OPEN'
                 exit_idx = i + 1
-                for j in range(i + 1, min(i + 50, len(df1h))):
+                for j in range(i + 1, min(i + 40, len(df1h))):
                     f_c = df1h.iloc[j]
                     exit_idx = j
                     if f_c['High'] >= sl:
@@ -203,7 +176,7 @@ for symbol, df1h in data_1h.items():
                     locked_until_index = exit_idx
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی MTF با ریسک به ریوارد 1:2.5")
+print("📊 گزارش نهایی پورتفوی اسمارت‌مانی (Liquidity Sweep R:R 1:2)")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -212,14 +185,13 @@ if all_portfolio_trades:
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
     portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    # محاسبه سود خالص با ضریب 2.5R برای هر برد
-    net_profit_score = (total_wins * 2.5) - total_losses
+    net_profit_score = (total_wins * 2.0) - total_losses
     
     print(f"🔸 تعداد کل معاملات کل سبد (پورتفوی): {total_trades}")
     print(f"🔸 کل معاملات برنده (WIN): {total_wins}")
     print(f"🔸 کل معاملات بازنده (LOSS): {total_losses}")
     print(f"🎯 **وین‌ریت تجمیعی کل پورتفوی (Portfolio Win Rate):** {portfolio_win_rate:.2f}%")
-    print(f"💰 امتیاز سودآوری خالص (Net Profit Score با R:R 1:2.5): {net_profit_score:.2f}R")
+    print(f"💰 امتیاز سودآوری خالص (Net Profit Score با R:R 1:2): {net_profit_score:.2f}R")
     
     print("\nتفکیک عملکرد به تفکیک هر نماد:")
     print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
