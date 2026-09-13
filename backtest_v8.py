@@ -30,7 +30,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها برای استراتژی سویپ نقدینگی و ساختار بازار')
+print('📥 دریافت داده‌ها برای ستاپ تپ و ادامه روند نهادی (ریسک به ریوارد ۱:۲)')
 print('============================================================')
 
 data_1h = {}
@@ -69,21 +69,22 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
 def calculate_indicators(df):
   df = df.copy()
+  # میانگین متحرک نهادی (EMA 50 و 200)
   df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
   df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
 
-  # تعیین سونگ‌های محلی برای تشخیص نقدینگی (سویپ)
-  df['Prev_Low_5'] = df['Low'].shift(1).rolling(window=5).min()
-  df['Prev_High_5'] = df['High'].shift(1).rolling(window=5).max()
+  # کانال دانچین (Donchian Channel) برای تشخیص بریک‌اوت‌ها و تپ‌ها
+  df['DC_High'] = df['High'].shift(1).rolling(window=10).max()
+  df['DC_Low'] = df['Low'].shift(1).rolling(window=10).min()
 
-  # ATR برای مدیریت ریسک دقیق
+  # ATR برای تعیین استاپ فیکس و ایمن
   high_low = df['High'] - df['Low']
   high_close = np.abs(df['High'] - df['Close'].shift(1))
   low_close = np.abs(df['Low'] - df['Close'].shift(1))
   tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
   df['ATR'] = tr.rolling(window=14).mean()
 
-  # RVOL برای تأیید حجم نقدینگی
+  # RVOL برای تایید حجم موسساتی
   vol_ma = df['Volume'].shift(1).rolling(window=20).mean()
   df['RVOL'] = df['Volume'] / (vol_ma + 1e-9)
 
@@ -92,7 +93,7 @@ def calculate_indicators(df):
 
 all_portfolio_trades = []
 SLIPPAGE = 0.0002
-FEE_RATE = 0.0007  # کارمزد صرافی (0.07% برای هر سمت)
+FEE_RATE = 0.0007  # کارمزد دقیق صرافی برای هر سمت
 
 for symbol, df1h in data_1h.items():
   if len(df1h) < 300:
@@ -100,7 +101,7 @@ for symbol, df1h in data_1h.items():
 
   df1h = calculate_indicators(df1h)
 
-  # ساخت تایم‌فریم 4 ساعته استاندارد و ایمن بدون Lookahead Bias
+  # تایم‌فریم تایید روند کلان ۴ ساعته بدون Lookahead Bias
   df4h = (
       df1h.set_index('Date')
       .resample('4h')
@@ -173,7 +174,7 @@ for symbol, df1h in data_1h.items():
           position = None
 
     if position is None:
-      # تایید روند کلان در تایم فریم 4 ساعته
+      # روند کلان صعودی و نزولی در ۴ ساعته
       trend_long = (r4h['Close_4H'] > r4h['EMA_200_4H']) and (
           r4h['EMA_50_4H'] > r4h['EMA_200_4H']
       )
@@ -181,67 +182,63 @@ for symbol, df1h in data_1h.items():
           r4h['EMA_50_4H'] < r4h['EMA_200_4H']
       )
 
-      # منطق سویپ نقدینگی (Liquidity Sweep): قیمت کف/سقف قبلی را جارو کرده ولی سریع برگشته است
-      sweep_long = (
-          prev_c1h['Low'] < prev_c1h['Prev_Low_5']
-          and prev_c1h['Close'] > prev_c1h['Prev_Low_5']
+      # استراتژی تپ (نفوذ به زیر کف/سقف و بازگشت پرقدرت به داخل کانال با حجم بالا)
+      trap_long = (prev_c1h['Low'] < prev_c1h['DC_Low']) and (
+          prev_c1h['Close'] > prev_c1h['DC_Low']
       )
-      sweep_short = (
-          prev_c1h['High'] > prev_c1h['Prev_High_5']
-          and prev_c1h['Close'] < prev_c1h['Prev_High_5']
+      trap_short = (prev_c1h['High'] > prev_c1h['DC_High']) and (
+          prev_c1h['Close'] < prev_c1h['DC_High']
       )
 
-      # کندل تأیید بازگشتی قدرتمند همراه با حجم بالا
-      bullish_engulfing = (prev_c1h['Close'] > prev_c1h['Open']) and (
+      # کندل استرانگ تایم ۱ ساعته همراه با تایید حجم
+      strong_bull = (prev_c1h['Close'] > prev_c1h['Open']) and (
           (prev_c1h['Close'] - prev_c1h['Open'])
-          > (prev_c1h['High'] - prev_c1h['Low']) * 0.6
+          > (prev_c1h['High'] - prev_c1h['Low']) * 0.5
       )
-      bearish_engulfing = (prev_c1h['Close'] < prev_c1h['Open']) and (
+      strong_bear = (prev_c1h['Close'] < prev_c1h['Open']) and (
           (prev_c1h['Open'] - prev_c1h['Close'])
-          > (prev_c1h['High'] - prev_c1h['Low']) * 0.6
+          > (prev_c1h['High'] - prev_c1h['Low']) * 0.5
       )
 
       signal_long = (
           trend_long
-          and sweep_long
-          and bullish_engulfing
-          and (prev_c1h['RVOL'] >= 1.4)
+          and trap_long
+          and strong_bull
+          and (prev_c1h['RVOL'] >= 1.3)
       )
       signal_short = (
           trend_short
-          and sweep_short
-          and bearish_engulfing
-          and (prev_c1h['RVOL'] >= 1.4)
+          and trap_short
+          and strong_bear
+          and (prev_c1h['RVOL'] >= 1.3)
       )
 
       if signal_long:
         position = 'LONG'
         entry_price = c1h['Open'] * (1 + SLIPPAGE)
-        stop_loss = (
-            prev_c1h['Low'] - 0.002
-        )  # حد ضرر زیر کف سویپ‌شده با تلورانس امن
+        stop_loss = prev_c1h['Low'] - (0.5 * prev_c1h['ATR'])
         risk = entry_price - stop_loss
-        if risk > 0 and (risk / entry_price) <= 0.04:
+        if risk > 0 and (risk / entry_price) <= 0.035:
           take_profit = entry_price + (
               2.0 * risk
-          )  # دقیقاً ریسک به ریوارد ۱ به ۲
+          )  # کاملاً ثابت روی ریسک به ریوارد ۱ به ۲
         else:
           position = None
 
       elif signal_short:
         position = 'SHORT'
         entry_price = c1h['Open'] * (1 - SLIPPAGE)
-        stop_loss = prev_c1h['High'] + 0.002  # حد ضرر بالای سقف سویپ‌شده
+        stop_loss = prev_c1h['High'] + (0.5 * prev_c1h['ATR'])
         risk = stop_loss - entry_price
-        if risk > 0 and (risk / entry_price) <= 0.04:
+        if risk > 0 and (risk / entry_price) <= 0.035:
           take_profit = entry_price - (
               2.0 * risk
-          )  # دقیقاً ریسک به ریوارد ۱ به ۲
+          )  # کاملاً ثابت روی ریسک به ریوارد ۱ به ۲
         else:
           position = None
 
 print('\n============================================================')
-print('📊 گزارش نهایی استراتژی سویپ نقدینگی (ریسک به ریوارد ۱:۲)')
+print('📊 گزارش نهایی ستاپ نهادی تپ و ادامه روند (ریسک به ریوارد ۱:۲)')
 print('============================================================')
 
 if all_portfolio_trades:
