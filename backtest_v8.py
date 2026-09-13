@@ -30,7 +30,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها برای استراتژی ایچیموکو (نسخه پایدار و نهایی)')
+print('📥 دریافت داده‌ها برای استراتژی ایچیموکو (محدودیت پوزیشن همزمان)')
 print('============================================================')
 
 data_1h = {}
@@ -122,135 +122,202 @@ for symbol, df1h in data_1h.items():
   df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
   processed_data[symbol] = {'1h': df1h, '4h': df4h.set_index('Date')}
 
-print('⚙️ شروع اجرای بک‌تست...')
+print('⚙️ شروع اجرای بک‌تست با اعمال محدودیت پوزیشن همزمان...')
 
+# شبیه‌سازی گام‌به‌گام زمان‌محور در کل پورتفوی برای مدیریت سقف پوزیشن‌های همزمان
+all_timestamps = set()
+for dat in processed_data.values():
+  all_timestamps.update(dat['1h']['Date'].tolist())
+sorted_timestamps = sorted(list(all_timestamps))
+
+active_positions = {}  # symbol: position_dict
 all_trades = []
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
+MAX_CONCURRENT_POSITIONS = 3
 
-for symbol, dat in processed_data.items():
-  df1h = dat['1h']
-  df4h_idx = dat['4h']
+# تبدیل داده‌ها به دیکشنری برای دسترسی سریع‌تر در لوپ زمانی
+dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items()}
+dfs_4h = {sym: dat['4h'] for sym, sym in processed_data.keys()}
 
-  position = None
-  entry_price = 0.0
-  stop_loss = 0.0
-  take_profit = 0.0
-  entry_index = 0
+# ردیابی وضعیت مدارشکن (Circuit Breaker) کل سبد
+consecutive_losses = 0
+pause_until = None
 
-  for i in range(60, len(df1h)):
+for ts in sorted_timestamps:
+  # ۱. مدیریت و بستن پوزیشن‌های باز در این ساعت
+  symbols_to_close = []
+  for symbol, pos in active_positions.items():
+    if ts not in dfs_1h[symbol].index:
+      continue
+    c1h = dfs_1h[symbol].loc[ts]
+    entry_index = pos['entry_index']
+    # پیدا کردن ایندکس عددی فعلی
+    df1h_local = processed_data[symbol]['1h']
+    match_rows = df1h_local[df1h_local['Date'] == ts]
+    if match_rows.empty:
+      continue
+    curr_i = match_rows.index[0]
+    candles_held = curr_i - entry_index
+
+    if pos['side'] == 'LONG':
+      if (
+          candles_held >= 24
+          or c1h['Low'] <= pos['stop_loss']
+          or c1h['High'] >= pos['take_profit']
+      ):
+        outcome = 'LOSS' if c1h['Low'] <= pos['stop_loss'] else 'WIN'
+        r_real = (
+            -1.0 - (FEE_RATE * 2) if outcome == 'LOSS' else 2.0 - (FEE_RATE * 2)
+        )
+        all_trades.append({
+            'Timestamp': ts,
+            'Symbol': symbol,
+            'Side': 'LONG',
+            'Outcome': outcome,
+            'Return': r_real,
+        })
+        symbols_to_close.append(symbol)
+    elif pos['side'] == 'SHORT':
+      if (
+          candles_held >= 24
+          or c1h['High'] >= pos['stop_loss']
+          or c1h['Low'] <= pos['take_profit']
+      ):
+        outcome = 'LOSS' if c1h['High'] >= pos['stop_loss'] else 'WIN'
+        r_real = (
+            -1.0 - (FEE_RATE * 2) if outcome == 'LOSS' else 2.0 - (FEE_RATE * 2)
+        )
+        all_trades.append({
+            'Timestamp': ts,
+            'Symbol': symbol,
+            'Side': 'SHORT',
+            'Outcome': outcome,
+            'Return': r_real,
+        })
+        symbols_to_close.append(symbol)
+
+  for sym in symbols_to_close:
+    del active_positions[sym]
+
+  # ۲. بررسی وضعیت توقف اضطراری (Circuit Breaker)
+  if pause_until is not None and ts < pause_until:
+    continue
+  elif pause_until is not None and ts >= pause_until:
+    pause_until = None
+    consecutive_losses = 0
+
+  # ۳. جستجوی سیگنال‌های جدید برای نمادهایی که پوزیشن ندارند
+  for symbol, dat in processed_data.items():
+    if symbol in active_positions:
+      continue
+    if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
+      break  # سقف پوزیشن‌های همزمان پر شده است
+
+    df1h = dat['1h']
+    if ts not in df1h['Date'].values:
+      continue
+
+    match_rows = df1h[df1h['Date'] == ts]
+    if match_rows.empty:
+      continue
+    i = match_rows.index[0]
+    if i < 2:
+      continue
+
     c1h = df1h.iloc[i]
     prev = df1h.iloc[i - 1]
     t4h_time = c1h['Date_4H']
+    df4h_idx = dat['4h']
 
     if t4h_time not in df4h_idx.index:
       continue
     r4h = df4h_idx.loc[t4h_time]
 
-    if position is not None:
-      candles_held = i - entry_index
-      if position == 'LONG':
-        if candles_held >= 24 or c1h['Low'] <= stop_loss or c1h['High'] >= take_profit:
-          outcome = 'LOSS' if c1h['Low'] <= stop_loss else 'WIN'
-          r_real = (
-              -1.0 - (FEE_RATE * 2)
-              if outcome == 'LOSS'
-              else 2.0 - (FEE_RATE * 2)
-          )
-          all_trades.append({
-              'Timestamp': c1h['Date'],
-              'Symbol': symbol,
-              'Side': 'LONG',
-              'Outcome': outcome,
-              'Return': r_real,
-          })
-          position = None
-      elif position == 'SHORT':
-        if candles_held >= 24 or c1h['High'] >= stop_loss or c1h['Low'] <= take_profit:
-          outcome = 'LOSS' if c1h['High'] >= stop_loss else 'WIN'
-          r_real = (
-              -1.0 - (FEE_RATE * 2)
-              if outcome == 'LOSS'
-              else 2.0 - (FEE_RATE * 2)
-          )
-          all_trades.append({
-              'Timestamp': c1h['Date'],
-              'Symbol': symbol,
-              'Side': 'SHORT',
-              'Outcome': outcome,
-              'Return': r_real,
-          })
-          position = None
+    cloud_top_1h = max(prev['Senkou_A'], prev['Senkou_B'])
+    cloud_bot_1h = min(prev['Senkou_A'], prev['Senkou_B'])
 
-    if position is None:
-      cloud_top_1h = max(prev['Senkou_A'], prev['Senkou_B'])
-      cloud_bot_1h = min(prev['Senkou_A'], prev['Senkou_B'])
+    # سیگنال Long
+    if r4h.get('Trend_Long', False) and prev['Close'] > cloud_top_1h:
+      tk_cross_long = (prev['Tenkan'] > prev['Kijun']) and (
+          df1h.iloc[i - 2]['Tenkan'] <= df1h.iloc[i - 2]['Kijun']
+      )
+      if tk_cross_long or (
+          prev['Low'] <= prev['Kijun'] and prev['Close'] > prev['Kijun']
+      ):
+        entry_price = c1h['Open'] * (1 + SLIPPAGE)
+        stop_loss = min(prev['Low'], cloud_bot_1h) - 0.2 * prev['ATR']
+        sl_dist_pct = (entry_price - stop_loss) / entry_price
 
-      if r4h.get('Trend_Long', False) and prev['Close'] > cloud_top_1h:
-        tk_cross_long = (prev['Tenkan'] > prev['Kijun']) and (
-            df1h.iloc[i - 2]['Tenkan'] <= df1h.iloc[i - 2]['Kijun']
-        )
-        if tk_cross_long or (
-            prev['Low'] <= prev['Kijun'] and prev['Close'] > prev['Kijun']
-        ):
-          entry_price = c1h['Open'] * (1 + SLIPPAGE)
-          stop_loss = min(prev['Low'], cloud_bot_1h) - 0.2 * prev['ATR']
-          sl_dist_pct = (entry_price - stop_loss) / entry_price
+        if 0.003 <= sl_dist_pct <= 0.04:
+          risk = entry_price - stop_loss
+          take_profit = entry_price + (2.0 * risk)
+          active_positions[symbol] = {
+              'side': 'LONG',
+              'entry_price': entry_price,
+              'stop_loss': stop_loss,
+              'take_profit': take_profit,
+              'entry_index': i,
+          }
+          continue
 
-          if 0.003 <= sl_dist_pct <= 0.04:
-            risk = entry_price - stop_loss
-            take_profit = entry_price + (2.0 * risk)
-            position = 'LONG'
-            entry_index = i
+    # سیگنال Short
+    elif r4h.get('Trend_Short', False) and prev['Close'] < cloud_bot_1h:
+      tk_cross_short = (prev['Tenkan'] < prev['Kijun']) and (
+          df1h.iloc[i - 2]['Tenkan'] >= df1h.iloc[i - 2]['Kijun']
+      )
+      if tk_cross_short or (
+          prev['High'] >= prev['Kijun'] and prev['Close'] < prev['Kijun']
+      ):
+        entry_price = c1h['Open'] * (1 - SLIPPAGE)
+        stop_loss = max(prev['High'], cloud_top_1h) + 0.2 * prev['ATR']
+        sl_dist_pct = (stop_loss - entry_price) / entry_price
 
-      elif r4h.get('Trend_Short', False) and prev['Close'] < cloud_bot_1h:
-        tk_cross_short = (prev['Tenkan'] < prev['Kijun']) and (
-            df1h.iloc[i - 2]['Tenkan'] >= df1h.iloc[i - 2]['Kijun']
-        )
-        if tk_cross_short or (
-            prev['High'] >= prev['Kijun'] and prev['Close'] < prev['Kijun']
-        ):
-          entry_price = c1h['Open'] * (1 - SLIPPAGE)
-          stop_loss = max(prev['High'], cloud_top_1h) + 0.2 * prev['ATR']
-          sl_dist_pct = (stop_loss - entry_price) / entry_price
-
-          if 0.003 <= sl_dist_pct <= 0.04:
-            risk = stop_loss - entry_price
-            take_profit = entry_price - (2.0 * risk)
-            position = 'SHORT'
-            entry_index = i
+        if 0.003 <= sl_dist_pct <= 0.04:
+          risk = stop_loss - entry_price
+          take_profit = entry_price - (2.0 * risk)
+          active_positions[symbol] = {
+              'side': 'SHORT',
+              'entry_price': entry_price,
+              'stop_loss': stop_loss,
+              'take_profit': take_profit,
+              'entry_index': i,
+          }
+          continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی (با اعمال فیلتر توقف ۲۴ ساعته پس از ۳ باخت)')
+print(
+    '📊 گزارش جامع پورتفوی (با سقف ۳ پوزیشن همزمان و مدارشکن ضرر‌های متوالی)'
+)
 print('============================================================')
 
 if all_trades:
   trades_df = pd.DataFrame(all_trades)
   trades_df.sort_values('Timestamp', inplace=True)
 
+  # اعمال فیلتر مدارشکن (Circuit Breaker) روی کل تاریخچه معاملات
   filtered_trades = []
-  consecutive_losses = 0
-  pause_until = None
+  consec_losses = 0
+  p_until = None
 
   for idx, row in trades_df.iterrows():
-    current_time = row['Timestamp']
-
-    if pause_until is not None:
-      if current_time < pause_until:
+    ctime = row['Timestamp']
+    if p_until is not None:
+      if ctime < p_until:
         continue
       else:
-        pause_until = None
-        consecutive_losses = 0
+        p_until = None
+        consec_losses = 0
 
     filtered_trades.append(row)
 
     if row['Outcome'] == 'LOSS':
-      consecutive_losses += 1
-      if consecutive_losses >= 3:
-        pause_until = current_time + timedelta(hours=24)
-        consecutive_losses = 0
+      consec_losses += 1
+      if consec_losses >= 3:
+        p_until = ctime + timedelta(hours=24)
+        consec_losses = 0
     else:
-      consecutive_losses = 0
+      consec_losses = 0
 
   if filtered_trades:
     f_df = pd.DataFrame(filtered_trades)
@@ -278,15 +345,47 @@ if all_trades:
         if curr_losses > max_losses:
           max_losses = curr_losses
 
-    print(f'🔸 تعداد کل معاملات پس از اعمال فیلتر: {tot_trades}')
+    print(f'🔸 تعداد کل معاملات سبد: {tot_trades}')
     print(f'🔸 معاملات برنده (WIN): {tot_wins}')
     print(f'🔸 معاملات بازنده (LOSS): {tot_losses}')
     print(f'🔥 **حداکثر سودهای متوالی:** {max_wins}')
     print(f'❄️ **حداکثر ضررهای متوالی (کنترل شده):** {max_losses}')
     print(f'🎯 **وین‌ریت تجمیعی پورتفوی:** {win_rate:.2f}%')
-    print(f'💰 **مجموع بازدهی خالص:** {net_r:.2f}R')
+    print(f'💰 **مجموع بازدهی خالص کل:** {net_r:.2f}R\n')
+
+    print(
+        '------------------------------------------------------------'
+    )
+    print('📈 **گزارش تفکیک‌شده به تفکیک هر ارز:**')
+    print(
+        '------------------------------------------------------------'
+    )
+
+    symbol_summary = []
+    for sym in SYMBOLS.keys():
+      sym_trades = f_df[f_df['Symbol'] == sym]
+      s_tot = len(sym_trades)
+      if s_tot > 0:
+        s_wins = len(sym_trades[sym_trades['Outcome'] == 'WIN'])
+        s_loss = len(sym_trades[sym_trades['Outcome'] == 'LOSS'])
+        s_wr = (s_wins / s_tot) * 100
+        s_net_r = sym_trades['Return'].sum()
+      else:
+        s_wins, s_loss, s_wr, s_net_r = 0, 0, 0.0, 0.0
+
+      symbol_summary.append({
+          'Symbol': sym,
+          'Trades': s_tot,
+          'Wins': s_wins,
+          'Losses': s_loss,
+          'WinRate(%)': round(s_wr, 2),
+          'Net_R': round(s_net_r, 2),
+      })
+
+    summary_df = pd.DataFrame(symbol_summary)
+    print(summary_df.to_string(index=False))
   else:
-    print('⚠️ معامله‌ای ثبت نشد.')
+    print('⚠️ تمامی معاملات توسط فیلتر مدارشکن مسدود شدند.')
 else:
   print('⚠️ معامله‌ای ثبت نشد.')
 
