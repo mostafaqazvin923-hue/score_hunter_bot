@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته برای سیستم نهایی (هدف: وین‌ریت 65-70%)")
+print("📥 دانلود داده‌های 1 ساعته (ریسک به ریوارد ثابت روی 1 به 1.5)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_ultimate_data.csv"
+    filename_1h = f"{symbol}_1h_fixed_rr_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -98,7 +98,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست نهایی با فیلتر روند قدرتمند 4 ساعته")
+print("🚀 اجرای موتور بک‌تست با ریسک به ریوارد 1:1.5 ثابت")
 print("============================================================")
 
 all_portfolio_trades = {}
@@ -124,7 +124,7 @@ for symbol, df1h in data_1h.items():
     symbol_trades = []
     locked_until_index = 0
     
-    for i in range(200, len(df1h) - 10):
+    for i in range(200, len(df1h) - 15):
         if i < locked_until_index:
             continue
             
@@ -136,37 +136,32 @@ for symbol, df1h in data_1h.items():
             
         r4h = df4h_indexed.loc[t4h_time]
         
-        # تشخیص روند اصلی در تایم فریم 4 ساعته
         is_uptrend_4h = (r4h['Close'] > r4h['EMA_200']) and (r4h['EMA_20'] > r4h['EMA_50'])
         is_downtrend_4h = (r4h['Close'] < r4h['EMA_200']) and (r4h['EMA_20'] < r4h['EMA_50'])
         
-        # شرایط اشباع در جهت روند
         is_long_pullback = is_uptrend_4h and (c1h['Close'] < c1h['BB_Lower']) and (c1h['RSI'] < 30)
         is_short_pullback = is_downtrend_4h and (c1h['Close'] > c1h['BB_Upper']) and (c1h['RSI'] > 70)
         
         if not is_long_pullback and not is_short_pullback:
             continue
             
-        avg_volume = df1h.iloc[i-20:i]['Volume'].mean()
-        if c1h['Volume'] < (avg_volume * 1.2):
-            continue
-            
-        candle_range = c1h['High'] - c1h['Low']
-        if candle_range == 0:
-            continue
-            
+        next_c = df1h.iloc[i + 1]
+        
         if is_long_pullback:
-            entry_price = c1h['Close']
+            if next_c['Close'] <= next_c['Open']:
+                continue
+                
+            entry_price = next_c['Close']
             sl = c1h['Low'] - (0.8 * c1h['ATR'])
             risk = entry_price - sl
             
             if risk > 0 and (risk / entry_price) <= 0.04:
-                # ریسک به ریوارد متوازن برای تضمین وین‌ریت بالا و سود خالص معقول
-                tp = entry_price + (0.8 * risk)
+                # ریسک به ریوارد ثابت روی 1 به 1.5
+                tp = entry_price + (1.5 * risk)
                 
                 outcome = None
-                exit_idx = i + 1
-                for j in range(i + 1, len(df1h)):
+                exit_idx = i + 2
+                for j in range(i + 2, len(df1h)):
                     f_c = df1h.iloc[j]
                     exit_idx = j
                     
@@ -186,23 +181,26 @@ for symbol, df1h in data_1h.items():
                 if outcome in ['WIN', 'LOSS']:
                     symbol_trades.append({
                         'Symbol': symbol,
-                        'Symbol': symbol,
                         'Side': 'LONG',
                         'Outcome': outcome
                     })
                     locked_until_index = exit_idx
                     
         elif is_short_pullback:
-            entry_price = c1h['Close']
+            if next_c['Close'] >= next_c['Open']:
+                continue
+                
+            entry_price = next_c['Close']
             sl = c1h['High'] + (0.8 * c1h['ATR'])
             risk = sl - entry_price
             
             if risk > 0 and (risk / entry_price) <= 0.04:
-                tp = entry_price - (0.8 * risk)
+                # ریسک به ریوارد ثابت روی 1 به 1.5
+                tp = entry_price - (1.5 * risk)
                 
                 outcome = None
-                exit_idx = i + 1
-                for j in range(i + 1, len(df1h)):
+                exit_idx = i + 2
+                for j in range(i + 2, len(df1h)):
                     f_c = df1h.iloc[j]
                     exit_idx = j
                     
@@ -231,7 +229,7 @@ for symbol, df1h in data_1h.items():
         all_portfolio_trades[symbol] = symbol_trades
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی با سیستم هوشمند چندتایم‌فریمی")
+print("📊 گزارش نهایی پورتفوی با ریسک به ریوارد 1:1.5 ثابت")
 print("============================================================")
 
 flat_trades = []
@@ -244,7 +242,8 @@ if flat_trades:
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
     win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    net_profit = (total_wins * 0.8) - total_losses
+    # محاسبه سود خالص با ضریب 1.5 برای بردها
+    net_profit = (total_wins * 1.5) - total_losses
     
     print(f"🔸 تعداد کل معاملات پورتفو: {total_trades}")
     print(f"🔸 کل برنده (WIN): {total_wins}")
