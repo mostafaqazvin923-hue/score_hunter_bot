@@ -14,7 +14,7 @@ import pandas as pd
 
 exchange = ccxt.lbank({'enableRateLimit': True})
 
-# حذف LINK و SUI و NEAR - جایگزینی با ارزی مثل RENDER یا UNI برای پویایی بیشتر
+# سبد بهینه‌شده: حذف ARB، حفظ ارزهای برتر و اضافه کردن 5 ارز قوی و روندپذیر جدید
 SYMBOLS = {
     'BTC': 'BTC/USDT',
     'ETH': 'ETH/USDT',
@@ -23,16 +23,19 @@ SYMBOLS = {
     'ADA': 'ADA/USDT',
     'AVAX': 'AVAX/USDT',
     'DOGE': 'DOGE/USDT',
-    'ARB': 'ARB/USDT',
-    'RENDER': 'RENDER/USDT',
     'DOT': 'DOT/USDT',
+    'LTC': 'LTC/USDT',
+    'NEAR': 'NEAR/USDT',
+    'UNI': 'UNI/USDT',
+    'RENDER': 'RENDER/USDT',
+    'ICP': 'ICP/USDT',
 }
 
 start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (با سبد کاملاً بهینه و بدون LINK)')
+print('📥 دریافت داده‌ها (سبد ۱۳ ارز قدرتمند و بدون ARB)')
 print('============================================================')
 
 data_1h = {}
@@ -89,9 +92,6 @@ def calculate_ichimoku(df):
   tr2 = np.abs(df['High'] - df['Close'].shift(1))
   tr3 = np.abs(df['Low'] - df['Close'].shift(1))
   df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
-  
-  # محاسبه ضخامت ابر (برای سنجش میزان قدرت روند و دوری از بازار رنج)
-  df['Cloud_Thickness'] = np.abs(df['Senkou_A'] - df['Senkou_B']) / df['Close']
 
   return df
 
@@ -121,13 +121,13 @@ for symbol, df1h in data_1h.items():
   df4h['Trend_Long'] = df4h['Close'] > df4h['Cloud_Top']
   df4h['Trend_Short'] = df4h['Close'] < df4h['Cloud_Bottom']
 
-  for col in ['Trend_Long', 'Trend_Short', 'Cloud_Top', 'Cloud_Bottom', 'Cloud_Thickness']:
+  for col in ['Trend_Long', 'Trend_Short', 'Cloud_Top', 'Cloud_Bottom']:
     df4h[col] = df4h[col].shift(1)
 
   df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
   processed_data[symbol] = {'1h': df1h, '4h': df4h.set_index('Date')}
 
-print('⚙️ شروع اجرای بک‌تست با فیلتر هوشمند رژیم بازار (جلوگیری از ضرر متوالی)...')
+print('⚙️ شروع اجرای بک‌تست خالص و بدون فیلترهای دست‌وپاگیر...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -223,10 +223,6 @@ for ts in sorted_timestamps:
       continue
     r4h = df4h_idx.loc[t4h_time]
 
-    # **فیلتر جدید رژیم بازار:** اگر ضخامت ابر خیلی نازک باشد (بازار رنج و فاقد روند پرقدرت)، از ورود خودداری کن
-    if r4h.get('Cloud_Thickness', 0) < 0.001:
-      continue
-
     cloud_top_1h = max(prev['Senkou_A'], prev['Senkou_B'])
     cloud_bot_1h = min(prev['Senkou_A'], prev['Senkou_B'])
 
@@ -277,7 +273,7 @@ for ts in sorted_timestamps:
           continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی پورتفوی (با فیلتر رژیم بازار و حذف ارزهای ضعیف)')
+print('📊 گزارش نهایی پورتفوی (بدون فیلتر اضافی و با ارزهای منتخب جدید)')
 print('============================================================')
 
 if all_trades:
