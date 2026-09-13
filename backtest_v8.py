@@ -34,10 +34,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print(
-    '📥 دریافت داده‌های 1 ساعته از صرافی LBank برای سبد 10 ارز (بدون نگاه به'
-    ' آینده)'
-)
+print('📥 دریافت داده‌های 1 ساعته از صرافی LBank برای سبد 10 ارز')
 print('============================================================')
 
 data_1h = {}
@@ -83,7 +80,6 @@ def calculate_indicators(df):
   """محاسبه اندیکاتورها با رعایت کامل عدم نشت اطلاعات آینده (Shifted)"""
   df = df.copy()
 
-  # اندیکاتورهای 1 ساعته
   df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
   df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
 
@@ -102,7 +98,7 @@ def calculate_indicators(df):
   vol_ma = df['Volume'].shift(1).rolling(window=20).mean()
   df['RVOL'] = df['Volume'] / (vol_ma + 1e-9)
 
-  # فیلتر ADX ساده‌شده (14 دوره‌ای)
+  # فیلتر ADX (14 دوره‌ای) سخت‌گیرانه‌تر (آستانه ۲۵)
   plus_dm = df['High'].diff().clip(lower=0)
   minus_dm = (-df['Low'].diff()).clip(lower=0)
   tr14 = tr.rolling(window=14).mean()
@@ -115,11 +111,10 @@ def calculate_indicators(df):
 
 
 print('\n============================================================')
-print('🚀 اجرای موتور بک‌تست رویدادمحور استراتژی ATB-10 (بدون Lookahead Bias)')
+print('🚀 اجرای موتور بک‌تست با استراتژی جدید Breakout + Retest')
 print('============================================================')
 
 all_portfolio_trades = []
-FEE_RATE = 0.0006  # کارمزد Taker (0.06%)
 SLIPPAGE = 0.0002  # اسلیپیج (0.02%)
 
 for symbol, df1h in data_1h.items():
@@ -128,7 +123,7 @@ for symbol, df1h in data_1h.items():
 
   df1h = calculate_indicators(df1h)
 
-  # ساخت تایم‌فریم 4 ساعته کاملاً ایمن و بدون نشت
+  # ساخت تایم‌فریم 4 ساعته ایمن و بدون نشت
   df4h = (
       df1h.set_index('Date')
       .resample('4H')
@@ -146,7 +141,6 @@ for symbol, df1h in data_1h.items():
   df4h['EMA_50_4H'] = df4h['Close'].ewm(span=50, adjust=False).mean()
   df4h['EMA_200_4H'] = df4h['Close'].ewm(span=200, adjust=False).mean()
 
-  # شیفت دادن 4H به اندازه یک کندل به عقب تا در هر ساعت، فقط کندل 4H *قبلاً بسته شده* قابل دسترسی باشد
   df4h['EMA_50_4H'] = df4h['EMA_50_4H'].shift(1)
   df4h['EMA_200_4H'] = df4h['EMA_200_4H'].shift(1)
   df4h['Close_4H'] = df4h['Close'].shift(1)
@@ -154,26 +148,24 @@ for symbol, df1h in data_1h.items():
   df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
   df4h_indexed = df4h.set_index('Date')
 
-  # شبیه‌سازی گام‌به‌گام رویدادمحور
-  position = None  # None, 'LONG', 'SHORT'
+  position = None
   entry_price = 0.0
   stop_loss = 0.0
   take_profit = 0.0
 
   for i in range(200, len(df1h)):
     c1h = df1h.iloc[i]
-    prev_c1h = df1h.iloc[i - 1]  # اطلاعات کندل کاملاً بسته شده 1 ساعته
+    prev_c1h = df1h.iloc[i - 1]
     t4h_time = c1h['Date_4H']
 
     if t4h_time not in df4h_indexed.index:
       continue
     r4h = df4h_indexed.loc[t4h_time]
 
-    # --- 1. مدیریت پوزیشن باز (بررسی TP و SL در کندل جاری بدون نگاه به آینده) ---
+    # --- 1. مدیریت پوزیشن باز ---
     if position is not None:
       if position == 'LONG':
         if c1h['Low'] <= stop_loss:
-          # خروج با ضرر
           all_portfolio_trades.append({
               'Symbol': symbol,
               'Side': 'LONG',
@@ -182,7 +174,6 @@ for symbol, df1h in data_1h.items():
           })
           position = None
         elif c1h['High'] >= take_profit:
-          # خروج با سود (R:R = 1:2)
           all_portfolio_trades.append({
               'Symbol': symbol,
               'Side': 'LONG',
@@ -208,9 +199,8 @@ for symbol, df1h in data_1h.items():
           })
           position = None
 
-    # --- 2. بررسی سیگنال جدید (فقط در صورت بسته بودن پوزیشن روی این ارز) ---
+    # --- 2. بررسی سیگنال با منطق Breakout + Retest ---
     if position is None:
-      # شرایط روند 4H
       is_4h_bullish = (r4h['Close_4H'] > r4h['EMA_200_4H']) and (
           r4h['EMA_50_4H'] > r4h['EMA_200_4H']
       )
@@ -218,38 +208,61 @@ for symbol, df1h in data_1h.items():
           r4h['EMA_50_4H'] < r4h['EMA_200_4H']
       )
 
-      # شرایط شکست 1H (استفاده از مقادیر شیفت‌شده قبلی)
+      # شرایط فیلتر روند قوی‌تر (ADX > 25)
+      is_adx_ok = prev_c1h['ADX'] > 25
+
+      # الف) تشخیص شکست اولیه (Breakout)
       is_breakout_long = prev_c1h['Close'] > prev_c1h['Donchian_High']
       is_breakout_short = prev_c1h['Close'] < prev_c1h['Donchian_Low']
 
-      # فیلتر حجم و روند
-      is_volume_ok = prev_c1h['RVOL'] >= 1.2
-      is_adx_ok = prev_c1h['ADX'] > 22
+      if is_4h_bullish and is_breakout_long and is_adx_ok:
+        # جستجو برای پولبک در چند کندل بعدی (بدون نگاه به آینده - رو به جلو)
+        broken_level = prev_c1h['Donchian_High']
+        for p in range(1, 8):  # تا 7 کندل آینده برای پولبک فرصت داریم
+          if i + p >= len(df1h) - 1:
+            break
+          retest_candle = df1h.iloc[i + p]
+          # شرط پولبک: قیمت به سطح شکسته شده نزدیک شود یا آن را لمس کند
+          if retest_candle['Low'] <= broken_level * 1.002:
+            # تأییدیه بازگشت: کندل صعودی با حجم مناسب
+            if (
+                retest_candle['Close'] > retest_candle['Open']
+                and retest_candle['RVOL'] >= 1.1
+            ):
+              position = 'LONG'
+              entry_price = retest_candle['Close'] * (1 + SLIPPAGE)
+              # حد ضرر زیر کف پولبک
+              stop_loss = retest_candle['Low'] - (0.5 * retest_candle['ATR'])
+              risk = entry_price - stop_loss
+              if risk > 0 and (risk / entry_price) <= 0.04:
+                take_profit = entry_price + (2.0 * risk)
+              else:
+                position = None
+              break
 
-      if is_4h_bullish and is_breakout_long and is_volume_ok and is_adx_ok:
-        position = 'LONG'
-        entry_price = c1h['Open'] * (
-            1 + SLIPPAGE
-        )  # ورود در قیمت بازگشایی کندل جدید
-        stop_loss = prev_c1h['Low'] - (0.5 * prev_c1h['ATR'])
-        risk = entry_price - stop_loss
-        if risk > 0:
-          take_profit = entry_price + (2.0 * risk)
-        else:
-          position = None  # لغو معامله در صورت ناهنجاری ریسک
-
-      elif is_4h_bearish and is_breakout_short and is_volume_ok and is_adx_ok:
-        position = 'SHORT'
-        entry_price = c1h['Open'] * (1 - SLIPPAGE)
-        stop_loss = prev_c1h['High'] + (0.5 * prev_c1h['ATR'])
-        risk = stop_loss - entry_price
-        if risk > 0:
-          take_profit = entry_price - (2.0 * risk)
-        else:
-          position = None
+      elif is_4h_bearish and is_breakout_short and is_adx_ok:
+        broken_level = prev_c1h['Donchian_Low']
+        for p in range(1, 8):
+          if i + p >= len(df1h) - 1:
+            break
+          retest_candle = df1h.iloc[i + p]
+          if retest_candle['High'] >= broken_level * 0.998:
+            if (
+                retest_candle['Close'] < retest_candle['Open']
+                and retest_candle['RVOL'] >= 1.1
+            ):
+              position = 'SHORT'
+              entry_price = retest_candle['Close'] * (1 - SLIPPAGE)
+              stop_loss = retest_candle['High'] + (0.5 * retest_candle['ATR'])
+              risk = stop_loss - entry_price
+              if risk > 0 and (risk / entry_price) <= 0.04:
+                take_profit = entry_price - (2.0 * risk)
+              else:
+                position = None
+              break
 
 print('\n============================================================')
-print('📊 گزارش نهایی ارزیابی عملکرد پورتفوی (ATB-10)')
+print('📊 گزارش نهایی ارزیابی عملکرد پورتفوی با منطق Breakout + Retest')
 print('============================================================')
 
 if all_portfolio_trades:
