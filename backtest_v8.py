@@ -3,7 +3,6 @@ import subprocess
 import sys
 from datetime import datetime, timedelta
 
-# نصب خودکار ccxt در صورت نیاز
 try:
     import ccxt
 except ImportError:
@@ -14,7 +13,7 @@ except ImportError:
 import numpy as np
 import pandas as pd
 
-# تنظیمات اتصال به صرافی LBank و سبد ۱۰ ارز
+# صرافی LBank و سبد ۱۰ ارز
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
     'BTC': 'BTC/USDT',
@@ -29,15 +28,11 @@ SYMBOLS = {
     'DOT': 'DOT/USDT',
 }
 
-# بازه زمانی: یک سال گذشته
 start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print(
-    '📥 دریافت داده‌های 1 ساعته از صرافی LBank (منطق Order Block + Liquidity'
-    ' Sweep)'
-)
+print('📥 دریافت داده‌های 1 ساعته از صرافی LBank (استراتژی Pullback)')
 print('============================================================')
 
 data_1h = {}
@@ -80,17 +75,23 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
 
 def calculate_indicators(df):
-  """محاسبه اندیکاتورها و سطوح نقدینگی بدون Lookahead Bias"""
+  """محاسبه اندیکاتورها با رعایت کامل عدم نشت اطلاعات آینده (Shifted)"""
   df = df.copy()
 
+  # میانگین‌های متحرک برای تشخیص روند
+  df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
   df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
   df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
 
-  # سطوح نقدینگی محلی (Swing High و Swing Low شیفت‌شده)
-  df['Swing_High_15'] = df['High'].shift(1).rolling(window=15).max()
-  df['Swing_Low_15'] = df['Low'].shift(1).rolling(window=15).min()
+  # RSI (14) - شیفت شده
+  delta = df['Close'].diff()
+  gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+  loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+  rs = gain / (loss + 1e-9)
+  df['RSI'] = 100 - (100 / (1 + rs))
+  df['RSI_Shift'] = df['RSI'].shift(1)
 
-  # محاسبه ATR (14)
+  # ATR (14)
   high_low = df['High'] - df['Low']
   high_close = np.abs(df['High'] - df['Close'].shift(1))
   low_close = np.abs(df['Low'] - df['Close'].shift(1))
@@ -105,7 +106,7 @@ def calculate_indicators(df):
 
 
 print('\n============================================================')
-print('🚀 اجرای موتور بک‌تست با استراتژی قدرتمند Order Block + Sweep')
+print('🚀 اجرای موتور بک‌تست پورتفوی (Pullback Continuation)')
 print('============================================================')
 
 all_portfolio_trades = []
@@ -116,32 +117,6 @@ for symbol, df1h in data_1h.items():
     continue
 
   df1h = calculate_indicators(df1h)
-
-  # ساخت تایم‌فریم 4 ساعته ایمن و بدون نشت
-  df4h = (
-      df1h.set_index('Date')
-      .resample('4H')
-      .agg({
-          'Open': 'first',
-          'High': 'max',
-          'Low': 'min',
-          'Close': 'last',
-          'Volume': 'sum',
-      })
-      .dropna()
-      .reset_index()
-  )
-
-  df4h['EMA_50_4H'] = df4h['Close'].ewm(span=50, adjust=False).mean()
-  df4h['EMA_200_4H'] = df4h['Close'].ewm(span=200, adjust=False).mean()
-
-  df4h['EMA_50_4H'] = df4h['EMA_50_4H'].shift(1)
-  df4h['EMA_200_4H'] = df4h['EMA_200_4H'].shift(1)
-  df4h['Close_4H'] = df4h['Close'].shift(1)
-
-  df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
-  df4h_indexed = df4h.set_index('Date')
-
   position = None
   entry_price = 0.0
   stop_loss = 0.0
@@ -150,11 +125,6 @@ for symbol, df1h in data_1h.items():
   for i in range(200, len(df1h)):
     c1h = df1h.iloc[i]
     prev_c1h = df1h.iloc[i - 1]
-    t4h_time = c1h['Date_4H']
-
-    if t4h_time not in df4h_indexed.index:
-      continue
-    r4h = df4h_indexed.loc[t4h_time]
 
     # --- 1. مدیریت پوزیشن باز ---
     if position is not None:
@@ -193,52 +163,48 @@ for symbol, df1h in data_1h.items():
           })
           position = None
 
-    # --- 2. بررسی سیگنال با منطق Sweep + Order Block ---
+    # --- 2. بررسی سیگنال با منطق Pullback در روند ---
     if position is None:
-      # روند کلان 4 ساعته
-      is_4h_bullish = r4h['Close_4H'] > r4h['EMA_50_4H']
-      is_4h_bearish = r4h['Close_4H'] < r4h['EMA_50_4H']
-
-      # الف) جاروب نقدینگی (Liquidity Sweep):
-      # لانگ: قیمت کفِ پایین‌تر از Swing Low قبلی را زده اما بسته شدن آن بالاتر از Swing Low است (ریجکشن کف)
-      sweep_long = (prev_c1h['Low'] < prev_c1h['Swing_Low_15']) and (
-          prev_c1h['Close'] > prev_c1h['Swing_Low_15']
+      # روند صعودی قوی: قیمت بالای EMA 200 و EMA 20 بالای EMA 50
+      is_uptrend = (
+          prev_c1h['Close'] > prev_c1h['EMA_200']
+          and prev_c1h['EMA_20'] > prev_c1h['EMA_50']
       )
-      # شورت: قیمت سقفِ بالاتر از Swing High قبلی را زده اما بسته شدن آن پایین‌تر از Swing High است (ریجکشن سقف)
-      sweep_short = (prev_c1h['High'] > prev_c1h['Swing_High_15']) and (
-          prev_c1h['Close'] < prev_c1h['Swing_High_15']
+      # روند نزولی قوی: قیمت پایین EMA 200 و EMA 20 پایین EMA 50
+      is_downtrend = (
+          prev_c1h['Close'] < prev_c1h['EMA_200']
+          and prev_c1h['EMA_20'] < prev_c1h['EMA_50']
       )
 
-      # ب) تأییدیه حجم و بدنه کندل (Order Block / Rejection Confirmation)
-      is_bullish_candle = (
-          prev_c1h['Close'] > prev_c1h['Open']
-          and prev_c1h['RVOL'] >= 1.3
-          and (prev_c1h['Close'] - prev_c1h['Open'])
-          > (prev_c1h['High'] - prev_c1h['Low']) * 0.4
+      # شرایط اصلاح (Pullback): قیمت به محدوده EMA 20 نزدیک شده یا کمی به زیر آن رفته، و RSI اصلاح انجام داده است
+      pullback_long = (
+          prev_c1h['Low'] <= prev_c1h['EMA_20']
+          and prev_c1h['RSI_Shift'] < 50
+          and prev_c1h['Close'] > prev_c1h['Open']
+          and prev_c1h['RVOL'] >= 1.1
       )
-      is_bearish_candle = (
-          prev_c1h['Close'] < prev_c1h['Open']
-          and prev_c1h['RVOL'] >= 1.3
-          and (prev_c1h['Open'] - prev_c1h['Close'])
-          > (prev_c1h['High'] - prev_c1h['Low']) * 0.4
+      pullback_short = (
+          prev_c1h['High'] >= prev_c1h['EMA_20']
+          and prev_c1h['RSI_Shift'] > 50
+          and prev_c1h['Close'] < prev_c1h['Open']
+          and prev_c1h['RVOL'] >= 1.1
       )
 
-      if is_4h_bullish and sweep_long and is_bullish_candle:
+      if is_uptrend and pullback_long:
         position = 'LONG'
         entry_price = c1h['Open'] * (1 + SLIPPAGE)
-        # حد ضرر ایمن زیر پایین‌ترین نقطه جاروب شده
-        stop_loss = prev_c1h['Low'] - (0.3 * prev_c1h['ATR'])
+        # حد ضرر پایین‌تر از کف کندل اصلاحی یا ATR
+        stop_loss = prev_c1h['Low'] - (0.5 * prev_c1h['ATR'])
         risk = entry_price - stop_loss
         if risk > 0 and (risk / entry_price) <= 0.04:
           take_profit = entry_price + (2.0 * risk)
         else:
           position = None
 
-      elif is_4h_bearish and sweep_short and is_bearish_candle:
+      elif is_downtrend and pullback_short:
         position = 'SHORT'
         entry_price = c1h['Open'] * (1 - SLIPPAGE)
-        # حد ضرر ایمن بالای بالاترین نقطه جاروب شده
-        stop_loss = prev_c1h['High'] + (0.3 * prev_c1h['ATR'])
+        stop_loss = prev_c1h['High'] + (0.5 * prev_c1h['ATR'])
         risk = stop_loss - entry_price
         if risk > 0 and (risk / entry_price) <= 0.04:
           take_profit = entry_price - (2.0 * risk)
@@ -246,7 +212,7 @@ for symbol, df1h in data_1h.items():
           position = None
 
 print('\n============================================================')
-print('📊 گزارش نهایی ارزیابی عملکرد پورتفوی (Order Block + Sweep)')
+print('📊 گزارش نهایی عملکرد پورتفوی (Pullback Continuation)')
 print('============================================================')
 
 if all_portfolio_trades:
