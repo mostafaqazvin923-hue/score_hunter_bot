@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (نسخه اصلاح‌شده و متعادل)")
+print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (نسخه پایدار و مطمئن)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_balanced_data.csv"
+    filename_1h = f"{symbol}_1h_stable_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -100,7 +100,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست با منطق اصلاح‌شده و متعادل")
+print("🚀 اجرای موتور بک‌تست با منطق پایدار و بهینه‌سازی ریسک به ریوارد")
 print("============================================================")
 
 all_portfolio_trades = {}
@@ -111,7 +111,6 @@ for symbol, df1h in data_1h.items():
         
     df1h = calculate_indicators(df1h)
     
-    # استفاده از '4h' به جای '4H' برای جلوگیری از هشدار پانداس
     df4h = df1h.set_index('Date').resample('4h').agg({
         'Open': 'first',
         'High': 'max',
@@ -125,7 +124,7 @@ for symbol, df1h in data_1h.items():
     df4h_indexed = df4h.set_index('Date')
     
     symbol_trades = []
-    locked_until_index = 0  # قفل همپوشانی
+    locked_until_index = 0
     
     for i in range(200, len(df1h) - 10):
         if i < locked_until_index:
@@ -139,36 +138,23 @@ for symbol, df1h in data_1h.items():
             
         r4h = df4h_indexed.loc[t4h_time]
         
-        ema20_4h = r4h['EMA_20']
-        ema50_4h = r4h['EMA_50']
-        ema200_4h = r4h['EMA_200']
+        # روند در تایم فریم 4 ساعته
+        is_uptrend = (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_20'] > r4h['EMA_50'])
+        is_downtrend = (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_20'] < r4h['EMA_50'])
         
-        # رژیم روند 4 ساعته با ADX مناسب
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and (r4h['ADX'] >= 22)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 22)
-        
-        if not is_long_regime and not is_short_regime:
+        if not is_uptrend and not is_downtrend:
             continue
             
-        lookback_slice = df1h.iloc[i-20:i]
-        struct_high = lookback_slice['High'].max()
-        struct_low = lookback_slice['Low'].min()
-        avg_vol = lookback_slice['Volume'].mean()
+        # منطق ورود استاندارد و مطمئن بر اساس پولبک به EMA20 و تاییدیه RSI
+        is_long_signal = is_uptrend and (c1h['Low'] <= c1h['EMA_20']) and (c1h['Close'] > c1h['EMA_20']) and (c1h['RSI'] > 45) and (c1h['RSI'] < 70)
+        is_short_signal = is_downtrend and (c1h['High'] >= c1h['EMA_20']) and (c1h['Close'] < c1h['EMA_20']) and (c1h['RSI'] < 55) and (c1h['RSI'] > 30)
         
-        # تشخیص اسویپ نقدینگی در چند کندل اخیر + شکست ساختار با حجم مناسب (1.4 برابر)
-        recent_slice = df1h.iloc[i-8:i]
-        has_swept_low = recent_slice['Low'].min() < struct_low
-        has_swept_high = recent_slice['High'].max() > struct_high
-        
-        is_signal_long = has_swept_low and (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 1.4) and (c1h['RSI'] > 50)
-        is_signal_short = has_swept_high and (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 1.4) and (c1h['RSI'] < 50)
-        
-        if is_long_regime and is_signal_long:
+        if is_long_signal:
             entry_price = c1h['Close']
-            sl = recent_slice['Low'].min() - (0.3 * c1h['ATR'])
+            sl = c1h['Low'] - (1.2 * c1h['ATR'])
             risk = entry_price - sl
             
-            if risk > 0 and (risk / entry_price) <= 0.045:
+            if risk > 0 and (risk / entry_price) <= 0.05:
                 tp = entry_price + (2.0 * risk)
                 
                 outcome = None
@@ -198,12 +184,12 @@ for symbol, df1h in data_1h.items():
                     })
                     locked_until_index = exit_idx
                     
-        elif is_short_regime and is_signal_short:
+        elif is_short_signal:
             entry_price = c1h['Close']
-            sl = recent_slice['High'].max() + (0.3 * c1h['ATR'])
+            sl = c1h['High'] + (1.2 * c1h['ATR'])
             risk = sl - entry_price
             
-            if risk > 0 and (risk / entry_price) <= 0.045:
+            if risk > 0 and (risk / entry_price) <= 0.05:
                 tp = entry_price - (2.0 * risk)
                 
                 outcome = None
@@ -237,7 +223,7 @@ for symbol, df1h in data_1h.items():
         all_portfolio_trades[symbol] = symbol_trades
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی (نسخه اصلاح‌شده و متوازن)")
+print("📊 گزارش نهایی پورتفوی (نسخه پایدار)")
 print("============================================================")
 
 flat_trades = []
