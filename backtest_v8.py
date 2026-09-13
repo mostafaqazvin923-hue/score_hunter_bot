@@ -30,7 +30,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌های 1 ساعته از صرافی LBank (نسخه بهینه‌شده Win-Rate)')
+print('📥 دریافت داده‌ها برای استراتژی هدف وین‌ریت بالا (>50%)')
 print('============================================================')
 
 data_1h = {}
@@ -69,10 +69,16 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
 def calculate_indicators(df):
   df = df.copy()
-  df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
   df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
   df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
 
+  # Bollinger Bands برای تشخیص فشردگی و بازگشت دقیق
+  sma20 = df['Close'].rolling(window=20).mean()
+  std20 = df['Close'].rolling(window=20).std()
+  df['BB_Upper'] = sma20 + (2.0 * std20)
+  df['BB_Lower'] = sma20 - (2.0 * std20)
+
+  # RSI (14) - شیفت شده
   delta = df['Close'].diff()
   gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
   loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -80,20 +86,12 @@ def calculate_indicators(df):
   df['RSI'] = 100 - (100 / (1 + rs))
   df['RSI_Shift'] = df['RSI'].shift(1)
 
+  # ATR (14)
   high_low = df['High'] - df['Low']
   high_close = np.abs(df['High'] - df['Close'].shift(1))
   low_close = np.abs(df['Low'] - df['Close'].shift(1))
   tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
   df['ATR'] = tr.rolling(window=14).mean()
-
-  # فیلتر ADX برای قدرت روند
-  plus_dm = df['High'].diff().clip(lower=0)
-  minus_dm = (-df['Low'].diff()).clip(lower=0)
-  tr14 = tr.rolling(window=14).mean()
-  plus_di = 100 * (plus_dm.rolling(window=14).mean() / (tr14 + 1e-9))
-  minus_di = 100 * (minus_dm.rolling(window=14).mean() / (tr14 + 1e-9))
-  dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-  df['ADX'] = dx.rolling(window=14).mean().fillna(20)
 
   vol_ma = df['Volume'].shift(1).rolling(window=20).mean()
   df['RVOL'] = df['Volume'] / (vol_ma + 1e-9)
@@ -109,6 +107,29 @@ for symbol, df1h in data_1h.items():
     continue
 
   df1h = calculate_indicators(df1h)
+
+  # ساخت تایم‌فریم 4 ساعته ایمن
+  df4h = (
+      df1h.set_index('Date')
+      .resample('4H')
+      .agg({
+          'Open': 'first',
+          'High': 'max',
+          'Low': 'min',
+          'Close': 'last',
+          'Volume': 'sum',
+      })
+      .dropna()
+      .reset_index()
+  )
+
+  df4h['EMA_50_4H'] = df4h['Close'].ewm(span=50, adjust=False).mean().shift(1)
+  df4h['EMA_200_4H'] = df4h['Close'].ewm(span=200, adjust=False).mean().shift(1)
+  df4h['Close_4H'] = df4h['Close'].shift(1)
+
+  df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
+  df4h_indexed = df4h.set_index('Date')
+
   position = None
   entry_price = 0.0
   stop_loss = 0.0
@@ -117,6 +138,11 @@ for symbol, df1h in data_1h.items():
   for i in range(200, len(df1h)):
     c1h = df1h.iloc[i]
     prev_c1h = df1h.iloc[i - 1]
+    t4h_time = c1h['Date_4H']
+
+    if t4h_time not in df4h_indexed.index:
+      continue
+    r4h = df4h_indexed.loc[t4h_time]
 
     if position is not None:
       if position == 'LONG':
@@ -133,8 +159,8 @@ for symbol, df1h in data_1h.items():
               'Symbol': symbol,
               'Side': 'LONG',
               'Outcome': 'WIN',
-              'Return': 2.0,
-          })
+              'Return': 1.5,
+          })  # تنظیم ریسک به ریوارد برایاتک وین‌ریت بالا
           position = None
       elif position == 'SHORT':
         if c1h['High'] >= stop_loss:
@@ -150,65 +176,60 @@ for symbol, df1h in data_1h.items():
               'Symbol': symbol,
               'Side': 'SHORT',
               'Outcome': 'WIN',
-              'Return': 2.0,
+              'Return': 1.5,
           })
           position = None
 
     if position is None:
-      is_uptrend = (
-          prev_c1h['Close'] > prev_c1h['EMA_200']
-          and prev_c1h['EMA_20'] > prev_c1h['EMA_50']
+      # روند کلان صعودی و نزولی در 4H
+      trend_long = (r4h['Close_4H'] > r4h['EMA_200_4H']) and (
+          r4h['EMA_50_4H'] > r4h['EMA_200_4H']
       )
-      is_downtrend = (
-          prev_c1h['Close'] < prev_c1h['EMA_200']
-          and prev_c1h['EMA_20'] < prev_c1h['EMA_50']
-      )
-
-      # اضافه شدن فیلتر ADX و قدرت بدنه کندل برای افزایش وین‌ریت
-      is_adx_strong = prev_c1h['ADX'] > 22
-
-      pullback_long = (
-          prev_c1h['Low'] <= prev_c1h['EMA_20']
-          and prev_c1h['RSI_Shift'] < 48
-          and prev_c1h['Close'] > prev_c1h['Open']
-          and (prev_c1h['Close'] - prev_c1h['Open'])
-          > (prev_c1h['High'] - prev_c1h['Low']) * 0.4
-          and prev_c1h['RVOL'] >= 1.2
-          and is_adx_strong
+      trend_short = (r4h['Close_4H'] < r4h['EMA_200_4H']) and (
+          r4h['EMA_50_4H'] < r4h['EMA_200_4H']
       )
 
-      pullback_short = (
-          prev_c1h['High'] >= prev_c1h['EMA_20']
-          and prev_c1h['RSI_Shift'] > 52
-          and prev_c1h['Close'] < prev_c1h['Open']
-          and (prev_c1h['Open'] - prev_c1h['Close'])
-          > (prev_c1h['High'] - prev_c1h['Low']) * 0.4
-          and prev_c1h['RVOL'] >= 1.2
-          and is_adx_strong
+      # شرط ورود با دقت بالا و فیلتر باند بولینگر و RSI برای دقت بالای ۵۰٪
+      signal_long = (
+          trend_long
+          and (prev_c1h['Low'] <= prev_c1h['BB_Lower'])
+          and (prev_c1h['RSI_Shift'] < 35)
+          and (prev_c1h['Close'] > prev_c1h['Open'])
+          and (prev_c1h['RVOL'] >= 1.3)
       )
 
-      if is_uptrend and pullback_long:
+      signal_short = (
+          trend_short
+          and (prev_c1h['High'] >= prev_c1h['BB_Upper'])
+          and (prev_c1h['RSI_Shift'] > 65)
+          and (prev_c1h['Close'] < prev_c1h['Open'])
+          and (prev_c1h['RVOL'] >= 1.3)
+      )
+
+      if signal_long:
         position = 'LONG'
         entry_price = c1h['Open'] * (1 + SLIPPAGE)
-        stop_loss = prev_c1h['Low'] - (0.5 * prev_c1h['ATR'])
+        stop_loss = prev_c1h['Low'] - (1.0 * prev_c1h['ATR'])
         risk = entry_price - stop_loss
-        if risk > 0 and (risk / entry_price) <= 0.04:
-          take_profit = entry_price + (2.0 * risk)
+        if risk > 0:
+          take_profit = entry_price + (
+              1.5 * risk
+          )  # ریوارد 1.5 برای تضمین وین‌ریت بالا
         else:
           position = None
 
-      elif is_downtrend and pullback_short:
+      elif signal_short:
         position = 'SHORT'
         entry_price = c1h['Open'] * (1 - SLIPPAGE)
-        stop_loss = prev_c1h['High'] + (0.5 * prev_c1h['ATR'])
+        stop_loss = prev_c1h['High'] + (1.0 * prev_c1h['ATR'])
         risk = stop_loss - entry_price
-        if risk > 0 and (risk / entry_price) <= 0.04:
-          take_profit = entry_price - (2.0 * risk)
+        if risk > 0:
+          take_profit = entry_price - (1.5 * risk)
         else:
           position = None
 
 print('\n============================================================')
-print('📊 گزارش نهایی پورتفوی (بهینه‌سازی شده)')
+print('📊 گزارش نهایی استراتژی با هدف وین‌ریت بالا')
 print('============================================================')
 
 if all_portfolio_trades:
