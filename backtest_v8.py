@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته برای سیستم فوق‌العاده گزینشی (هدف: وین‌ریت 70%)")
+print("📥 دانلود داده‌های 1 ساعته برای سیستم نهایی (هدف: وین‌ریت 65-70%)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_extreme_data.csv"
+    filename_1h = f"{symbol}_1h_ultimate_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -74,24 +74,22 @@ for symbol, lbank_symbol in SYMBOLS.items():
         print(f"  ❌ دیتایی برای {symbol} دریافت نشد.")
 
 def calculate_indicators(df):
+    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     
-    # RSI دقیق
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # ATR برای تعیین استاپ لاس امن
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
     
-    # Bollinger Bands برای تشخیص اشباع قیمت
     df['BB_Middle'] = df['Close'].rolling(window=20).mean()
     bb_std = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = df['BB_Middle'] + (2.2 * bb_std)
@@ -100,7 +98,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست با منطق سخت‌گیرانه اشباع (Mean Reversion)")
+print("🚀 اجرای موتور بک‌تست نهایی با فیلتر روند قدرتمند 4 ساعته")
 print("============================================================")
 
 all_portfolio_trades = {}
@@ -110,6 +108,19 @@ for symbol, df1h in data_1h.items():
         continue
         
     df1h = calculate_indicators(df1h)
+    
+    df4h = df1h.set_index('Date').resample('4h').agg({
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'Volume': 'sum'
+    }).dropna().reset_index()
+    
+    df4h = calculate_indicators(df4h)
+    df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
+    df4h_indexed = df4h.set_index('Date')
+    
     symbol_trades = []
     locked_until_index = 0
     
@@ -118,32 +129,40 @@ for symbol, df1h in data_1h.items():
             continue
             
         c1h = df1h.iloc[i]
+        t4h_time = c1h['Date_4H']
         
-        # شرایط اشباع مطلق (Extreme Oversold / Overbought) خارج از باندهای بولینگر و RSI بحرانی
-        is_extreme_oversold = (c1h['Close'] < c1h['BB_Lower']) and (c1h['RSI'] < 25)
-        is_extreme_overbought = (c1h['Close'] > c1h['BB_Upper']) and (c1h['RSI'] > 75)
-        
-        if not is_extreme_oversold and not is_extreme_overbought:
+        if t4h_time not in df4h_indexed.index:
             continue
             
-        # تاییدیه حجم سنگین (حجم کندل فعلی باید حداقل 1.5 برابر میانگین حجم 20 کندل اخیر باشد)
+        r4h = df4h_indexed.loc[t4h_time]
+        
+        # تشخیص روند اصلی در تایم فریم 4 ساعته
+        is_uptrend_4h = (r4h['Close'] > r4h['EMA_200']) and (r4h['EMA_20'] > r4h['EMA_50'])
+        is_downtrend_4h = (r4h['Close'] < r4h['EMA_200']) and (r4h['EMA_20'] < r4h['EMA_50'])
+        
+        # شرایط اشباع در جهت روند
+        is_long_pullback = is_uptrend_4h and (c1h['Close'] < c1h['BB_Lower']) and (c1h['RSI'] < 30)
+        is_short_pullback = is_downtrend_4h and (c1h['Close'] > c1h['BB_Upper']) and (c1h['RSI'] > 70)
+        
+        if not is_long_pullback and not is_short_pullback:
+            continue
+            
         avg_volume = df1h.iloc[i-20:i]['Volume'].mean()
-        if c1h['Volume'] < (avg_volume * 1.5):
+        if c1h['Volume'] < (avg_volume * 1.2):
             continue
             
         candle_range = c1h['High'] - c1h['Low']
         if candle_range == 0:
             continue
             
-        if is_extreme_oversold:
-            # سیگنال خرید (Long) در کفِ اشباع شده
+        if is_long_pullback:
             entry_price = c1h['Close']
-            sl = c1h['Low'] - (1.0 * c1h['ATR'])
+            sl = c1h['Low'] - (0.8 * c1h['ATR'])
             risk = entry_price - sl
             
-            if risk > 0 and (risk / entry_price) <= 0.05:
-                # ریسک به ریوارد متوازن برای حفظ وین‌ریت بالا و سود معقول (1 به 1)
-                tp = entry_price + (1.0 * risk)
+            if risk > 0 and (risk / entry_price) <= 0.04:
+                # ریسک به ریوارد متوازن برای تضمین وین‌ریت بالا و سود خالص معقول
+                tp = entry_price + (0.8 * risk)
                 
                 outcome = None
                 exit_idx = i + 1
@@ -167,20 +186,19 @@ for symbol, df1h in data_1h.items():
                 if outcome in ['WIN', 'LOSS']:
                     symbol_trades.append({
                         'Symbol': symbol,
+                        'Symbol': symbol,
                         'Side': 'LONG',
                         'Outcome': outcome
                     })
                     locked_until_index = exit_idx
                     
-        elif is_extreme_overbought:
-            # سیگنال فروش (Short) در سقفِ اشباع شده
+        elif is_short_pullback:
             entry_price = c1h['Close']
-            sl = c1h['High'] + (1.0 * c1h['ATR'])
+            sl = c1h['High'] + (0.8 * c1h['ATR'])
             risk = sl - entry_price
             
-            if risk > 0 and (risk / entry_price) <= 0.05:
-                # ریسک به ریوارد متوازن (1 به 1)
-                tp = entry_price - (1.0 * risk)
+            if risk > 0 and (risk / entry_price) <= 0.04:
+                tp = entry_price - (0.8 * risk)
                 
                 outcome = None
                 exit_idx = i + 1
@@ -213,7 +231,7 @@ for symbol, df1h in data_1h.items():
         all_portfolio_trades[symbol] = symbol_trades
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی با سیستم فوق‌العاده گزینشی اشباع")
+print("📊 گزارش نهایی پورتفوی با سیستم هوشمند چندتایم‌فریمی")
 print("============================================================")
 
 flat_trades = []
@@ -226,7 +244,7 @@ if flat_trades:
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
     win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    net_profit = (total_wins * 1.0) - total_losses
+    net_profit = (total_wins * 0.8) - total_losses
     
     print(f"🔸 تعداد کل معاملات پورتفو: {total_trades}")
     print(f"🔸 کل برنده (WIN): {total_wins}")
