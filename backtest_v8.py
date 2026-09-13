@@ -23,7 +23,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای موتور تک‌تیرانداز (Macro Trend + Liquidity Sweep + R:R 1:3)")
+print("📥 دانلود داده‌ها برای موتور تک‌تیرانداز (Macro Trend + Liquidity Sweep + R:R 1:2.5)")
 print("============================================================")
 
 data_1h = {}
@@ -58,7 +58,7 @@ def calculate_indicators(df):
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
     return df
 
-print("\n🚀 اجرای موتور تک‌تیرانداز با فیلتر روند کلان و حجم کمِ معاملات...")
+print("\n🚀 اجرای موتور تک‌تیرانداز با ریسک به ریوارد ۱ به ۲.۵...")
 
 all_portfolio_trades = []
 
@@ -66,7 +66,6 @@ for symbol, df1h in data_1h.items():
     if len(df1h) < 400: continue
     df1h = calculate_indicators(df1h)
     
-    # ساخت تایم فریم 4 ساعته برای تعیین روند آهنینی
     df4h = df1h.set_index('Date').resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna().reset_index()
     df4h = calculate_indicators(df4h)
     df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
@@ -81,18 +80,15 @@ for symbol, df1h in data_1h.items():
         if t4h_time not in df4h_indexed.index: continue
         r4h = df4h_indexed.loc[t4h_time]
         
-        # روند کاملاً مشخص در 4 ساعته
         is_bullish_macro = (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_50'] > r4h['EMA_200'])
         is_bearish_macro = (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_50'] < r4h['EMA_200'])
         
         if not is_bullish_macro and not is_bearish_macro: continue
         
-        # سقف و کف محلی برای شکار نقدینگی
         lookback = df1h.iloc[i-25:i]
         local_high = lookback['High'].max()
         local_low = lookback['Low'].min()
         
-        # 1. ورود صعودی: فقط در روند صعودی 4 ساعته، وقتی قیمت کفِ قبلی را جارو کرد و با قدرت برگشت بالا
         if is_bullish_macro:
             swept_low = (c['Low'] < local_low) and (c['Close'] > local_low) and (c['Close'] > c['Open'])
             if not swept_low: continue
@@ -103,7 +99,8 @@ for symbol, df1h in data_1h.items():
             
             if risk <= 0 or (risk / entry_price) > 0.035: continue
             
-            tp = entry_price + (3.0 * risk)
+            # تغییر ریسک به ریوارد به ۱ به ۲.۵
+            tp = entry_price + (2.5 * risk)
             
             outcome = 'OPEN'
             exit_idx = i + 1
@@ -121,7 +118,6 @@ for symbol, df1h in data_1h.items():
                 all_portfolio_trades.append({'Symbol': symbol, 'Outcome': outcome})
                 locked_until_index = exit_idx
                 
-        # 2. ورود نزولی: فقط در روند نزولی 4 ساعته، وقتی قیمت سقفِ قبلی را جارو کرد و ریخت
         elif is_bearish_macro:
             swept_high = (c['High'] > local_high) and (c['Close'] < local_high) and (c['Close'] < c['Open'])
             if not swept_high: continue
@@ -132,7 +128,8 @@ for symbol, df1h in data_1h.items():
             
             if risk <= 0 or (risk / entry_price) > 0.035: continue
             
-            tp = entry_price - (3.0 * risk)
+            # تغییر ریسک به ریوارد به ۱ به ۲.۵
+            tp = entry_price - (2.5 * risk)
             
             outcome = 'OPEN'
             exit_idx = i + 1
@@ -151,7 +148,7 @@ for symbol, df1h in data_1h.items():
                 locked_until_index = exit_idx
 
 print("\n============================================================")
-print("📊 گزارش نهایی موتور تک‌تیرانداز (Sniper Macro Liquidity)")
+print("📊 گزارش نهایی موتور تک‌تیرانداز (Sniper Macro Liquidity + R:R 1:2.5)")
 print("============================================================")
 if all_portfolio_trades:
     pf_df = pd.DataFrame(all_portfolio_trades)
@@ -159,11 +156,11 @@ if all_portfolio_trades:
     losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
     total = len(pf_df)
     win_rate = (wins / total) * 100 if total > 0 else 0
-    net_score = (wins * 3.0) - losses
+    net_score = (wins * 2.5) - losses
     
     print(pf_df['Outcome'].value_counts())
-    print(f"🔸 تعداد کل معاملات (محدود و گلچین شده): {total}")
-    print(f"🎯 وین‌ریت: {win_rate:.2f}%")
-    print(f"💰 امتیاز سود خالص (Net Score با R:R 1:3): {net_score:.2f}R")
+    print(f"🔸 تعداد کل معاملات: {total}")
+    print(f"🎯 وین‌ریت جدید: {win_rate:.2f}%")
+    print(f"💰 امتیاز سود خالص (Net Score با R:R 1:2.5): {net_score:.2f}R")
 else:
     print("معامله‌ای ثبت نشد.")
