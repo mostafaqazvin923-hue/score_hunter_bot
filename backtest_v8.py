@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (منطق Pullback + Sweep)")
+print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (منطق CHoCH + حجم بالا)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_pullback_data.csv"
+    filename_1h = f"{symbol}_1h_choch_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -100,7 +100,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست با استراتژی Pullback پس از Liquidity Sweep")
+print("🚀 اجرای موتور بک‌تست با استراتژی CHoCH + حجم فوق‌سنگین")
 print("============================================================")
 
 all_portfolio_trades = {}
@@ -142,7 +142,7 @@ for symbol, df1h in data_1h.items():
         ema50_4h = r4h['EMA_50']
         ema200_4h = r4h['EMA_200']
         
-        # فیلتر رژیم روند پرقدرت در تایم فریم 4H
+        # رژیم روند 4 ساعته
         is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and (r4h['ADX'] >= 25)
         is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 25)
         
@@ -152,115 +152,95 @@ for symbol, df1h in data_1h.items():
         lookback_slice = df1h.iloc[i-20:i]
         struct_high = lookback_slice['High'].max()
         struct_low = lookback_slice['Low'].min()
+        avg_vol = lookback_slice['Volume'].mean()
         
-        # 💡 منطق جدید: شناسایی Liquidity Sweep (قیمت سقف/کف را به صورت سایه زده ولی بسته نشده)
-        is_long_sweep = (c1h['High'] > struct_high) and (c1h['Close'] < struct_high)
-        is_short_sweep = (c1h['Low'] < struct_low) and (c1h['Close'] > struct_low)
+        # 1. مرحله اسویپ نقدینگی در گذشته نزدیک (۱۰ کندل گذشته)
+        recent_slice = df1h.iloc[i-10:i]
+        sweep_low = recent_slice['Low'].min()
+        sweep_high = recent_slice['High'].max()
         
-        if is_long_regime and is_long_sweep:
-            # جستجوی پولبک تاییدشده در کندل‌های بعدی (بدون نگاه به آینده)
-            entered = False
-            for p in range(1, 8):
-                if i + p >= len(df1h):
-                    break
-                p_candle = df1h.iloc[i + p]
+        has_swept_low = sweep_low < struct_low
+        has_swept_high = sweep_high > struct_high
+        
+        # 2. تاییدیه CHoCH (تغییر ساختار با حجم فوق‌سنگین >= 2.0 برابر میانگین)
+        is_choch_long = has_swept_low and (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 2.0) and (c1h['RSI'] > 55)
+        is_choch_short = has_swept_high and (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 2.0) and (c1h['RSI'] < 45)
+        
+        if is_long_regime and is_choch_long:
+            entry_price = c1h['Close']
+            sl = recent_slice['Low'].min() - (0.3 * c1h['ATR'])
+            risk = entry_price - sl
+            
+            if risk > 0 and (risk / entry_price) <= 0.045:
+                tp = entry_price + (2.0 * risk)
                 
-                # شرط پولبک به میانگین متحرک 20 یا ناحیه حمایتی با تاییدیه حجم و مومنتوم
-                if p_candle['Close'] <= p_candle['EMA_20'] * 1.005:
-                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 45:
-                        entry_price = p_candle['Close']
-                        # تعیین حد ضرر پشت کف اسویپ یا نوسان اخیر
-                        sl = df1h.iloc[i:i+p+1]['Low'].min() - (0.4 * p_candle['ATR'])
-                        risk = entry_price - sl
+                outcome = None
+                exit_idx = i + 1
+                for j in range(i + 1, len(df1h)):
+                    f_c = df1h.iloc[j]
+                    exit_idx = j
+                    
+                    hit_sl = f_c['Low'] <= sl
+                    hit_tp = f_c['High'] >= tp
+                    
+                    if hit_sl and hit_tp:
+                        outcome = 'LOSS'
+                        break
+                    elif hit_sl:
+                        outcome = 'LOSS'
+                        break
+                    elif hit_tp:
+                        outcome = 'WIN'
+                        break
                         
-                        if risk <= 0 or (risk / entry_price) > 0.045:
-                            break
-                            
-                        tp = entry_price + (2.0 * risk)
-                        
-                        outcome = None
-                        exit_idx = i + p + 1
-                        for j in range(i + p + 1, len(df1h)):
-                            f_c = df1h.iloc[j]
-                            exit_idx = j
-                            
-                            hit_sl = f_c['Low'] <= sl
-                            hit_tp = f_c['High'] >= tp
-                            
-                            if hit_sl and hit_tp:
-                                outcome = 'LOSS'
-                                break
-                            elif hit_sl:
-                                outcome = 'LOSS'
-                                break
-                            elif hit_tp:
-                                outcome = 'WIN'
-                                break
-                                
-                        if outcome in ['WIN', 'LOSS']:
-                            symbol_trades.append({
-                                'Symbol': symbol,
-                                'Side': 'LONG',
-                                'Outcome': outcome
-                            })
-                            locked_until_index = exit_idx
-                            entered = True
-                            break
-            if entered:
-                continue
+                if outcome in ['WIN', 'LOSS']:
+                    symbol_trades.append({
+                        'Symbol': symbol,
+                        'Side': 'LONG',
+                        'Outcome': outcome
+                    })
+                    locked_until_index = exit_idx
+                    
+        elif is_short_regime and is_choch_short:
+            entry_price = c1h['Close']
+            sl = recent_slice['High'].max() + (0.3 * c1h['ATR'])
+            risk = sl - entry_price
+            
+            if risk > 0 and (risk / entry_price) <= 0.045:
+                tp = entry_price - (2.0 * risk)
                 
-        elif is_short_regime and is_short_sweep:
-            entered = False
-            for p in range(1, 8):
-                if i + p >= len(df1h):
-                    break
-                p_candle = df1h.iloc[i + p]
-                
-                if p_candle['Close'] >= p_candle['EMA_20'] * 0.995:
-                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 55:
-                        entry_price = p_candle['Close']
-                        sl = df1h.iloc[i:i+p+1]['High'].max() + (0.4 * p_candle['ATR'])
-                        risk = sl - entry_price
+                outcome = None
+                exit_idx = i + 1
+                for j in range(i + 1, len(df1h)):
+                    f_c = df1h.iloc[j]
+                    exit_idx = j
+                    
+                    hit_sl = f_c['High'] >= sl
+                    hit_tp = f_c['Low'] <= tp
+                    
+                    if hit_sl and hit_tp:
+                        outcome = 'LOSS'
+                        break
+                    elif hit_sl:
+                        outcome = 'LOSS'
+                        break
+                    elif hit_tp:
+                        outcome = 'WIN'
+                        break
                         
-                        if risk <= 0 or (risk / entry_price) > 0.045:
-                            break
-                            
-                        tp = entry_price - (2.0 * risk)
-                        
-                        outcome = None
-                        exit_idx = i + p + 1
-                        for j in range(i + p + 1, len(df1h)):
-                            f_c = df1h.iloc[j]
-                            exit_idx = j
-                            
-                            hit_sl = f_c['High'] >= sl
-                            hit_tp = f_c['Low'] <= tp
-                            
-                            if hit_sl and hit_tp:
-                                outcome = 'LOSS'
-                                break
-                            elif hit_sl:
-                                outcome = 'LOSS'
-                                break
-                            elif hit_tp:
-                                outcome = 'WIN'
-                                break
-                                
-                        if outcome in ['WIN', 'LOSS']:
-                            symbol_trades.append({
-                                'Symbol': symbol,
-                                'Side': 'SHORT',
-                                'Outcome': outcome
-                            })
-                            locked_until_index = exit_idx
-                            entered = True
-                            break
+                if outcome in ['WIN', 'LOSS']:
+                    symbol_trades.append({
+                        'Symbol': symbol,
+                        'Side': 'SHORT',
+                        'Outcome': outcome
+                    })
+                    locked_until_index = exit_idx
 
     if symbol_trades:
         all_portfolio_trades[symbol] = symbol_trades
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی با منطق جدید (Pullback + Sweep)")
+print("📊 گزارش نهایی پورتفوی با منطق CHoCH + حجم فوق‌سنگین")
 print("============================================================")
 
 flat_trades = []
