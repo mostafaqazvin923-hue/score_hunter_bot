@@ -30,7 +30,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها برای استراتژی پولبک روندی نهادی (ریسک به ریوارد ۱:۲)')
+print('📥 دریافت داده‌ها برای استراتژی پلاس نهادی با وین‌ریت بالا (۱:۲)')
 print('============================================================')
 
 data_1h = {}
@@ -69,25 +69,21 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
 def calculate_indicators(df):
   df = df.copy()
-  df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
   df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
   df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
 
-  # RSI برای اصلاح سالم (RSI Reset)
-  delta = df['Close'].diff()
-  gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-  loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-  rs = gain / (loss + 1e-9)
-  df['RSI'] = 100 - (100 / (1 + rs))
+  # تشخیص Fair Value Gap (FVG) ساده برای ورود نهادی
+  df['FVG_Bull'] = df['Low'].shift(1) > df['High'].shift(3)
+  df['FVG_Bear'] = df['High'].shift(1) < df['Low'].shift(3)
 
-  # ATR برای مدیریت ریسک و استاپ‌لاس
+  # ATR برای تعیین حد ضرر ایمن
   high_low = df['High'] - df['Low']
   high_close = np.abs(df['High'] - df['Close'].shift(1))
   low_close = np.abs(df['Low'] - df['Close'].shift(1))
   tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
   df['ATR'] = tr.rolling(window=14).mean()
 
-  # ADX برای سنجش قدرت روند
+  # ADX برای اطمینان از وجود روند قدرتمند
   plus_dm = df['High'].diff().clip(lower=0)
   minus_dm = (-df['Low'].diff()).clip(lower=0)
   tr14 = tr.rolling(window=14).mean()
@@ -96,12 +92,16 @@ def calculate_indicators(df):
   dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
   df['ADX'] = dx.rolling(window=14).mean().fillna(20)
 
+  # RVOL برای حجم بالای تاییدیه
+  vol_ma = df['Volume'].shift(1).rolling(window=20).mean()
+  df['RVOL'] = df['Volume'] / (vol_ma + 1e-9)
+
   return df
 
 
 all_portfolio_trades = []
 SLIPPAGE = 0.0002
-FEE_RATE = 0.0007  # کارمزد صرافی
+FEE_RATE = 0.0007  # کارمزد دقیق صرافی
 
 for symbol, df1h in data_1h.items():
   if len(df1h) < 300:
@@ -109,7 +109,7 @@ for symbol, df1h in data_1h.items():
 
   df1h = calculate_indicators(df1h)
 
-  # ساخت تایم‌فریم ۴ ساعته ایمن بدون Lookahead Bias
+  # ساخت تایم‌فریم ۴ ساعته بدون Lookahead Bias
   df4h = (
       df1h.set_index('Date')
       .resample('4h')
@@ -182,7 +182,7 @@ for symbol, df1h in data_1h.items():
           position = None
 
     if position is None:
-      # روند صعودی و نزولی قدرتمند در تایم فریم ۴ ساعته
+      # تایید روند کلان بسیار قوی در تایم فریم ۴ ساعته
       trend_long = (r4h['Close_4H'] > r4h['EMA_200_4H']) and (
           r4h['EMA_50_4H'] > r4h['EMA_200_4H']
       )
@@ -190,51 +190,57 @@ for symbol, df1h in data_1h.items():
           r4h['EMA_50_4H'] < r4h['EMA_200_4H']
       )
 
-      # استراتژی پولبک به EMA ۲۰ در تایم ۱ ساعته همراه با ریست RSI
-      pullback_long = (
+      # سیگنال‌های مبتنی بر FVG و تاییدیه مومنتوم بالا
+      signal_long = (
           trend_long
-          and (prev_c1h['Low'] <= prev_c1h['EMA_20'])
-          and (prev_c1h['Close'] > prev_c1h['EMA_20'])
-          and (prev_c1h['RSI'] < 55)
+          and prev_c1h['FVG_Bull']
           and (prev_c1h['Close'] > prev_c1h['Open'])
-          and (prev_c1h['ADX'] > 25)
+          and (
+              (prev_c1h['Close'] - prev_c1h['Open'])
+              > (prev_c1h['High'] - prev_c1h['Low']) * 0.55
+          )
+          and (prev_c1h['RVOL'] >= 1.6)
+          and (prev_c1h['ADX'] > 28)
       )
 
-      pullback_short = (
+      signal_short = (
           trend_short
-          and (prev_c1h['High'] >= prev_c1h['EMA_20'])
-          and (prev_c1h['Close'] < prev_c1h['EMA_20'])
-          and (prev_c1h['RSI'] > 45)
+          and prev_c1h['FVG_Bear']
           and (prev_c1h['Close'] < prev_c1h['Open'])
-          and (prev_c1h['ADX'] > 25)
+          and (
+              (prev_c1h['Open'] - prev_c1h['Close'])
+              > (prev_c1h['High'] - prev_c1h['Low']) * 0.55
+          )
+          and (prev_c1h['RVOL'] >= 1.6)
+          and (prev_c1h['ADX'] > 28)
       )
 
-      if pullback_long:
+      if signal_long:
         position = 'LONG'
         entry_price = c1h['Open'] * (1 + SLIPPAGE)
-        stop_loss = prev_c1h['Low'] - (1.0 * prev_c1h['ATR'])
+        stop_loss = prev_c1h['Low'] - (0.8 * prev_c1h['ATR'])
         risk = entry_price - stop_loss
-        if risk > 0:
+        if risk > 0 and (risk / entry_price) <= 0.035:
           take_profit = entry_price + (
               2.0 * risk
-          )  # قفل قطعی بر روی ریسک به ریوارد ۱ به ۲
+          )  # قفل دقیق روی ریسک به ریوارد ۱ به ۲
         else:
           position = None
 
-      elif pullback_short:
+      elif signal_short:
         position = 'SHORT'
         entry_price = c1h['Open'] * (1 - SLIPPAGE)
-        stop_loss = prev_c1h['High'] + (1.0 * prev_c1h['ATR'])
+        stop_loss = prev_c1h['High'] + (0.8 * prev_c1h['ATR'])
         risk = stop_loss - entry_price
-        if risk > 0:
+        if risk > 0 and (risk / entry_price) <= 0.035:
           take_profit = entry_price - (
               2.0 * risk
-          )  # قفل قطعی بر روی ریسک به ریوارد ۱ به ۲
+          )  # قفل دقیق روی ریسک به ریوارد ۱ به ۲
         else:
           position = None
 
 print('\n============================================================')
-print('📊 گزارش نهایی استراتژی پولبک روندی (ریسک به ریوارد ۱:۲)')
+print('📊 گزارش نهایی استراتژی FVG نهادی (ریسک به ریوارد ۱:۲)')
 print('============================================================')
 
 if all_portfolio_trades:
