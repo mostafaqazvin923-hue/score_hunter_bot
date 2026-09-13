@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (نسخه پایدار و مطمئن)")
+print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (منطق جدید: Order Block + Rejection)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_stable_data.csv"
+    filename_1h = f"{symbol}_1h_sniper_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -100,7 +100,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست با منطق پایدار و بهینه‌سازی ریسک به ریوارد")
+print("🚀 اجرای موتور بک‌تست با منطق جدید (کیفیت بالا و کاهش نویز)")
 print("============================================================")
 
 all_portfolio_trades = {}
@@ -138,24 +138,39 @@ for symbol, df1h in data_1h.items():
             
         r4h = df4h_indexed.loc[t4h_time]
         
-        # روند در تایم فریم 4 ساعته
-        is_uptrend = (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_20'] > r4h['EMA_50'])
-        is_downtrend = (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_20'] < r4h['EMA_50'])
+        # رژیم روند بسیار قدرتمند 4 ساعته با ADX بالا
+        is_strong_uptrend = (r4h['Close'] > r4h['EMA_200']) and (r4h['EMA_20'] > r4h['EMA_50']) and (r4h['ADX'] >= 25)
+        is_strong_downtrend = (r4h['Close'] < r4h['EMA_200']) and (r4h['EMA_20'] < r4h['EMA_50']) and (r4h['ADX'] >= 25)
         
-        if not is_uptrend and not is_downtrend:
+        if not is_strong_uptrend and not is_strong_downtrend:
             continue
             
-        # منطق ورود استاندارد و مطمئن بر اساس پولبک به EMA20 و تاییدیه RSI
-        is_long_signal = is_uptrend and (c1h['Low'] <= c1h['EMA_20']) and (c1h['Close'] > c1h['EMA_20']) and (c1h['RSI'] > 45) and (c1h['RSI'] < 70)
-        is_short_signal = is_downtrend and (c1h['High'] >= c1h['EMA_20']) and (c1h['Close'] < c1h['EMA_20']) and (c1h['RSI'] < 55) and (c1h['RSI'] > 30)
+        # بررسی کندل‌های اخیر برای پیدا کردن الگوهای ریجکشن (Pinbar / Rejection Wick) و حجم بالا
+        c_prev = df1h.iloc[i-1]
+        body = abs(c1h['Close'] - c1h['Open'])
+        candle_range = c1h['High'] - c1h['Low']
+        
+        if candle_range == 0:
+            continue
+            
+        # تشخیص ریجکشن صعودی (سایه پایین بلند و بسته‌ شدن در نیمه بالایی کندل)
+        lower_wick = c1h['Close'] - c1h['Low'] if c1h['Close'] > c1h['Open'] else c1h['Open'] - c1h['Low']
+        is_bullish_rejection = (lower_wick >= candle_range * 0.5) and (c1h['Close'] > c1h['Open']) and (c1h['RSI'] > 40) and (c1h['RSI'] < 65)
+        
+        # تشخیص ریجکشن نزولی (سایه بالا بلند و بسته شدن در نیمه پایینی کندل)
+        upper_wick = c1h['High'] - c1h['Open'] if c1h['Close'] > c1h['Open'] else c1h['High'] - c1h['Close']
+        is_bearish_rejection = (upper_wick >= candle_range * 0.5) and (c1h['Close'] < c1h['Open']) and (c1h['RSI'] < 60) and (c1h['RSI'] > 35)
+        
+        is_long_signal = is_strong_uptrend and is_bullish_rejection and (c1h['Volume'] > df1h.iloc[i-20:i]['Volume'].mean())
+        is_short_signal = is_strong_downtrend and is_bearish_rejection and (c1h['Volume'] > df1h.iloc[i-20:i]['Volume'].mean())
         
         if is_long_signal:
             entry_price = c1h['Close']
-            sl = c1h['Low'] - (1.2 * c1h['ATR'])
+            sl = c1h['Low'] - (0.5 * c1h['ATR'])
             risk = entry_price - sl
             
-            if risk > 0 and (risk / entry_price) <= 0.05:
-                tp = entry_price + (2.0 * risk)
+            if risk > 0 and (risk / entry_price) <= 0.04:
+                tp = entry_price + (2.0 * risk) # ریسک به ریوارد دست‌نخورده (۱:۲)
                 
                 outcome = None
                 exit_idx = i + 1
@@ -186,11 +201,11 @@ for symbol, df1h in data_1h.items():
                     
         elif is_short_signal:
             entry_price = c1h['Close']
-            sl = c1h['High'] + (1.2 * c1h['ATR'])
+            sl = c1h['High'] + (0.5 * c1h['ATR'])
             risk = sl - entry_price
             
-            if risk > 0 and (risk / entry_price) <= 0.05:
-                tp = entry_price - (2.0 * risk)
+            if risk > 0 and (risk / entry_price) <= 0.04:
+                tp = entry_price - (2.0 * risk) # ریسک به ریوارد دست‌نخورده (۱:۲)
                 
                 outcome = None
                 exit_idx = i + 1
@@ -223,7 +238,7 @@ for symbol, df1h in data_1h.items():
         all_portfolio_trades[symbol] = symbol_trades
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی (نسخه پایدار)")
+print("📊 گزارش نهایی پورتفوی (منطق جدید Sniper + ریجکشن حجم بالا)")
 print("============================================================")
 
 flat_trades = []
