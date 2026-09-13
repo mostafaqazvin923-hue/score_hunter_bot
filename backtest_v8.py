@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته با تاییدیه جریان سفارشات (Order Flow & Volume Profile)")
+print("📥 دانلود داده‌های 1 ساعته برای هدف وین‌ریت 70% (فیلترهای فوق‌سخت‌گیرانه)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_orderflow_data.csv"
+    filename_1h = f"{symbol}_1h_elite_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -98,15 +98,11 @@ def calculate_indicators(df):
     dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
     df['ADX'] = dx.rolling(window=14).mean().fillna(20)
     
-    # محاسبه میانگین متحرک حجم برای تشخیص لانگ‌بارها و نقدینگی نهنگ‌ها
     df['Volume_MA20'] = df['Volume'].rolling(window=20).mean()
-    # شبیه‌سازی تقریب جریان سفارشات (Buying / Selling Pressure بر اساس موقعیت بسته شدن در کندل)
-    df['Price_Action_Flow'] = (df['Close'] - df['Open']) / (df['High'] - df['Low'] + 1e-9)
-    
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست با تاییدیه جریان سفارشات و نقدینگی (R:R 1:1)")
+print("🚀 اجرای موتور بک‌تست با فیلترهای الیت (هدف: وین‌ریت بالا | R:R 1:1)")
 print("============================================================")
 
 all_portfolio_trades = {}
@@ -144,13 +140,17 @@ for symbol, df1h in data_1h.items():
             
         r4h = df4h_indexed.loc[t4h_time]
         
-        # روند پرقدرت 4 ساعته با ADX جهت‌دار
-        is_strong_uptrend = (r4h['Close'] > r4h['EMA_200']) and (r4h['EMA_20'] > r4h['EMA_50']) and (r4h['ADX'] >= 28)
-        is_strong_downtrend = (r4h['Close'] < r4h['EMA_200']) and (r4h['EMA_20'] < r4h['EMA_50']) and (r4h['ADX'] >= 28)
+        # روند فوق‌العاده قدرتمند با ADX بالای 35 (حذف کامل بازارهای نویزدار)
+        is_elite_uptrend = (r4h['Close'] > r4h['EMA_200']) and (r4h['EMA_20'] > r4h['EMA_50']) and (r4h['ADX'] >= 35)
+        is_elite_downtrend = (r4h['Close'] < r4h['EMA_200']) and (r4h['EMA_20'] < r4h['EMA_50']) and (r4h['ADX'] >= 35)
         
-        if not is_strong_uptrend and not is_strong_downtrend:
+        if not is_elite_uptrend and not is_elite_downtrend:
             continue
             
+        # شرط پولبک به ناحیه ارزش (نزدیک بودن قیمت به EMA 20 یا EMA 50)
+        is_near_ema_long = (c1h['Low'] <= c1h['EMA_20']) and (c1h['Close'] > c1h['EMA_50'])
+        is_near_ema_short = (c1h['High'] >= c1h['EMA_20']) and (c1h['Close'] < c1h['EMA_50'])
+        
         candle_range = c1h['High'] - c1h['Low']
         if candle_range == 0:
             continue
@@ -158,15 +158,12 @@ for symbol, df1h in data_1h.items():
         lower_wick = c1h['Close'] - c1h['Low'] if c1h['Close'] > c1h['Open'] else c1h['Open'] - c1h['Low']
         upper_wick = c1h['High'] - c1h['Open'] if c1h['Close'] > c1h['Open'] else c1h['High'] - c1h['Close']
         
-        # تاییدیه ریجکشن به همراه فشار خرید/فروش مثبت (Order Flow Delta)
-        is_bullish_order_flow = (lower_wick >= candle_range * 0.5) and (c1h['Price_Action_Flow'] > 0.3) and (c1h['RSI'] > 42) and (c1h['RSI'] < 62)
-        is_bearish_order_flow = (upper_wick >= candle_range * 0.5) and (c1h['Price_Action_Flow'] < -0.3) and (c1h['RSI'] < 58) and (c1h['RSI'] > 38)
+        # تاییدیه پین‌بار / ریجکشن ساختاری تمیز به همراه حجم انفجاری (2 برابر میانگین)
+        is_clean_bullish_pin = (lower_wick >= candle_range * 0.6) and (c1h['Close'] > c1h['Open']) and (c1h['Volume'] > c1h['Volume_MA20'] * 2.0)
+        is_clean_bearish_pin = (upper_wick >= candle_range * 0.6) and (c1h['Close'] < c1h['Open']) and (c1h['Volume'] > c1h['Volume_MA20'] * 2.0)
         
-        # تاییدیه نقدینگی و حجم سنگین (حداقل 1.5 برابر میانگین حجم)
-        is_high_volume = c1h['Volume'] > (c1h['Volume_MA20'] * 1.5)
-        
-        is_long_signal = is_strong_uptrend and is_bullish_order_flow and is_high_volume
-        is_short_signal = is_strong_downtrend and is_bearish_order_flow and is_high_volume
+        is_long_signal = is_elite_uptrend and is_near_ema_long and is_clean_bullish_pin and (45 < c1h['RSI'] < 65)
+        is_short_signal = is_elite_downtrend and is_near_ema_short and is_clean_bearish_pin and (35 < c1h['RSI'] < 55)
         
         if is_long_signal:
             entry_price = c1h['Close']
@@ -242,7 +239,7 @@ for symbol, df1h in data_1h.items():
         all_portfolio_trades[symbol] = symbol_trades
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی با تاییدیه جریان سفارشات (R:R 1:1)")
+print("📊 گزارش نهایی پورتفوی با فیلترهای الیت (R:R 1:1)")
 print("============================================================")
 
 flat_trades = []
