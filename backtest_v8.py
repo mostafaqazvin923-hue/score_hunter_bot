@@ -124,35 +124,30 @@ for symbol, df1h in data_1h.items():
 
 print('⚙️ شروع اجرای بک‌تست با اعمال محدودیت پوزیشن همزمان...')
 
-# شبیه‌سازی گام‌به‌گام زمان‌محور در کل پورتفوی برای مدیریت سقف پوزیشن‌های همزمان
 all_timestamps = set()
 for dat in processed_data.values():
   all_timestamps.update(dat['1h']['Date'].tolist())
 sorted_timestamps = sorted(list(all_timestamps))
 
-active_positions = {}  # symbol: position_dict
+active_positions = {}
 all_trades = []
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 MAX_CONCURRENT_POSITIONS = 3
 
-# تبدیل داده‌ها به دیکشنری برای دسترسی سریع‌تر در لوپ زمانی
 dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items()}
-dfs_4h = {sym: dat['4h'] for sym, sym in processed_data.keys()}
+dfs_4h = {sym: dat['4h'] for sym, dat in processed_data.items()}
 
-# ردیابی وضعیت مدارشکن (Circuit Breaker) کل سبد
 consecutive_losses = 0
 pause_until = None
 
 for ts in sorted_timestamps:
-  # ۱. مدیریت و بستن پوزیشن‌های باز در این ساعت
   symbols_to_close = []
   for symbol, pos in active_positions.items():
     if ts not in dfs_1h[symbol].index:
       continue
     c1h = dfs_1h[symbol].loc[ts]
     entry_index = pos['entry_index']
-    # پیدا کردن ایندکس عددی فعلی
     df1h_local = processed_data[symbol]['1h']
     match_rows = df1h_local[df1h_local['Date'] == ts]
     if match_rows.empty:
@@ -200,19 +195,17 @@ for ts in sorted_timestamps:
   for sym in symbols_to_close:
     del active_positions[sym]
 
-  # ۲. بررسی وضعیت توقف اضطراری (Circuit Breaker)
   if pause_until is not None and ts < pause_until:
     continue
   elif pause_until is not None and ts >= pause_until:
     pause_until = None
     consecutive_losses = 0
 
-  # ۳. جستجوی سیگنال‌های جدید برای نمادهایی که پوزیشن ندارند
   for symbol, dat in processed_data.items():
     if symbol in active_positions:
       continue
     if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
-      break  # سقف پوزیشن‌های همزمان پر شده است
+      break
 
     df1h = dat['1h']
     if ts not in df1h['Date'].values:
@@ -237,7 +230,6 @@ for ts in sorted_timestamps:
     cloud_top_1h = max(prev['Senkou_A'], prev['Senkou_B'])
     cloud_bot_1h = min(prev['Senkou_A'], prev['Senkou_B'])
 
-    # سیگنال Long
     if r4h.get('Trend_Long', False) and prev['Close'] > cloud_top_1h:
       tk_cross_long = (prev['Tenkan'] > prev['Kijun']) and (
           df1h.iloc[i - 2]['Tenkan'] <= df1h.iloc[i - 2]['Kijun']
@@ -261,7 +253,6 @@ for ts in sorted_timestamps:
           }
           continue
 
-    # سیگنال Short
     elif r4h.get('Trend_Short', False) and prev['Close'] < cloud_bot_1h:
       tk_cross_short = (prev['Tenkan'] < prev['Kijun']) and (
           df1h.iloc[i - 2]['Tenkan'] >= df1h.iloc[i - 2]['Kijun']
@@ -295,7 +286,6 @@ if all_trades:
   trades_df = pd.DataFrame(all_trades)
   trades_df.sort_values('Timestamp', inplace=True)
 
-  # اعمال فیلتر مدارشکن (Circuit Breaker) روی کل تاریخچه معاملات
   filtered_trades = []
   consec_losses = 0
   p_until = None
