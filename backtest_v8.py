@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته (نسخه اصلاح‌شده R:R 1:1)")
+print("📥 دانلود داده‌های 1 ساعته برای هدف وین‌ریت 70% (فیلترهای الیت اولترا)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_fixed_data.csv"
+    filename_1h = f"{symbol}_1h_target70_ultra_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -100,7 +100,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست اصلاح‌شده (ریسک به ریوارد 1 به 1 بدون همپوشانی)")
+print("🚀 اجرای موتور بک‌تست فوق‌سخت‌گیرانه (هدف وین‌ریت بالا | R:R 1:1)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -148,8 +148,9 @@ for symbol, df1h in data_1h.items():
         except:
             slope_positive = True
             
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 20) and (r4h['RSI'] > 55)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 20) and (r4h['RSI'] < 45)
+        # 💡 فیلترهای فوق‌سخت‌گیرانه رژیم بازار (افزایش ADX به 32 و فیلتر دقیق‌تر RSI)
+        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 32) and (r4h['RSI'] > 60)
+        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 32) and (r4h['RSI'] < 40)
         
         if not is_long_regime and not is_short_regime:
             continue
@@ -159,8 +160,9 @@ for symbol, df1h in data_1h.items():
         struct_low = lookback_slice['Low'].min()
         
         avg_vol = lookback_slice['Volume'].mean()
-        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 1.1)
-        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 1.1)
+        # 💡 افزایش فیلتر حجم به 1.8 برابر میانگین برای تایید نقدینگی واقعی
+        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 1.8)
+        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 1.8)
         
         if is_long_regime and is_breakout_long:
             entered = False
@@ -170,7 +172,7 @@ for symbol, df1h in data_1h.items():
                 p_candle = df1h.iloc[i + p]
                 
                 if p_candle['Low'] <= struct_high * 1.003: 
-                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 50:
+                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 55:
                         entry_price = p_candle['Close']
                         swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
                         sl = swing_low_pullback - (0.25 * p_candle['ATR'])
@@ -179,7 +181,7 @@ for symbol, df1h in data_1h.items():
                         if risk <= 0 or (risk / entry_price) > 0.045:
                             break
                             
-                        # تنظیم ریسک به ریوارد دقیقاً روی 1 به 1
+                        # ریسک به ریوارد ثابت 1 به 1
                         tp = entry_price + (1.0 * risk)
                         
                         outcome = 'OPEN'
@@ -214,7 +216,7 @@ for symbol, df1h in data_1h.items():
                 p_candle = df1h.iloc[i + p]
                 
                 if p_candle['High'] >= struct_low * 0.997:
-                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 50:
+                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 45:
                         entry_price = p_candle['Close']
                         swing_high_pullback = df1h.iloc[i:i+p+1]['High'].max()
                         sl = swing_high_pullback + (0.25 * p_candle['ATR'])
@@ -223,7 +225,7 @@ for symbol, df1h in data_1h.items():
                         if risk <= 0 or (risk / entry_price) > 0.045:
                             break
                             
-                        # تنظیم ریسک به ریوارد دقیقاً روی 1 به 1
+                        # ریسک به ریوارد ثابت 1 به 1
                         tp = entry_price - (1.0 * risk)
                         
                         outcome = 'OPEN'
@@ -249,7 +251,7 @@ for symbol, df1h in data_1h.items():
                             break
 
 print("\n============================================================")
-print("📊 گزارش تجمیعی نهایی پورتفوی (R:R 1:1)")
+print("📊 گزارش نهایی پورتفوی فوق‌سخت‌گیرانه (R:R 1:1)")
 print("============================================================")
 
 if all_portfolio_trades:
