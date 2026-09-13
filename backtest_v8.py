@@ -23,7 +23,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای موتور الیت (با قابلیت Risk-Free و سربه سر)")
+print("📥 دانلود داده‌ها برای موتور خالص اسمارت‌مانی (Liquidity Sweep + R:R 1:4)")
 print("============================================================")
 
 data_1h = {}
@@ -48,180 +48,106 @@ for symbol, lbank_symbol in SYMBOLS.items():
         df1h = df1h[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].dropna().drop_duplicates(subset=['Date']).sort_values('Date').reset_index(drop=True)
         data_1h[symbol] = df1h
 
-def calculate_indicators(df):
+def calculate_atr(df):
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
-    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
-    
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
-print("\n🚀 اجرای موتور با فیلترهای حجمی، مومنتوم و مکانیزم Risk-Free...")
+print("\n🚀 اجرای موتور خالص شکار نقدینگی و پرایس‌اکشن نهادی...")
 
 all_portfolio_trades = []
 
 for symbol, df1h in data_1h.items():
-    if len(df1h) < 400: continue
-    df1h = calculate_indicators(df1h)
-    
-    df4h = df1h.set_index('Date').resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna().reset_index()
-    df4h = calculate_indicators(df4h)
-    df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
-    df4h_indexed = df4h.set_index('Date')
+    if len(df1h) < 300: continue
+    df1h = calculate_atr(df1h)
     
     locked_until_index = 0
-    for i in range(250, len(df1h) - 70):
+    for i in range(50, len(df1h) - 80):
         if i < locked_until_index: continue
-        c1h = df1h.iloc[i]
-        prev_c1h = df1h.iloc[i-1]
-        t4h_time = c1h['Date_4H']
-        if t4h_time not in df4h_indexed.index: continue
-        r4h = df4h_indexed.loc[t4h_time]
         
-        is_bullish_market = (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_50'] > r4h['EMA_200']) and (r4h['RSI'] > 50)
-        is_bearish_market = (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_50'] < r4h['EMA_200']) and (r4h['RSI'] < 50)
+        c = df1h.iloc[i]
+        prev = df1h.iloc[i-1]
         
-        if not is_bullish_market and not is_bearish_market: continue
+        # تعیین سقف و کف‌های محلی برای شناسایی استخرهای نقدینگی (20 کندل گذشته)
+        lookback = df1h.iloc[i-20:i]
+        local_high = lookback['High'].max()
+        local_low = lookback['Low'].min()
         
-        if is_bullish_market:
-            lookback_slice = df1h.iloc[i-15:i]
-            ob_candidates = lookback_slice[lookback_slice['Close'] < lookback_slice['Open']]
-            if ob_candidates.empty: continue
+        # 1. سناریوی صعودی (Bullish Liquidity Sweep): قیمت کفِ قبلی را زد و برگشت بالا
+        swept_low = (c['Low'] < local_low) and (c['Close'] > local_low) and (c['Close'] > c['Open'])
+        
+        if swept_low:
+            entry_price = c['Close']
+            sl = c['Low'] - (0.5 * c['ATR'])
+            risk = entry_price - sl
             
-            ob_low = ob_candidates['Low'].min()
-            ob_high = ob_candidates['High'].max()
+            if risk <= 0 or (risk / entry_price) > 0.04: continue
             
-            # اصلاح خطای دستوری خط ۱۰۹ (بررسی صحیح شرایط RSI و حجم)
-            is_mitigated = (
-                (c1h['Low'] <= ob_high) and 
-                (c1h['Close'] > c1h['Open']) and 
-                (c1h['Close'] > ob_low) and
-                (c1h['Volume'] > c1h['Volume_MA'] * 1.3) and 
-                (c1h['RSI'] > prev_c1h['RSI']) and 
-                (c1h['RSI'] > 40 and c1h['RSI'] < 65)
-            )
+            # ریسک به ریوارد ثابت و قدرتمند 1 به 4
+            tp = entry_price + (4.0 * risk)
             
-            if is_mitigated:
-                entry_price = c1h['Close']
-                sl = ob_low - (0.4 * c1h['ATR'])
-                risk = entry_price - sl
-                
-                if risk <= 0 or (risk / entry_price) > 0.03: continue
-                
-                tp = entry_price + (2.5 * risk)
-                half_tp_distance = 0.5 * (tp - entry_price)
-                
-                current_sl = sl
-                is_be_triggered = False
-                outcome = 'OPEN'
-                exit_idx = i + 1
-                
-                for j in range(i + 1, min(i + 80, len(df1h))):
-                    f_c = df1h.iloc[j]
-                    exit_idx = j
+            outcome = 'OPEN'
+            exit_idx = i + 1
+            for j in range(i + 1, min(i + 90, len(df1h))):
+                f_c = df1h.iloc[j]
+                exit_idx = j
+                if f_c['Low'] <= sl:
+                    outcome = 'LOSS'
+                    break
+                elif f_c['High'] >= tp:
+                    outcome = 'WIN'
+                    break
                     
-                    # شرط ریسک‌فری: اگر ۵۰ درصد راه تا TP طی شد، حد ضرر بیاید روی نقطه ورود
-                    if not is_be_triggered and f_c['High'] >= (entry_price + half_tp_distance):
-                        current_sl = entry_price
-                        is_be_triggered = True
-                        
-                    if f_c['Low'] <= current_sl:
-                        if is_be_triggered and current_sl == entry_price:
-                            outcome = 'BE'
-                        else:
-                            outcome = 'LOSS'
-                        break
-                    elif f_c['High'] >= tp:
-                        outcome = 'WIN'
-                        break
-                        
-                if outcome in ['WIN', 'LOSS', 'BE']:
-                    all_portfolio_trades.append({'Symbol': symbol, 'Outcome': outcome})
-                    locked_until_index = exit_idx
+            if outcome in ['WIN', 'LOSS']:
+                all_portfolio_trades.append({'Symbol': symbol, 'Outcome': outcome})
+                locked_until_index = exit_idx
+                
+        # 2. سناریوی نزولی (Bearish Liquidity Sweep): قیمت سقفِ قبلی را زد و برگشت پایین
+        swept_high = (c['High'] > local_high) and (c['Close'] < local_high) and (c['Close'] < c['Open'])
+        
+        if swept_high:
+            entry_price = c['Close']
+            sl = c['High'] + (0.5 * c['ATR'])
+            risk = sl - entry_price
+            
+            if risk <= 0 or (risk / entry_price) > 0.04: continue
+            
+            tp = entry_price - (4.0 * risk)
+            
+            outcome = 'OPEN'
+            exit_idx = i + 1
+            for j in range(i + 1, min(i + 90, len(df1h))):
+                f_c = df1h.iloc[j]
+                exit_idx = j
+                if f_c['High'] >= sl:
+                    outcome = 'LOSS'
+                    break
+                elif f_c['Low'] <= tp:
+                    outcome = 'WIN'
+                    break
                     
-        elif is_bearish_market:
-            lookback_slice = df1h.iloc[i-15:i]
-            ob_candidates = lookback_slice[lookback_slice['Close'] > lookback_slice['Open']]
-            if ob_candidates.empty: continue
-            
-            ob_low = ob_candidates['Low'].min()
-            ob_high = ob_candidates['High'].max()
-            
-            is_mitigated = (
-                (c1h['High'] >= ob_low) and 
-                (c1h['Close'] < c1h['Open']) and 
-                (c1h['Close'] < ob_high) and
-                (c1h['Volume'] > c1h['Volume_MA'] * 1.3) and
-                (c1h['RSI'] < prev_c1h['RSI']) and 
-                (c1h['RSI'] > 35 and c1h['RSI'] < 60)
-            )
-            
-            if is_mitigated:
-                entry_price = c1h['Close']
-                sl = ob_high + (0.4 * c1h['ATR'])
-                risk = sl - entry_price
-                
-                if risk <= 0 or (risk / entry_price) > 0.03: continue
-                
-                tp = entry_price - (2.5 * risk)
-                half_tp_distance = 0.5 * (entry_price - tp)
-                
-                current_sl = sl
-                is_be_triggered = False
-                outcome = 'OPEN'
-                exit_idx = i + 1
-                
-                for j in range(i + 1, min(i + 80, len(df1h))):
-                    f_c = df1h.iloc[j]
-                    exit_idx = j
-                    
-                    if not is_be_triggered and f_c['Low'] <= (entry_price - half_tp_distance):
-                        current_sl = entry_price
-                        is_be_triggered = True
-                        
-                    if f_c['High'] >= current_sl:
-                        if is_be_triggered and current_sl == entry_price:
-                            outcome = 'BE'
-                        else:
-                            outcome = 'LOSS'
-                        break
-                    elif f_c['Low'] <= tp:
-                        outcome = 'WIN'
-                        break
-                        
-                if outcome in ['WIN', 'LOSS', 'BE']:
-                    all_portfolio_trades.append({'Symbol': symbol, 'Outcome': outcome})
-                    locked_until_index = exit_idx
+            if outcome in ['WIN', 'LOSS']:
+                all_portfolio_trades.append({'Symbol': symbol, 'Outcome': outcome})
+                locked_until_index = exit_idx
 
 print("\n============================================================")
-print("📊 گزارش نهایی موتور الیت (با احتساب Risk-Free و حذف تاثیر BE در سود)")
+print("📊 گزارش نهایی موتور خالص اسمارت‌مانی (Liquidity Sweep + R:R 1:4)")
 print("============================================================")
 if all_portfolio_trades:
     pf_df = pd.DataFrame(all_portfolio_trades)
     wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
-    bes = len(pf_df[pf_df['Outcome'] == 'BE'])
     total = len(pf_df)
-    
-    # وین‌ریت بر اساس معاملات قطعی (برد در مقابل باخت واقعی، بدون احتساب سر به سر در مخرج یا صورت سود)
-    decisive_total = wins + losses
-    win_rate = (wins / decisive_total) * 100 if decisive_total > 0 else 0
-    
-    # محاسبه امتیاز خالص (بردها با ضریب 2.5R، باخت‌ها 1R، و سر به سر معادل 0R)
-    net_score = (wins * 2.5) - losses
+    win_rate = (wins / total) * 100 if total > 0 else 0
+    # محاسبه سود خالص با ضریب 4R برای بردها
+    net_score = (wins * 4.0) - losses
     
     print(pf_df['Outcome'].value_counts())
-    print(f"🔸 تعداد کل معاملات: {total} (شامل {bes} معامله ریسک‌فری سربه سر)")
-    print(f"🎯 وین‌ریت واقعی (برد / (برد + باخت)): {win_rate:.2f}%")
-    print(f"💰 امتیاز سود خالص (Net Score): {net_score:.2f}R")
+    print(f"🔸 تعداد کل معاملات: {total}")
+    print(f"🎯 وین‌ریت: {win_rate:.2f}%")
+    print(f"💰 امتیاز سود خالص (Net Score با R:R 1:4): {net_score:.2f}R")
 else:
     print("معامله‌ای ثبت نشد.")
