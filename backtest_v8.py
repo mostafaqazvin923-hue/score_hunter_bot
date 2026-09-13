@@ -399,6 +399,43 @@ def print_diag_table(all_diag):
 
 
 # ============================================================================
+# Score Sweep — بدون دانلود مجدد، فقط min_score را عبور می‌دهد تا نقطه واقعی
+# تعادل بین تعداد معامله و Win Rate/Expectancy بعد از هزینه پیدا شود.
+# ============================================================================
+def run_score_sweep(regime_frames, score_values):
+    baseline_score = CONFIG["min_score"]
+    print("\n" + "=" * 70)
+    print("🧪 Score Sweep — همان داده‌ها، فقط آستانه min_score عوض می‌شود")
+    print("=" * 70)
+    for sc_val in score_values:
+        CONFIG["min_score"] = sc_val
+        all_trades = []
+        for key, df1h in regime_frames.items():
+            trades, _ = run_symbol_backtest(key, df1h)
+            all_trades.extend(trades)
+        if all_trades:
+            df_t = pd.DataFrame(all_trades)
+            total = len(df_t)
+            wr = (df_t["Outcome"] == "WIN").mean() * 100
+            net_before = df_t["Gross_R"].sum()
+            net_after = df_t["Net_R"].sum()
+            span_days = max((df_t["EntryTime"].max() - df_t["EntryTime"].min()).days, 1)
+            per_day = total / span_days
+            outcomes = df_t.sort_values("EntryTime")["Outcome"].tolist()
+            max_l = cur_l = 0
+            for o in outcomes:
+                cur_l = cur_l + 1 if o == "LOSS" else 0
+                max_l = max(max_l, cur_l)
+        else:
+            total, wr, net_before, net_after, per_day, max_l = 0, 0.0, 0.0, 0.0, 0.0, 0
+        marker = " <-- تنظیم فعلی" if sc_val == baseline_score else ""
+        print(f"  min_score={sc_val:<4} Trades={total:<4} ({per_day:4.2f}/day)  "
+              f"WinRate={wr:5.1f}%  Net(before)={net_before:7.2f}R  Net(after)={net_after:7.2f}R  "
+              f"MaxLossStreak={max_l}{marker}")
+    CONFIG["min_score"] = baseline_score
+
+
+# ============================================================================
 # اجرای کامل — همه‌چیز مستقیم در کنسول چاپ می‌شود، هیچ فایلی ذخیره نمی‌شود
 # ============================================================================
 def main():
@@ -406,7 +443,7 @@ def main():
     print("📥 دانلود داده 1H از LBank و ساخت زمینه 4H بدون Lookahead")
     print("=" * 70)
 
-    all_trades, all_diag = [], {}
+    all_trades, all_diag, regime_frames = [], {}, {}
     for key, sym in SYMBOLS.items():
         df1h_raw = fetch_1h_data(key, sym, CONFIG["days_back"])
         if df1h_raw is None or len(df1h_raw) < CONFIG["min_1h_bars"]:
@@ -417,6 +454,7 @@ def main():
         df1h = build_4h_context(df1h)
         df1h = add_regime_flags(df1h)
         df1h = df1h.dropna(subset=["ATR", "ADX", "EMA200_4H", "ADX_4H_min3"]).reset_index(drop=True)
+        regime_frames[key] = df1h  # کش می‌شود تا Score Sweep نیازی به دانلود مجدد نداشته باشد
 
         trades, diag = run_symbol_backtest(key, df1h)
         print(f"  ✅ {key}: {len(trades)} معامله یافت شد.  "
@@ -449,6 +487,9 @@ def main():
     print("=" * 70)
     pd.set_option("display.max_rows", None)
     print(df_trades.sort_values("EntryTime").to_string(index=False))
+
+    # Score Sweep همیشه اجرا می‌شود (هزینه محاسباتی‌اش ناچیز است، چون داده تکرار دانلود نمی‌شود)
+    run_score_sweep(regime_frames, [45, 50, 55, 60, 65, 70, 75, 80, 85])
 
     print("\n✨ بک‌تست TPCS به اتمام رسید.")
 
