@@ -62,7 +62,7 @@ def calculate_indicators(df):
 print("\n🚀 اجرای موتور با مدیریت ریسک پویای واقعی (Trailing Stop + Fee)...")
 
 all_portfolio_trades = []
-FEE_RATE = 0.001  گارمز مجموعاً 0.1 درصد برای ورود و خروج
+FEE_RATE = 0.001  # کارمزد مجموعاً 0.1 درصد برای ورود و خروج
 
 for symbol, df1h in data_1h.items():
     if len(df1h) < 300: continue
@@ -94,7 +94,6 @@ for symbol, df1h in data_1h.items():
                 risk = entry_price - sl
                 if risk <= 0 or (risk / entry_price) > 0.04: continue
                 
-                # تریلینگ استاپ: قیمت ابتدا حرکت می‌کند و استاپ بالا می‌آید
                 current_sl = sl
                 best_price = entry_price
                 outcome = 'LOSS'
@@ -106,10 +105,8 @@ for symbol, df1h in data_1h.items():
                     
                     if f_c['High'] > best_price:
                         best_price = f_c['High']
-                        # اگر سود به اندازه 1R رسید، استاپ را بیاور روی نقطه ورود
                         if best_price >= entry_price + risk:
                             current_sl = max(current_sl, entry_price)
-                        # اگر سود به 2R رسید، استاپ را قفل کن رو سود 1R
                         if best_price >= entry_price + (2 * risk):
                             current_sl = max(current_sl, entry_price + risk)
                             
@@ -117,7 +114,7 @@ for symbol, df1h in data_1h.items():
                         if current_sl > entry_price:
                             outcome = 'WIN'
                         elif current_sl == entry_price:
-                            outcome = 'BE' # سر به سر
+                            outcome = 'BE'
                         else:
                             outcome = 'LOSS'
                         break
