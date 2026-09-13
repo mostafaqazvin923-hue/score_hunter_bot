@@ -46,7 +46,7 @@ CONFIG = {
     "min_atr_pct": 0.003,       # حداقل ATR/Price برای اجازه معامله (0.3%)
     "sl_lookback": 5,           # کندل‌های قبل برای یافتن Swing کوچک جهت SL
     "sl_atr_buffer": 0.30,      # بافر ATR اضافه به Swing برای SL
-    "min_sl_atr": 0.5,          # حداقل فاصله SL بر حسب ATR
+    "min_sl_atr": 1.0,          # حداقل فاصله SL بر حسب ATR (بازگردانده‌شده از 0.5 — استاپ تنگ باعث افت شدید بعد از هزینه می‌شد)
     "max_sl_atr": 3.0,          # حداکثر فاصله SL بر حسب ATR
     "rr": 2.0,                  # Risk:Reward ثابت — 1:2
     "vol_mult": 0.9,            # حداقل نسبت حجم کندل Trigger به میانگین (ملایم)
@@ -150,12 +150,15 @@ def build_4h_context(df1h):
     )
     df4h = calculate_indicators(df4h)
     df4h["EMA200_prev"] = df4h["EMA_200"].shift(1)
+    # پایداری روند: ADX باید حداقل 3 کندل 4H متوالی (قبل از کندل جاری هم) بالای
+    # آستانه بماند، نه فقط یک لحظه — جلوگیری از Whipsaw در بازارهای رنج
+    df4h["ADX_min3"] = df4h["ADX"].rolling(3).min()
     df4h["available_at"] = df4h["Date"] + pd.Timedelta(hours=4)
 
-    ctx_cols = ["available_at", "EMA_20", "EMA_50", "EMA_200", "EMA200_prev", "RSI", "ADX"]
+    ctx_cols = ["available_at", "EMA_20", "EMA_50", "EMA_200", "EMA200_prev", "RSI", "ADX", "ADX_min3"]
     df4h_ctx = df4h[ctx_cols].rename(columns={
         "EMA_20": "EMA20_4H", "EMA_50": "EMA50_4H", "EMA_200": "EMA200_4H",
-        "RSI": "RSI_4H", "ADX": "ADX_4H",
+        "RSI": "RSI_4H", "ADX": "ADX_4H", "ADX_min3": "ADX_4H_min3",
     })
 
     merged = pd.merge_asof(
@@ -170,11 +173,11 @@ def add_regime_flags(df):
     long_ok = (
         (df["EMA20_4H"] > df["EMA50_4H"]) & (df["EMA50_4H"] > df["EMA200_4H"]) &
         (df["EMA200_4H"] >= df["EMA200_prev"]) &
-        (df["ADX_4H"] >= CONFIG["adx_min"]) & (df["RSI_4H"] > 50)
+        (df["ADX_4H_min3"] >= CONFIG["adx_min"]) & (df["RSI_4H"] > 50)
     )
     short_ok = (
         (df["EMA20_4H"] < df["EMA50_4H"]) & (df["EMA50_4H"] < df["EMA200_4H"]) &
-        (df["ADX_4H"] >= CONFIG["adx_min"]) & (df["RSI_4H"] < 50)
+        (df["ADX_4H_min3"] >= CONFIG["adx_min"]) & (df["RSI_4H"] < 50)
     )
     df["regime_long"] = long_ok.fillna(False)
     df["regime_short"] = short_ok.fillna(False)
@@ -413,7 +416,7 @@ def main():
         df1h = calculate_indicators(df1h_raw)
         df1h = build_4h_context(df1h)
         df1h = add_regime_flags(df1h)
-        df1h = df1h.dropna(subset=["ATR", "ADX", "EMA200_4H"]).reset_index(drop=True)
+        df1h = df1h.dropna(subset=["ATR", "ADX", "EMA200_4H", "ADX_4H_min3"]).reset_index(drop=True)
 
         trades, diag = run_symbol_backtest(key, df1h)
         print(f"  ✅ {key}: {len(trades)} معامله یافت شد.  "
