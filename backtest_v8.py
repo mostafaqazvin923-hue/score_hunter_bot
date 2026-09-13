@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (منطق ریسک به ریوارد 1 به 0.5 برای وین‌ریت بالا)")
+print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (ریسک به ریوارد 1 به 1.5)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_high_wr_data.csv"
+    filename_1h = f"{symbol}_1h_rr_1.5_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -100,7 +100,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست با ریسک به ریوارد 1:0.5 (هدف: وین‌ریت بالا)")
+print("🚀 اجرای موتور بک‌تست با ریسک به ریوارد 1:1.5")
 print("============================================================")
 
 all_portfolio_trades = {}
@@ -163,8 +163,8 @@ for symbol, df1h in data_1h.items():
             risk = entry_price - sl
             
             if risk > 0 and (risk / entry_price) <= 0.04:
-                # تغییر ریسک به ریوارد به 1 به 0.5 (حد سود نصف ریسک)
-                tp = entry_price + (0.5 * risk)
+                # ریسک به ریوارد 1 به 1.5
+                tp = entry_price + (1.5 * risk)
                 
                 outcome = None
                 exit_idx = i + 1
@@ -176,7 +176,7 @@ for symbol, df1h in data_1h.items():
                     hit_tp = f_c['High'] >= tp
                     
                     if hit_sl and hit_tp:
-                        outcome = 'LOSS'  # اولویت با برخورد همزمان یا استاپ
+                        outcome = 'LOSS'
                         break
                     elif hit_sl:
                         outcome = 'LOSS'
@@ -199,8 +199,8 @@ for symbol, df1h in data_1h.items():
             risk = sl - entry_price
             
             if risk > 0 and (risk / entry_price) <= 0.04:
-                # تغییر ریسک به ریوارد به 1 به 0.5 (حد سود نصف ریسک)
-                tp = entry_price - (0.5 * risk)
+                # ریسک به ریوارد 1 به 1.5
+                tp = entry_price - (1.5 * risk)
                 
                 outcome = None
                 exit_idx = i + 1
@@ -233,7 +233,7 @@ for symbol, df1h in data_1h.items():
         all_portfolio_trades[symbol] = symbol_trades
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی با ریسک به ریوارد 1:0.5")
+print("📊 گزارش نهایی پورتفوی با ریسک به ریوارد 1:1.5")
 print("============================================================")
 
 flat_trades = []
@@ -246,8 +246,8 @@ if flat_trades:
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
     win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    # محاسبه سود خالص با ضریب 0.5 برای بردها
-    net_profit = (total_wins * 0.5) - total_losses
+    # محاسبه سود خالص با ضریب 1.5 برای بردها
+    net_profit = (total_wins * 1.5) - total_losses
     
     print(f"🔸 تعداد کل معاملات پورتفو: {total_trades}")
     print(f"🔸 کل برنده (WIN): {total_wins}")
