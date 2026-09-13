@@ -69,25 +69,20 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
 def calculate_ichimoku(df):
   df = df.copy()
-  # Tenkan-sen (Conversion Line): (9-period high + 9-period low) / 2
   period9_high = df['High'].rolling(window=9).max()
   period9_low = df['Low'].rolling(window=9).min()
   df['Tenkan'] = (period9_high + period9_low) / 2
 
-  # Kijun-sen (Base Line): (26-period high + 26-period low) / 2
   period26_high = df['High'].rolling(window=26).max()
   period26_low = df['Low'].rolling(window=26).min()
   df['Kijun'] = (period26_high + period26_low) / 2
 
-  # Senkou Span A (Leading Span A): (Tenkan + Kijun) / 2 shifted 26 periods ahead
   df['Senkou_A'] = ((df['Tenkan'] + df['Kijun']) / 2).shift(26)
 
-  # Senkou Span B (Leading Span B): (52-period high + 52-period low) / 2 shifted 26 periods ahead
   period52_high = df['High'].rolling(window=52).max()
   period52_low = df['Low'].rolling(window=52).min()
   df['Senkou_B'] = ((period52_high + period52_low) / 2).shift(26)
 
-  # ATR برای مدیریت ریسک
   tr1 = df['High'] - df['Low']
   tr2 = np.abs(df['High'] - df['Close'].shift(1))
   tr3 = np.abs(df['Low'] - df['Close'].shift(1))
@@ -102,7 +97,6 @@ for symbol, df1h in data_1h.items():
     continue
   df1h = calculate_ichimoku(df1h)
 
-  # ساخت تایم‌فریم ۴ ساعته ایچیموکو برای تشخیص روند کلان
   df4h = (
       df1h.set_index('Date')
       .resample('4h')
@@ -123,7 +117,7 @@ for symbol, df1h in data_1h.items():
   df4h['Trend_Short'] = df4h['Close'] < df4h['Cloud_Bottom']
 
   for col in ['Trend_Long', 'Trend_Short', 'Cloud_Top', 'Cloud_Bottom']:
-    df4h[col] = df4h[col].shift(1)  # جلوگیری از Lookahead
+    df4h[col] = df4h[col].shift(1)
 
   df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
   processed_data[symbol] = {'1h': df1h, '4h': df4h.set_index('Date')}
@@ -153,7 +147,6 @@ for symbol, dat in processed_data.items():
       continue
     r4h = df4h_idx.loc[t4h_time]
 
-    # مدیریت پوزیشن باز
     if position is not None:
       candles_held = i - entry_index
       if position == 'LONG':
@@ -165,6 +158,7 @@ for symbol, dat in processed_data.items():
               else 2.0 - (FEE_RATE * 2)
           )
           all_trades.append({
+              'Timestamp': c1h['Date'],
               'Symbol': symbol,
               'Side': 'LONG',
               'Outcome': outcome,
@@ -180,6 +174,7 @@ for symbol, dat in processed_data.items():
               else 2.0 - (FEE_RATE * 2)
           )
           all_trades.append({
+              'Timestamp': c1h['Date'],
               'Symbol': symbol,
               'Side': 'SHORT',
               'Outcome': outcome,
@@ -187,14 +182,11 @@ for symbol, dat in processed_data.items():
           })
           position = None
 
-    # سیگنال‌های ورود جدید
     if position is None:
       cloud_top_1h = max(prev['Senkou_A'], prev['Senkou_B'])
       cloud_bot_1h = min(prev['Senkou_A'], prev['Senkou_B'])
 
-      # شرایط LONG: روند ۴ ساعته صعودی + قیمت بالای ابر ۱ ساعته + تقاطع تنکان و کیجون یا پولبک به کیجون
       if r4h.get('Trend_Long', False) and prev['Close'] > cloud_top_1h:
-        # Tenkan از بالا قطع می‌کند یا قیمت به کیجون واکنش داده
         tk_cross_long = (prev['Tenkan'] > prev['Kijun']) and (
             df1h.iloc[i - 2]['Tenkan'] <= df1h.iloc[i - 2]['Kijun']
         )
@@ -202,9 +194,7 @@ for symbol, dat in processed_data.items():
             prev['Low'] <= prev['Kijun'] and prev['Close'] > prev['Kijun']
         ):
           entry_price = c1h['Open'] * (1 + SLIPPAGE)
-          stop_loss = (
-              min(prev['Low'], cloud_bot_1h) - 0.2 * prev['ATR']
-          )  # استاب زیر ابر یا کف کندل
+          stop_loss = min(prev['Low'], cloud_bot_1h) - 0.2 * prev['ATR']
           sl_dist_pct = (entry_price - stop_loss) / entry_price
 
           if 0.003 <= sl_dist_pct <= 0.04:
@@ -213,7 +203,6 @@ for symbol, dat in processed_data.items():
             position = 'LONG'
             entry_index = i
 
-      # شرایط SHORT: روند ۴ ساعته نزولی + قیمت زیر ابر ۱ ساعته + تقاطع نزولی تنکان و کیجون
       elif r4h.get('Trend_Short', False) and prev['Close'] < cloud_bot_1h:
         tk_cross_short = (prev['Tenkan'] < prev['Kijun']) and (
             df1h.iloc[i - 2]['Tenkan'] >= df1h.iloc[i - 2]['Kijun']
@@ -237,15 +226,40 @@ print('============================================================')
 
 if all_trades:
   trades_df = pd.DataFrame(all_trades)
+  trades_df.sort_values('Timestamp', inplace=True)
+
   tot_trades = len(trades_df)
   tot_wins = len(trades_df[trades_df['Outcome'] == 'WIN'])
   tot_losses = len(trades_df[trades_df['Outcome'] == 'LOSS'])
   win_rate = (tot_wins / tot_trades) * 100 if tot_trades > 0 else 0
   net_r = trades_df['Return'].sum()
 
+  # محاسبه بیشترین بردهای متوالی و باخت‌های متوالی بر اساس زمان انجام معاملات در کل پورتفوی
+  outcomes = trades_df['Outcome'].tolist()
+  max_wins = 0
+  max_losses = 0
+  curr_wins = 0
+  curr_losses = 0
+
+  for out in outcomes:
+    if out == 'WIN':
+      curr_wins += 1
+      curr_losses = 0
+      if curr_wins > max_wins:
+        max_wins = curr_wins
+    else:
+      curr_losses += 1
+      curr_wins = 0
+      if curr_losses > max_losses:
+        max_losses = curr_losses
+
   print(f'🔸 تعداد کل معاملات پورتفوی: {tot_trades}')
   print(f'🔸 معاملات برنده (WIN): {tot_wins}')
   print(f'🔸 معاملات بازنده (LOSS): {tot_losses}')
+  print(f'🔥 **حداکثر سودهای متوالی (Max Consecutive Wins):** {max_wins}')
+  print(
+      f'❄️ **حداکثر ضررهای متوالی (Max Consecutive Losses):** {max_losses}'
+  )
   print(f'🎯 **وین‌ریت تجمیعی پورتفوی:** {win_rate:.2f}%')
   print(f'💰 **مجموع بازدهی خالص:** {net_r:.2f}R')
 
