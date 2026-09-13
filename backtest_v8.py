@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته برای هدف وین‌ریت 70% (فیلترهای الیت اولترا)")
+print("📥 دانلود داده‌های 1 ساعته برای سیستم برگشت از اسوینگ‌های کلیدی")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_target70_ultra_data.csv"
+    filename_1h = f"{symbol}_1h_swing_rejection_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -73,185 +73,119 @@ for symbol, lbank_symbol in SYMBOLS.items():
     else:
         print(f"  ❌ دیتایی برای {symbol} دریافت نشد.")
 
-def calculate_indicators(df):
-    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
+def calculate_atr(df):
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
-    
-    plus_dm = df['High'].diff().clip(lower=0)
-    minus_dm = (-df['Low'].diff()).clip(lower=0)
-    tr14 = tr.rolling(window=14).mean()
-    plus_di = 100 * (plus_dm.rolling(window=14).mean() / tr14)
-    minus_di = 100 * (minus_dm.rolling(window=14).mean() / tr14)
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-    df['ADX'] = dx.rolling(window=14).mean().fillna(20)
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست فوق‌سخت‌گیرانه (هدف وین‌ریت بالا | R:R 1:1)")
+print("🚀 اجرای موتور برگشت از اسوینگ خالص (R:R 1:1)")
 print("============================================================")
 
 all_portfolio_trades = []
 
 for symbol, df1h in data_1h.items():
-    if len(df1h) < 300:
+    if len(df1h) < 200:
         continue
         
-    df1h = calculate_indicators(df1h)
+    df1h = calculate_atr(df1h)
     
-    df4h = df1h.set_index('Date').resample('4H').agg({
-        'Open': 'first',
-        'High': 'max',
-        'Low': 'min',
-        'Close': 'last',
-        'Volume': 'sum'
-    }).dropna().reset_index()
-    
-    df4h = calculate_indicators(df4h)
-    
-    df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
-    df4h_indexed = df4h.set_index('Date')
+    # ساختار روند بزرگتر با میانگین متحرک ساده 50 کندلی برای جهت‌گیری کلی
+    df1h['SMA_50'] = df1h['Close'].rolling(window=50).mean()
+    df1h['Volume_MA'] = df1h['Volume'].rolling(window=20).mean()
     
     locked_until_index = 0
     
-    for i in range(200, len(df1h) - 40):
+    for i in range(100, len(df1h) - 30):
         if i < locked_until_index:
             continue
             
-        c1h = df1h.iloc[i]
-        t4h_time = c1h['Date_4H']
+        c = df1h.iloc[i]
+        prev_c = df1h.iloc[i-1]
         
-        if t4h_time not in df4h_indexed.index:
+        # تعریف اسوینگ‌های مهم در 30 کندل گذشته
+        lookback = df1h.iloc[i-30:i]
+        swing_high = lookback['High'].max()
+        swing_low = lookback['Low'].min()
+        
+        candle_range = c['High'] - c['Low']
+        if candle_range == 0:
+            isnan = np.isnan(c['ATR'])
+            if isnan: continue
             continue
             
-        r4h = df4h_indexed.loc[t4h_time]
+        body_size = abs(c['Close'] - c['Open'])
+        lower_wick = c['Close'] - c['Low'] if c['Close'] > c['Open'] else c['Open'] - c['Low']
+        upper_wick = c['High'] - c['Open'] if c['Close'] > c['Open'] else c['High'] - c['Close']
         
-        ema20_4h = r4h['EMA_20']
-        ema50_4h = r4h['EMA_50']
-        ema200_4h = r4h['EMA_200']
+        # شروط برگشت قیمت (ریجکشن تمیز از کف یا سقف اسوینگ قبلی به همراه حجم بالا)
+        is_near_support = c['Low'] <= swing_low * 1.002
+        is_near_resistance = c['High'] >= swing_high * 0.998
         
-        try:
-            prev_ema200_4h = df4h.loc[df4h['Date'] == t4h_time, 'EMA_200'].values[0]
-            slope_positive = ema200_4h >= prev_ema200_4h
-        except:
-            slope_positive = True
+        bullish_rejection = is_near_support and (lower_wick >= candle_range * 0.6) and (c['Close'] > c['Open']) and (c['Volume'] > c['Volume_MA'] * 1.5)
+        bearish_rejection = is_near_resistance and (upper_wick >= candle_range * 0.6) and (c['Close'] < c['Open']) and (c['Volume'] > c['Volume_MA'] * 1.5)
+        
+        if bullish_rejection and (c['Close'] > c['SMA_50']):
+            entry_price = c['Close']
+            sl = c['Low'] - (0.5 * c['ATR'])
+            risk = entry_price - sl
             
-        # 💡 فیلترهای فوق‌سخت‌گیرانه رژیم بازار (افزایش ADX به 32 و فیلتر دقیق‌تر RSI)
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 32) and (r4h['RSI'] > 60)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 32) and (r4h['RSI'] < 40)
-        
-        if not is_long_regime and not is_short_regime:
-            continue
+            if risk > 0 and (risk / entry_price) <= 0.04:
+                tp = entry_price + (1.0 * risk) # ریسک به ریوارد دقیقاً ۱ به ۱
+                
+                outcome = 'OPEN'
+                exit_idx = i + 1
+                for j in range(i + 1, min(i + 35, len(df1h))):
+                    f_c = df1h.iloc[j]
+                    exit_idx = j
+                    if f_c['Low'] <= sl:
+                        outcome = 'LOSS'
+                        break
+                    elif f_c['High'] >= tp:
+                        outcome = 'WIN'
+                        break
+                        
+                if outcome in ['WIN', 'LOSS']:
+                    all_portfolio_trades.append({
+                        'Symbol': symbol,
+                        'Side': 'LONG',
+                        'Outcome': outcome
+                    })
+                    locked_until_index = exit_idx
+                    
+        elif bearish_rejection and (c['Close'] < c['SMA_50']):
+            entry_price = c['Close']
+            sl = c['High'] + (0.5 * c['ATR'])
+            risk = sl - entry_price
             
-        lookback_slice = df1h.iloc[i-15:i]
-        struct_high = lookback_slice['High'].max()
-        struct_low = lookback_slice['Low'].min()
-        
-        avg_vol = lookback_slice['Volume'].mean()
-        # 💡 افزایش فیلتر حجم به 1.8 برابر میانگین برای تایید نقدینگی واقعی
-        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 1.8)
-        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 1.8)
-        
-        if is_long_regime and is_breakout_long:
-            entered = False
-            for p in range(1, 14):
-                if i + p >= len(df1h) - 10:
-                    break
-                p_candle = df1h.iloc[i + p]
+            if risk > 0 and (risk / entry_price) <= 0.04:
+                tp = entry_price - (1.0 * risk) # ریسک به ریوارد دقیقاً ۱ به ۱
                 
-                if p_candle['Low'] <= struct_high * 1.003: 
-                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 55:
-                        entry_price = p_candle['Close']
-                        swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
-                        sl = swing_low_pullback - (0.25 * p_candle['ATR'])
-                        risk = entry_price - sl
+                outcome = 'OPEN'
+                exit_idx = i + 1
+                for j in range(i + 1, min(i + 35, len(df1h))):
+                    f_c = df1h.iloc[j]
+                    exit_idx = j
+                    if f_c['High'] >= sl:
+                        outcome = 'LOSS'
+                        break
+                    elif f_c['Low'] <= tp:
+                        outcome = 'WIN'
+                        break
                         
-                        if risk <= 0 or (risk / entry_price) > 0.045:
-                            break
-                            
-                        # ریسک به ریوارد ثابت 1 به 1
-                        tp = entry_price + (1.0 * risk)
-                        
-                        outcome = 'OPEN'
-                        exit_idx = i + p + 1
-                        for j in range(i + p + 1, min(i + p + 40, len(df1h))):
-                            f_c = df1h.iloc[j]
-                            exit_idx = j
-                            if f_c['Low'] <= sl:
-                                outcome = 'LOSS'
-                                break
-                            elif f_c['High'] >= tp:
-                                outcome = 'WIN'
-                                break
-                                
-                        if outcome in ['WIN', 'LOSS']:
-                            all_portfolio_trades.append({
-                                'Symbol': symbol,
-                                'Side': 'LONG',
-                                'Outcome': outcome
-                            })
-                            locked_until_index = exit_idx
-                            entered = True
-                            break
-            if entered:
-                continue
-                
-        elif is_short_regime and is_breakout_short:
-            entered = False
-            for p in range(1, 14):
-                if i + p >= len(df1h) - 10:
-                    break
-                p_candle = df1h.iloc[i + p]
-                
-                if p_candle['High'] >= struct_low * 0.997:
-                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 45:
-                        entry_price = p_candle['Close']
-                        swing_high_pullback = df1h.iloc[i:i+p+1]['High'].max()
-                        sl = swing_high_pullback + (0.25 * p_candle['ATR'])
-                        risk = sl - entry_price
-                        
-                        if risk <= 0 or (risk / entry_price) > 0.045:
-                            break
-                            
-                        # ریسک به ریوارد ثابت 1 به 1
-                        tp = entry_price - (1.0 * risk)
-                        
-                        outcome = 'OPEN'
-                        exit_idx = i + p + 1
-                        for j in range(i + p + 1, min(i + p + 40, len(df1h))):
-                            f_c = df1h.iloc[j]
-                            exit_idx = j
-                            if f_c['High'] >= sl:
-                                outcome = 'LOSS'
-                                break
-                            elif f_c['Low'] <= tp:
-                                outcome = 'WIN'
-                                break
-                                
-                        if outcome in ['WIN', 'LOSS']:
-                            all_portfolio_trades.append({
-                                'Symbol': symbol,
-                                'Side': 'SHORT',
-                                'Outcome': outcome
-                            })
-                            locked_until_index = exit_idx
-                            entered = True
-                            break
+                if outcome in ['WIN', 'LOSS']:
+                    all_portfolio_trades.append({
+                        'Symbol': symbol,
+                        'Side': 'SHORT',
+                        'Outcome': outcome
+                    })
+                    locked_until_index = exit_idx
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی فوق‌سخت‌گیرانه (R:R 1:1)")
+print("📊 گزارش نهایی پورتفوی سیستم اسوینگ ریجکشن (R:R 1:1)")
 print("============================================================")
 
 if all_portfolio_trades:
