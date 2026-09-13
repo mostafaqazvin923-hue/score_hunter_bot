@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (منطق جدید: Order Block + Rejection)")
+print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (منطق ریسک به ریوارد 1 به 0.5 برای وین‌ریت بالا)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_sniper_data.csv"
+    filename_1h = f"{symbol}_1h_high_wr_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -100,7 +100,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست با منطق جدید (کیفیت بالا و کاهش نویز)")
+print("🚀 اجرای موتور بک‌تست با ریسک به ریوارد 1:0.5 (هدف: وین‌ریت بالا)")
 print("============================================================")
 
 all_portfolio_trades = {}
@@ -138,26 +138,19 @@ for symbol, df1h in data_1h.items():
             
         r4h = df4h_indexed.loc[t4h_time]
         
-        # رژیم روند بسیار قدرتمند 4 ساعته با ADX بالا
         is_strong_uptrend = (r4h['Close'] > r4h['EMA_200']) and (r4h['EMA_20'] > r4h['EMA_50']) and (r4h['ADX'] >= 25)
         is_strong_downtrend = (r4h['Close'] < r4h['EMA_200']) and (r4h['EMA_20'] < r4h['EMA_50']) and (r4h['ADX'] >= 25)
         
         if not is_strong_uptrend and not is_strong_downtrend:
             continue
             
-        # بررسی کندل‌های اخیر برای پیدا کردن الگوهای ریجکشن (Pinbar / Rejection Wick) و حجم بالا
-        c_prev = df1h.iloc[i-1]
-        body = abs(c1h['Close'] - c1h['Open'])
         candle_range = c1h['High'] - c1h['Low']
-        
         if candle_range == 0:
             continue
             
-        # تشخیص ریجکشن صعودی (سایه پایین بلند و بسته‌ شدن در نیمه بالایی کندل)
         lower_wick = c1h['Close'] - c1h['Low'] if c1h['Close'] > c1h['Open'] else c1h['Open'] - c1h['Low']
         is_bullish_rejection = (lower_wick >= candle_range * 0.5) and (c1h['Close'] > c1h['Open']) and (c1h['RSI'] > 40) and (c1h['RSI'] < 65)
         
-        # تشخیص ریجکشن نزولی (سایه بالا بلند و بسته شدن در نیمه پایینی کندل)
         upper_wick = c1h['High'] - c1h['Open'] if c1h['Close'] > c1h['Open'] else c1h['High'] - c1h['Close']
         is_bearish_rejection = (upper_wick >= candle_range * 0.5) and (c1h['Close'] < c1h['Open']) and (c1h['RSI'] < 60) and (c1h['RSI'] > 35)
         
@@ -170,7 +163,8 @@ for symbol, df1h in data_1h.items():
             risk = entry_price - sl
             
             if risk > 0 and (risk / entry_price) <= 0.04:
-                tp = entry_price + (2.0 * risk) # ریسک به ریوارد دست‌نخورده (۱:۲)
+                # تغییر ریسک به ریوارد به 1 به 0.5 (حد سود نصف ریسک)
+                tp = entry_price + (0.5 * risk)
                 
                 outcome = None
                 exit_idx = i + 1
@@ -182,7 +176,7 @@ for symbol, df1h in data_1h.items():
                     hit_tp = f_c['High'] >= tp
                     
                     if hit_sl and hit_tp:
-                        outcome = 'LOSS'
+                        outcome = 'LOSS'  # اولویت با برخورد همزمان یا استاپ
                         break
                     elif hit_sl:
                         outcome = 'LOSS'
@@ -205,7 +199,8 @@ for symbol, df1h in data_1h.items():
             risk = sl - entry_price
             
             if risk > 0 and (risk / entry_price) <= 0.04:
-                tp = entry_price - (2.0 * risk) # ریسک به ریوارد دست‌نخورده (۱:۲)
+                # تغییر ریسک به ریوارد به 1 به 0.5 (حد سود نصف ریسک)
+                tp = entry_price - (0.5 * risk)
                 
                 outcome = None
                 exit_idx = i + 1
@@ -238,7 +233,7 @@ for symbol, df1h in data_1h.items():
         all_portfolio_trades[symbol] = symbol_trades
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی (منطق جدید Sniper + ریجکشن حجم بالا)")
+print("📊 گزارش نهایی پورتفوی با ریسک به ریوارد 1:0.5")
 print("============================================================")
 
 flat_trades = []
@@ -251,7 +246,8 @@ if flat_trades:
     total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
     win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    net_profit = (total_wins * 2.0) - total_losses
+    # محاسبه سود خالص با ضریب 0.5 برای بردها
+    net_profit = (total_wins * 0.5) - total_losses
     
     print(f"🔸 تعداد کل معاملات پورتفو: {total_trades}")
     print(f"🔸 کل برنده (WIN): {total_wins}")
