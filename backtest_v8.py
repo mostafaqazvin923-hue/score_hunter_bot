@@ -209,7 +209,18 @@ def score_signal(adx, sweep_depth_atr, bos_size_atr, retest_dist_atr, vol_ratio,
 # ۶. موتور اصلی: Sweep -> BOS -> Retest -> Score -> Entry -> Forward Resolution
 #    (بدون هیچ نگاهی به آینده برای فیلتر کردن نتیجه معامله)
 # ============================================================================
-def run_symbol_backtest(symbol, df1h):
+def run_symbol_backtest(symbol, df1h, diag=None):
+    """
+    diag: دیکشنری شمارنده اختیاری برای تشخیص اینکه سیگنال‌ها در کدام مرحله
+    از قیف (Regime -> Sweep -> BOS -> Retest -> Score -> Risk-Bounds -> Trade)
+    رد می‌شوند. اگر None باشد، شمارش انجام نمی‌شود.
+    """
+    if diag is None:
+        diag = {}
+    for key in ["regime_bars", "atr_ok_bars", "sweep_events", "bos_confirmed",
+                "retest_zone_hit", "score_passed", "risk_bounds_passed", "trades_taken"]:
+        diag.setdefault(key, 0)
+
     n = len(df1h)
     lb = CONFIG["structure_lookback"]
     trades = []
@@ -225,9 +236,11 @@ def run_symbol_backtest(symbol, df1h):
         if not (row["regime_long"] or row["regime_short"]):
             i += 1
             continue
+        diag["regime_bars"] += 1
         if pd.isna(row["ATR"]) or row["ATR"] / row["Close"] < CONFIG["min_atr_pct"]:
             i += 1
             continue
+        diag["atr_ok_bars"] += 1
 
         # ساختار مرجع فقط از کندل‌های *قبل* از کندل جاری (i را شامل نمی‌شود)
         lookback = df1h.iloc[i - lb:i]
@@ -239,6 +252,7 @@ def run_symbol_backtest(symbol, df1h):
 
         # ---------------- سناریوی LONG ----------------
         if row["regime_long"] and row["Low"] < struct_low and row["Close"] > struct_low:
+            diag["sweep_events"] += 1
             sweep_depth = (struct_low - row["Low"]) / atr_now
             # جست‌وجوی BOS در کندل‌های بعدی (فقط رو به جلو، مثل واقعیت زنده)
             for k in range(i + 1, min(i + 1 + CONFIG["sweep_confirm_window"], n)):
@@ -247,6 +261,7 @@ def run_symbol_backtest(symbol, df1h):
                     avg_vol = df1h.iloc[k - lb:k]["Volume"].mean()
                     if bos_c["Volume"] < avg_vol * CONFIG["vol_mult"]:
                         break
+                    diag["bos_confirmed"] += 1
                     bos_size_atr = (bos_c["Close"] - struct_high) / atr_now
                     # جست‌وجوی Retest
                     for p in range(k + 1, min(k + 1 + CONFIG["retest_window"], n)):
@@ -254,12 +269,14 @@ def run_symbol_backtest(symbol, df1h):
                         dist_atr = abs(rt_c["Low"] - struct_high) / atr_now
                         in_zone = rt_c["Low"] <= struct_high + CONFIG["retest_atr_mult"] * atr_now
                         if in_zone and rt_c["Close"] > rt_c["Open"] and 45 <= rt_c["RSI"] <= 65:
+                            diag["retest_zone_hit"] += 1
                             prev_rsi = df1h.iloc[p - 1]["RSI"]
                             rsi_slope_ok = rt_c["RSI"] > prev_rsi
                             sc = score_signal(row["ADX_4H"], sweep_depth, bos_size_atr,
                                                dist_atr, bos_c["Volume"] / avg_vol, rsi_slope_ok)
                             if sc < CONFIG["min_score"]:
                                 break
+                            diag["score_passed"] += 1
                             entry_price = rt_c["Close"]
                             swing_low_pullback = df1h.iloc[k:p + 1]["Low"].min()
                             sl = swing_low_pullback - CONFIG["sl_atr_buffer"] * atr_now
@@ -269,6 +286,7 @@ def run_symbol_backtest(symbol, df1h):
                             risk_atr = risk / atr_now
                             if not (CONFIG["min_sl_atr"] <= risk_atr <= CONFIG["max_sl_atr"]):
                                 break
+                            diag["risk_bounds_passed"] += 1
                             tp = entry_price + CONFIG["rr"] * risk
 
                             outcome, exit_idx, bars_held = resolve_forward(
@@ -282,6 +300,7 @@ def run_symbol_backtest(symbol, df1h):
                                 ))
                                 locked_until = exit_idx  # قفل تا انتهای همان کندلِ رفع‌تکلیف
                                 traded = True
+                                diag["trades_taken"] += 1
                             break
                     break
                 # اگر ساختار به‌کل نقض شد (سقوط بیشتر) از انتظار BOS خارج شو
@@ -290,6 +309,7 @@ def run_symbol_backtest(symbol, df1h):
 
         # ---------------- سناریوی SHORT ----------------
         if not traded and row["regime_short"] and row["High"] > struct_high and row["Close"] < struct_high:
+            diag["sweep_events"] += 1
             sweep_depth = (row["High"] - struct_high) / atr_now
             for k in range(i + 1, min(i + 1 + CONFIG["sweep_confirm_window"], n)):
                 bos_c = df1h.iloc[k]
@@ -297,18 +317,21 @@ def run_symbol_backtest(symbol, df1h):
                     avg_vol = df1h.iloc[k - lb:k]["Volume"].mean()
                     if bos_c["Volume"] < avg_vol * CONFIG["vol_mult"]:
                         break
+                    diag["bos_confirmed"] += 1
                     bos_size_atr = (struct_low - bos_c["Close"]) / atr_now
                     for p in range(k + 1, min(k + 1 + CONFIG["retest_window"], n)):
                         rt_c = df1h.iloc[p]
                         dist_atr = abs(rt_c["High"] - struct_low) / atr_now
                         in_zone = rt_c["High"] >= struct_low - CONFIG["retest_atr_mult"] * atr_now
                         if in_zone and rt_c["Close"] < rt_c["Open"] and 35 <= rt_c["RSI"] <= 55:
+                            diag["retest_zone_hit"] += 1
                             prev_rsi = df1h.iloc[p - 1]["RSI"]
                             rsi_slope_ok = rt_c["RSI"] < prev_rsi
                             sc = score_signal(row["ADX_4H"], sweep_depth, bos_size_atr,
                                                dist_atr, bos_c["Volume"] / avg_vol, rsi_slope_ok)
                             if sc < CONFIG["min_score"]:
                                 break
+                            diag["score_passed"] += 1
                             entry_price = rt_c["Close"]
                             swing_high_pullback = df1h.iloc[k:p + 1]["High"].max()
                             sl = swing_high_pullback + CONFIG["sl_atr_buffer"] * atr_now
@@ -318,6 +341,7 @@ def run_symbol_backtest(symbol, df1h):
                             risk_atr = risk / atr_now
                             if not (CONFIG["min_sl_atr"] <= risk_atr <= CONFIG["max_sl_atr"]):
                                 break
+                            diag["risk_bounds_passed"] += 1
                             tp = entry_price - CONFIG["rr"] * risk
 
                             outcome, exit_idx, bars_held = resolve_forward(
@@ -331,6 +355,7 @@ def run_symbol_backtest(symbol, df1h):
                                 ))
                                 locked_until = exit_idx
                                 traded = True
+                                diag["trades_taken"] += 1
                             break
                     break
                 if bos_c["Close"] > struct_high + atr_now:
@@ -338,7 +363,7 @@ def run_symbol_backtest(symbol, df1h):
 
         i = (locked_until + 1) if traded else (i + 1)
 
-    return trades
+    return trades, diag
 
 
 def resolve_forward(df1h, entry_idx, entry_price, sl, tp, side):
@@ -442,6 +467,7 @@ def main():
     print("=" * 70)
 
     all_trades = []
+    all_diag = {}
     for key, sym in SYMBOLS.items():
         df1h_raw = fetch_1h_data(key, sym, CONFIG["days_back"])
         if df1h_raw is None or len(df1h_raw) < CONFIG["min_1h_bars"]:
@@ -453,9 +479,22 @@ def main():
         df1h = add_regime_flags(df1h)
         df1h = df1h.dropna(subset=["ATR", "ADX", "EMA200_4H"]).reset_index(drop=True)
 
-        trades = run_symbol_backtest(key, df1h)
-        print(f"  ✅ {key}: {len(trades)} معامله یافت شد.")
+        trades, diag = run_symbol_backtest(key, df1h)
+        print(f"  ✅ {key}: {len(trades)} معامله یافت شد.  "
+              f"[Regime={diag['regime_bars']} ATR-ok={diag['atr_ok_bars']} "
+              f"Sweep={diag['sweep_events']} BOS={diag['bos_confirmed']} "
+              f"Retest={diag['retest_zone_hit']} Score-ok={diag['score_passed']} "
+              f"Risk-ok={diag['risk_bounds_passed']}]")
         all_trades.extend(trades)
+        all_diag[key] = diag
+
+    print("\n" + "=" * 70)
+    print("🔬 قیف تشخیصی (کجای زنجیره فیلترها سیگنال‌ها رد می‌شوند)")
+    print("=" * 70)
+    diag_df = pd.DataFrame(all_diag).T
+    diag_df.loc["TOTAL"] = diag_df.sum(numeric_only=True)
+    print(diag_df[["regime_bars", "atr_ok_bars", "sweep_events", "bos_confirmed",
+                    "retest_zone_hit", "score_passed", "risk_bounds_passed", "trades_taken"]])
 
     print("\n" + "=" * 70)
     print("📊 گزارش تجمیعی نهایی پورتفوی — LSCS")
