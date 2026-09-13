@@ -32,13 +32,13 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (نسخه فیلتر پیشرفته)")
+print("📥 دانلود داده‌های 1 ساعته و آماده‌سازی پورتفوی 10 ارزی LBank (منطق Pullback + Sweep)")
 print("============================================================")
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_high_winrate_data.csv"
+    filename_1h = f"{symbol}_1h_pullback_data.csv"
     print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
     
     all_ohlcv = []
@@ -100,7 +100,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست بهینه‌شده با فیلترهای سخت‌گیرانه روند و حجم")
+print("🚀 اجرای موتور بک‌تست با استراتژی Pullback پس از Liquidity Sweep")
 print("============================================================")
 
 all_portfolio_trades = {}
@@ -124,7 +124,7 @@ for symbol, df1h in data_1h.items():
     df4h_indexed = df4h.set_index('Date')
     
     symbol_trades = []
-    locked_until_index = 0  # فیلتر قفل همپوشانی
+    locked_until_index = 0  # قفل همپوشانی
     
     for i in range(200, len(df1h) - 10):
         if i < locked_until_index:
@@ -142,9 +142,9 @@ for symbol, df1h in data_1h.items():
         ema50_4h = r4h['EMA_50']
         ema200_4h = r4h['EMA_200']
         
-        # 💡 فیلترهای رژیم بازار قدرتمندتر (ADX >= 26 و RSI سخت‌گیرانه)
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and (r4h['ADX'] >= 26) and (r4h['RSI'] > 58)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 26) and (r4h['RSI'] < 42)
+        # فیلتر رژیم روند پرقدرت در تایم فریم 4H
+        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and (r4h['ADX'] >= 25)
+        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 25)
         
         if not is_long_regime and not is_short_regime:
             continue
@@ -152,27 +152,28 @@ for symbol, df1h in data_1h.items():
         lookback_slice = df1h.iloc[i-20:i]
         struct_high = lookback_slice['High'].max()
         struct_low = lookback_slice['Low'].min()
-        avg_vol = lookback_slice['Volume'].mean()
         
-        # 💡 فیلتر حجم سنگین‌تر (1.6 برابر میانگین برای تایید ورود پول هوشمند)
-        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 1.6)
-        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 1.6)
+        # 💡 منطق جدید: شناسایی Liquidity Sweep (قیمت سقف/کف را به صورت سایه زده ولی بسته نشده)
+        is_long_sweep = (c1h['High'] > struct_high) and (c1h['Close'] < struct_high)
+        is_short_sweep = (c1h['Low'] < struct_low) and (c1h['Close'] > struct_low)
         
-        if is_long_regime and is_breakout_long:
+        if is_long_regime and is_long_sweep:
+            # جستجوی پولبک تاییدشده در کندل‌های بعدی (بدون نگاه به آینده)
             entered = False
-            for p in range(1, 10):
+            for p in range(1, 8):
                 if i + p >= len(df1h):
                     break
                 p_candle = df1h.iloc[i + p]
                 
-                if p_candle['Low'] <= struct_high * 1.003:
-                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 52:
+                # شرط پولبک به میانگین متحرک 20 یا ناحیه حمایتی با تاییدیه حجم و مومنتوم
+                if p_candle['Close'] <= p_candle['EMA_20'] * 1.005:
+                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 45:
                         entry_price = p_candle['Close']
-                        swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
-                        sl = swing_low_pullback - (0.3 * p_candle['ATR'])
+                        # تعیین حد ضرر پشت کف اسویپ یا نوسان اخیر
+                        sl = df1h.iloc[i:i+p+1]['Low'].min() - (0.4 * p_candle['ATR'])
                         risk = entry_price - sl
                         
-                        if risk <= 0 or (risk / entry_price) > 0.04:
+                        if risk <= 0 or (risk / entry_price) > 0.045:
                             break
                             
                         tp = entry_price + (2.0 * risk)
@@ -208,21 +209,20 @@ for symbol, df1h in data_1h.items():
             if entered:
                 continue
                 
-        elif is_short_regime and is_breakout_short:
+        elif is_short_regime and is_short_sweep:
             entered = False
-            for p in range(1, 10):
+            for p in range(1, 8):
                 if i + p >= len(df1h):
                     break
                 p_candle = df1h.iloc[i + p]
                 
-                if p_candle['High'] >= struct_low * 0.997:
-                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 48:
+                if p_candle['Close'] >= p_candle['EMA_20'] * 0.995:
+                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 55:
                         entry_price = p_candle['Close']
-                        swing_high_pullback = df1h.iloc[i:i+p+1]['High'].max()
-                        sl = swing_high_pullback + (0.3 * p_candle['ATR'])
+                        sl = df1h.iloc[i:i+p+1]['High'].max() + (0.4 * p_candle['ATR'])
                         risk = sl - entry_price
                         
-                        if risk <= 0 or (risk / entry_price) > 0.04:
+                        if risk <= 0 or (risk / entry_price) > 0.045:
                             break
                             
                         tp = entry_price - (2.0 * risk)
@@ -260,7 +260,7 @@ for symbol, df1h in data_1h.items():
         all_portfolio_trades[symbol] = symbol_trades
 
 print("\n============================================================")
-print("📊 گزارش نهایی پورتفوی بهینه‌شده (با فیلترهای سخت‌گیرانه)")
+print("📊 گزارش نهایی پورتفوی با منطق جدید (Pullback + Sweep)")
 print("============================================================")
 
 flat_trades = []
