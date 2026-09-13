@@ -30,7 +30,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها برای استراتژی نهایی و بهینه‌سازی‌شده')
+print('📥 دریافت داده‌ها با ریسک به ریوارد ۱:۲ و لحاظ کردن کارمزد')
 print('============================================================')
 
 data_1h = {}
@@ -73,7 +73,6 @@ def calculate_indicators(df):
   df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
   df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
 
-  # RSI ایمن و شیفت شده
   delta = df['Close'].diff()
   gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
   loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -81,14 +80,12 @@ def calculate_indicators(df):
   df['RSI'] = 100 - (100 / (1 + rs))
   df['RSI_Shift'] = df['RSI'].shift(1)
 
-  # ATR
   high_low = df['High'] - df['Low']
   high_close = np.abs(df['High'] - df['Close'].shift(1))
   low_close = np.abs(df['Low'] - df['Close'].shift(1))
   tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
   df['ATR'] = tr.rolling(window=14).mean()
 
-  # RVOL شیفت شده
   vol_ma = df['Volume'].shift(1).rolling(window=20).mean()
   df['RVOL'] = df['Volume'] / (vol_ma + 1e-9)
 
@@ -97,6 +94,7 @@ def calculate_indicators(df):
 
 all_portfolio_trades = []
 SLIPPAGE = 0.0002
+FEE_RATE = 0.0007  # کارمزد تخمینی صرافی (0.07% برای هر سمت)
 
 for symbol, df1h in data_1h.items():
   if len(df1h) < 300:
@@ -104,7 +102,6 @@ for symbol, df1h in data_1h.items():
 
   df1h = calculate_indicators(df1h)
 
-  # ساخت تایم‌فریم 4 ساعته بدون نشت اطلاعات
   df4h = (
       df1h.set_index('Date')
       .resample('4h')
@@ -147,7 +144,7 @@ for symbol, df1h in data_1h.items():
               'Symbol': symbol,
               'Side': 'LONG',
               'Outcome': 'LOSS',
-              'Return': -1.0,
+              'Return': -1.0 - (FEE_RATE * 2),
           })
           position = None
         elif c1h['High'] >= take_profit:
@@ -155,8 +152,8 @@ for symbol, df1h in data_1h.items():
               'Symbol': symbol,
               'Side': 'LONG',
               'Outcome': 'WIN',
-              'Return': 1.0,
-          })
+              'Return': 2.0 - (FEE_RATE * 2),
+          })  # ریوارد 1:2 سر جای خودش
           position = None
       elif position == 'SHORT':
         if c1h['High'] >= stop_loss:
@@ -164,7 +161,7 @@ for symbol, df1h in data_1h.items():
               'Symbol': symbol,
               'Side': 'SHORT',
               'Outcome': 'LOSS',
-              'Return': -1.0,
+              'Return': -1.0 - (FEE_RATE * 2),
           })
           position = None
         elif c1h['Low'] <= take_profit:
@@ -172,7 +169,7 @@ for symbol, df1h in data_1h.items():
               'Symbol': symbol,
               'Side': 'SHORT',
               'Outcome': 'WIN',
-              'Return': 1.0,
+              'Return': 2.0 - (FEE_RATE * 2),
           })
           position = None
 
@@ -184,21 +181,20 @@ for symbol, df1h in data_1h.items():
           r4h['EMA_50_4H'] < r4h['EMA_200_4H']
       )
 
-      # منطق اصلاح معتبر و استاندارد برای دستیابی به وین‌ریت بالا
       signal_long = (
           trend_long
           and (prev_c1h['Low'] <= prev_c1h['EMA_20'])
-          and (prev_c1h['RSI_Shift'] < 42)
+          and (prev_c1h['RSI_Shift'] < 40)
           and (prev_c1h['Close'] > prev_c1h['Open'])
-          and (prev_c1h['RVOL'] >= 1.2)
+          and (prev_c1h['RVOL'] >= 1.3)
       )
 
       signal_short = (
           trend_short
           and (prev_c1h['High'] >= prev_c1h['EMA_20'])
-          and (prev_c1h['RSI_Shift'] > 58)
+          and (prev_c1h['RSI_Shift'] > 60)
           and (prev_c1h['Close'] < prev_c1h['Open'])
-          and (prev_c1h['RVOL'] >= 1.2)
+          and (prev_c1h['RVOL'] >= 1.3)
       )
 
       if signal_long:
@@ -207,7 +203,9 @@ for symbol, df1h in data_1h.items():
         stop_loss = prev_c1h['Low'] - (0.8 * prev_c1h['ATR'])
         risk = entry_price - stop_loss
         if risk > 0:
-          take_profit = entry_price + (1.0 * risk)
+          take_profit = entry_price + (
+              2.0 * risk
+          )  # بازگشت قطعی به ریسک به ریوارد 1 به 2
         else:
           position = None
 
@@ -217,12 +215,12 @@ for symbol, df1h in data_1h.items():
         stop_loss = prev_c1h['High'] + (0.8 * prev_c1h['ATR'])
         risk = stop_loss - entry_price
         if risk > 0:
-          take_profit = entry_price - (1.0 * risk)
+          take_profit = entry_price - (2.0 * risk)
         else:
           position = None
 
 print('\n============================================================')
-print('📊 گزارش نهایی استراتژی بهینه‌سازی شده نهایی')
+print('📊 گزارش نهایی با ریسک به ریوارد ۱:۲ و کارمزد')
 print('============================================================')
 
 if all_portfolio_trades:
@@ -237,7 +235,7 @@ if all_portfolio_trades:
   print(f'🔸 معاملات برنده (WIN): {total_wins}')
   print(f'🔸 معاملات بازنده (LOSS): {total_losses}')
   print(f'🎯 **وین‌ریت تجمیعی پورتفوی:** {win_rate:.2f}%')
-  print(f'💰 **مجموع بازدهی خالص (بر حسب R):** {net_r:.2f}R')
+  print(f'💰 **مجموع بازدهی خالص (با احتساب کارمزد):** {net_r:.2f}R')
 
   print('\nتفکیک عملکرد به تفکیک هر نماد:')
   print(pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0))
