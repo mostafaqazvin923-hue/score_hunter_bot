@@ -23,7 +23,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای موتور حرفه‌ای اسمارت‌مانی (Structural TP + Filtered OB)")
+print("📥 دانلود داده‌ها برای موتور فوق‌پیشرفته (هدف: وین‌ریت بالا + فیلتر حجم و مومنتوم)")
 print("============================================================")
 
 data_1h = {}
@@ -56,9 +56,16 @@ def calculate_indicators(df):
     df['ATR'] = tr.rolling(window=14).mean()
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+    df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
+    
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
-print("\n🚀 اجرای موتور اسمارت‌مانی با فیلتر ساختاری و حد سود پویا...")
+print("\n🚀 اجرای موتور با فیلترهای سخت‌گیرانه حجم و مومنتوم برای افزایش وین‌ریت...")
 
 all_portfolio_trades = []
 
@@ -66,7 +73,6 @@ for symbol, df1h in data_1h.items():
     if len(df1h) < 400: continue
     df1h = calculate_indicators(df1h)
     
-    # تایم فریم 4 ساعته برای تشخیص روند ماژور و ساختار اصلی
     df4h = df1h.set_index('Date').resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna().reset_index()
     df4h = calculate_indicators(df4h)
     df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
@@ -76,18 +82,17 @@ for symbol, df1h in data_1h.items():
     for i in range(250, len(df1h) - 70):
         if i < locked_until_index: continue
         c1h = df1h.iloc[i]
+        prev_c1h = df1h.iloc[i-1]
         t4h_time = c1h['Date_4H']
         if t4h_time not in df4h_indexed.index: continue
         r4h = df4h_indexed.loc[t4h_time]
         
-        # روند پرقدرت و ساختاری در 4 ساعته (تاییدیه جهت بازار)
-        is_bullish_market = (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_50'] > r4h['EMA_200'])
-        is_bearish_market = (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_50'] < r4h['EMA_200'])
+        is_bullish_market = (r4h['Close'] > r4h['EMA_50']) and (r4h['EMA_50'] > r4h['EMA_200']) and (r4h['RSI'] > 50)
+        is_bearish_market = (r4h['Close'] < r4h['EMA_50']) and (r4h['EMA_50'] < r4h['EMA_200']) and (r4h['RSI'] < 50)
         
         if not is_bullish_market and not is_bearish_market: continue
         
         if is_bullish_market:
-            # جستجوی Order Block صعودی معتبر (آخرین کندل نزولی قوی در اصلاح)
             lookback_slice = df1h.iloc[i-15:i]
             ob_candidates = lookback_slice[lookback_slice['Close'] < lookback_slice['Open']]
             if ob_candidates.empty: continue
@@ -95,31 +100,25 @@ for symbol, df1h in data_1h.items():
             ob_low = ob_candidates['Low'].min()
             ob_high = ob_candidates['High'].max()
             
-            # شرط ورود: قیمت به ناحیه بلوک سفارش صعودی برگشته و ریجکت داده شده است
-            is_mitigated = (c1h['Low'] <= ob_high) and (c1h['Close'] > c1h['Open']) and (c1h['Close'] > ob_low)
+            # فیلترهای فوق‌پیشرفته: برخورد با ناحیه + حجم بالا + برگشت مومنتوم RSI
+            is_mitigated = (
+                (c1h['Low'] <= ob_high) and 
+                (c1h['Close'] > c1h['Open']) and 
+                (c1h['Close'] > ob_low) and
+                (c1h['Volume'] > c1h['Volume_MA'] * 1.3) and # حجم تاییدکننده ورود نهنگ
+                (c1h['RSI'] > prev_c1h['RSI']) and (c1h['RSI'] between_50_65 := (c1h['RSI'] > 40 and c1h['RSI'] < 65))
+            )
             
             if is_mitigated:
                 entry_price = c1h['Close']
-                sl = ob_low - (0.3 * c1h['ATR'])
+                sl = ob_low - (0.4 * c1h['ATR'])
                 risk = entry_price - sl
                 
-                if risk <= 0 or (risk / entry_price) > 0.035: continue
+                if risk <= 0 or (risk / entry_price) > 0.03: continue
                 
-                # تعیین حد سود ساختاری (بررسی اسخترهای نقدینگی / سقف‌های قبلی در آینده نزدیک یا میان‌مدت)
-                future_slice = df1h.iloc[i+1:i+60]
-                if future_slice.empty: continue
-                structural_resistance = future_slice['High'].max()
+                # تنظیم ریسک به ریوارد روی ۱ به ۲.۵ برای تعادل بین وین‌ریت بالا و سودآوری
+                tp = entry_price + (2.5 * risk)
                 
-                # محاسبه حداقل ریوارد ریاضی (1 به 3) به عنوان کفِ اجباری
-                min_tp = entry_price + (3.0 * risk)
-                
-                # بررسی قابلیت دسترسی و منطقی بودن سقف ساختاری
-                if structural_resistance >= min_tp:
-                    tp = structural_resistance # هدف روی سقف ساختاری تنظیم می‌شود
-                else:
-                    tp = min_tp # اگر سقف ساختاری نزدیک بود، کفِ استاندارد 1:3 اعمال می‌شود
-                
-                # بررسی اینکه آیا قیمت قبل از TP به SL می‌رسد یا خیر (بک‌تست پوزیشن)
                 outcome = 'OPEN'
                 exit_idx = i + 1
                 for j in range(i + 1, min(i + 80, len(df1h))):
@@ -144,25 +143,22 @@ for symbol, df1h in data_1h.items():
             ob_low = ob_candidates['Low'].min()
             ob_high = ob_candidates['High'].max()
             
-            is_mitigated = (c1h['High'] >= ob_low) and (c1h['Close'] < c1h['Open']) and (c1h['Close'] < ob_high)
+            is_mitigated = (
+                (c1h['High'] >= ob_low) and 
+                (c1h['Close'] < c1h['Open']) and 
+                (c1h['Close'] < ob_high) and
+                (c1h['Volume'] > c1h['Volume_MA'] * 1.3) and
+                (c1h['RSI'] < prev_c1h['RSI']) and (c1h['RSI'] > 35 and c1h['RSI'] < 60)
+            )
             
             if is_mitigated:
                 entry_price = c1h['Close']
-                sl = ob_high + (0.3 * c1h['ATR'])
+                sl = ob_high + (0.4 * c1h['ATR'])
                 risk = sl - entry_price
                 
-                if risk <= 0 or (risk / entry_price) > 0.035: continue
+                if risk <= 0 or (risk / entry_price) > 0.03: continue
                 
-                future_slice = df1h.iloc[i+1:i+60]
-                if future_slice.empty: continue
-                structural_support = future_slice['Low'].min()
-                
-                min_tp = entry_price - (3.0 * risk)
-                
-                if structural_support <= min_tp:
-                    tp = structural_support
-                else:
-                    tp = min_tp
+                tp = entry_price - (2.5 * risk)
                 
                 outcome = 'OPEN'
                 exit_idx = i + 1
@@ -181,7 +177,7 @@ for symbol, df1h in data_1h.items():
                     locked_until_index = exit_idx
 
 print("\n============================================================")
-print("📊 گزارش نهایی استراتژی اسمارت‌مانی ساختاری (Smart Money Pro)")
+print("📊 گزارش نهایی موتور الیت (هدف وین‌ریت بالا)")
 print("============================================================")
 if all_portfolio_trades:
     pf_df = pd.DataFrame(all_portfolio_trades)
@@ -189,11 +185,11 @@ if all_portfolio_trades:
     losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
     total = len(pf_df)
     win_rate = (wins / total) * 100 if total > 0 else 0
-    net_score = (wins * 3.0) - losses
+    net_score = (wins * 2.5) - losses
     
     print(pf_df['Outcome'].value_counts())
-    print(f"🔸 تعداد کل معاملات (کاهش یافته و عقلانی): {total}")
-    print(f"🎯 وین‌ریت: {win_rate:.2f}%")
-    print(f"💰 امتیاز سود خالص (Net Score): {net_score:.2f}R")
+    print(f"🔸 تعداد کل معاملات (بسیار انتخابی): {total}")
+    print(f"🎯 وین‌ریت جدید: {win_rate:.2f}%")
+    print(f"💰 امتیاز سود خالص (Net Score با R:R 1:2.5): {net_score:.2f}R")
 else:
     print("معامله‌ای ثبت نشد.")
