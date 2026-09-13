@@ -23,7 +23,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("============================================================")
-print("📥 دانلود داده‌ها برای موتور فوق‌پیشرفته (هدف: وین‌ریت بالا + فیلتر حجم و مومنتوم)")
+print("📥 دانلود داده‌ها برای موتور الیت (با قابلیت Risk-Free و سربه سر)")
 print("============================================================")
 
 data_1h = {}
@@ -65,7 +65,7 @@ def calculate_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
-print("\n🚀 اجرای موتور با فیلترهای سخت‌گیرانه حجم و مومنتوم برای افزایش وین‌ریت...")
+print("\n🚀 اجرای موتور با فیلترهای حجمی، مومنتوم و مکانیزم Risk-Free...")
 
 all_portfolio_trades = []
 
@@ -100,13 +100,14 @@ for symbol, df1h in data_1h.items():
             ob_low = ob_candidates['Low'].min()
             ob_high = ob_candidates['High'].max()
             
-            # فیلترهای فوق‌پیشرفته: برخورد با ناحیه + حجم بالا + برگشت مومنتوم RSI
+            # اصلاح خطای دستوری خط ۱۰۹ (بررسی صحیح شرایط RSI و حجم)
             is_mitigated = (
                 (c1h['Low'] <= ob_high) and 
                 (c1h['Close'] > c1h['Open']) and 
                 (c1h['Close'] > ob_low) and
-                (c1h['Volume'] > c1h['Volume_MA'] * 1.3) and # حجم تاییدکننده ورود نهنگ
-                (c1h['RSI'] > prev_c1h['RSI']) and (c1h['RSI'] between_50_65 := (c1h['RSI'] > 40 and c1h['RSI'] < 65))
+                (c1h['Volume'] > c1h['Volume_MA'] * 1.3) and 
+                (c1h['RSI'] > prev_c1h['RSI']) and 
+                (c1h['RSI'] > 40 and c1h['RSI'] < 65)
             )
             
             if is_mitigated:
@@ -116,22 +117,34 @@ for symbol, df1h in data_1h.items():
                 
                 if risk <= 0 or (risk / entry_price) > 0.03: continue
                 
-                # تنظیم ریسک به ریوارد روی ۱ به ۲.۵ برای تعادل بین وین‌ریت بالا و سودآوری
                 tp = entry_price + (2.5 * risk)
+                half_tp_distance = 0.5 * (tp - entry_price)
                 
+                current_sl = sl
+                is_be_triggered = False
                 outcome = 'OPEN'
                 exit_idx = i + 1
+                
                 for j in range(i + 1, min(i + 80, len(df1h))):
                     f_c = df1h.iloc[j]
                     exit_idx = j
-                    if f_c['Low'] <= sl:
-                        outcome = 'LOSS'
+                    
+                    # شرط ریسک‌فری: اگر ۵۰ درصد راه تا TP طی شد، حد ضرر بیاید روی نقطه ورود
+                    if not is_be_triggered and f_c['High'] >= (entry_price + half_tp_distance):
+                        current_sl = entry_price
+                        is_be_triggered = True
+                        
+                    if f_c['Low'] <= current_sl:
+                        if is_be_triggered and current_sl == entry_price:
+                            outcome = 'BE'
+                        else:
+                            outcome = 'LOSS'
                         break
                     elif f_c['High'] >= tp:
                         outcome = 'WIN'
                         break
                         
-                if outcome in ['WIN', 'LOSS']:
+                if outcome in ['WIN', 'LOSS', 'BE']:
                     all_portfolio_trades.append({'Symbol': symbol, 'Outcome': outcome})
                     locked_until_index = exit_idx
                     
@@ -148,7 +161,8 @@ for symbol, df1h in data_1h.items():
                 (c1h['Close'] < c1h['Open']) and 
                 (c1h['Close'] < ob_high) and
                 (c1h['Volume'] > c1h['Volume_MA'] * 1.3) and
-                (c1h['RSI'] < prev_c1h['RSI']) and (c1h['RSI'] > 35 and c1h['RSI'] < 60)
+                (c1h['RSI'] < prev_c1h['RSI']) and 
+                (c1h['RSI'] > 35 and c1h['RSI'] < 60)
             )
             
             if is_mitigated:
@@ -159,37 +173,55 @@ for symbol, df1h in data_1h.items():
                 if risk <= 0 or (risk / entry_price) > 0.03: continue
                 
                 tp = entry_price - (2.5 * risk)
+                half_tp_distance = 0.5 * (entry_price - tp)
                 
+                current_sl = sl
+                is_be_triggered = False
                 outcome = 'OPEN'
                 exit_idx = i + 1
+                
                 for j in range(i + 1, min(i + 80, len(df1h))):
                     f_c = df1h.iloc[j]
                     exit_idx = j
-                    if f_c['High'] >= sl:
-                        outcome = 'LOSS'
+                    
+                    if not is_be_triggered and f_c['Low'] <= (entry_price - half_tp_distance):
+                        current_sl = entry_price
+                        is_be_triggered = True
+                        
+                    if f_c['High'] >= current_sl:
+                        if is_be_triggered and current_sl == entry_price:
+                            outcome = 'BE'
+                        else:
+                            outcome = 'LOSS'
                         break
                     elif f_c['Low'] <= tp:
                         outcome = 'WIN'
                         break
                         
-                if outcome in ['WIN', 'LOSS']:
+                if outcome in ['WIN', 'LOSS', 'BE']:
                     all_portfolio_trades.append({'Symbol': symbol, 'Outcome': outcome})
                     locked_until_index = exit_idx
 
 print("\n============================================================")
-print("📊 گزارش نهایی موتور الیت (هدف وین‌ریت بالا)")
+print("📊 گزارش نهایی موتور الیت (با احتساب Risk-Free و حذف تاثیر BE در سود)")
 print("============================================================")
 if all_portfolio_trades:
     pf_df = pd.DataFrame(all_portfolio_trades)
     wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
     losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
+    bes = len(pf_df[pf_df['Outcome'] == 'BE'])
     total = len(pf_df)
-    win_rate = (wins / total) * 100 if total > 0 else 0
+    
+    # وین‌ریت بر اساس معاملات قطعی (برد در مقابل باخت واقعی، بدون احتساب سر به سر در مخرج یا صورت سود)
+    decisive_total = wins + losses
+    win_rate = (wins / decisive_total) * 100 if decisive_total > 0 else 0
+    
+    # محاسبه امتیاز خالص (بردها با ضریب 2.5R، باخت‌ها 1R، و سر به سر معادل 0R)
     net_score = (wins * 2.5) - losses
     
     print(pf_df['Outcome'].value_counts())
-    print(f"🔸 تعداد کل معاملات (بسیار انتخابی): {total}")
-    print(f"🎯 وین‌ریت جدید: {win_rate:.2f}%")
-    print(f"💰 امتیاز سود خالص (Net Score با R:R 1:2.5): {net_score:.2f}R")
+    print(f"🔸 تعداد کل معاملات: {total} (شامل {bes} معامله ریسک‌فری سربه سر)")
+    print(f"🎯 وین‌ریت واقعی (برد / (برد + باخت)): {win_rate:.2f}%")
+    print(f"💰 امتیاز سود خالص (Net Score): {net_score:.2f}R")
 else:
     print("معامله‌ای ثبت نشد.")
