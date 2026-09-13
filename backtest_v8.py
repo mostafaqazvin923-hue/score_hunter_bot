@@ -14,7 +14,7 @@ import pandas as pd
 
 exchange = ccxt.lbank({'enableRateLimit': True})
 
-# حذف SUI و NEAR و اضافه کردن DOGE و ARB به عنوان ارزهای روندپذیرتر
+# حذف LINK و SUI و NEAR - جایگزینی با ارزی مثل RENDER یا UNI برای پویایی بیشتر
 SYMBOLS = {
     'BTC': 'BTC/USDT',
     'ETH': 'ETH/USDT',
@@ -22,9 +22,9 @@ SYMBOLS = {
     'XRP': 'XRP/USDT',
     'ADA': 'ADA/USDT',
     'AVAX': 'AVAX/USDT',
-    'LINK': 'LINK/USDT',
     'DOGE': 'DOGE/USDT',
     'ARB': 'ARB/USDT',
+    'RENDER': 'RENDER/USDT',
     'DOT': 'DOT/USDT',
 }
 
@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (با جایگزینی ارزهای قوی‌تر DOGE و ARB)')
+print('📥 دریافت داده‌ها (با سبد کاملاً بهینه و بدون LINK)')
 print('============================================================')
 
 data_1h = {}
@@ -89,6 +89,9 @@ def calculate_ichimoku(df):
   tr2 = np.abs(df['High'] - df['Close'].shift(1))
   tr3 = np.abs(df['Low'] - df['Close'].shift(1))
   df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
+  
+  # محاسبه ضخامت ابر (برای سنجش میزان قدرت روند و دوری از بازار رنج)
+  df['Cloud_Thickness'] = np.abs(df['Senkou_A'] - df['Senkou_B']) / df['Close']
 
   return df
 
@@ -118,13 +121,13 @@ for symbol, df1h in data_1h.items():
   df4h['Trend_Long'] = df4h['Close'] > df4h['Cloud_Top']
   df4h['Trend_Short'] = df4h['Close'] < df4h['Cloud_Bottom']
 
-  for col in ['Trend_Long', 'Trend_Short', 'Cloud_Top', 'Cloud_Bottom']:
+  for col in ['Trend_Long', 'Trend_Short', 'Cloud_Top', 'Cloud_Bottom', 'Cloud_Thickness']:
     df4h[col] = df4h[col].shift(1)
 
   df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
   processed_data[symbol] = {'1h': df1h, '4h': df4h.set_index('Date')}
 
-print('⚙️ شروع اجرای بک‌تست با سبد جدید ارزها...')
+print('⚙️ شروع اجرای بک‌تست با فیلتر هوشمند رژیم بازار (جلوگیری از ضرر متوالی)...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -139,9 +142,6 @@ MAX_CONCURRENT_POSITIONS = 3
 
 dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items()}
 dfs_4h = {sym: dat['4h'] for sym, dat in processed_data.items()}
-
-consecutive_losses = 0
-pause_until = None
 
 for ts in sorted_timestamps:
   symbols_to_close = []
@@ -197,12 +197,6 @@ for ts in sorted_timestamps:
   for sym in symbols_to_close:
     del active_positions[sym]
 
-  if pause_until is not None and ts < pause_until:
-    continue
-  elif pause_until is not None and ts >= pause_until:
-    pause_until = None
-    consecutive_losses = 0
-
   for symbol, dat in processed_data.items():
     if symbol in active_positions:
       continue
@@ -228,6 +222,10 @@ for ts in sorted_timestamps:
     if t4h_time not in df4h_idx.index:
       continue
     r4h = df4h_idx.loc[t4h_time]
+
+    # **فیلتر جدید رژیم بازار:** اگر ضخامت ابر خیلی نازک باشد (بازار رنج و فاقد روند پرقدرت)، از ورود خودداری کن
+    if r4h.get('Cloud_Thickness', 0) < 0.001:
+      continue
 
     cloud_top_1h = max(prev['Senkou_A'], prev['Senkou_B'])
     cloud_bot_1h = min(prev['Senkou_A'], prev['Senkou_B'])
@@ -279,103 +277,72 @@ for ts in sorted_timestamps:
           continue
 
 print('\n============================================================')
-print('📊 گزارش جامع پورتفوی (با ارزهای جدید و بهینه‌سازی شده)')
+print('📊 گزارش نهایی پورتفوی (با فیلتر رژیم بازار و حذف ارزهای ضعیف)')
 print('============================================================')
 
 if all_trades:
   trades_df = pd.DataFrame(all_trades)
   trades_df.sort_values('Timestamp', inplace=True)
 
-  filtered_trades = []
-  consec_losses = 0
-  p_until = None
+  tot_trades = len(trades_df)
+  tot_wins = len(trades_df[trades_df['Outcome'] == 'WIN'])
+  tot_losses = len(trades_df[trades_df['Outcome'] == 'LOSS'])
+  win_rate = (tot_wins / tot_trades) * 100 if tot_trades > 0 else 0
+  net_r = trades_df['Return'].sum()
 
-  for idx, row in trades_df.iterrows():
-    ctime = row['Timestamp']
-    if p_until is not None:
-      if ctime < p_until:
-        continue
-      else:
-        p_until = None
-        consec_losses = 0
+  outcomes = trades_df['Outcome'].tolist()
+  max_wins = 0
+  max_losses = 0
+  curr_wins = 0
+  curr_losses = 0
 
-    filtered_trades.append(row)
-
-    if row['Outcome'] == 'LOSS':
-      consec_losses += 1
-      if consec_losses >= 3:
-        p_until = ctime + timedelta(hours=24)
-        consec_losses = 0
+  for out in outcomes:
+    if out == 'WIN':
+      curr_wins += 1
+      curr_losses = 0
+      if curr_wins > max_wins:
+        max_wins = curr_wins
     else:
-      consec_losses = 0
+      curr_losses += 1
+      curr_wins = 0
+      if curr_losses > max_losses:
+        max_losses = curr_losses
 
-  if filtered_trades:
-    f_df = pd.DataFrame(filtered_trades)
-    tot_trades = len(f_df)
-    tot_wins = len(f_df[f_df['Outcome'] == 'WIN'])
-    tot_losses = len(f_df[f_df['Outcome'] == 'LOSS'])
-    win_rate = (tot_wins / tot_trades) * 100 if tot_trades > 0 else 0
-    net_r = f_df['Return'].sum()
+  print(f'🔸 تعداد کل معاملات سبد: {tot_trades}')
+  print(f'🔸 معاملات برنده (WIN): {tot_wins}')
+  print(f'🔸 معاملات بازنده (LOSS): {tot_losses}')
+  print(f'🔥 **حداکثر سودهای متوالی:** {max_wins}')
+  print(f'❄️ **حداکثر ضررهای متوالی:** {max_losses}')
+  print(f'🎯 **وین‌ریت تجمیعی پورتفوی:** {win_rate:.2f}%')
+  print(f'💰 **مجموع بازدهی خالص کل:** {net_r:.2f}R\n')
 
-    outcomes = f_df['Outcome'].tolist()
-    max_wins = 0
-    max_losses = 0
-    curr_wins = 0
-    curr_losses = 0
+  print('------------------------------------------------------------')
+  print('📈 **گزارش تفکیک‌شده به تفکیک هر ارز:**')
+  print('------------------------------------------------------------')
 
-    for out in outcomes:
-      if out == 'WIN':
-        curr_wins += 1
-        curr_losses = 0
-        if curr_wins > max_wins:
-          max_wins = curr_wins
-      else:
-        curr_losses += 1
-        curr_wins = 0
-        if curr_losses > max_losses:
-          max_losses = curr_losses
+  symbol_summary = []
+  for sym in SYMBOLS.keys():
+    sym_trades = trades_df[trades_df['Symbol'] == sym]
+    s_tot = len(sym_trades)
+    if s_tot > 0:
+      s_wins = len(sym_trades[sym_trades['Outcome'] == 'WIN'])
+      s_loss = len(sym_trades[sym_trades['Outcome'] == 'LOSS'])
+      s_wr = (s_wins / s_tot) * 100
+      s_net_r = sym_trades['Return'].sum()
+    else:
+      s_wins, s_loss, s_wr, s_net_r = 0, 0, 0.0, 0.0
 
-    print(f'🔸 تعداد کل معاملات سبد: {tot_trades}')
-    print(f'🔸 معاملات برنده (WIN): {tot_wins}')
-    print(f'🔸 معاملات بازنده (LOSS): {tot_losses}')
-    print(f'🔥 **حداکثر سودهای متوالی:** {max_wins}')
-    print(f'❄️ **حداکثر ضررهای متوالی (کنترل شده):** {max_losses}')
-    print(f'🎯 **وین‌ریت تجمیعی پورتفوی:** {win_rate:.2f}%')
-    print(f'💰 **مجموع بازدهی خالص کل:** {net_r:.2f}R\n')
+    symbol_summary.append({
+        'Symbol': sym,
+        'Trades': s_tot,
+        'Wins': s_wins,
+        'Losses': s_loss,
+        'WinRate(%)': round(s_wr, 2),
+        'Net_R': round(s_net_r, 2),
+    })
 
-    print(
-        '------------------------------------------------------------'
-    )
-    print('📈 **گزارش تفکیک‌شده به تفکیک هر ارز:**')
-    print(
-        '------------------------------------------------------------'
-    )
-
-    symbol_summary = []
-    for sym in SYMBOLS.keys():
-      sym_trades = f_df[f_df['Symbol'] == sym]
-      s_tot = len(sym_trades)
-      if s_tot > 0:
-        s_wins = len(sym_trades[sym_trades['Outcome'] == 'WIN'])
-        s_loss = len(sym_trades[sym_trades['Outcome'] == 'LOSS'])
-        s_wr = (s_wins / s_tot) * 100
-        s_net_r = sym_trades['Return'].sum()
-      else:
-        s_wins, s_loss, s_wr, s_net_r = 0, 0, 0.0, 0.0
-
-      symbol_summary.append({
-          'Symbol': sym,
-          'Trades': s_tot,
-          'Wins': s_wins,
-          'Losses': s_loss,
-          'WinRate(%)': round(s_wr, 2),
-          'Net_R': round(s_net_r, 2),
-      })
-
-    summary_df = pd.DataFrame(symbol_summary)
-    print(summary_df.to_string(index=False))
-  else:
-    print('⚠️ تمامی معاملات توسط فیلتر مدارشکن مسدود شدند.')
+  summary_df = pd.DataFrame(symbol_summary)
+  print(summary_df.to_string(index=False))
 else:
   print('⚠️ معامله‌ای ثبت نشد.')
 
