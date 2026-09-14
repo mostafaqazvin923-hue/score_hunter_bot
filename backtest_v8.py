@@ -13,7 +13,7 @@ except ImportError:
 import pandas as pd
 import numpy as np
 
-# ۱. اتصال به صرافی LBank و تعریف سبد ۱۰ ارز
+# اتصال به صرافی LBank و تعریف سبد ۱۰ ارز
 exchange = ccxt.lbank({'enableRateLimit': True})
 SYMBOLS = {
     "BTC": "BTC/USDT",
@@ -74,7 +74,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
         print(f"  ❌ دیتایی برای {symbol} دریافت نشد.")
 
 def calculate_indicators(df):
-    # محاسبه اندیکاتورها بدون بایاس نگاه به آینده (استفاده از اطلاعات گذشته و حال بسته شده)
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
@@ -101,7 +100,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست ایمن (بدون Lookahead، قفل همپوشانی و ثبت جزئیات)")
+print("🚀 اجرای موتور بک‌تست اصلاح‌شده (با فیلترهای سخت‌گیرانه وین‌ریت)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -112,8 +111,8 @@ for symbol, df1h in data_1h.items():
         
     df1h = calculate_indicators(df1h)
     
-    # ساخت کندل 4 ساعته بدون لوک‌آد
-    df4h = df1h.set_index('Date').resample('4H').agg({
+    # ساخت کندل 4 ساعته با استاندارد 'h' (بدون هشدار deprecation)
+    df4h = df1h.set_index('Date').resample('4h').agg({
         'Open': 'first',
         'High': 'max',
         'Low': 'min',
@@ -126,11 +125,9 @@ for symbol, df1h in data_1h.items():
     df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
     df4h_indexed = df4h.set_index('Date')
     
-    locked_until_index = 0  # قفل همپوشانی برای جلوگیری از ورود جدید تا بسته شدن معامله قبلی
+    locked_until_index = 0
     
-    # حلقه روی کندل‌های 1 ساعته (شروع از ایندکس 200 برای پایداری اندیکاتورها)
     for i in range(200, len(df1h) - 40):
-        # بررسی قفل همپوشانی (اگر پوزیشنی باز است، اجازه معامله جدید داده نمی‌شود)
         if i < locked_until_index:
             continue
             
@@ -152,37 +149,38 @@ for symbol, df1h in data_1h.items():
         except:
             slope_positive = True
             
-        # فیلتر رژیم بازار در تایم‌فریم 4H
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 20) and (r4h['RSI'] > 55)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 20) and (r4h['RSI'] < 45)
+        # 💡 اصلاح اساسی ۱: افزایش سخت‌گیری فیلتر رژیم بازار (ADX >= 25 و شیب روند)
+        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 25) and (r4h['RSI'] > 58)
+        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 25) and (r4h['RSI'] < 42)
         
         if not is_long_regime and not is_short_regime:
             continue
             
-        lookback_slice = df1h.iloc[i-15:i]
+        lookback_slice = df1h.iloc[i-20:i]
         struct_high = lookback_slice['High'].max()
         struct_low = lookback_slice['Low'].min()
         
         avg_vol = lookback_slice['Volume'].mean()
-        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 1.1)
-        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 1.1)
+        # 💡 اصلاح اساسی ۲: افزایش فیلتر حجم به 1.5 برابر میانگین برای تایید شکست معتبر
+        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 1.5)
+        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 1.5)
         
         if is_long_regime and is_breakout_long:
             entered = False
-            for p in range(1, 14):
+            for p in range(1, 10):
                 if i + p >= len(df1h) - 10:
                     break
                 p_candle = df1h.iloc[i + p]
                 
-                if p_candle['Low'] <= struct_high * 1.003: 
-                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 50:
+                if p_candle['Low'] <= struct_high * 1.002: 
+                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 52:
                         entry_price = p_candle['Close']
                         entry_time = p_candle['Date']
                         swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
-                        sl = swing_low_pullback - (0.25 * p_candle['ATR'])
+                        sl = swing_low_pullback - (0.5 * p_candle['ATR']) # افزایش فاصله منطقی SL
                         risk = entry_price - sl
                         
-                        if risk <= 0 or (risk / entry_price) > 0.045:
+                        if risk <= 0 or (risk / entry_price) > 0.035:
                             break
                             
                         tp = entry_price + (2.0 * risk)
@@ -191,8 +189,7 @@ for symbol, df1h in data_1h.items():
                         exit_idx = i + p + 1
                         exit_time = entry_time
                         
-                        # بررسی نتایج معامله در کندل‌های بعدی (بدون نگاه به آینده در لحظه تصمیم‌گیری)
-                        for j in range(i + p + 1, min(i + p + 40, len(df1h))):
+                        for j in range(i + p + 1, min(i + p + 45, len(df1h))):
                             f_c = df1h.iloc[j]
                             exit_idx = j
                             exit_time = f_c['Date']
@@ -211,7 +208,7 @@ for symbol, df1h in data_1h.items():
                                 'EntryTime': entry_time,
                                 'ExitTime': exit_time
                             })
-                            locked_until_index = exit_idx  # اعمال قفل همپوشانی تا پایان معامله
+                            locked_until_index = exit_idx
                             entered = True
                             break
             if entered:
@@ -219,20 +216,20 @@ for symbol, df1h in data_1h.items():
                 
         elif is_short_regime and is_breakout_short:
             entered = False
-            for p in range(1, 14):
+            for p in range(1, 10):
                 if i + p >= len(df1h) - 10:
                     break
                 p_candle = df1h.iloc[i + p]
                 
-                if p_candle['High'] >= struct_low * 0.997:
-                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 50:
+                if p_candle['High'] >= struct_low * 0.998:
+                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 48:
                         entry_price = p_candle['Close']
                         entry_time = p_candle['Date']
                         swing_high_pullback = df1h.iloc[i:i+p+1]['High'].max()
-                        sl = swing_high_pullback + (0.25 * p_candle['ATR'])
+                        sl = swing_high_pullback + (0.5 * p_candle['ATR'])
                         risk = sl - entry_price
                         
-                        if risk <= 0 or (risk / entry_price) > 0.045:
+                        if risk <= 0 or (risk / entry_price) > 0.035:
                             break
                             
                         tp = entry_price - (2.0 * risk)
@@ -241,7 +238,7 @@ for symbol, df1h in data_1h.items():
                         exit_idx = i + p + 1
                         exit_time = entry_time
                         
-                        for j in range(i + p + 1, min(i + p + 40, len(df1h))):
+                        for j in range(i + p + 1, min(i + p + 45, len(df1h))):
                             f_c = df1h.iloc[j]
                             exit_idx = j
                             exit_time = f_c['Date']
@@ -265,7 +262,7 @@ for symbol, df1h in data_1h.items():
                             break
 
 print("\n============================================================")
-print("📊 گزارش جامع عملکرد پورتفوی و تحلیل دوره‌های ضررهای متوالی")
+print("📊 گزارش جامع عملکرد پورتفوی اصلاح‌شده و تحلیل دوره‌های ضرر متوالی")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -298,7 +295,7 @@ if all_portfolio_trades:
         if row['Outcome'] == 'LOSS':
             current_streak.append(row)
         else:
-            if len(current_streak) >= 2: # ثبت دوره‌هایی که ضرر متوالی 2 تا یا بیشتر بوده
+            if len(current_streak) >= 2:
                 consecutive_loss_periods.append({
                     'Count': len(current_streak),
                     'StartDate': current_streak[0]['EntryTime'],
@@ -306,7 +303,6 @@ if all_portfolio_trades:
                 })
             current_streak = []
             
-    # بررسی انتهای لیست
     if len(current_streak) >= 2:
         consecutive_loss_periods.append({
             'Count': len(current_streak),
@@ -323,4 +319,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ بک‌تست به اتمام رسید.")
+print("\n✨ بک‌تست اصلاح‌شده به اتمام رسید.")
