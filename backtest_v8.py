@@ -19,22 +19,39 @@ SYMBOLS = {
     'ETH': 'ETH/USDT',
     'SOL': 'SOL/USDT',
     'XRP': 'XRP/USDT',
-    'ADA': 'ADA/USDT',
-    'AVAX': 'AVAX/USDT',
+    'LINK': 'LINK/USDT',
+    'NEAR': 'NEAR/USDT',
+    'SUI': 'SUI/USDT',
+    'MATIC': 'MATIC/USDT',
+    'UNI': 'UNI/USDT',
+    'ICP': 'ICP/USDT',
+    'APT': 'APT/USDT',
+    'ARB': 'ARB/USDT',
+    'OP': 'OP/USDT',
+    'INJ': 'INJ/USDT',
+    'FIL': 'FIL/USDT',
+    'ATOM': 'ATOM/USDT',
+    'RENDER': 'RENDER/USDT',
+    'TIA': 'TIA/USDT',
+    'SEI': 'SEI/USDT',
+    'FET': 'FET/USDT',
+    'FTM': 'FTM/USDT',
+    'IMX': 'IMX/USDT',
     'DOGE': 'DOGE/USDT',
     'DOT': 'DOT/USDT',
     'LTC': 'LTC/USDT',
-    'RENDER': 'RENDER/USDT',
-    'ATOM': 'ATOM/USDT',
+    'ETC': 'ETC/USDT',
+    'XLM': 'XLM/USDT',
+    'AR': 'AR/USDT',
+    'GRT': 'GRT/USDT',
+    'SNX': 'SNX/USDT',
 }
 
 start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print(
-    '📥 دریافت داده‌ها (HUNTER-V28 - Regime-Filtered Institutional CTA)'
-)
+print('📥 دریافت داده‌ها (HUNTER-V29 - Expanded 30-Asset Institutional CTA)')
 print('============================================================')
 
 processed_data = {}
@@ -72,22 +89,24 @@ for symbol, lbank_symbol in SYMBOLS.items():
   df4h.sort_values('Date', inplace=True)
   df4h.reset_index(drop=True, inplace=True)
 
-  # ATR و میانگین متحرک نمایی برای تشخیص روند ساختاری
   tr1 = df4h['High'] - df4h['Low']
   tr2 = np.abs(df4h['High'] - df4h['Close'].shift(1))
   tr3 = np.abs(df4h['Low'] - df4h['Close'].shift(1))
   df4h['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
-  
+
   df4h['EMA20'] = df4h['Close'].ewm(span=20, adjust=False).mean()
   df4h['EMA50'] = df4h['Close'].ewm(span=50, adjust=False).mean()
 
-  # محاسبه ضریب قدرت روند (Trend Intensity Index)
-  df4h['Mom_Short'] = (df4h['Close'] - df4h['Close'].shift(10)) / df4h['Close'].shift(10)
-  df4h['Mom_Long'] = (df4h['Close'] - df4h['Close'].shift(30)) / df4h['Close'].shift(30)
+  df4h['Mom_Short'] = (df4h['Close'] - df4h['Close'].shift(10)) / df4h[
+      'Close'
+  ].shift(10)
+  df4h['Mom_Long'] = (df4h['Close'] - df4h['Close'].shift(30)) / df4h[
+      'Close'
+  ].shift(30)
 
   processed_data[symbol] = df4h.set_index('Date')
 
-print('⚙️ شروع اجرای بک‌تست هوشمند HUNTER-V28...')
+print('⚙️ شروع اجرای بک‌تست هوشمند HUNTER-V29...')
 
 all_timestamps = set()
 for df in processed_data.values():
@@ -98,7 +117,7 @@ active_positions = {}
 all_trades = []
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
-MAX_POSITIONS = 3
+MAX_POSITIONS = 4  # افزایش همزمان پوزیشن‌ها متناسب با ۳۰ ارز
 
 for ts in sorted_timestamps:
   symbols_to_close = []
@@ -107,7 +126,6 @@ for ts in sorted_timestamps:
       continue
     c4h = processed_data[symbol].loc[ts]
 
-    # تریلینگ استاپ پویا برای قفل کردن سود
     if c4h['High'] > pos['highest_price']:
       pos['highest_price'] = c4h['High']
       new_trailing_sl = pos['highest_price'] - (2.0 * c4h['ATR'])
@@ -141,7 +159,6 @@ for ts in sorted_timestamps:
   for sym in symbols_to_close:
     del active_positions[sym]
 
-  # رتبه‌بندی مومنتوم بلندمدت
   current_scores = {}
   for symbol, df in processed_data.items():
     if ts in df.index:
@@ -176,10 +193,10 @@ for ts in sorted_timestamps:
 
     c4h = df.iloc[i]
 
-    # فیلتر رژیم بازار (Market Regime Filtering):
-    # قیمت بالای EMA20 و EMA50 جهت‌دار + مومنتوم مثبت دوگانه
     regime_bull = (c4h['Close'] > c4h['EMA20']) and (c4h['EMA20'] > c4h['EMA50'])
-    valid_trend = regime_bull and (c4h['Mom_Short'] > 0.015) and (c4h['Mom_Long'] > 0.04)
+    valid_trend = (
+        regime_bull and (c4h['Mom_Short'] > 0.015) and (c4h['Mom_Long'] > 0.04)
+    )
 
     if valid_trend:
       entry_price = c4h['Open'] * (1 + SLIPPAGE)
@@ -198,7 +215,7 @@ for ts in sorted_timestamps:
         }
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V28 (Regime-Filtered Institutional CTA)')
+print('📊 گزارش نهایی HUNTER-V29 (Expanded 30-Asset Institutional CTA)')
 print('============================================================')
 
 if all_trades:
