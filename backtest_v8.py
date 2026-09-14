@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V54 (V51 Core + Breakeven Lock for Streak Reduction)
+# HUNTER-V55 (V51 Core + ADX Trend Strength Filter for Streak Control)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -48,7 +48,7 @@ SYMBOLS = {k: v for k, v in SYMBOLS.items() if k not in REMOVED_COINS}
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
-MAX_POSITIONS = 5  # برگشت به حالت اصلی و بهینه
+MAX_POSITIONS = 5
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 ATR_PERIOD = 14
@@ -66,7 +66,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V54")
+print("📥 دریافت داده‌ها - HUNTER-V55")
 print("=" * 60)
 
 processed_data = {}
@@ -140,6 +140,21 @@ def fetch_symbol_data(lbank_symbol):
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
 
+    # محاسبه اندیکاتور ADX برای تشخیص قدرت روند و فیلتر کردن بازارهای رنج
+    plus_dm = df["High"].diff()
+    minus_dm = df["Low"].diff().mul(-1)
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm < 0] = 0
+    
+    tr_series = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr_val = tr_series.ewm(span=14, adjust=False).mean()
+    
+    plus_di = 100 * (plus_dm.ewm(span=14, adjust=False).mean() / atr_val)
+    minus_di = 100 * (minus_dm.ewm(span=14, adjust=False).mean() / atr_val)
+    
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+    df["ADX"] = dx.ewm(span=14, adjust=False).mean()
+
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
@@ -156,7 +171,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V54...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V55 (با فیلتر روند ADX)...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -175,12 +190,6 @@ def run_backtest(processed_data):
                 continue
             
             c4h = df.loc[ts]
-            
-            # بررسی مکانیزم Breakeven: اگر قیمت به 1R سود رسید، استاپ لاس را به قیمت ورود منتقل کن
-            if not pos["breakeven_locked"]:
-                if c4h["High"] >= pos["entry_price"] + pos["initial_risk"]:
-                    pos["stop_loss"] = pos["entry_price"]
-                    pos["breakeven_locked"] = True
             
             if c4h["High"] > pos["highest_price"]:
                 pos["highest_price"] = c4h["High"]
@@ -250,6 +259,10 @@ def run_backtest(processed_data):
                 continue
             
             c4h = df.iloc[i]
+            
+            # فیلتر رنج بازار با ADX (باید روند قوی وجود داشته باشد تا ربات وارد معامله شود)
+            adx_valid = (not np.isnan(c4h["ADX"])) and (c4h["ADX"] > 22)
+            
             regime_bull = (
                 (c4h["Close"] > c4h["EMA20"])
                 and (c4h["EMA20"] > c4h["EMA50"])
@@ -257,7 +270,8 @@ def run_backtest(processed_data):
             )
             
             valid_trend = (
-                regime_bull
+                adx_valid
+                and regime_bull
                 and (c4h["Mom_Short"] > 0.012)
                 and (c4h["Mom_Long"] > 0.035)
             )
@@ -275,7 +289,6 @@ def run_backtest(processed_data):
                         "stop_loss": initial_sl,
                         "highest_price": entry_price,
                         "initial_risk": initial_risk,
-                        "breakeven_locked": False,
                         "entry_index": i,
                     }
                     
@@ -283,7 +296,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با مکانیزم سر به سر - HUNTER-V54")
+    print("📊 گزارش نهایی استراتژی با فیلتر روند ADX - HUNTER-V55")
     print("=" * 68)
 
     if trades_df.empty:
@@ -341,4 +354,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V54 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V55 به پایان رسید.")
