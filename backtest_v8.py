@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-V15 - Squeeze Momentum & Volatility Breakout)')
+print('📥 دریافت داده‌ها (HUNTER-V16 - High Frequency & Smart Quarantine)')
 print('============================================================')
 
 data_1h = {}
@@ -60,7 +60,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
     df1h = pd.DataFrame(
         all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
     )
-    df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit= 'ms')
+    df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
     df1h = df1h[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
     df1h.dropna(inplace=True)
     df1h.drop_duplicates(subset=['Date'], inplace=True)
@@ -76,24 +76,7 @@ def calculate_indicators(df):
   tr3 = np.abs(df['Low'] - df['Close'].shift(1))
   df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
-  # Bollinger Bands
-  df['BB_Mid'] = df['Close'].rolling(20).mean()
-  df['BB_Std'] = df['Close'].rolling(20).std()
-  df['BB_Upper'] = df['BB_Mid'] + (2.0 * df['BB_Std'])
-  df['BB_Lower'] = df['BB_Mid'] - (2.0 * df['BB_Std'])
-
-  # Keltner Channel
-  df['KC_Mid'] = df['Close'].ewm(span=20, adjust=False).mean()
-  df['KC_Upper'] = df['KC_Mid'] + (1.5 * df['ATR'])
-  df['KC_Lower'] = df['KC_Mid'] - (1.5 * df['ATR'])
-
-  # Squeeze Indicator (Bollinger inside Keltner = Squeeze ON)
-  df['Squeeze_On'] = (df['BB_Upper'] < df['KC_Upper']) & (
-      df['BB_Lower'] > df['KC_Lower']
-  )
-  df['Squeeze_Off'] = ~df['Squeeze_On']
-
-  # Momentum Oscillator (Linear Regression of Close)
+  df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
   df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
   df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
   df['Volume_MA'] = df['Volume'].rolling(20).mean()
@@ -148,7 +131,7 @@ for symbol, df1h in data_1h.items():
       'daily': df_daily.set_index('Date'),
   }
 
-print('⚙️ شروع اجرای بک‌تست HUNTER-V15 (Squeeze Breakout)...')
+print('⚙️ شروع اجرای بک‌تست HUNTER-V16...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -157,10 +140,11 @@ sorted_timestamps = sorted(list(all_timestamps))
 
 active_positions = {}
 cooldown_timers = {}
+consecutive_symbol_losses = {}  # برای سیستم قرنطینه هوشمند
 all_trades = []
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
-MAX_CONCURRENT_POSITIONS = 2
+MAX_CONCURRENT_POSITIONS = 3
 
 dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items()}
 
@@ -186,16 +170,24 @@ for ts in sorted_timestamps:
     if pos['side'] == 'LONG':
       hit_sl = c1h['Low'] <= pos['stop_loss']
       hit_tp = c1h['High'] >= pos['take_profit']
-      is_timeout = candles_held >= 20
+      is_timeout = candles_held >= 24
 
       if hit_sl or hit_tp or is_timeout:
         if hit_sl:
           outcome = 'LOSS'
           r_real = -1.0 - (FEE_RATE * 2)
-          cooldown_timers[symbol] = 16
+          consecutive_symbol_losses[symbol] = (
+              consecutive_symbol_losses.get(symbol, 0) + 1
+          )
+          # اگر ۲ ضرر پشت هم داشت، ۴۸ ساعت قرنطینه سنگین شود
+          if consecutive_symbol_losses[symbol] >= 2:
+            cooldown_timers[symbol] = 48
+          else:
+            cooldown_timers[symbol] = 10
         elif hit_tp:
           outcome = 'WIN'
           r_real = 2.0 - (FEE_RATE * 2)
+          consecutive_symbol_losses[symbol] = 0  # ریست شدن ضررهای متوالی ارز
         else:
           risk = pos['entry_price'] - pos['stop_loss']
           if risk > 0:
@@ -204,7 +196,15 @@ for ts in sorted_timestamps:
             r_real = 0.0
           outcome = 'WIN' if r_real > 0 else 'LOSS'
           if outcome == 'LOSS':
-            cooldown_timers[symbol] = 16
+            consecutive_symbol_losses[symbol] = (
+                consecutive_symbol_losses.get(symbol, 0) + 1
+            )
+            if consecutive_symbol_losses[symbol] >= 2:
+              cooldown_timers[symbol] = 48
+            else:
+              cooldown_timers[symbol] = 10
+          else:
+            consecutive_symbol_losses[symbol] = 0
 
         all_trades.append({
             'Timestamp': ts,
@@ -218,16 +218,23 @@ for ts in sorted_timestamps:
     elif pos['side'] == 'SHORT':
       hit_sl = c1h['High'] >= pos['stop_loss']
       hit_tp = c1h['Low'] <= pos['take_profit']
-      is_timeout = candles_held >= 20
+      is_timeout = candles_held >= 24
 
       if hit_sl or hit_tp or is_timeout:
         if hit_sl:
           outcome = 'LOSS'
           r_real = -1.0 - (FEE_RATE * 2)
-          cooldown_timers[symbol] = 16
+          consecutive_symbol_losses[symbol] = (
+              consecutive_symbol_losses.get(symbol, 0) + 1
+          )
+          if consecutive_symbol_losses[symbol] >= 2:
+            cooldown_timers[symbol] = 48
+          else:
+            cooldown_timers[symbol] = 10
         elif hit_tp:
           outcome = 'WIN'
           r_real = 2.0 - (FEE_RATE * 2)
+          consecutive_symbol_losses[symbol] = 0
         else:
           risk = pos['stop_loss'] - pos['entry_price']
           if risk > 0:
@@ -236,7 +243,15 @@ for ts in sorted_timestamps:
             r_real = 0.0
           outcome = 'WIN' if r_real > 0 else 'LOSS'
           if outcome == 'LOSS':
-            cooldown_timers[symbol] = 16
+            consecutive_symbol_losses[symbol] = (
+                consecutive_symbol_losses.get(symbol, 0) + 1
+            )
+            if consecutive_symbol_losses[symbol] >= 2:
+              cooldown_timers[symbol] = 48
+            else:
+              cooldown_timers[symbol] = 10
+          else:
+            consecutive_symbol_losses[symbol] = 0
 
         all_trades.append({
             'Timestamp': ts,
@@ -269,12 +284,7 @@ for ts in sorted_timestamps:
 
     c1h = df1h.iloc[i]
     prev = df1h.iloc[i - 1]
-    prev2 = df1h.iloc[i - 2]
 
-    # تاییدیه اسکوئیز: خروج از حالت فشردگی (Squeeze release) در کندل قبلی
-    squeeze_fired = prev2['Squeeze_On'] and prev['Squeeze_Off']
-
-    # فیلتر چندتایم‌فریمی سخت‌گیرانه
     daily_time = c1h['Date_Daily']
     df_daily_idx = dat['daily']
     if daily_time not in df_daily_idx.index:
@@ -294,17 +304,26 @@ for ts in sorted_timestamps:
     trend_4h_up = r4h.get('EMA50_4H', 0) > r4h.get('EMA200_4H', 0)
     trend_4h_down = r4h.get('EMA50_4H', 0) < r4h.get('EMA200_4H', 0)
 
-    volume_surge = prev['Volume'] > (1.4 * prev['Volume_MA'])
-
-    # ورود لانگ
-    if (
-        squeeze_fired
-        and macro_bull
+    # سیستم پولبک در روند (Trend Pullback) برای افزایش تعداد معاملات
+    pullback_long = (
+        macro_bull
         and trend_4h_up
-        and prev['Close'] > prev['EMA50']
-        and volume_surge
-        and prev['Close'] > prev['Open']
-    ):
+        and prev['EMA20'] > prev['EMA50']
+        and prev['Low'] <= prev['EMA20']
+        and prev['Close'] > prev['EMA20']
+        and prev['Volume'] > (1.1 * prev['Volume_MA'])
+    )
+
+    pullback_short = (
+        macro_bear
+        and trend_4h_down
+        and prev['EMA20'] < prev['EMA50']
+        and prev['High'] >= prev['EMA20']
+        and prev['Close'] < prev['EMA20']
+        and prev['Volume'] > (1.1 * prev['Volume_MA'])
+    )
+
+    if pullback_long:
       entry_price = c1h['Open'] * (1 + SLIPPAGE)
       stop_loss = df1h['Low'].iloc[i - 5 : i].min() - 0.2 * prev['ATR']
       sl_dist_pct = (entry_price - stop_loss) / entry_price
@@ -321,15 +340,7 @@ for ts in sorted_timestamps:
         }
         continue
 
-    # ورود شورت
-    elif (
-        squeeze_fired
-        and macro_bear
-        and trend_4h_down
-        and prev['Close'] < prev['EMA50']
-        and volume_surge
-        and prev['Close'] < prev['Open']
-    ):
+    elif pullback_short:
       entry_price = c1h['Open'] * (1 - SLIPPAGE)
       stop_loss = df1h['High'].iloc[i - 5 : i].max() + 0.2 * prev['ATR']
       sl_dist_pct = (stop_loss - entry_price) / entry_price
@@ -347,7 +358,7 @@ for ts in sorted_timestamps:
         continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V15 (Squeeze Momentum & Breakout)')
+print('📊 گزارش نهایی HUNTER-V16 (High Frequency & Smart Quarantine)')
 print('============================================================')
 
 if all_trades:
