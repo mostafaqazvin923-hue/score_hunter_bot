@@ -33,7 +33,7 @@ since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
 print(
-    '📥 دریافت داده‌ها (HUNTER-V27 - Institutional CTA & Trailing Volatility)'
+    '📥 دریافت داده‌ها (HUNTER-V28 - Regime-Filtered Institutional CTA)'
 )
 print('============================================================')
 
@@ -72,24 +72,22 @@ for symbol, lbank_symbol in SYMBOLS.items():
   df4h.sort_values('Date', inplace=True)
   df4h.reset_index(drop=True, inplace=True)
 
-  # ATR و میانگین نوسان برای فیلتر بازار رِنج (جلوگیری از ضررهای متوالی فرسایشی)
+  # ATR و میانگین متحرک نمایی برای تشخیص روند ساختاری
   tr1 = df4h['High'] - df4h['Low']
   tr2 = np.abs(df4h['High'] - df4h['Close'].shift(1))
   tr3 = np.abs(df4h['Low'] - df4h['Close'].shift(1))
   df4h['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
-  df4h['ATR_MA'] = df4h['ATR'].rolling(30).mean()
+  
+  df4h['EMA20'] = df4h['Close'].ewm(span=20, adjust=False).mean()
+  df4h['EMA50'] = df4h['Close'].ewm(span=50, adjust=False).mean()
 
-  # مومنتوم چندلایه (Dual-Lookback TSMOM)
-  df4h['Mom_Short'] = (df4h['Close'] - df4h['Close'].shift(12)) / df4h[
-      'Close'
-  ].shift(12)
-  df4h['Mom_Long'] = (df4h['Close'] - df4h['Close'].shift(36)) / df4h[
-      'Close'
-  ].shift(36)
+  # محاسبه ضریب قدرت روند (Trend Intensity Index)
+  df4h['Mom_Short'] = (df4h['Close'] - df4h['Close'].shift(10)) / df4h['Close'].shift(10)
+  df4h['Mom_Long'] = (df4h['Close'] - df4h['Close'].shift(30)) / df4h['Close'].shift(30)
 
   processed_data[symbol] = df4h.set_index('Date')
 
-print('⚙️ شروع اجرای بک‌تست حرفه‌ای HUNTER-V27...')
+print('⚙️ شروع اجرای بک‌تست هوشمند HUNTER-V28...')
 
 all_timestamps = set()
 for df in processed_data.values():
@@ -109,11 +107,10 @@ for ts in sorted_timestamps:
       continue
     c4h = processed_data[symbol].loc[ts]
 
-    # مدیریت استاپ لاس پویا (Trailing Stop بر اساس بالاترین قیمت ثبت شده)
+    # تریلینگ استاپ پویا برای قفل کردن سود
     if c4h['High'] > pos['highest_price']:
       pos['highest_price'] = c4h['High']
-      # تریل کردن استاپ لاس به سمت بالا برای حفظ سود
-      new_trailing_sl = pos['highest_price'] - (2.2 * c4h['ATR'])
+      new_trailing_sl = pos['highest_price'] - (2.0 * c4h['ATR'])
       if new_trailing_sl > pos['stop_loss']:
         pos['stop_loss'] = new_trailing_sl
 
@@ -124,16 +121,11 @@ for ts in sorted_timestamps:
       continue
     curr_i = match_rows.index[0]
     candles_held = curr_i - pos['entry_index']
-    is_timeout = candles_held >= 50  # حداکثر زمان نگهداری در روند
+    is_timeout = candles_held >= 45
 
     if hit_sl or is_timeout:
       initial_risk = pos['initial_risk']
-      if hit_sl:
-        # اگر استاپ لاس خورد، محاسبه بازدهی بر اساس قیمت استاپ یا بسته شدن
-        exit_p = min(pos['stop_loss'], c4h['Open'])
-      else:
-        exit_p = c4h['Close']
-
+      exit_p = min(pos['stop_loss'], c4h['Open']) if hit_sl else c4h['Close']
       r_real = (exit_p - pos['entry_price']) / initial_risk - (FEE_RATE * 2)
       outcome = 'WIN' if r_real > 0 else 'LOSS'
 
@@ -149,7 +141,7 @@ for ts in sorted_timestamps:
   for sym in symbols_to_close:
     del active_positions[sym]
 
-  # رتبه‌بندی مومنتوم بین تمام ارزها
+  # رتبه‌بندی مومنتوم بلندمدت
   current_scores = {}
   for symbol, df in processed_data.items():
     if ts in df.index:
@@ -184,22 +176,18 @@ for ts in sorted_timestamps:
 
     c4h = df.iloc[i]
 
-    # فیلترهای استراتژیک صندوق‌های بزرگ:
-    # 1. مومنتوم کوتاه و بلند مثبت
-    # 2. فیلتر نوسان (ATR بالاتر از میانگین برای دوری از بازار فرسایشی و سایدوی)
-    valid_trend = (
-        c4h['Mom_Short'] > 0.02
-        and c4h['Mom_Long'] > 0.05
-        and c4h['ATR'] > c4h['ATR_MA']
-    )
+    # فیلتر رژیم بازار (Market Regime Filtering):
+    # قیمت بالای EMA20 و EMA50 جهت‌دار + مومنتوم مثبت دوگانه
+    regime_bull = (c4h['Close'] > c4h['EMA20']) and (c4h['EMA20'] > c4h['EMA50'])
+    valid_trend = regime_bull and (c4h['Mom_Short'] > 0.015) and (c4h['Mom_Long'] > 0.04)
 
     if valid_trend:
       entry_price = c4h['Open'] * (1 + SLIPPAGE)
-      initial_sl = entry_price - (2.0 * c4h['ATR'])
+      initial_sl = entry_price - (1.8 * c4h['ATR'])
       initial_risk = entry_price - initial_sl
       sl_dist_pct = initial_risk / entry_price
 
-      if 0.01 <= sl_dist_pct <= 0.045:
+      if 0.01 <= sl_dist_pct <= 0.04:
         active_positions[symbol] = {
             'side': 'LONG',
             'entry_price': entry_price,
@@ -210,7 +198,7 @@ for ts in sorted_timestamps:
         }
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V27 (Institutional CTA & Trailing)')
+print('📊 گزارش نهایی HUNTER-V28 (Regime-Filtered Institutional CTA)')
 print('============================================================')
 
 if all_trades:
