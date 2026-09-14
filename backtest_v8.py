@@ -32,7 +32,10 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-V18 - Global Circuit Breaker & High Winrate)')
+print(
+    '📥 دریافت داده‌ها (HUNTER-V19 - Institutional Donchian Breakout & ADX'
+    ' Regime)'
+)
 print('============================================================')
 
 data_1h = {}
@@ -76,16 +79,33 @@ def calculate_indicators(df):
   tr3 = np.abs(df['Low'] - df['Close'].shift(1))
   df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
-  df['EMA10'] = df['Close'].ewm(span=10, adjust=False).mean()
-  df['EMA30'] = df['Close'].ewm(span=30, adjust=False).mean()
-  df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+  # Donchian Channels (20 periods) - Turtle Trading Core
+  df['Donchian_High'] = df['High'].rolling(20).max().shift(1)
+  df['Donchian_Low'] = df['Low'].rolling(20).min().shift(1)
 
-  # RSI
-  delta = df['Close'].diff()
-  gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-  loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-  rs = gain / loss
-  df['RSI'] = 100 - (100 / (1 + rs))
+  # ADX (Average Directional Index) for Market Regime
+  plus_dm = df['High'].diff()
+  minus_dm = df['Low'].diff()
+  plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+  minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+
+  tr = df['ATR']
+  plus_di = (
+      100
+      * pd.Series(plus_dm).rolling(14).mean()
+      / (tr.replace(0, np.nan))
+  )
+  minus_di = (
+      100
+      * pd.Series(minus_dm).rolling(14).mean()
+      / (tr.replace(0, np.nan))
+  )
+  dx = (
+      100
+      * np.abs(plus_di - minus_di)
+      / (plus_di + minus_di).replace(0, np.nan)
+  )
+  df['ADX'] = dx.rolling(14).mean()
 
   df['Volume_MA'] = df['Volume'].rolling(20).mean()
   return df
@@ -110,36 +130,17 @@ for symbol, df1h in data_1h.items():
       .dropna()
       .reset_index()
   )
-  df_daily['Daily_EMA30'] = (
-      df_daily['Close'].ewm(span=30, adjust=False).mean().shift(1)
+  df_daily['Daily_EMA50'] = (
+      df_daily['Close'].ewm(span=50, adjust=False).mean().shift(1)
   )
   df1h['Date_Daily'] = df1h['Date'].dt.floor('1d')
 
-  df4h = (
-      df1h.set_index('Date')
-      .resample('4h')
-      .agg({
-          'Open': 'first',
-          'High': 'max',
-          'Low': 'min',
-          'Close': 'last',
-          'Volume': 'sum',
-      })
-      .dropna()
-      .reset_index()
-  )
-  df4h = calculate_indicators(df4h)
-  df4h['EMA30_4H'] = df4h['EMA30'].shift(1)
-  df4h['EMA200_4H'] = df4h['EMA200'].shift(1)
-  df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
-
   processed_data[symbol] = {
       '1h': df1h,
-      '4h': df4h.set_index('Date'),
       'daily': df_daily.set_index('Date'),
   }
 
-print('⚙️ شروع اجرای بک‌تست HUNTER-V18...')
+print('⚙️ شروع اجرای بک‌تست HUNTER-V19 (Institutional Model)...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -147,20 +148,14 @@ for dat in processed_data.values():
 sorted_timestamps = sorted(list(all_timestamps))
 
 active_positions = {}
-global_consecutive_losses = 0
-global_cooldown_timer = 0
 all_trades = []
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
-MAX_CONCURRENT_POSITIONS = 2
+MAX_CONCURRENT_POSITIONS = 3
 
 dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items()}
 
 for ts in sorted_timestamps:
-  # کنترل تایمر قرنطینه جهانی
-  if global_cooldown_timer > 0:
-    global_cooldown_timer -= 1
-
   symbols_to_close = []
   for symbol, pos in active_positions.items():
     if ts not in dfs_1h[symbol].index:
@@ -177,7 +172,7 @@ for ts in sorted_timestamps:
     if pos['side'] == 'LONG':
       hit_sl = c1h['Low'] <= pos['stop_loss']
       hit_tp = c1h['High'] >= pos['take_profit']
-      is_timeout = candles_held >= 20
+      is_timeout = candles_held >= 48  # هولد طولانی‌تر در ترندها
 
       if hit_sl or hit_tp or is_timeout:
         if hit_sl:
@@ -185,7 +180,9 @@ for ts in sorted_timestamps:
           r_real = -1.0 - (FEE_RATE * 2)
         elif hit_tp:
           outcome = 'WIN'
-          r_real = 1.8 - (FEE_RATE * 2)
+          r_real = 3.5 - (
+              FEE_RATE * 2
+          )  # پاداش سنگین ۳.۵ برابری برای جبران وین‌ریت
         else:
           risk = pos['entry_price'] - pos['stop_loss']
           if risk > 0:
@@ -193,16 +190,6 @@ for ts in sorted_timestamps:
           else:
             r_real = 0.0
           outcome = 'WIN' if r_real > 0 else 'LOSS'
-
-        # مدیریت زنجیره جهانی ضرر
-        if outcome == 'LOSS':
-          global_consecutive_losses += 1
-          if global_consecutive_losses >= 3:
-            global_cooldown_timer = (
-                48  # قفل کامل کل ربات به مدت ۴۸ ساعت پس از ۳ ضرر متوالی سبد
-            )
-        else:
-          global_consecutive_losses = 0
 
         all_trades.append({
             'Timestamp': ts,
@@ -216,7 +203,7 @@ for ts in sorted_timestamps:
     elif pos['side'] == 'SHORT':
       hit_sl = c1h['High'] >= pos['stop_loss']
       hit_tp = c1h['Low'] <= pos['take_profit']
-      is_timeout = candles_held >= 20
+      is_timeout = candles_held >= 48
 
       if hit_sl or hit_tp or is_timeout:
         if hit_sl:
@@ -224,7 +211,7 @@ for ts in sorted_timestamps:
           r_real = -1.0 - (FEE_RATE * 2)
         elif hit_tp:
           outcome = 'WIN'
-          r_real = 1.8 - (FEE_RATE * 2)
+          r_real = 3.5 - (FEE_RATE * 2)
         else:
           risk = pos['stop_loss'] - pos['entry_price']
           if risk > 0:
@@ -232,13 +219,6 @@ for ts in sorted_timestamps:
           else:
             r_real = 0.0
           outcome = 'WIN' if r_real > 0 else 'LOSS'
-
-        if outcome == 'LOSS':
-          global_consecutive_losses += 1
-          if global_consecutive_losses >= 3:
-            global_cooldown_timer = 48
-        else:
-          global_consecutive_losses = 0
 
         all_trades.append({
             'Timestamp': ts,
@@ -251,10 +231,6 @@ for ts in sorted_timestamps:
 
   for sym in symbols_to_close:
     del active_positions[sym]
-
-  # اگر ربات در قرنطینه جهانی است، هیچ معامله‌ای باز نکن
-  if global_cooldown_timer > 0:
-    continue
 
   for symbol, dat in processed_data.items():
     if symbol in active_positions:
@@ -276,52 +252,44 @@ for ts in sorted_timestamps:
     c1h = df1h.iloc[i]
     prev = df1h.iloc[i - 1]
 
+    # فیلتر رژیم بازار (ADX باید بالای ۲۲ باشد تا مشخص شود بازار رنج نیست)
+    if pd.isna(prev['ADX']) or prev['ADX'] < 22:
+      continue
+
     daily_time = c1h['Date_Daily']
     df_daily_idx = dat['daily']
     if daily_time not in df_daily_idx.index:
       continue
     macro_bull = prev['Close'] > df_daily_idx.loc[daily_time].get(
-        'Daily_EMA30', prev['Close']
+        'Daily_EMA50', prev['Close']
     )
     macro_bear = prev['Close'] < df_daily_idx.loc[daily_time].get(
-        'Daily_EMA30', prev['Close']
+        'Daily_EMA50', prev['Close']
     )
 
-    t4h_time = c1h['Date_4H']
-    df4h_idx = dat['4h']
-    if t4h_time not in df4h_idx.index:
-      continue
-    r4h = df4h_idx.loc[t4h_time]
-    trend_4h_up = r4h.get('EMA30_4H', 0) > r4h.get('EMA200_4H', 0)
-    trend_4h_down = r4h.get('EMA30_4H', 0) < r4h.get('EMA200_4H', 0)
-
-    # استراتژی امن‌تر با فیلتر دقیق RSI و EMA
-    long_signal = (
+    # استراتژی کانال دونچیان (شکست سقف یا کف ۲۰ کندل گذشته همراه با حجم بالا)
+    breakout_long = (
         macro_bull
-        and trend_4h_up
-        and prev['EMA10'] > prev['EMA30']
-        and 45 <= prev['RSI'] <= 60
-        and prev['Volume'] > (1.2 * prev['Volume_MA'])
-        and prev['Close'] > prev['Open']
+        and prev['Close'] >= prev['Donchian_High']
+        and prev['Volume'] > (1.3 * prev['Volume_MA'])
     )
 
-    short_signal = (
+    breakout_short = (
         macro_bear
-        and trend_4h_down
-        and prev['EMA10'] < prev['EMA30']
-        and 40 <= prev['RSI'] <= 55
-        and prev['Volume'] > (1.2 * prev['Volume_MA'])
-        and prev['Close'] < prev['Open']
+        and prev['Close'] <= prev['Donchian_Low']
+        and prev['Volume'] > (1.3 * prev['Volume_MA'])
     )
 
-    if long_signal:
+    if breakout_long:
       entry_price = c1h['Open'] * (1 + SLIPPAGE)
-      stop_loss = df1h['Low'].iloc[i - 4 : i].min() - 0.1 * prev['ATR']
+      stop_loss = entry_price - (2.0 * prev['ATR'])  # حد ضرر مبتنی بر نوسان ATR
       sl_dist_pct = (entry_price - stop_loss) / entry_price
 
-      if 0.003 <= sl_dist_pct <= 0.025:
+      if 0.005 <= sl_dist_pct <= 0.05:
         risk = entry_price - stop_loss
-        take_profit = entry_price + (1.8 * risk)
+        take_profit = entry_price + (
+            3.5 * risk
+        )  # پاداش ۳.۵ برابری (اصول تریدرهای بزرگ)
         active_positions[symbol] = {
             'side': 'LONG',
             'entry_price': entry_price,
@@ -331,14 +299,14 @@ for ts in sorted_timestamps:
         }
         continue
 
-    elif short_signal:
+    elif breakout_short:
       entry_price = c1h['Open'] * (1 - SLIPPAGE)
-      stop_loss = df1h['High'].iloc[i - 4 : i].max() + 0.1 * prev['ATR']
+      stop_loss = entry_price + (2.0 * prev['ATR'])
       sl_dist_pct = (stop_loss - entry_price) / entry_price
 
-      if 0.003 <= sl_dist_pct <= 0.025:
+      if 0.005 <= sl_dist_pct <= 0.05:
         risk = stop_loss - entry_price
-        take_profit = entry_price - (1.8 * risk)
+        take_profit = entry_price - (3.5 * risk)
         active_positions[symbol] = {
             'side': 'SHORT',
             'entry_price': entry_price,
@@ -349,7 +317,7 @@ for ts in sorted_timestamps:
         continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V18 (Global Circuit Breaker)')
+print('📊 گزارش نهایی HUNTER-V19 (Institutional Model)')
 print('============================================================')
 
 if all_trades:
