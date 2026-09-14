@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V59 (Pure Core + Dynamic Risk Scaling for Streak Mitigation)
+# HUNTER-V60 (Core + Cooldown Mechanism to Break Loss Streaks)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -57,16 +57,20 @@ INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
-# تنظیمات مالی اصلی
+# تنظیمات مالی
 INITIAL_CAPITAL = 1000.0
-BASE_TRADE_MARGIN = 100.0  # مارجین پایه
+TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
+
+# تنظیمات کلید‌ی کوئیداون برای شکستن زنجیره‌ی باخت
+COOLDOWN_CANDLES = 3  # تعداد کندل استراحت پس از باخت متوالی
+CONSECUTIVE_LOSS_TRIGGER = 2  # بعد از چند باخت پشت سر هم قفل شود؟
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V59 (مدیریت ریسک پویا)")
+print("📥 دریافت داده‌ها - HUNTER-V60 (با مکانیسم وقفه هوشمند)")
 print("=" * 60)
 
 processed_data = {}
@@ -156,7 +160,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V59...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V60...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -166,10 +170,14 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     
-    # ردیابی زنجیره باخت جاری برای اعمال ریسک پویا
     current_loss_streak = 0
+    cooldown_counter = 0  # شمارشگر کندل‌های استراحت باقیمانده
     
     for ts in all_timestamps:
+        # کاهش شمارشگر وقفه در هر گام زمانی جدید
+        if cooldown_counter > 0:
+            cooldown_counter -= 1
+            
         symbols_to_close = []
         
         for symbol, pos in list(active_positions.items()):
@@ -201,13 +209,15 @@ def run_backtest(processed_data):
                 
                 outcome = "WIN" if r_real > 0 else "LOSS"
                 
-                # به‌روزرسانی زنجیره باخت برای تعدیل ریسک پوزیشن‌های بعدی
                 if outcome == "WIN":
                     current_loss_streak = 0
                 else:
                     current_loss_streak += 1
+                    # اگر تعداد باخت‌های متوالی به حد نصاب رسید، ربات وارد فاز تنفس می‌شود
+                    if current_loss_streak >= CONSECUTIVE_LOSS_TRIGGER:
+                        cooldown_counter = COOLDOWN_CANDLES
                 
-                position_notional = pos["used_margin"] * LEVERAGE
+                position_notional = TRADE_MARGIN * LEVERAGE
                 price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
                 
@@ -223,6 +233,10 @@ def run_backtest(processed_data):
         
         for sym in symbols_to_close:
             del active_positions[sym]
+        
+        # اگر ربات در حال تنفس (Cooldown) باشد، از ورود جدید جلوگیری می‌شود
+        if cooldown_counter > 0:
+            continue
         
         current_scores = {}
         for symbol, df in processed_data.items():
@@ -272,21 +286,12 @@ def run_backtest(processed_data):
                 sl_dist_pct = initial_risk / entry_price
                 
                 if 0.01 <= sl_dist_pct <= 0.04:
-                    # --- مکانیزم ریسک پویا (Dynamic Risk Scaling) ---
-                    # اگر ربات وارد زنجیره باخت شود (مثلاً ۲ باخت متوالی یا بیشتر)،
-                    # حجم پوزیشن بعدی (مارجین) به صورت خودکار نصف می‌شود تا اثر باخت خنثی شود.
-                    if current_loss_streak >= 2:
-                        current_margin = BASE_TRADE_MARGIN * 0.5  # نصف کردن ریسک در زمان باخت‌های متوالی
-                    else:
-                        current_margin = BASE_TRADE_MARGIN
-                    
                     active_positions[symbol] = {
                         "side": "LONG",
                         "entry_price": entry_price,
                         "stop_loss": initial_sl,
                         "highest_price": entry_price,
                         "initial_risk": initial_risk,
-                        "used_margin": current_margin,
                         "entry_index": i,
                     }
                     
@@ -294,7 +299,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با مدیریت ریسک پویا - HUNTER-V59")
+    print("📊 گزارش نهایی استراتژی با مکانیزم وقفه - HUNTER-V60")
     print("=" * 68)
 
     if trades_df.empty:
@@ -332,7 +337,7 @@ def summarize_result(trades_df):
         loss_sequences.append(temp_loss_seq)
 
     print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
-    print(f"🔸 مارجین پایه: ${BASE_TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
+    print(f"🔸 مارجین: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
     print(f"🔸 تعداد کل معاملات: {trades}")
     print(f"🔸 معاملات برنده (WIN): {wins} | بازنده (LOSS): {losses}")
     print(f"🎯 وین‌ریت کلی (Win Rate): {wr:.2f}%")
@@ -352,4 +357,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V59 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V60 به پایان رسید.")
