@@ -32,7 +32,10 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-V25 - Smart Money Order Block & Sweep)')
+print(
+    '📥 دریافت داده‌ها (HUNTER-V26 - Cross-Sectional Momentum & Volatility'
+    ' Parity)'
+)
 print('============================================================')
 
 processed_data = {}
@@ -70,144 +73,124 @@ for symbol, lbank_symbol in SYMBOLS.items():
   df4h.sort_values('Date', inplace=True)
   df4h.reset_index(drop=True, inplace=True)
 
-  # محاسبه ATR برای مدیریت ریسک ساختاری
+  # محاسبه ATR برای ریسک
   tr1 = df4h['High'] - df4h['Low']
   tr2 = np.abs(df4h['High'] - df4h['Close'].shift(1))
   tr3 = np.abs(df4h['Low'] - df4h['Close'].shift(1))
   df4h['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
-  # جهت بازار روزانه (تایید روند کلان)
-  df4h['Date_Daily'] = df4h['Date'].dt.floor('1d')
-  df_daily = (
-      df4h.set_index('Date')
-      .resample('1d')
-      .agg({
-          'Open': 'first',
-          'High': 'max',
-          'Low': 'min',
-          'Close': 'last',
-          'Volume': 'sum',
-      })
-      .dropna()
-      .reset_index()
-  )
-  df_daily['EMA50'] = df_daily['Close'].ewm(span=50, adjust=False).mean()
+  # محاسبه بازدهی گذشته (Momentum Score 30 دوره‌ای برابر با ۵ روز)
+  df4h['Momentum_Score'] = (df4h['Close'] - df4h['Close'].shift(30)) / df4h[
+      'Close'
+  ].shift(30)
 
-  processed_data[symbol] = {
-      '4h': df4h.set_index('Date'),
-      'daily': df_daily.set_index('Date'),
-  }
+  processed_data[symbol] = df4h.set_index('Date')
 
-print('⚙️ شروع اجرای بک‌تست هوشمند HUNTER-V25...')
+print('⚙️ شروع اجرای بک‌تست کوآنتیتیو HUNTER-V26...')
 
 all_timestamps = set()
-for dat in processed_data.values():
-  all_timestamps.update(dat['4h'].index.tolist())
+for df in processed_data.values():
+  all_timestamps.update(df.index.tolist())
 sorted_timestamps = sorted(list(all_timestamps))
 
 active_positions = {}
 all_trades = []
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
-MAX_CONCURRENT_POSITIONS = 2
-
-dfs_4h = {sym: dat['4h'] for sym, dat in processed_data.items()}
-dfs_daily = {sym: dat['daily'] for sym, dat in processed_data.items()}
+MAX_POSITIONS = 3
 
 for ts in sorted_timestamps:
+  # مدیریت خروج از پوزیشن‌ها
   symbols_to_close = []
   for symbol, pos in active_positions.items():
-    if ts not in dfs_4h[symbol].index:
+    if ts not in processed_data[symbol].index:
       continue
-    c4h = dfs_4h[symbol].loc[ts]
-    df4h_local = dfs_4h[symbol].reset_index()
-    match_rows = df4h_local[df4h_local['Date'] == ts]
+    c4h = processed_data[symbol].loc[ts]
+    df_local = processed_data[symbol].reset_index()
+    match_rows = df_local[df_local['Date'] == ts]
     if match_rows.empty:
       continue
     curr_i = match_rows.index[0]
     candles_held = curr_i - pos['entry_index']
 
-    if pos['side'] == 'LONG':
-      hit_sl = c4h['Low'] <= pos['stop_loss']
-      hit_tp = c4h['High'] >= pos['take_profit']
-      is_timeout = candles_held >= 30
+    hit_sl = c4h['Low'] <= pos['stop_loss']
+    hit_tp = c4h['High'] >= pos['take_profit']
+    is_timeout = candles_held >= 42  # حدود یک هفته نگهداری حداکثری
 
-      if hit_sl or hit_tp or is_timeout:
-        if hit_sl:
-          outcome = 'LOSS'
-          r_real = -1.0 - (FEE_RATE * 2)
-        elif hit_tp:
-          outcome = 'WIN'
-          r_real = 2.5 - (FEE_RATE * 2)  # ریوارد استاندارد ۲.۵ برابری
+    if hit_sl or hit_tp or is_timeout:
+      if hit_sl:
+        outcome = 'LOSS'
+        r_real = -1.0 - (FEE_RATE * 2)
+      elif hit_tp:
+        outcome = 'WIN'
+        r_real = 3.0 - (FEE_RATE * 2)  # ریوارد ۳ برابری سیستماتیک
+      else:
+        risk = pos['entry_price'] - pos['stop_loss']
+        if risk > 0:
+          r_real = (c4h['Close'] - pos['entry_price']) / risk - (FEE_RATE * 2)
         else:
-          risk = pos['entry_price'] - pos['stop_loss']
-          if risk > 0:
-            r_real = (c4h['Close'] - pos['entry_price']) / risk - (FEE_RATE * 2)
-          else:
-            r_real = 0.0
-          outcome = 'WIN' if r_real > 0 else 'LOSS'
+          r_real = 0.0
+        outcome = 'WIN' if r_real > 0 else 'LOSS'
 
-        all_trades.append({
-            'Timestamp': ts,
-            'Symbol': symbol,
-            'Side': 'LONG',
-            'Outcome': outcome,
-            'Return': r_real,
-        })
-        symbols_to_close.append(symbol)
+      all_trades.append({
+          'Timestamp': ts,
+          'Symbol': symbol,
+          'Side': 'LONG',
+          'Outcome': outcome,
+          'Return': r_real,
+      })
+      symbols_to_close.append(symbol)
 
   for sym in symbols_to_close:
     del active_positions[sym]
 
-  for symbol, dat in processed_data.items():
+  # رتبه‌بندی تمام ارزها بر اساس مومنتوم در لحظه (Cross-Sectional Ranking)
+  current_scores = {}
+  for symbol, df in processed_data.items():
+    if ts in df.index:
+      val = df.loc[ts, 'Momentum_Score']
+      if not np.isnan(val):
+        current_scores[symbol] = val
+
+  if not current_scores:
+    continue
+
+  # مرتب‌سازی ارزها از بیشترین مومنتوم به کمترین
+  ranked_symbols = sorted(
+      current_scores.keys(), key=lambda x: current_scores[x], reverse=True
+  )
+
+  # ورود به برترین ارزهای بازار در صورت داشتن فضای خالی
+  for symbol in ranked_symbols:
+    if len(active_positions) >= MAX_POSITIONS:
+      break
     if symbol in active_positions:
       continue
-    if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
-      break
 
-    df4h = dat['4h']
-    if ts not in df4h.index:
+    df = processed_data[symbol]
+    if ts not in df.index:
       continue
 
-    df4h_reset = df4h.reset_index()
-    match_rows = df4h_reset[df4h_reset['Date'] == ts]
+    df_reset = df.reset_index()
+    match_rows = df_reset[df_reset['Date'] == ts]
     if match_rows.empty:
       continue
     i = match_rows.index[0]
-    if i < 20:
+    if i < 35:
       continue
 
-    c4h = df4h.iloc[i]
-    prev4h = df4h.iloc[i - 1]
-    p_prev4h = df4h.iloc[i - 2]
+    c4h = df.iloc[i]
+    score = c4h['Momentum_Score']
 
-    daily_time = pd.Timestamp(ts).floor('1d')
-    df_d = dfs_daily[symbol]
-    if daily_time not in df_d.index:
-      continue
-    d_row = df_d.loc[daily_time]
-
-    # تایید روند صعودی در تایم‌فریم روزانه
-    macro_bull = d_row['Close'] > d_row['EMA50']
-
-    # ستاپ اسمارت مانی (Smart Money Setup):
-    # 1. لیکوییدی سوئپ (کف قبلی زده شده و سریع برگشته بالا)
-    # 2. بلوک سفارشی صعودی (آخرین کندل منفی قبل از پامپ)
-    is_sweep = (
-        prev4h['Low'] < df4h['Low'].iloc[i - 5 : i - 1].min()
-        and prev4h['Close'] > prev4h['Open']
-    )
-    bullish_ob = p_prev4h['Close'] < p_prev4h['Open']  # کندل منفی قبلی
-
-    if macro_bull and is_sweep and bullish_ob:
+    # شرط ورود: مومنتوم مثبت و قوی نسبت به کل بازار
+    if score > 0.05:
       entry_price = c4h['Open'] * (1 + SLIPPAGE)
-      # استاپ لاس پشت کفِ سویپ شده قرار میگیرد تا توسط نهنگ ها هانت نشود
-      stop_loss = prev4h['Low'] - (0.5 * prev4h['ATR'])
+      stop_loss = entry_price - (2.0 * c4h['ATR'])
       sl_dist_pct = (entry_price - stop_loss) / entry_price
 
-      if 0.008 <= sl_dist_pct <= 0.035:
+      if 0.01 <= sl_dist_pct <= 0.05:
         risk = entry_price - stop_loss
-        take_profit = entry_price + (2.5 * risk)
+        take_profit = entry_price + (3.0 * risk)
         active_positions[symbol] = {
             'side': 'LONG',
             'entry_price': entry_price,
@@ -215,10 +198,9 @@ for ts in sorted_timestamps:
             'take_profit': take_profit,
             'entry_index': i,
         }
-        continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V25 (Smart Money Order Block & Sweep)')
+print('📊 گزارش نهایی HUNTER-V26 (Cross-Sectional Momentum)')
 print('============================================================')
 
 if all_trades:
@@ -268,7 +250,7 @@ if all_trades:
   print(f'💰 **مجموع بازدهی خالص کل:** {net_r:.2f}R\n')
 
   print('------------------------------------------------------------')
-  print('📉 **لیست کامل تعداد ضررهای متوالی ثبت‌شده (در تمام دوره‌ها):**')
+  print('📉 **لیست کامل تعداد ضررهای متوالی ثبت‌شده:**')
   print('------------------------------------------------------------')
   if loss_sequences:
     print(', '.join(map(str, loss_sequences)))
