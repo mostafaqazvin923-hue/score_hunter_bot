@@ -14,7 +14,7 @@ import pandas as pd
 
 exchange = ccxt.lbank({'enableRateLimit': True})
 
-# حذف NEAR و ICP - اضافه کردن ATOM و LINK به عنوان جایگزین‌های قوی
+# سبد نهایی و بهینه‌شده (بدون UNI و LINK و سایر ارزهای ضعیف)
 SYMBOLS = {
     'BTC': 'BTC/USDT',
     'ETH': 'ETH/USDT',
@@ -25,9 +25,7 @@ SYMBOLS = {
     'DOGE': 'DOGE/USDT',
     'DOT': 'DOT/USDT',
     'LTC': 'LTC/USDT',
-    'UNI': 'UNI/USDT',
     'RENDER': 'RENDER/USDT',
-    'LINK': 'LINK/USDT',
     'ATOM': 'ATOM/USDT',
 }
 
@@ -35,7 +33,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (حذف NEAR و ICP و اضافه کردن ATOM و LINK)')
+print('📥 دریافت داده‌ها (نسخه V8.1 - اصلاح منطق Timeout و حذف ارزهای ضعیف)')
 print('============================================================')
 
 data_1h = {}
@@ -127,7 +125,7 @@ for symbol, df1h in data_1h.items():
   df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
   processed_data[symbol] = {'1h': df1h, '4h': df4h.set_index('Date')}
 
-print('⚙️ شروع بک‌تست با فیلتر جهت‌دار لیدر بازار (BTC Trend Filter)...')
+print('⚙️ شروع اجرای بک‌تست اصلاح‌شده V8.1...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -144,17 +142,6 @@ dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items(
 dfs_4h = {sym: dat['4h'] for sym, dat in processed_data.items()}
 
 for ts in sorted_timestamps:
-  # بررسی جهت روند بیت‌کوین به عنوان لیدر بازار در این تایم‌فریم
-  btc_allows_long = True
-  btc_allows_short = True
-  if 'BTC' in processed_data:
-    t4h_btc = ts - timedelta(hours=ts.hour % 4, minutes=ts.minute, seconds=ts.second)
-    df4h_btc = processed_data['BTC']['4h']
-    if t4h_btc in df4h_btc.index:
-      btc_row = df4h_btc.loc[t4h_btc]
-      btc_allows_long = btc_row.get('Trend_Long', True)
-      btc_allows_short = btc_row.get('Trend_Short', True)
-
   symbols_to_close = []
   for symbol, pos in active_positions.items():
     if ts not in dfs_1h[symbol].index:
@@ -169,15 +156,26 @@ for ts in sorted_timestamps:
     candles_held = curr_i - entry_index
 
     if pos['side'] == 'LONG':
-      if (
-          candles_held >= 24
-          or c1h['Low'] <= pos['stop_loss']
-          or c1h['High'] >= pos['take_profit']
-      ):
-        outcome = 'LOSS' if c1h['Low'] <= pos['stop_loss'] else 'WIN'
-        r_real = (
-            -1.0 - (FEE_RATE * 2) if outcome == 'LOSS' else 2.0 - (FEE_RATE * 2)
-        )
+      hit_sl = c1h['Low'] <= pos['stop_loss']
+      hit_tp = c1h['High'] >= pos['take_profit']
+      is_timeout = candles_held >= 24
+
+      if hit_sl or hit_tp or is_timeout:
+        if hit_sl:
+          outcome = 'LOSS'
+          r_real = -1.0 - (FEE_RATE * 2)
+        elif hit_tp:
+          outcome = 'WIN'
+          r_real = 2.0 - (FEE_RATE * 2)
+        else:
+          # اصلاح منطق تایم‌اوت بر اساس قیمت کلوز واقعی
+          risk = pos['entry_price'] - pos['stop_loss']
+          if risk > 0:
+            r_real = (c1h['Close'] - pos['entry_price']) / risk - (FEE_RATE * 2)
+          else:
+            r_real = 0.0
+          outcome = 'WIN' if r_real > 0 else 'LOSS'
+
         all_trades.append({
             'Timestamp': ts,
             'Symbol': symbol,
@@ -186,16 +184,28 @@ for ts in sorted_timestamps:
             'Return': r_real,
         })
         symbols_to_close.append(symbol)
+
     elif pos['side'] == 'SHORT':
-      if (
-          candles_held >= 24
-          or c1h['High'] >= pos['stop_loss']
-          or c1h['Low'] <= pos['take_profit']
-      ):
-        outcome = 'LOSS' if c1h['High'] >= pos['stop_loss'] else 'WIN'
-        r_real = (
-            -1.0 - (FEE_RATE * 2) if outcome == 'LOSS' else 2.0 - (FEE_RATE * 2)
-        )
+      hit_sl = c1h['High'] >= pos['stop_loss']
+      hit_tp = c1h['Low'] <= pos['take_profit']
+      is_timeout = candles_held >= 24
+
+      if hit_sl or hit_tp or is_timeout:
+        if hit_sl:
+          outcome = 'LOSS'
+          r_real = -1.0 - (FEE_RATE * 2)
+        elif hit_tp:
+          outcome = 'WIN'
+          r_real = 2.0 - (FEE_RATE * 2)
+        else:
+          # اصلاح منطق تایم‌اوت بر اساس قیمت کلوز واقعی
+          risk = pos['stop_loss'] - pos['entry_price']
+          if risk > 0:
+            r_real = (pos['entry_price'] - c1h['Close']) / risk - (FEE_RATE * 2)
+          else:
+            r_real = 0.0
+          outcome = 'WIN' if r_real > 0 else 'LOSS'
+
         all_trades.append({
             'Timestamp': ts,
             'Symbol': symbol,
@@ -237,8 +247,7 @@ for ts in sorted_timestamps:
     cloud_top_1h = max(prev['Senkou_A'], prev['Senkou_B'])
     cloud_bot_1h = min(prev['Senkou_A'], prev['Senkou_B'])
 
-    # شرط لانگ با تأیید لیدر بازار (BTC)
-    if btc_allows_long and r4h.get('Trend_Long', False) and prev['Close'] > cloud_top_1h:
+    if r4h.get('Trend_Long', False) and prev['Close'] > cloud_top_1h:
       tk_cross_long = (prev['Tenkan'] > prev['Kijun']) and (
           df1h.iloc[i - 2]['Tenkan'] <= df1h.iloc[i - 2]['Kijun']
       )
@@ -261,8 +270,7 @@ for ts in sorted_timestamps:
           }
           continue
 
-    # شرط شورت با تأیید لیدر بازار (BTC)
-    elif btc_allows_short and r4h.get('Trend_Short', False) and prev['Close'] < cloud_bot_1h:
+    elif r4h.get('Trend_Short', False) and prev['Close'] < cloud_bot_1h:
       tk_cross_short = (prev['Tenkan'] < prev['Kijun']) and (
           df1h.iloc[i - 2]['Tenkan'] >= df1h.iloc[i - 2]['Kijun']
       )
@@ -286,7 +294,7 @@ for ts in sorted_timestamps:
           continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی پورتفوی (با فیلتر روند لیدر بازار و حذف NEAR و ICP)')
+print('📊 گزارش نهایی نسخه V8.1 (واقعی، بدون خطای Timeout مصنوعی)')
 print('============================================================')
 
 if all_trades:
