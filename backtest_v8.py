@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V57 (V51 Core + Swing Low Structural Stop Loss)
+# HUNTER-V59 (Pure Core + Dynamic Risk Scaling for Streak Mitigation)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -53,19 +53,20 @@ SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 ATR_PERIOD = 14
 TRAILING_ATR_MULTIPLIER = 2.0
+INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
-# تنظیمات مالی اصلی و تایید شده
+# تنظیمات مالی اصلی
 INITIAL_CAPITAL = 1000.0
-TRADE_MARGIN = 100.0
+BASE_TRADE_MARGIN = 100.0  # مارجین پایه
 LEVERAGE = 80.0
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V57")
+print("📥 دریافت داده‌ها - HUNTER-V59 (مدیریت ریسک پویا)")
 print("=" * 60)
 
 processed_data = {}
@@ -139,9 +140,6 @@ def fetch_symbol_data(lbank_symbol):
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
 
-    # محاسبه کف قیمتی ساختاری (پایین‌ترین Low در ۳ کندل اخیر به عنوان بیس استاپ)
-    df["Swing_Low"] = df["Low"].rolling(3).min()
-
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
@@ -158,7 +156,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V57 (استاپ‌لاس ساختاری)...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V59...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -167,6 +165,9 @@ def run_backtest(processed_data):
     
     active_positions = {}
     all_trades = []
+    
+    # ردیابی زنجیره باخت جاری برای اعمال ریسک پویا
+    current_loss_streak = 0
     
     for ts in all_timestamps:
         symbols_to_close = []
@@ -200,7 +201,13 @@ def run_backtest(processed_data):
                 
                 outcome = "WIN" if r_real > 0 else "LOSS"
                 
-                position_notional = TRADE_MARGIN * LEVERAGE
+                # به‌روزرسانی زنجیره باخت برای تعدیل ریسک پوزیشن‌های بعدی
+                if outcome == "WIN":
+                    current_loss_streak = 0
+                else:
+                    current_loss_streak += 1
+                
+                position_notional = pos["used_margin"] * LEVERAGE
                 price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
                 
@@ -260,19 +267,26 @@ def run_backtest(processed_data):
             
             if valid_trend:
                 entry_price = c4h["Open"] * (1 + SLIPPAGE)
-                # استاپ‌لاس ساختاری: پایین‌ترین نقطه در کندل‌های اخیر به عنوان مرز امنیتی
-                swing_low = c4h["Swing_Low"]
-                initial_sl = min(swing_low, entry_price - 1.5 * c4h["ATR"])
+                initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"]
                 initial_risk = entry_price - initial_sl
                 sl_dist_pct = initial_risk / entry_price
                 
-                if 0.01 <= sl_dist_pct <= 0.05:
+                if 0.01 <= sl_dist_pct <= 0.04:
+                    # --- مکانیزم ریسک پویا (Dynamic Risk Scaling) ---
+                    # اگر ربات وارد زنجیره باخت شود (مثلاً ۲ باخت متوالی یا بیشتر)،
+                    # حجم پوزیشن بعدی (مارجین) به صورت خودکار نصف می‌شود تا اثر باخت خنثی شود.
+                    if current_loss_streak >= 2:
+                        current_margin = BASE_TRADE_MARGIN * 0.5  # نصف کردن ریسک در زمان باخت‌های متوالی
+                    else:
+                        current_margin = BASE_TRADE_MARGIN
+                    
                     active_positions[symbol] = {
                         "side": "LONG",
                         "entry_price": entry_price,
                         "stop_loss": initial_sl,
                         "highest_price": entry_price,
                         "initial_risk": initial_risk,
+                        "used_margin": current_margin,
                         "entry_index": i,
                     }
                     
@@ -280,7 +294,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با استاپ‌لاس ساختاری - HUNTER-V57")
+    print("📊 گزارش نهایی استراتژی با مدیریت ریسک پویا - HUNTER-V59")
     print("=" * 68)
 
     if trades_df.empty:
@@ -318,7 +332,7 @@ def summarize_result(trades_df):
         loss_sequences.append(temp_loss_seq)
 
     print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
-    print(f"🔸 مارجین: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
+    print(f"🔸 مارجین پایه: ${BASE_TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
     print(f"🔸 تعداد کل معاملات: {trades}")
     print(f"🔸 معاملات برنده (WIN): {wins} | بازنده (LOSS): {losses}")
     print(f"🎯 وین‌ریت کلی (Win Rate): {wr:.2f}%")
@@ -338,4 +352,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V57 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V59 به پایان رسید.")
