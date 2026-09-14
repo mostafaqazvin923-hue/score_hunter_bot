@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V42
+# HUNTER-V43
 # Baseline-preserving backtest:
 # منطق سیگنال/ورود/خروج V33 حفظ شده و فقط خطاهای فنی بک‌تست
 # (داده ناقص، کندل ناقص، pagination، index lookup و گزارش DD)
@@ -22,56 +22,42 @@ import pandas as pd
 
 exchange = ccxt.lbank({"enableRateLimit": True})
 
+# کاندیدهای گسترده‌تر؛ بعد از دریافت داده فقط نمادهای واقعاً موجود در LBank
+# و دارای تاریخچه کافی وارد بک‌تست می‌شوند.
 SYMBOLS = {
     "BTC": "BTC/USDT",
     "ETH": "ETH/USDT",
     "SOL": "SOL/USDT",
     "XRP": "XRP/USDT",
     "LINK": "LINK/USDT",
-    "UNI": "UNI/USDT",
-    "ICP": "ICP/USDT",
-    "OP": "OP/USDT",
-    "INJ": "INJ/USDT",
+    "AAVE": "AAVE/USDT",
     "ATOM": "ATOM/USDT",
+    "INJ": "INJ/USDT",
     "RENDER": "RENDER/USDT",
     "XLM": "XLM/USDT",
-    "AAVE": "AAVE/USDT",
-    "WIF": "WIF/USDT",
-    "NEAR": "NEAR/USDT",
-    "TIA": "TIA/USDT",
-    "FET": "FET/USDT",
-    "PENDLE": "PENDLE/USDT",
     "ONDO": "ONDO/USDT",
+    "UNI": "UNI/USDT",
+    "WIF": "WIF/USDT",
+    "HYPE": "HYPE/USDT",
+    "BNB": "BNB/USDT",
+    "ADA": "ADA/USDT",
+    "HBAR": "HBAR/USDT",
+    "DOGE": "DOGE/USDT",
     "SUI": "SUI/USDT",
-}
-
-REMOVED_COINS = {
-    "SEI", "NEAR", "ARB", "SUI", "AVAX", "DOT", "ETC", "SHIB",
-    "STX", "RUNE", "MKR", "APT", "LTC", "FET", "TIA", "AR",
-    "IMX", "PEPE", "BONK", "PENDLE",
-}
-
-SYMBOLS = {k: v for k, v in SYMBOLS.items() if k not in REMOVED_COINS}
-
-# این update عمداً مطابق نسخه مرجع V33 نگه داشته شده است.
-SYMBOLS.update({
-    "BTC": "BTC/USDT",
-    "ETH": "ETH/USDT",
-    "SOL": "SOL/USDT",
-    "XRP": "XRP/USDT",
-    "LINK": "LINK/USDT",
-    "UNI": "UNI/USDT",
+    "AVAX": "AVAX/USDT",
+    "NEAR": "NEAR/USDT",
     "ICP": "ICP/USDT",
     "OP": "OP/USDT",
-    "INJ": "INJ/USDT",
-    "ATOM": "ATOM/USDT",
-    "RENDER": "RENDER/USDT",
-    "XLM": "XLM/USDT",
-    "AAVE": "AAVE/USDT",
-    "WIF": "WIF/USDT",
-    "ONDO": "ONDO/USDT",
-    "NEAR": "NEAR/USDT",
-})
+}
+
+# فقط نمادهایی که در بک‌تست قبلی واقعاً ضعیف بودند حذف اولیه می‌شوند.
+# بقیه ضعیف/قوی بودنشان با فیلترهای rolling تعیین می‌شود.
+INITIAL_BLACKLIST = {"NEAR", "OP"}
+
+SYMBOLS = {
+    k: v for k, v in SYMBOLS.items()
+    if k not in INITIAL_BLACKLIST
+}
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
@@ -84,6 +70,16 @@ INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
+# کنترل ریسک زنجیره‌ای:
+# فقط وقتی وارد می‌شویم که بازار breadth مناسبی داشته باشد.
+MARKET_BREADTH_MIN = 0.30
+BTC_REGIME_REQUIRED = True
+
+# به‌جای حذف دائمی ارزها، فقط وقتی یک نماد در نیمه ضعیف سبد است
+# و مومنتوم آن هم ضعیف شده، از ورودش جلوگیری می‌شود.
+RELATIVE_STRENGTH_LOOKBACK = 30
+RELATIVE_RANK_MIN = 0.50
+
 # ------------------------------------------------------------
 # دریافت مطمئن داده
 # ------------------------------------------------------------
@@ -92,10 +88,23 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V42")
+print("📥 دریافت داده‌ها - HUNTER-V43")
 print("=" * 60)
 
 processed_data = {}
+
+# بازارهای واقعی LBank را یک بار می‌خوانیم تا نماد فرضی وارد بک‌تست نشود.
+try:
+    exchange.load_markets()
+    available_symbols = set(exchange.symbols)
+except Exception as e:
+    print(f"⚠️ load_markets شکست خورد؛ فیلتر بازار غیرفعال شد: {e}")
+    available_symbols = set(SYMBOLS.values())
+
+SYMBOLS = {
+    k: v for k, v in SYMBOLS.items()
+    if v in available_symbols
+}
 
 def fetch_symbol_data(lbank_symbol):
     all_ohlcv = []
@@ -189,6 +198,12 @@ def fetch_symbol_data(lbank_symbol):
         / df["Close"].shift(30)
     )
 
+    # مومنتوم نسبی برای جلوگیری از ورود به ارزهای ضعیف‌تر سبد.
+    df["Mom_30"] = (
+        (df["Close"] - df["Close"].shift(RELATIVE_STRENGTH_LOOKBACK))
+        / df["Close"].shift(RELATIVE_STRENGTH_LOOKBACK)
+    )
+
     # timestampها را یک بار به عنوان index نگه می‌داریم.
     df.set_index("Date", inplace=True)
     return df
@@ -203,7 +218,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         print(f"❌ {symbol}: حذف شد")
 
 print(f"\n✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V42...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V43...")
 
 # ------------------------------------------------------------
 # بک‌تست — منطق اصلی V33 حفظ شده
@@ -285,15 +300,44 @@ for ts in all_timestamps:
     # امتیازدهی و ورود
     # -------------------------
     current_scores = {}
+    bullish_symbols = []
 
     for symbol, df in processed_data.items():
         if ts in df.index:
-            val = df.loc[ts, "Mom_Long"]
-            if not np.isnan(val):
-                current_scores[symbol] = val
+            row = df.loc[ts]
+
+            if not np.isnan(row["Mom_Long"]):
+                current_scores[symbol] = row["Mom_Long"]
+
+            if (
+                row["Close"] > row["EMA20"]
+                and row["EMA20"] > row["EMA50"]
+                and row["Close"] > row["EMA200"]
+                and row["Mom_Long"] > 0.0
+            ):
+                bullish_symbols.append(symbol)
 
     if not current_scores:
         continue
+
+    # فیلتر بازار: در محیط رنج/نزولی از شکار سیگنال‌های منفرد جلوگیری می‌کند.
+    breadth = len(bullish_symbols) / max(len(processed_data), 1)
+
+    if breadth < MARKET_BREADTH_MIN:
+        continue
+
+    if BTC_REGIME_REQUIRED and "BTC" in processed_data:
+        btc_df = processed_data["BTC"]
+        if ts not in btc_df.index:
+            continue
+        btc = btc_df.loc[ts]
+        btc_bull = (
+            btc["Close"] > btc["EMA20"]
+            and btc["EMA20"] > btc["EMA50"]
+            and btc["Close"] > btc["EMA200"]
+        )
+        if not btc_bull:
+            continue
 
     ranked_symbols = sorted(
         current_scores.keys(),
@@ -301,11 +345,18 @@ for ts in all_timestamps:
         reverse=True,
     )
 
+    # فقط نیمه قوی‌تر universe اجازه ورود دارد.
+    strength_cutoff = max(1, int(len(ranked_symbols) * RELATIVE_RANK_MIN))
+    eligible_strength = set(ranked_symbols[:strength_cutoff])
+
     for symbol in ranked_symbols:
         if len(active_positions) >= MAX_POSITIONS:
             break
 
         if symbol in active_positions:
+            continue
+
+        if symbol not in eligible_strength:
             continue
 
         df = processed_data[symbol]
@@ -330,6 +381,7 @@ for ts in all_timestamps:
             regime_bull
             and (c4h["Mom_Short"] > 0.012)
             and (c4h["Mom_Long"] > 0.035)
+            and (c4h["Mom_30"] > 0.0)
         )
 
         if valid_trend:
@@ -359,7 +411,7 @@ for ts in all_timestamps:
 # ------------------------------------------------------------
 
 print("\n" + "=" * 60)
-print("📊 گزارش نهایی HUNTER-V42")
+print("📊 گزارش نهایی HUNTER-V43")
 print("=" * 60)
 
 if not all_trades:
@@ -483,4 +535,4 @@ else:
     summary_df = pd.DataFrame(symbol_summary)
     print(summary_df.to_string(index=False))
 
-print("\n✨ بک‌تست HUNTER-V42 به پایان رسید.")
+print("\n✨ بک‌تست HUNTER-V43 به پایان رسید.")
