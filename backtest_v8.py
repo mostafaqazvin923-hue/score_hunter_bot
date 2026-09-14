@@ -38,7 +38,6 @@ print('============================================================')
 processed_data = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-  # دریافت داده‌های 4 ساعته
   all_ohlcv_4h = []
   current_since = since_timestamp
   now_timestamp = exchange.milliseconds()
@@ -71,7 +70,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
   df4h.sort_values('Date', inplace=True)
   df4h.reset_index(drop=True, inplace=True)
 
-  # اندیکاتورهای 4 ساعته
   tr1 = df4h['High'] - df4h['Low']
   tr2 = np.abs(df4h['High'] - df4h['Close'].shift(1))
   tr3 = np.abs(df4h['Low'] - df4h['Close'].shift(1))
@@ -79,7 +77,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
   df4h['EMA20'] = df4h['Close'].ewm(span=20, adjust=False).mean()
   df4h['Volume_MA'] = df4h['Volume'].rolling(20).mean()
 
-  # ساخت فریم روزانه از روی داده‌های 4 ساعته برای جهت بازار
   df4h['Date_Daily'] = df4h['Date'].dt.floor('1d')
   df_daily = (
       df4h.set_index('Date')
@@ -98,7 +95,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
       df_daily['Close'].ewm(span=50, adjust=False).mean().shift(1)
   )
 
-  # محاسبه ADX روزانه برای تشخیص رژیم روند
   tr_d1 = df_daily['High'] - df_daily['Low']
   tr_d2 = np.abs(df_daily['High'] - df_daily['Close'].shift(1))
   tr_d3 = np.abs(df_daily['Low'] - df_daily['Close'].shift(1))
@@ -151,19 +147,17 @@ for ts in sorted_timestamps:
     if ts not in dfs_4h[symbol].index:
       continue
     c4h = dfs_4h[symbol].loc[ts]
-    entry_index = pos['entry_index']
-    df4h_local = dfs_4h[symbol]
-    match_rows = df4h_local.reset_index()
-    match_rows = match_rows[match_rows['Date'] == ts]
+    df4h_local = dfs_4h[symbol].reset_index()
+    match_rows = df4h_local[df4h_local['Date'] == ts]
     if match_rows.empty:
       continue
     curr_i = match_rows.index[0]
-    candles_held = curr_i - pos['raw_index']
+    candles_held = curr_i - pos['entry_index']
 
     if pos['side'] == 'LONG':
       hit_sl = c4h['Low'] <= pos['stop_loss']
       hit_tp = c4h['High'] >= pos['take_profit']
-      is_timeout = candles_held >= 30  # حداکثر ۵ روز نگهداری در 4H
+      is_timeout = candles_held >= 30
 
       if hit_sl or hit_tp or is_timeout:
         if hit_sl:
@@ -213,7 +207,6 @@ for ts in sorted_timestamps:
     c4h = df4h.iloc[i]
     prev4h = df4h.iloc[i - 1]
 
-    # بررسی جهت بازار در تایم‌فریم روزانه
     daily_time = pd.Timestamp(ts).floor('1d')
     df_d = dfs_daily[symbol]
     if daily_time not in df_d.index:
@@ -224,7 +217,6 @@ for ts in sorted_timestamps:
         'EMA50_Daily', d_row['Close']
     ) and d_row.get('ADX_Daily', 30) > 22
 
-    # ستاپ ورود ۴ ساعته: روند روزانه صعودی + پولبک به EMA20 در ۴ ساعته + تایید حجم
     long_signal = (
         macro_bull
         and prev4h['Low'] <= prev4h['EMA20']
@@ -234,9 +226,7 @@ for ts in sorted_timestamps:
 
     if long_signal:
       entry_price = c4h['Open'] * (1 + SLIPPAGE)
-      stop_loss = (
-          df4h['Low'].iloc[i - 4 : i].min() - 0.2 * prev4h['ATR']
-      )  # کف محلی 4 ساعته
+      stop_loss = df4h['Low'].iloc[i - 4 : i].min() - 0.2 * prev4h['ATR']
       sl_dist_pct = (entry_price - stop_loss) / entry_price
 
       if 0.005 <= sl_dist_pct <= 0.03:
@@ -247,7 +237,7 @@ for ts in sorted_timestamps:
             'entry_price': entry_price,
             'stop_loss': stop_loss,
             'take_profit': take_profit,
-            'raw_index': i,
+            'entry_index': i,
         }
         continue
 
