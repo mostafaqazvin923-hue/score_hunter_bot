@@ -1,619 +1,429 @@
-# backtest_v9.py
-# HUNTER-ICHIMOKU V9
-# 4H = regime/trend | 1H = Kijun Pullback + Reclaim entry
-# RR 1:2 | No lookahead | LBank 1H data
-#
-# Required packages:
-#   pip install ccxt pandas numpy requests
-
 import os
-import time
-import ccxt
+import subprocess
+import sys
+from datetime import datetime, timedelta
+
+try:
+    import ccxt
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
+    import ccxt
+
 import numpy as np
 import pandas as pd
 
-# =========================
-# CONFIG
-# =========================
-SYMBOLS = [
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT",
-    "ADA/USDT", "AVAX/USDT", "DOGE/USDT", "DOT/USDT",
-    "LTC/USDT", "UNI/USDT", "RENDER/USDT", "LINK/USDT",
-    "ATOM/USDT"
-]
+exchange = ccxt.lbank({'enableRateLimit': True})
 
-EXCHANGE_ID = "lbank"
-TIMEFRAME = "1h"
+# سبد ۱۱ ارزی بهینه‌شده
+SYMBOLS = {
+    'BTC': 'BTC/USDT',
+    'ETH': 'ETH/USDT',
+    'SOL': 'SOL/USDT',
+    'XRP': 'XRP/USDT',
+    'ADA': 'ADA/USDT',
+    'AVAX': 'AVAX/USDT',
+    'DOGE': 'DOGE/USDT',
+    'DOT': 'DOT/USDT',
+    'LTC': 'LTC/USDT',
+    'RENDER': 'RENDER/USDT',
+    'ATOM': 'ATOM/USDT',
+}
 
-# 1-year window ending at current UTC time.
-DAYS = 365
-LIMIT = 1000
+start_date = datetime.now() - timedelta(days=365)
+since_timestamp = int(start_date.timestamp() * 1000)
 
-# Ichimoku standard settings
-TENKAN = 9
-KIJUN = 26
-SENKOU_B = 52
-DISPLACEMENT = 26
+print('============================================================')
+print(
+    '📥 دریافت داده‌ها (HUNTER-ICHIMOKU V9 - استراتژی Kijun Pullback و Reclaim)'
+)
+print('============================================================')
 
-# Entry / risk
-RR = 2.0
-SL_BUFFER_ATR = 0.20
-MIN_SL_PCT = 0.003       # 0.30%
-MAX_SL_PCT = 0.040       # 4.00%
-PULLBACK_LOOKBACK = 8
-SWING_LOOKBACK = 8
+data_1h = {}
 
-# ATR
-ATR_PERIOD = 14
+for symbol, lbank_symbol in SYMBOLS.items():
+  all_ohlcv = []
+  current_since = since_timestamp
+  now_timestamp = exchange.milliseconds()
 
-# Execution costs
-FEE_RATE = 0.0007        # per side
-SLIPPAGE = 0.0003        # 0.03%
+  while current_since < now_timestamp:
+    try:
+      ohlcv = exchange.fetch_ohlcv(
+          lbank_symbol, timeframe='1h', since=current_since, limit=1000
+      )
+      if not ohlcv:
+        break
+      current_since = ohlcv[-1][0] + 1
+      all_ohlcv.extend(ohlcv)
+      if len(ohlcv) < 1000:
+        break
+    except Exception:
+      break
 
-# Maximum concurrent positions
-MAX_POSITIONS = 3
-
-# Maximum holding period in 1H candles
-MAX_HOLD = 24
-
-
-# =========================
-# INDICATORS
-# =========================
-def ichimoku(df):
-    high = df["high"]
-    low = df["low"]
-
-    tenkan = (
-        high.rolling(TENKAN).max() +
-        low.rolling(TENKAN).min()
-    ) / 2
-
-    kijun = (
-        high.rolling(KIJUN).max() +
-        low.rolling(KIJUN).min()
-    ) / 2
-
-    span_a_raw = (tenkan + kijun) / 2
-    span_b_raw = (
-        high.rolling(SENKOU_B).max() +
-        low.rolling(SENKOU_B).min()
-    ) / 2
-
-    # IMPORTANT:
-    # For a decision at candle t, the cloud value that is
-    # visible at t is the value calculated 26 candles earlier.
-    span_a_visible = span_a_raw.shift(DISPLACEMENT)
-    span_b_visible = span_b_raw.shift(DISPLACEMENT)
-
-    out = df.copy()
-    out["tenkan"] = tenkan
-    out["kijun"] = kijun
-    out["span_a"] = span_a_visible
-    out["span_b"] = span_b_visible
-    out["cloud_top"] = out[["span_a", "span_b"]].max(axis=1)
-    out["cloud_bottom"] = out[["span_a", "span_b"]].min(axis=1)
-
-    # Chikou confirmation without looking into the future:
-    # current close versus close 26 candles ago.
-    out["chikou_long"] = out["close"] > out["close"].shift(DISPLACEMENT)
-    out["chikou_short"] = out["close"] < out["close"].shift(DISPLACEMENT)
-
-    return out
-
-
-def add_atr(df):
-    out = df.copy()
-    prev_close = out["close"].shift(1)
-
-    tr = pd.concat([
-        out["high"] - out["low"],
-        (out["high"] - prev_close).abs(),
-        (out["low"] - prev_close).abs()
-    ], axis=1).max(axis=1)
-
-    out["atr"] = tr.rolling(ATR_PERIOD).mean()
-    return out
-
-
-# =========================
-# DATA
-# =========================
-def fetch_ohlcv(exchange, symbol, since_ms, until_ms):
-    rows = []
-    cursor = since_ms
-
-    while cursor < until_ms:
-        batch = exchange.fetch_ohlcv(
-            symbol,
-            timeframe=TIMEFRAME,
-            since=cursor,
-            limit=LIMIT
-        )
-
-        if not batch:
-            break
-
-        rows.extend(batch)
-        last_ts = batch[-1][0]
-
-        if last_ts <= cursor:
-            break
-
-        cursor = last_ts + 60 * 60 * 1000
-
-        if len(batch) < LIMIT:
-            break
-
-        time.sleep(exchange.rateLimit / 1000)
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(
-        rows,
-        columns=["timestamp", "open", "high", "low", "close", "volume"]
+  if all_ohlcv:
+    df1h = pd.DataFrame(
+        all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
     )
-
-    df = df.drop_duplicates("timestamp").sort_values("timestamp")
-    df = df[
-        (df["timestamp"] >= since_ms) &
-        (df["timestamp"] <= until_ms)
-    ].copy()
-
-    df["datetime"] = pd.to_datetime(
-        df["timestamp"], unit="ms", utc=True
-    )
-
-    return df.reset_index(drop=True)
+    df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
+    df1h = df1h[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+    df1h.dropna(inplace=True)
+    df1h.drop_duplicates(subset=['Date'], inplace=True)
+    df1h.sort_values('Date', inplace=True)
+    df1h.reset_index(drop=True, inplace=True)
+    data_1h[symbol] = df1h
 
 
-# =========================
-# 4H REGIME
-# =========================
-def build_4h(df1h):
-    x = df1h.set_index("datetime")[["open", "high", "low", "close", "volume"]]
+def calculate_ichimoku(df):
+  df = df.copy()
+  period9_high = df['High'].rolling(window=9).max()
+  period9_low = df['Low'].rolling(window=9).min()
+  df['Tenkan'] = (period9_high + period9_low) / 2
 
-    df4 = x.resample("4h", label="right", closed="right").agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum"
-    }).dropna()
+  period26_high = df['High'].rolling(window=26).max()
+  period26_low = df['Low'].rolling(window=26).min()
+  df['Kijun'] = (period26_high + period26_low) / 2
 
-    df4 = ichimoku(df4.reset_index())
-    df4 = add_atr(df4)
+  df['Senkou_A'] = ((df['Tenkan'] + df['Kijun']) / 2).shift(26)
 
-    return df4
+  period52_high = df['High'].rolling(window=52).max()
+  period52_low = df['Low'].rolling(window=52).min()
+  df['Senkou_B'] = ((period52_high + period52_low) / 2).shift(26)
 
+  # ATR برای مدیریت ریسک
+  tr1 = df['High'] - df['Low']
+  tr2 = np.abs(df['High'] - df['Close'].shift(1))
+  tr3 = np.abs(df['Low'] - df['Close'].shift(1))
+  df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
-def map_4h_to_1h(df1h, df4):
-    a = df1h.copy()
-    b = df4.copy()
-
-    # Only CLOSED 4H candles can influence the following 1H candle.
-    b["regime_time"] = b["datetime"]
-
-    a = pd.merge_asof(
-        a.sort_values("datetime"),
-        b[[
-            "regime_time",
-            "close",
-            "tenkan",
-            "kijun",
-            "cloud_top",
-            "cloud_bottom",
-            "chikou_long",
-            "chikou_short"
-        ]].rename(columns={
-            "close": "h4_close",
-            "tenkan": "h4_tenkan",
-            "kijun": "h4_kijun",
-            "cloud_top": "h4_cloud_top",
-            "cloud_bottom": "h4_cloud_bottom",
-            "chikou_long": "h4_chikou_long",
-            "chikou_short": "h4_chikou_short"
-        }),
-        left_on="datetime",
-        right_on="regime_time",
-        direction="backward"
-    )
-
-    return a
+  return df
 
 
-# =========================
-# SIGNAL
-# =========================
-def add_signals(df):
-    x = df.copy()
+processed_data = {}
+for symbol, df1h in data_1h.items():
+  if len(df1h) < 100:
+    continue
+  df1h = calculate_ichimoku(df1h)
 
-    # 4H bullish regime
-    x["regime_long"] = (
-        (x["h4_close"] > x["h4_cloud_top"]) &
-        (x["h4_tenkan"] > x["h4_kijun"]) &
-        (x["h4_kijun"] >= x["h4_kijun"].shift(1)) &
-        (x["h4_chikou_long"])
-    )
+  # ساخت فریم 4 ساعته
+  df4h = (
+      df1h.set_index('Date')
+      .resample('4h')
+      .agg({
+          'Open': 'first',
+          'High': 'max',
+          'Low': 'min',
+          'Close': 'last',
+          'Volume': 'sum',
+      })
+      .dropna()
+      .reset_index()
+  )
+  df4h = calculate_ichimoku(df4h)
+  df4h['Cloud_Top'] = df4h[['Senkou_A', 'Senkou_B']].max(axis=1)
+  df4h['Cloud_Bottom'] = df4h[['Senkou_A', 'Senkou_B']].min(axis=1)
 
-    # 4H bearish regime
-    x["regime_short"] = (
-        (x["h4_close"] < x["h4_cloud_bottom"]) &
-        (x["h4_tenkan"] < x["h4_kijun"]) &
-        (x["h4_kijun"] <= x["h4_kijun"].shift(1)) &
-        (x["h4_chikou_short"])
-    )
+  # رژیم روند 4 ساعته
+  df4h['Trend_Long'] = (
+      (df4h['Close'] > df4h['Cloud_Top'])
+      & (df4h['Tenkan'] > df4h['Kijun'])
+      & (df4h['Kijun'] >= df4h['Kijun'].shift(1))
+  )
+  df4h['Trend_Short'] = (
+      (df4h['Close'] < df4h['Cloud_Bottom'])
+      & (df4h['Tenkan'] < df4h['Kijun'])
+      & (df4h['Kijun'] <= df4h['Kijun'].shift(1))
+  )
 
-    # 1H trend position
-    x["above_cloud"] = x["close"] > x["cloud_top"]
-    x["below_cloud"] = x["close"] < x["cloud_bottom"]
+  for col in [
+      'Trend_Long',
+      'Trend_Short',
+      'Cloud_Top',
+      'Cloud_Bottom',
+      'Tenkan',
+      'Kijun',
+  ]:
+    df4h[col] = df4h[col].shift(1)  # جلوگیری از Lookahead
 
-    # Price has recently touched / approached Kijun.
-    # ATR-normalized distance avoids a fixed percentage threshold.
-    x["near_kijun"] = (
-        ((x["low"] <= x["kijun"] + 0.25 * x["atr"]) &
-         (x["high"] >= x["kijun"] - 0.25 * x["atr"]))
-        .rolling(PULLBACK_LOOKBACK)
-        .max()
-        .astype(bool)
-    )
+  df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
+  processed_data[symbol] = {'1h': df1h, '4h': df4h.set_index('Date')}
 
-    # Reclaim candle:
-    # previous candle was at/below Kijun, current candle closes above it.
-    x["long_reclaim"] = (
-        (x["close"] > x["kijun"]) &
-        (x["close"].shift(1) <= x["kijun"].shift(1)) &
-        (x["close"] > x["open"])
-    )
+print('⚙️ شروع اجرای بک‌تست HUNTER-ICHIMOKU V9...')
 
-    x["short_reclaim"] = (
-        (x["close"] < x["kijun"]) &
-        (x["close"].shift(1) >= x["kijun"].shift(1)) &
-        (x["close"] < x["open"])
-    )
+all_timestamps = set()
+for dat in processed_data.values():
+  all_timestamps.update(dat['1h']['Date'].tolist())
+sorted_timestamps = sorted(list(all_timestamps))
 
-    # Tenkan confirmation on the actual entry candle.
-    x["tenkan_long"] = x["tenkan"] > x["kijun"]
-    x["tenkan_short"] = x["tenkan"] < x["kijun"]
+active_positions = {}
+all_trades = []
+SLIPPAGE = 0.0003
+FEE_RATE = 0.0007
+MAX_CONCURRENT_POSITIONS = 3
 
-    # Displacement/strength: body must be meaningful relative to ATR.
-    body = (x["close"] - x["open"]).abs()
-    x["strong_long"] = (
-        (x["close"] > x["open"]) &
-        (body >= 0.30 * x["atr"])
-    )
-    x["strong_short"] = (
-        (x["close"] < x["open"]) &
-        (body >= 0.30 * x["atr"])
-    )
+dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items()}
+dfs_4h = {sym: dat['4h'] for sym, dat in processed_data.items()}
 
-    # Final signals are evaluated ONLY after the signal candle closes.
-    x["long_signal"] = (
-        x["regime_long"] &
-        x["above_cloud"] &
-        x["near_kijun"] &
-        x["long_reclaim"] &
-        x["tenkan_long"] &
-        x["strong_long"]
-    )
+for ts in sorted_timestamps:
+  symbols_to_close = []
+  for symbol, pos in active_positions.items():
+    if ts not in dfs_1h[symbol].index:
+      continue
+    c1h = dfs_1h[symbol].loc[ts]
+    entry_index = pos['entry_index']
+    df1h_local = processed_data[symbol]['1h']
+    match_rows = df1h_local[df1h_local['Date'] == ts]
+    if match_rows.empty:
+      continue
+    curr_i = match_rows.index[0]
+    candles_held = curr_i - entry_index
 
-    x["short_signal"] = (
-        x["regime_short"] &
-        x["below_cloud"] &
-        x["near_kijun"] &
-        x["short_reclaim"] &
-        x["tenkan_short"] &
-        x["strong_short"]
-    )
+    if pos['side'] == 'LONG':
+      hit_sl = c1h['Low'] <= pos['stop_loss']
+      hit_tp = c1h['High'] >= pos['take_profit']
+      is_timeout = candles_held >= 24
 
-    return x
-
-
-# =========================
-# BACKTEST
-# =========================
-def simulate_trade(df, i, side):
-    # Entry at NEXT candle open: no lookahead.
-    if i + 1 >= len(df):
-        return None
-
-    signal = df.iloc[i]
-    entry_candle = df.iloc[i + 1]
-
-    entry = float(entry_candle["open"])
-
-    if side == "LONG":
-        entry *= (1 + SLIPPAGE)
-
-        recent_low = df.iloc[max(0, i - SWING_LOOKBACK + 1):i + 1]["low"].min()
-        sl = min(
-            recent_low,
-            float(signal["kijun"]) - SL_BUFFER_ATR * float(signal["atr"])
-        )
-
-        risk = entry - sl
-
-        if risk <= 0:
-            return None
-
-        sl_pct = risk / entry
-        if not (MIN_SL_PCT <= sl_pct <= MAX_SL_PCT):
-            return None
-
-        tp = entry + RR * risk
-
-    else:
-        entry *= (1 - SLIPPAGE)
-
-        recent_high = df.iloc[max(0, i - SWING_LOOKBACK + 1):i + 1]["high"].max()
-        sl = max(
-            recent_high,
-            float(signal["kijun"]) + SL_BUFFER_ATR * float(signal["atr"])
-        )
-
-        risk = sl - entry
-
-        if risk <= 0:
-            return None
-
-        sl_pct = risk / entry
-        if not (MIN_SL_PCT <= sl_pct <= MAX_SL_PCT):
-            return None
-
-        tp = entry - RR * risk
-
-    fee_r = (2 * FEE_RATE) / sl_pct
-
-    end = min(len(df), i + 1 + MAX_HOLD)
-
-    result = "TIMEOUT"
-    exit_price = float(df.iloc[end - 1]["close"])
-    exit_index = end - 1
-
-    for j in range(i + 1, end):
-        c = df.iloc[j]
-
-        if side == "LONG":
-            hit_sl = c["low"] <= sl
-            hit_tp = c["high"] >= tp
-        else:
-            hit_sl = c["high"] >= sl
-            hit_tp = c["low"] <= tp
-
-        # Conservative: if both are hit in one candle, count LOSS.
-        if hit_sl and hit_tp:
-            result = "LOSS"
-            exit_price = sl
-            exit_index = j
-            break
-        elif hit_sl:
-            result = "LOSS"
-            exit_price = sl
-            exit_index = j
-            break
+      if hit_sl or hit_tp or is_timeout:
+        if hit_sl:
+          outcome = 'LOSS'
+          r_real = -1.0 - (FEE_RATE * 2)
         elif hit_tp:
-            result = "WIN"
-            exit_price = tp
-            exit_index = j
-            break
-
-    if result == "WIN":
-        gross_r = RR
-    elif result == "LOSS":
-        gross_r = -1.0
-    else:
-        if side == "LONG":
-            gross_r = (exit_price - entry) / risk
+          outcome = 'WIN'
+          r_real = 2.0 - (FEE_RATE * 2)
         else:
-            gross_r = (entry - exit_price) / risk
+          risk = pos['entry_price'] - pos['stop_loss']
+          if risk > 0:
+            r_real = (c1h['Close'] - pos['entry_price']) / risk - (FEE_RATE * 2)
+          else:
+            r_real = 0.0
+          outcome = 'WIN' if r_real > 0 else 'LOSS'
 
-    net_r = gross_r - fee_r
+        all_trades.append({
+            'Timestamp': ts,
+            'Symbol': symbol,
+            'Side': 'LONG',
+            'Outcome': outcome,
+            'Return': r_real,
+        })
+        symbols_to_close.append(symbol)
 
-    return {
-        "side": side,
-        "signal_time": signal["datetime"],
-        "entry_time": entry_candle["datetime"],
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "result": result,
-        "gross_r": gross_r,
-        "net_r": net_r,
-        "hold": exit_index - i,
-        "exit_time": df.iloc[exit_index]["datetime"],
-        "exit_price": exit_price
-    }
+    elif pos['side'] == 'SHORT':
+      hit_sl = c1h['High'] >= pos['stop_loss']
+      hit_tp = c1h['Low'] <= pos['take_profit']
+      is_timeout = candles_held >= 24
 
+      if hit_sl or hit_tp or is_timeout:
+        if hit_sl:
+          outcome = 'LOSS'
+          r_real = -1.0 - (FEE_RATE * 2)
+        elif hit_tp:
+          outcome = 'WIN'
+          r_real = 2.0 - (FEE_RATE * 2)
+        else:
+          risk = pos['stop_loss'] - pos['entry_price']
+          if risk > 0:
+            r_real = (pos['entry_price'] - c1h['Close']) / risk - (FEE_RATE * 2)
+          else:
+            r_real = 0.0
+          outcome = 'WIN' if r_real > 0 else 'LOSS'
 
-def backtest_symbol(df):
-    df = df.copy()
-    df = ichimoku(df)
-    df = add_atr(df)
+        all_trades.append({
+            'Timestamp': ts,
+            'Symbol': symbol,
+            'Side': 'SHORT',
+            'Outcome': outcome,
+            'Return': r_real,
+        })
+        symbols_to_close.append(symbol)
 
-    # Need enough history for 4H + Ichimoku.
-    df4 = build_4h(df)
-    df = map_4h_to_1h(df, df4)
-    df = add_signals(df)
+  for sym in symbols_to_close:
+    del active_positions[sym]
 
-    trades = []
-    active_until = -1
+  for symbol, dat in processed_data.items():
+    if symbol in active_positions:
+      continue
+    if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
+      break
 
-    for i in range(len(df) - MAX_HOLD - 1):
-        if i <= active_until:
-            continue
+    df1h = dat['1h']
+    if ts not in df1h['Date'].values:
+      continue
 
-        side = None
+    match_rows = df1h[df1h['Date'] == ts]
+    if match_rows.empty:
+      continue
+    i = match_rows.index[0]
+    if i < 30:  # نیاز به تاریخچه برای بررسی چیکوسپان و سویچ
+      continue
 
-        if bool(df.iloc[i]["long_signal"]):
-            side = "LONG"
-        elif bool(df.iloc[i]["short_signal"]):
-            side = "SHORT"
+    c1h = df1h.iloc[i]
+    prev = df1h.iloc[i - 1]
+    t4h_time = c1h['Date_4H']
+    df4h_idx = dat['4h']
 
-        if side is None:
-            continue
+    if t4h_time not in df4h_idx.index:
+      continue
+    r4h = df4h_idx.loc[t4h_time]
 
-        trade = simulate_trade(df, i, side)
+    cloud_top_1h = max(prev['Senkou_A'], prev['Senkou_B'])
+    cloud_bot_1h = min(prev['Senkou_A'], prev['Senkou_B'])
 
-        if trade is None:
-            continue
+    # بررسی امن چیکوسپان (مقایسه با ۲۶ کندل قبل بدون Lookahead)
+    chikou_long = prev['Close'] > df1h.iloc[i - 27]['Close']
+    chikou_short = prev['Close'] < df1h.iloc[i - 27]['Close']
 
-        trades.append(trade)
-        active_until = i + trade["hold"]
+    # منطق ورود LONG: روند 4H صعودی + پولبک به کیجون در 1H + ریکلیم صعودی
+    if (
+        r4h.get('Trend_Long', False)
+        and prev['Close'] > cloud_top_1h
+        and chikou_long
+    ):
+      # بررسی پولبک در چند کندل گذشته به کیجون
+      recent_lows = df1h['Low'].iloc[i - 5 : i]
+      recent_kijun = df1h['Kijun'].iloc[i - 5 : i]
+      touched_kijun = any(recent_lows <= recent_kijun * 1.003)
 
-    return trades
+      # تریگر Reclaim: کندل قبلی یا فعلی از کیجون رد شده و تنکان بالای کیجون است
+      reclaim = (prev['Low'] <= prev['Kijun']) and (
+          prev['Close'] > prev['Kijun']
+      )
+      tenkan_cond = prev['Tenkan'] > prev['Kijun']
 
+      if touched_kijun and reclaim and tenkan_cond:
+        entry_price = c1h['Open'] * (1 + SLIPPAGE)
+        # استاپ لاس پشت سوینگ پایین اخیر یا لبه ابر
+        swing_low = df1h['Low'].iloc[i - 5 : i].min()
+        stop_loss = min(swing_low, cloud_bot_1h) - 0.2 * prev['ATR']
+        sl_dist_pct = (entry_price - stop_loss) / entry_price
 
-# =========================
-# REPORT
-# =========================
-def print_summary(all_trades):
-    if not all_trades:
-        print("\nNo trades.")
-        return
+        if 0.003 <= sl_dist_pct <= 0.04:
+          risk = entry_price - stop_loss
+          take_profit = entry_price + (2.0 * risk)
+          active_positions[symbol] = {
+              'side': 'LONG',
+              'entry_price': entry_price,
+              'stop_loss': stop_loss,
+              'take_profit': take_profit,
+              'entry_index': i,
+          }
+          continue
 
-    t = pd.DataFrame(all_trades)
+    # منطق ورود SHORT: روند 4H نزولی + پولبک به کیجون در 1H + ریکلیم نزولی
+    elif (
+        r4h.get('Trend_Short', False)
+        and prev['Close'] < cloud_bot_1h
+        and chikou_short
+    ):
+      recent_highs = df1h['High'].iloc[i - 5 : i]
+      recent_kijun = df1h['Kijun'].iloc[i - 5 : i]
+      touched_kijun = any(recent_highs >= recent_kijun * 0.997)
 
-    total = len(t)
-    wins = int((t["result"] == "WIN").sum())
-    losses = int((t["result"] == "LOSS").sum())
-    timeouts = int((t["result"] == "TIMEOUT").sum())
+      reclaim = (prev['High'] >= prev['Kijun']) and (
+          prev['Close'] < prev['Kijun']
+      )
+      tenkan_cond = prev['Tenkan'] < prev['Kijun']
 
-    wr_ex_timeout = (
-        wins / (wins + losses) * 100
-        if wins + losses else 0
-    )
+      if touched_kijun and reclaim and tenkan_cond:
+        entry_price = c1h['Open'] * (1 - SLIPPAGE)
+        swing_high = df1h['High'].iloc[i - 5 : i].max()
+        stop_loss = max(swing_high, cloud_top_1h) + 0.2 * prev['ATR']
+        sl_dist_pct = (stop_loss - entry_price) / entry_price
 
-    net_r = t["net_r"].sum()
-    avg_r = t["net_r"].mean()
+        if 0.003 <= sl_dist_pct <= 0.04:
+          risk = stop_loss - entry_price
+          take_profit = entry_price - (2.0 * risk)
+          active_positions[symbol] = {
+              'side': 'SHORT',
+              'entry_price': entry_price,
+              'stop_loss': stop_loss,
+              'take_profit': take_profit,
+              'entry_index': i,
+          }
+          continue
 
-    gross_profit = t.loc[t["net_r"] > 0, "net_r"].sum()
-    gross_loss = -t.loc[t["net_r"] < 0, "net_r"].sum()
-    pf = gross_profit / gross_loss if gross_loss > 0 else np.inf
+print('\n============================================================')
+print('📊 گزارش نهایی HUNTER-ICHIMOKU V9')
+print('============================================================')
 
-    equity = t["net_r"].cumsum()
-    peak = equity.cummax()
-    dd = equity - peak
-    max_dd = dd.min()
+if all_trades:
+  trades_df = pd.DataFrame(all_trades)
+  trades_df.sort_values('Timestamp', inplace=True)
 
-    print("\n" + "=" * 55)
-    print("HUNTER-ICHIMOKU V9 — CLEAN BACKTEST")
-    print("=" * 55)
-    print(f"Trades              : {total}")
-    print(f"Wins                : {wins}")
-    print(f"Losses              : {losses}")
-    print(f"Timeouts            : {timeouts}")
-    print(f"WR (W/L only)       : {wr_ex_timeout:.2f}%")
-    print(f"Net R               : {net_r:.2f}R")
-    print(f"Avg R / trade       : {avg_r:.4f}R")
-    print(f"Profit Factor       : {pf:.3f}")
-    print(f"Max Drawdown        : {max_dd:.2f}R")
-    print("=" * 55)
+  tot_trades = len(trades_df)
+  tot_wins = len(trades_df[trades_df['Outcome'] == 'WIN'])
+  tot_losses = len(trades_df[trades_df['Outcome'] == 'LOSS'])
+  win_rate = (tot_wins / tot_trades) * 100 if tot_trades > 0 else 0
+  net_r = trades_df['Return'].sum()
 
-    print("\nExit reasons:")
-    print(t["result"].value_counts().to_string())
+  outcomes = trades_df['Outcome'].tolist()
+  max_wins = 0
+  max_losses = 0
+  curr_wins = 0
+  curr_losses = 0
 
-    print("\nBy side:")
-    for side in ["LONG", "SHORT"]:
-        s = t[t["side"] == side]
-        if len(s):
-            w = (s["result"] == "WIN").sum()
-            l = (s["result"] == "LOSS").sum()
-            wr = w / (w + l) * 100 if w + l else 0
-            print(
-                f"{side:5s} | trades={len(s):4d} | "
-                f"W={w:3d} L={l:3d} | WR={wr:6.2f}% | "
-                f"Net={s['net_r'].sum():8.2f}R"
-            )
+  loss_sequences = []
+  temp_loss_seq = 0
 
-    print("\nBy symbol:")
-    if "symbol" in t.columns:
-        for symbol, s in t.groupby("symbol"):
-            w = (s["result"] == "WIN").sum()
-            l = (s["result"] == "LOSS").sum()
-            wr = w / (w + l) * 100 if w + l else 0
-            print(
-                f"{symbol:12s} | {len(s):4d} | "
-                f"WR={wr:6.2f}% | Net={s['net_r'].sum():8.2f}R"
-            )
+  for out in outcomes:
+    if out == 'WIN':
+      curr_wins += 1
+      curr_losses = 0
+      if curr_wins > max_wins:
+        max_wins = curr_wins
+      if temp_loss_seq > 0:
+        loss_sequences.append(temp_loss_seq)
+        temp_loss_seq = 0
+    else:
+      curr_losses += 1
+      curr_wins = 0
+      temp_loss_seq += 1
+      if curr_losses > max_losses:
+        max_losses = curr_losses
 
+  if temp_loss_seq > 0:
+    loss_sequences.append(temp_loss_seq)
 
-# =========================
-# MAIN
-# =========================
-def main():
-    exchange_class = getattr(ccxt, EXCHANGE_ID)
-    exchange = exchange_class({
-        "enableRateLimit": True,
-        "options": {"defaultType": "swap"},
+  print(f'🔸 تعداد کل معاملات سبد: {tot_trades}')
+  print(f'🔸 معاملات برنده (WIN): {tot_wins}')
+  print(f'🔸 معاملات بازنده (LOSS): {tot_losses}')
+  print(f'🔥 **حداکثر سودهای متوالی:** {max_wins}')
+  print(f'❄️ **حداکثر ضررهای متوالی:** {max_losses}')
+  print(f'🎯 **وین‌ریت تجمیعی پورتفوی:** {win_rate:.2f}%')
+  print(f'💰 **مجموع بازدهی خالص کل:** {net_r:.2f}R\n')
+
+  print('------------------------------------------------------------')
+  print('📉 **لیست کامل تعداد ضررهای متوالی ثبت‌شده:**')
+  print('------------------------------------------------------------')
+  if loss_sequences:
+    print(', '.join(map(str, loss_sequences)))
+  else:
+    print('هیچ زنجیره ضرری ثبت نشد.')
+  print('\n------------------------------------------------------------')
+  print('📈 **گزارش تفکیک‌شده به تفکیک هر ارز:**')
+  print('------------------------------------------------------------')
+
+  symbol_summary = []
+  for sym in SYMBOLS.keys():
+    sym_trades = trades_df[trades_df['Symbol'] == sym]
+    s_tot = len(sym_trades)
+    if s_tot > 0:
+      s_wins = len(sym_trades[sym_trades['Outcome'] == 'WIN'])
+      s_loss = len(sym_trades[sym_trades['Outcome'] == 'LOSS'])
+      s_wr = (s_wins / s_tot) * 100
+      s_net_r = sym_trades['Return'].sum()
+    else:
+      s_wins, s_loss, s_wr, s_net_r = 0, 0, 0.0, 0.0
+
+    symbol_summary.append({
+        'Symbol': sym,
+        'Trades': s_tot,
+        'Wins': s_wins,
+        'Losses': s_loss,
+        'WinRate(%)': round(s_wr, 2),
+        'Net_R': round(s_net_r, 2),
     })
 
-    now_ms = exchange.milliseconds()
-    since_ms = now_ms - DAYS * 24 * 60 * 60 * 1000
+  summary_df = pd.DataFrame(symbol_summary)
+  print(summary_df.to_string(index=False))
+else:
+  print('⚠️ معامله‌ای ثبت نشد.')
 
-    all_trades = []
-
-    for symbol in SYMBOLS:
-        print(f"\nDownloading {symbol} ...")
-
-        try:
-            df = fetch_ohlcv(
-                exchange,
-                symbol,
-                since_ms,
-                now_ms
-            )
-
-            print(f"  Candles: {len(df)}")
-
-            if len(df) < 3000:
-                print("  Skipped: insufficient data.")
-                continue
-
-            trades = backtest_symbol(df)
-
-            for tr in trades:
-                tr["symbol"] = symbol
-
-            all_trades.extend(trades)
-
-            print(f"  Trades: {len(trades)}")
-
-        except Exception as e:
-            print(f"  ERROR: {type(e).__name__}: {e}")
-
-    if not all_trades:
-        print("\nNo trades generated.")
-        return
-
-    # Sort chronologically so portfolio statistics are valid.
-    all_trades = sorted(
-        all_trades,
-        key=lambda x: x["entry_time"]
-    )
-
-    # Global max concurrent position cap.
-    accepted = []
-    active = []
-
-    for tr in all_trades:
-        entry_time = tr["entry_time"]
-
-        active = [
-            x for x in active
-            if x["exit_time"] > entry_time
-        ]
-
-        if len(active) < MAX_POSITIONS:
-            accepted.append(tr)
-            active.append(tr)
-
-    print_summary(accepted)
-
-    out = pd.DataFrame(accepted)
-    out.to_csv("v9_trades.csv", index=False)
-    print("\nSaved: v9_trades.csv")
-
-
-if __name__ == "__main__":
-    main()
+print('\n✨ بک‌تست به پایان رسید.')
