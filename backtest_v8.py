@@ -14,7 +14,7 @@ import pandas as pd
 
 exchange = ccxt.lbank({'enableRateLimit': True})
 
-# لیست نهایی الیت‌تراشیده شده (حذف SEI, NEAR, ARB, SUI, AVAX و جایگزینی با قوی‌ترین موتورهای روند بازار)
+# لیست نهایی و کاملاً الیت (حذف دائمی NEAR، OP و سایر موارد ضعیف)
 SYMBOLS = {
     'BTC': 'BTC/USDT',
     'ETH': 'ETH/USDT',
@@ -23,27 +23,24 @@ SYMBOLS = {
     'LINK': 'LINK/USDT',
     'UNI': 'UNI/USDT',
     'ICP': 'ICP/USDT',
-    'OP': 'OP/USDT',
     'INJ': 'INJ/USDT',
     'ATOM': 'ATOM/USDT',
     'RENDER': 'RENDER/USDT',
     'XLM': 'XLM/USDT',
     'AAVE': 'AAVE/USDT',
     'WIF': 'WIF/USDT',
-    'NEAR': 'NEAR/USDT',  # جایگزینی با گزینه‌های جدید پرقدرت زیر
-    'TIA': 'TIA/USDT',
-    'FET': 'FET/USDT',
-    'PENDLE': 'PENDLE/USDT',
     'ONDO': 'ONDO/USDT',
     'SUI': 'SUI/USDT',
+    'TIA': 'TIA/USDT',
+    'FET': 'FET/USDT',
 }
 
-# حذف قطعی و کاملِ ارزهای نوسانی، تنبل و ضعیف (شامل SEI, NEAR, ARB, SUI, AVAX و قبلی‌ها)
+# لیست سیاه قطعی (ارزهایی که برای همیشه ممنوع هستند و نباید برگردند)
 REMOVED_COINS = {
-    'SEI',
     'NEAR',
+    'OP',
+    'SEI',
     'ARB',
-    'SUI',
     'AVAX',
     'DOT',
     'ETC',
@@ -53,41 +50,21 @@ REMOVED_COINS = {
     'MKR',
     'APT',
     'LTC',
-    'FET',
-    'TIA',
+    'PENDLE',
     'AR',
     'IMX',
     'PEPE',
     'BONK',
-    'PENDLE',
 }
 SYMBOLS = {k: v for k, v in SYMBOLS.items() if k not in REMOVED_COINS}
-
-# اضافه کردن گلچین‌شده‌ترین و پرروندترین ارزهای بازار به سبد جدید
-SYMBOLS.update({
-    'BTC': 'BTC/USDT',
-    'ETH': 'ETH/USDT',
-    'SOL': 'SOL/USDT',
-    'XRP': 'XRP/USDT',
-    'LINK': 'LINK/USDT',
-    'UNI': 'UNI/USDT',
-    'ICP': 'ICP/USDT',
-    'OP': 'OP/USDT',
-    'INJ': 'INJ/USDT',
-    'ATOM': 'ATOM/USDT',
-    'RENDER': 'RENDER/USDT',
-    'XLM': 'XLM/USDT',
-    'AAVE': 'AAVE/USDT',
-    'WIF': 'WIF/USDT',
-    'ONDO': 'ONDO/USDT',
-    'NEAR': 'NEAR/USDT',  # بررسی مجدد با فیلترهای قوی‌تر
-})
 
 start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-V33 - Ultra-Clean & Low-Drawdown CTA)')
+print(
+    '📥 دریافت داده‌ها (HUNTER-V34 - Institutional Low-Drawdown Hardened CTA)'
+)
 print('============================================================')
 
 processed_data = {}
@@ -132,9 +109,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
   df4h['EMA20'] = df4h['Close'].ewm(span=20, adjust=False).mean()
   df4h['EMA50'] = df4h['Close'].ewm(span=50, adjust=False).mean()
-  df4h['EMA200'] = (
-      df4h['Close'].ewm(span=200, adjust=False).mean()
-  )  # فیلتر کلانِ روند برای جلوگیری از ورود در رِنج
+  df4h['EMA200'] = df4h['Close'].ewm(span=200, adjust=False).mean()
 
   df4h['Mom_Short'] = (df4h['Close'] - df4h['Close'].shift(10)) / df4h[
       'Close'
@@ -145,7 +120,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
   processed_data[symbol] = df4h.set_index('Date')
 
-print('⚙️ شروع اجرای بک‌تست هوشمند HUNTER-V33...')
+print('⚙️ شروع اجرای بک‌تست هوشمند HUNTER-V34...')
 
 all_timestamps = set()
 for df in processed_data.values():
@@ -154,11 +129,18 @@ sorted_timestamps = sorted(list(all_timestamps))
 
 active_positions = {}
 all_trades = []
+cooldown_timers = {}  # سیستم جدید مدیریت فریز پس از استاپ لاس
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 MAX_POSITIONS = 5
 
 for ts in sorted_timestamps:
+  # کاهش تایمر کوئوداون در هر گام زمانی
+  for sym in list(cooldown_timers.keys()):
+    cooldown_timers[sym] -= 1
+    if cooldown_timers[sym] <= 0:
+      del cooldown_timers[sym]
+
   symbols_to_close = []
   for symbol, pos in active_positions.items():
     if ts not in processed_data[symbol].index:
@@ -167,9 +149,7 @@ for ts in sorted_timestamps:
 
     if c4h['High'] > pos['highest_price']:
       pos['highest_price'] = c4h['High']
-      new_trailing_sl = pos['highest_price'] - (
-          2.0 * c4h['ATR']
-      )  # تریلینگ استاپ استاندارد
+      new_trailing_sl = pos['highest_price'] - (2.0 * c4h['ATR'])
       if new_trailing_sl > pos['stop_loss']:
         pos['stop_loss'] = new_trailing_sl
 
@@ -197,6 +177,10 @@ for ts in sorted_timestamps:
       })
       symbols_to_close.append(symbol)
 
+      # اگر استاپ خورد، تا ۱۰ کندل (۴۰ ساعت) حق ورود مجدد روی این ارز را نداریم
+      if hit_sl:
+        cooldown_timers[symbol] = 10
+
   for sym in symbols_to_close:
     del active_positions[sym]
 
@@ -219,6 +203,8 @@ for ts in sorted_timestamps:
       break
     if symbol in active_positions:
       continue
+    if symbol in cooldown_timers:
+      continue  # رد شدن اگر ارز در حالت استراحت باشد
 
     df = processed_data[symbol]
     if ts not in df.index:
@@ -230,18 +216,18 @@ for ts in sorted_timestamps:
       continue
     i = match_rows.index[0]
     if i < 200:
-      continue  # نیاز به تاریخچه کافی برای EMA200
+      continue
 
     c4h = df.iloc[i]
 
-    # فیلتر بسیار قدرتمندِ رژیم صعودی و جلوگیری از ورود در بازارهای اصلاحی/رِنج
+    # فیلترهای فوق‌سخت‌گیرانه برای حذف کامل سیگنال‌های فیک و رِنج
     regime_bull = (
         (c4h['Close'] > c4h['EMA20'])
         and (c4h['EMA20'] > c4h['EMA50'])
-        and (c4h['Close'] > c4h['EMA200'])
+        and (c4h['EMA50'] > c4h['EMA200'])
     )
     valid_trend = (
-        regime_bull and (c4h['Mom_Short'] > 0.012) and (c4h['Mom_Long'] > 0.035)
+        regime_bull and (c4h['Mom_Short'] > 0.015) and (c4h['Mom_Long'] > 0.04)
     )
 
     if valid_trend:
@@ -261,7 +247,9 @@ for ts in sorted_timestamps:
         }
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V33 (Ultra-Clean & Low-Drawdown CTA)')
+print(
+    '📊 گزارش نهایی HUNTER-V34 (Institutional Low-Drawdown Hardened CTA)'
+)
 print('============================================================')
 
 if all_trades:
