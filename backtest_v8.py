@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V60 (Core + Cooldown Mechanism to Break Loss Streaks)
+# HUNTER-V61 (Core + Breakeven Stop Trigger at +1R)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -62,15 +62,11 @@ INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-# تنظیمات کلید‌ی کوئیداون برای شکستن زنجیره‌ی باخت
-COOLDOWN_CANDLES = 3  # تعداد کندل استراحت پس از باخت متوالی
-CONSECUTIVE_LOSS_TRIGGER = 2  # بعد از چند باخت پشت سر هم قفل شود؟
-
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V60 (با مکانیسم وقفه هوشمند)")
+print("📥 دریافت داده‌ها - HUNTER-V61 (با مکانیسم Breakeven)")
 print("=" * 60)
 
 processed_data = {}
@@ -160,7 +156,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V60...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V61...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -170,14 +166,7 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     
-    current_loss_streak = 0
-    cooldown_counter = 0  # شمارشگر کندل‌های استراحت باقیمانده
-    
     for ts in all_timestamps:
-        # کاهش شمارشگر وقفه در هر گام زمانی جدید
-        if cooldown_counter > 0:
-            cooldown_counter -= 1
-            
         symbols_to_close = []
         
         for symbol, pos in list(active_positions.items()):
@@ -187,6 +176,12 @@ def run_backtest(processed_data):
             
             c4h = df.loc[ts]
             
+            # بررسی فعالسازی Breakeven: اگر قیمت به +1R رسید، استاپ‌لاس را به قیمت ورود منتقل کن
+            if not pos["be_triggered"] and c4h["High"] >= (pos["entry_price"] + 1.0 * pos["initial_risk"]):
+                pos["stop_loss"] = max(pos["stop_loss"], pos["entry_price"])
+                pos["be_triggered"] = True
+            
+            # مدیریت Trailing Stop معمولی
             if c4h["High"] > pos["highest_price"]:
                 pos["highest_price"] = c4h["High"]
                 new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
@@ -209,14 +204,6 @@ def run_backtest(processed_data):
                 
                 outcome = "WIN" if r_real > 0 else "LOSS"
                 
-                if outcome == "WIN":
-                    current_loss_streak = 0
-                else:
-                    current_loss_streak += 1
-                    # اگر تعداد باخت‌های متوالی به حد نصاب رسید، ربات وارد فاز تنفس می‌شود
-                    if current_loss_streak >= CONSECUTIVE_LOSS_TRIGGER:
-                        cooldown_counter = COOLDOWN_CANDLES
-                
                 position_notional = TRADE_MARGIN * LEVERAGE
                 price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
@@ -233,10 +220,6 @@ def run_backtest(processed_data):
         
         for sym in symbols_to_close:
             del active_positions[sym]
-        
-        # اگر ربات در حال تنفس (Cooldown) باشد، از ورود جدید جلوگیری می‌شود
-        if cooldown_counter > 0:
-            continue
         
         current_scores = {}
         for symbol, df in processed_data.items():
@@ -293,13 +276,14 @@ def run_backtest(processed_data):
                         "highest_price": entry_price,
                         "initial_risk": initial_risk,
                         "entry_index": i,
+                        "be_triggered": False,
                     }
                     
     return pd.DataFrame(all_trades)
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با مکانیزم وقفه - HUNTER-V60")
+    print("📊 گزارش نهایی استراتژی با مکانیزم Breakeven - HUNTER-V61")
     print("=" * 68)
 
     if trades_df.empty:
@@ -357,4 +341,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V60 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V61 به پایان رسید.")
