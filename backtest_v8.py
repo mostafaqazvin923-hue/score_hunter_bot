@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V47 (Final Report & R-Distribution Upgrade)
+# HUNTER-V48 (Portfolio Capital & Dollar PnL Tracker)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -57,11 +57,15 @@ INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
+# تنظیمات جدید مدیریت سرمایه و مارجین
+INITIAL_CAPITAL = 1000.0
+TRADE_MARGIN = 100.0
+
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V47")
+print("📥 دریافت داده‌ها - HUNTER-V48")
 print("=" * 60)
 
 processed_data = {}
@@ -151,7 +155,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V47...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V48...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -193,11 +197,16 @@ def run_backtest(processed_data):
                 
                 outcome = "WIN" if r_real > 0 else "LOSS"
                 
+                # محاسبه سود/زیان دلاری بر اساس ۱۰۰ دلار مارجین
+                price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
+                dollar_pnl = (TRADE_MARGIN * price_return_pct) - (TRADE_MARGIN * FEE_RATE * 2)
+                
                 all_trades.append({
                     "Timestamp": ts,
                     "Symbol": symbol,
                     "Outcome": outcome,
                     "Return": r_real,
+                    "Dollar_PnL": dollar_pnl,
                     "ExitOrder": len(all_trades),
                 })
                 symbols_to_close.append(symbol)
@@ -266,7 +275,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش جامع و تفکیکی استراتژی HUNTER-V47")
+    print("📊 گزارش جامع مالی و عملکردی HUNTER-V48")
     print("=" * 68)
 
     if trades_df.empty:
@@ -280,8 +289,11 @@ def summarize_result(trades_df):
     trades = len(trades_df)
     wr = (wins / trades * 100) if trades > 0 else 0
     net_r = float(trades_df["Return"].sum())
+    
+    # محاسبه کل سود/زیان دلاری و سرمایه نهایی
+    total_dollar_pnl = float(trades_df["Dollar_PnL"].sum())
+    final_capital = INITIAL_CAPITAL + total_dollar_pnl
 
-    # محاسبه زنجیره‌های ضرر (Loss Streaks)
     max_losses = 0
     current_losses = 0
     loss_sequences = []
@@ -301,7 +313,6 @@ def summarize_result(trades_df):
     if temp_loss_seq > 0:
         loss_sequences.append(temp_loss_seq)
 
-    # دسته‌بندی ریسک به ریوارد (R-Multiple Breakdown برای برنده‌ها)
     r_buckets = {
         "1R تا <2R (1:1 تا 1:2)": 0,
         "2R تا <3R (1:2 تا 1:3)": 0,
@@ -320,11 +331,14 @@ def summarize_result(trades_df):
         elif r >= 4:
             r_buckets["4R به بالا (1:4+)"] += 1
 
+    print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
+    print(f"🔸 مارجین هر معامله: ${TRADE_MARGIN:,.2f}")
     print(f"🔸 تعداد کل معاملات: {trades}")
-    print(f"🔸 معاملات برنده (WIN): {wins}")
-    print(f"🔸 معاملات بازنده (LOSS): {losses}")
+    print(f"🔸 معاملات برنده (WIN): {wins} | بازنده (LOSS): {losses}")
     print(f"🎯 وین‌ریت کلی (Win Rate): {wr:.2f}%")
     print(f"💰 مجموع بازدهی خالص: {net_r:.2f}R")
+    print(f"💵 مجموع سود/زیان دلاری خالص: ${total_dollar_pnl:,.2f}")
+    print(f"🏦 سرمایه نهایی پس از یک سال: ${final_capital:,.2f}")
     print(f"❄️ حداکثر ضررهای متوالی: {max_losses}")
 
     print("\n------------------------------------------------------------")
@@ -344,4 +358,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V47 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V48 به پایان رسید.")
