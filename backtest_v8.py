@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V44
+# HUNTER-V45
 # Baseline-preserving backtest:
 # منطق سیگنال/ورود/خروج V33 حفظ شده و فقط خطاهای فنی بک‌تست
 # (داده ناقص، کندل ناقص، pagination، index lookup و گزارش DD)
@@ -107,7 +107,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V44")
+print("📥 دریافت داده‌ها - HUNTER-V45")
 print("=" * 60)
 
 processed_data = {}
@@ -218,10 +218,10 @@ for symbol, lbank_symbol in SYMBOLS.items():
         print(f"❌ {symbol}: حذف شد")
 
 print(f"\n✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V44...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V45...")
 
 # ------------------------------------------------------------
-# بک‌تست — منطق اصلی V33 حفظ شده
+# بک‌تست — منطق اصلی V33 حفظ شده؛ V45 فقط تشخیص Loss Cluster اضافه می‌کند
 # ------------------------------------------------------------
 
 all_timestamps = sorted({
@@ -297,12 +297,47 @@ for ts in all_timestamps:
             if portfolio_loss_streak >= STREAK_TRIGGER:
                 streak_pause_remaining = STREAK_PAUSE_CANDLES
 
+            # اطلاعات تشخیصی در لحظه خروج؛ هیچ اثری بر معامله ندارد.
+            btc_regime = "UNKNOWN"
+            market_breadth = np.nan
+
+            if "BTC" in processed_data and ts in processed_data["BTC"].index:
+                btc = processed_data["BTC"].loc[ts]
+                btc_regime = (
+                    "STRONG"
+                    if (
+                        btc["Close"] > btc["EMA20"]
+                        and btc["EMA20"] > btc["EMA50"]
+                        and btc["Close"] > btc["EMA200"]
+                    )
+                    else "WEAK"
+                )
+
+            breadth_total = 0
+            breadth_bull = 0
+            for _sym, _df in processed_data.items():
+                if ts in _df.index:
+                    breadth_total += 1
+                    _c = _df.loc[ts]
+                    if (
+                        _c["Close"] > _c["EMA20"]
+                        and _c["EMA20"] > _c["EMA50"]
+                        and _c["Close"] > _c["EMA200"]
+                    ):
+                        breadth_bull += 1
+
+            if breadth_total:
+                market_breadth = breadth_bull / breadth_total
+
             all_trades.append({
                 "Timestamp": ts,
                 "Symbol": symbol,
                 "Side": "LONG",
                 "Outcome": outcome,
                 "Return": r_real,
+                "ExitOrder": len(all_trades),
+                "BTC_Regime": btc_regime,
+                "Market_Breadth": market_breadth,
             })
 
             symbols_to_close.append(symbol)
@@ -388,11 +423,169 @@ for ts in all_timestamps:
                 }
 
 # ------------------------------------------------------------
+# تشخیص حرفه‌ای زنجیره ضرر
+# مهم: این بخش منطق Entry/Exit را تغییر نمی‌دهد.
+# هدف: بفهمیم زنجیره‌های ضرر واقعاً از چه نوعی هستند:
+#   1) ضررهای پشت سر هم در یک timestamp / موج بازار
+#   2) ضررهای پشت سر هم در یک ارز
+#   3) ضررها در زمانی که BTC یا اکثریت سبد ضعیف بوده‌اند
+# ------------------------------------------------------------
+
+def print_loss_cluster_diagnostics(trades_df):
+    if trades_df.empty:
+        return
+
+    print("\n" + "=" * 60)
+    print("🧪 V45 — تشخیص ریشه زنجیره ضررها")
+    print("=" * 60)
+
+    # ترتیب واقعی ثبت خروج‌ها حفظ می‌شود؛ برای تحلیل streak ترتیبی،
+    # timestamp سپس order ثبت خروج استفاده می‌شود، نه Symbol alphabetic.
+    ordered = trades_df.copy()
+    if "ExitOrder" in ordered.columns:
+        ordered = ordered.sort_values(
+            ["Timestamp", "ExitOrder"], kind="stable"
+        ).reset_index(drop=True)
+    else:
+        ordered = ordered.reset_index(drop=True)
+
+    # --------------------------------------------------------
+    # 1) Portfolio streak با ترتیب واقعی ثبت خروج
+    # --------------------------------------------------------
+    max_streak = 0
+    cur = 0
+    sequences = []
+
+    for out in ordered["Outcome"]:
+        if out == "LOSS":
+            cur += 1
+            max_streak = max(max_streak, cur)
+        else:
+            if cur:
+                sequences.append(cur)
+            cur = 0
+    if cur:
+        sequences.append(cur)
+
+    print(f"🔴 Max LOSS streak بر اساس ترتیب واقعی خروج: {max_streak}")
+    print(
+        "🔎 این معیار برای جلوگیری از خطای مرتب‌سازی Symbol "
+        "استفاده می‌شود."
+    )
+
+    # --------------------------------------------------------
+    # 2) Loss clusters در یک timestamp
+    # --------------------------------------------------------
+    loss_rows = ordered[ordered["Outcome"] == "LOSS"].copy()
+    if not loss_rows.empty:
+        by_ts = (
+            loss_rows.groupby("Timestamp")
+            .size()
+            .sort_values(ascending=False)
+        )
+
+        multi_loss_ts = by_ts[by_ts >= 2]
+        total_loss = len(loss_rows)
+        clustered_loss = int(multi_loss_ts.sum()) if not multi_loss_ts.empty else 0
+
+        print(f"\n🧩 تعداد کل Lossها: {total_loss}")
+        print(
+            f"🧩 Lossهایی که همزمان با حداقل یک Loss دیگر رخ داده‌اند: "
+            f"{clustered_loss} ({clustered_loss / total_loss * 100:.1f}%)"
+        )
+        print(
+            f"🧩 بیشترین Loss در یک timestamp: "
+            f"{int(by_ts.max())}"
+        )
+
+        if not multi_loss_ts.empty:
+            print("\n📌 بزرگ‌ترین Loss Clusterها:")
+            for ts, n in multi_loss_ts.head(10).items():
+                syms = ordered[
+                    (ordered["Timestamp"] == ts)
+                    & (ordered["Outcome"] == "LOSS")
+                ]["Symbol"].tolist()
+                print(
+                    f"   {ts} -> {n} LOSS -> {', '.join(syms)}"
+                )
+
+    # --------------------------------------------------------
+    # 3) Streak اختصاصی هر ارز
+    # --------------------------------------------------------
+    print("\n🪙 بیشترین زنجیره Loss برای هر ارز:")
+    per_symbol = []
+
+    for sym in sorted(ordered["Symbol"].unique()):
+        seq = 0
+        best = 0
+        for out in ordered.loc[
+            ordered["Symbol"] == sym, "Outcome"
+        ]:
+            if out == "LOSS":
+                seq += 1
+                best = max(best, seq)
+            else:
+                seq = 0
+        per_symbol.append((sym, best))
+
+    per_symbol.sort(key=lambda x: x[1], reverse=True)
+    for sym, best in per_symbol:
+        print(f"   {sym}: {best}")
+
+    # --------------------------------------------------------
+    # 4) شدت زیان‌ها در هر cluster
+    # --------------------------------------------------------
+    if not loss_rows.empty:
+        cluster_returns = (
+            loss_rows.groupby("Timestamp")["Return"]
+            .sum()
+            .sort_values()
+        )
+        print("\n💥 بدترین Loss Clusterها بر اساس مجموع R:")
+        for ts, rsum in cluster_returns.head(10).items():
+            syms = loss_rows[
+                loss_rows["Timestamp"] == ts
+            ]["Symbol"].tolist()
+            print(
+                f"   {ts} -> {rsum:.2f}R -> {', '.join(syms)}"
+            )
+
+    # --------------------------------------------------------
+    # 5) آیا Lossها عمدتاً در شرایط ضعیف بازار رخ می‌دهند؟
+    # BTC و breadth فقط برای تشخیص هستند؛ هیچ فیلتری اعمال نمی‌شود.
+    # --------------------------------------------------------
+    if "BTC_Regime" in ordered.columns:
+        loss_btc = ordered.loc[
+            ordered["Outcome"] == "LOSS", "BTC_Regime"
+        ]
+        if len(loss_btc):
+            weak = int((loss_btc == "WEAK").sum())
+            print(
+                f"\n₿ Loss در BTC Weak Regime: "
+                f"{weak}/{len(loss_btc)} "
+                f"({weak / len(loss_btc) * 100:.1f}%)"
+            )
+
+    if "Market_Breadth" in ordered.columns:
+        lb = ordered.loc[
+            ordered["Outcome"] == "LOSS", "Market_Breadth"
+        ].dropna()
+        if len(lb):
+            print(
+                f"📊 میانگین Market Breadth هنگام Loss: "
+                f"{lb.mean() * 100:.1f}%"
+            )
+            print(
+                f"📊 میانه Market Breadth هنگام Loss: "
+                f"{lb.median() * 100:.1f}%"
+            )
+
+# ------------------------------------------------------------
 # گزارش
 # ------------------------------------------------------------
 
 print("\n" + "=" * 60)
-print("📊 گزارش نهایی HUNTER-V44")
+print("📊 گزارش نهایی HUNTER-V45")
 print("=" * 60)
 
 if not all_trades:
@@ -400,10 +593,13 @@ if not all_trades:
 else:
     trades_df = pd.DataFrame(all_trades)
     trades_df.sort_values(
-        ["Timestamp", "Symbol"],
+        ["Timestamp", "ExitOrder"],
         inplace=True,
         ignore_index=True,
     )
+
+    # تحلیل جداگانه؛ منطق استراتژی و گزارش اصلی دست‌نخورده می‌ماند.
+    print_loss_cluster_diagnostics(trades_df)
 
     tot_trades = len(trades_df)
     tot_wins = int((trades_df["Outcome"] == "WIN").sum())
@@ -516,4 +712,4 @@ else:
     summary_df = pd.DataFrame(symbol_summary)
     print(summary_df.to_string(index=False))
 
-print("\n✨ بک‌تست HUNTER-V44 به پایان رسید.")
+print("\n✨ بک‌تست HUNTER-V45 به پایان رسید.")
