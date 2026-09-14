@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V48 (Portfolio Capital & Dollar PnL Tracker)
+# HUNTER-V51 (Fixed $100 Margin, 80x Leverage & Loss Streaks)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -57,15 +57,16 @@ INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
-# تنظیمات جدید مدیریت سرمایه و مارجین
+# تنظیمات جدید مدیریت سرمایه، مارجین و لورج
 INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
+LEVERAGE = 80.0
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V48")
+print("📥 دریافت داده‌ها - HUNTER-V51")
 print("=" * 60)
 
 processed_data = {}
@@ -155,7 +156,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V48...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V51...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -197,9 +198,10 @@ def run_backtest(processed_data):
                 
                 outcome = "WIN" if r_real > 0 else "LOSS"
                 
-                # محاسبه سود/زیان دلاری بر اساس ۱۰۰ دلار مارجین
+                # محاسبه سود/زیان دلاری با در نظر گرفتن مارجین و لورج ۸۰
+                position_notional = TRADE_MARGIN * LEVERAGE
                 price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
-                dollar_pnl = (TRADE_MARGIN * price_return_pct) - (TRADE_MARGIN * FEE_RATE * 2)
+                dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
                 
                 all_trades.append({
                     "Timestamp": ts,
@@ -275,7 +277,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش جامع مالی و عملکردی HUNTER-V48")
+    print("📊 گزارش نهایی استراتژی با لورج ۸۰ - HUNTER-V51")
     print("=" * 68)
 
     if trades_df.empty:
@@ -290,7 +292,6 @@ def summarize_result(trades_df):
     wr = (wins / trades * 100) if trades > 0 else 0
     net_r = float(trades_df["Return"].sum())
     
-    # محاسبه کل سود/زیان دلاری و سرمایه نهایی
     total_dollar_pnl = float(trades_df["Dollar_PnL"].sum())
     final_capital = INITIAL_CAPITAL + total_dollar_pnl
 
@@ -313,32 +314,14 @@ def summarize_result(trades_df):
     if temp_loss_seq > 0:
         loss_sequences.append(temp_loss_seq)
 
-    r_buckets = {
-        "1R تا <2R (1:1 تا 1:2)": 0,
-        "2R تا <3R (1:2 تا 1:3)": 0,
-        "3R تا <4R (1:3 تا 1:4)": 0,
-        "4R به بالا (1:4+)": 0,
-    }
-
-    winning_returns = trades_df[trades_df["Outcome"] == "WIN"]["Return"]
-    for r in winning_returns:
-        if 1 <= r < 2:
-            r_buckets["1R تا <2R (1:1 تا 1:2)"] += 1
-        elif 2 <= r < 3:
-            r_buckets["2R تا <3R (1:2 تا 1:3)"] += 1
-        elif 3 <= r < 4:
-            r_buckets["3R تا <4R (1:3 تا 1:4)"] += 1
-        elif r >= 4:
-            r_buckets["4R به بالا (1:4+)"] += 1
-
     print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
-    print(f"🔸 مارجین هر معامله: ${TRADE_MARGIN:,.2f}")
+    print(f"🔸 مارجین هر معامله: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
     print(f"🔸 تعداد کل معاملات: {trades}")
     print(f"🔸 معاملات برنده (WIN): {wins} | بازنده (LOSS): {losses}")
     print(f"🎯 وین‌ریت کلی (Win Rate): {wr:.2f}%")
     print(f"💰 مجموع بازدهی خالص: {net_r:.2f}R")
     print(f"💵 مجموع سود/زیان دلاری خالص: ${total_dollar_pnl:,.2f}")
-    print(f"🏦 سرمایه نهایی پس از یک سال: ${final_capital:,.2f}")
+    print(f"🏦 سرمایه نهایی: ${final_capital:,.2f}")
     print(f"❄️ حداکثر ضررهای متوالی: {max_losses}")
 
     print("\n------------------------------------------------------------")
@@ -349,13 +332,7 @@ def summarize_result(trades_df):
     else:
         print("هیچ زنجیره ضرری ثبت نشد.")
 
-    print("\n------------------------------------------------------------")
-    print("🎯 دسته‌بندی ریسک به ریوارد معاملات برنده (R-Distribution):")
-    print("------------------------------------------------------------")
-    for category, count in r_buckets.items():
-        print(f"  • {category}: {count} معامله")
-
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V48 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V51 به پایان رسید.")
