@@ -33,7 +33,9 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-ICHIMOKU V11 - Kumo Twist & Trend Filter)')
+print(
+    '📥 دریافت داده‌ها (HUNTER-ICHIMOKU V12 - Trend & ADX Filter Validation)'
+)
 print('============================================================')
 
 data_1h = {}
@@ -70,7 +72,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
     data_1h[symbol] = df1h
 
 
-def calculate_ichimoku(df):
+def calculate_ichimoku_and_adx(df):
   df = df.copy()
   period9_high = df['High'].rolling(window=9).max()
   period9_low = df['Low'].rolling(window=9).min()
@@ -91,6 +93,36 @@ def calculate_ichimoku(df):
   tr3 = np.abs(df['Low'] - df['Close'].shift(1))
   df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
+  # محاسبه ADX (شاخص جهت‌دار میانگین) برای تشخیص قدرت روند
+  plus_dm = df['High'].diff()
+  minus_dm = df['Low'].diff()
+  plus_dm = np.where(
+      (plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0
+  )
+  minus_dm = np.where(
+      (minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0
+  )
+
+  tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+  atr14 = tr.rolling(14).mean()
+
+  plus_di = (
+      100
+      * pd.Series(plus_dm, index=df.index)
+      .rolling(14)
+      .mean()
+      / (atr14 + 1e-9)
+  )
+  minus_di = (
+      100
+      * pd.Series(minus_dm, index=df.index)
+      .rolling(14)
+      .mean()
+      / (atr14 + 1e-9)
+  )
+  dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+  df['ADX'] = dx.rolling(14).mean()
+
   return df
 
 
@@ -98,7 +130,7 @@ processed_data = {}
 for symbol, df1h in data_1h.items():
   if len(df1h) < 100:
     continue
-  df1h = calculate_ichimoku(df1h)
+  df1h = calculate_ichimoku_and_adx(df1h)
 
   df4h = (
       df1h.set_index('Date')
@@ -113,19 +145,19 @@ for symbol, df1h in data_1h.items():
       .dropna()
       .reset_index()
   )
-  df4h = calculate_ichimoku(df4h)
+  df4h = calculate_ichimoku_and_adx(df4h)
   df4h['Cloud_Top'] = df4h[['Senkou_A', 'Senkou_B']].max(axis=1)
   df4h['Cloud_Bottom'] = df4h[['Senkou_A', 'Senkou_B']].min(axis=1)
-  df4h['Cloud_Thickness'] = (
-      df4h['Cloud_Top'] - df4h['Cloud_Bottom']
-  ) / df4h['Close']
 
-  # تاییدیه روند و شکست ابر در 4H همراه با ضخامت ابر معتبر
-  df4h['Trend_Long'] = (df4h['Close'] > df4h['Cloud_Top']) & (
-      df4h['Tenkan'] > df4h['Kijun']
+  df4h['Trend_Long'] = (
+      (df4h['Close'] > df4h['Cloud_Top'])
+      & (df4h['Tenkan'] > df4h['Kijun'])
+      & (df4h['ADX'] > 22)
   )
-  df4h['Trend_Short'] = (df4h['Close'] < df4h['Cloud_Bottom']) & (
-      df4h['Tenkan'] < df4h['Kijun']
+  df4h['Trend_Short'] = (
+      (df4h['Close'] < df4h['Cloud_Bottom'])
+      & (df4h['Tenkan'] < df4h['Kijun'])
+      & (df4h['ADX'] > 22)
   )
 
   for col in [
@@ -133,14 +165,14 @@ for symbol, df1h in data_1h.items():
       'Trend_Short',
       'Cloud_Top',
       'Cloud_Bottom',
-      'Cloud_Thickness',
+      'ADX',
   ]:
     df4h[col] = df4h[col].shift(1)  # جلوگیری از Lookahead مطلق
 
   df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
   processed_data[symbol] = {'1h': df1h, '4h': df4h.set_index('Date')}
 
-print('⚙️ شروع اجرای بک‌تست HUNTER-ICHIMOKU V11...')
+print('⚙️ شروع اجرای بک‌تست HUNTER-ICHIMOKU V12...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -151,7 +183,7 @@ active_positions = {}
 all_trades = []
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
-MAX_CONCURRENT_POSITIONS = 3
+MAX_CONCURRENT_POSITIONS = 2  # کاهش همپوشانی برای مدیریت بهتر ریسک
 
 dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items()}
 dfs_4h = {sym: dat['4h'] for sym, dat in processed_data.items()}
@@ -245,7 +277,7 @@ for ts in sorted_timestamps:
     if match_rows.empty:
       continue
     i = match_rows.index[0]
-    if i < 35:
+    if i < 40:
       continue
 
     c1h = df1h.iloc[i]
@@ -257,18 +289,15 @@ for ts in sorted_timestamps:
       continue
     r4h = df4h_idx.loc[t4h_time]
 
-    # فیلتر کیفیت ابر و روند در 1H
-    tk_cross_long = prev['Tenkan'] > prev['Kijun']
-    tk_cross_short = prev['Tenkan'] < prev['Kijun']
+    tk_cross_long = prev['Tenkan'] > prev['Kijun'] and prev['ADX'] > 20
+    tk_cross_short = prev['Tenkan'] < prev['Kijun'] and prev['ADX'] > 20
     chikou_long = prev['Close'] > df1h.iloc[i - 27]['Close']
     chikou_short = prev['Close'] < df1h.iloc[i - 27]['Close']
 
-    # منطق ورود لانگ: تاییدیه 4H + تقاطع تنکان/کیجون 1H + چیکوسپان سالم
+    # منطق ورود لانگ با فیلتر روند قدرتمند
     if r4h.get('Trend_Long', False) and tk_cross_long and chikou_long:
-      # بررسی پولبک تمیز به خط کیجون یا لبه بالایی ابر
-      cloud_top_1h = max(prev['Senkou_A'], prev['Senkou_B'])
       if (
-          prev['Low'] <= prev['Kijun'] * 1.003
+          prev['Low'] <= prev['Kijun'] * 1.002
           and prev['Close'] > prev['Kijun']
       ):
         entry_price = c1h['Open'] * (1 + SLIPPAGE)
@@ -281,7 +310,7 @@ for ts in sorted_timestamps:
         )
         sl_dist_pct = (entry_price - stop_loss) / entry_price
 
-        if 0.003 <= sl_dist_pct <= 0.035:
+        if 0.003 <= sl_dist_pct <= 0.03:
           risk = entry_price - stop_loss
           take_profit = entry_price + (2.0 * risk)
           active_positions[symbol] = {
@@ -293,11 +322,10 @@ for ts in sorted_timestamps:
           }
           continue
 
-    # منطق ورود شورت: تاییدیه 4H + تقاطع تنکان/کیجون 1H + چیکوسپان سالم
+    # منطق ورود شورت با فیلتر روند قدرتمند
     elif r4h.get('Trend_Short', False) and tk_cross_short and chikou_short:
-      cloud_bot_1h = min(prev['Senkou_A'], prev['Senkou_B'])
       if (
-          prev['High'] >= prev['Kijun'] * 0.997
+          prev['High'] >= prev['Kijun'] * 0.998
           and prev['Close'] < prev['Kijun']
       ):
         entry_price = c1h['Open'] * (1 - SLIPPAGE)
@@ -310,7 +338,7 @@ for ts in sorted_timestamps:
         )
         sl_dist_pct = (stop_loss - entry_price) / entry_price
 
-        if 0.003 <= sl_dist_pct <= 0.035:
+        if 0.003 <= sl_dist_pct <= 0.03:
           risk = stop_loss - entry_price
           take_profit = entry_price - (2.0 * risk)
           active_positions[symbol] = {
@@ -323,7 +351,7 @@ for ts in sorted_timestamps:
           continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-ICHIMOKU V11 (Trend & TK Filter)')
+print('📊 گزارش نهایی HUNTER-ICHIMOKU V12 (ADX Filtered)')
 print('============================================================')
 
 if all_trades:
