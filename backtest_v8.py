@@ -1,5 +1,5 @@
 # CLTS v1 — Causal Liquidity/Structure Trend System
-# LBank USDT-M Futures / Direct REST
+# LBank / CCXT exact sample connection
 #
 # FIXED:
 # - Resolves real LBank SwapU futures contracts directly from LBank
@@ -82,36 +82,41 @@ CONSERVATIVE_INTRABAR = True
 
 
 # ============================================================
-# LBank FUTURES DATA CONNECTION
+# LBank DATA CONNECTION — EXACT SAME PATH AS USER'S WORKING SAMPLE
 # ============================================================
-
-# IMPORTANT:
-# We do NOT use ccxt.fetch_ohlcv() here. LBank's documented Contract API
-# exposes instrument/market/order endpoints, while historical futures K-lines
-# are not documented there. The legacy LBank Futures REST K-line endpoint is
-# used directly because this is the same futures data path, not Spot data.
 #
-# The endpoint is kept configurable and the response is strictly validated.
-# If LBank changes/removes it, the script FAILS rather than silently falling
-# back to Spot candles.
+# IMPORTANT:
+# This intentionally uses the exact connection method from the supplied
+# working code:
+#
+#     exchange = ccxt.lbank({'enableRateLimit': True})
+#     exchange.fetch_ohlcv('BTC/USDT', '1h', since=..., limit=1000)
+#
+# This endpoint/path is LBank SPOT market data (BTC/USDT), not USDT-M
+# perpetual Futures. We do NOT relabel Spot candles as Futures.
+#
+# If the requirement is specifically Futures candles, this exact method
+# cannot honestly satisfy that requirement: current LBank/CCXT behavior
+# rejects Futures OHLCV requests. The file below therefore prioritizes
+# reproducing the user's proven real-LBank data connection exactly.
 
-LBANK_FUTURES_BASE = "https://api.lbkex.com"
-LBANK_CONTRACT_BASE = "https://lbkperp.lbank.com"
-PRODUCT_GROUP = "SwapU"
-REQUEST_TIMEOUT = 20
+exchange = ccxt.lbank({"enableRateLimit": True})
+
+SYMBOLS = {
+    "BTC": "BTC/USDT",
+    "ETH": "ETH/USDT",
+    "SOL": "SOL/USDT",
+    "XRP": "XRP/USDT",
+    "SUI": "SUI/USDT",
+    "NEAR": "NEAR/USDT",
+    "ADA": "ADA/USDT",
+    "LINK": "LINK/USDT",
+    "AVAX": "AVAX/USDT",
+    "DOT": "DOT/USDT",
+}
+
+REQUEST_TIMEOUT = 30
 PAGE_LIMIT = 1000
-
-# Legacy Futures REST K-line endpoint. This is not the documented Contract v1
-# endpoint, so we try only known futures variants and NEVER use spot kline.
-FUTURES_KLINE_ENDPOINTS = [
-    "/v2/future/kline.do",
-]
-
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "CLTS-LBank-Futures-Backtest/3.0",
-    "Accept": "application/json",
-})
 
 
 def utc_now():
@@ -122,241 +127,190 @@ def timeframe_ms(timeframe):
     return {"1h": 3600000, "4h": 14400000}[timeframe]
 
 
-def floor_timestamp_ms(ts_ms, tf_ms):
-    return (ts_ms // tf_ms) * tf_ms
-
-
 def _empty_ohlcv():
-    return pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"])
-
-
-def _json_from_response(resp):
-    try:
-        return resp.json()
-    except Exception:
-        return None
-
-
-def _extract_kline_rows(payload):
-    """Accept common LBank futures kline response shapes only."""
-    if payload is None:
-        return []
-
-    if isinstance(payload, list):
-        return payload
-
-    if isinstance(payload, dict):
-        for key in ("data", "result", "rows", "klines", "candles"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return value
-
-    return []
-
-
-def _normalize_kline_row(row):
-    # LBank legacy futures responses commonly return:
-    # [timestamp, open, high, low, close, volume, ...]
-    if isinstance(row, (list, tuple)) and len(row) >= 6:
-        try:
-            return [
-                int(float(row[0])),
-                float(row[1]),
-                float(row[2]),
-                float(row[3]),
-                float(row[4]),
-                float(row[5]),
-            ]
-        except Exception:
-            return None
-
-    # Also accept a dict-shaped candle if LBank returns one.
-    if isinstance(row, dict):
-        try:
-            ts = row.get("timestamp", row.get("time", row.get("ts", row.get("open_time"))))
-            op = row.get("open", row.get("o"))
-            hi = row.get("high", row.get("h"))
-            lo = row.get("low", row.get("l"))
-            cl = row.get("close", row.get("c"))
-            vol = row.get("volume", row.get("vol", row.get("v", 0)))
-            if ts is None or op is None or hi is None or lo is None or cl is None:
-                return None
-            return [int(float(ts)), float(op), float(hi), float(lo), float(cl), float(vol)]
-        except Exception:
-            return None
-
-    return None
-
-
-def get_futures_contracts():
-    """Resolve actual LBank SwapU contract IDs from LBank itself."""
-    url = LBANK_CONTRACT_BASE + "/cfd/openApi/v1/pub/instrument"
-    resp = session.get(url, params={"productGroup": PRODUCT_GROUP}, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    payload = resp.json()
-
-    data = payload.get("data", payload) if isinstance(payload, dict) else payload
-    if isinstance(data, dict):
-        data = data.get("data", data.get("list", []))
-    if not isinstance(data, list):
-        raise RuntimeError(f"Unexpected LBank instrument response: {payload}")
-
-    contracts = {}
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        symbol = str(item.get("symbol", "")).upper()
-        base = str(item.get("baseCurrency", "")).upper()
-        quote = str(item.get("clearCurrency", item.get("priceCurrency", ""))).upper()
-        if not symbol or not base:
-            continue
-        if quote not in ("USDT", ""):
-            continue
-        contracts[base] = symbol
-
-    return contracts
-
-
-def _fetch_kline_page(contract_symbol, timeframe, start_ms, end_ms):
-    minutes = {"1h": 60, "4h": 240}[timeframe]
-    # The legacy endpoint has appeared with both interval spellings in LBank
-    # integrations. We try these futures-only forms, never spot endpoints.
-    variants = [
-        {"symbol": contract_symbol, "type": f"{minutes}min", "size": PAGE_LIMIT},
-        {"symbol": contract_symbol, "type": str(minutes), "size": PAGE_LIMIT},
-        {"symbol": contract_symbol, "period": f"{minutes}min", "size": PAGE_LIMIT},
-        {"symbol": contract_symbol, "period": str(minutes), "size": PAGE_LIMIT},
-    ]
-
-    last_error = None
-    for path in FUTURES_KLINE_ENDPOINTS:
-        for params in variants:
-            # Add time bounds when the endpoint accepts/ignores them. If ignored,
-            # the result is still filtered locally and pagination advances safely.
-            params = dict(params)
-            params["start"] = start_ms
-            params["end"] = end_ms
-            try:
-                resp = session.get(
-                    LBANK_FUTURES_BASE + path,
-                    params=params,
-                    timeout=REQUEST_TIMEOUT,
-                )
-                if resp.status_code != 200:
-                    last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                    continue
-                payload = _json_from_response(resp)
-                rows = _extract_kline_rows(payload)
-                normalized = []
-                for row in rows:
-                    x = _normalize_kline_row(row)
-                    if x is not None:
-                        normalized.append(x)
-                if normalized:
-                    return normalized
-                last_error = f"No candle rows in response: {str(payload)[:300]}"
-            except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-
-    raise RuntimeError(
-        f"LBank Futures historical K-line endpoint unavailable for {contract_symbol} "
-        f"{timeframe}. Last error: {last_error}. "
-        "No Spot fallback is permitted."
+    return pd.DataFrame(
+        columns=["Date", "Open", "High", "Low", "Close", "Volume"]
     )
 
 
-def fetch_ohlcv_paginated(contract_symbol, timeframe, since_ms, until_ms):
-    """Download futures candles only, validate, deduplicate and remove open candle."""
-    tf_ms = timeframe_ms(timeframe)
-    all_rows = []
-    cursor = since_ms
-    seen_min = None
-    safety = 0
+def validate_ohlcv_support(symbol):
+    """Preflight the exact CCXT/LBank path used by the user's sample."""
+    try:
+        exchange.load_markets()
+        if symbol not in exchange.markets:
+            raise RuntimeError(f"{symbol} is not present in LBank markets")
+        if exchange.has.get("fetchOHLCV") is False:
+            raise RuntimeError("CCXT reports fetchOHLCV unsupported")
+        probe = exchange.fetch_ohlcv(
+            symbol,
+            timeframe="1h",
+            since=exchange.milliseconds() - 3 * 3600000,
+            limit=3,
+        )
+        if not probe:
+            raise RuntimeError("LBank returned no OHLCV rows")
+        return True
+    except Exception as exc:
+        print(f"  ⚠️ OHLCV preflight failed for {symbol}: {type(exc).__name__}: {exc}")
+        return False
 
-    while cursor < until_ms and safety < 500:
-        safety += 1
-        batch = _fetch_kline_page(contract_symbol, timeframe, cursor, until_ms)
-        if not batch:
+
+def fetch_ohlcv_paginated(symbol, timeframe, since_ms, until_ms):
+    """
+    Exact pagination logic from the user's supplied working LBank sample,
+    with only chronological de-duplication/closed-candle cleanup added.
+    """
+    all_ohlcv = []
+    current_since = since_ms
+
+    while current_since < until_ms:
+        try:
+            ohlcv = exchange.fetch_ohlcv(
+                symbol,
+                timeframe=timeframe,
+                since=current_since,
+                limit=PAGE_LIMIT,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"LBank fetch_ohlcv failed for {symbol} {timeframe}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        if not ohlcv:
             break
 
-        all_rows.extend(batch)
-        timestamps = [int(x[0]) for x in batch]
-        newest = max(timestamps)
-        oldest = min(timestamps)
+        all_ohlcv.extend(ohlcv)
 
-        if seen_min is not None and oldest <= seen_min and newest <= cursor:
-            break
-        seen_min = oldest
+        newest = int(ohlcv[-1][0])
+        next_since = newest + 1
 
-        # Move strictly forward. If the server ignores bounds and returns a
-        # fixed recent window, stop rather than looping forever.
-        next_cursor = newest + tf_ms
-        if next_cursor <= cursor:
-            break
-        cursor = next_cursor
-
-        # If the server returned fewer than a full page and the newest candle
-        # reached the requested interval, there is nothing else to request.
-        if len(batch) < PAGE_LIMIT and newest >= until_ms - tf_ms:
+        if next_since <= current_since:
             break
 
-        # Hard stop if endpoint is clearly not paginatable.
-        if safety >= 3 and newest < since_ms + tf_ms:
+        current_since = next_since
+
+        if len(ohlcv) < PAGE_LIMIT:
             break
 
-    if not all_rows:
+    if not all_ohlcv:
         return _empty_ohlcv()
 
-    df = pd.DataFrame(all_rows, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+    df = pd.DataFrame(
+        all_ohlcv,
+        columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"],
+    )
+
     df["Timestamp"] = pd.to_numeric(df["Timestamp"], errors="coerce")
     df = df.dropna(subset=["Timestamp"]).copy()
     df["Timestamp"] = df["Timestamp"].astype(np.int64)
 
-    # Normalize seconds -> milliseconds if needed.
-    if len(df) and int(df["Timestamp"].median()) < 10_000_000_000:
-        df["Timestamp"] *= 1000
-
-    df = df[(df["Timestamp"] >= since_ms) & (df["Timestamp"] < until_ms)].copy()
     df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
-    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-    df = df.drop_duplicates("Date").sort_values("Date").reset_index(drop=True)
 
-    for c in ["Open", "High", "Low", "Close", "Volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna().reset_index(drop=True)
+    df = df[
+        ["Date", "Open", "High", "Low", "Close", "Volume"]
+    ].copy()
 
+    df.dropna(inplace=True)
+    df.drop_duplicates(subset=["Date"], inplace=True)
+    df.sort_values("Date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df.dropna(inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # Strict requested time range.
+    start_ts = pd.Timestamp(since_ms, unit="ms", tz="UTC")
+    end_ts = pd.Timestamp(until_ms, unit="ms", tz="UTC")
+    df = df[(df["Date"] >= start_ts) & (df["Date"] < end_ts)].copy()
+
+    # Only closed candles.
+    tf_ms = timeframe_ms(timeframe)
+    now_ms = exchange.milliseconds()
+    current_open_ms = (now_ms // tf_ms) * tf_ms
+    df = df[df["Date"].astype("int64") // 10**6 < current_open_ms]
+
+    # OHLCV sanity checks.
     bad = (
-        (df["High"] < df[["Open", "Close"]].max(axis=1)) |
-        (df["Low"] > df[["Open", "Close"]].min(axis=1)) |
-        (df["High"] < df["Low"]) |
-        (df["Volume"] < 0)
+        (df["High"] < df[["Open", "Close"]].max(axis=1))
+        | (df["Low"] > df[["Open", "Close"]].min(axis=1))
+        | (df["High"] < df["Low"])
+        | (df["Volume"] < 0)
     )
+
     if bad.any():
-        print(f"  ⚠️ removing {int(bad.sum())} invalid futures candles for {contract_symbol} {timeframe}")
-        df = df.loc[~bad].reset_index(drop=True)
+        print(
+            f"  ⚠️ removing {int(bad.sum())} invalid candles for "
+            f"{symbol} {timeframe}"
+        )
+        df = df.loc[~bad].copy()
 
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    last_complete_open = floor_timestamp_ms(now_ms, tf_ms) - tf_ms
-    df = df[df["Date"].astype("int64") // 10**6 <= last_complete_open].reset_index(drop=True)
-
-    return df
+    return df.reset_index(drop=True)
 
 
-def resolve_markets():
-    """Resolve actual LBank contract symbols directly from the Contract API."""
-    contracts = get_futures_contracts()
-    resolved = {}
-    print("\n🔎 Resolving real LBank SwapU Futures contracts directly from LBank...")
-    for base in BASES:
-        symbol = contracts.get(base)
-        if symbol:
-            resolved[base] = symbol
-            print(f"  ✅ {base}: LBank contract={symbol}")
-        else:
-            print(f"  ⚠️ {base}: no SwapU USDT contract returned by LBank")
-    if not resolved:
-        raise RuntimeError("LBank returned no requested SwapU USDT contracts.")
-    return resolved
+def prepare_symbol(name, unified_symbol, since_ms, until_ms):
+    print(
+        f"\n📥 {name}: {unified_symbol} | "
+        f"downloading 1H + constructing 4H"
+    )
+
+    if not validate_ohlcv_support(unified_symbol):
+        print(f"  ⚠️ {name}: skipped because OHLCV preflight failed.")
+        return None
+
+    df1h = fetch_ohlcv_paginated(
+        unified_symbol,
+        "1h",
+        since_ms,
+        until_ms,
+    )
+
+    if len(df1h) < 500:
+        print(f"  ⚠️ insufficient 1H data: {len(df1h)}")
+        return None
+
+    # Build 4H from the same 1H LBank candles, exactly as the supplied
+    # working sample does. No second data source is introduced.
+    df4h = (
+        df1h.set_index("Date")
+        .resample("4h", label="left", closed="left")
+        .agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        })
+        .dropna()
+        .reset_index()
+    )
+
+    if len(df4h) < 250:
+        print(f"  ⚠️ insufficient 4H data: {len(df4h)}")
+        return None
+
+    df4h = build_4h_regime(add_indicators(df4h))
+
+    df1h = attach_4h_regime(
+        build_confirmed_pivots(add_indicators(df1h)),
+        df4h,
+    )
+
+    signals = build_signals(df1h)
+
+    print(
+        f"  ✓ 1H={len(df1h)}, 4H={len(df4h)}, "
+        f"signals={len(signals)}"
+    )
+
+    return {
+        "df": df1h,
+        "signals": signals,
+        "ccxt_symbol": unified_symbol,
+    }
 
 
 # ============================================================
@@ -1191,7 +1145,7 @@ def max_drawdown_from_r(trades):
 
 def report(trades, processed):
     print("\n" + "=" * 72)
-    print("📊 CLTS v1 — LBank Futures")
+    print("📊 CLTS v1 — LBank (same CCXT data path as supplied sample)")
     print("=" * 72)
 
     if trades.empty:
@@ -1290,8 +1244,8 @@ def report(trades, processed):
     print("\n" + "-" * 72)
     print("🔐 AUDIT")
     print("-" * 72)
-    print("✓ Real LBank SwapU contract resolved directly from LBank Contract API")
-    print("✓ Futures K-line REST adapter; NO Spot fallback")
+    print("✓ LBank connection is exactly ccxt.lbank({'enableRateLimit': True})")
+    print("✓ 1H data fetched through LBank CCXT fetch_ohlcv using BTC/USDT-style symbols")
     print("✓ Closed 1H + 4H candles only")
     print("✓ Entry = next 1H OPEN")
     print("✓ Confirmed pivots only")
@@ -1303,7 +1257,7 @@ def report(trades, processed):
     print("✓ Same-candle re-entry blocked")
     print("✓ SL first when SL+TP both touched")
     print("✓ End-of-data open positions are not forcibly closed")
-    print("✓ Funding is NOT fabricated; historical funding is excluded")
+    print("✓ No funding data is fabricated")
 
 
 # ============================================================
@@ -1312,11 +1266,11 @@ def report(trades, processed):
 
 def main():
     print("=" * 72)
-    print("🚀 CLTS v1 — LBank USDT-M Futures")
+    print("🚀 CLTS v1 — LBank / CCXT sample connection")
     print("   4H Regime → 1H Sweep → BOS → Retest → Entry → SL → 2R")
     print("=" * 72)
 
-    resolved = resolve_markets()
+    exchange.load_markets()
 
     end_dt = utc_now()
     start_dt = end_dt - timedelta(days=DAYS)
@@ -1332,7 +1286,7 @@ def main():
 
     processed = {}
 
-    for name, symbol in resolved.items():
+    for name, symbol in SYMBOLS.items():
         try:
             item = prepare_symbol(
                 name,
@@ -1370,7 +1324,7 @@ def main():
     if not processed:
         raise RuntimeError(
             "No symbol data was successfully prepared. "
-            "Check LBank Futures historical K-line endpoint availability and the contract-resolution output."
+            "Check LBank CCXT OHLCV availability and the supplied BTC/USDT-style symbols."
         )
 
     print("\n⚙️ Starting chronological backtest...")
