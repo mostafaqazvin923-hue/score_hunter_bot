@@ -290,15 +290,6 @@ def run_backtest(processed_data, regime_breadth_threshold=None):
     
                 outcome = "WIN" if r_real > 0 else "LOSS"
     
-                if outcome == "LOSS":
-                    portfolio_loss_streak += 1
-                else:
-                    portfolio_loss_streak = 0
-    
-                # فقط پس از 3 ضرر پیاپی، دو کندل بازار را استراحت می‌دهیم.
-                # این کار در حالت عادی هیچ اثری ندارد.
-                if portfolio_loss_streak >= STREAK_TRIGGER:
-                    streak_pause_remaining = STREAK_PAUSE_CANDLES
     
                 # اطلاعات تشخیصی در لحظه خروج؛ هیچ اثری بر معامله ندارد.
                 btc_regime = "UNKNOWN"
@@ -351,9 +342,6 @@ def run_backtest(processed_data, regime_breadth_threshold=None):
         # -------------------------
         # امتیازدهی و ورود
         # -------------------------
-        if streak_pause_remaining > 0:
-            streak_pause_remaining -= 1
-            continue
     
         current_scores = {}
     
