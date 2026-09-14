@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-V21 - Daily Institutional Swing)')
+print('📥 دریافت داده‌ها (HUNTER-V22 - Daily Mean Reversion Pullback)')
 print('============================================================')
 
 data_daily = {}
@@ -67,20 +67,30 @@ for symbol, lbank_symbol in SYMBOLS.items():
     df.sort_values('Date', inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # Indicators
     tr1 = df['High'] - df['Low']
     tr2 = np.abs(df['High'] - df['Close'].shift(1))
     tr3 = np.abs(df['Low'] - df['Close'].shift(1))
     df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
-    # 50-Day Donchian Channel for Major Structure Break
-    df['Donchian_High'] = df['High'].rolling(50).max().shift(1)
-    df['Donchian_Low'] = df['Low'].rolling(50).min().shift(1)
+    # Trend filter & Pullback core
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+    df['RSI'] = 100 - (
+        100
+        / (
+            1
+            + df['Close']
+            .diff()
+            .clip(lower=0)
+            .rolling(14)
+            .mean()
+            / df['Close'].diff().clip(upper=0).abs().rolling(14).mean()
+        )
+    )
 
     data_daily[symbol] = df
 
-print('⚙️ شروع اجرای بک‌تست روزانه HUNTER-V21...')
+print('⚙️ شروع اجرای بک‌تست روزانه HUNTER-V22...')
 
 all_timestamps = set()
 for df in data_daily.values():
@@ -111,7 +121,7 @@ for ts in sorted_timestamps:
           r_real = -1.0 - (FEE_RATE * 2)
         else:
           outcome = 'WIN'
-          r_real = 3.0 - (FEE_RATE * 2)
+          r_real = 1.8 - (FEE_RATE * 2)  # ریسک به ریوارد منطقی ۱.۸
 
         all_trades.append({
             'Timestamp': ts,
@@ -121,11 +131,6 @@ for ts in sorted_timestamps:
             'Return': r_real,
         })
         symbols_to_close.append(symbol)
-      else:
-        # Trail Stop loss with ATR if price moves up
-        new_sl = c_day['Close'] - (2.5 * c_day['ATR'])
-        if new_sl > pos['stop_loss']:
-          pos['stop_loss'] = new_sl
 
     elif pos['side'] == 'SHORT':
       hit_sl = c_day['High'] >= pos['stop_loss']
@@ -137,7 +142,7 @@ for ts in sorted_timestamps:
           r_real = -1.0 - (FEE_RATE * 2)
         else:
           outcome = 'WIN'
-          r_real = 3.0 - (FEE_RATE * 2)
+          r_real = 1.8 - (FEE_RATE * 2)
 
         all_trades.append({
             'Timestamp': ts,
@@ -147,10 +152,6 @@ for ts in sorted_timestamps:
             'Return': r_real,
         })
         symbols_to_close.append(symbol)
-      else:
-        new_sl = c_day['Close'] + (2.5 * c_day['ATR'])
-        if new_sl < pos['stop_loss']:
-          pos['stop_loss'] = new_sl
 
   for sym in symbols_to_close:
     del active_positions[sym]
@@ -166,27 +167,26 @@ for ts in sorted_timestamps:
     if match_rows.empty:
       continue
     i = match_rows.index[0]
-    if i < 60:
+    if i < 200:
       continue
 
     c_day = df.iloc[i]
     prev = df.iloc[i - 1]
 
-    # Breakout of 50-day high/low with EMA filter
-    breakout_long = (
-        prev['Close'] >= prev['Donchian_High']
+    # استراتژی: روند کلی صعودی است (قیمت بالای EMA50 و EMA200) و قیمت یک اصلاح (Pullback) به سمت EMA50 زده و RSI زیر ۴۵ آمده
+    long_pullback = (
+        prev['Close'] > prev['EMA200']
         and prev['Close'] > prev['EMA50']
-    )
-    breakout_short = (
-        prev['Close'] <= prev['Donchian_Low']
-        and prev['Close'] < prev['EMA50']
+        and prev['Low'] <= prev['EMA50']
+        and prev['Close'] > prev['EMA50']
+        and prev['RSI'] < 50
     )
 
-    if breakout_long:
+    if long_pullback:
       entry_price = c_day['Open'] * (1 + SLIPPAGE)
-      stop_loss = entry_price - (2.5 * prev['ATR'])
+      stop_loss = entry_price - (2.0 * prev['ATR'])
       risk = entry_price - stop_loss
-      take_profit = entry_price + (3.0 * risk)
+      take_profit = entry_price + (1.8 * risk)
 
       active_positions[symbol] = {
           'side': 'LONG',
@@ -196,22 +196,8 @@ for ts in sorted_timestamps:
       }
       continue
 
-    elif breakout_short:
-      entry_price = c_day['Open'] * (1 - SLIPPAGE)
-      stop_loss = entry_price + (2.5 * prev['ATR'])
-      risk = stop_loss - entry_price
-      take_profit = entry_price - (3.0 * risk)
-
-      active_positions[symbol] = {
-          'side': 'SHORT',
-          'entry_price': entry_price,
-          'stop_loss': stop_loss,
-          'take_profit': take_profit,
-      }
-      continue
-
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V21 (Daily Institutional Swing)')
+print('📊 گزارش نهایی HUNTER-V22 (Daily Mean Reversion)')
 print('============================================================')
 
 if all_trades:
