@@ -89,6 +89,7 @@ def calculate_indicators(df):
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
+    df['ATR_MA'] = df['ATR'].rolling(window=50).mean() # میانگین نوسان برای فیلتر رژیم نوسانی
     
     plus_dm = df['High'].diff().clip(lower=0)
     minus_dm = (-df['Low'].diff()).clip(lower=0)
@@ -100,7 +101,7 @@ def calculate_indicators(df):
     return df
 
 print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست اصلاح‌شده (با فیلترهای سخت‌گیرانه وین‌ریت)")
+print("🚀 اجرای موتور بک‌تست با مکانیزم ضد ضرر متوالی (Anti-Streak Cooldown)")
 print("============================================================")
 
 all_portfolio_trades = []
@@ -111,7 +112,6 @@ for symbol, df1h in data_1h.items():
         
     df1h = calculate_indicators(df1h)
     
-    # ساخت کندل 4 ساعته با استاندارد 'h' (بدون هشدار deprecation)
     df4h = df1h.set_index('Date').resample('4h').agg({
         'Open': 'first',
         'High': 'max',
@@ -126,14 +126,20 @@ for symbol, df1h in data_1h.items():
     df4h_indexed = df4h.set_index('Date')
     
     locked_until_index = 0
+    consecutive_losses_count = 0  # شمارشگر ضررهای متوالی برای هر نماد
+    cooldown_until_time = None    # زمان رفع مسدودیت بعد از ضرر متوالی
     
     for i in range(200, len(df1h) - 40):
         if i < locked_until_index:
             continue
             
         c1h = df1h.iloc[i]
-        t4h_time = c1h['Date_4H']
         
+        # بررسی زمان Cooldown بعد از ضررهای متوالی
+        if cooldown_until_time and c1h['Date'] < cooldown_until_time:
+            continue
+            
+        t4h_time = c1h['Date_4H']
         if t4h_time not in df4h_indexed.index:
             continue
             
@@ -149,38 +155,39 @@ for symbol, df1h in data_1h.items():
         except:
             slope_positive = True
             
-        # 💡 اصلاح اساسی ۱: افزایش سخت‌گیری فیلتر رژیم بازار (ADX >= 25 و شیب روند)
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 25) and (r4h['RSI'] > 58)
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 25) and (r4h['RSI'] < 42)
+        # فیلترهای فوق‌سخت‌گیرانه روند و نوسان برای جلوگیری از ورود در بازار خنثی
+        volatility_ok = c1h['ATR'] >= c1h['ATR_MA'] * 0.8 # فیلتر عدم ورود در نوسانات بسیار مرده
+        
+        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 30) and (r4h['RSI'] > 62) and volatility_ok
+        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 30) and (r4h['RSI'] < 38) and volatility_ok
         
         if not is_long_regime and not is_short_regime:
             continue
             
-        lookback_slice = df1h.iloc[i-20:i]
+        lookback_slice = df1h.iloc[i-24:i]
         struct_high = lookback_slice['High'].max()
         struct_low = lookback_slice['Low'].min()
         
         avg_vol = lookback_slice['Volume'].mean()
-        # 💡 اصلاح اساسی ۲: افزایش فیلتر حجم به 1.5 برابر میانگین برای تایید شکست معتبر
-        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 1.5)
-        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 1.5)
+        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 2.0)
+        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 2.0)
         
         if is_long_regime and is_breakout_long:
             entered = False
-            for p in range(1, 10):
+            for p in range(1, 6):
                 if i + p >= len(df1h) - 10:
                     break
                 p_candle = df1h.iloc[i + p]
                 
-                if p_candle['Low'] <= struct_high * 1.002: 
-                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 52:
+                if p_candle['Low'] <= struct_high * 1.001: 
+                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 58:
                         entry_price = p_candle['Close']
                         entry_time = p_candle['Date']
                         swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
-                        sl = swing_low_pullback - (0.5 * p_candle['ATR']) # افزایش فاصله منطقی SL
+                        sl = swing_low_pullback - (0.4 * p_candle['ATR'])
                         risk = entry_price - sl
                         
-                        if risk <= 0 or (risk / entry_price) > 0.035:
+                        if risk <= 0 or (risk / entry_price) > 0.025:
                             break
                             
                         tp = entry_price + (2.0 * risk)
@@ -208,6 +215,17 @@ for symbol, df1h in data_1h.items():
                                 'EntryTime': entry_time,
                                 'ExitTime': exit_time
                             })
+                            
+                            # مدیریت ضررهای متوالی و استراحت (Cooldown)
+                            if outcome == 'LOSS':
+                                consecutive_losses_count += 1
+                                if consecutive_losses_count >= 2: # بعد از ۲ ضرر متوالی، نماد برای ۲۴ ساعت قفل می‌شود
+                                    cooldown_until_time = exit_time + timedelta(hours=24)
+                                    consecutive_losses_count = 0
+                            else:
+                                consecutive_losses_count = 0
+                                cooldown_until_time = None
+                                
                             locked_until_index = exit_idx
                             entered = True
                             break
@@ -216,20 +234,20 @@ for symbol, df1h in data_1h.items():
                 
         elif is_short_regime and is_breakout_short:
             entered = False
-            for p in range(1, 10):
+            for p in range(1, 6):
                 if i + p >= len(df1h) - 10:
                     break
                 p_candle = df1h.iloc[i + p]
                 
-                if p_candle['High'] >= struct_low * 0.998:
-                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 48:
+                if p_candle['High'] >= struct_low * 0.999:
+                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 42:
                         entry_price = p_candle['Close']
                         entry_time = p_candle['Date']
                         swing_high_pullback = df1h.iloc[i:i+p+1]['High'].max()
-                        sl = swing_high_pullback + (0.5 * p_candle['ATR'])
+                        sl = swing_high_pullback + (0.4 * p_candle['ATR'])
                         risk = sl - entry_price
                         
-                        if risk <= 0 or (risk / entry_price) > 0.035:
+                        if risk <= 0 or (risk / entry_price) > 0.025:
                             break
                             
                         tp = entry_price - (2.0 * risk)
@@ -257,12 +275,22 @@ for symbol, df1h in data_1h.items():
                                 'EntryTime': entry_time,
                                 'ExitTime': exit_time
                             })
+                            
+                            if outcome == 'LOSS':
+                                consecutive_losses_count += 1
+                                if consecutive_losses_count >= 2:
+                                    cooldown_until_time = exit_time + timedelta(hours=24)
+                                    consecutive_losses_count = 0
+                            else:
+                                consecutive_losses_count = 0
+                                cooldown_until_time = None
+                                
                             locked_until_index = exit_idx
                             entered = True
                             break
 
 print("\n============================================================")
-print("📊 گزارش جامع عملکرد پورتفوی اصلاح‌شده و تحلیل دوره‌های ضرر متوالی")
+print("📊 گزارش جامع پورتفوی ضد ضرر متوالی")
 print("============================================================")
 
 if all_portfolio_trades:
@@ -287,7 +315,7 @@ if all_portfolio_trades:
     symbol_breakdown['WinRate %'] = (symbol_breakdown.get('WIN', 0) / (symbol_breakdown.get('WIN', 0) + symbol_breakdown.get('LOSS', 0))) * 100
     print(symbol_breakdown)
     
-    print("\n--- شناسایی دوره‌های ضررهای متوالی (Consecutive Losses) ---")
+    print("\n--- بررسی دوره‌های ضررهای متوالی پس از اعمال مکانیزم ضد ضرر ---")
     consecutive_loss_periods = []
     current_streak = []
     
@@ -319,4 +347,4 @@ if all_portfolio_trades:
 else:
     print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
 
-print("\n✨ بک‌تست اصلاح‌شده به اتمام رسید.")
+print("\n✨ تست به اتمام رسید.")
