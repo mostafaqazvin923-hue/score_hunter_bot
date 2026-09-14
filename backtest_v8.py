@@ -32,96 +32,153 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-V22 - Daily Mean Reversion Pullback)')
+print('📥 دریافت داده‌ها (HUNTER-V23 - Multi-Timeframe 1D & 4H)')
 print('============================================================')
 
-data_daily = {}
+processed_data = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-  all_ohlcv = []
+  # دریافت داده‌های 4 ساعته
+  all_ohlcv_4h = []
   current_since = since_timestamp
   now_timestamp = exchange.milliseconds()
 
   while current_since < now_timestamp:
     try:
       ohlcv = exchange.fetch_ohlcv(
-          lbank_symbol, timeframe='1d', since=current_since, limit=1000
+          lbank_symbol, timeframe='4h', since=current_since, limit=1000
       )
       if not ohlcv:
         break
       current_since = ohlcv[-1][0] + 1
-      all_ohlcv.extend(ohlcv)
+      all_ohlcv_4h.extend(ohlcv)
       if len(ohlcv) < 1000:
         break
     except Exception:
       break
 
-  if all_ohlcv:
-    df = pd.DataFrame(
-        all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
-    )
-    df['Date'] = pd.to_datetime(df['Timestamp'], unit='ms')
-    df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-    df.dropna(inplace=True)
-    df.drop_duplicates(subset=['Date'], inplace=True)
-    df.sort_values('Date', inplace=True)
-    df.reset_index(drop=True, inplace=True)
+  if not all_ohlcv_4h:
+    continue
 
-    tr1 = df['High'] - df['Low']
-    tr2 = np.abs(df['High'] - df['Close'].shift(1))
-    tr3 = np.abs(df['Low'] - df['Close'].shift(1))
-    df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
+  df4h = pd.DataFrame(
+      all_ohlcv_4h,
+      columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'],
+  )
+  df4h['Date'] = pd.to_datetime(df4h['Timestamp'], unit='ms')
+  df4h = df4h[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+  df4h.dropna(inplace=True)
+  df4h.drop_duplicates(subset=['Date'], inplace=True)
+  df4h.sort_values('Date', inplace=True)
+  df4h.reset_index(drop=True, inplace=True)
 
-    # Trend filter & Pullback core
-    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    df['RSI'] = 100 - (
-        100
-        / (
-            1
-            + df['Close']
-            .diff()
-            .clip(lower=0)
-            .rolling(14)
-            .mean()
-            / df['Close'].diff().clip(upper=0).abs().rolling(14).mean()
-        )
-    )
+  # اندیکاتورهای 4 ساعته
+  tr1 = df4h['High'] - df4h['Low']
+  tr2 = np.abs(df4h['High'] - df4h['Close'].shift(1))
+  tr3 = np.abs(df4h['Low'] - df4h['Close'].shift(1))
+  df4h['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
+  df4h['EMA20'] = df4h['Close'].ewm(span=20, adjust=False).mean()
+  df4h['Volume_MA'] = df4h['Volume'].rolling(20).mean()
 
-    data_daily[symbol] = df
+  # ساخت فریم روزانه از روی داده‌های 4 ساعته برای جهت بازار
+  df4h['Date_Daily'] = df4h['Date'].dt.floor('1d')
+  df_daily = (
+      df4h.set_index('Date')
+      .resample('1d')
+      .agg({
+          'Open': 'first',
+          'High': 'max',
+          'Low': 'min',
+          'Close': 'last',
+          'Volume': 'sum',
+      })
+      .dropna()
+      .reset_index()
+  )
+  df_daily['EMA50_Daily'] = (
+      df_daily['Close'].ewm(span=50, adjust=False).mean().shift(1)
+  )
 
-print('⚙️ شروع اجرای بک‌تست روزانه HUNTER-V22...')
+  # محاسبه ADX روزانه برای تشخیص رژیم روند
+  tr_d1 = df_daily['High'] - df_daily['Low']
+  tr_d2 = np.abs(df_daily['High'] - df_daily['Close'].shift(1))
+  tr_d3 = np.abs(df_daily['Low'] - df_daily['Close'].shift(1))
+  atr_d = pd.concat([tr_d1, tr_d2, tr_d3], axis=1).max(axis=1).rolling(14).mean()
+  plus_dm = df_daily['High'].diff()
+  minus_dm = df_daily['Low'].diff()
+  plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+  minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+  plus_di = (
+      100
+      * pd.Series(plus_dm).rolling(14).mean()
+      / (atr_d.replace(0, np.nan))
+  )
+  minus_di = (
+      100
+      * pd.Series(minus_dm).rolling(14).mean()
+      / (atr_d.replace(0, np.nan))
+  )
+  dx = (
+      100
+      * np.abs(plus_di - minus_di)
+      / (plus_di + minus_di).replace(0, np.nan)
+  )
+  df_daily['ADX_Daily'] = dx.rolling(14).mean()
+
+  processed_data[symbol] = {
+      '4h': df4h.set_index('Date'),
+      'daily': df_daily.set_index('Date'),
+  }
+
+print('⚙️ شروع اجرای بک‌تست چندتایم‌فریمه HUNTER-V23...')
 
 all_timestamps = set()
-for df in data_daily.values():
-  all_timestamps.update(df['Date'].tolist())
+for dat in processed_data.values():
+  all_timestamps.update(dat['4h'].index.tolist())
 sorted_timestamps = sorted(list(all_timestamps))
 
 active_positions = {}
 all_trades = []
-SLIPPAGE = 0.0005
+SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
+MAX_CONCURRENT_POSITIONS = 2
 
-dfs_daily = {sym: df.set_index('Date') for sym, df in data_daily.items()}
+dfs_4h = {sym: dat['4h'] for sym, dat in processed_data.items()}
+dfs_daily = {sym: dat['daily'] for sym, dat in processed_data.items()}
 
 for ts in sorted_timestamps:
   symbols_to_close = []
   for symbol, pos in active_positions.items():
-    if ts not in dfs_daily[symbol].index:
+    if ts not in dfs_4h[symbol].index:
       continue
-    c_day = dfs_daily[symbol].loc[ts]
+    c4h = dfs_4h[symbol].loc[ts]
+    entry_index = pos['entry_index']
+    df4h_local = dfs_4h[symbol]
+    match_rows = df4h_local.reset_index()
+    match_rows = match_rows[match_rows['Date'] == ts]
+    if match_rows.empty:
+      continue
+    curr_i = match_rows.index[0]
+    candles_held = curr_i - pos['raw_index']
 
     if pos['side'] == 'LONG':
-      hit_sl = c_day['Low'] <= pos['stop_loss']
-      hit_tp = c_day['High'] >= pos['take_profit']
+      hit_sl = c4h['Low'] <= pos['stop_loss']
+      hit_tp = c4h['High'] >= pos['take_profit']
+      is_timeout = candles_held >= 30  # حداکثر ۵ روز نگهداری در 4H
 
-      if hit_sl or hit_tp:
+      if hit_sl or hit_tp or is_timeout:
         if hit_sl:
           outcome = 'LOSS'
           r_real = -1.0 - (FEE_RATE * 2)
-        else:
+        elif hit_tp:
           outcome = 'WIN'
-          r_real = 1.8 - (FEE_RATE * 2)  # ریسک به ریوارد منطقی ۱.۸
+          r_real = 2.2 - (FEE_RATE * 2)
+        else:
+          risk = pos['entry_price'] - pos['stop_loss']
+          if risk > 0:
+            r_real = (c4h['Close'] - pos['entry_price']) / risk - (FEE_RATE * 2)
+          else:
+            r_real = 0.0
+          outcome = 'WIN' if r_real > 0 else 'LOSS'
 
         all_trades.append({
             'Timestamp': ts,
@@ -132,72 +189,70 @@ for ts in sorted_timestamps:
         })
         symbols_to_close.append(symbol)
 
-    elif pos['side'] == 'SHORT':
-      hit_sl = c_day['High'] >= pos['stop_loss']
-      hit_tp = c_day['Low'] <= pos['take_profit']
-
-      if hit_sl or hit_tp:
-        if hit_sl:
-          outcome = 'LOSS'
-          r_real = -1.0 - (FEE_RATE * 2)
-        else:
-          outcome = 'WIN'
-          r_real = 1.8 - (FEE_RATE * 2)
-
-        all_trades.append({
-            'Timestamp': ts,
-            'Symbol': symbol,
-            'Side': 'SHORT',
-            'Outcome': outcome,
-            'Return': r_real,
-        })
-        symbols_to_close.append(symbol)
-
   for sym in symbols_to_close:
     del active_positions[sym]
 
-  for symbol, df in data_daily.items():
+  for symbol, dat in processed_data.items():
     if symbol in active_positions:
       continue
+    if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
+      break
 
-    if ts not in df['Date'].values:
+    df4h = dat['4h']
+    if ts not in df4h.index:
       continue
 
-    match_rows = df[df['Date'] == ts]
+    df4h_reset = df4h.reset_index()
+    match_rows = df4h_reset[df4h_reset['Date'] == ts]
     if match_rows.empty:
       continue
     i = match_rows.index[0]
-    if i < 200:
+    if i < 50:
       continue
 
-    c_day = df.iloc[i]
-    prev = df.iloc[i - 1]
+    c4h = df4h.iloc[i]
+    prev4h = df4h.iloc[i - 1]
 
-    # استراتژی: روند کلی صعودی است (قیمت بالای EMA50 و EMA200) و قیمت یک اصلاح (Pullback) به سمت EMA50 زده و RSI زیر ۴۵ آمده
-    long_pullback = (
-        prev['Close'] > prev['EMA200']
-        and prev['Close'] > prev['EMA50']
-        and prev['Low'] <= prev['EMA50']
-        and prev['Close'] > prev['EMA50']
-        and prev['RSI'] < 50
+    # بررسی جهت بازار در تایم‌فریم روزانه
+    daily_time = pd.Timestamp(ts).floor('1d')
+    df_d = dfs_daily[symbol]
+    if daily_time not in df_d.index:
+      continue
+
+    d_row = df_d.loc[daily_time]
+    macro_bull = d_row['Close'] > d_row.get(
+        'EMA50_Daily', d_row['Close']
+    ) and d_row.get('ADX_Daily', 30) > 22
+
+    # ستاپ ورود ۴ ساعته: روند روزانه صعودی + پولبک به EMA20 در ۴ ساعته + تایید حجم
+    long_signal = (
+        macro_bull
+        and prev4h['Low'] <= prev4h['EMA20']
+        and prev4h['Close'] > prev4h['EMA20']
+        and prev4h['Volume'] > (1.2 * prev4h['Volume_MA'])
     )
 
-    if long_pullback:
-      entry_price = c_day['Open'] * (1 + SLIPPAGE)
-      stop_loss = entry_price - (2.0 * prev['ATR'])
-      risk = entry_price - stop_loss
-      take_profit = entry_price + (1.8 * risk)
+    if long_signal:
+      entry_price = c4h['Open'] * (1 + SLIPPAGE)
+      stop_loss = (
+          df4h['Low'].iloc[i - 4 : i].min() - 0.2 * prev4h['ATR']
+      )  # کف محلی 4 ساعته
+      sl_dist_pct = (entry_price - stop_loss) / entry_price
 
-      active_positions[symbol] = {
-          'side': 'LONG',
-          'entry_price': entry_price,
-          'stop_loss': stop_loss,
-          'take_profit': take_profit,
-      }
-      continue
+      if 0.005 <= sl_dist_pct <= 0.03:
+        risk = entry_price - stop_loss
+        take_profit = entry_price + (2.2 * risk)
+        active_positions[symbol] = {
+            'side': 'LONG',
+            'entry_price': entry_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'raw_index': i,
+        }
+        continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V22 (Daily Mean Reversion)')
+print('📊 گزارش نهایی HUNTER-V23 (Multi-Timeframe 1D + 4H)')
 print('============================================================')
 
 if all_trades:
