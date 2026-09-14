@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-V24 - Modern Quant Volatility & Z-Score)')
+print('📥 دریافت داده‌ها (HUNTER-V25 - Smart Money Order Block & Sweep)')
 print('============================================================')
 
 processed_data = {}
@@ -70,35 +70,13 @@ for symbol, lbank_symbol in SYMBOLS.items():
   df4h.sort_values('Date', inplace=True)
   df4h.reset_index(drop=True, inplace=True)
 
-  # ابزارهای مدرن کمیتی: Bollinger Bands + Volume Z-Score + ATR Channel
-  df4h['ATR'] = (
-      pd.concat(
-          [
-              df4h['High'] - df4h['Low'],
-              np.abs(df4h['High'] - df4h['Close'].shift(1)),
-              np.abs(df4h['Low'] - df4h['Close'].shift(1)),
-          ],
-          axis=1,
-      )
-      .max(axis=1)
-      .rolling(20)
-      .mean()
-  )
+  # محاسبه ATR برای مدیریت ریسک ساختاری
+  tr1 = df4h['High'] - df4h['Low']
+  tr2 = np.abs(df4h['High'] - df4h['Close'].shift(1))
+  tr3 = np.abs(df4h['Low'] - df4h['Close'].shift(1))
+  df4h['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
-  # باند بولینگر استاندارد
-  sma20 = df4h['Close'].rolling(20).mean()
-  std20 = df4h['Close'].rolling(20).std()
-  df4h['BB_Upper'] = sma20 + (2.0 * std20)
-  df4h['BB_Lower'] = sma20 - (2.0 * std20)
-
-  # استاندارد زدن حجم (Volume Z-Score) برای تشخیص ورود پول واقعی نهنگ‌ها
-  vol_mean = df4h['Volume'].rolling(30).mean()
-  vol_std = df4h['Volume'].rolling(30).std()
-  df4h['Vol_ZScore'] = (df4h['Volume'] - vol_mean) / (
-      vol_std.replace(0, np.nan)
-  )
-
-  # ساخت جهت بازار روزانه مدرن (Donchian Channel 20 در روزانه)
+  # جهت بازار روزانه (تایید روند کلان)
   df4h['Date_Daily'] = df4h['Date'].dt.floor('1d')
   df_daily = (
       df4h.set_index('Date')
@@ -113,15 +91,14 @@ for symbol, lbank_symbol in SYMBOLS.items():
       .dropna()
       .reset_index()
   )
-  df_daily['Donchian_High'] = df_daily['High'].rolling(20).max().shift(1)
-  df_daily['Donchian_Low'] = df_daily['Low'].rolling(20).min().shift(1)
+  df_daily['EMA50'] = df_daily['Close'].ewm(span=50, adjust=False).mean()
 
   processed_data[symbol] = {
       '4h': df4h.set_index('Date'),
       'daily': df_daily.set_index('Date'),
   }
 
-print('⚙️ شروع اجرای بک‌تست مدرن HUNTER-V24...')
+print('⚙️ شروع اجرای بک‌تست هوشمند HUNTER-V25...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -153,7 +130,7 @@ for ts in sorted_timestamps:
     if pos['side'] == 'LONG':
       hit_sl = c4h['Low'] <= pos['stop_loss']
       hit_tp = c4h['High'] >= pos['take_profit']
-      is_timeout = candles_held >= 24  # حداکثر ۴ روز در پوزیشن
+      is_timeout = candles_held >= 30
 
       if hit_sl or hit_tp or is_timeout:
         if hit_sl:
@@ -161,7 +138,7 @@ for ts in sorted_timestamps:
           r_real = -1.0 - (FEE_RATE * 2)
         elif hit_tp:
           outcome = 'WIN'
-          r_real = 2.0 - (FEE_RATE * 2)
+          r_real = 2.5 - (FEE_RATE * 2)  # ریوارد استاندارد ۲.۵ برابری
         else:
           risk = pos['entry_price'] - pos['stop_loss']
           if risk > 0:
@@ -197,37 +174,40 @@ for ts in sorted_timestamps:
     if match_rows.empty:
       continue
     i = match_rows.index[0]
-    if i < 40:
+    if i < 20:
       continue
 
     c4h = df4h.iloc[i]
     prev4h = df4h.iloc[i - 1]
+    p_prev4h = df4h.iloc[i - 2]
 
     daily_time = pd.Timestamp(ts).floor('1d')
     df_d = dfs_daily[symbol]
     if daily_time not in df_d.index:
       continue
-
     d_row = df_d.loc[daily_time]
-    # فیلتر روند روزانه مدرن: قیمت بالای کانال میانه‌رو روزانه باشد و حجم انفجاری (Z-Score > 1.5) در 4H ثبت شود
-    macro_trend = prev4h['Close'] > d_row.get(
-        'Donchian_Low', prev4h['Close']
-    ) and prev4h['Close'] >= prev4h['BB_Upper'] * 0.99
 
-    modern_signal = (
-        macro_trend
-        and prev4h['Vol_ZScore'] > 1.5  # ورود حجم غیرعادی و نهنگ‌پسند
+    # تایید روند صعودی در تایم‌فریم روزانه
+    macro_bull = d_row['Close'] > d_row['EMA50']
+
+    # ستاپ اسمارت مانی (Smart Money Setup):
+    # 1. لیکوییدی سوئپ (کف قبلی زده شده و سریع برگشته بالا)
+    # 2. بلوک سفارشی صعودی (آخرین کندل منفی قبل از پامپ)
+    is_sweep = (
+        prev4h['Low'] < df4h['Low'].iloc[i - 5 : i - 1].min()
         and prev4h['Close'] > prev4h['Open']
     )
+    bullish_ob = p_prev4h['Close'] < p_prev4h['Open']  # کندل منفی قبلی
 
-    if modern_signal:
+    if macro_bull and is_sweep and bullish_ob:
       entry_price = c4h['Open'] * (1 + SLIPPAGE)
-      stop_loss = entry_price - (1.5 * prev4h['ATR'])
+      # استاپ لاس پشت کفِ سویپ شده قرار میگیرد تا توسط نهنگ ها هانت نشود
+      stop_loss = prev4h['Low'] - (0.5 * prev4h['ATR'])
       sl_dist_pct = (entry_price - stop_loss) / entry_price
 
-      if 0.01 <= sl_dist_pct <= 0.04:
+      if 0.008 <= sl_dist_pct <= 0.035:
         risk = entry_price - stop_loss
-        take_profit = entry_price + (2.0 * risk)
+        take_profit = entry_price + (2.5 * risk)
         active_positions[symbol] = {
             'side': 'LONG',
             'entry_price': entry_price,
@@ -238,7 +218,7 @@ for ts in sorted_timestamps:
         continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V24 (Modern Volatility & Z-Score)')
+print('📊 گزارش نهایی HUNTER-V25 (Smart Money Order Block & Sweep)')
 print('============================================================')
 
 if all_trades:
