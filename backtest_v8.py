@@ -6,345 +6,407 @@ from datetime import datetime, timedelta
 try:
     import ccxt
 except ImportError:
-    print("📦 در حال نصب کتابخانه ccxt...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
     import ccxt
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# اتصال به صرافی LBank و تعریف سبد ۱۰ ارز
 exchange = ccxt.lbank({'enableRateLimit': True})
+
+# سبد ۱۱ ارزی بهینه‌شده
 SYMBOLS = {
-    "BTC": "BTC/USDT",
-    "ETH": "ETH/USDT",
-    "SOL": "SOL/USDT",
-    "XRP": "XRP/USDT",
-    "ADA": "ADA/USDT",
-    "AVAX": "AVAX/USDT",
-    "LINK": "LINK/USDT",
-    "NEAR": "NEAR/USDT",
-    "SUI": "SUI/USDT",
-    "DOT": "DOT/USDT"
+    'BTC': 'BTC/USDT',
+    'ETH': 'ETH/USDT',
+    'SOL': 'SOL/USDT',
+    'XRP': 'XRP/USDT',
+    'ADA': 'ADA/USDT',
+    'AVAX': 'AVAX/USDT',
+    'DOGE': 'DOGE/USDT',
+    'DOT': 'DOT/USDT',
+    'LTC': 'LTC/USDT',
+    'RENDER': 'RENDER/USDT',
+    'ATOM': 'ATOM/USDT',
 }
 
 start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
-print("============================================================")
-print("📥 دانلود داده‌های 1 ساعته و ساخت کندل‌های 4 ساعته از LBank")
-print("============================================================")
+print('============================================================')
+print('📥 دریافت داده‌ها (HUNTER-ICHIMOKU V11 - Kumo Twist & Trend Filter)')
+print('============================================================')
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    filename_1h = f"{symbol}_1h_optimized_data.csv"
-    print(f"🔹 در حال دریافت دیتای 1 ساعته {symbol}...")
-    
-    all_ohlcv = []
-    current_since = since_timestamp
-    now_timestamp = exchange.milliseconds()
-    
-    while current_since < now_timestamp:
-        try:
-            ohlcv = exchange.fetch_ohlcv(lbank_symbol, timeframe='1h', since=current_since, limit=1000)
-            if not ohlcv:
-                break
-            current_since = ohlcv[-1][0] + 1
-            all_ohlcv.extend(ohlcv)
-            if len(ohlcv) < 1000:
-                break
-        except Exception as e:
-            print(f"  ❌ خطا در دریافت داده {symbol}: {e}")
-            break
-            
-    if all_ohlcv:
-        df1h = pd.DataFrame(all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-        df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
-        df1h = df1h[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-        df1h.dropna(inplace=True)
-        df1h.drop_duplicates(subset=['Date'], inplace=True)
-        df1h.sort_values('Date', inplace=True)
-        df1h.reset_index(drop=True, inplace=True)
-        
-        df1h.to_csv(filename_1h, index=False)
-        data_1h[symbol] = df1h
-        print(f"  ✔️ دیتای 1 ساعته {symbol} آماده شد (تعداد کندل: {len(df1h)})")
-    else:
-        print(f"  ❌ دیتایی برای {symbol} دریافت نشد.")
+  all_ohlcv = []
+  current_since = since_timestamp
+  now_timestamp = exchange.milliseconds()
 
-def calculate_indicators(df):
-    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['ATR'] = tr.rolling(window=14).mean()
-    df['ATR_MA'] = df['ATR'].rolling(window=50).mean() # میانگین نوسان برای فیلتر رژیم نوسانی
-    
-    plus_dm = df['High'].diff().clip(lower=0)
-    minus_dm = (-df['Low'].diff()).clip(lower=0)
-    tr14 = tr.rolling(window=14).mean()
-    plus_di = 100 * (plus_dm.rolling(window=14).mean() / tr14)
-    minus_di = 100 * (minus_dm.rolling(window=14).mean() / tr14)
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-    df['ADX'] = dx.rolling(window=14).mean().fillna(20)
-    return df
+  while current_since < now_timestamp:
+    try:
+      ohlcv = exchange.fetch_ohlcv(
+          lbank_symbol, timeframe='1h', since=current_since, limit=1000
+      )
+      if not ohlcv:
+        break
+      current_since = ohlcv[-1][0] + 1
+      all_ohlcv.extend(ohlcv)
+      if len(ohlcv) < 1000:
+        break
+    except Exception:
+      break
 
-print("\n============================================================")
-print("🚀 اجرای موتور بک‌تست با مکانیزم ضد ضرر متوالی (Anti-Streak Cooldown)")
-print("============================================================")
+  if all_ohlcv:
+    df1h = pd.DataFrame(
+        all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
+    )
+    df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
+    df1h = df1h[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+    df1h.dropna(inplace=True)
+    df1h.drop_duplicates(subset=['Date'], inplace=True)
+    df1h.sort_values('Date', inplace=True)
+    df1h.reset_index(drop=True, inplace=True)
+    data_1h[symbol] = df1h
 
-all_portfolio_trades = []
 
+def calculate_ichimoku(df):
+  df = df.copy()
+  period9_high = df['High'].rolling(window=9).max()
+  period9_low = df['Low'].rolling(window=9).min()
+  df['Tenkan'] = (period9_high + period9_low) / 2
+
+  period26_high = df['High'].rolling(window=26).max()
+  period26_low = df['Low'].rolling(window=26).min()
+  df['Kijun'] = (period26_high + period26_low) / 2
+
+  df['Senkou_A'] = ((df['Tenkan'] + df['Kijun']) / 2).shift(26)
+
+  period52_high = df['High'].rolling(window=52).max()
+  period52_low = df['Low'].rolling(window=52).min()
+  df['Senkou_B'] = ((period52_high + period52_low) / 2).shift(26)
+
+  tr1 = df['High'] - df['Low']
+  tr2 = np.abs(df['High'] - df['Close'].shift(1))
+  tr3 = np.abs(df['Low'] - df['Close'].shift(1))
+  df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
+
+  return df
+
+
+processed_data = {}
 for symbol, df1h in data_1h.items():
-    if len(df1h) < 300:
-        continue
-        
-    df1h = calculate_indicators(df1h)
-    
-    df4h = df1h.set_index('Date').resample('4h').agg({
-        'Open': 'first',
-        'High': 'max',
-        'Low': 'min',
-        'Close': 'last',
-        'Volume': 'sum'
-    }).dropna().reset_index()
-    
-    df4h = calculate_indicators(df4h)
-    
-    df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
-    df4h_indexed = df4h.set_index('Date')
-    
-    locked_until_index = 0
-    consecutive_losses_count = 0  # شمارشگر ضررهای متوالی برای هر نماد
-    cooldown_until_time = None    # زمان رفع مسدودیت بعد از ضرر متوالی
-    
-    for i in range(200, len(df1h) - 40):
-        if i < locked_until_index:
-            continue
-            
-        c1h = df1h.iloc[i]
-        
-        # بررسی زمان Cooldown بعد از ضررهای متوالی
-        if cooldown_until_time and c1h['Date'] < cooldown_until_time:
-            continue
-            
-        t4h_time = c1h['Date_4H']
-        if t4h_time not in df4h_indexed.index:
-            continue
-            
-        r4h = df4h_indexed.loc[t4h_time]
-        
-        ema20_4h = r4h['EMA_20']
-        ema50_4h = r4h['EMA_50']
-        ema200_4h = r4h['EMA_200']
-        
-        try:
-            prev_ema200_4h = df4h.loc[df4h['Date'] == t4h_time, 'EMA_200'].values[0]
-            slope_positive = ema200_4h >= prev_ema200_4h
-        except:
-            slope_positive = True
-            
-        # فیلترهای فوق‌سخت‌گیرانه روند و نوسان برای جلوگیری از ورود در بازار خنثی
-        volatility_ok = c1h['ATR'] >= c1h['ATR_MA'] * 0.8 # فیلتر عدم ورود در نوسانات بسیار مرده
-        
-        is_long_regime = (r4h['Close'] > ema200_4h) and (ema20_4h > ema50_4h) and (ema50_4h > ema200_4h) and slope_positive and (r4h['ADX'] >= 30) and (r4h['RSI'] > 62) and volatility_ok
-        is_short_regime = (r4h['Close'] < ema200_4h) and (ema20_4h < ema50_4h) and (ema50_4h < ema200_4h) and (r4h['ADX'] >= 30) and (r4h['RSI'] < 38) and volatility_ok
-        
-        if not is_long_regime and not is_short_regime:
-            continue
-            
-        lookback_slice = df1h.iloc[i-24:i]
-        struct_high = lookback_slice['High'].max()
-        struct_low = lookback_slice['Low'].min()
-        
-        avg_vol = lookback_slice['Volume'].mean()
-        is_breakout_long = (c1h['Close'] > struct_high) and (c1h['Volume'] >= avg_vol * 2.0)
-        is_breakout_short = (c1h['Close'] < struct_low) and (c1h['Volume'] >= avg_vol * 2.0)
-        
-        if is_long_regime and is_breakout_long:
-            entered = False
-            for p in range(1, 6):
-                if i + p >= len(df1h) - 10:
-                    break
-                p_candle = df1h.iloc[i + p]
-                
-                if p_candle['Low'] <= struct_high * 1.001: 
-                    if p_candle['Close'] > p_candle['Open'] and p_candle['RSI'] > 58:
-                        entry_price = p_candle['Close']
-                        entry_time = p_candle['Date']
-                        swing_low_pullback = df1h.iloc[i:i+p+1]['Low'].min()
-                        sl = swing_low_pullback - (0.4 * p_candle['ATR'])
-                        risk = entry_price - sl
-                        
-                        if risk <= 0 or (risk / entry_price) > 0.025:
-                            break
-                            
-                        tp = entry_price + (2.0 * risk)
-                        
-                        outcome = 'OPEN'
-                        exit_idx = i + p + 1
-                        exit_time = entry_time
-                        
-                        for j in range(i + p + 1, min(i + p + 45, len(df1h))):
-                            f_c = df1h.iloc[j]
-                            exit_idx = j
-                            exit_time = f_c['Date']
-                            if f_c['Low'] <= sl:
-                                outcome = 'LOSS'
-                                break
-                            elif f_c['High'] >= tp:
-                                outcome = 'WIN'
-                                break
-                                
-                        if outcome in ['WIN', 'LOSS']:
-                            all_portfolio_trades.append({
-                                'Symbol': symbol,
-                                'Side': 'LONG',
-                                'Outcome': outcome,
-                                'EntryTime': entry_time,
-                                'ExitTime': exit_time
-                            })
-                            
-                            # مدیریت ضررهای متوالی و استراحت (Cooldown)
-                            if outcome == 'LOSS':
-                                consecutive_losses_count += 1
-                                if consecutive_losses_count >= 2: # بعد از ۲ ضرر متوالی، نماد برای ۲۴ ساعت قفل می‌شود
-                                    cooldown_until_time = exit_time + timedelta(hours=24)
-                                    consecutive_losses_count = 0
-                            else:
-                                consecutive_losses_count = 0
-                                cooldown_until_time = None
-                                
-                            locked_until_index = exit_idx
-                            entered = True
-                            break
-            if entered:
-                continue
-                
-        elif is_short_regime and is_breakout_short:
-            entered = False
-            for p in range(1, 6):
-                if i + p >= len(df1h) - 10:
-                    break
-                p_candle = df1h.iloc[i + p]
-                
-                if p_candle['High'] >= struct_low * 0.999:
-                    if p_candle['Close'] < p_candle['Open'] and p_candle['RSI'] < 42:
-                        entry_price = p_candle['Close']
-                        entry_time = p_candle['Date']
-                        swing_high_pullback = df1h.iloc[i:i+p+1]['High'].max()
-                        sl = swing_high_pullback + (0.4 * p_candle['ATR'])
-                        risk = sl - entry_price
-                        
-                        if risk <= 0 or (risk / entry_price) > 0.025:
-                            break
-                            
-                        tp = entry_price - (2.0 * risk)
-                        
-                        outcome = 'OPEN'
-                        exit_idx = i + p + 1
-                        exit_time = entry_time
-                        
-                        for j in range(i + p + 1, min(i + p + 45, len(df1h))):
-                            f_c = df1h.iloc[j]
-                            exit_idx = j
-                            exit_time = f_c['Date']
-                            if f_c['High'] >= sl:
-                                outcome = 'LOSS'
-                                break
-                            elif f_c['Low'] <= tp:
-                                outcome = 'WIN'
-                                break
-                                
-                        if outcome in ['WIN', 'LOSS']:
-                            all_portfolio_trades.append({
-                                'Symbol': symbol,
-                                'Side': 'SHORT',
-                                'Outcome': outcome,
-                                'EntryTime': entry_time,
-                                'ExitTime': exit_time
-                            })
-                            
-                            if outcome == 'LOSS':
-                                consecutive_losses_count += 1
-                                if consecutive_losses_count >= 2:
-                                    cooldown_until_time = exit_time + timedelta(hours=24)
-                                    consecutive_losses_count = 0
-                            else:
-                                consecutive_losses_count = 0
-                                cooldown_until_time = None
-                                
-                            locked_until_index = exit_idx
-                            entered = True
-                            break
+  if len(df1h) < 100:
+    continue
+  df1h = calculate_ichimoku(df1h)
 
-print("\n============================================================")
-print("📊 گزارش جامع پورتفوی ضد ضرر متوالی")
-print("============================================================")
+  df4h = (
+      df1h.set_index('Date')
+      .resample('4h')
+      .agg({
+          'Open': 'first',
+          'High': 'max',
+          'Low': 'min',
+          'Close': 'last',
+          'Volume': 'sum',
+      })
+      .dropna()
+      .reset_index()
+  )
+  df4h = calculate_ichimoku(df4h)
+  df4h['Cloud_Top'] = df4h[['Senkou_A', 'Senkou_B']].max(axis=1)
+  df4h['Cloud_Bottom'] = df4h[['Senkou_A', 'Senkou_B']].min(axis=1)
+  df4h['Cloud_Thickness'] = (
+      df4h['Cloud_Top'] - df4h['Cloud_Bottom']
+  ) / df4h['Close']
 
-if all_portfolio_trades:
-    pf_df = pd.DataFrame(all_portfolio_trades)
-    pf_df.sort_values('EntryTime', inplace=True)
-    pf_df.reset_index(drop=True, inplace=True)
-    
-    total_trades = len(pf_df)
-    total_wins = len(pf_df[pf_df['Outcome'] == 'WIN'])
-    total_losses = len(pf_df[pf_df['Outcome'] == 'LOSS'])
-    portfolio_win_rate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    net_profit_score = (total_wins * 2.0) - total_losses
-    
-    print(f"🔸 تعداد کل معاملات پورتفوی: {total_trades}")
-    print(f"🔸 کل معاملات برنده: {total_wins}")
-    print(f"🔸 کل معاملات بازنده: {total_losses}")
-    print(f"🎯 **وین‌ریت کل پورتفوی:** {portfolio_win_rate:.2f}%")
-    print(f"💰 امتیاز سودآوری خالص: {net_profit_score:.2f}R")
-    
-    print("\n--- تفکیک عملکرد به تفکیک هر نماد ---")
-    symbol_breakdown = pf_df.groupby('Symbol')['Outcome'].value_counts().unstack(fill_value=0)
-    symbol_breakdown['WinRate %'] = (symbol_breakdown.get('WIN', 0) / (symbol_breakdown.get('WIN', 0) + symbol_breakdown.get('LOSS', 0))) * 100
-    print(symbol_breakdown)
-    
-    print("\n--- بررسی دوره‌های ضررهای متوالی پس از اعمال مکانیزم ضد ضرر ---")
-    consecutive_loss_periods = []
-    current_streak = []
-    
-    for idx, row in pf_df.iterrows():
-        if row['Outcome'] == 'LOSS':
-            current_streak.append(row)
+  # تاییدیه روند و شکست ابر در 4H همراه با ضخامت ابر معتبر
+  df4h['Trend_Long'] = (df4h['Close'] > df4h['Cloud_Top']) & (
+      df4h['Tenkan'] > df4h['Kijun']
+  )
+  df4h['Trend_Short'] = (df4h['Close'] < df4h['Cloud_Bottom']) & (
+      df4h['Tenkan'] < df4h['Kijun']
+  )
+
+  for col in [
+      'Trend_Long',
+      'Trend_Short',
+      'Cloud_Top',
+      'Cloud_Bottom',
+      'Cloud_Thickness',
+  ]:
+    df4h[col] = df4h[col].shift(1)  # جلوگیری از Lookahead مطلق
+
+  df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
+  processed_data[symbol] = {'1h': df1h, '4h': df4h.set_index('Date')}
+
+print('⚙️ شروع اجرای بک‌تست HUNTER-ICHIMOKU V11...')
+
+all_timestamps = set()
+for dat in processed_data.values():
+  all_timestamps.update(dat['1h']['Date'].tolist())
+sorted_timestamps = sorted(list(all_timestamps))
+
+active_positions = {}
+all_trades = []
+SLIPPAGE = 0.0003
+FEE_RATE = 0.0007
+MAX_CONCURRENT_POSITIONS = 3
+
+dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items()}
+dfs_4h = {sym: dat['4h'] for sym, dat in processed_data.items()}
+
+for ts in sorted_timestamps:
+  symbols_to_close = []
+  for symbol, pos in active_positions.items():
+    if ts not in dfs_1h[symbol].index:
+      continue
+    c1h = dfs_1h[symbol].loc[ts]
+    entry_index = pos['entry_index']
+    df1h_local = processed_data[symbol]['1h']
+    match_rows = df1h_local[df1h_local['Date'] == ts]
+    if match_rows.empty:
+      continue
+    curr_i = match_rows.index[0]
+    candles_held = curr_i - entry_index
+
+    if pos['side'] == 'LONG':
+      hit_sl = c1h['Low'] <= pos['stop_loss']
+      hit_tp = c1h['High'] >= pos['take_profit']
+      is_timeout = candles_held >= 24
+
+      if hit_sl or hit_tp or is_timeout:
+        if hit_sl:
+          outcome = 'LOSS'
+          r_real = -1.0 - (FEE_RATE * 2)
+        elif hit_tp:
+          outcome = 'WIN'
+          r_real = 2.0 - (FEE_RATE * 2)
         else:
-            if len(current_streak) >= 2:
-                consecutive_loss_periods.append({
-                    'Count': len(current_streak),
-                    'StartDate': current_streak[0]['EntryTime'],
-                    'EndDate': current_streak[-1]['ExitTime']
-                })
-            current_streak = []
-            
-    if len(current_streak) >= 2:
-        consecutive_loss_periods.append({
-            'Count': len(current_streak),
-            'StartDate': current_streak[0]['EntryTime'],
-            'EndDate': current_streak[-1]['ExitTime']
-        })
-        
-    if consecutive_loss_periods:
-        print(f"تعداد دوره‌های ضرر متوالی (>=2): {len(consecutive_loss_periods)}")
-        for period in consecutive_loss_periods:
-            print(f"❌ تعداد {period['Count']} ضرر پشت سر هم | از تاریخ: {period['StartDate']} تا {period['EndDate']}")
-    else:
-        print("✨ هیچ دوره ضرر متوالی قابل‌توجهی ثبت نشد.")
-else:
-    print("⚠️ هیچ معامله‌ای با شرایط ثبت نشد.")
+          risk = pos['entry_price'] - pos['stop_loss']
+          if risk > 0:
+            r_real = (c1h['Close'] - pos['entry_price']) / risk - (FEE_RATE * 2)
+          else:
+            r_real = 0.0
+          outcome = 'WIN' if r_real > 0 else 'LOSS'
 
-print("\n✨ تست به اتمام رسید.")
+        all_trades.append({
+            'Timestamp': ts,
+            'Symbol': symbol,
+            'Side': 'LONG',
+            'Outcome': outcome,
+            'Return': r_real,
+        })
+        symbols_to_close.append(symbol)
+
+    elif pos['side'] == 'SHORT':
+      hit_sl = c1h['High'] >= pos['stop_loss']
+      hit_tp = c1h['Low'] <= pos['take_profit']
+      is_timeout = candles_held >= 24
+
+      if hit_sl or hit_tp or is_timeout:
+        if hit_sl:
+          outcome = 'LOSS'
+          r_real = -1.0 - (FEE_RATE * 2)
+        elif hit_tp:
+          outcome = 'WIN'
+          r_real = 2.0 - (FEE_RATE * 2)
+        else:
+          risk = pos['stop_loss'] - pos['entry_price']
+          if risk > 0:
+            r_real = (pos['entry_price'] - c1h['Close']) / risk - (FEE_RATE * 2)
+          else:
+            r_real = 0.0
+          outcome = 'WIN' if r_real > 0 else 'LOSS'
+
+        all_trades.append({
+            'Timestamp': ts,
+            'Symbol': symbol,
+            'Side': 'SHORT',
+            'Outcome': outcome,
+            'Return': r_real,
+        })
+        symbols_to_close.append(symbol)
+
+  for sym in symbols_to_close:
+    del active_positions[sym]
+
+  for symbol, dat in processed_data.items():
+    if symbol in active_positions:
+      continue
+    if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
+      break
+
+    df1h = dat['1h']
+    if ts not in df1h['Date'].values:
+      continue
+
+    match_rows = df1h[df1h['Date'] == ts]
+    if match_rows.empty:
+      continue
+    i = match_rows.index[0]
+    if i < 35:
+      continue
+
+    c1h = df1h.iloc[i]
+    prev = df1h.iloc[i - 1]
+    t4h_time = c1h['Date_4H']
+    df4h_idx = dat['4h']
+
+    if t4h_time not in df4h_idx.index:
+      continue
+    r4h = df4h_idx.loc[t4h_time]
+
+    # فیلتر کیفیت ابر و روند در 1H
+    tk_cross_long = prev['Tenkan'] > prev['Kijun']
+    tk_cross_short = prev['Tenkan'] < prev['Kijun']
+    chikou_long = prev['Close'] > df1h.iloc[i - 27]['Close']
+    chikou_short = prev['Close'] < df1h.iloc[i - 27]['Close']
+
+    # منطق ورود لانگ: تاییدیه 4H + تقاطع تنکان/کیجون 1H + چیکوسپان سالم
+    if r4h.get('Trend_Long', False) and tk_cross_long and chikou_long:
+      # بررسی پولبک تمیز به خط کیجون یا لبه بالایی ابر
+      cloud_top_1h = max(prev['Senkou_A'], prev['Senkou_B'])
+      if (
+          prev['Low'] <= prev['Kijun'] * 1.003
+          and prev['Close'] > prev['Kijun']
+      ):
+        entry_price = c1h['Open'] * (1 + SLIPPAGE)
+        stop_loss = (
+            min(
+                df1h['Low'].iloc[i - 5 : i].min(),
+                min(prev['Senkou_A'], prev['Senkou_B']),
+            )
+            - 0.2 * prev['ATR']
+        )
+        sl_dist_pct = (entry_price - stop_loss) / entry_price
+
+        if 0.003 <= sl_dist_pct <= 0.035:
+          risk = entry_price - stop_loss
+          take_profit = entry_price + (2.0 * risk)
+          active_positions[symbol] = {
+              'side': 'LONG',
+              'entry_price': entry_price,
+              'stop_loss': stop_loss,
+              'take_profit': take_profit,
+              'entry_index': i,
+          }
+          continue
+
+    # منطق ورود شورت: تاییدیه 4H + تقاطع تنکان/کیجون 1H + چیکوسپان سالم
+    elif r4h.get('Trend_Short', False) and tk_cross_short and chikou_short:
+      cloud_bot_1h = min(prev['Senkou_A'], prev['Senkou_B'])
+      if (
+          prev['High'] >= prev['Kijun'] * 0.997
+          and prev['Close'] < prev['Kijun']
+      ):
+        entry_price = c1h['Open'] * (1 - SLIPPAGE)
+        stop_loss = (
+            max(
+                df1h['High'].iloc[i - 5 : i].max(),
+                max(prev['Senkou_A'], prev['Senkou_B']),
+            )
+            + 0.2 * prev['ATR']
+        )
+        sl_dist_pct = (stop_loss - entry_price) / entry_price
+
+        if 0.003 <= sl_dist_pct <= 0.035:
+          risk = stop_loss - entry_price
+          take_profit = entry_price - (2.0 * risk)
+          active_positions[symbol] = {
+              'side': 'SHORT',
+              'entry_price': entry_price,
+              'stop_loss': stop_loss,
+              'take_profit': take_profit,
+              'entry_index': i,
+          }
+          continue
+
+print('\n============================================================')
+print('📊 گزارش نهایی HUNTER-ICHIMOKU V11 (Trend & TK Filter)')
+print('============================================================')
+
+if all_trades:
+  trades_df = pd.DataFrame(all_trades)
+  trades_df.sort_values('Timestamp', inplace=True)
+
+  tot_trades = len(trades_df)
+  tot_wins = len(trades_df[trades_df['Outcome'] == 'WIN'])
+  tot_losses = len(trades_df[trades_df['Outcome'] == 'LOSS'])
+  win_rate = (tot_wins / tot_trades) * 100 if tot_trades > 0 else 0
+  net_r = trades_df['Return'].sum()
+
+  outcomes = trades_df['Outcome'].tolist()
+  max_wins = 0
+  max_losses = 0
+  curr_wins = 0
+  curr_losses = 0
+
+  loss_sequences = []
+  temp_loss_seq = 0
+
+  for out in outcomes:
+    if out == 'WIN':
+      curr_wins += 1
+      curr_losses = 0
+      if curr_wins > max_wins:
+        max_wins = curr_wins
+      if temp_loss_seq > 0:
+        loss_sequences.append(temp_loss_seq)
+        temp_loss_seq = 0
+    else:
+      curr_losses += 1
+      curr_wins = 0
+      temp_loss_seq += 1
+      if curr_losses > max_losses:
+        max_losses = curr_losses
+
+  if temp_loss_seq > 0:
+    loss_sequences.append(temp_loss_seq)
+
+  print(f'🔸 تعداد کل معاملات سبد: {tot_trades}')
+  print(f'🔸 معاملات برنده (WIN): {tot_wins}')
+  print(f'🔸 معاملات بازنده (LOSS): {tot_losses}')
+  print(f'🔥 **حداکثر سودهای متوالی:** {max_wins}')
+  print(f'❄️ **حداکثر ضررهای متوالی:** {max_losses}')
+  print(f'🎯 **وین‌ریت تجمیعی پورتفوی:** {win_rate:.2f}%')
+  print(f'💰 **مجموع بازدهی خالص کل:** {net_r:.2f}R\n')
+
+  print('------------------------------------------------------------')
+  print('📉 **لیست کامل تعداد ضررهای متوالی ثبت‌شده (در تمام دوره‌ها):**')
+  print('------------------------------------------------------------')
+  if loss_sequences:
+    print(', '.join(map(str, loss_sequences)))
+  else:
+    print('هیچ زنجیره ضرری ثبت نشد.')
+  print('\n------------------------------------------------------------')
+  print('📈 **گزارش تفکیک‌شده به تفکیک هر ارز:**')
+  print('------------------------------------------------------------')
+
+  symbol_summary = []
+  for sym in SYMBOLS.keys():
+    sym_trades = trades_df[trades_df['Symbol'] == sym]
+    s_tot = len(sym_trades)
+    if s_tot > 0:
+      s_wins = len(sym_trades[sym_trades['Outcome'] == 'WIN'])
+      s_loss = len(sym_trades[sym_trades['Outcome'] == 'LOSS'])
+      s_wr = (s_wins / s_tot) * 100
+      s_net_r = sym_trades['Return'].sum()
+    else:
+      s_wins, s_loss, s_wr, s_net_r = 0, 0, 0.0, 0.0
+
+    symbol_summary.append({
+        'Symbol': sym,
+        'Trades': s_tot,
+        'Wins': s_wins,
+        'Losses': s_loss,
+        'WinRate(%)': round(s_wr, 2),
+        'Net_R': round(s_net_r, 2),
+    })
+
+  summary_df = pd.DataFrame(symbol_summary)
+  print(summary_df.to_string(index=False))
+else:
+  print('⚠️ معامله‌ای ثبت نشد.')
+
+print('\n✨ بک‌تست به پایان رسید.')
