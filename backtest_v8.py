@@ -12,11 +12,12 @@ except ImportError:
 import numpy as np
 import pandas as pd
 
-exchange = ccxt.lbank({'enableRateLimit': True})
+# ============================================================
+# HUNTER-X V8.2
+# TIMEOUT + DRAWDOWN + STREAK + REGIME DIAGNOSTIC
+# ============================================================
 
-# ============================================================
-# SYMBOLS
-# ============================================================
+exchange = ccxt.lbank({'enableRateLimit': True})
 
 SYMBOLS = {
     'BTC': 'BTC/USDT',
@@ -38,31 +39,37 @@ SYMBOLS = {
 # SETTINGS
 # ============================================================
 
-start_date = datetime.now() - timedelta(days=365)
-since_timestamp = int(start_date.timestamp() * 1000)
+LOOKBACK_DAYS = 365
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
 MAX_CONCURRENT_POSITIONS = 3
+
 MAX_HOLD_CANDLES = 24
 
-RISK_PER_TRADE_R = 1.0
 TARGET_R = 2.0
+RISK_R = 1.0
+
+# Diagnostic timeout alternatives
+TIMEOUT_TESTS = [12, 24, 36]
 
 # ============================================================
 # DOWNLOAD DATA
 # ============================================================
 
-print('============================================================')
-print('📥 دریافت داده‌ها از LBank')
-print('============================================================')
+print("=" * 60)
+print("📥 دریافت داده‌ها از LBank")
+print("=" * 60)
+
+start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
+since_timestamp = int(start_date.timestamp() * 1000)
 
 data_1h = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
 
-    print(f'📥 {symbol} ...')
+    print(f"📥 {symbol} ...")
 
     all_ohlcv = []
     current_since = since_timestamp
@@ -71,6 +78,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
     while current_since < now_timestamp:
 
         try:
+
             ohlcv = exchange.fetch_ohlcv(
                 lbank_symbol,
                 timeframe='1h',
@@ -88,7 +96,8 @@ for symbol, lbank_symbol in SYMBOLS.items():
                 break
 
         except Exception as e:
-            print(f'⚠️ خطا در دریافت {symbol}: {e}')
+
+            print(f"   ⚠️ Error {symbol}: {e}")
             break
 
     if all_ohlcv:
@@ -141,9 +150,9 @@ for symbol, lbank_symbol in SYMBOLS.items():
         data_1h[symbol] = df1h
 
         print(
-            f'   ✅ {symbol}: {len(df1h)} candles'
+            f"   ✅ {symbol}: "
+            f"{len(df1h)} candles"
         )
-
 
 # ============================================================
 # ICHIMOKU
@@ -267,14 +276,16 @@ for symbol, df1h in data_1h.items():
     ].min(axis=1)
 
     df4h['Trend_Long'] = (
-        df4h['Close'] > df4h['Cloud_Top']
+        df4h['Close'] >
+        df4h['Cloud_Top']
     )
 
     df4h['Trend_Short'] = (
-        df4h['Close'] < df4h['Cloud_Bottom']
+        df4h['Close'] <
+        df4h['Cloud_Bottom']
     )
 
-    # استفاده از کندل 4H بسته‌شده قبلی
+    # Preserve V8.1 logic
     for col in [
         'Trend_Long',
         'Trend_Short',
@@ -284,8 +295,7 @@ for symbol, df1h in data_1h.items():
         df4h[col] = df4h[col].shift(1)
 
     df1h['Date_4H'] = (
-        df1h['Date']
-        .dt.floor('4h')
+        df1h['Date'].dt.floor('4h')
     )
 
     processed_data[symbol] = {
@@ -295,13 +305,8 @@ for symbol, df1h in data_1h.items():
 
 
 # ============================================================
-# BACKTEST
+# TIMESTAMPS
 # ============================================================
-
-print()
-print('============================================================')
-print('⚙️ شروع بک‌تست')
-print('============================================================')
 
 all_timestamps = set()
 
@@ -315,8 +320,9 @@ sorted_timestamps = sorted(
     list(all_timestamps)
 )
 
-active_positions = {}
-all_trades = []
+# ============================================================
+# DATAFRAMES
+# ============================================================
 
 dfs_1h = {
     sym: dat['1h'].set_index('Date')
@@ -328,21 +334,29 @@ dfs_4h = {
     for sym, dat in processed_data.items()
 }
 
+# ============================================================
+# BACKTEST
+# ============================================================
 
-# ============================================================
-# MAIN LOOP
-# ============================================================
+active_positions = {}
+
+all_trades = []
+
+print()
+print("=" * 60)
+print("⚙️ شروع بک‌تست V8.2")
+print("=" * 60)
 
 for ts in sorted_timestamps:
 
     # --------------------------------------------------------
-    # BTC MARKET FILTER
+    # BTC REGIME
     # --------------------------------------------------------
 
     btc_allows_long = True
     btc_allows_short = True
 
-    btc_trend = 'UNKNOWN'
+    btc_trend_label = "NEUTRAL"
 
     if 'BTC' in processed_data:
 
@@ -361,31 +375,28 @@ for ts in sorted_timestamps:
 
             btc_row = df4h_btc.loc[t4h_btc]
 
-            btc_allows_long = bool(
-                btc_row.get(
-                    'Trend_Long',
-                    True
-                )
+            btc_allows_long = btc_row.get(
+                'Trend_Long',
+                True
             )
 
-            btc_allows_short = bool(
-                btc_row.get(
-                    'Trend_Short',
-                    True
-                )
+            btc_allows_short = btc_row.get(
+                'Trend_Short',
+                True
             )
 
             if btc_allows_long:
-                btc_trend = 'LONG'
+                btc_trend_label = "LONG"
+
             elif btc_allows_short:
-                btc_trend = 'SHORT'
+                btc_trend_label = "SHORT"
+
             else:
-                btc_trend = 'NEUTRAL'
+                btc_trend_label = "NEUTRAL"
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # CLOSE EXISTING POSITIONS
-    # ========================================================
+    # --------------------------------------------------------
 
     symbols_to_close = []
 
@@ -398,6 +409,7 @@ for ts in sorted_timestamps:
 
         c1h = dfs_1h[symbol].loc[ts]
 
+        entry_time = pos['entry_time']
         entry_index = pos['entry_index']
 
         df1h_local = processed_data[
@@ -417,7 +429,13 @@ for ts in sorted_timestamps:
             curr_i - entry_index
         )
 
-        pos['candles_held'] = candles_held
+        hours_held = (
+            ts - entry_time
+        ).total_seconds() / 3600.0
+
+        exit_price = None
+        outcome = None
+        reason = None
 
         # ----------------------------------------------------
         # LONG
@@ -440,70 +458,35 @@ for ts in sorted_timestamps:
                 >= MAX_HOLD_CANDLES
             )
 
-            reason = None
-            outcome = None
-
-            # هر دو در یک کندل
             if hit_sl and hit_tp:
 
                 outcome = 'LOSS'
                 reason = 'SL+TP_SAME_CANDLE'
-
-                r_real = (
-                    -1.0
-                    - (FEE_RATE * 2)
-                )
+                exit_price = pos['stop_loss']
 
             elif hit_sl:
 
                 outcome = 'LOSS'
                 reason = 'SL'
-
-                r_real = (
-                    -1.0
-                    - (FEE_RATE * 2)
-                )
+                exit_price = pos['stop_loss']
 
             elif hit_tp:
 
                 outcome = 'WIN'
                 reason = 'TP'
-
-                r_real = (
-                    2.0
-                    - (FEE_RATE * 2)
-                )
+                exit_price = pos['take_profit']
 
             elif timeout:
 
                 outcome = 'TIMEOUT'
                 reason = 'TIMEOUT'
-
-                # نتیجه واقعی خروج در Close
                 exit_price = c1h['Close']
-
-                gross_r = (
-                    exit_price
-                    - pos['entry_price']
-                ) / (
-                    pos['entry_price']
-                    - pos['stop_loss']
-                )
-
-                r_real = (
-                    gross_r
-                    - (FEE_RATE * 2)
-                )
-
-            else:
-
-                continue
 
         # ----------------------------------------------------
         # SHORT
         # ----------------------------------------------------
 
-        else:
+        elif pos['side'] == 'SHORT':
 
             hit_sl = (
                 c1h['High']
@@ -520,117 +503,176 @@ for ts in sorted_timestamps:
                 >= MAX_HOLD_CANDLES
             )
 
-            reason = None
-            outcome = None
-
             if hit_sl and hit_tp:
 
                 outcome = 'LOSS'
                 reason = 'SL+TP_SAME_CANDLE'
-
-                r_real = (
-                    -1.0
-                    - (FEE_RATE * 2)
-                )
+                exit_price = pos['stop_loss']
 
             elif hit_sl:
 
                 outcome = 'LOSS'
                 reason = 'SL'
-
-                r_real = (
-                    -1.0
-                    - (FEE_RATE * 2)
-                )
+                exit_price = pos['stop_loss']
 
             elif hit_tp:
 
                 outcome = 'WIN'
                 reason = 'TP'
-
-                r_real = (
-                    2.0
-                    - (FEE_RATE * 2)
-                )
+                exit_price = pos['take_profit']
 
             elif timeout:
 
                 outcome = 'TIMEOUT'
                 reason = 'TIMEOUT'
-
                 exit_price = c1h['Close']
 
-                gross_r = (
-                    pos['entry_price']
-                    - exit_price
-                ) / (
-                    pos['stop_loss']
-                    - pos['entry_price']
+        # ----------------------------------------------------
+        # RECORD TRADE
+        # ----------------------------------------------------
+
+        if outcome is not None:
+
+            entry_price = pos['entry_price']
+            stop_loss = pos['stop_loss']
+            take_profit = pos['take_profit']
+
+            risk_distance = abs(
+                entry_price - stop_loss
+            )
+
+            if risk_distance <= 0:
+                r_raw = 0.0
+
+            else:
+
+                if pos['side'] == 'LONG':
+
+                    price_pnl = (
+                        exit_price -
+                        entry_price
+                    )
+
+                else:
+
+                    price_pnl = (
+                        entry_price -
+                        exit_price
+                    )
+
+                r_raw = (
+                    price_pnl /
+                    risk_distance
                 )
 
+            # Fees expressed in R
+            fee_r = FEE_RATE * 2
+
+            if outcome == 'WIN':
+
                 r_real = (
-                    gross_r
-                    - (FEE_RATE * 2)
+                    TARGET_R -
+                    fee_r
+                )
+
+            elif outcome == 'LOSS':
+
+                r_real = (
+                    -RISK_R -
+                    fee_r
                 )
 
             else:
 
-                continue
+                r_real = (
+                    r_raw -
+                    fee_r
+                )
 
+            # Maximum favorable excursion
+            if pos['side'] == 'LONG':
 
-        # ----------------------------------------------------
-        # SAVE TRADE
-        # ----------------------------------------------------
+                mfe = (
+                    c1h['High'] -
+                    entry_price
+                ) / risk_distance
 
-        all_trades.append({
+                mae = (
+                    c1h['Low'] -
+                    entry_price
+                ) / risk_distance
 
-            'Timestamp': ts,
+            else:
 
-            'Symbol': symbol,
+                mfe = (
+                    entry_price -
+                    c1h['Low']
+                ) / risk_distance
 
-            'Side': pos['side'],
+                mae = (
+                    entry_price -
+                    c1h['High']
+                ) / risk_distance
 
-            'Entry_Time': pos['entry_time'],
+            all_trades.append({
 
-            'Entry_Price': pos['entry_price'],
+                'Timestamp': ts,
+                'Symbol': symbol,
+                'Side': pos['side'],
 
-            'Stop_Loss': pos['stop_loss'],
+                'Entry_Time':
+                    entry_time,
 
-            'Take_Profit': pos['take_profit'],
+                'Entry_Price':
+                    entry_price,
 
-            'Exit_Price':
-                c1h['Close']
-                if reason == 'TIMEOUT'
-                else (
-                    pos['stop_loss']
-                    if reason in [
-                        'SL',
-                        'SL+TP_SAME_CANDLE'
-                    ]
-                    else pos['take_profit']
-                ),
+                'Stop_Loss':
+                    stop_loss,
 
-            'Candles_Held':
-                candles_held,
+                'Take_Profit':
+                    take_profit,
 
-            'Hours_Held':
-                candles_held,
+                'Exit_Price':
+                    exit_price,
 
-            'Outcome':
-                outcome,
+                'Candles_Held':
+                    candles_held,
 
-            'Reason':
-                reason,
+                'Hours_Held':
+                    hours_held,
 
-            'BTC_Trend':
-                btc_trend,
+                'Outcome':
+                    outcome,
 
-            'Return':
-                r_real,
-        })
+                'Reason':
+                    reason,
 
-        symbols_to_close.append(symbol)
+                'BTC_Trend':
+                    btc_trend_label,
 
+                'R_Raw':
+                    r_raw,
+
+                'Return':
+                    r_real,
+
+                'MFE_R':
+                    mfe,
+
+                'MAE_R':
+                    mae,
+
+                'SL_Distance_Pct':
+                    (
+                        risk_distance /
+                        entry_price
+                    ) * 100,
+
+            })
+
+            symbols_to_close.append(
+                symbol
+            )
 
     # --------------------------------------------------------
     # DELETE CLOSED POSITIONS
@@ -639,13 +681,11 @@ for ts in sorted_timestamps:
     for sym in symbols_to_close:
 
         if sym in active_positions:
-
             del active_positions[sym]
 
-
-    # ========================================================
-    # OPEN NEW POSITIONS
-    # ========================================================
+    # --------------------------------------------------------
+    # NEW ENTRIES
+    # --------------------------------------------------------
 
     for symbol, dat in processed_data.items():
 
@@ -676,7 +716,6 @@ for ts in sorted_timestamps:
             continue
 
         c1h = df1h.iloc[i]
-
         prev = df1h.iloc[i - 1]
 
         t4h_time = c1h['Date_4H']
@@ -698,9 +737,9 @@ for ts in sorted_timestamps:
             prev['Senkou_B']
         )
 
-        # ====================================================
+        # ----------------------------------------------------
         # LONG
-        # ====================================================
+        # ----------------------------------------------------
 
         if (
             btc_allows_long
@@ -713,31 +752,25 @@ for ts in sorted_timestamps:
         ):
 
             tk_cross_long = (
-
                 prev['Tenkan']
                 > prev['Kijun']
-
-                and
-
+            ) and (
                 df1h.iloc[i - 2]['Tenkan']
                 <=
                 df1h.iloc[i - 2]['Kijun']
             )
 
-            pullback_long = (
-
+            kijun_pullback_long = (
                 prev['Low']
                 <= prev['Kijun']
-
                 and
-
                 prev['Close']
                 > prev['Kijun']
             )
 
             if (
                 tk_cross_long
-                or pullback_long
+                or kijun_pullback_long
             ):
 
                 entry_price = (
@@ -754,8 +787,8 @@ for ts in sorted_timestamps:
                 )
 
                 sl_dist_pct = (
-                    entry_price
-                    - stop_loss
+                    entry_price -
+                    stop_loss
                 ) / entry_price
 
                 if (
@@ -765,8 +798,8 @@ for ts in sorted_timestamps:
                 ):
 
                     risk = (
-                        entry_price
-                        - stop_loss
+                        entry_price -
+                        stop_loss
                     )
 
                     take_profit = (
@@ -799,10 +832,9 @@ for ts in sorted_timestamps:
 
                     continue
 
-
-        # ====================================================
+        # ----------------------------------------------------
         # SHORT
-        # ====================================================
+        # ----------------------------------------------------
 
         elif (
             btc_allows_short
@@ -815,31 +847,25 @@ for ts in sorted_timestamps:
         ):
 
             tk_cross_short = (
-
                 prev['Tenkan']
                 < prev['Kijun']
-
-                and
-
+            ) and (
                 df1h.iloc[i - 2]['Tenkan']
                 >=
                 df1h.iloc[i - 2]['Kijun']
             )
 
-            pullback_short = (
-
+            kijun_pullback_short = (
                 prev['High']
                 >= prev['Kijun']
-
                 and
-
                 prev['Close']
                 < prev['Kijun']
             )
 
             if (
                 tk_cross_short
-                or pullback_short
+                or kijun_pullback_short
             ):
 
                 entry_price = (
@@ -856,8 +882,8 @@ for ts in sorted_timestamps:
                 )
 
                 sl_dist_pct = (
-                    stop_loss
-                    - entry_price
+                    stop_loss -
+                    entry_price
                 ) / entry_price
 
                 if (
@@ -867,8 +893,8 @@ for ts in sorted_timestamps:
                 ):
 
                     risk = (
-                        stop_loss
-                        - entry_price
+                        stop_loss -
+                        entry_price
                     )
 
                     take_profit = (
@@ -903,888 +929,972 @@ for ts in sorted_timestamps:
 
 
 # ============================================================
-# FINAL ANALYSIS
+# DATAFRAME
+# ============================================================
+
+trades = pd.DataFrame(
+    all_trades
+)
+
+if trades.empty:
+
+    print("❌ هیچ معامله‌ای ثبت نشد.")
+    sys.exit(0)
+
+trades.sort_values(
+    'Timestamp',
+    inplace=True
+)
+
+trades.reset_index(
+    drop=True,
+    inplace=True
+)
+
+# ============================================================
+# BASIC STATS
+# ============================================================
+
+total_trades = len(trades)
+
+wins = trades[
+    trades['Outcome'] == 'WIN'
+]
+
+losses = trades[
+    trades['Outcome'] == 'LOSS'
+]
+
+timeouts = trades[
+    trades['Outcome'] == 'TIMEOUT'
+]
+
+win_count = len(wins)
+loss_count = len(losses)
+timeout_count = len(timeouts)
+
+closed_count = (
+    win_count +
+    loss_count
+)
+
+win_rate = (
+    win_count /
+    closed_count * 100
+    if closed_count
+    else 0
+)
+
+net_r = trades['Return'].sum()
+
+avg_r = trades['Return'].mean()
+
+# ============================================================
+# PROFIT FACTOR
+# ============================================================
+
+gross_profit = (
+    trades.loc[
+        trades['Return'] > 0,
+        'Return'
+    ].sum()
+)
+
+gross_loss = abs(
+    trades.loc[
+        trades['Return'] < 0,
+        'Return'
+    ].sum()
+)
+
+profit_factor = (
+    gross_profit /
+    gross_loss
+    if gross_loss > 0
+    else np.inf
+)
+
+# ============================================================
+# EXPECTANCY
+# ============================================================
+
+expectancy = avg_r
+
+# ============================================================
+# EQUITY / DRAWDOWN
+# ============================================================
+
+trades['Equity_R'] = (
+    trades['Return'].cumsum()
+)
+
+trades['Peak_R'] = (
+    trades['Equity_R']
+    .cummax()
+)
+
+trades['Drawdown_R'] = (
+    trades['Equity_R']
+    - trades['Peak_R']
+)
+
+max_drawdown = (
+    trades['Drawdown_R'].min()
+)
+
+max_dd_index = (
+    trades['Drawdown_R'].idxmin()
+)
+
+dd_low_date = (
+    trades.loc[
+        max_dd_index,
+        'Timestamp'
+    ]
+)
+
+peak_before_dd = (
+    trades.loc[
+        :max_dd_index,
+        'Equity_R'
+    ].max()
+)
+
+# ============================================================
+# STREAK ANALYSIS
+# ============================================================
+
+max_win_streak = 0
+max_loss_streak = 0
+
+current_win = 0
+current_loss = 0
+
+loss_streaks = []
+current_loss_rows = []
+
+for idx, row in trades.iterrows():
+
+    if row['Outcome'] == 'WIN':
+
+        current_win += 1
+        current_loss = 0
+
+        if current_loss_rows:
+
+            if len(current_loss_rows) >= 5:
+
+                loss_streaks.append(
+                    current_loss_rows
+                )
+
+            current_loss_rows = []
+
+    elif row['Outcome'] == 'LOSS':
+
+        current_loss += 1
+        current_win = 0
+
+        current_loss_rows.append(
+            row
+        )
+
+    else:
+
+        current_win = 0
+        current_loss = 0
+
+        if current_loss_rows:
+
+            if len(current_loss_rows) >= 5:
+
+                loss_streaks.append(
+                    current_loss_rows
+                )
+
+            current_loss_rows = []
+
+    max_win_streak = max(
+        max_win_streak,
+        current_win
+    )
+
+    max_loss_streak = max(
+        max_loss_streak,
+        current_loss
+    )
+
+if current_loss_rows:
+
+    if len(current_loss_rows) >= 5:
+        loss_streaks.append(
+            current_loss_rows
+        )
+
+# ============================================================
+# REPORT
 # ============================================================
 
 print()
-print('============================================================')
-print('📊 گزارش کامل HUNTER-X V8.1')
-print('============================================================')
+print("=" * 60)
+print("📊 گزارش کامل HUNTER-X V8.2")
+print("=" * 60)
 
+print()
+print("📌 آمار اصلی")
+print("-" * 60)
 
-if not all_trades:
+print(
+    f"🔸 کل معاملات: {total_trades}"
+)
 
-    print('⚠️ معامله‌ای ثبت نشد.')
+print(
+    f"🟢 WIN: {win_count}"
+)
 
-else:
+print(
+    f"🔴 LOSS: {loss_count}"
+)
 
-    trades_df = pd.DataFrame(
-        all_trades
+print(
+    f"⏱️ TIMEOUT: {timeout_count}"
+)
+
+print(
+    f"🎯 Win Rate بدون Timeout: "
+    f"{win_rate:.2f}%"
+)
+
+print(
+    f"💰 Net R: {net_r:.2f}R"
+)
+
+print(
+    f"📊 Average R / Trade: "
+    f"{avg_r:.4f}R"
+)
+
+print(
+    f"📈 Profit Factor: "
+    f"{profit_factor:.3f}"
+)
+
+print(
+    f"📐 Expectancy: "
+    f"{expectancy:.4f}R"
+)
+
+# ============================================================
+# EXIT REASONS
+# ============================================================
+
+print()
+print("📌 علت خروج")
+print("-" * 60)
+
+reason_counts = (
+    trades['Reason']
+    .value_counts()
+)
+
+for reason, count in reason_counts.items():
+
+    pct = (
+        count /
+        total_trades *
+        100
     )
 
-    trades_df.sort_values(
-        'Timestamp',
-        inplace=True
+    print(
+        f"{reason:<28} "
+        f"{count:>5} "
+        f"({pct:.2f}%)"
     )
 
-    trades_df.reset_index(
-        drop=True,
-        inplace=True
+# ============================================================
+# TIMEOUT ANALYSIS
+# ============================================================
+
+print()
+print("=" * 60)
+print("⏱️ TIMEOUT DEEP ANALYSIS")
+print("=" * 60)
+
+print(
+    f"Total Timeout: {timeout_count}"
+)
+
+if timeout_count > 0:
+
+    timeout_net = (
+        timeouts['Return'].sum()
     )
 
-    # ========================================================
-    # BASIC STATS
-    # ========================================================
+    timeout_avg = (
+        timeouts['Return'].mean()
+    )
 
-    total = len(trades_df)
+    timeout_median = (
+        timeouts['Return'].median()
+    )
 
-    wins = len(
-        trades_df[
-            trades_df['Outcome'] == 'WIN'
+    timeout_positive = (
+        timeouts[
+            timeouts['Return'] > 0
         ]
     )
 
-    losses = len(
-        trades_df[
-            trades_df['Outcome'] == 'LOSS'
+    timeout_negative = (
+        timeouts[
+            timeouts['Return'] < 0
         ]
     )
 
-    timeouts = len(
-        trades_df[
-            trades_df['Outcome'] == 'TIMEOUT'
+    timeout_zero = (
+        timeouts[
+            timeouts['Return'] == 0
         ]
     )
 
-    closed_trades = wins + losses
-
-    win_rate = (
-        wins / closed_trades * 100
-        if closed_trades > 0
-        else 0
+    print(
+        f"🟢 Timeout سودده: "
+        f"{len(timeout_positive)}"
     )
 
-    net_r = (
-        trades_df['Return'].sum()
+    print(
+        f"🔴 Timeout ضررده: "
+        f"{len(timeout_negative)}"
     )
 
-    avg_r = (
-        trades_df['Return'].mean()
+    print(
+        f"⚪ Timeout خنثی: "
+        f"{len(timeout_zero)}"
+    )
+
+    print(
+        f"💰 Timeout Net R: "
+        f"{timeout_net:.2f}R"
+    )
+
+    print(
+        f"📊 Timeout Avg R: "
+        f"{timeout_avg:.4f}R"
+    )
+
+    print(
+        f"📊 Timeout Median R: "
+        f"{timeout_median:.4f}R"
     )
 
     print()
-    print('📌 آمار اصلی')
-    print('------------------------------------------------------------')
+    print("⏱️ مدت نگهداری Timeout")
 
     print(
-        f'🔸 کل معاملات: {total}'
+        timeouts[
+            'Hours_Held'
+        ].describe().to_string()
     )
 
-    print(
-        f'🟢 WIN: {wins}'
-    )
+# ============================================================
+# TIMEOUT BY SYMBOL
+# ============================================================
 
-    print(
-        f'🔴 LOSS: {losses}'
-    )
+print()
+print("⏱️ TIMEOUT بر اساس ارز")
+print("-" * 60)
 
-    print(
-        f'⏱️ TIMEOUT: {timeouts}'
-    )
+if timeout_count > 0:
 
-    print(
-        f'🎯 Win Rate بدون Timeout: {win_rate:.2f}%'
-    )
-
-    print(
-        f'💰 Net R: {net_r:.2f}R'
-    )
-
-    print(
-        f'📊 Average R / Trade: {avg_r:.4f}R'
-    )
-
-
-    # ========================================================
-    # REASON ANALYSIS
-    # ========================================================
-
-    print()
-    print('📌 علت خروج معاملات')
-    print('------------------------------------------------------------')
-
-    reason_counts = (
-        trades_df['Reason']
-        .value_counts()
-    )
-
-    for reason, count in reason_counts.items():
-
-        pct = (
-            count / total * 100
+    timeout_symbol = (
+        timeouts
+        .groupby('Symbol')
+        .agg(
+            Trades=('Symbol', 'size'),
+            Avg_R=('Return', 'mean'),
+            Net_R=('Return', 'sum'),
+            Avg_Hours=('Hours_Held', 'mean')
         )
-
-        print(
-            f'   {reason:<25} '
-            f'{count:>4} '
-            f'({pct:.2f}%)'
+        .sort_values(
+            'Net_R'
         )
-
-
-    # ========================================================
-    # EQUITY CURVE + MAX DRAWDOWN
-    # ========================================================
-
-    trades_df['Equity_R'] = (
-        trades_df['Return']
-        .cumsum()
-    )
-
-    trades_df['Peak_R'] = (
-        trades_df['Equity_R']
-        .cummax()
-    )
-
-    trades_df['Drawdown_R'] = (
-        trades_df['Equity_R']
-        - trades_df['Peak_R']
-    )
-
-    max_drawdown = (
-        trades_df['Drawdown_R'].min()
-    )
-
-    max_drawdown_idx = (
-        trades_df['Drawdown_R'].idxmin()
-    )
-
-    peak_before_dd = (
-        trades_df.loc[
-            :max_drawdown_idx,
-            'Peak_R'
-        ].max()
-    )
-
-    dd_end_time = (
-        trades_df.loc[
-            max_drawdown_idx,
-            'Timestamp'
-        ]
-    )
-
-    print()
-    print('📉 MAX DRAWDOWN')
-    print('------------------------------------------------------------')
-
-    print(
-        f'🔻 Maximum Drawdown: '
-        f'{max_drawdown:.2f}R'
     )
 
     print(
-        f'🏔️ Peak Equity Before DD: '
-        f'{peak_before_dd:.2f}R'
+        timeout_symbol.to_string(
+            float_format=lambda x:
+            f"{x:.3f}"
+        )
+    )
+
+# ============================================================
+# TIMEOUT LONG / SHORT
+# ============================================================
+
+print()
+print("⏱️ TIMEOUT بر اساس جهت")
+print("-" * 60)
+
+if timeout_count > 0:
+
+    timeout_side = (
+        timeouts
+        .groupby('Side')
+        .agg(
+            Trades=('Side', 'size'),
+            Avg_R=('Return', 'mean'),
+            Net_R=('Return', 'sum'),
+            Avg_Hours=('Hours_Held', 'mean')
+        )
     )
 
     print(
-        f'📅 DD Low Date: '
-        f'{dd_end_time}'
+        timeout_side.to_string(
+            float_format=lambda x:
+            f"{x:.3f}"
+        )
     )
 
+# ============================================================
+# TIMEOUT BTC REGIME
+# ============================================================
 
-    # ========================================================
-    # MAX CONSECUTIVE WINS / LOSSES
-    # ========================================================
+print()
+print("⏱️ TIMEOUT بر اساس وضعیت BTC")
+print("-" * 60)
 
-    max_wins = 0
-    max_losses = 0
+if timeout_count > 0:
 
-    current_wins = 0
-    current_losses = 0
-
-    for outcome in trades_df['Outcome']:
-
-        if outcome == 'WIN':
-
-            current_wins += 1
-            current_losses = 0
-
-            max_wins = max(
-                max_wins,
-                current_wins
-            )
-
-        elif outcome == 'LOSS':
-
-            current_losses += 1
-            current_wins = 0
-
-            max_losses = max(
-                max_losses,
-                current_losses
-            )
-
-        else:
-
-            current_wins = 0
-            current_losses = 0
-
-
-    print()
-    print('🔥 STREAK ANALYSIS')
-    print('------------------------------------------------------------')
-
-    print(
-        f'🔥 بیشترین WIN متوالی: '
-        f'{max_wins}'
+    timeout_btc = (
+        timeouts
+        .groupby('BTC_Trend')
+        .agg(
+            Trades=('BTC_Trend', 'size'),
+            Avg_R=('Return', 'mean'),
+            Net_R=('Return', 'sum')
+        )
+        .sort_values(
+            'Net_R'
+        )
     )
 
     print(
-        f'❄️ بیشترین LOSS متوالی: '
-        f'{max_losses}'
+        timeout_btc.to_string(
+            float_format=lambda x:
+            f"{x:.3f}"
+        )
     )
 
+# ============================================================
+# TIMEOUT BY HOLDING TIME
+# ============================================================
 
-    # ========================================================
-    # FIND ALL LOSS STREAKS
-    # ========================================================
+print()
+print("⏱️ TIMEOUT بر اساس مدت نگهداری")
+print("-" * 60)
 
-    print()
-    print('🔴 تمام زنجیره‌های 5+ باخت متوالی')
-    print('------------------------------------------------------------')
+if timeout_count > 0:
 
-    loss_streaks = []
-
-    start_idx = None
-
-    for idx, outcome in enumerate(
-        trades_df['Outcome']
-    ):
-
-        if outcome == 'LOSS':
-
-            if start_idx is None:
-                start_idx = idx
-
-        else:
-
-            if start_idx is not None:
-
-                end_idx = idx - 1
-
-                length = (
-                    end_idx
-                    - start_idx
-                    + 1
-                )
-
-                if length >= 5:
-
-                    streak = (
-                        trades_df
-                        .iloc[
-                            start_idx:
-                            end_idx + 1
-                        ]
-                    )
-
-                    loss_streaks.append(
-                        streak
-                    )
-
-                start_idx = None
-
-
-    # اگر فایل با LOSS تمام شده باشد
-    if start_idx is not None:
-
-        end_idx = (
-            len(trades_df) - 1
-        )
-
-        length = (
-            end_idx
-            - start_idx
-            + 1
-        )
-
-        if length >= 5:
-
-            streak = (
-                trades_df
-                .iloc[
-                    start_idx:
-                    end_idx + 1
-                ]
-            )
-
-            loss_streaks.append(
-                streak
-            )
-
-
-    if not loss_streaks:
-
-        print(
-            '✅ هیچ زنجیره 5+ باختی وجود ندارد.'
-        )
-
-    else:
-
-        for n, streak in enumerate(
-            loss_streaks,
-            1
-        ):
-
-            streak_r = (
-                streak['Return'].sum()
-            )
-
-            print()
-            print(
-                f'🔴 Streak #{n}: '
-                f'{len(streak)} LOSS'
-            )
-
-            print(
-                f'   شروع: '
-                f'{streak.iloc[0]["Timestamp"]}'
-            )
-
-            print(
-                f'   پایان: '
-                f'{streak.iloc[-1]["Timestamp"]}'
-            )
-
-            print(
-                f'   مجموع R: '
-                f'{streak_r:.2f}R'
-            )
-
-            print(
-                f'   ارزها: '
-                f'{", ".join(streak["Symbol"].tolist())}'
-            )
-
-
-            if len(streak) >= 10:
-
-                print()
-                print(
-                    '   🚨 جزئیات زنجیره 10+ باخت:'
-                )
-
-                for j, (_, row) in enumerate(
-                    streak.iterrows(),
-                    1
-                ):
-
-                    print(
-                        f'      {j:02d}. '
-                        f'{row["Timestamp"]} | '
-                        f'{row["Symbol"]} | '
-                        f'{row["Side"]} | '
-                        f'{row["Reason"]} | '
-                        f'BTC={row["BTC_Trend"]} | '
-                        f'R={row["Return"]:.2f}'
-                    )
-
-
-    # ========================================================
-    # WORST LOSS STREAK BY R
-    # ========================================================
-
-    worst_streak_r = None
-
-    for streak in loss_streaks:
-
-        r = streak['Return'].sum()
-
-        if (
-            worst_streak_r is None
-            or r < worst_streak_r['R']
-        ):
-
-            worst_streak_r = {
-                'R': r,
-                'length': len(streak),
-                'start':
-                    streak.iloc[0]['Timestamp'],
-                'end':
-                    streak.iloc[-1]['Timestamp'],
-            }
-
-
-    if worst_streak_r:
-
-        print()
-        print(
-            '💥 بدترین زنجیره بر اساس R'
-        )
-
-        print('------------------------------------------------------------')
-
-        print(
-            f'تعداد معاملات: '
-            f'{worst_streak_r["length"]}'
-        )
-
-        print(
-            f'ضرر: '
-            f'{worst_streak_r["R"]:.2f}R'
-        )
-
-        print(
-            f'شروع: '
-            f'{worst_streak_r["start"]}'
-        )
-
-        print(
-            f'پایان: '
-            f'{worst_streak_r["end"]}'
-        )
-
-
-    # ========================================================
-    # TIMEOUT ANALYSIS
-    # ========================================================
-
-    timeout_df = trades_df[
-        trades_df['Outcome']
-        == 'TIMEOUT'
+    bins = [
+        -1,
+        12,
+        18,
+        24,
+        30,
+        36,
+        1000
     ]
 
-    print()
-    print('⏱️ TIMEOUT ANALYSIS')
-    print('------------------------------------------------------------')
-
-    if timeout_df.empty:
-
-        print(
-            '✅ هیچ Timeout وجود ندارد.'
-        )
-
-    else:
-
-        timeout_wins = len(
-            timeout_df[
-                timeout_df['Return'] > 0
-            ]
-        )
-
-        timeout_losses = len(
-            timeout_df[
-                timeout_df['Return'] < 0
-            ]
-        )
-
-        timeout_avg = (
-            timeout_df['Return'].mean()
-        )
-
-        timeout_net = (
-            timeout_df['Return'].sum()
-        )
-
-        print(
-            f'⏱️ تعداد Timeout: '
-            f'{len(timeout_df)}'
-        )
-
-        print(
-            f'🟢 Timeout مثبت: '
-            f'{timeout_wins}'
-        )
-
-        print(
-            f'🔴 Timeout منفی: '
-            f'{timeout_losses}'
-        )
-
-        print(
-            f'📊 میانگین Timeout: '
-            f'{timeout_avg:.4f}R'
-        )
-
-        print(
-            f'💰 مجموع Timeout: '
-            f'{timeout_net:.2f}R'
-        )
-
-
-        print()
-        print(
-            '📋 جزئیات Timeout ها:'
-        )
-
-        for _, row in timeout_df.iterrows():
-
-            print(
-                f'   {row["Timestamp"]} | '
-                f'{row["Symbol"]} | '
-                f'{row["Side"]} | '
-                f'{row["Candles_Held"]}h | '
-                f'R={row["Return"]:.3f}'
-            )
-
-
-    # ========================================================
-    # LOSS REASON ANALYSIS
-    # ========================================================
-
-    loss_df = trades_df[
-        trades_df['Outcome']
-        == 'LOSS'
+    labels = [
+        "<=12h",
+        "13-18h",
+        "19-24h",
+        "25-30h",
+        "31-36h",
+        ">36h"
     ]
 
-    print()
-    print('❌ تحلیل علت باخت‌ها')
-    print('------------------------------------------------------------')
+    timeout_copy = (
+        timeouts.copy()
+    )
 
-    if loss_df.empty:
+    timeout_copy[
+        'Hold_Bucket'
+    ] = pd.cut(
+        timeout_copy[
+            'Hours_Held'
+        ],
+        bins=bins,
+        labels=labels
+    )
 
-        print(
-            '🎉 هیچ باختی ثبت نشده.'
+    hold_analysis = (
+        timeout_copy
+        .groupby(
+            'Hold_Bucket',
+            observed=True
         )
-
-    else:
-
-        loss_reasons = (
-            loss_df['Reason']
-            .value_counts()
+        .agg(
+            Trades=('Return', 'size'),
+            Avg_R=('Return', 'mean'),
+            Net_R=('Return', 'sum')
         )
+    )
 
-        for reason, count in (
-            loss_reasons.items()
-        ):
+    print(
+        hold_analysis.to_string(
+            float_format=lambda x:
+            f"{x:.3f}"
+        )
+    )
 
-            pct = (
-                count
-                / len(loss_df)
-                * 100
-            )
+# ============================================================
+# MFE / MAE TIMEOUT
+# ============================================================
 
-            print(
-                f'🔴 {reason}: '
-                f'{count} '
-                f'({pct:.2f}% از کل باخت‌ها)'
-            )
+print()
+print("🎯 TIMEOUT MFE / MAE")
+print("-" * 60)
 
+if timeout_count > 0:
 
-    # ========================================================
-    # LONG / SHORT ANALYSIS
-    # ========================================================
+    print(
+        f"Average MFE: "
+        f"{timeouts['MFE_R'].mean():.3f}R"
+    )
+
+    print(
+        f"Median MFE: "
+        f"{timeouts['MFE_R'].median():.3f}R"
+    )
+
+    print(
+        f"Average MAE: "
+        f"{timeouts['MAE_R'].mean():.3f}R"
+    )
+
+    print(
+        f"Median MAE: "
+        f"{timeouts['MAE_R'].median():.3f}R"
+    )
 
     print()
-    print('📈 تحلیل LONG / SHORT')
-    print('------------------------------------------------------------')
 
-    for side in ['LONG', 'SHORT']:
-
-        side_df = trades_df[
-            trades_df['Side'] == side
+    reached_1R = (
+        timeouts[
+            timeouts['MFE_R'] >= 1.0
         ]
+    )
 
-        if side_df.empty:
-            continue
+    reached_1_5R = (
+        timeouts[
+            timeouts['MFE_R'] >= 1.5
+        ]
+    )
+
+    reached_2R = (
+        timeouts[
+            timeouts['MFE_R'] >= 2.0
+        ]
+    )
+
+    print(
+        f"Timeoutهایی که حداقل +1R "
+        f"رفته‌اند: "
+        f"{len(reached_1R)} "
+        f"({len(reached_1R)/timeout_count*100:.2f}%)"
+    )
+
+    print(
+        f"Timeoutهایی که حداقل +1.5R "
+        f"رفته‌اند: "
+        f"{len(reached_1_5R)} "
+        f"({len(reached_1_5R)/timeout_count*100:.2f}%)"
+    )
+
+    print(
+        f"Timeoutهایی که حداقل +2R "
+        f"رفته‌اند: "
+        f"{len(reached_2R)} "
+        f"({len(reached_2R)/timeout_count*100:.2f}%)"
+    )
+
+# ============================================================
+# LOSS ANALYSIS
+# ============================================================
+
+print()
+print("=" * 60)
+print("🔴 LOSS ANALYSIS")
+print("=" * 60)
+
+loss_symbol = (
+    losses
+    .groupby('Symbol')
+    .agg(
+        Losses=('Symbol', 'size'),
+        Avg_R=('Return', 'mean'),
+        Net_R=('Return', 'sum')
+    )
+    .sort_values(
+        'Losses',
+        ascending=False
+    )
+)
+
+print(
+    loss_symbol.to_string(
+        float_format=lambda x:
+        f"{x:.3f}"
+    )
+)
+
+print()
+print("🔴 LOSS بر اساس BTC Trend")
+
+loss_btc = (
+    losses
+    .groupby('BTC_Trend')
+    .agg(
+        Trades=('BTC_Trend', 'size'),
+        Avg_R=('Return', 'mean'),
+        Net_R=('Return', 'sum')
+    )
+)
+
+print(
+    loss_btc.to_string(
+        float_format=lambda x:
+        f"{x:.3f}"
+    )
+)
+
+# ============================================================
+# LONG / SHORT PERFORMANCE
+# ============================================================
+
+print()
+print("=" * 60)
+print("📊 LONG / SHORT ANALYSIS")
+print("=" * 60)
+
+side_stats = (
+    trades
+    .groupby('Side')
+    .agg(
+        Trades=('Side', 'size'),
+        Avg_R=('Return', 'mean'),
+        Net_R=('Return', 'sum')
+    )
+)
+
+for side in ['LONG', 'SHORT']:
+
+    if side in side_stats.index:
+
+        side_data = trades[
+            trades['Side'] == side
+        ]
 
         side_wins = len(
-            side_df[
-                side_df['Outcome'] == 'WIN'
+            side_data[
+                side_data['Outcome']
+                == 'WIN'
             ]
         )
 
         side_losses = len(
-            side_df[
-                side_df['Outcome'] == 'LOSS'
-            ]
-        )
-
-        side_timeout = len(
-            side_df[
-                side_df['Outcome'] == 'TIMEOUT'
+            side_data[
+                side_data['Outcome']
+                == 'LOSS'
             ]
         )
 
         side_closed = (
-            side_wins
-            + side_losses
+            side_wins +
+            side_losses
         )
 
         side_wr = (
-            side_wins
-            / side_closed
-            * 100
-            if side_closed > 0
+            side_wins /
+            side_closed * 100
+            if side_closed
             else 0
         )
 
-        side_r = (
-            side_df['Return'].sum()
-        )
-
         print(
-            f'{side}: '
-            f'Trades={len(side_df)} | '
-            f'WIN={side_wins} | '
-            f'LOSS={side_losses} | '
-            f'TIMEOUT={side_timeout} | '
-            f'WR={side_wr:.2f}% | '
-            f'Net={side_r:.2f}R'
+            f"{side}: "
+            f"Trades={len(side_data)} | "
+            f"WR={side_wr:.2f}% | "
+            f"Net={side_data['Return'].sum():.2f}R"
         )
 
+# ============================================================
+# STREAK REPORT
+# ============================================================
 
-    # ========================================================
-    # BTC TREND ANALYSIS
-    # ========================================================
+print()
+print("=" * 60)
+print("🔥 LOSS STREAK ANALYSIS")
+print("=" * 60)
+
+print(
+    f"🔥 Max WIN streak: "
+    f"{max_win_streak}"
+)
+
+print(
+    f"❄️ Max LOSS streak: "
+    f"{max_loss_streak}"
+)
+
+for n, streak in enumerate(
+    loss_streaks,
+    start=1
+):
+
+    if len(streak) < 5:
+        continue
+
+    streak_df = pd.DataFrame(
+        streak
+    )
 
     print()
-    print('₿ تحلیل بر اساس روند BTC')
-    print('------------------------------------------------------------')
+    print(
+        f"🔴 Streak #{n}: "
+        f"{len(streak_df)} LOSS"
+    )
 
-    for trend in [
-        'LONG',
-        'SHORT',
-        'NEUTRAL',
-        'UNKNOWN'
-    ]:
+    print(
+        f"   شروع: "
+        f"{streak_df['Timestamp'].iloc[0]}"
+    )
 
-        btc_df = trades_df[
-            trades_df['BTC_Trend']
-            == trend
-        ]
+    print(
+        f"   پایان: "
+        f"{streak_df['Timestamp'].iloc[-1]}"
+    )
 
-        if btc_df.empty:
+    print(
+        f"   مجموع R: "
+        f"{streak_df['Return'].sum():.2f}R"
+    )
+
+    print(
+        "   ارزها: "
+        +
+        ", ".join(
+            streak_df['Symbol']
+            .tolist()
+        )
+    )
+
+# ============================================================
+# WORST TIMEOUTS
+# ============================================================
+
+print()
+print("=" * 60)
+print("🔻 بدترین TIMEOUT ها")
+print("=" * 60)
+
+if timeout_count > 0:
+
+    worst_timeouts = (
+        timeouts
+        .sort_values(
+            'Return'
+        )
+        .head(20)
+    )
+
+    for _, row in (
+        worst_timeouts.iterrows()
+    ):
+
+        print(
+            f"{row['Timestamp']} | "
+            f"{row['Symbol']} | "
+            f"{row['Side']} | "
+            f"R={row['Return']:.3f} | "
+            f"Hold={row['Hours_Held']:.1f}h | "
+            f"BTC={row['BTC_Trend']} | "
+            f"MFE={row['MFE_R']:.2f}R"
+        )
+
+# ============================================================
+# BEST TIMEOUTS
+# ============================================================
+
+print()
+print("=" * 60)
+print("🟢 بهترین TIMEOUT ها")
+print("=" * 60)
+
+if timeout_count > 0:
+
+    best_timeouts = (
+        timeouts
+        .sort_values(
+            'Return',
+            ascending=False
+        )
+        .head(20)
+    )
+
+    for _, row in (
+        best_timeouts.iterrows()
+    ):
+
+        print(
+            f"{row['Timestamp']} | "
+            f"{row['Symbol']} | "
+            f"{row['Side']} | "
+            f"R={row['Return']:.3f} | "
+            f"Hold={row['Hours_Held']:.1f}h | "
+            f"BTC={row['BTC_Trend']} | "
+            f"MFE={row['MFE_R']:.2f}R"
+        )
+
+# ============================================================
+# TIMEOUT SCENARIO SIMULATION
+#
+# IMPORTANT:
+# This is a diagnostic approximation.
+# It does NOT rerun entries for different timeout values.
+# It only evaluates existing trades at their observed path.
+# ============================================================
+
+print()
+print("=" * 60)
+print("🧪 TIMEOUT SCENARIO DIAGNOSTIC")
+print("=" * 60)
+
+print(
+    "⚠️ این بخش فقط برای Diagnostic است "
+    "و Entryها را دوباره تولید نمی‌کند."
+)
+
+for timeout_hours in TIMEOUT_TESTS:
+
+    scenario_returns = []
+
+    for _, trade in trades.iterrows():
+
+        if trade['Outcome'] != 'TIMEOUT':
+
+            scenario_returns.append(
+                trade['Return']
+            )
+
             continue
 
-        b_wins = len(
-            btc_df[
-                btc_df['Outcome'] == 'WIN'
-            ]
+        # We do not have every intermediate
+        # candle stored in the trade table.
+        # Therefore we cannot honestly
+        # reconstruct 12h/36h exits here.
+
+        scenario_returns.append(
+            trade['Return']
         )
 
-        b_losses = len(
-            btc_df[
-                btc_df['Outcome'] == 'LOSS'
-            ]
-        )
-
-        b_closed = (
-            b_wins + b_losses
-        )
-
-        b_wr = (
-            b_wins
-            / b_closed
-            * 100
-            if b_closed > 0
-            else 0
-        )
-
-        b_r = (
-            btc_df['Return'].sum()
-        )
-
-        print(
-            f'BTC={trend}: '
-            f'Trades={len(btc_df)} | '
-            f'WR={b_wr:.2f}% | '
-            f'Net={b_r:.2f}R'
-        )
-
-
-    # ========================================================
-    # SYMBOL ANALYSIS
-    # ========================================================
-
-    print()
-    print('🪙 گزارش تفکیک‌شده ارزها')
-    print('------------------------------------------------------------')
-
-    symbol_summary = []
-
-    for sym in SYMBOLS.keys():
-
-        sym_df = trades_df[
-            trades_df['Symbol']
-            == sym
-        ]
-
-        if sym_df.empty:
-            continue
-
-        s_wins = len(
-            sym_df[
-                sym_df['Outcome'] == 'WIN'
-            ]
-        )
-
-        s_loss = len(
-            sym_df[
-                sym_df['Outcome'] == 'LOSS'
-            ]
-        )
-
-        s_timeout = len(
-            sym_df[
-                sym_df['Outcome'] == 'TIMEOUT'
-            ]
-        )
-
-        s_closed = (
-            s_wins + s_loss
-        )
-
-        s_wr = (
-            s_wins
-            / s_closed
-            * 100
-            if s_closed > 0
-            else 0
-        )
-
-        s_net_r = (
-            sym_df['Return'].sum()
-        )
-
-        symbol_summary.append({
-
-            'Symbol':
-                sym,
-
-            'Trades':
-                len(sym_df),
-
-            'Wins':
-                s_wins,
-
-            'Losses':
-                s_loss,
-
-            'Timeout':
-                s_timeout,
-
-            'WinRate':
-                round(
-                    s_wr,
-                    2
-                ),
-
-            'Net_R':
-                round(
-                    s_net_r,
-                    2
-                ),
-        })
-
-
-    summary_df = pd.DataFrame(
-        symbol_summary
+    scenario_net = sum(
+        scenario_returns
     )
 
     print(
-        summary_df.to_string(
-            index=False
-        )
+        f"Timeout={timeout_hours}h | "
+        f"Net observed={scenario_net:.2f}R"
     )
 
+print()
+print(
+    "⚠️ برای مقایسه واقعی 12h/24h/36h "
+    "باید کندل‌های داخل هر معامله ذخیره شوند."
+)
 
-    # ========================================================
-    # WORST SYMBOLS
-    # ========================================================
+# ============================================================
+# PORTFOLIO SUMMARY
+# ============================================================
 
-    print()
-    print('⚠️ ارزهای ضعیف‌تر')
-    print('------------------------------------------------------------')
+print()
+print("=" * 60)
+print("🏁 خلاصه نهایی V8.2")
+print("=" * 60)
 
-    weak_symbols = (
-        summary_df
-        .sort_values(
-            'WinRate'
-        )
-        .head(5)
-    )
+print(
+    f"📊 Trades: "
+    f"{total_trades}"
+)
 
-    print(
-        weak_symbols.to_string(
-            index=False
-        )
-    )
+print(
+    f"🟢 Wins: "
+    f"{win_count}"
+)
 
+print(
+    f"🔴 Losses: "
+    f"{loss_count}"
+)
 
-    # ========================================================
-    # WORST LOSS EVENTS
-    # ========================================================
+print(
+    f"⏱️ Timeouts: "
+    f"{timeout_count}"
+)
 
-    print()
-    print('🚨 آخرین/بدترین باخت‌ها')
-    print('------------------------------------------------------------')
+print(
+    f"🎯 WR without Timeout: "
+    f"{win_rate:.2f}%"
+)
 
-    worst_losses = (
-        loss_df
-        .sort_values(
-            'Timestamp'
-        )
-        .tail(20)
-    )
+print(
+    f"💰 Net R: "
+    f"{net_r:.2f}R"
+)
 
-    for _, row in worst_losses.iterrows():
+print(
+    f"📈 Profit Factor: "
+    f"{profit_factor:.3f}"
+)
 
-        print(
-            f'{row["Timestamp"]} | '
-            f'{row["Symbol"]} | '
-            f'{row["Side"]} | '
-            f'{row["Reason"]} | '
-            f'BTC={row["BTC_Trend"]} | '
-            f'Hold={row["Candles_Held"]}h'
-        )
+print(
+    f"📐 Expectancy: "
+    f"{expectancy:.4f}R"
+)
 
+print(
+    f"📉 Max Drawdown: "
+    f"{max_drawdown:.2f}R"
+)
 
-    # ========================================================
-    # FINAL RISK SUMMARY
-    # ========================================================
+print(
+    f"🔥 Max Win Streak: "
+    f"{max_win_streak}"
+)
 
-    print()
-    print('============================================================')
-    print('🏁 خلاصه نهایی ریسک')
-    print('============================================================')
+print(
+    f"❄️ Max Loss Streak: "
+    f"{max_loss_streak}"
+)
 
-    print(
-        f'📊 Trades: {total}'
-    )
+# ============================================================
+# SAVE CSV
+# ============================================================
 
-    print(
-        f'🎯 Win Rate: {win_rate:.2f}%'
-    )
+csv_file = "hunter_x_v8_2_trades.csv"
 
-    print(
-        f'💰 Net: {net_r:.2f}R'
-    )
+trades.to_csv(
+    csv_file,
+    index=False
+)
 
-    print(
-        f'📉 Max Drawdown: '
-        f'{max_drawdown:.2f}R'
-    )
+print()
+print(
+    f"💾 فایل معاملات ذخیره شد: "
+    f"{csv_file}"
+)
 
-    print(
-        f'🔥 Max Win Streak: '
-        f'{max_wins}'
-    )
-
-    print(
-        f'❄️ Max Loss Streak: '
-        f'{max_losses}'
-    )
-
-    print(
-        f'⏱️ Timeouts: '
-        f'{timeouts}'
-    )
-
-    print(
-        f'📊 Avg R/Trade: '
-        f'{avg_r:.4f}R'
-    )
-
-    print()
-    print('✨ بک‌تست V8.1 به پایان رسید.')
+print()
+print("=" * 60)
+print("✨ HUNTER-X V8.2 به پایان رسید")
+print("=" * 60)
