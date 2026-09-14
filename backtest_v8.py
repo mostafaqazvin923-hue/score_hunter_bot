@@ -14,7 +14,6 @@ import pandas as pd
 
 exchange = ccxt.lbank({'enableRateLimit': True})
 
-# سبد ۱۱ ارزی بهینه‌شده
 SYMBOLS = {
     'BTC': 'BTC/USDT',
     'ETH': 'ETH/USDT',
@@ -33,9 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print(
-    '📥 دریافت داده‌ها (HUNTER-V14 - Macro Trend & Anti-Whipsaw Protection)'
-)
+print('📥 دریافت داده‌ها (HUNTER-V15 - Squeeze Momentum & Volatility Breakout)')
 print('============================================================')
 
 data_1h = {}
@@ -63,7 +60,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
     df1h = pd.DataFrame(
         all_ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
     )
-    df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit='ms')
+    df1h['Date'] = pd.to_datetime(df1h['Timestamp'], unit= 'ms')
     df1h = df1h[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
     df1h.dropna(inplace=True)
     df1h.drop_duplicates(subset=['Date'], inplace=True)
@@ -78,6 +75,25 @@ def calculate_indicators(df):
   tr2 = np.abs(df['High'] - df['Close'].shift(1))
   tr3 = np.abs(df['Low'] - df['Close'].shift(1))
   df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
+
+  # Bollinger Bands
+  df['BB_Mid'] = df['Close'].rolling(20).mean()
+  df['BB_Std'] = df['Close'].rolling(20).std()
+  df['BB_Upper'] = df['BB_Mid'] + (2.0 * df['BB_Std'])
+  df['BB_Lower'] = df['BB_Mid'] - (2.0 * df['BB_Std'])
+
+  # Keltner Channel
+  df['KC_Mid'] = df['Close'].ewm(span=20, adjust=False).mean()
+  df['KC_Upper'] = df['KC_Mid'] + (1.5 * df['ATR'])
+  df['KC_Lower'] = df['KC_Mid'] - (1.5 * df['ATR'])
+
+  # Squeeze Indicator (Bollinger inside Keltner = Squeeze ON)
+  df['Squeeze_On'] = (df['BB_Upper'] < df['KC_Upper']) & (
+      df['BB_Lower'] > df['KC_Lower']
+  )
+  df['Squeeze_Off'] = ~df['Squeeze_On']
+
+  # Momentum Oscillator (Linear Regression of Close)
   df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
   df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
   df['Volume_MA'] = df['Volume'].rolling(20).mean()
@@ -90,7 +106,6 @@ for symbol, df1h in data_1h.items():
     continue
   df1h = calculate_indicators(df1h)
 
-  # داده‌های روزانه برای فیلتر کلان
   df_daily = (
       df1h.set_index('Date')
       .resample('1d')
@@ -105,13 +120,10 @@ for symbol, df1h in data_1h.items():
       .reset_index()
   )
   df_daily['Daily_EMA50'] = (
-      df_daily['Close'].ewm(span=50, adjust=False).mean()
+      df_daily['Close'].ewm(span=50, adjust=False).mean().shift(1)
   )
-  df_daily['Daily_EMA50'] = df_daily['Daily_EMA50'].shift(1)  # بدون Lookahead
-
   df1h['Date_Daily'] = df1h['Date'].dt.floor('1d')
 
-  # داده‌های 4 ساعته برای ساختار بازار
   df4h = (
       df1h.set_index('Date')
       .resample('4h')
@@ -126,27 +138,17 @@ for symbol, df1h in data_1h.items():
       .reset_index()
   )
   df4h = calculate_indicators(df4h)
-  df4h['Swing_High'] = df4h['High'].rolling(window=12).max().shift(1)
-  df4h['Swing_Low'] = df4h['Low'].rolling(window=12).min().shift(1)
-
-  df4h['Structure_Long'] = (df4h['Close'] > df4h['Swing_High']) & (
-      df4h['EMA50'] > df4h['EMA200']
-  )
-  df4h['Structure_Short'] = (df4h['Close'] < df4h['Swing_Low']) & (
-      df4h['EMA50'] < df4h['EMA200']
-  )
-
-  for col in ['Structure_Long', 'Structure_Short', 'Swing_High', 'Swing_Low']:
-    df4h[col] = df4h[col].shift(1)
-
+  df4h['EMA50_4H'] = df4h['EMA50'].shift(1)
+  df4h['EMA200_4H'] = df4h['EMA200'].shift(1)
   df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
+
   processed_data[symbol] = {
       '1h': df1h,
       '4h': df4h.set_index('Date'),
       'daily': df_daily.set_index('Date'),
   }
 
-print('⚙️ شروع اجرای بک‌تست HUNTER-V14...')
+print('⚙️ شروع اجرای بک‌تست HUNTER-V15 (Squeeze Breakout)...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -154,7 +156,7 @@ for dat in processed_data.values():
 sorted_timestamps = sorted(list(all_timestamps))
 
 active_positions = {}
-cooldown_timers = {}  # برای جلوگیری از ترید پشت سر هم بعد از ضرر
+cooldown_timers = {}
 all_trades = []
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
@@ -163,7 +165,6 @@ MAX_CONCURRENT_POSITIONS = 2
 dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items()}
 
 for ts in sorted_timestamps:
-  # کاهش تایمر کول‌داون
   for sym in list(cooldown_timers.keys()):
     cooldown_timers[sym] -= 1
     if cooldown_timers[sym] <= 0:
@@ -185,13 +186,13 @@ for ts in sorted_timestamps:
     if pos['side'] == 'LONG':
       hit_sl = c1h['Low'] <= pos['stop_loss']
       hit_tp = c1h['High'] >= pos['take_profit']
-      is_timeout = candles_held >= 24
+      is_timeout = candles_held >= 20
 
       if hit_sl or hit_tp or is_timeout:
         if hit_sl:
           outcome = 'LOSS'
           r_real = -1.0 - (FEE_RATE * 2)
-          cooldown_timers[symbol] = 12  # ۱۲ ساعت استراحت بعد از ضرر
+          cooldown_timers[symbol] = 16
         elif hit_tp:
           outcome = 'WIN'
           r_real = 2.0 - (FEE_RATE * 2)
@@ -203,7 +204,7 @@ for ts in sorted_timestamps:
             r_real = 0.0
           outcome = 'WIN' if r_real > 0 else 'LOSS'
           if outcome == 'LOSS':
-            cooldown_timers[symbol] = 12
+            cooldown_timers[symbol] = 16
 
         all_trades.append({
             'Timestamp': ts,
@@ -217,13 +218,13 @@ for ts in sorted_timestamps:
     elif pos['side'] == 'SHORT':
       hit_sl = c1h['High'] >= pos['stop_loss']
       hit_tp = c1h['Low'] <= pos['take_profit']
-      is_timeout = candles_held >= 24
+      is_timeout = candles_held >= 20
 
       if hit_sl or hit_tp or is_timeout:
         if hit_sl:
           outcome = 'LOSS'
           r_real = -1.0 - (FEE_RATE * 2)
-          cooldown_timers[symbol] = 12
+          cooldown_timers[symbol] = 16
         elif hit_tp:
           outcome = 'WIN'
           r_real = 2.0 - (FEE_RATE * 2)
@@ -235,7 +236,7 @@ for ts in sorted_timestamps:
             r_real = 0.0
           outcome = 'WIN' if r_real > 0 else 'LOSS'
           if outcome == 'LOSS':
-            cooldown_timers[symbol] = 12
+            cooldown_timers[symbol] = 16
 
         all_trades.append({
             'Timestamp': ts,
@@ -263,38 +264,49 @@ for ts in sorted_timestamps:
     if match_rows.empty:
       continue
     i = match_rows.index[0]
-    if i < 60:
+    if i < 50:
       continue
 
     c1h = df1h.iloc[i]
     prev = df1h.iloc[i - 1]
+    prev2 = df1h.iloc[i - 2]
 
-    # فیلتر روند کلان روزانه
+    # تاییدیه اسکوئیز: خروج از حالت فشردگی (Squeeze release) در کندل قبلی
+    squeeze_fired = prev2['Squeeze_On'] and prev['Squeeze_Off']
+
+    # فیلتر چندتایم‌فریمی سخت‌گیرانه
     daily_time = c1h['Date_Daily']
     df_daily_idx = dat['daily']
     if daily_time not in df_daily_idx.index:
       continue
-    r_daily = df_daily_idx.loc[daily_time]
-    macro_bull = prev['Close'] > r_daily.get('Daily_EMA50', prev['Close'])
-    macro_bear = prev['Close'] < r_daily.get('Daily_EMA50', prev['Close'])
+    macro_bull = prev['Close'] > df_daily_idx.loc[daily_time].get(
+        'Daily_EMA50', prev['Close']
+    )
+    macro_bear = prev['Close'] < df_daily_idx.loc[daily_time].get(
+        'Daily_EMA50', prev['Close']
+    )
 
     t4h_time = c1h['Date_4H']
     df4h_idx = dat['4h']
     if t4h_time not in df4h_idx.index:
       continue
     r4h = df4h_idx.loc[t4h_time]
+    trend_4h_up = r4h.get('EMA50_4H', 0) > r4h.get('EMA200_4H', 0)
+    trend_4h_down = r4h.get('EMA50_4H', 0) < r4h.get('EMA200_4H', 0)
 
-    volume_surge = prev['Volume'] > (1.3 * prev['Volume_MA'])
+    volume_surge = prev['Volume'] > (1.4 * prev['Volume_MA'])
 
-    # ورود لانگ: هم‌راستا با روند روزانه و ساختار 4H
+    # ورود لانگ
     if (
-        r4h.get('Structure_Long', False)
+        squeeze_fired
         and macro_bull
+        and trend_4h_up
         and prev['Close'] > prev['EMA50']
         and volume_surge
+        and prev['Close'] > prev['Open']
     ):
       entry_price = c1h['Open'] * (1 + SLIPPAGE)
-      stop_loss = df1h['Low'].iloc[i - 6 : i].min() - 0.2 * prev['ATR']
+      stop_loss = df1h['Low'].iloc[i - 5 : i].min() - 0.2 * prev['ATR']
       sl_dist_pct = (entry_price - stop_loss) / entry_price
 
       if 0.003 <= sl_dist_pct <= 0.03:
@@ -309,15 +321,17 @@ for ts in sorted_timestamps:
         }
         continue
 
-    # ورود شورت: هم‌راستا با روند روزانه و ساختار 4H
+    # ورود شورت
     elif (
-        r4h.get('Structure_Short', False)
+        squeeze_fired
         and macro_bear
+        and trend_4h_down
         and prev['Close'] < prev['EMA50']
         and volume_surge
+        and prev['Close'] < prev['Open']
     ):
       entry_price = c1h['Open'] * (1 - SLIPPAGE)
-      stop_loss = df1h['High'].iloc[i - 6 : i].max() + 0.2 * prev['ATR']
+      stop_loss = df1h['High'].iloc[i - 5 : i].max() + 0.2 * prev['ATR']
       sl_dist_pct = (stop_loss - entry_price) / entry_price
 
       if 0.003 <= sl_dist_pct <= 0.03:
@@ -333,7 +347,7 @@ for ts in sorted_timestamps:
         continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V14 (Macro & Cooldown Protected)')
+print('📊 گزارش نهایی HUNTER-V15 (Squeeze Momentum & Breakout)')
 print('============================================================')
 
 if all_trades:
