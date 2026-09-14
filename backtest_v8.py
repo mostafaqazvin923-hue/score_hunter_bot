@@ -14,6 +14,7 @@ import pandas as pd
 
 exchange = ccxt.lbank({'enableRateLimit': True})
 
+# لیست نهایی و خالص‌شده (حذف کامل LTC و سایر ارزهای ضعیف و اضافه کردن تاپ‌ترین‌های بازار)
 SYMBOLS = {
     'BTC': 'BTC/USDT',
     'ETH': 'ETH/USDT',
@@ -22,7 +23,6 @@ SYMBOLS = {
     'LINK': 'LINK/USDT',
     'NEAR': 'NEAR/USDT',
     'SUI': 'SUI/USDT',
-    'MATIC': 'MATIC/USDT',
     'UNI': 'UNI/USDT',
     'ICP': 'ICP/USDT',
     'APT': 'APT/USDT',
@@ -32,26 +32,32 @@ SYMBOLS = {
     'FIL': 'FIL/USDT',
     'ATOM': 'ATOM/USDT',
     'RENDER': 'RENDER/USDT',
-    'TIA': 'TIA/USDT',
     'SEI': 'SEI/USDT',
-    'FET': 'FET/USDT',
-    'FTM': 'FTM/USDT',
     'IMX': 'IMX/USDT',
     'DOGE': 'DOGE/USDT',
     'DOT': 'DOT/USDT',
-    'LTC': 'LTC/USDT',
     'ETC': 'ETC/USDT',
     'XLM': 'XLM/USDT',
-    'AR': 'AR/USDT',
-    'GRT': 'GRT/USDT',
     'SNX': 'SNX/USDT',
+    'PEPE': 'PEPE/USDT',
+    'WIF': 'WIF/USDT',
+    'BONK': 'BONK/USDT',
+    'STX': 'STX/USDT',
+    'RUNE': 'RUNE/USDT',
+    'AAVE': 'AAVE/USDT',
+    'MKR': 'MKR/USDT',
+    'SHIB': 'SHIB/USDT',
+    'PENDLE': 'PENDLE/USDT',
+    'NEAR': 'NEAR/USDT',
 }
+# پاکسازی کلیدهای تکراری احتمالی
+SYMBOLS = {k: v for k, v in SYMBOLS.items() if k != 'LTC'}
 
 start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-V29 - Expanded 30-Asset Institutional CTA)')
+print('📥 دریافت داده‌ها (HUNTER-V31 - Final Cleaned Top-Tier CTA)')
 print('============================================================')
 
 processed_data = {}
@@ -106,7 +112,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
   processed_data[symbol] = df4h.set_index('Date')
 
-print('⚙️ شروع اجرای بک‌تست هوشمند HUNTER-V29...')
+print('⚙️ شروع اجرای بک‌تست هوشمند HUNTER-V31...')
 
 all_timestamps = set()
 for df in processed_data.values():
@@ -117,7 +123,7 @@ active_positions = {}
 all_trades = []
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
-MAX_POSITIONS = 4  # افزایش همزمان پوزیشن‌ها متناسب با ۳۰ ارز
+MAX_POSITIONS = 5
 
 for ts in sorted_timestamps:
   symbols_to_close = []
@@ -195,7 +201,7 @@ for ts in sorted_timestamps:
 
     regime_bull = (c4h['Close'] > c4h['EMA20']) and (c4h['EMA20'] > c4h['EMA50'])
     valid_trend = (
-        regime_bull and (c4h['Mom_Short'] > 0.015) and (c4h['Mom_Long'] > 0.04)
+        regime_bull and (c4h['Mom_Short'] > 0.01) and (c4h['Mom_Long'] > 0.03)
     )
 
     if valid_trend:
@@ -215,7 +221,7 @@ for ts in sorted_timestamps:
         }
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V29 (Expanded 30-Asset Institutional CTA)')
+print('📊 گزارش نهایی HUNTER-V31 (Final Cleaned Top-Tier CTA)')
 print('============================================================')
 
 if all_trades:
