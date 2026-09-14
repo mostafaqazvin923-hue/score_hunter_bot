@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V43
+# HUNTER-V44
 # Baseline-preserving backtest:
 # منطق سیگنال/ورود/خروج V33 حفظ شده و فقط خطاهای فنی بک‌تست
 # (داده ناقص، کندل ناقص، pagination، index lookup و گزارش DD)
@@ -22,42 +22,62 @@ import pandas as pd
 
 exchange = ccxt.lbank({"enableRateLimit": True})
 
-# کاندیدهای گسترده‌تر؛ بعد از دریافت داده فقط نمادهای واقعاً موجود در LBank
-# و دارای تاریخچه کافی وارد بک‌تست می‌شوند.
 SYMBOLS = {
+    # Core leaders from V42
     "BTC": "BTC/USDT",
     "ETH": "ETH/USDT",
     "SOL": "SOL/USDT",
     "XRP": "XRP/USDT",
     "LINK": "LINK/USDT",
-    "AAVE": "AAVE/USDT",
-    "ATOM": "ATOM/USDT",
+    "UNI": "UNI/USDT",
+    "ICP": "ICP/USDT",
     "INJ": "INJ/USDT",
+    "ATOM": "ATOM/USDT",
     "RENDER": "RENDER/USDT",
     "XLM": "XLM/USDT",
-    "ONDO": "ONDO/USDT",
-    "UNI": "UNI/USDT",
+    "AAVE": "AAVE/USDT",
     "WIF": "WIF/USDT",
-    "HYPE": "HYPE/USDT",
+    "ONDO": "ONDO/USDT",
+
+    # New candidates replacing persistent weak names
+    "DOGE": "DOGE/USDT",
     "BNB": "BNB/USDT",
     "ADA": "ADA/USDT",
-    "HBAR": "HBAR/USDT",
-    "DOGE": "DOGE/USDT",
-    "SUI": "SUI/USDT",
-    "AVAX": "AVAX/USDT",
-    "NEAR": "NEAR/USDT",
-    "ICP": "ICP/USDT",
-    "OP": "OP/USDT",
 }
 
-# فقط نمادهایی که در بک‌تست قبلی واقعاً ضعیف بودند حذف اولیه می‌شوند.
-# بقیه ضعیف/قوی بودنشان با فیلترهای rolling تعیین می‌شود.
-INITIAL_BLACKLIST = {"NEAR", "OP"}
+# Names that were persistently weak in the tested basket are excluded.
+# This is a fixed universe choice, not a future-looking trade filter.
+REMOVED_COINS = {
+    "NEAR",
+    "OP",
+    "HYPE",
+    "HBAR",
+    "AVAX",
+    "SUI",
+    "PENDLE",
+    "TIA",
+    "FET",
+    "SEI",
+    "ARB",
+    "DOT",
+    "ETC",
+    "SHIB",
+    "STX",
+    "RUNE",
+    "MKR",
+    "APT",
+    "LTC",
+    "AR",
+    "IMX",
+    "PEPE",
+    "BONK",
+}
 
 SYMBOLS = {
     k: v for k, v in SYMBOLS.items()
-    if k not in INITIAL_BLACKLIST
+    if k not in REMOVED_COINS
 }
+
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
@@ -70,15 +90,14 @@ INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
-# کنترل ریسک زنجیره‌ای:
-# فقط وقتی وارد می‌شویم که بازار breadth مناسبی داشته باشد.
-MARKET_BREADTH_MIN = 0.30
-BTC_REGIME_REQUIRED = True
-
-# به‌جای حذف دائمی ارزها، فقط وقتی یک نماد در نیمه ضعیف سبد است
-# و مومنتوم آن هم ضعیف شده، از ورودش جلوگیری می‌شود.
-RELATIVE_STRENGTH_LOOKBACK = 30
-RELATIVE_RANK_MIN = 0.50
+# ------------------------------------------------------------
+# محافظت سبک از زنجیره ضرر
+# این فیلتر فقط بعد از ایجاد زنجیره ضرر فعال می‌شود و در حالت عادی
+# هیچ محدودیتی روی سیگنال‌های V42 اعمال نمی‌کند.
+# ------------------------------------------------------------
+STREAK_TRIGGER = 3
+STREAK_PAUSE_CANDLES = 2
+STREAK_MOM_LONG_BOOST = 0.010
 
 # ------------------------------------------------------------
 # دریافت مطمئن داده
@@ -88,23 +107,10 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V43")
+print("📥 دریافت داده‌ها - HUNTER-V44")
 print("=" * 60)
 
 processed_data = {}
-
-# بازارهای واقعی LBank را یک بار می‌خوانیم تا نماد فرضی وارد بک‌تست نشود.
-try:
-    exchange.load_markets()
-    available_symbols = set(exchange.symbols)
-except Exception as e:
-    print(f"⚠️ load_markets شکست خورد؛ فیلتر بازار غیرفعال شد: {e}")
-    available_symbols = set(SYMBOLS.values())
-
-SYMBOLS = {
-    k: v for k, v in SYMBOLS.items()
-    if v in available_symbols
-}
 
 def fetch_symbol_data(lbank_symbol):
     all_ohlcv = []
@@ -198,12 +204,6 @@ def fetch_symbol_data(lbank_symbol):
         / df["Close"].shift(30)
     )
 
-    # مومنتوم نسبی برای جلوگیری از ورود به ارزهای ضعیف‌تر سبد.
-    df["Mom_30"] = (
-        (df["Close"] - df["Close"].shift(RELATIVE_STRENGTH_LOOKBACK))
-        / df["Close"].shift(RELATIVE_STRENGTH_LOOKBACK)
-    )
-
     # timestampها را یک بار به عنوان index نگه می‌داریم.
     df.set_index("Date", inplace=True)
     return df
@@ -218,7 +218,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         print(f"❌ {symbol}: حذف شد")
 
 print(f"\n✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V43...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V44...")
 
 # ------------------------------------------------------------
 # بک‌تست — منطق اصلی V33 حفظ شده
@@ -232,6 +232,10 @@ all_timestamps = sorted({
 
 active_positions = {}
 all_trades = []
+
+# تعداد ضررهای متوالی پورتفوی؛ فقط معاملات بسته‌شده را می‌شمارد.
+portfolio_loss_streak = 0
+streak_pause_remaining = 0
 
 for ts in all_timestamps:
 
@@ -283,6 +287,16 @@ for ts in all_timestamps:
 
             outcome = "WIN" if r_real > 0 else "LOSS"
 
+            if outcome == "LOSS":
+                portfolio_loss_streak += 1
+            else:
+                portfolio_loss_streak = 0
+
+            # فقط پس از 3 ضرر پیاپی، دو کندل بازار را استراحت می‌دهیم.
+            # این کار در حالت عادی هیچ اثری ندارد.
+            if portfolio_loss_streak >= STREAK_TRIGGER:
+                streak_pause_remaining = STREAK_PAUSE_CANDLES
+
             all_trades.append({
                 "Timestamp": ts,
                 "Symbol": symbol,
@@ -299,45 +313,20 @@ for ts in all_timestamps:
     # -------------------------
     # امتیازدهی و ورود
     # -------------------------
+    if streak_pause_remaining > 0:
+        streak_pause_remaining -= 1
+        continue
+
     current_scores = {}
-    bullish_symbols = []
 
     for symbol, df in processed_data.items():
         if ts in df.index:
-            row = df.loc[ts]
-
-            if not np.isnan(row["Mom_Long"]):
-                current_scores[symbol] = row["Mom_Long"]
-
-            if (
-                row["Close"] > row["EMA20"]
-                and row["EMA20"] > row["EMA50"]
-                and row["Close"] > row["EMA200"]
-                and row["Mom_Long"] > 0.0
-            ):
-                bullish_symbols.append(symbol)
+            val = df.loc[ts, "Mom_Long"]
+            if not np.isnan(val):
+                current_scores[symbol] = val
 
     if not current_scores:
         continue
-
-    # فیلتر بازار: در محیط رنج/نزولی از شکار سیگنال‌های منفرد جلوگیری می‌کند.
-    breadth = len(bullish_symbols) / max(len(processed_data), 1)
-
-    if breadth < MARKET_BREADTH_MIN:
-        continue
-
-    if BTC_REGIME_REQUIRED and "BTC" in processed_data:
-        btc_df = processed_data["BTC"]
-        if ts not in btc_df.index:
-            continue
-        btc = btc_df.loc[ts]
-        btc_bull = (
-            btc["Close"] > btc["EMA20"]
-            and btc["EMA20"] > btc["EMA50"]
-            and btc["Close"] > btc["EMA200"]
-        )
-        if not btc_bull:
-            continue
 
     ranked_symbols = sorted(
         current_scores.keys(),
@@ -345,18 +334,11 @@ for ts in all_timestamps:
         reverse=True,
     )
 
-    # فقط نیمه قوی‌تر universe اجازه ورود دارد.
-    strength_cutoff = max(1, int(len(ranked_symbols) * RELATIVE_RANK_MIN))
-    eligible_strength = set(ranked_symbols[:strength_cutoff])
-
     for symbol in ranked_symbols:
         if len(active_positions) >= MAX_POSITIONS:
             break
 
         if symbol in active_positions:
-            continue
-
-        if symbol not in eligible_strength:
             continue
 
         df = processed_data[symbol]
@@ -381,7 +363,6 @@ for ts in all_timestamps:
             regime_bull
             and (c4h["Mom_Short"] > 0.012)
             and (c4h["Mom_Long"] > 0.035)
-            and (c4h["Mom_30"] > 0.0)
         )
 
         if valid_trend:
@@ -411,7 +392,7 @@ for ts in all_timestamps:
 # ------------------------------------------------------------
 
 print("\n" + "=" * 60)
-print("📊 گزارش نهایی HUNTER-V43")
+print("📊 گزارش نهایی HUNTER-V44")
 print("=" * 60)
 
 if not all_trades:
@@ -535,4 +516,4 @@ else:
     summary_df = pd.DataFrame(symbol_summary)
     print(summary_df.to_string(index=False))
 
-print("\n✨ بک‌تست HUNTER-V43 به پایان رسید.")
+print("\n✨ بک‌تست HUNTER-V44 به پایان رسید.")
