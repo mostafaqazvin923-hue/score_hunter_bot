@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-V16 - High Frequency & Smart Quarantine)')
+print('📥 دریافت داده‌ها (HUNTER-V17 - Sniper Precision & Strict Circuit Breaker)')
 print('============================================================')
 
 data_1h = {}
@@ -79,6 +79,21 @@ def calculate_indicators(df):
   df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
   df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
   df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+
+  # MACD Indicators
+  exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+  exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+  df['MACD'] = exp1 - exp2
+  df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+  df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+
+  # RSI Indicator
+  delta = df['Close'].diff()
+  gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+  loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+  rs = gain / loss
+  df['RSI'] = 100 - (100 / (1 + rs))
+
   df['Volume_MA'] = df['Volume'].rolling(20).mean()
   return df
 
@@ -131,7 +146,7 @@ for symbol, df1h in data_1h.items():
       'daily': df_daily.set_index('Date'),
   }
 
-print('⚙️ شروع اجرای بک‌تست HUNTER-V16...')
+print('⚙️ شروع اجرای بک‌تست HUNTER-V17...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -140,11 +155,11 @@ sorted_timestamps = sorted(list(all_timestamps))
 
 active_positions = {}
 cooldown_timers = {}
-consecutive_symbol_losses = {}  # برای سیستم قرنطینه هوشمند
+consecutive_symbol_losses = {}
 all_trades = []
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
-MAX_CONCURRENT_POSITIONS = 3
+MAX_CONCURRENT_POSITIONS = 2
 
 dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items()}
 
@@ -179,15 +194,14 @@ for ts in sorted_timestamps:
           consecutive_symbol_losses[symbol] = (
               consecutive_symbol_losses.get(symbol, 0) + 1
           )
-          # اگر ۲ ضرر پشت هم داشت، ۴۸ ساعت قرنطینه سنگین شود
           if consecutive_symbol_losses[symbol] >= 2:
-            cooldown_timers[symbol] = 48
+            cooldown_timers[symbol] = 72  # قرنطینه ۷۲ ساعته سخت‌گیرانه
           else:
-            cooldown_timers[symbol] = 10
+            cooldown_timers[symbol] = 12
         elif hit_tp:
           outcome = 'WIN'
           r_real = 2.0 - (FEE_RATE * 2)
-          consecutive_symbol_losses[symbol] = 0  # ریست شدن ضررهای متوالی ارز
+          consecutive_symbol_losses[symbol] = 0
         else:
           risk = pos['entry_price'] - pos['stop_loss']
           if risk > 0:
@@ -200,9 +214,9 @@ for ts in sorted_timestamps:
                 consecutive_symbol_losses.get(symbol, 0) + 1
             )
             if consecutive_symbol_losses[symbol] >= 2:
-              cooldown_timers[symbol] = 48
+              cooldown_timers[symbol] = 72
             else:
-              cooldown_timers[symbol] = 10
+              cooldown_timers[symbol] = 12
           else:
             consecutive_symbol_losses[symbol] = 0
 
@@ -228,9 +242,9 @@ for ts in sorted_timestamps:
               consecutive_symbol_losses.get(symbol, 0) + 1
           )
           if consecutive_symbol_losses[symbol] >= 2:
-            cooldown_timers[symbol] = 48
+            cooldown_timers[symbol] = 72
           else:
-            cooldown_timers[symbol] = 10
+            cooldown_timers[symbol] = 12
         elif hit_tp:
           outcome = 'WIN'
           r_real = 2.0 - (FEE_RATE * 2)
@@ -247,9 +261,9 @@ for ts in sorted_timestamps:
                 consecutive_symbol_losses.get(symbol, 0) + 1
             )
             if consecutive_symbol_losses[symbol] >= 2:
-              cooldown_timers[symbol] = 48
+              cooldown_timers[symbol] = 72
             else:
-              cooldown_timers[symbol] = 10
+              cooldown_timers[symbol] = 12
           else:
             consecutive_symbol_losses[symbol] = 0
 
@@ -284,6 +298,7 @@ for ts in sorted_timestamps:
 
     c1h = df1h.iloc[i]
     prev = df1h.iloc[i - 1]
+    prev2 = df1h.iloc[i - 2]
 
     daily_time = c1h['Date_Daily']
     df_daily_idx = dat['daily']
@@ -304,26 +319,36 @@ for ts in sorted_timestamps:
     trend_4h_up = r4h.get('EMA50_4H', 0) > r4h.get('EMA200_4H', 0)
     trend_4h_down = r4h.get('EMA50_4H', 0) < r4h.get('EMA200_4H', 0)
 
-    # سیستم پولبک در روند (Trend Pullback) برای افزایش تعداد معاملات
-    pullback_long = (
+    # فیلترهای سخت‌گیرانه مومنتوم (جلوگیری از سیگنال‌های فیک و پر شدن بیهوده حجم معامله)
+    macd_bull = prev['MACD_Hist'] > 0 and prev['MACD_Hist'] > prev2['MACD_Hist']
+    macd_bear = prev['MACD_Hist'] < 0 and prev['MACD_Hist'] < prev2['MACD_Hist']
+
+    rsi_long_ok = 45 <= prev['RSI'] <= 65
+    rsi_short_ok = 35 <= prev['RSI'] <= 55
+
+    volume_confirm = prev['Volume'] > (1.3 * prev['Volume_MA'])
+
+    sniper_long = (
         macro_bull
         and trend_4h_up
         and prev['EMA20'] > prev['EMA50']
-        and prev['Low'] <= prev['EMA20']
-        and prev['Close'] > prev['EMA20']
-        and prev['Volume'] > (1.1 * prev['Volume_MA'])
+        and macd_bull
+        and rsi_long_ok
+        and volume_confirm
+        and prev['Close'] > prev['Open']
     )
 
-    pullback_short = (
+    sniper_short = (
         macro_bear
         and trend_4h_down
         and prev['EMA20'] < prev['EMA50']
-        and prev['High'] >= prev['EMA20']
-        and prev['Close'] < prev['EMA20']
-        and prev['Volume'] > (1.1 * prev['Volume_MA'])
+        and macd_bear
+        and rsi_short_ok
+        and volume_confirm
+        and prev['Close'] < prev['Open']
     )
 
-    if pullback_long:
+    if sniper_long:
       entry_price = c1h['Open'] * (1 + SLIPPAGE)
       stop_loss = df1h['Low'].iloc[i - 5 : i].min() - 0.2 * prev['ATR']
       sl_dist_pct = (entry_price - stop_loss) / entry_price
@@ -340,7 +365,7 @@ for ts in sorted_timestamps:
         }
         continue
 
-    elif pullback_short:
+    elif sniper_short:
       entry_price = c1h['Open'] * (1 - SLIPPAGE)
       stop_loss = df1h['High'].iloc[i - 5 : i].max() + 0.2 * prev['ATR']
       sl_dist_pct = (stop_loss - entry_price) / entry_price
@@ -358,7 +383,7 @@ for ts in sorted_timestamps:
         continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V16 (High Frequency & Smart Quarantine)')
+print('📊 گزارش نهایی HUNTER-V17 (Sniper Precision & Strict Circuit Breaker)')
 print('============================================================')
 
 if all_trades:
