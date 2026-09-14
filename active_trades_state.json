@@ -1,12 +1,12 @@
 {
     "active": {
-        "SUI": {
-            "symbol": "SUI/USDT",
-            "direction": "SHORT",
-            "entry_price": 0.7167,
-            "tp": 0.6860714285714286,
-            "sl": 0.7320142857142857,
-            "time": "2026-09-13 07:00:00"
+        "ETH": {
+            "symbol": "ETH/USDT",
+            "direction": "LONG",
+            "entry_price": 2538.86,
+            "tp": 2648.8825,
+            "sl": 2483.84875,
+            "time": "2026-09-14 18:00:00"
         }
     },
     "cooldown": {}
