@@ -34,7 +34,7 @@ since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
 print(
-    '📥 دریافت داده‌ها (HUNTER-ICHIMOKU V12 - Trend & ADX Filter Validation)'
+    '📥 دریافت داده‌ها (HUNTER-V13 - Market Structure & Price Action Breakout)'
 )
 print('============================================================')
 
@@ -72,65 +72,25 @@ for symbol, lbank_symbol in SYMBOLS.items():
     data_1h[symbol] = df1h
 
 
-def calculate_ichimoku_and_adx(df):
+def calculate_indicators(df):
   df = df.copy()
-  period9_high = df['High'].rolling(window=9).max()
-  period9_low = df['Low'].rolling(window=9).min()
-  df['Tenkan'] = (period9_high + period9_low) / 2
-
-  period26_high = df['High'].rolling(window=26).max()
-  period26_low = df['Low'].rolling(window=26).min()
-  df['Kijun'] = (period26_high + period26_low) / 2
-
-  df['Senkou_A'] = ((df['Tenkan'] + df['Kijun']) / 2).shift(26)
-
-  period52_high = df['High'].rolling(window=52).max()
-  period52_low = df['Low'].rolling(window=52).min()
-  df['Senkou_B'] = ((period52_high + period52_low) / 2).shift(26)
-
   tr1 = df['High'] - df['Low']
   tr2 = np.abs(df['High'] - df['Close'].shift(1))
   tr3 = np.abs(df['Low'] - df['Close'].shift(1))
   df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
-  # محاسبه ADX (شاخص جهت‌دار میانگین) برای تشخیص قدرت روند
-  plus_dm = df['High'].diff()
-  minus_dm = df['Low'].diff()
-  plus_dm = np.where(
-      (plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0
-  )
-  minus_dm = np.where(
-      (minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0
-  )
-
-  tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-  atr14 = tr.rolling(14).mean()
-
-  plus_di = (
-      100
-      * pd.Series(plus_dm, index=df.index)
-      .rolling(14)
-      .mean()
-      / (atr14 + 1e-9)
-  )
-  minus_di = (
-      100
-      * pd.Series(minus_dm, index=df.index)
-      .rolling(14)
-      .mean()
-      / (atr14 + 1e-9)
-  )
-  dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-  df['ADX'] = dx.rolling(14).mean()
-
+  # میانگین متحرک برای تشخیص روند ساختاری
+  df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+  df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+  df['Volume_MA'] = df['Volume'].rolling(20).mean()
   return df
 
 
 processed_data = {}
 for symbol, df1h in data_1h.items():
-  if len(df1h) < 100:
+  if len(df1h) < 200:
     continue
-  df1h = calculate_ichimoku_and_adx(df1h)
+  df1h = calculate_indicators(df1h)
 
   df4h = (
       df1h.set_index('Date')
@@ -145,34 +105,26 @@ for symbol, df1h in data_1h.items():
       .dropna()
       .reset_index()
   )
-  df4h = calculate_ichimoku_and_adx(df4h)
-  df4h['Cloud_Top'] = df4h[['Senkou_A', 'Senkou_B']].max(axis=1)
-  df4h['Cloud_Bottom'] = df4h[['Senkou_A', 'Senkou_B']].min(axis=1)
+  df4h = calculate_indicators(df4h)
 
-  df4h['Trend_Long'] = (
-      (df4h['Close'] > df4h['Cloud_Top'])
-      & (df4h['Tenkan'] > df4h['Kijun'])
-      & (df4h['ADX'] > 22)
+  # ساختار بازار (Market Structure Break) در 4H
+  df4h['Swing_High'] = df4h['High'].rolling(window=10).max().shift(1)
+  df4h['Swing_Low'] = df4h['Low'].rolling(window=10).min().shift(1)
+
+  df4h['Structure_Long'] = (df4h['Close'] > df4h['Swing_High']) & (
+      df4h['EMA50'] > df4h['EMA200']
   )
-  df4h['Trend_Short'] = (
-      (df4h['Close'] < df4h['Cloud_Bottom'])
-      & (df4h['Tenkan'] < df4h['Kijun'])
-      & (df4h['ADX'] > 22)
+  df4h['Structure_Short'] = (df4h['Close'] < df4h['Swing_Low']) & (
+      df4h['EMA50'] < df4h['EMA200']
   )
 
-  for col in [
-      'Trend_Long',
-      'Trend_Short',
-      'Cloud_Top',
-      'Cloud_Bottom',
-      'ADX',
-  ]:
+  for col in ['Structure_Long', 'Structure_Short', 'Swing_High', 'Swing_Low']:
     df4h[col] = df4h[col].shift(1)  # جلوگیری از Lookahead مطلق
 
   df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
   processed_data[symbol] = {'1h': df1h, '4h': df4h.set_index('Date')}
 
-print('⚙️ شروع اجرای بک‌تست HUNTER-ICHIMOKU V12...')
+print('⚙️ شروع اجرای بک‌تست HUNTER-V13 (Price Action Structure)...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -183,7 +135,7 @@ active_positions = {}
 all_trades = []
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
-MAX_CONCURRENT_POSITIONS = 2  # کاهش همپوشانی برای مدیریت بهتر ریسک
+MAX_CONCURRENT_POSITIONS = 2
 
 dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items()}
 dfs_4h = {sym: dat['4h'] for sym, dat in processed_data.items()}
@@ -277,7 +229,7 @@ for ts in sorted_timestamps:
     if match_rows.empty:
       continue
     i = match_rows.index[0]
-    if i < 40:
+    if i < 50:
       continue
 
     c1h = df1h.iloc[i]
@@ -289,69 +241,53 @@ for ts in sorted_timestamps:
       continue
     r4h = df4h_idx.loc[t4h_time]
 
-    tk_cross_long = prev['Tenkan'] > prev['Kijun'] and prev['ADX'] > 20
-    tk_cross_short = prev['Tenkan'] < prev['Kijun'] and prev['ADX'] > 20
-    chikou_long = prev['Close'] > df1h.iloc[i - 27]['Close']
-    chikou_short = prev['Close'] < df1h.iloc[i - 27]['Close']
+    # تاییدیه پرایس اکشن در 1H همراه با حجم معتبر
+    volume_surge = prev['Volume'] > (1.2 * prev['Volume_MA'])
+    trend_up_1h = prev['Close'] > prev['EMA50']
+    trend_down_1h = prev['Close'] < prev['EMA50']
 
-    # منطق ورود لانگ با فیلتر روند قدرتمند
-    if r4h.get('Trend_Long', False) and tk_cross_long and chikou_long:
-      if (
-          prev['Low'] <= prev['Kijun'] * 1.002
-          and prev['Close'] > prev['Kijun']
-      ):
-        entry_price = c1h['Open'] * (1 + SLIPPAGE)
-        stop_loss = (
-            min(
-                df1h['Low'].iloc[i - 5 : i].min(),
-                min(prev['Senkou_A'], prev['Senkou_B']),
-            )
-            - 0.2 * prev['ATR']
-        )
-        sl_dist_pct = (entry_price - stop_loss) / entry_price
+    # ورود لانگ: ساختار صعودی 4H + روند مثبت 1H + جهش حجم
+    if r4h.get('Structure_Long', False) and trend_up_1h and volume_surge:
+      entry_price = c1h['Open'] * (1 + SLIPPAGE)
+      stop_loss = (
+          df1h['Low'].iloc[i - 5 : i].min() - 0.3 * prev['ATR']
+      )
+      sl_dist_pct = (entry_price - stop_loss) / entry_price
 
-        if 0.003 <= sl_dist_pct <= 0.03:
-          risk = entry_price - stop_loss
-          take_profit = entry_price + (2.0 * risk)
-          active_positions[symbol] = {
-              'side': 'LONG',
-              'entry_price': entry_price,
-              'stop_loss': stop_loss,
-              'take_profit': take_profit,
-              'entry_index': i,
-          }
-          continue
+      if 0.003 <= sl_dist_pct <= 0.035:
+        risk = entry_price - stop_loss
+        take_profit = entry_price + (2.0 * risk)
+        active_positions[symbol] = {
+            'side': 'LONG',
+            'entry_price': entry_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'entry_index': i,
+        }
+        continue
 
-    # منطق ورود شورت با فیلتر روند قدرتمند
-    elif r4h.get('Trend_Short', False) and tk_cross_short and chikou_short:
-      if (
-          prev['High'] >= prev['Kijun'] * 0.998
-          and prev['Close'] < prev['Kijun']
-      ):
-        entry_price = c1h['Open'] * (1 - SLIPPAGE)
-        stop_loss = (
-            max(
-                df1h['High'].iloc[i - 5 : i].max(),
-                max(prev['Senkou_A'], prev['Senkou_B']),
-            )
-            + 0.2 * prev['ATR']
-        )
-        sl_dist_pct = (stop_loss - entry_price) / entry_price
+    # ورود شورت: ساختار نزولی 4H + روند منفی 1H + جهش حجم
+    elif r4h.get('Structure_Short', False) and trend_down_1h and volume_surge:
+      entry_price = c1h['Open'] * (1 - SLIPPAGE)
+      stop_loss = (
+          df1h['High'].iloc[i - 5 : i].max() + 0.3 * prev['ATR']
+      )
+      sl_dist_pct = (stop_loss - entry_price) / entry_price
 
-        if 0.003 <= sl_dist_pct <= 0.03:
-          risk = stop_loss - entry_price
-          take_profit = entry_price - (2.0 * risk)
-          active_positions[symbol] = {
-              'side': 'SHORT',
-              'entry_price': entry_price,
-              'stop_loss': stop_loss,
-              'take_profit': take_profit,
-              'entry_index': i,
-          }
-          continue
+      if 0.003 <= sl_dist_pct <= 0.035:
+        risk = stop_loss - entry_price
+        take_profit = entry_price - (2.0 * risk)
+        active_positions[symbol] = {
+            'side': 'SHORT',
+            'entry_price': entry_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'entry_index': i,
+        }
+        continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-ICHIMOKU V12 (ADX Filtered)')
+print('📊 گزارش نهایی HUNTER-V13 (Price Action Structure)')
 print('============================================================')
 
 if all_trades:
