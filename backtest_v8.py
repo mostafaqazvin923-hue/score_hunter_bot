@@ -14,7 +14,7 @@ import pandas as pd
 
 exchange = ccxt.lbank({'enableRateLimit': True})
 
-# لیست نهایی و خالص‌شده (حذف کامل LTC و سایر ارزهای ضعیف و اضافه کردن تاپ‌ترین‌های بازار)
+# لیست نهایی الیت و پاکسازی‌شده (حذف شیب، اتلس، دات، اتچ و ارزهای تنبل؛ تمرکز روی موتورهای روند قدرتمند)
 SYMBOLS = {
     'BTC': 'BTC/USDT',
     'ETH': 'ETH/USDT',
@@ -25,39 +25,27 @@ SYMBOLS = {
     'SUI': 'SUI/USDT',
     'UNI': 'UNI/USDT',
     'ICP': 'ICP/USDT',
-    'APT': 'APT/USDT',
     'ARB': 'ARB/USDT',
     'OP': 'OP/USDT',
     'INJ': 'INJ/USDT',
-    'FIL': 'FIL/USDT',
     'ATOM': 'ATOM/USDT',
     'RENDER': 'RENDER/USDT',
     'SEI': 'SEI/USDT',
-    'IMX': 'IMX/USDT',
-    'DOGE': 'DOGE/USDT',
-    'DOT': 'DOT/USDT',
-    'ETC': 'ETC/USDT',
     'XLM': 'XLM/USDT',
-    'SNX': 'SNX/USDT',
-    'PEPE': 'PEPE/USDT',
-    'WIF': 'WIF/USDT',
-    'BONK': 'BONK/USDT',
-    'STX': 'STX/USDT',
-    'RUNE': 'RUNE/USDT',
     'AAVE': 'AAVE/USDT',
-    'MKR': 'MKR/USDT',
-    'SHIB': 'SHIB/USDT',
-    'PENDLE': 'PENDLE/USDT',
+    'WIF': 'WIF/USDT',
+    'AVAX': 'AVAX/USDT',
     'NEAR': 'NEAR/USDT',
 }
-# پاکسازی کلیدهای تکراری احتمالی
-SYMBOLS = {k: v for k, v in SYMBOLS.items() if k != 'LTC'}
+# حذف قطعی موارد ضعیف و تکراری
+REMOVED_COINS = {'DOT', 'ETC', 'SHIB', 'STX', 'RUNE', 'MKR', 'APT', 'LTC', 'PENDLE', 'FET', 'TIA', 'AR', 'IMX', 'PEPE', 'BONK'}
+SYMBOLS = {k: v for k, v in SYMBOLS.items() if k not in REMOVED_COINS}
 
 start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-V31 - Final Cleaned Top-Tier CTA)')
+print('📥 دریافت داده‌ها (HUNTER-V32 - Elite Cleaned CTA)')
 print('============================================================')
 
 processed_data = {}
@@ -112,7 +100,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
   processed_data[symbol] = df4h.set_index('Date')
 
-print('⚙️ شروع اجرای بک‌تست هوشمند HUNTER-V31...')
+print('⚙️ شروع اجرای بک‌تست هوشمند HUNTER-V32...')
 
 all_timestamps = set()
 for df in processed_data.values():
@@ -221,7 +209,7 @@ for ts in sorted_timestamps:
         }
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V31 (Final Cleaned Top-Tier CTA)')
+print('📊 گزارش نهایی HUNTER-V32 (Elite Cleaned CTA)')
 print('============================================================')
 
 if all_trades:
