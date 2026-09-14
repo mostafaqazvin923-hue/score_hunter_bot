@@ -1,26 +1,18 @@
 # CLTS v1 — Causal Liquidity/Structure Trend System
 # LBank USDT-M Futures / CCXT
 #
-# IMPORTANT:
-# - Uses only closed 1H and 4H candles.
-# - Entry is at the NEXT 1H candle open after a confirmed signal.
-# - Confirmed pivots are timestamped at the candle on which confirmation becomes available.
-# - No timeout / max-bars exit.
-# - No overlapping position per symbol.
-# - Portfolio max positions + correlation-group lock.
-# - If SL and TP are both touched in the same candle, SL wins (conservative).
-# - A candle that closes a trade is NOT allowed to create a new signal for that symbol.
-# - The script prints portfolio + per-symbol results and every consecutive-loss streak.
-#
-# Install:
-#   pip install ccxt pandas numpy
-#
-# Run:
-#   python clts_lbank_backtest.py
-#
-# NOTE:
-# The script fetches public market data from LBank. No API key is needed for
-# historical market data. It is deliberately NOT an order-execution bot.
+# FIXED:
+# - Resolves real LBank swap markets after load_markets()
+# - Does not hard-code BTC/USDT:USDT as the only accepted market id
+# - Tests OHLCV support before downloading a full year
+# - Uses only closed 1H/4H candles
+# - Entry = next 1H candle open
+# - No timeout / max-bars exit
+# - No overlapping position per symbol
+# - Portfolio max positions + correlation-group lock
+# - Same-candle re-entry blocked
+# - Conservative SL-first ambiguity
+# - Structural setup invalidation is used; NO time-based setup expiry
 
 import sys
 import subprocess
@@ -29,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 try:
     import ccxt
 except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "ccxt"])
     import ccxt
 
 import numpy as np
@@ -42,22 +34,8 @@ import pandas as pd
 
 DAYS = 365
 
-# Exact requested universe. These are LBank USDT perpetual contracts.
-SYMBOLS = {
-    "BTC": "BTC/USDT:USDT",
-    "ETH": "ETH/USDT:USDT",
-    "SOL": "SOL/USDT:USDT",
-    "XRP": "XRP/USDT:USDT",
-    "SUI": "SUI/USDT:USDT",
-    "NEAR": "NEAR/USDT:USDT",
-    "ADA": "ADA/USDT:USDT",
-    "LINK": "LINK/USDT:USDT",
-    "AVAX": "AVAX/USDT:USDT",
-    "DOT": "DOT/USDT:USDT",
-}
+BASES = ["BTC", "ETH", "SOL", "XRP", "SUI", "NEAR", "ADA", "LINK", "AVAX", "DOT"]
 
-# Correlation/exposure groups.
-# Only one position from each group can be open at once.
 CORRELATION_GROUP = {
     "BTC": "MAJOR",
     "ETH": "MAJOR",
@@ -73,7 +51,6 @@ CORRELATION_GROUP = {
 
 MAX_OPEN_POSITIONS = 3
 
-# Strategy parameters — baseline, intentionally not aggressively optimized.
 PIVOT_LEFT = 2
 PIVOT_RIGHT = 2
 
@@ -85,30 +62,16 @@ RSI_LEN = 14
 RVOL_LEN = 20
 
 ADX_MIN = 20.0
-RVOL_MIN = 1.20
-RSI_LONG_MIN = 50.0
-RSI_SHORT_MAX = 50.0
-
 BOS_ATR_BUFFER = 0.10
 RETEST_ATR_BUFFER = 0.15
 SL_ATR_BUFFER = 0.20
-
-MAX_RISK_PCT_OF_ENTRY = 0.025  # reject trades whose structural stop is >2.5%
-
+MAX_RISK_PCT_OF_ENTRY = 0.025
 TP_R = 2.0
 
-# Backtest execution assumptions.
-# LBank currently publishes a 0.06% taker fee in its futures fee documentation.
-# We model both entry and exit as taker executions by default.
 TAKER_FEE = 0.0006
-
-# Conservative modeled slippage. This is an assumption, not historical LBank tick data.
 SLIPPAGE = 0.0002
 
-# No timeout. This constant exists only as an explicit audit marker.
 TIMEOUT_ENABLED = False
-
-# If both SL and TP are inside the same candle, always take the conservative SL first.
 CONSERVATIVE_INTRABAR = True
 
 
@@ -125,6 +88,86 @@ exchange = ccxt.lbank({
 
 
 # ============================================================
+# LBank MARKET RESOLUTION
+# ============================================================
+
+def resolve_markets():
+    """
+    Never assume that a hard-coded unified symbol is accepted by the
+    installed CCXT/LBank version.
+
+    We select actual CCXT market metadata:
+      swap=True, linear=True, quote=USDT, settle=USDT, base=<asset>
+
+    Some LBank/CCXT versions expose a different unified symbol. We use
+    the exact symbol returned by load_markets().
+    """
+    exchange.load_markets()
+
+    resolved = {}
+
+    print("\n🔎 Resolving real LBank USDT-M perpetual markets...")
+
+    for base in BASES:
+        candidates = []
+
+        for symbol, market in exchange.markets.items():
+            if market.get("base") != base:
+                continue
+            if market.get("quote") != "USDT":
+                continue
+            if market.get("settle") != "USDT":
+                continue
+            if not market.get("swap", False):
+                continue
+            if market.get("linear") is False:
+                continue
+
+            candidates.append((symbol, market))
+
+        # Prefer active markets.
+        active = [x for x in candidates if x[1].get("active", True) is not False]
+        if active:
+            candidates = active
+
+        if not candidates:
+            # Diagnostic only; do not invent a symbol.
+            raw = [
+                s for s in exchange.symbols
+                if s.upper().startswith(base + "/USDT")
+                or s.upper().startswith(base + "USDT")
+            ]
+            print(f"  ⚠️ {base}: no USDT linear swap found. Raw candidates: {raw[:10]}")
+            continue
+
+        # Prefer a canonical unified perpetual symbol if several exist.
+        candidates.sort(key=lambda x: (
+            0 if x[0] == f"{base}/USDT:USDT" else 1,
+            x[0],
+        ))
+
+        symbol, market = candidates[0]
+        resolved[base] = symbol
+
+        print(
+            f"  ✅ {base}: {symbol} | "
+            f"id={market.get('id')} | "
+            f"type={market.get('type')} | "
+            f"swap={market.get('swap')} | "
+            f"linear={market.get('linear')} | "
+            f"active={market.get('active')}"
+        )
+
+    if not resolved:
+        raise RuntimeError(
+            "No LBank USDT-M linear perpetual market could be resolved. "
+            "Print the loaded market list above and update CCXT if necessary."
+        )
+
+    return resolved
+
+
+# ============================================================
 # DATA HELPERS
 # ============================================================
 
@@ -132,19 +175,15 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
-def timeframe_ms(timeframe: str) -> int:
-    return {
-        "1h": 60 * 60 * 1000,
-        "4h": 4 * 60 * 60 * 1000,
-    }[timeframe]
+def timeframe_ms(timeframe):
+    return {"1h": 3600000, "4h": 14400000}[timeframe]
 
 
-def floor_timestamp_ms(ts_ms: int, tf_ms: int) -> int:
+def floor_timestamp_ms(ts_ms, tf_ms):
     return (ts_ms // tf_ms) * tf_ms
 
 
 def fetch_ohlcv_paginated(symbol, timeframe, since_ms, until_ms):
-    """Fetch historical OHLCV in chronological pages."""
     tf_ms = timeframe_ms(timeframe)
     rows = []
     cursor = since_ms
@@ -158,8 +197,10 @@ def fetch_ohlcv_paginated(symbol, timeframe, since_ms, until_ms):
                 limit=1000,
             )
         except Exception as exc:
-            print(f"  ERROR {symbol} {timeframe}: {exc}")
-            break
+            print(f"  ERROR {symbol} {timeframe}: {type(exc).__name__}: {exc}")
+            return pd.DataFrame(
+                columns=["Date", "Open", "High", "Low", "Close", "Volume"]
+            )
 
         if not batch:
             break
@@ -187,9 +228,10 @@ def fetch_ohlcv_paginated(symbol, timeframe, since_ms, until_ms):
         columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"],
     )
 
+    df["Timestamp"] = pd.to_numeric(df["Timestamp"], errors="coerce")
+    df = df.dropna(subset=["Timestamp"]).copy()
     df["Timestamp"] = df["Timestamp"].astype(np.int64)
 
-    # Only candles whose OPEN time is inside requested range.
     df = df[
         (df["Timestamp"] >= since_ms) &
         (df["Timestamp"] < until_ms)
@@ -197,36 +239,60 @@ def fetch_ohlcv_paginated(symbol, timeframe, since_ms, until_ms):
 
     df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
 
-    df = df[
-        ["Date", "Open", "High", "Low", "Close", "Volume"]
-    ].drop_duplicates("Date").sort_values("Date").reset_index(drop=True)
+    df = (
+        df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+        .drop_duplicates("Date")
+        .sort_values("Date")
+        .reset_index(drop=True)
+    )
 
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df = df.dropna().reset_index(drop=True)
 
-    # Sanity validation.
     bad = (
         (df["High"] < df[["Open", "Close"]].max(axis=1)) |
         (df["Low"] > df[["Open", "Close"]].min(axis=1)) |
         (df["High"] < df["Low"]) |
         (df["Volume"] < 0)
     )
+
     if bad.any():
-        print(f"  WARNING: removing {int(bad.sum())} invalid candles for {symbol} {timeframe}")
+        print(
+            f"  WARNING: removing {int(bad.sum())} invalid "
+            f"{timeframe} candles for {symbol}"
+        )
         df = df.loc[~bad].reset_index(drop=True)
 
-    # Remove the currently-open candle.
+    # Never use the currently-open candle.
     now_ms = exchange.milliseconds()
-    last_complete_open = floor_timestamp_ms(now_ms, tf_ms) - tf_ms
-    df = df[df["Timestamp"] <= last_complete_open].copy()
+    current_open = floor_timestamp_ms(now_ms, tf_ms)
+    df = df[df["Timestamp"] < current_open].copy()
 
     return df.reset_index(drop=True)
 
 
+def validate_ohlcv_support(symbol):
+    """
+    Small preflight test. This catches Invalid Trading Pair before a
+    long historical download.
+    """
+    try:
+        data = exchange.fetch_ohlcv(
+            symbol,
+            timeframe="1h",
+            since=exchange.milliseconds() - 3 * 3600000,
+            limit=2,
+        )
+        return bool(data)
+    except Exception as exc:
+        print(f"  ❌ OHLCV preflight failed for {symbol}: {exc}")
+        return False
+
+
 # ============================================================
-# INDICATORS — ALL CAUSAL
+# INDICATORS
 # ============================================================
 
 def true_range(df):
@@ -242,9 +308,11 @@ def true_range(df):
 
 
 def atr_wilder(df, length=14):
-    tr = true_range(df)
-    # ewm(..., adjust=False) is causal.
-    return tr.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    return true_range(df).ewm(
+        alpha=1 / length,
+        adjust=False,
+        min_periods=length,
+    ).mean()
 
 
 def rsi_wilder(series, length=14):
@@ -252,8 +320,17 @@ def rsi_wilder(series, length=14):
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
-    avg_loss = loss.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    avg_gain = gain.ewm(
+        alpha=1 / length,
+        adjust=False,
+        min_periods=length,
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / length,
+        adjust=False,
+        min_periods=length,
+    ).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
@@ -359,13 +436,6 @@ def add_indicators(df):
 # ============================================================
 
 def build_confirmed_pivots(df):
-    """
-    A pivot at i is NOT usable at i.
-
-    It becomes usable only at i + PIVOT_RIGHT.
-
-    This avoids assigning future-confirmed structure to the past.
-    """
     n = len(df)
 
     swing_high_confirmed = [None] * n
@@ -418,12 +488,7 @@ def build_confirmed_pivots(df):
 # ============================================================
 
 def regime_from_4h(row, previous_row):
-    vals = [
-        row["EMA50"],
-        row["EMA200"],
-        row["ADX"],
-        row["Close"],
-    ]
+    vals = [row["EMA50"], row["EMA200"], row["ADX"], row["Close"]]
 
     if any(pd.isna(x) for x in vals):
         return "NEUTRAL"
@@ -463,19 +528,7 @@ def build_4h_regime(df4h):
     return df
 
 
-# ============================================================
-# 4H -> 1H CAUSAL ALIGNMENT
-# ============================================================
-
 def attach_4h_regime(df1h, df4h):
-    """
-    Each 1H candle receives only the LAST COMPLETED 4H regime.
-
-    4H candle timestamp is its OPEN time. Its regime is available
-    only after that 4H candle closes, i.e. at open_time + 4h.
-
-    Therefore the 1H candle at the exact 4H close can use it.
-    """
     h4 = df4h.copy()
 
     h4["RegimeAvailableAt"] = h4["Date"] + pd.Timedelta(hours=4)
@@ -484,21 +537,20 @@ def attach_4h_regime(df1h, df4h):
         "RegimeAvailableAt"
     )
 
-    out = pd.merge_asof(
+    return pd.merge_asof(
         df1h.sort_values("Date"),
         regime_map,
         left_on="Date",
         right_on="RegimeAvailableAt",
         direction="backward",
         allow_exact_matches=True,
+    ).assign(
+        Regime=lambda x: x["Regime"].fillna("NEUTRAL")
     )
-
-    out["Regime"] = out["Regime"].fillna("NEUTRAL")
-    return out
 
 
 # ============================================================
-# SIGNAL STATE
+# PIVOT LOOKUP / SWEEP
 # ============================================================
 
 def find_recent_confirmed_pivot(pivot_column, upto_index):
@@ -509,12 +561,7 @@ def find_recent_confirmed_pivot(pivot_column, upto_index):
     return None
 
 
-def generate_signal_at(df, i):
-    """
-    Signal is generated ONLY from information available at candle close i.
-
-    Entry is always at candle i+1 OPEN.
-    """
+def generate_sweep(df, i):
     if i < 1:
         return None
 
@@ -527,201 +574,146 @@ def generate_signal_at(df, i):
         return None
 
     atr = float(row["ATR"])
-
     if atr <= 0:
         return None
 
-    # We only use pivots already confirmed by time i.
-    prior_high = find_recent_confirmed_pivot(df["NewSwingHigh"], i)
-    prior_low = find_recent_confirmed_pivot(df["NewSwingLow"], i)
+    prior_high = find_recent_confirmed_pivot(df["NewSwingHigh"], i - 1)
+    prior_low = find_recent_confirmed_pivot(df["NewSwingLow"], i - 1)
 
     if prior_high is None or prior_low is None:
         return None
 
-    # Need a pivot before current candle, not one created at current candle.
-    if prior_high["confirmed_index"] >= i:
-        return None
-    if prior_low["confirmed_index"] >= i:
-        return None
-
-    # ========================================================
-    # LONG: liquidity sweep below confirmed swing low
-    # followed by bullish BOS, then retest
-    # ========================================================
     if row["Regime"] == "BULL":
         sweep_level = prior_low["price"]
 
-        swept = (
+        if (
             float(row["Low"]) < sweep_level
             and float(row["Close"]) > sweep_level
-        )
+        ):
+            pre_sweep_high = find_recent_confirmed_pivot(
+                df["NewSwingHigh"], i - 1
+            )
 
-        if not swept:
-            return None
+            if pre_sweep_high is not None:
+                return {
+                    "side": "LONG",
+                    "sweep_index": i,
+                    "sweep_low": sweep_level,
+                    "bos_level": float(pre_sweep_high["price"]),
+                }
 
-        # The swing high used for BOS must be a confirmed swing
-        # that existed before this sweep candle.
-        pre_sweep_high = None
-
-        for j in range(i - 1, -1, -1):
-            x = df["NewSwingHigh"].iloc[j]
-            if isinstance(x, dict):
-                pre_sweep_high = x
-                break
-
-        if pre_sweep_high is None:
-            return None
-
-        bos_level = float(pre_sweep_high["price"])
-
-        # BOS must occur AFTER the sweep, not on the same candle.
-        # Therefore this function alone does not create the trade.
-        # The state machine below tracks sweep -> BOS -> retest.
-        return {
-            "event": "SWEEP_LONG",
-            "index": i,
-            "sweep_low": sweep_level,
-            "bos_reference": bos_level,
-            "atr": atr,
-        }
-
-    # ========================================================
-    # SHORT: liquidity sweep above confirmed swing high
-    # ========================================================
-    if row["Regime"] == "BEAR":
+    else:
         sweep_level = prior_high["price"]
 
-        swept = (
+        if (
             float(row["High"]) > sweep_level
             and float(row["Close"]) < sweep_level
-        )
+        ):
+            pre_sweep_low = find_recent_confirmed_pivot(
+                df["NewSwingLow"], i - 1
+            )
 
-        if not swept:
-            return None
-
-        pre_sweep_low = None
-
-        for j in range(i - 1, -1, -1):
-            x = df["NewSwingLow"].iloc[j]
-            if isinstance(x, dict):
-                pre_sweep_low = x
-                break
-
-        if pre_sweep_low is None:
-            return None
-
-        bos_level = float(pre_sweep_low["price"])
-
-        return {
-            "event": "SWEEP_SHORT",
-            "index": i,
-            "sweep_high": sweep_level,
-            "bos_reference": bos_level,
-            "atr": atr,
-        }
+            if pre_sweep_low is not None:
+                return {
+                    "side": "SHORT",
+                    "sweep_index": i,
+                    "sweep_high": sweep_level,
+                    "bos_level": float(pre_sweep_low["price"]),
+                }
 
     return None
 
 
 # ============================================================
-# PER-SYMBOL SETUP STATE MACHINE
+# STATE MACHINE
 # ============================================================
 
 def build_signals(df):
-    """
-    Stateful, chronological signal generator.
-
-    States:
-        IDLE
-        AFTER_SWEEP_LONG / AFTER_BOS_LONG
-        AFTER_SWEEP_SHORT / AFTER_BOS_SHORT
-
-    No future candle is referenced for signal timing.
-    """
     df = df.copy()
-
     pending = None
     signals = []
 
-    for i in range(len(df)):
-        row = df.iloc[i]
+    warmup = max(EMA_SLOW, RVOL_LEN, ATR_LEN, ADX_LEN) + 5
 
-        # We need enough history.
-        if i < max(EMA_SLOW, RVOL_LEN, ATR_LEN, ADX_LEN) + 5:
+    for i in range(len(df)):
+        if i < warmup:
             continue
 
-        # ----------------------------------------------------
-        # Existing pending setup
-        # ----------------------------------------------------
-        if pending is not None:
+        row = df.iloc[i]
 
-            # Regime must still support the direction.
+        if pending is not None:
+            side = pending["side"]
+
+            # Regime invalidation is structural/contextual, not time-based.
             if (
-                (pending["side"] == "LONG" and row["Regime"] != "BULL")
+                (side == "LONG" and row["Regime"] != "BULL")
                 or
-                (pending["side"] == "SHORT" and row["Regime"] != "BEAR")
+                (side == "SHORT" and row["Regime"] != "BEAR")
             ):
                 pending = None
                 continue
 
-            atr = float(row["ATR"]) if not pd.isna(row["ATR"]) else np.nan
-            if not np.isfinite(atr) or atr <= 0:
+            if pd.isna(row["ATR"]):
+                continue
+
+            atr = float(row["ATR"])
+            if atr <= 0:
                 continue
 
             # ---------------- LONG ----------------
-            if pending["side"] == "LONG":
+            if side == "LONG":
+                sweep_low = pending["sweep_low"]
 
-                # BOS must occur after the sweep.
+                # Invalidate if price closes back below the swept low.
+                if float(row["Close"]) < sweep_low:
+                    pending = None
+                    continue
+
                 if pending["stage"] == "SWEEP":
-                    if (
-                        float(row["Close"])
-                        > pending["bos_level"] + BOS_ATR_BUFFER * atr
-                    ):
+                    if float(row["Close"]) > pending["bos_level"] + BOS_ATR_BUFFER * atr:
                         pending["stage"] = "BOS"
                         pending["bos_index"] = i
-                        pending["bos_level"] = pending["bos_level"]
-
-                        # Do NOT enter on BOS candle.
                         continue
 
                 elif pending["stage"] == "BOS":
                     bos = pending["bos_level"]
+
+                    # Structural invalidation before retest.
+                    if float(row["Close"]) < sweep_low:
+                        pending = None
+                        continue
 
                     retest = (
                         float(row["Low"]) <= bos + RETEST_ATR_BUFFER * atr
                         and float(row["Close"]) > bos
                     )
 
-                    if retest:
-                        # Confirmation is complete at close i.
-                        # Entry is at OPEN i+1.
-                        if i + 1 < len(df):
-                            structure_low = min(
-                                float(df["Low"].iloc[pending["sweep_index"]:i + 1].min()),
-                                float(df["Low"].iloc[i]),
-                            )
+                    if retest and i + 1 < len(df):
+                        structure_low = float(
+                            df["Low"].iloc[pending["sweep_index"]:i + 1].min()
+                        )
 
-                            # Entry uses next candle open, which is not
-                            # known until next candle arrives. The signal
-                            # stores only causal information.
-                            signals.append({
-                                "signal_index": i,
-                                "entry_index": i + 1,
-                                "side": "LONG",
-                                "bos_level": bos,
-                                "structure_low": structure_low,
-                            })
+                        signals.append({
+                            "signal_index": i,
+                            "entry_index": i + 1,
+                            "side": "LONG",
+                            "bos_level": bos,
+                            "structure_low": structure_low,
+                        })
 
                         pending = None
                         continue
 
             # ---------------- SHORT ----------------
             else:
+                sweep_high = pending["sweep_high"]
+
+                if float(row["Close"]) > sweep_high:
+                    pending = None
+                    continue
+
                 if pending["stage"] == "SWEEP":
-                    if (
-                        float(row["Close"])
-                        < pending["bos_level"] - BOS_ATR_BUFFER * atr
-                    ):
+                    if float(row["Close"]) < pending["bos_level"] - BOS_ATR_BUFFER * atr:
                         pending["stage"] = "BOS"
                         pending["bos_index"] = i
                         continue
@@ -729,131 +721,99 @@ def build_signals(df):
                 elif pending["stage"] == "BOS":
                     bos = pending["bos_level"]
 
+                    if float(row["Close"]) > sweep_high:
+                        pending = None
+                        continue
+
                     retest = (
                         float(row["High"]) >= bos - RETEST_ATR_BUFFER * atr
                         and float(row["Close"]) < bos
                     )
 
-                    if retest:
-                        if i + 1 < len(df):
-                            structure_high = max(
-                                float(df["High"].iloc[pending["sweep_index"]:i + 1].max()),
-                                float(df["High"].iloc[i]),
-                            )
+                    if retest and i + 1 < len(df):
+                        structure_high = float(
+                            df["High"].iloc[pending["sweep_index"]:i + 1].max()
+                        )
 
-                            signals.append({
-                                "signal_index": i,
-                                "entry_index": i + 1,
-                                "side": "SHORT",
-                                "bos_level": bos,
-                                "structure_high": structure_high,
-                            })
+                        signals.append({
+                            "signal_index": i,
+                            "entry_index": i + 1,
+                            "side": "SHORT",
+                            "bos_level": bos,
+                            "structure_high": structure_high,
+                        })
 
                         pending = None
                         continue
 
-        # ----------------------------------------------------
-        # No pending setup: detect a NEW sweep
-        # ----------------------------------------------------
+        # New sweep only when no setup is pending.
         if pending is None:
-            event = generate_signal_at(df, i)
+            event = generate_sweep(df, i)
 
-            if event is None:
-                continue
-
-            if event["event"] == "SWEEP_LONG":
-                pending = {
-                    "side": "LONG",
-                    "stage": "SWEEP",
-                    "sweep_index": i,
-                    "bos_level": event["bos_reference"],
-                }
-
-            elif event["event"] == "SWEEP_SHORT":
-                pending = {
-                    "side": "SHORT",
-                    "stage": "SWEEP",
-                    "sweep_index": i,
-                    "bos_level": event["bos_reference"],
-                }
+            if event is not None:
+                event["stage"] = "SWEEP"
+                pending = event
 
     return signals
 
 
 # ============================================================
-# PREPARE ALL SYMBOL DATA
+# PREPARE
 # ============================================================
 
-def prepare_symbol(symbol_name, unified_symbol, since_ms, until_ms):
-    print(f"\n📥 {symbol_name}: downloading LBank Futures 1H + 4H")
+def prepare_symbol(name, unified_symbol, since_ms, until_ms):
+    print(f"\n📥 {name}: {unified_symbol} | downloading 1H + 4H")
+
+    if not validate_ohlcv_support(unified_symbol):
+        print(f"  ⚠️ {name}: skipped because OHLCV preflight failed.")
+        return None
 
     df1h = fetch_ohlcv_paginated(
-        unified_symbol,
-        "1h",
-        since_ms,
-        until_ms,
+        unified_symbol, "1h", since_ms, until_ms
     )
 
     df4h = fetch_ohlcv_paginated(
         unified_symbol,
         "4h",
-        since_ms - 400 * 4 * 60 * 60 * 1000,
+        since_ms - 400 * 4 * 3600000,
         until_ms,
     )
 
     if len(df1h) < 500 or len(df4h) < 250:
-        print(
-            f"  ⚠️ insufficient data: 1H={len(df1h)}, 4H={len(df4h)}"
-        )
+        print(f"  ⚠️ insufficient data: 1H={len(df1h)}, 4H={len(df4h)}")
         return None
 
-    df4h = add_indicators(df4h)
-    df4h = build_4h_regime(df4h)
-
-    df1h = add_indicators(df1h)
-    df1h = build_confirmed_pivots(df1h)
-    df1h = attach_4h_regime(df1h, df4h)
+    df4h = build_4h_regime(add_indicators(df4h))
+    df1h = attach_4h_regime(
+        build_confirmed_pivots(add_indicators(df1h)),
+        df4h,
+    )
 
     signals = build_signals(df1h)
 
-    # Keep only signals whose entry candle is inside requested test range.
-    signals = [
-        s for s in signals
-        if s["entry_index"] < len(df1h)
-    ]
-
     print(
-        f"  ✓ 1H candles={len(df1h)}, 4H candles={len(df4h)}, "
-        f"candidate signals={len(signals)}"
+        f"  ✓ 1H={len(df1h)}, 4H={len(df4h)}, "
+        f"signals={len(signals)}"
     )
 
-    return {
-        "df": df1h,
-        "signals": signals,
-    }
+    return {"df": df1h, "signals": signals, "ccxt_symbol": unified_symbol}
 
 
 # ============================================================
-# EXECUTION HELPERS
+# EXECUTION
 # ============================================================
 
 def apply_entry_slippage(side, price):
-    if side == "LONG":
-        return price * (1.0 + SLIPPAGE)
-    return price * (1.0 - SLIPPAGE)
+    return price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
 
 
 def apply_exit_slippage(side, price):
-    # Long closes by selling; short closes by buying.
-    if side == "LONG":
-        return price * (1.0 - SLIPPAGE)
-    return price * (1.0 + SLIPPAGE)
+    return price * (1 - SLIPPAGE) if side == "LONG" else price * (1 + SLIPPAGE)
 
 
-def calculate_net_r(pos, exit_price, fee_rate=TAKER_FEE):
+def calculate_net_r(pos, exit_price):
     entry = pos["entry_price"]
-    sl = pos["stop_loss"]
-    risk = abs(entry - sl)
+    risk = abs(entry - pos["stop_loss"])
 
     if risk <= 0:
         return 0.0
@@ -863,59 +823,40 @@ def calculate_net_r(pos, exit_price, fee_rate=TAKER_FEE):
     else:
         gross_r = (entry - exit_price) / risk
 
-    # Fee is charged on entry + exit notional.
-    # Approximate R deduction using the entry risk denominator.
-    entry_fee = entry * fee_rate
-    exit_fee = exit_price * fee_rate
-    fee_r = (entry_fee + exit_fee) / risk
-
+    fee_r = (entry * TAKER_FEE + exit_price * TAKER_FEE) / risk
     return gross_r - fee_r
 
 
-# ============================================================
-# SIGNAL SCORE
-# ============================================================
-
 def score_signal(df, signal):
-    i = signal["signal_index"]
-    row = df.iloc[i]
-
+    row = df.iloc[signal["signal_index"]]
     score = 0.0
 
     adx = float(row["ADX"])
     rvol = float(row["RVOL"])
     rsi = float(row["RSI"])
+    atr = float(row["ATR"])
 
-    # Trend strength
     if adx >= 30:
         score += 2
     elif adx >= 20:
         score += 1
 
-    # Volume
     if rvol >= 1.50:
         score += 2
     elif rvol >= 1.20:
         score += 1
 
-    # Momentum
     if signal["side"] == "LONG":
         if rsi >= 60:
             score += 2
         elif rsi >= 50:
             score += 1
+        displacement = float(row["Close"]) - signal["bos_level"]
     else:
         if rsi <= 40:
             score += 2
         elif rsi <= 50:
             score += 1
-
-    # Structure displacement
-    atr = float(row["ATR"])
-
-    if signal["side"] == "LONG":
-        displacement = float(row["Close"]) - signal["bos_level"]
-    else:
         displacement = signal["bos_level"] - float(row["Close"])
 
     if displacement >= 0.25 * atr:
@@ -927,32 +868,19 @@ def score_signal(df, signal):
 
 
 # ============================================================
-# BACKTEST ENGINE
+# BACKTEST
 # ============================================================
 
 def run_backtest(processed):
-    """
-    Chronological event engine.
-
-    Critical ordering:
-        1. Existing positions are checked for exits using current candle.
-        2. If a position closes on this candle, that symbol is LOCKED
-           against new signals on the same candle.
-        3. New candidate signals are considered only from signals whose
-           signal candle already closed before this entry candle.
-        4. Entries happen at the next candle OPEN.
-    """
     active_positions = {}
     all_trades = []
 
-    # Build global event timestamps from all 1H candles.
     timestamps = sorted({
         ts
         for item in processed.values()
         for ts in item["df"]["Date"]
     })
 
-    # Pre-index signals by their ENTRY timestamp.
     signals_by_entry_ts = {}
 
     for symbol, item in processed.items():
@@ -960,32 +888,23 @@ def run_backtest(processed):
 
         for sig in item["signals"]:
             entry_i = sig["entry_index"]
-
             if entry_i >= len(df):
                 continue
 
-            entry_ts = df["Date"].iloc[entry_i]
-
             sig2 = dict(sig)
             sig2["symbol"] = symbol
-            sig2["entry_ts"] = entry_ts
-
-            # Signal score was computed from the CLOSED signal candle.
+            sig2["entry_ts"] = df["Date"].iloc[entry_i]
             sig2["score"] = score_signal(df, sig)
 
-            signals_by_entry_ts.setdefault(entry_ts, []).append(sig2)
-
-    # Prevent re-entry on the candle that closes a trade.
-    blocked_until_next_candle = set()
+            signals_by_entry_ts.setdefault(
+                sig2["entry_ts"], []
+            ).append(sig2)
 
     for ts in timestamps:
-
-        # ====================================================
-        # 1) EXIT OPEN POSITIONS
-        # ====================================================
         closed_symbols = set()
 
-        for symbol in list(active_positions.keys()):
+        # 1) exits first
+        for symbol in list(active_positions):
             pos = active_positions[symbol]
             df = processed[symbol]["df"]
 
@@ -996,13 +915,9 @@ def run_backtest(processed):
             i = int(matches[0])
             candle = df.iloc[i]
 
-            hit_sl = False
-            hit_tp = False
-
             if pos["side"] == "LONG":
                 hit_sl = float(candle["Low"]) <= pos["stop_loss"]
                 hit_tp = float(candle["High"]) >= pos["take_profit"]
-
             else:
                 hit_sl = float(candle["High"]) >= pos["stop_loss"]
                 hit_tp = float(candle["Low"]) <= pos["take_profit"]
@@ -1010,31 +925,23 @@ def run_backtest(processed):
             if not (hit_sl or hit_tp):
                 continue
 
-            # Conservative intrabar rule:
-            # If both are touched, SL wins.
             if hit_sl and hit_tp and CONSERVATIVE_INTRABAR:
                 outcome = "LOSS"
-                exit_reason = "SL_AMBIGUOUS"
+                reason = "SL_AMBIGUOUS"
                 raw_exit = pos["stop_loss"]
             elif hit_sl:
                 outcome = "LOSS"
-                exit_reason = "SL"
+                reason = "SL"
                 raw_exit = pos["stop_loss"]
             else:
                 outcome = "WIN"
-                exit_reason = "TP"
+                reason = "TP"
                 raw_exit = pos["take_profit"]
 
             exit_price = apply_exit_slippage(pos["side"], raw_exit)
-
-            gross_r = (
-                -1.0 if outcome == "LOSS" else TP_R
-            )
-
             net_r = calculate_net_r(pos, exit_price)
 
-            # Record both theoretical R and after-cost R.
-            trade = {
+            all_trades.append({
                 "Timestamp": ts,
                 "Symbol": symbol,
                 "Side": pos["side"],
@@ -1044,127 +951,79 @@ def run_backtest(processed):
                 "StopLoss": pos["stop_loss"],
                 "TakeProfit": pos["take_profit"],
                 "ExitPrice": exit_price,
-                "ExitReason": exit_reason,
+                "ExitReason": reason,
                 "Outcome": outcome,
-                "Gross_R": gross_r,
+                "Gross_R": -1.0 if outcome == "LOSS" else TP_R,
                 "Net_R": net_r,
                 "BarsHeld": i - pos["entry_index"],
-                "HoldingHours": (i - pos["entry_index"]) * 1.0,
+                "HoldingHours": float(i - pos["entry_index"]),
                 "Score": pos["score"],
-            }
+            })
 
-            all_trades.append(trade)
             closed_symbols.add(symbol)
 
-        # Remove positions only after recording exits.
         for symbol in closed_symbols:
             del active_positions[symbol]
 
-        # ====================================================
-        # 2) SAME-CANDLE RE-ENTRY LOCK
-        # ====================================================
-        # A symbol that just closed is forbidden from re-entering
-        # on this exact candle, even if a signal is otherwise queued.
-        blocked_until_next_candle = closed_symbols
+        # 2) same-candle lock
+        blocked = closed_symbols
 
-        # ====================================================
-        # 3) NEW ENTRIES
-        # ====================================================
-        candidates = signals_by_entry_ts.get(ts, [])
-
-        if not candidates:
-            continue
-
-        # Sort all candidates before allocation.
+        # 3) entries
         candidates = sorted(
-            candidates,
-            key=lambda x: (
-                -x["score"],
-                -float(processed[x["symbol"]]["df"].loc[
-                    processed[x["symbol"]]["df"]["Date"] == x["entry_ts"],
-                    "ADX"
-                ].iloc[0]),
-                x["symbol"],
-            ),
+            signals_by_entry_ts.get(ts, []),
+            key=lambda x: (-x["score"], x["symbol"]),
         )
 
         used_groups = {
-            CORRELATION_GROUP[symbol]
-            for symbol in active_positions.keys()
+            CORRELATION_GROUP[s]
+            for s in active_positions
         }
 
         for sig in candidates:
             symbol = sig["symbol"]
 
-            if symbol in blocked_until_next_candle:
+            if symbol in blocked:
                 continue
-
             if symbol in active_positions:
                 continue
-
             if len(active_positions) >= MAX_OPEN_POSITIONS:
                 break
 
             group = CORRELATION_GROUP[symbol]
-
             if group in used_groups:
                 continue
 
             df = processed[symbol]["df"]
             entry_i = sig["entry_index"]
+            signal_i = sig["signal_index"]
 
             if entry_i >= len(df):
                 continue
 
-            row = df.iloc[entry_i]
+            entry_raw = float(df.iloc[entry_i]["Open"])
+            entry_price = apply_entry_slippage(sig["side"], entry_raw)
+            atr = float(df.iloc[signal_i]["ATR"])
 
-            # The signal was formed on entry_i - 1.
-            # Entry uses ONLY this candle's OPEN.
-            entry_raw = float(row["Open"])
-
-            side = sig["side"]
-
-            entry_price = apply_entry_slippage(side, entry_raw)
-
-            signal_i = sig["signal_index"]
-            signal_row = df.iloc[signal_i]
-
-            atr = float(signal_row["ATR"])
-
-            if side == "LONG":
-                structure_low = sig["structure_low"]
-                stop_loss = structure_low - SL_ATR_BUFFER * atr
-
+            if sig["side"] == "LONG":
+                stop_loss = sig["structure_low"] - SL_ATR_BUFFER * atr
                 risk = entry_price - stop_loss
 
-                if risk <= 0:
-                    continue
-
-                risk_pct = risk / entry_price
-
-                if risk_pct > MAX_RISK_PCT_OF_ENTRY:
+                if risk <= 0 or risk / entry_price > MAX_RISK_PCT_OF_ENTRY:
                     continue
 
                 take_profit = entry_price + TP_R * risk
 
             else:
-                structure_high = sig["structure_high"]
-                stop_loss = structure_high + SL_ATR_BUFFER * atr
-
+                stop_loss = sig["structure_high"] + SL_ATR_BUFFER * atr
                 risk = stop_loss - entry_price
 
-                if risk <= 0:
-                    continue
-
-                risk_pct = risk / entry_price
-
-                if risk_pct > MAX_RISK_PCT_OF_ENTRY:
+                if risk <= 0 or risk / entry_price > MAX_RISK_PCT_OF_ENTRY:
                     continue
 
                 take_profit = entry_price - TP_R * risk
 
             active_positions[symbol] = {
-                "side": side,
+                "side": sig["side"],
                 "entry_price": entry_price,
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,
@@ -1176,44 +1035,38 @@ def run_backtest(processed):
 
             used_groups.add(group)
 
-    # No artificial closing of open positions at the end.
-    # This is intentional: NO TIMEOUT.
     return pd.DataFrame(all_trades), active_positions
 
 
 # ============================================================
-# REPORTING
+# REPORT
 # ============================================================
 
 def loss_streaks(outcomes):
-    streaks = []
-    current = 0
+    result = []
+    cur = 0
 
-    for outcome in outcomes:
-        if outcome == "LOSS":
-            current += 1
-        else:
-            if current > 0:
-                streaks.append(current)
-                current = 0
+    for x in outcomes:
+        if x == "LOSS":
+            cur += 1
+        elif cur:
+            result.append(cur)
+            cur = 0
 
-    if current > 0:
-        streaks.append(current)
+    if cur:
+        result.append(cur)
 
-    return streaks
+    return result
 
 
 def max_streak(outcomes, target):
-    best = 0
-    cur = 0
-
+    best = cur = 0
     for x in outcomes:
         if x == target:
             cur += 1
             best = max(best, cur)
         else:
             cur = 0
-
     return best
 
 
@@ -1222,21 +1075,16 @@ def max_drawdown_from_r(trades):
         return 0.0
 
     equity = trades["Net_R"].cumsum()
-    peak = equity.cummax()
-    dd = equity - peak
-
-    return float(dd.min())
+    return float((equity - equity.cummax()).min())
 
 
 def report(trades, processed):
     print("\n" + "=" * 72)
-    print("📊 CLTS v1 — LBank Futures Causal Backtest")
+    print("📊 CLTS v1 — LBank Futures")
     print("=" * 72)
 
     if trades.empty:
         print("⚠️ No completed trades.")
-        print("این نتیجه به معنی صفر معامله کامل‌شده است؛ پوزیشن‌های باز انتهای دیتاست")
-        print("عمداً بسته نشده‌اند چون Time-Out ممنوع است.")
         return
 
     trades = trades.sort_values(
@@ -1247,74 +1095,48 @@ def report(trades, processed):
     wins = int((trades["Outcome"] == "WIN").sum())
     losses = int((trades["Outcome"] == "LOSS").sum())
 
-    win_rate = 100 * wins / total if total else 0.0
-
+    win_rate = 100 * wins / total
     gross_r = trades["Gross_R"].sum()
     net_r = trades["Net_R"].sum()
 
-    gross_profit = trades.loc[trades["Net_R"] > 0, "Net_R"].sum()
-    gross_loss = -trades.loc[trades["Net_R"] < 0, "Net_R"].sum()
+    gp = trades.loc[trades["Net_R"] > 0, "Net_R"].sum()
+    gl = -trades.loc[trades["Net_R"] < 0, "Net_R"].sum()
+    pf = gp / gl if gl > 0 else np.inf
 
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 0 else np.inf
-    )
+    avg_win = trades.loc[
+        trades["Outcome"] == "WIN", "Net_R"
+    ].mean() if wins else 0.0
 
-    avg_win = (
-        trades.loc[trades["Outcome"] == "WIN", "Net_R"].mean()
-        if wins else 0.0
-    )
-
-    avg_loss = (
-        trades.loc[trades["Outcome"] == "LOSS", "Net_R"].mean()
-        if losses else 0.0
-    )
-
-    expectancy = trades["Net_R"].mean()
-
-    avg_trades_day = total / DAYS
-
-    max_dd = max_drawdown_from_r(trades)
+    avg_loss = trades.loc[
+        trades["Outcome"] == "LOSS", "Net_R"
+    ].mean() if losses else 0.0
 
     outcomes = trades["Outcome"].tolist()
     streaks = loss_streaks(outcomes)
 
-    print(f"🔸 Total Trades:             {total}")
-    print(f"🔸 Wins:                     {wins}")
-    print(f"🔸 Losses:                   {losses}")
-    print(f"🎯 Win Rate:                 {win_rate:.2f}%")
-    print(f"📈 Gross R (before costs):   {gross_r:.4f}R")
-    print(f"💰 Net R (after costs):      {net_r:.4f}R")
-    print(f"📊 Profit Factor:            {profit_factor:.4f}")
-    print(f"➕ Average Win:              {avg_win:.4f}R")
-    print(f"➖ Average Loss:             {avg_loss:.4f}R")
-    print(f"📐 Expectancy:              {expectancy:.4f}R/trade")
-    print(f"📉 Max Drawdown:            {max_dd:.4f}R")
-    print(f"🔥 Max Consecutive Wins:    {max_streak(outcomes, 'WIN')}")
-    print(f"❄️ Max Consecutive Losses:  {max_streak(outcomes, 'LOSS')}")
-    print(f"📅 Avg Trades / Day:        {avg_trades_day:.4f}")
-    print(
-        f"⏱️ Avg Holding Time:        "
-        f"{trades['HoldingHours'].mean():.2f} hours"
-    )
-    print(
-        f"🟢 Long Trades:             "
-        f"{int((trades['Side'] == 'LONG').sum())}"
-    )
-    print(
-        f"🔴 Short Trades:            "
-        f"{int((trades['Side'] == 'SHORT').sum())}"
-    )
+    print(f"Total Trades:             {total}")
+    print(f"Wins:                     {wins}")
+    print(f"Losses:                   {losses}")
+    print(f"Win Rate:                 {win_rate:.2f}%")
+    print(f"Gross R:                  {gross_r:.4f}R")
+    print(f"Net R:                    {net_r:.4f}R")
+    print(f"Profit Factor:            {pf:.4f}")
+    print(f"Average Win:              {avg_win:.4f}R")
+    print(f"Average Loss:             {avg_loss:.4f}R")
+    print(f"Expectancy:               {trades['Net_R'].mean():.4f}R")
+    print(f"Max Drawdown:             {max_drawdown_from_r(trades):.4f}R")
+    print(f"Max Win Streak:           {max_streak(outcomes, 'WIN')}")
+    print(f"Max Loss Streak:          {max_streak(outcomes, 'LOSS')}")
+    print(f"Avg Trades / Day:         {total / DAYS:.4f}")
+    print(f"Avg Holding Hours:        {trades['HoldingHours'].mean():.2f}")
+    print(f"Long Trades:              {int((trades['Side'] == 'LONG').sum())}")
+    print(f"Short Trades:             {int((trades['Side'] == 'SHORT').sum())}")
 
     print("\n" + "-" * 72)
     print("📉 ALL CONSECUTIVE LOSS STREAKS")
     print("-" * 72)
-
-    if streaks:
-        print(", ".join(map(str, streaks)))
-        print(f"تعداد زنجیره‌های ضرر: {len(streaks)}")
-    else:
-        print("هیچ زنجیره ضرری ثبت نشد.")
+    print(", ".join(map(str, streaks)) if streaks else "None")
+    print(f"Number of loss streaks: {len(streaks)}")
 
     print("\n" + "-" * 72)
     print("📈 SYMBOL-BY-SYMBOL")
@@ -1322,23 +1144,14 @@ def report(trades, processed):
 
     rows = []
 
-    for sym in SYMBOLS.keys():
+    for sym in BASES:
         x = trades[trades["Symbol"] == sym]
 
         if x.empty:
             rows.append({
-                "Symbol": sym,
-                "Trades": 0,
-                "Wins": 0,
-                "Losses": 0,
-                "WinRate%": 0.0,
-                "GrossR": 0.0,
-                "NetR": 0.0,
-                "PF": 0.0,
-                "AvgWinR": 0.0,
-                "AvgLossR": 0.0,
-                "MaxLossStreak": 0,
-                "AvgHoldH": 0.0,
+                "Symbol": sym, "Trades": 0, "Wins": 0, "Losses": 0,
+                "WinRate%": 0.0, "GrossR": 0.0, "NetR": 0.0,
+                "PF": 0.0, "MaxLossStreak": 0, "AvgHoldH": 0.0,
             })
             continue
 
@@ -1348,8 +1161,6 @@ def report(trades, processed):
         gp = x.loc[x["Net_R"] > 0, "Net_R"].sum()
         gl = -x.loc[x["Net_R"] < 0, "Net_R"].sum()
 
-        pf = gp / gl if gl > 0 else np.inf
-
         rows.append({
             "Symbol": sym,
             "Trades": len(x),
@@ -1358,60 +1169,30 @@ def report(trades, processed):
             "WinRate%": round(100 * w / len(x), 2),
             "GrossR": round(x["Gross_R"].sum(), 3),
             "NetR": round(x["Net_R"].sum(), 3),
-            "PF": round(pf, 3) if np.isfinite(pf) else np.inf,
-            "AvgWinR": round(
-                x.loc[x["Outcome"] == "WIN", "Net_R"].mean()
-                if w else 0.0, 3
-            ),
-            "AvgLossR": round(
-                x.loc[x["Outcome"] == "LOSS", "Net_R"].mean()
-                if l else 0.0, 3
-            ),
-            "MaxLossStreak": max_streak(
-                x["Outcome"].tolist(),
-                "LOSS",
-            ),
+            "PF": round(gp / gl, 3) if gl > 0 else np.inf,
+            "MaxLossStreak": max_streak(x["Outcome"].tolist(), "LOSS"),
             "AvgHoldH": round(x["HoldingHours"].mean(), 2),
         })
 
     print(pd.DataFrame(rows).to_string(index=False))
 
     print("\n" + "-" * 72)
-    print("🧾 COMPLETED TRADE LEDGER")
-    print("-" * 72)
-
-    cols = [
-        "Timestamp",
-        "Symbol",
-        "Side",
-        "Outcome",
-        "EntryPrice",
-        "StopLoss",
-        "TakeProfit",
-        "ExitPrice",
-        "ExitReason",
-        "Gross_R",
-        "Net_R",
-        "BarsHeld",
-    ]
-
-    print(trades[cols].to_string(index=False))
-
-    print("\n" + "-" * 72)
     print("🔐 AUDIT")
     print("-" * 72)
-
-    print("✓ No timeout:", not TIMEOUT_ENABLED)
-    print("✓ No max-bars exit:", not TIMEOUT_ENABLED)
-    print("✓ Entry = next 1H candle open after closed signal candle")
-    print("✓ Confirmed pivots become usable only at confirmation time")
-    print("✓ No negative shift / centered rolling / backfill")
-    print("✓ No same-symbol overlapping positions")
+    print("✓ Real LBank market resolved from load_markets()")
+    print("✓ OHLCV preflight before full download")
+    print("✓ Closed 1H + 4H candles only")
+    print("✓ Entry = next 1H OPEN")
+    print("✓ Confirmed pivots only")
+    print("✓ No lookahead / no negative shift / no centered rolling")
+    print("✓ No timeout / no max-bars exit")
+    print("✓ Structural setup invalidation only")
     print("✓ Max portfolio positions:", MAX_OPEN_POSITIONS)
     print("✓ One position per correlation group")
-    print("✓ Same-candle re-entry after exit is blocked")
-    print("✓ Same-candle SL+TP ambiguity -> SL first")
-    print("✓ Open positions at dataset end are NOT forcibly closed")
+    print("✓ Same-candle re-entry blocked")
+    print("✓ SL first when SL+TP both touched")
+    print("✓ End-of-data open positions are not forcibly closed")
+    print("✓ Funding is NOT fabricated; historical funding is excluded")
 
 
 # ============================================================
@@ -1420,37 +1201,13 @@ def report(trades, processed):
 
 def main():
     print("=" * 72)
-    print("🚀 CLTS v1 — LBank USDT Futures")
-    print("   4H Regime → 1H Sweep → BOS → Retest → Entry → SL/2R")
+    print("🚀 CLTS v1 — LBank USDT-M Futures")
+    print("   4H Regime → 1H Sweep → BOS → Retest → Entry → SL → 2R")
     print("=" * 72)
 
-    print("\nLoading LBank markets...")
-    exchange.load_markets()
-
-    available = set(exchange.symbols)
-
-    resolved = {}
-
-    for name, symbol in SYMBOLS.items():
-        if symbol in available:
-            resolved[name] = symbol
-        else:
-            # Fallback diagnostic for CCXT/LBank symbol naming changes.
-            matches = [
-                s for s in exchange.symbols
-                if s.startswith(f"{name}/USDT")
-            ]
-            print(f"⚠️ {name}: {symbol} not found. Candidates: {matches[:10]}")
-
-    if not resolved:
-        raise RuntimeError(
-            "None of the requested LBank USDT perpetual contracts were found."
-        )
+    resolved = resolve_markets()
 
     end_dt = utc_now()
-
-    # Add warm-up before the actual one-year test.
-    # This is NOT part of the reported test period.
     start_dt = end_dt - timedelta(days=DAYS)
     warmup_dt = start_dt - timedelta(days=100)
 
@@ -1458,11 +1215,9 @@ def main():
     until_ms = int(end_dt.timestamp() * 1000)
 
     print(
-        f"\nTest period target: {start_dt.isoformat()} → {end_dt.isoformat()}"
+        f"\nTest period: {start_dt.isoformat()} → {end_dt.isoformat()}"
     )
-    print(
-        "Warm-up period is used only to initialize indicators/structure."
-    )
+    print("Warm-up: 100 days before test period")
 
     processed = {}
 
@@ -1474,61 +1229,38 @@ def main():
                 since_ms,
                 until_ms,
             )
-            if item is not None:
-                # Trim actual backtest rows to the requested one-year window.
-                df = item["df"].copy()
-                df = df[
-                    df["Date"] >= pd.Timestamp(start_dt)
-                ].reset_index(drop=True)
 
-                # Rebuild signals after trim is NOT allowed because that could
-                # accidentally alter state. Signals were already generated
-                # chronologically from the warmup + test period.
-                #
-                # Instead, retain only signals whose signal/entry timestamps
-                # belong to the final test window.
-                original_df = item["df"]
+            if item is None:
+                continue
 
-                kept_signals = []
-                for s in item["signals"]:
-                    sig_ts = original_df["Date"].iloc[s["signal_index"]]
-                    entry_ts = original_df["Date"].iloc[s["entry_index"]]
+            original_df = item["df"]
 
-                    if (
-                        pd.Timestamp(start_dt)
-                        <= sig_ts
-                        < pd.Timestamp(end_dt)
-                        and
-                        pd.Timestamp(start_dt)
-                        <= entry_ts
-                        < pd.Timestamp(end_dt)
-                    ):
-                        # Convert indices to trimmed dataframe indices.
-                        entry_match = df.index[
-                            df["Date"] == entry_ts
-                        ]
-                        sig_match = df.index[
-                            df["Date"] == sig_ts
-                        ]
+            # Keep the warmup in the dataframe while preserving the already
+            # generated causal state. Then keep only test-period signals.
+            test_start = pd.Timestamp(start_dt)
+            test_end = pd.Timestamp(end_dt)
 
-                        if len(entry_match) and len(sig_match):
-                            s2 = dict(s)
+            kept = []
 
-                            s2["entry_index"] = int(entry_match[0])
-                            s2["signal_index"] = int(sig_match[0])
+            for s in item["signals"]:
+                sig_ts = original_df["Date"].iloc[s["signal_index"]]
+                entry_ts = original_df["Date"].iloc[s["entry_index"]]
 
-                            kept_signals.append(s2)
+                if test_start <= sig_ts < test_end and test_start <= entry_ts < test_end:
+                    kept.append(s)
 
-                item["df"] = df
-                item["signals"] = kept_signals
-
-                processed[name] = item
+            # Keep full dataframe because signal indices reference it.
+            item["signals"] = kept
+            processed[name] = item
 
         except Exception as exc:
             print(f"❌ {name} failed: {type(exc).__name__}: {exc}")
 
     if not processed:
-        raise RuntimeError("No symbol data was successfully prepared.")
+        raise RuntimeError(
+            "No symbol data was successfully prepared. "
+            "Check LBank availability, CCXT version, and the market-resolution output."
+        )
 
     print("\n⚙️ Starting chronological backtest...")
     trades, open_positions = run_backtest(processed)
@@ -1537,7 +1269,7 @@ def main():
 
     if open_positions:
         print("\n" + "-" * 72)
-        print("🔓 POSITIONS STILL OPEN AT END OF DATA")
+        print("🔓 OPEN AT END OF DATA — NOT FORCE-CLOSED")
         print("-" * 72)
 
         for symbol, pos in open_positions.items():
@@ -1549,11 +1281,6 @@ def main():
                 "TP=", pos["take_profit"],
                 "entry_time=", pos["entry_timestamp"],
             )
-
-        print(
-            "\nاین پوزیشن‌ها عمداً در آمار معاملات بسته‌شده وارد نشده‌اند؛ "
-            "بستن اجباری انتهای دیتاست خلاف قانون NO TIMEOUT است."
-        )
 
 
 if __name__ == "__main__":
