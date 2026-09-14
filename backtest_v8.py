@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V52 (Circuit Breaker Added for Loss Streak Control)
+# HUNTER-V53 (Aggressive Streak Defense: Max Pos 3 & Strict CB)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -48,7 +48,7 @@ SYMBOLS = {k: v for k, v in SYMBOLS.items() if k not in REMOVED_COINS}
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
-MAX_POSITIONS = 5
+MAX_POSITIONS = 3  # کاهش پوزیشن‌های همزمان برای ایمنی بیشتر
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 ATR_PERIOD = 14
@@ -62,15 +62,15 @@ INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-# پارامترهای جدید Circuit Breaker برای کنترل ضررهای متوالی
-MAX_CONSECUTIVE_LOSSES_BEFORE_PAUSE = 2  # بعد از ۲ باخت متوالی ربات استراحت می‌کند
-CIRCUIT_BREAKER_COOLDOWN = 4       # تعداد کندل استراحت (4 کندل ۴ ساعته = 16 ساعت)
+# پارامترهای دفاعی جدید Circuit Breaker
+MAX_CONSECUTIVE_LOSSES_BEFORE_PAUSE = 1  # توقف حتی پس از اولین باخت
+CIRCUIT_BREAKER_COOLDOWN = 6       # ۶ کندل ۴ ساعته (۲۴ ساعت) استراحت
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V52")
+print("📥 دریافت داده‌ها - HUNTER-V53")
 print("=" * 60)
 
 processed_data = {}
@@ -160,7 +160,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V52 (با مکانیزم Circuit Breaker)...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V53...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -170,12 +170,10 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     
-    # متغیرهای کنترل زنجیره ضرر و استراحت اضطراری
     consecutive_losses = 0
     cooldown_timer = 0
     
     for ts in all_timestamps:
-        # کاهش تایمر استراحت در هر گام زمانی جدید
         if cooldown_timer > 0:
             cooldown_timer -= 1
             
@@ -210,13 +208,12 @@ def run_backtest(processed_data):
                 
                 outcome = "WIN" if r_real > 0 else "LOSS"
                 
-                # مدیریت شمارنده باخت‌های متوالی و فعال‌سازی Circuit Breaker
                 if outcome == "LOSS":
                     consecutive_losses += 1
                     if consecutive_losses >= MAX_CONSECUTIVE_LOSSES_BEFORE_PAUSE:
                         cooldown_timer = CIRCUIT_BREAKER_COOLDOWN
                 else:
-                    consecutive_losses = 0  # با برد متوالی ریست می‌شود
+                    consecutive_losses = 0
                 
                 position_notional = TRADE_MARGIN * LEVERAGE
                 price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
@@ -235,7 +232,6 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
         
-        # اگر ربات در فاز استراحت (Circuit Breaker) باشد، اجازه ورود جدید ندارد
         if cooldown_timer > 0:
             continue
         
@@ -300,7 +296,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با Circuit Breaker - HUNTER-V52")
+    print("📊 گزارش نهایی استراتژی دفاعی - HUNTER-V53")
     print("=" * 68)
 
     if trades_df.empty:
@@ -338,7 +334,7 @@ def summarize_result(trades_df):
         loss_sequences.append(temp_loss_seq)
 
     print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
-    print(f"🔸 مارجین: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
+    print(f"🔸 مارجین: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x | حداکثر پوزیشن همزمان: {MAX_POSITIONS}")
     print(f"🔸 تعداد کل معاملات: {trades}")
     print(f"🔸 معاملات برنده (WIN): {wins} | بازنده (LOSS): {losses}")
     print(f"🎯 وین‌ریت کلی (Win Rate): {wr:.2f}%")
@@ -358,4 +354,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V52 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V53 به پایان رسید.")
