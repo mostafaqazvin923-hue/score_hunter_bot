@@ -1,10 +1,10 @@
 # CLTS v1 — Causal Liquidity/Structure Trend System
-# LBank USDT-M Futures / CCXT
+# LBank USDT-M Futures / Direct REST
 #
 # FIXED:
-# - Resolves real LBank swap markets after load_markets()
-# - Does not hard-code BTC/USDT:USDT as the only accepted market id
-# - Tests OHLCV support before downloading a full year
+# - Resolves real LBank SwapU futures contracts directly from LBank
+# - Does not use CCXT fetch_ohlcv() for Futures candles
+# - Tests Futures OHLCV support before downloading a full year
 # - Uses only closed 1H/4H candles
 # - Entry = next 1H candle open
 # - No timeout / max-bars exit
@@ -17,6 +17,12 @@
 import sys
 import subprocess
 from datetime import datetime, timedelta, timezone
+
+try:
+    import requests
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "requests"])
+    import requests
 
 try:
     import ccxt
@@ -819,6 +825,49 @@ def build_signals(df):
     return signals
 
 
+
+def validate_ohlcv_support(contract_symbol):
+    """Preflight the FUTURES-only historical K-line adapter.
+
+    This deliberately does not use CCXT and does not fall back to Spot.
+    It requests a small recent closed-candle window and validates that the
+    response contains real OHLCV rows for the requested futures contract.
+    """
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    tf_ms = timeframe_ms("1h")
+    end_ms = floor_timestamp_ms(now_ms, tf_ms) - tf_ms
+    start_ms = end_ms - 3 * tf_ms
+
+    try:
+        rows = _fetch_kline_page(
+            contract_symbol,
+            "1h",
+            start_ms,
+            end_ms + tf_ms,
+        )
+    except Exception as exc:
+        print(
+            f"  ⚠️ OHLCV preflight failed for {contract_symbol}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return False
+
+    valid = []
+    for row in rows:
+        x = _normalize_kline_row(row)
+        if x is None:
+            continue
+        ts, op, hi, lo, cl, vol = x
+        if hi >= max(op, cl) and lo <= min(op, cl) and hi >= lo and vol >= 0:
+            valid.append(x)
+
+    if not valid:
+        print(f"  ⚠️ OHLCV preflight returned no valid Futures candles for {contract_symbol}")
+        return False
+
+    print(f"  ✓ Futures OHLCV preflight passed for {contract_symbol} ({len(valid)} candles)")
+    return True
+
 # ============================================================
 # PREPARE
 # ============================================================
@@ -858,7 +907,7 @@ def prepare_symbol(name, unified_symbol, since_ms, until_ms):
         f"signals={len(signals)}"
     )
 
-    return {"df": df1h, "signals": signals, "ccxt_symbol": unified_symbol}
+    return {"df": df1h, "signals": signals, "futures_contract": unified_symbol}
 
 
 # ============================================================
