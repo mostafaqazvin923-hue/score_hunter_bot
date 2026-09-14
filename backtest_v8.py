@@ -239,9 +239,6 @@ def run_backtest(processed_data, regime_breadth_threshold=None):
     active_positions = {}
     all_trades = []
     
-    # تعداد ضررهای متوالی پورتفوی؛ فقط معاملات بسته‌شده را می‌شمارد.
-    portfolio_loss_streak = 0
-    streak_pause_remaining = 0
     
     for ts in all_timestamps:
     
@@ -491,7 +488,9 @@ if __name__ == "__main__":
     print("A: BTC Weak + Breadth < 20%  → block NEW LONG")
     print("B: BTC Weak + Breadth < 30%  → block NEW LONG")
     print("⚠️ Entry / Exit / SL / Trailing / Fees باقی می‌مانند.")
+    print("⚠️ V44 Streak Pause در این تست غیرفعال است؛ فقط Regime Gate تست می‌شود.")
     print("⚠️ پوزیشن‌های باز هرگز توسط Regime Gate بسته نمی‌شوند.")
+    print("📌 A/B فقط تفاوت آستانه Breadth را می‌سنجد: 20% در برابر 30%.")
 
     # The data-loading code above this main guard is already executed once.
     results = {}
@@ -508,10 +507,6 @@ if __name__ == "__main__":
             processed_data,
             regime_breadth_threshold=threshold,
         )
-
-        # Diagnostics are descriptive only; they do not affect the test.
-        if not df_trades.empty:
-            print_loss_cluster_diagnostics(df_trades)
 
         results[label] = summarize_result(df_trades, label)
 
