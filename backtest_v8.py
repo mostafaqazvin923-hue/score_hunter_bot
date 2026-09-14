@@ -6,8 +6,14 @@ from datetime import datetime, timedelta
 try:
     import ccxt
 except ImportError:
-    print("📦 در حال نصب کتابخانه ccxt...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
+    print("📦 در حال نصب کتابخانه ccxt...", flush=True)
+    subprocess.check_call([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "ccxt"
+    ])
     import ccxt
 
 import numpy as np
@@ -17,20 +23,34 @@ import pandas as pd
 # ============================================================
 # HUNTER-V47
 # ============================================================
-# پایه: HUNTER-V44 / V46
 #
-# تغییر جدید V47:
+# پایه:
+# HUNTER-V46
+#
+# تغییر V47:
+#
 # اگر حداقل 2 معامله در یک timestamp با LOSS بسته شوند،
-# ورودهای جدید برای تعداد مشخصی کندل متوقف می‌شود.
+# ورودهای جدید برای تعداد مشخصی کندل متوقف می‌شوند.
 #
-# سه تست:
-#   BASE   = بدون Cluster Control
-#   V47-A  = Cluster Cooldown = 2 candles
-#   V47-B  = Cluster Cooldown = 4 candles
+# تست‌ها:
 #
-# نکته:
-# پوزیشن‌های باز هرگز به خاطر Cluster Control بسته نمی‌شوند.
-# SL / Trailing / Exit / Fee / Entry منطق اصلی تغییر نکرده است.
+# BASE  = بدون Cluster Control
+# V47-A = Cooldown = 2 candles
+# V47-B = Cooldown = 4 candles
+#
+# نکته مهم:
+#
+# Cluster Control فقط NEW ENTRY را متوقف می‌کند.
+# پوزیشن‌های باز همچنان با همان:
+#   SL
+#   Trailing
+#   Timeout
+#   Exit
+# مدیریت می‌شوند.
+#
+# هیچ Position Sizing جدیدی اضافه نشده.
+# هیچ Short اضافه نشده.
+# هیچ فیلتر جدیدی اضافه نشده.
 # ============================================================
 
 
@@ -98,6 +118,7 @@ REMOVED_COINS = {
     "BONK",
 }
 
+
 SYMBOLS = {
     k: v
     for k, v in SYMBOLS.items()
@@ -110,16 +131,19 @@ SYMBOLS = {
 # ============================================================
 
 LOOKBACK_DAYS = 365
+
 TIMEFRAME = "4h"
 
 MAX_POSITIONS = 5
 
 SLIPPAGE = 0.0003
+
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
 
 TRAILING_ATR_MULTIPLIER = 2.0
+
 INITIAL_ATR_MULTIPLIER = 1.8
 
 TIMEOUT_CANDLES = 45
@@ -131,8 +155,9 @@ EMA_WARMUP = 200
 # تاریخ شروع
 # ============================================================
 
-start_date = datetime.now() - timedelta(
-    days=LOOKBACK_DAYS
+start_date = (
+    datetime.now()
+    - timedelta(days=LOOKBACK_DAYS)
 )
 
 since_timestamp = int(
@@ -144,9 +169,14 @@ since_timestamp = int(
 # دریافت داده از LBank
 # ============================================================
 
-print("=" * 68)
-print("📥 دریافت داده‌ها - HUNTER-V47")
-print("=" * 68)
+print("=" * 68, flush=True)
+
+print(
+    "📥 دریافت داده‌ها - HUNTER-V47",
+    flush=True
+)
+
+print("=" * 68, flush=True)
 
 
 def fetch_symbol_data(lbank_symbol):
@@ -161,9 +191,9 @@ def fetch_symbol_data(lbank_symbol):
 
         batch = None
 
-        # ----------------------------------------------------
-        # Retry API
-        # ----------------------------------------------------
+        # ====================================================
+        # Retry
+        # ====================================================
 
         for attempt in range(3):
 
@@ -183,20 +213,24 @@ def fetch_symbol_data(lbank_symbol):
                 if attempt == 2:
 
                     print(
-                        f"⚠️ دریافت ناقص {lbank_symbol}: {e}"
+                        f"⚠️ دریافت ناقص "
+                        f"{lbank_symbol}: {e}",
+                        flush=True
                     )
 
                     return None
 
         if not batch:
+
             break
 
         first_ts = batch[0][0]
+
         last_ts = batch[-1][0]
 
-        # ----------------------------------------------------
-        # جلوگیری از loop pagination
-        # ----------------------------------------------------
+        # ====================================================
+        # Pagination protection
+        # ====================================================
 
         if (
             last_seen is not None
@@ -205,7 +239,8 @@ def fetch_symbol_data(lbank_symbol):
 
             print(
                 f"⚠️ pagination متوقف شد: "
-                f"{lbank_symbol}"
+                f"{lbank_symbol}",
+                flush=True
             )
 
             return None
@@ -217,9 +252,11 @@ def fetch_symbol_data(lbank_symbol):
         current_since = last_ts + 1
 
         if len(batch) < 1000:
+
             break
 
     if not all_ohlcv:
+
         return None
 
     # ========================================================
@@ -238,6 +275,10 @@ def fetch_symbol_data(lbank_symbol):
         ],
     )
 
+    # ========================================================
+    # Date
+    # ========================================================
+
     df["Date"] = pd.to_datetime(
         df["Timestamp"],
         unit="ms"
@@ -254,9 +295,9 @@ def fetch_symbol_data(lbank_symbol):
         ]
     ]
 
-    # --------------------------------------------------------
-    # پاکسازی
-    # --------------------------------------------------------
+    # ========================================================
+    # Cleaning
+    # ========================================================
 
     df.dropna(
         inplace=True
@@ -287,7 +328,8 @@ def fetch_symbol_data(lbank_symbol):
         now_ms = exchange.milliseconds()
 
         last_ms = int(
-            df.iloc[-1]["Date"].timestamp() * 1000
+            df.iloc[-1]["Date"].timestamp()
+            * 1000
         )
 
         candle_ms = (
@@ -297,12 +339,15 @@ def fetch_symbol_data(lbank_symbol):
             * 1000
         )
 
-        if last_ms + candle_ms > now_ms:
+        if (
+            last_ms + candle_ms
+            > now_ms
+        ):
 
             df = df.iloc[:-1].copy()
 
     # ========================================================
-    # حداقل داده
+    # Minimum data
     # ========================================================
 
     if len(df) < EMA_WARMUP + 50:
@@ -310,7 +355,7 @@ def fetch_symbol_data(lbank_symbol):
         return None
 
     # ========================================================
-    # کنترل Gap
+    # Gap check
     # ========================================================
 
     deltas = (
@@ -321,8 +366,10 @@ def fetch_symbol_data(lbank_symbol):
 
     if (
         not deltas.empty
-        and deltas.max()
-        > pd.Timedelta(
+        and
+        deltas.max()
+        >
+        pd.Timedelta(
             hours=4,
             minutes=10
         )
@@ -331,7 +378,8 @@ def fetch_symbol_data(lbank_symbol):
         print(
             f"⚠️ gap بزرگ در "
             f"{lbank_symbol}؛ "
-            f"نماد حذف شد."
+            f"نماد حذف شد.",
+            flush=True
         )
 
         return None
@@ -342,17 +390,20 @@ def fetch_symbol_data(lbank_symbol):
 
     tr1 = (
         df["High"]
-        - df["Low"]
+        -
+        df["Low"]
     )
 
     tr2 = np.abs(
         df["High"]
-        - df["Close"].shift(1)
+        -
+        df["Close"].shift(1)
     )
 
     tr3 = np.abs(
         df["Low"]
-        - df["Close"].shift(1)
+        -
+        df["Close"].shift(1)
     )
 
     true_range = pd.concat(
@@ -410,7 +461,8 @@ def fetch_symbol_data(lbank_symbol):
     df["Mom_Short"] = (
         (
             df["Close"]
-            - df["Close"].shift(10)
+            -
+            df["Close"].shift(10)
         )
         /
         df["Close"].shift(10)
@@ -419,7 +471,8 @@ def fetch_symbol_data(lbank_symbol):
     df["Mom_Long"] = (
         (
             df["Close"]
-            - df["Close"].shift(30)
+            -
+            df["Close"].shift(30)
         )
         /
         df["Close"].shift(30)
@@ -446,6 +499,11 @@ processed_data = {}
 
 for symbol, lbank_symbol in SYMBOLS.items():
 
+    print(
+        f"📡 دریافت {symbol} ...",
+        flush=True
+    )
+
     df4h = fetch_symbol_data(
         lbank_symbol
     )
@@ -456,20 +514,33 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
         print(
             f"✅ {symbol}: "
-            f"{len(df4h)} کندل"
+            f"{len(df4h)} کندل",
+            flush=True
         )
 
     else:
 
         print(
-            f"❌ {symbol}: حذف شد"
+            f"❌ {symbol}: حذف شد",
+            flush=True
         )
 
 
 print(
-    f"\n✅ تعداد نمادهای معتبر: "
+    "",
+    flush=True
+)
+
+print(
+    f"✅ تعداد نمادهای معتبر: "
     f"{len(processed_data)} "
-    f"از {len(SYMBOLS)}"
+    f"از {len(SYMBOLS)}",
+    flush=True
+)
+
+print(
+    "=" * 68,
+    flush=True
 )
 
 
@@ -483,7 +554,7 @@ def run_backtest(
 ):
 
     # ========================================================
-    # تمام timestampها
+    # Timestampهای مشترک/موجود
     # ========================================================
 
     all_timestamps = sorted(
@@ -495,37 +566,47 @@ def run_backtest(
     )
 
     # ========================================================
-    # وضعیت پوزیشن‌ها
+    # Active Positions
     # ========================================================
 
     active_positions = {}
 
+    # ========================================================
+    # Trades
+    # ========================================================
+
     all_trades = []
 
     # ========================================================
-    # V47 Cluster Cooldown
+    # Cluster Cooldown State
+    # ========================================================
+    #
+    # تعداد کندل‌هایی که ورود جدید ممنوع است.
+    #
+    # مقدار 0:
+    # هیچ محدودیتی وجود ندارد.
+    #
     # ========================================================
 
     cluster_cooldown_remaining = 0
 
     # ========================================================
-    # Loop بازار
+    # Market Loop
     # ========================================================
 
     for ts in all_timestamps:
 
         # ====================================================
-        # مدیریت معاملات باز
+        # این متغیر فقط برای همین timestamp است.
         # ====================================================
+
+        losses_this_timestamp = 0
 
         symbols_to_close = []
 
-        # تعداد LOSSهایی که در همین timestamp بسته می‌شوند
-        losses_this_timestamp = 0
-
-        # ----------------------------------------------------
-        # بررسی پوزیشن‌های باز
-        # ----------------------------------------------------
+        # ====================================================
+        # 1) مدیریت پوزیشن‌های باز
+        # ====================================================
 
         for symbol, pos in list(
             active_positions.items()
@@ -534,6 +615,7 @@ def run_backtest(
             df = processed_data[symbol]
 
             if ts not in df.index:
+
                 continue
 
             c4h = df.loc[ts]
@@ -544,7 +626,8 @@ def run_backtest(
 
             if (
                 c4h["High"]
-                > pos["highest_price"]
+                >
+                pos["highest_price"]
             ):
 
                 pos["highest_price"] = (
@@ -552,7 +635,9 @@ def run_backtest(
                 )
 
                 new_trailing_sl = (
+
                     pos["highest_price"]
+
                     -
                     TRAILING_ATR_MULTIPLIER
                     *
@@ -561,7 +646,8 @@ def run_backtest(
 
                 if (
                     new_trailing_sl
-                    > pos["stop_loss"]
+                    >
+                    pos["stop_loss"]
                 ):
 
                     pos["stop_loss"] = (
@@ -574,15 +660,16 @@ def run_backtest(
 
             hit_sl = (
                 c4h["Low"]
-                <= pos["stop_loss"]
+                <=
+                pos["stop_loss"]
             )
 
             # =================================================
             # Timeout
             # =================================================
 
-            curr_i = df.index.get_loc(
-                ts
+            curr_i = (
+                df.index.get_loc(ts)
             )
 
             candles_held = (
@@ -593,37 +680,41 @@ def run_backtest(
 
             is_timeout = (
                 candles_held
-                >= TIMEOUT_CANDLES
+                >=
+                TIMEOUT_CANDLES
             )
 
             # =================================================
-            # خروج
+            # Exit
             # =================================================
 
-            if hit_sl or is_timeout:
+            if (
+                hit_sl
+                or
+                is_timeout
+            ):
 
                 initial_risk = (
                     pos["initial_risk"]
                 )
 
-                # ------------------------------------------------
-                # منطق خروج اصلی V33
-                # ------------------------------------------------
+                # =================================================
+                # Exit price
+                # =================================================
 
-                exit_p = (
+                if hit_sl:
 
-                    min(
+                    exit_p = min(
                         pos["stop_loss"],
                         c4h["Open"]
                     )
 
-                    if hit_sl
+                else:
 
-                    else c4h["Close"]
-                )
+                    exit_p = c4h["Close"]
 
                 # =================================================
-                # Return بر اساس R
+                # R result
                 # =================================================
 
                 r_real = (
@@ -637,83 +728,87 @@ def run_backtest(
                     initial_risk
 
                     -
-                    (FEE_RATE * 2)
+                    (
+                        FEE_RATE
+                        *
+                        2
+                    )
                 )
 
                 # =================================================
                 # Outcome
                 # =================================================
 
-                outcome = (
+                if r_real > 0:
 
-                    "WIN"
+                    outcome = "WIN"
 
-                    if r_real > 0
+                else:
 
-                    else "LOSS"
-                )
+                    outcome = "LOSS"
 
-                # =================================================
-                # V47 Loss Cluster Counter
-                # =================================================
-
-                if outcome == "LOSS":
-
+                    # فقط LOSSهای همین timestamp
                     losses_this_timestamp += 1
 
                 # =================================================
-                # Diagnostic data
+                # Diagnostic
                 # =================================================
 
                 btc_regime = "UNKNOWN"
 
                 market_breadth = np.nan
 
-                # ------------------------------------------------
+                # =================================================
                 # BTC Regime
-                # ------------------------------------------------
+                # =================================================
 
                 if (
-                    "BTC" in processed_data
-                    and
-                    ts in processed_data[
-                        "BTC"
-                    ].index
+                    "BTC"
+                    in
+                    processed_data
                 ):
 
-                    btc = (
-                        processed_data[
-                            "BTC"
-                        ].loc[ts]
+                    btc_df = (
+                        processed_data["BTC"]
                     )
 
-                    btc_regime = (
+                    if ts in btc_df.index:
 
-                        "STRONG"
+                        btc = (
+                            btc_df.loc[ts]
+                        )
 
                         if (
                             btc["Close"]
-                            > btc["EMA20"]
+                            >
+                            btc["EMA20"]
 
                             and
 
                             btc["EMA20"]
-                            > btc["EMA50"]
+                            >
+                            btc["EMA50"]
 
                             and
 
                             btc["Close"]
-                            > btc["EMA200"]
-                        )
+                            >
+                            btc["EMA200"]
+                        ):
 
-                        else
+                            btc_regime = (
+                                "STRONG"
+                            )
 
-                        "WEAK"
-                    )
+                        else:
 
-                # ------------------------------------------------
+                            btc_regime = (
+                                "WEAK"
+                            )
+
+                # =================================================
                 # Market Breadth
-                # ------------------------------------------------
+                # =================================================
 
                 breadth_total = 0
 
@@ -725,6 +820,7 @@ def run_backtest(
                 ) in processed_data.items():
 
                     if ts not in _df.index:
+
                         continue
 
                     breadth_total += 1
@@ -733,22 +829,25 @@ def run_backtest(
 
                     if (
                         _c["Close"]
-                        > _c["EMA20"]
+                        >
+                        _c["EMA20"]
 
                         and
 
                         _c["EMA20"]
-                        > _c["EMA50"]
+                        >
+                        _c["EMA50"]
 
                         and
 
                         _c["Close"]
-                        > _c["EMA200"]
+                        >
+                        _c["EMA200"]
                     ):
 
                         breadth_bull += 1
 
-                if breadth_total:
+                if breadth_total > 0:
 
                     market_breadth = (
                         breadth_bull
@@ -761,7 +860,6 @@ def run_backtest(
                 # =================================================
 
                 all_trades.append(
-
                     {
                         "Timestamp": ts,
 
@@ -773,9 +871,8 @@ def run_backtest(
 
                         "Return": r_real,
 
-                        "ExitOrder": len(
-                            all_trades
-                        ),
+                        "ExitOrder":
+                            len(all_trades),
 
                         "BTC_Regime":
                             btc_regime,
@@ -789,27 +886,29 @@ def run_backtest(
                     symbol
                 )
 
-        # ========================================================
-        # حذف پوزیشن‌های بسته‌شده
-        # ========================================================
+        # ====================================================
+        # 2) حذف پوزیشن‌های بسته‌شده
+        # ====================================================
 
         for sym in symbols_to_close:
 
-            del active_positions[
-                sym
-            ]
+            if sym in active_positions:
 
-        # ========================================================
-        # V47 — Loss Cluster Detection
-        # ========================================================
+                del active_positions[sym]
+
+        # ====================================================
+        # 3) Cluster Detection
+        # ====================================================
         #
-        # اگر حداقل 2 LOSS در همین timestamp
-        # بسته شده باشد، cooldown فعال می‌شود.
+        # بسیار مهم:
         #
-        # نکته:
-        # cooldown فقط ورود جدید را متوقف می‌کند.
-        # پوزیشن باز وجود داشته باشد، همچنان مدیریت می‌شود.
-        # ========================================================
+        # این قسمت فقط زمانی فعال است که حداقل 2 LOSS
+        # در همین timestamp بسته شده باشد.
+        #
+        # برای BASE چون مقدار cooldown = 0 است،
+        # هیچ تغییری در رفتار ایجاد نمی‌کند.
+        #
+        # ====================================================
 
         if (
             cluster_cooldown_candles > 0
@@ -818,15 +917,21 @@ def run_backtest(
         ):
 
             cluster_cooldown_remaining = max(
-
                 cluster_cooldown_remaining,
-
                 cluster_cooldown_candles
             )
 
-        # ========================================================
-        # V47 — Cooldown
-        # ========================================================
+        # ====================================================
+        # 4) Cluster Cooldown
+        # ====================================================
+        #
+        # اگر cooldown فعال باشد:
+        #
+        # - پوزیشن‌های باز قبلاً مدیریت شده‌اند.
+        # - هیچ پوزیشن جدیدی باز نمی‌شود.
+        # - سپس یک کندل از cooldown مصرف می‌شود.
+        #
+        # ====================================================
 
         if (
             cluster_cooldown_remaining
@@ -837,9 +942,9 @@ def run_backtest(
 
             continue
 
-        # ========================================================
-        # امتیازدهی
-        # ========================================================
+        # ====================================================
+        # 5) Ranking
+        # ====================================================
 
         current_scores = {}
 
@@ -849,6 +954,7 @@ def run_backtest(
         ) in processed_data.items():
 
             if ts not in df.index:
+
                 continue
 
             val = df.loc[
@@ -863,31 +969,29 @@ def run_backtest(
                 ] = val
 
         if not current_scores:
+
             continue
 
-        # ========================================================
-        # Ranking
-        # ========================================================
+        # ====================================================
+        # 6) Sort by Mom_Long
+        # ====================================================
 
         ranked_symbols = sorted(
-
             current_scores.keys(),
-
             key=lambda x:
                 current_scores[x],
-
             reverse=True
         )
 
-        # ========================================================
-        # ورود
-        # ========================================================
+        # ====================================================
+        # 7) Entry
+        # ====================================================
 
         for symbol in ranked_symbols:
 
-            # ----------------------------------------------------
-            # MAX POSITIONS
-            # ----------------------------------------------------
+            # =================================================
+            # Max Positions
+            # =================================================
 
             if (
                 len(active_positions)
@@ -896,9 +1000,9 @@ def run_backtest(
 
                 break
 
-            # ----------------------------------------------------
-            # اگر از قبل پوزیشن داریم
-            # ----------------------------------------------------
+            # =================================================
+            # Already open
+            # =================================================
 
             if symbol in active_positions:
 
@@ -912,13 +1016,11 @@ def run_backtest(
 
                 continue
 
-            # ====================================================
+            # =================================================
             # Index
-            # ====================================================
+            # =================================================
 
-            i = df.index.get_loc(
-                ts
-            )
+            i = df.index.get_loc(ts)
 
             if i < EMA_WARMUP:
 
@@ -926,9 +1028,21 @@ def run_backtest(
 
             c4h = df.iloc[i]
 
-            # ====================================================
+            # =================================================
+            # ATR validation
+            # =================================================
+
+            if (
+                pd.isna(c4h["ATR"])
+                or
+                c4h["ATR"] <= 0
+            ):
+
+                continue
+
+            # =================================================
             # Bull Regime
-            # ====================================================
+            # =================================================
 
             regime_bull = (
 
@@ -949,9 +1063,9 @@ def run_backtest(
                 c4h["EMA200"]
             )
 
-            # ====================================================
-            # V33 Signal
-            # ====================================================
+            # =================================================
+            # Original V33 Signal
+            # =================================================
 
             valid_trend = (
 
@@ -960,36 +1074,43 @@ def run_backtest(
                 and
 
                 c4h["Mom_Short"]
-                > 0.012
+                >
+                0.012
 
                 and
 
                 c4h["Mom_Long"]
-                > 0.035
+                >
+                0.035
             )
 
             if not valid_trend:
 
                 continue
 
-            # ====================================================
-            # Entry
-            # ====================================================
+            # =================================================
+            # Entry Price
+            # =================================================
             #
-            # عمداً همان منطق قبلی حفظ شده:
-            # ورود روی Open همان کندل.
-            # ====================================================
+            # عمداً همان منطق قبلی:
+            # Open همان کندل.
+            #
+            # =================================================
 
             entry_price = (
 
                 c4h["Open"]
                 *
-                (1 + SLIPPAGE)
+                (
+                    1
+                    +
+                    SLIPPAGE
+                )
             )
 
-            # ====================================================
+            # =================================================
             # Initial Stop
-            # ====================================================
+            # =================================================
 
             initial_sl = (
 
@@ -1001,9 +1122,9 @@ def run_backtest(
                 c4h["ATR"]
             )
 
-            # ====================================================
+            # =================================================
             # Initial Risk
-            # ====================================================
+            # =================================================
 
             initial_risk = (
 
@@ -1020,9 +1141,9 @@ def run_backtest(
 
                 continue
 
-            # ====================================================
+            # =================================================
             # SL Distance
-            # ====================================================
+            # =================================================
 
             sl_dist_pct = (
 
@@ -1031,21 +1152,23 @@ def run_backtest(
                 entry_price
             )
 
-            # ====================================================
-            # Risk Filter
-            # ====================================================
+            # =================================================
+            # Original Risk Filter
+            # =================================================
 
             if not (
                 0.01
-                <= sl_dist_pct
-                <= 0.04
+                <=
+                sl_dist_pct
+                <=
+                0.04
             ):
 
                 continue
 
-            # ====================================================
-            # ثبت پوزیشن
-            # ====================================================
+            # =================================================
+            # Open Position
+            # =================================================
 
             active_positions[
                 symbol
@@ -1070,8 +1193,9 @@ def run_backtest(
                     i,
             }
 
+
     # ========================================================
-    # خروجی
+    # Return Trades
     # ========================================================
 
     return pd.DataFrame(
@@ -1080,7 +1204,7 @@ def run_backtest(
 
 
 # ============================================================
-# Summary
+# SUMMARY
 # ============================================================
 
 def summarize_result(
@@ -1091,44 +1215,43 @@ def summarize_result(
     print(
         "\n"
         +
-        "=" * 68
+        "=" * 68,
+        flush=True
     )
 
     print(
-        f"📊 {label}"
+        f"📊 {label}",
+        flush=True
     )
 
     print(
-        "=" * 68
+        "=" * 68,
+        flush=True
     )
 
     if trades_df.empty:
 
         print(
-            "⚠️ هیچ معامله‌ای ثبت نشد."
+            "⚠️ هیچ معامله‌ای ثبت نشد.",
+            flush=True
         )
 
         return {
-
             "Trades": 0,
-
+            "Wins": 0,
+            "Losses": 0,
             "WR": 0.0,
-
             "NetR": 0.0,
-
             "MaxDD": 0.0,
-
             "MaxLossStreak": 0,
         }
 
     # ========================================================
-    # ترتیب واقعی خروج
+    # Actual exit order
     # ========================================================
 
     trades_df = (
-
         trades_df
-
         .sort_values(
             [
                 "Timestamp",
@@ -1136,27 +1259,28 @@ def summarize_result(
             ],
             kind="stable"
         )
-
         .reset_index(
             drop=True
         )
     )
 
     # ========================================================
-    # Stats
+    # Wins / Losses
     # ========================================================
 
     wins = int(
         (
             trades_df["Outcome"]
-            == "WIN"
+            ==
+            "WIN"
         ).sum()
     )
 
     losses = int(
         (
             trades_df["Outcome"]
-            == "LOSS"
+            ==
+            "LOSS"
         ).sum()
     )
 
@@ -1164,14 +1288,21 @@ def summarize_result(
         trades_df
     )
 
-    wr = (
+    # ========================================================
+    # Win Rate
+    # ========================================================
 
+    wr = (
         wins
         /
         trades
         *
         100
     )
+
+    # ========================================================
+    # Net R
+    # ========================================================
 
     net_r = float(
         trades_df[
@@ -1201,12 +1332,8 @@ def summarize_result(
         outcome,
         r
     ) in zip(
-        trades_df[
-            "Outcome"
-        ],
-        trades_df[
-            "Return"
-        ]
+        trades_df["Outcome"],
+        trades_df["Return"]
     ):
 
         if outcome == "LOSS":
@@ -1239,51 +1366,50 @@ def summarize_result(
     # ========================================================
 
     print(
-        f"🔸 Trades: {trades}"
+        f"🔸 Trades: {trades}",
+        flush=True
     )
 
     print(
-        f"🔸 Wins: {wins}"
+        f"🔸 Wins: {wins}",
+        flush=True
     )
 
     print(
-        f"🔸 Losses: {losses}"
+        f"🔸 Losses: {losses}",
+        flush=True
     )
 
     print(
-        f"🎯 Win Rate: {wr:.2f}%"
+        f"🎯 Win Rate: {wr:.2f}%",
+        flush=True
     )
 
     print(
-        f"💰 Net R: {net_r:.2f}R"
+        f"💰 Net R: {net_r:.2f}R",
+        flush=True
     )
 
     print(
         f"❄️ Max Loss Streak: "
-        f"{max_streak}"
+        f"{max_streak}",
+        flush=True
     )
 
     print(
         f"📉 Max DD: "
-        f"{max_dd:.2f}R"
+        f"{max_dd:.2f}R",
+        flush=True
     )
 
     return {
-
-        "Trades":
-            trades,
-
-        "WR":
-            wr,
-
-        "NetR":
-            net_r,
-
-        "MaxDD":
-            max_dd,
-
-        "MaxLossStreak":
-            max_streak,
+        "Trades": trades,
+        "Wins": wins,
+        "Losses": losses,
+        "WR": wr,
+        "NetR": net_r,
+        "MaxDD": max_dd,
+        "MaxLossStreak": max_streak,
     }
 
 
@@ -1296,7 +1422,455 @@ if __name__ == "__main__":
     print(
         "\n"
         +
-        "=" * 68
+        "=" * 68,
+        flush=True
     )
 
-   
+    print(
+        "🚀 HUNTER-V47",
+        flush=True
+    )
+
+    print(
+        "Confirmed Loss-Cluster Control Test",
+        flush=True
+    )
+
+    print(
+        "=" * 68,
+        flush=True
+    )
+
+    print(
+        "\n⚙️ Universe: "
+        f"{len(processed_data)} symbols",
+        flush=True
+    )
+
+    print(
+        "⚙️ Timeframe: 4h",
+        flush=True
+    )
+
+    print(
+        "⚙️ Lookback: 365 days",
+        flush=True
+    )
+
+    print(
+        "⚙️ Max Positions: 5",
+        flush=True
+    )
+
+    print(
+        "\n"
+        "⚠️ منطق Entry / Exit / SL / "
+        "Trailing / Timeout / Fee ثابت است.",
+        flush=True
+    )
+
+    # ========================================================
+    # Results container
+    # ========================================================
+
+    results = {}
+
+    # ========================================================
+    # BASE
+    # ========================================================
+
+    print(
+        "\n"
+        +
+        "-" * 68,
+        flush=True
+    )
+
+    print(
+        "🧪 اجرای BASE",
+        flush=True
+    )
+
+    print(
+        "Cluster Control = OFF",
+        flush=True
+    )
+
+    print(
+        "-" * 68,
+        flush=True
+    )
+
+    df_base = run_backtest(
+        processed_data,
+        cluster_cooldown_candles=0
+    )
+
+    results["BASE"] = summarize_result(
+        df_base,
+        "BASE — No Cluster Control"
+    )
+
+    # ========================================================
+    # V47-A
+    # ========================================================
+
+    print(
+        "\n"
+        +
+        "-" * 68,
+        flush=True
+    )
+
+    print(
+        "🧪 اجرای V47-A",
+        flush=True
+    )
+
+    print(
+        "Cluster Cooldown = 2 candles",
+        flush=True
+    )
+
+    print(
+        "-" * 68,
+        flush=True
+    )
+
+    df_a = run_backtest(
+        processed_data,
+        cluster_cooldown_candles=2
+    )
+
+    results["V47-A"] = summarize_result(
+        df_a,
+        "V47-A — Cluster Cooldown 2"
+    )
+
+    # ========================================================
+    # V47-B
+    # ========================================================
+
+    print(
+        "\n"
+        +
+        "-" * 68,
+        flush=True
+    )
+
+    print(
+        "🧪 اجرای V47-B",
+        flush=True
+    )
+
+    print(
+        "Cluster Cooldown = 4 candles",
+        flush=True
+    )
+
+    print(
+        "-" * 68,
+        flush=True
+    )
+
+    df_b = run_backtest(
+        processed_data,
+        cluster_cooldown_candles=4
+    )
+
+    results["V47-B"] = summarize_result(
+        df_b,
+        "V47-B — Cluster Cooldown 4"
+    )
+
+    # ========================================================
+    # Comparison
+    # ========================================================
+
+    print(
+        "\n"
+        +
+        "=" * 82,
+        flush=True
+    )
+
+    print(
+        "🏁 HUNTER-V47 COMPARISON",
+        flush=True
+    )
+
+    print(
+        "=" * 82,
+        flush=True
+    )
+
+    print(
+        f"{'Variant':<15}"
+        f"{'Trades':>10}"
+        f"{'Wins':>8}"
+        f"{'Losses':>9}"
+        f"{'WR%':>10}"
+        f"{'NetR':>12}"
+        f"{'MaxDD':>12}"
+        f"{'MaxLS':>10}",
+        flush=True
+    )
+
+    print(
+        "-" * 82,
+        flush=True
+    )
+
+    for (
+        label,
+        result
+    ) in results.items():
+
+        print(
+            f"{label:<15}"
+            f"{result['Trades']:>10}"
+            f"{result['Wins']:>8}"
+            f"{result['Losses']:>9}"
+            f"{result['WR']:>9.2f}%"
+            f"{result['NetR']:>11.2f}R"
+            f"{result['MaxDD']:>11.2f}R"
+            f"{result['MaxLossStreak']:>10}",
+            flush=True
+        )
+
+    # ========================================================
+    # Comparison versus BASE
+    # ========================================================
+
+    base = results["BASE"]
+
+    print(
+        "\n"
+        +
+        "=" * 82,
+        flush=True
+    )
+
+    print(
+        "📈 تغییر نسبت به BASE",
+        flush=True
+    )
+
+    print(
+        "=" * 82,
+        flush=True
+    )
+
+    for label in [
+        "V47-A",
+        "V47-B"
+    ]:
+
+        r = results[label]
+
+        print(
+            f"\n🔹 {label}",
+            flush=True
+        )
+
+        print(
+            f"Trades Δ: "
+            f"{r['Trades'] - base['Trades']:+d}",
+            flush=True
+        )
+
+        print(
+            f"WR Δ: "
+            f"{r['WR'] - base['WR']:+.2f}%",
+            flush=True
+        )
+
+        print(
+            f"Net R Δ: "
+            f"{r['NetR'] - base['NetR']:+.2f}R",
+            flush=True
+        )
+
+        print(
+            f"Max DD Δ: "
+            f"{r['MaxDD'] - base['MaxDD']:+.2f}R",
+            flush=True
+        )
+
+        print(
+            f"Max Loss Streak Δ: "
+            f"{r['MaxLossStreak'] - base['MaxLossStreak']:+d}",
+            flush=True
+        )
+
+    # ========================================================
+    # Validation
+    # ========================================================
+
+    print(
+        "\n"
+        +
+        "=" * 82,
+        flush=True
+    )
+
+    print(
+        "🔍 BASE VALIDATION",
+        flush=True
+    )
+
+    print(
+        "=" * 82,
+        flush=True
+    )
+
+    expected = {
+        "Trades": 267,
+        "Wins": 162,
+        "Losses": 105,
+        "WR": 60.67,
+        "NetR": 97.45,
+        "MaxDD": -5.73,
+        "MaxLossStreak": 9,
+    }
+
+    print(
+        "نتیجه مرجع V46:",
+        flush=True
+    )
+
+    print(
+        "267 Trades | "
+        "162 Wins | "
+        "105 Losses | "
+        "60.67% WR | "
+        "+97.45R | "
+        "-5.73R DD | "
+        "9 MaxLS",
+        flush=True
+    )
+
+    print(
+        "\nنتیجه BASE فعلی:",
+        flush=True
+    )
+
+    print(
+        f"{base['Trades']} Trades | "
+        f"{base['Wins']} Wins | "
+        f"{base['Losses']} Losses | "
+        f"{base['WR']:.2f}% WR | "
+        f"{base['NetR']:.2f}R | "
+        f"{base['MaxDD']:.2f}R DD | "
+        f"{base['MaxLossStreak']} MaxLS",
+        flush=True
+    )
+
+    # ========================================================
+    # Check
+    # ========================================================
+
+    base_matches = (
+
+        base["Trades"]
+        ==
+        expected["Trades"]
+
+        and
+
+        base["Wins"]
+        ==
+        expected["Wins"]
+
+        and
+
+        base["Losses"]
+        ==
+        expected["Losses"]
+
+        and
+
+        abs(
+            base["WR"]
+            -
+            expected["WR"]
+        )
+        < 0.01
+
+        and
+
+        abs(
+            base["NetR"]
+            -
+            expected["NetR"]
+        )
+        < 0.01
+
+        and
+
+        abs(
+            base["MaxDD"]
+            -
+            expected["MaxDD"]
+        )
+        < 0.01
+
+        and
+
+        base["MaxLossStreak"]
+        ==
+        expected["MaxLossStreak"]
+    )
+
+    if base_matches:
+
+        print(
+            "\n✅ BASE با نتیجه مرجع V46 "
+            "مطابقت دارد.",
+            flush=True
+        )
+
+        print(
+            "✅ حالا V47-A و V47-B قابل مقایسه هستند.",
+            flush=True
+        )
+
+    else:
+
+        print(
+            "\n⚠️ هشدار:",
+            flush=True
+        )
+
+        print(
+            "BASE با نتیجه مرجع V46 "
+            "مطابقت ندارد.",
+            flush=True
+        )
+
+        print(
+            "قبل از قضاوت درباره Cluster Control، "
+            "داده یا منطق نسخه پایه باید بررسی شود.",
+            flush=True
+        )
+
+    # ========================================================
+    # Final
+    # ========================================================
+
+    print(
+        "\n"
+        +
+        "=" * 82,
+        flush=True
+    )
+
+    print(
+        "✨ HUNTER-V47 به پایان رسید.",
+        flush=True
+    )
+
+    print(
+        "=" * 82,
+        flush=True
+    )
