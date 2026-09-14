@@ -8,14 +8,6 @@
             "sl": 7.500785714285715,
             "time": "2026-09-12 16:00:00"
         },
-        "BTC": {
-            "symbol": "BTC/USDT",
-            "direction": "SHORT",
-            "entry_price": 77122.49,
-            "tp": 76304.14785714289,
-            "sl": 77531.66107142856,
-            "time": "2026-09-12 19:00:00"
-        },
         "SUI": {
             "symbol": "SUI/USDT",
             "direction": "SHORT",
