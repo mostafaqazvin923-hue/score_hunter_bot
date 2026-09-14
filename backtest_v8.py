@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-V23 - Multi-Timeframe 1D & 4H)')
+print('📥 دریافت داده‌ها (HUNTER-V24 - Modern Quant Volatility & Z-Score)')
 print('============================================================')
 
 processed_data = {}
@@ -70,13 +70,35 @@ for symbol, lbank_symbol in SYMBOLS.items():
   df4h.sort_values('Date', inplace=True)
   df4h.reset_index(drop=True, inplace=True)
 
-  tr1 = df4h['High'] - df4h['Low']
-  tr2 = np.abs(df4h['High'] - df4h['Close'].shift(1))
-  tr3 = np.abs(df4h['Low'] - df4h['Close'].shift(1))
-  df4h['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
-  df4h['EMA20'] = df4h['Close'].ewm(span=20, adjust=False).mean()
-  df4h['Volume_MA'] = df4h['Volume'].rolling(20).mean()
+  # ابزارهای مدرن کمیتی: Bollinger Bands + Volume Z-Score + ATR Channel
+  df4h['ATR'] = (
+      pd.concat(
+          [
+              df4h['High'] - df4h['Low'],
+              np.abs(df4h['High'] - df4h['Close'].shift(1)),
+              np.abs(df4h['Low'] - df4h['Close'].shift(1)),
+          ],
+          axis=1,
+      )
+      .max(axis=1)
+      .rolling(20)
+      .mean()
+  )
 
+  # باند بولینگر استاندارد
+  sma20 = df4h['Close'].rolling(20).mean()
+  std20 = df4h['Close'].rolling(20).std()
+  df4h['BB_Upper'] = sma20 + (2.0 * std20)
+  df4h['BB_Lower'] = sma20 - (2.0 * std20)
+
+  # استاندارد زدن حجم (Volume Z-Score) برای تشخیص ورود پول واقعی نهنگ‌ها
+  vol_mean = df4h['Volume'].rolling(30).mean()
+  vol_std = df4h['Volume'].rolling(30).std()
+  df4h['Vol_ZScore'] = (df4h['Volume'] - vol_mean) / (
+      vol_std.replace(0, np.nan)
+  )
+
+  # ساخت جهت بازار روزانه مدرن (Donchian Channel 20 در روزانه)
   df4h['Date_Daily'] = df4h['Date'].dt.floor('1d')
   df_daily = (
       df4h.set_index('Date')
@@ -91,41 +113,15 @@ for symbol, lbank_symbol in SYMBOLS.items():
       .dropna()
       .reset_index()
   )
-  df_daily['EMA50_Daily'] = (
-      df_daily['Close'].ewm(span=50, adjust=False).mean().shift(1)
-  )
-
-  tr_d1 = df_daily['High'] - df_daily['Low']
-  tr_d2 = np.abs(df_daily['High'] - df_daily['Close'].shift(1))
-  tr_d3 = np.abs(df_daily['Low'] - df_daily['Close'].shift(1))
-  atr_d = pd.concat([tr_d1, tr_d2, tr_d3], axis=1).max(axis=1).rolling(14).mean()
-  plus_dm = df_daily['High'].diff()
-  minus_dm = df_daily['Low'].diff()
-  plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-  minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
-  plus_di = (
-      100
-      * pd.Series(plus_dm).rolling(14).mean()
-      / (atr_d.replace(0, np.nan))
-  )
-  minus_di = (
-      100
-      * pd.Series(minus_dm).rolling(14).mean()
-      / (atr_d.replace(0, np.nan))
-  )
-  dx = (
-      100
-      * np.abs(plus_di - minus_di)
-      / (plus_di + minus_di).replace(0, np.nan)
-  )
-  df_daily['ADX_Daily'] = dx.rolling(14).mean()
+  df_daily['Donchian_High'] = df_daily['High'].rolling(20).max().shift(1)
+  df_daily['Donchian_Low'] = df_daily['Low'].rolling(20).min().shift(1)
 
   processed_data[symbol] = {
       '4h': df4h.set_index('Date'),
       'daily': df_daily.set_index('Date'),
   }
 
-print('⚙️ شروع اجرای بک‌تست چندتایم‌فریمه HUNTER-V23...')
+print('⚙️ شروع اجرای بک‌تست مدرن HUNTER-V24...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -157,7 +153,7 @@ for ts in sorted_timestamps:
     if pos['side'] == 'LONG':
       hit_sl = c4h['Low'] <= pos['stop_loss']
       hit_tp = c4h['High'] >= pos['take_profit']
-      is_timeout = candles_held >= 30
+      is_timeout = candles_held >= 24  # حداکثر ۴ روز در پوزیشن
 
       if hit_sl or hit_tp or is_timeout:
         if hit_sl:
@@ -165,7 +161,7 @@ for ts in sorted_timestamps:
           r_real = -1.0 - (FEE_RATE * 2)
         elif hit_tp:
           outcome = 'WIN'
-          r_real = 2.2 - (FEE_RATE * 2)
+          r_real = 2.0 - (FEE_RATE * 2)
         else:
           risk = pos['entry_price'] - pos['stop_loss']
           if risk > 0:
@@ -201,7 +197,7 @@ for ts in sorted_timestamps:
     if match_rows.empty:
       continue
     i = match_rows.index[0]
-    if i < 50:
+    if i < 40:
       continue
 
     c4h = df4h.iloc[i]
@@ -213,25 +209,25 @@ for ts in sorted_timestamps:
       continue
 
     d_row = df_d.loc[daily_time]
-    macro_bull = d_row['Close'] > d_row.get(
-        'EMA50_Daily', d_row['Close']
-    ) and d_row.get('ADX_Daily', 30) > 22
+    # فیلتر روند روزانه مدرن: قیمت بالای کانال میانه‌رو روزانه باشد و حجم انفجاری (Z-Score > 1.5) در 4H ثبت شود
+    macro_trend = prev4h['Close'] > d_row.get(
+        'Donchian_Low', prev4h['Close']
+    ) and prev4h['Close'] >= prev4h['BB_Upper'] * 0.99
 
-    long_signal = (
-        macro_bull
-        and prev4h['Low'] <= prev4h['EMA20']
-        and prev4h['Close'] > prev4h['EMA20']
-        and prev4h['Volume'] > (1.2 * prev4h['Volume_MA'])
+    modern_signal = (
+        macro_trend
+        and prev4h['Vol_ZScore'] > 1.5  # ورود حجم غیرعادی و نهنگ‌پسند
+        and prev4h['Close'] > prev4h['Open']
     )
 
-    if long_signal:
+    if modern_signal:
       entry_price = c4h['Open'] * (1 + SLIPPAGE)
-      stop_loss = df4h['Low'].iloc[i - 4 : i].min() - 0.2 * prev4h['ATR']
+      stop_loss = entry_price - (1.5 * prev4h['ATR'])
       sl_dist_pct = (entry_price - stop_loss) / entry_price
 
-      if 0.005 <= sl_dist_pct <= 0.03:
+      if 0.01 <= sl_dist_pct <= 0.04:
         risk = entry_price - stop_loss
-        take_profit = entry_price + (2.2 * risk)
+        take_profit = entry_price + (2.0 * risk)
         active_positions[symbol] = {
             'side': 'LONG',
             'entry_price': entry_price,
@@ -242,7 +238,7 @@ for ts in sorted_timestamps:
         continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V23 (Multi-Timeframe 1D + 4H)')
+print('📊 گزارش نهایی HUNTER-V24 (Modern Volatility & Z-Score)')
 print('============================================================')
 
 if all_trades:
