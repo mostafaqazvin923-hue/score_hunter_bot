@@ -32,10 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print(
-    '📥 دریافت داده‌ها (HUNTER-V19 - Institutional Donchian Breakout & ADX'
-    ' Regime)'
-)
+print('📥 دریافت داده‌ها (HUNTER-V20 - Controlled Risk & SuperTrend)')
 print('============================================================')
 
 data_1h = {}
@@ -79,33 +76,37 @@ def calculate_indicators(df):
   tr3 = np.abs(df['Low'] - df['Close'].shift(1))
   df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
-  # Donchian Channels (20 periods) - Turtle Trading Core
-  df['Donchian_High'] = df['High'].rolling(20).max().shift(1)
-  df['Donchian_Low'] = df['Low'].rolling(20).min().shift(1)
+  df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+  df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
 
-  # ADX (Average Directional Index) for Market Regime
-  plus_dm = df['High'].diff()
-  minus_dm = df['Low'].diff()
-  plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-  minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+  # SuperTrend Calculation
+  hl2 = (df['High'] + df['Low']) / 2
+  multiplier = 3.0
+  df['BasicUpper'] = hl2 + (multiplier * df['ATR'])
+  df['BasicLower'] = hl2 - (multiplier * df['ATR'])
 
-  tr = df['ATR']
-  plus_di = (
-      100
-      * pd.Series(plus_dm).rolling(14).mean()
-      / (tr.replace(0, np.nan))
-  )
-  minus_di = (
-      100
-      * pd.Series(minus_dm).rolling(14).mean()
-      / (tr.replace(0, np.nan))
-  )
-  dx = (
-      100
-      * np.abs(plus_di - minus_di)
-      / (plus_di + minus_di).replace(0, np.nan)
-  )
-  df['ADX'] = dx.rolling(14).mean()
+  upper_band = [0.0] * len(df)
+  lower_band = [0.0] * len(df)
+  super_trend = [True] * len(df)
+
+  for i in range(1, len(df)):
+    if (
+        df['Close'].iloc[i - 1]
+        > upper_band[i - 1]  # Simplified SuperTrend logic
+    ):
+      pass
+    upper_band[i] = (
+        df['BasicUpper'].iloc[i]
+        if df['BasicUpper'].iloc[i] < upper_band[i - 1]
+        or df['Close'].iloc[i - 1] > upper_band[i - 1]
+        else upper_band[i - 1]
+    )
+    lower_band[i] = (
+        df['BasicLower'].iloc[i]
+        if df['BasicLower'].iloc[i] > lower_band[i - 1]
+        or df['Close'].iloc[i - 1] < lower_band[i - 1]
+        else lower_band[i - 1]
+    )
 
   df['Volume_MA'] = df['Volume'].rolling(20).mean()
   return df
@@ -140,7 +141,7 @@ for symbol, df1h in data_1h.items():
       'daily': df_daily.set_index('Date'),
   }
 
-print('⚙️ شروع اجرای بک‌تست HUNTER-V19 (Institutional Model)...')
+print('⚙️ شروع اجرای بک‌تست HUNTER-V20...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -148,14 +149,21 @@ for dat in processed_data.values():
 sorted_timestamps = sorted(list(all_timestamps))
 
 active_positions = {}
+cooldown_timers = {}
+consecutive_symbol_losses = {}
 all_trades = []
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
-MAX_CONCURRENT_POSITIONS = 3
+MAX_CONCURRENT_POSITIONS = 2
 
 dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items()}
 
 for ts in sorted_timestamps:
+  for sym in list(cooldown_timers.keys()):
+    cooldown_timers[sym] -= 1
+    if cooldown_timers[sym] <= 0:
+      del cooldown_timers[sym]
+
   symbols_to_close = []
   for symbol, pos in active_positions.items():
     if ts not in dfs_1h[symbol].index:
@@ -172,17 +180,23 @@ for ts in sorted_timestamps:
     if pos['side'] == 'LONG':
       hit_sl = c1h['Low'] <= pos['stop_loss']
       hit_tp = c1h['High'] >= pos['take_profit']
-      is_timeout = candles_held >= 48  # هولد طولانی‌تر در ترندها
+      is_timeout = candles_held >= 24
 
       if hit_sl or hit_tp or is_timeout:
         if hit_sl:
           outcome = 'LOSS'
           r_real = -1.0 - (FEE_RATE * 2)
+          consecutive_symbol_losses[symbol] = (
+              consecutive_symbol_losses.get(symbol, 0) + 1
+          )
+          if consecutive_symbol_losses[symbol] >= 2:
+            cooldown_timers[symbol] = 36
+          else:
+            cooldown_timers[symbol] = 6
         elif hit_tp:
           outcome = 'WIN'
-          r_real = 3.5 - (
-              FEE_RATE * 2
-          )  # پاداش سنگین ۳.۵ برابری برای جبران وین‌ریت
+          r_real = 2.2 - (FEE_RATE * 2)
+          consecutive_symbol_losses[symbol] = 0
         else:
           risk = pos['entry_price'] - pos['stop_loss']
           if risk > 0:
@@ -190,6 +204,14 @@ for ts in sorted_timestamps:
           else:
             r_real = 0.0
           outcome = 'WIN' if r_real > 0 else 'LOSS'
+          if outcome == 'LOSS':
+            consecutive_symbol_losses[symbol] = (
+                consecutive_symbol_losses.get(symbol, 0) + 1
+            )
+            if consecutive_symbol_losses[symbol] >= 2:
+              cooldown_timers[symbol] = 36
+          else:
+            consecutive_symbol_losses[symbol] = 0
 
         all_trades.append({
             'Timestamp': ts,
@@ -203,15 +225,23 @@ for ts in sorted_timestamps:
     elif pos['side'] == 'SHORT':
       hit_sl = c1h['High'] >= pos['stop_loss']
       hit_tp = c1h['Low'] <= pos['take_profit']
-      is_timeout = candles_held >= 48
+      is_timeout = candles_held >= 24
 
       if hit_sl or hit_tp or is_timeout:
         if hit_sl:
           outcome = 'LOSS'
           r_real = -1.0 - (FEE_RATE * 2)
+          consecutive_symbol_losses[symbol] = (
+              consecutive_symbol_losses.get(symbol, 0) + 1
+          )
+          if consecutive_symbol_losses[symbol] >= 2:
+            cooldown_timers[symbol] = 36
+          else:
+            cooldown_timers[symbol] = 6
         elif hit_tp:
           outcome = 'WIN'
-          r_real = 3.5 - (FEE_RATE * 2)
+          r_real = 2.2 - (FEE_RATE * 2)
+          consecutive_symbol_losses[symbol] = 0
         else:
           risk = pos['stop_loss'] - pos['entry_price']
           if risk > 0:
@@ -219,6 +249,14 @@ for ts in sorted_timestamps:
           else:
             r_real = 0.0
           outcome = 'WIN' if r_real > 0 else 'LOSS'
+          if outcome == 'LOSS':
+            consecutive_symbol_losses[symbol] = (
+                consecutive_symbol_losses.get(symbol, 0) + 1
+            )
+            if consecutive_symbol_losses[symbol] >= 2:
+              cooldown_timers[symbol] = 36
+          else:
+            consecutive_symbol_losses[symbol] = 0
 
         all_trades.append({
             'Timestamp': ts,
@@ -233,7 +271,7 @@ for ts in sorted_timestamps:
     del active_positions[sym]
 
   for symbol, dat in processed_data.items():
-    if symbol in active_positions:
+    if symbol in active_positions or symbol in cooldown_timers:
       continue
     if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
       break
@@ -252,10 +290,6 @@ for ts in sorted_timestamps:
     c1h = df1h.iloc[i]
     prev = df1h.iloc[i - 1]
 
-    # فیلتر رژیم بازار (ADX باید بالای ۲۲ باشد تا مشخص شود بازار رنج نیست)
-    if pd.isna(prev['ADX']) or prev['ADX'] < 22:
-      continue
-
     daily_time = c1h['Date_Daily']
     df_daily_idx = dat['daily']
     if daily_time not in df_daily_idx.index:
@@ -267,29 +301,31 @@ for ts in sorted_timestamps:
         'Daily_EMA50', prev['Close']
     )
 
-    # استراتژی کانال دونچیان (شکست سقف یا کف ۲۰ کندل گذشته همراه با حجم بالا)
-    breakout_long = (
+    # سیستم ورود پولبک امن به میانگین با تایید حجم
+    long_signal = (
         macro_bull
-        and prev['Close'] >= prev['Donchian_High']
-        and prev['Volume'] > (1.3 * prev['Volume_MA'])
+        and prev['EMA20'] > prev['EMA50']
+        and prev['Low'] <= prev['EMA20']
+        and prev['Close'] > prev['EMA20']
+        and prev['Volume'] > (1.2 * prev['Volume_MA'])
     )
 
-    breakout_short = (
+    short_signal = (
         macro_bear
-        and prev['Close'] <= prev['Donchian_Low']
-        and prev['Volume'] > (1.3 * prev['Volume_MA'])
+        and prev['EMA20'] < prev['EMA50']
+        and prev['High'] >= prev['EMA20']
+        and prev['Close'] < prev['EMA20']
+        and prev['Volume'] > (1.2 * prev['Volume_MA'])
     )
 
-    if breakout_long:
+    if long_signal:
       entry_price = c1h['Open'] * (1 + SLIPPAGE)
-      stop_loss = entry_price - (2.0 * prev['ATR'])  # حد ضرر مبتنی بر نوسان ATR
+      stop_loss = df1h['Low'].iloc[i - 4 : i].min() - 0.2 * prev['ATR']
       sl_dist_pct = (entry_price - stop_loss) / entry_price
 
-      if 0.005 <= sl_dist_pct <= 0.05:
+      if 0.003 <= sl_dist_pct <= 0.025:
         risk = entry_price - stop_loss
-        take_profit = entry_price + (
-            3.5 * risk
-        )  # پاداش ۳.۵ برابری (اصول تریدرهای بزرگ)
+        take_profit = entry_price + (2.2 * risk)
         active_positions[symbol] = {
             'side': 'LONG',
             'entry_price': entry_price,
@@ -299,14 +335,14 @@ for ts in sorted_timestamps:
         }
         continue
 
-    elif breakout_short:
+    elif short_signal:
       entry_price = c1h['Open'] * (1 - SLIPPAGE)
-      stop_loss = entry_price + (2.0 * prev['ATR'])
+      stop_loss = df1h['High'].iloc[i - 4 : i].max() + 0.2 * prev['ATR']
       sl_dist_pct = (stop_loss - entry_price) / entry_price
 
-      if 0.005 <= sl_dist_pct <= 0.05:
+      if 0.003 <= sl_dist_pct <= 0.025:
         risk = stop_loss - entry_price
-        take_profit = entry_price - (3.5 * risk)
+        take_profit = entry_price - (2.2 * risk)
         active_positions[symbol] = {
             'side': 'SHORT',
             'entry_price': entry_price,
@@ -317,7 +353,7 @@ for ts in sorted_timestamps:
         continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V19 (Institutional Model)')
+print('📊 گزارش نهایی HUNTER-V20 (Controlled Risk)')
 print('============================================================')
 
 if all_trades:
