@@ -32,7 +32,7 @@ start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-V17 - Sniper Precision & Strict Circuit Breaker)')
+print('📥 دریافت داده‌ها (HUNTER-V18 - Global Circuit Breaker & High Winrate)')
 print('============================================================')
 
 data_1h = {}
@@ -76,18 +76,11 @@ def calculate_indicators(df):
   tr3 = np.abs(df['Low'] - df['Close'].shift(1))
   df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
-  df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-  df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+  df['EMA10'] = df['Close'].ewm(span=10, adjust=False).mean()
+  df['EMA30'] = df['Close'].ewm(span=30, adjust=False).mean()
   df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
 
-  # MACD Indicators
-  exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-  exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-  df['MACD'] = exp1 - exp2
-  df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-  df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
-
-  # RSI Indicator
+  # RSI
   delta = df['Close'].diff()
   gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
   loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -117,8 +110,8 @@ for symbol, df1h in data_1h.items():
       .dropna()
       .reset_index()
   )
-  df_daily['Daily_EMA50'] = (
-      df_daily['Close'].ewm(span=50, adjust=False).mean().shift(1)
+  df_daily['Daily_EMA30'] = (
+      df_daily['Close'].ewm(span=30, adjust=False).mean().shift(1)
   )
   df1h['Date_Daily'] = df1h['Date'].dt.floor('1d')
 
@@ -136,7 +129,7 @@ for symbol, df1h in data_1h.items():
       .reset_index()
   )
   df4h = calculate_indicators(df4h)
-  df4h['EMA50_4H'] = df4h['EMA50'].shift(1)
+  df4h['EMA30_4H'] = df4h['EMA30'].shift(1)
   df4h['EMA200_4H'] = df4h['EMA200'].shift(1)
   df1h['Date_4H'] = df1h['Date'].dt.floor('4h')
 
@@ -146,7 +139,7 @@ for symbol, df1h in data_1h.items():
       'daily': df_daily.set_index('Date'),
   }
 
-print('⚙️ شروع اجرای بک‌تست HUNTER-V17...')
+print('⚙️ شروع اجرای بک‌تست HUNTER-V18...')
 
 all_timestamps = set()
 for dat in processed_data.values():
@@ -154,8 +147,8 @@ for dat in processed_data.values():
 sorted_timestamps = sorted(list(all_timestamps))
 
 active_positions = {}
-cooldown_timers = {}
-consecutive_symbol_losses = {}
+global_consecutive_losses = 0
+global_cooldown_timer = 0
 all_trades = []
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
@@ -164,10 +157,9 @@ MAX_CONCURRENT_POSITIONS = 2
 dfs_1h = {sym: dat['1h'].set_index('Date') for sym, dat in processed_data.items()}
 
 for ts in sorted_timestamps:
-  for sym in list(cooldown_timers.keys()):
-    cooldown_timers[sym] -= 1
-    if cooldown_timers[sym] <= 0:
-      del cooldown_timers[sym]
+  # کنترل تایمر قرنطینه جهانی
+  if global_cooldown_timer > 0:
+    global_cooldown_timer -= 1
 
   symbols_to_close = []
   for symbol, pos in active_positions.items():
@@ -185,23 +177,15 @@ for ts in sorted_timestamps:
     if pos['side'] == 'LONG':
       hit_sl = c1h['Low'] <= pos['stop_loss']
       hit_tp = c1h['High'] >= pos['take_profit']
-      is_timeout = candles_held >= 24
+      is_timeout = candles_held >= 20
 
       if hit_sl or hit_tp or is_timeout:
         if hit_sl:
           outcome = 'LOSS'
           r_real = -1.0 - (FEE_RATE * 2)
-          consecutive_symbol_losses[symbol] = (
-              consecutive_symbol_losses.get(symbol, 0) + 1
-          )
-          if consecutive_symbol_losses[symbol] >= 2:
-            cooldown_timers[symbol] = 72  # قرنطینه ۷۲ ساعته سخت‌گیرانه
-          else:
-            cooldown_timers[symbol] = 12
         elif hit_tp:
           outcome = 'WIN'
-          r_real = 2.0 - (FEE_RATE * 2)
-          consecutive_symbol_losses[symbol] = 0
+          r_real = 1.8 - (FEE_RATE * 2)
         else:
           risk = pos['entry_price'] - pos['stop_loss']
           if risk > 0:
@@ -209,16 +193,16 @@ for ts in sorted_timestamps:
           else:
             r_real = 0.0
           outcome = 'WIN' if r_real > 0 else 'LOSS'
-          if outcome == 'LOSS':
-            consecutive_symbol_losses[symbol] = (
-                consecutive_symbol_losses.get(symbol, 0) + 1
+
+        # مدیریت زنجیره جهانی ضرر
+        if outcome == 'LOSS':
+          global_consecutive_losses += 1
+          if global_consecutive_losses >= 3:
+            global_cooldown_timer = (
+                48  # قفل کامل کل ربات به مدت ۴۸ ساعت پس از ۳ ضرر متوالی سبد
             )
-            if consecutive_symbol_losses[symbol] >= 2:
-              cooldown_timers[symbol] = 72
-            else:
-              cooldown_timers[symbol] = 12
-          else:
-            consecutive_symbol_losses[symbol] = 0
+        else:
+          global_consecutive_losses = 0
 
         all_trades.append({
             'Timestamp': ts,
@@ -232,23 +216,15 @@ for ts in sorted_timestamps:
     elif pos['side'] == 'SHORT':
       hit_sl = c1h['High'] >= pos['stop_loss']
       hit_tp = c1h['Low'] <= pos['take_profit']
-      is_timeout = candles_held >= 24
+      is_timeout = candles_held >= 20
 
       if hit_sl or hit_tp or is_timeout:
         if hit_sl:
           outcome = 'LOSS'
           r_real = -1.0 - (FEE_RATE * 2)
-          consecutive_symbol_losses[symbol] = (
-              consecutive_symbol_losses.get(symbol, 0) + 1
-          )
-          if consecutive_symbol_losses[symbol] >= 2:
-            cooldown_timers[symbol] = 72
-          else:
-            cooldown_timers[symbol] = 12
         elif hit_tp:
           outcome = 'WIN'
-          r_real = 2.0 - (FEE_RATE * 2)
-          consecutive_symbol_losses[symbol] = 0
+          r_real = 1.8 - (FEE_RATE * 2)
         else:
           risk = pos['stop_loss'] - pos['entry_price']
           if risk > 0:
@@ -256,16 +232,13 @@ for ts in sorted_timestamps:
           else:
             r_real = 0.0
           outcome = 'WIN' if r_real > 0 else 'LOSS'
-          if outcome == 'LOSS':
-            consecutive_symbol_losses[symbol] = (
-                consecutive_symbol_losses.get(symbol, 0) + 1
-            )
-            if consecutive_symbol_losses[symbol] >= 2:
-              cooldown_timers[symbol] = 72
-            else:
-              cooldown_timers[symbol] = 12
-          else:
-            consecutive_symbol_losses[symbol] = 0
+
+        if outcome == 'LOSS':
+          global_consecutive_losses += 1
+          if global_consecutive_losses >= 3:
+            global_cooldown_timer = 48
+        else:
+          global_consecutive_losses = 0
 
         all_trades.append({
             'Timestamp': ts,
@@ -279,8 +252,12 @@ for ts in sorted_timestamps:
   for sym in symbols_to_close:
     del active_positions[sym]
 
+  # اگر ربات در قرنطینه جهانی است، هیچ معامله‌ای باز نکن
+  if global_cooldown_timer > 0:
+    continue
+
   for symbol, dat in processed_data.items():
-    if symbol in active_positions or symbol in cooldown_timers:
+    if symbol in active_positions:
       continue
     if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
       break
@@ -298,17 +275,16 @@ for ts in sorted_timestamps:
 
     c1h = df1h.iloc[i]
     prev = df1h.iloc[i - 1]
-    prev2 = df1h.iloc[i - 2]
 
     daily_time = c1h['Date_Daily']
     df_daily_idx = dat['daily']
     if daily_time not in df_daily_idx.index:
       continue
     macro_bull = prev['Close'] > df_daily_idx.loc[daily_time].get(
-        'Daily_EMA50', prev['Close']
+        'Daily_EMA30', prev['Close']
     )
     macro_bear = prev['Close'] < df_daily_idx.loc[daily_time].get(
-        'Daily_EMA50', prev['Close']
+        'Daily_EMA30', prev['Close']
     )
 
     t4h_time = c1h['Date_4H']
@@ -316,46 +292,36 @@ for ts in sorted_timestamps:
     if t4h_time not in df4h_idx.index:
       continue
     r4h = df4h_idx.loc[t4h_time]
-    trend_4h_up = r4h.get('EMA50_4H', 0) > r4h.get('EMA200_4H', 0)
-    trend_4h_down = r4h.get('EMA50_4H', 0) < r4h.get('EMA200_4H', 0)
+    trend_4h_up = r4h.get('EMA30_4H', 0) > r4h.get('EMA200_4H', 0)
+    trend_4h_down = r4h.get('EMA30_4H', 0) < r4h.get('EMA200_4H', 0)
 
-    # فیلترهای سخت‌گیرانه مومنتوم (جلوگیری از سیگنال‌های فیک و پر شدن بیهوده حجم معامله)
-    macd_bull = prev['MACD_Hist'] > 0 and prev['MACD_Hist'] > prev2['MACD_Hist']
-    macd_bear = prev['MACD_Hist'] < 0 and prev['MACD_Hist'] < prev2['MACD_Hist']
-
-    rsi_long_ok = 45 <= prev['RSI'] <= 65
-    rsi_short_ok = 35 <= prev['RSI'] <= 55
-
-    volume_confirm = prev['Volume'] > (1.3 * prev['Volume_MA'])
-
-    sniper_long = (
+    # استراتژی امن‌تر با فیلتر دقیق RSI و EMA
+    long_signal = (
         macro_bull
         and trend_4h_up
-        and prev['EMA20'] > prev['EMA50']
-        and macd_bull
-        and rsi_long_ok
-        and volume_confirm
+        and prev['EMA10'] > prev['EMA30']
+        and 45 <= prev['RSI'] <= 60
+        and prev['Volume'] > (1.2 * prev['Volume_MA'])
         and prev['Close'] > prev['Open']
     )
 
-    sniper_short = (
+    short_signal = (
         macro_bear
         and trend_4h_down
-        and prev['EMA20'] < prev['EMA50']
-        and macd_bear
-        and rsi_short_ok
-        and volume_confirm
+        and prev['EMA10'] < prev['EMA30']
+        and 40 <= prev['RSI'] <= 55
+        and prev['Volume'] > (1.2 * prev['Volume_MA'])
         and prev['Close'] < prev['Open']
     )
 
-    if sniper_long:
+    if long_signal:
       entry_price = c1h['Open'] * (1 + SLIPPAGE)
-      stop_loss = df1h['Low'].iloc[i - 5 : i].min() - 0.2 * prev['ATR']
+      stop_loss = df1h['Low'].iloc[i - 4 : i].min() - 0.1 * prev['ATR']
       sl_dist_pct = (entry_price - stop_loss) / entry_price
 
-      if 0.003 <= sl_dist_pct <= 0.03:
+      if 0.003 <= sl_dist_pct <= 0.025:
         risk = entry_price - stop_loss
-        take_profit = entry_price + (2.0 * risk)
+        take_profit = entry_price + (1.8 * risk)
         active_positions[symbol] = {
             'side': 'LONG',
             'entry_price': entry_price,
@@ -365,14 +331,14 @@ for ts in sorted_timestamps:
         }
         continue
 
-    elif sniper_short:
+    elif short_signal:
       entry_price = c1h['Open'] * (1 - SLIPPAGE)
-      stop_loss = df1h['High'].iloc[i - 5 : i].max() + 0.2 * prev['ATR']
+      stop_loss = df1h['High'].iloc[i - 4 : i].max() + 0.1 * prev['ATR']
       sl_dist_pct = (stop_loss - entry_price) / entry_price
 
-      if 0.003 <= sl_dist_pct <= 0.03:
+      if 0.003 <= sl_dist_pct <= 0.025:
         risk = stop_loss - entry_price
-        take_profit = entry_price - (2.0 * risk)
+        take_profit = entry_price - (1.8 * risk)
         active_positions[symbol] = {
             'side': 'SHORT',
             'entry_price': entry_price,
@@ -383,7 +349,7 @@ for ts in sorted_timestamps:
         continue
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V17 (Sniper Precision & Strict Circuit Breaker)')
+print('📊 گزارش نهایی HUNTER-V18 (Global Circuit Breaker)')
 print('============================================================')
 
 if all_trades:
