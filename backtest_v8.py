@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V61 (Core + Breakeven Stop Trigger at +1R)
+# HUNTER-V62 (Institutional Adaptive Volatility & Regime Filter)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -66,7 +66,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V61 (با مکانیسم Breakeven)")
+print("📥 دریافت داده‌ها - HUNTER-V62 (فیلتر رژیم تطبیقی پیشرفته)")
 print("=" * 60)
 
 processed_data = {}
@@ -139,6 +139,10 @@ def fetch_symbol_data(lbank_symbol):
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
+    
+    # شاخص انحراف نوسان (Volatility Ratio) برای تشخیص فازهای رِنج مخرب
+    df["ATR_SMA"] = df["ATR"].rolling(50).mean()
+    df["Vol_Ratio"] = df["ATR"] / df["ATR_SMA"]
 
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
@@ -156,7 +160,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V61...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V62...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -176,12 +180,6 @@ def run_backtest(processed_data):
             
             c4h = df.loc[ts]
             
-            # بررسی فعالسازی Breakeven: اگر قیمت به +1R رسید، استاپ‌لاس را به قیمت ورود منتقل کن
-            if not pos["be_triggered"] and c4h["High"] >= (pos["entry_price"] + 1.0 * pos["initial_risk"]):
-                pos["stop_loss"] = max(pos["stop_loss"], pos["entry_price"])
-                pos["be_triggered"] = True
-            
-            # مدیریت Trailing Stop معمولی
             if c4h["High"] > pos["highest_price"]:
                 pos["highest_price"] = c4h["High"]
                 new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
@@ -250,6 +248,12 @@ def run_backtest(processed_data):
                 continue
             
             c4h = df.iloc[i]
+            
+            # فیلتر رژیم تطبیقی: حذف بازارهای بیش از حد متلاطم یا کاملاً فشرده (جلوگیری از فیک‌اوت)
+            vol_ratio = c4h["Vol_Ratio"]
+            if np.isnan(vol_ratio) or vol_ratio < 0.65 or vol_ratio > 2.2:
+                continue
+
             regime_bull = (
                 (c4h["Close"] > c4h["EMA20"])
                 and (c4h["EMA20"] > c4h["EMA50"])
@@ -276,14 +280,13 @@ def run_backtest(processed_data):
                         "highest_price": entry_price,
                         "initial_risk": initial_risk,
                         "entry_index": i,
-                        "be_triggered": False,
                     }
                     
     return pd.DataFrame(all_trades)
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با مکانیزم Breakeven - HUNTER-V61")
+    print("📊 گزارش نهایی استراتژی با فیلتر رژیم نوسانی تطبیقی - HUNTER-V62")
     print("=" * 68)
 
     if trades_df.empty:
@@ -341,4 +344,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V61 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V62 به پایان رسید.")
