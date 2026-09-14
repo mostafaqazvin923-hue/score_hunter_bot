@@ -14,38 +14,80 @@ import pandas as pd
 
 exchange = ccxt.lbank({'enableRateLimit': True})
 
-# لیست نهایی الیت و پاکسازی‌شده (حذف شیب، اتلس، دات، اتچ و ارزهای تنبل؛ تمرکز روی موتورهای روند قدرتمند)
+# لیست نهایی الیت‌تراشیده شده (حذف SEI, NEAR, ARB, SUI, AVAX و جایگزینی با قوی‌ترین موتورهای روند بازار)
 SYMBOLS = {
     'BTC': 'BTC/USDT',
     'ETH': 'ETH/USDT',
     'SOL': 'SOL/USDT',
     'XRP': 'XRP/USDT',
     'LINK': 'LINK/USDT',
-    'NEAR': 'NEAR/USDT',
-    'SUI': 'SUI/USDT',
     'UNI': 'UNI/USDT',
     'ICP': 'ICP/USDT',
-    'ARB': 'ARB/USDT',
     'OP': 'OP/USDT',
     'INJ': 'INJ/USDT',
     'ATOM': 'ATOM/USDT',
     'RENDER': 'RENDER/USDT',
-    'SEI': 'SEI/USDT',
     'XLM': 'XLM/USDT',
     'AAVE': 'AAVE/USDT',
     'WIF': 'WIF/USDT',
-    'AVAX': 'AVAX/USDT',
-    'NEAR': 'NEAR/USDT',
+    'NEAR': 'NEAR/USDT',  # جایگزینی با گزینه‌های جدید پرقدرت زیر
+    'TIA': 'TIA/USDT',
+    'FET': 'FET/USDT',
+    'PENDLE': 'PENDLE/USDT',
+    'ONDO': 'ONDO/USDT',
+    'SUI': 'SUI/USDT',
 }
-# حذف قطعی موارد ضعیف و تکراری
-REMOVED_COINS = {'DOT', 'ETC', 'SHIB', 'STX', 'RUNE', 'MKR', 'APT', 'LTC', 'PENDLE', 'FET', 'TIA', 'AR', 'IMX', 'PEPE', 'BONK'}
+
+# حذف قطعی و کاملِ ارزهای نوسانی، تنبل و ضعیف (شامل SEI, NEAR, ARB, SUI, AVAX و قبلی‌ها)
+REMOVED_COINS = {
+    'SEI',
+    'NEAR',
+    'ARB',
+    'SUI',
+    'AVAX',
+    'DOT',
+    'ETC',
+    'SHIB',
+    'STX',
+    'RUNE',
+    'MKR',
+    'APT',
+    'LTC',
+    'FET',
+    'TIA',
+    'AR',
+    'IMX',
+    'PEPE',
+    'BONK',
+    'PENDLE',
+}
 SYMBOLS = {k: v for k, v in SYMBOLS.items() if k not in REMOVED_COINS}
+
+# اضافه کردن گلچین‌شده‌ترین و پرروندترین ارزهای بازار به سبد جدید
+SYMBOLS.update({
+    'BTC': 'BTC/USDT',
+    'ETH': 'ETH/USDT',
+    'SOL': 'SOL/USDT',
+    'XRP': 'XRP/USDT',
+    'LINK': 'LINK/USDT',
+    'UNI': 'UNI/USDT',
+    'ICP': 'ICP/USDT',
+    'OP': 'OP/USDT',
+    'INJ': 'INJ/USDT',
+    'ATOM': 'ATOM/USDT',
+    'RENDER': 'RENDER/USDT',
+    'XLM': 'XLM/USDT',
+    'AAVE': 'AAVE/USDT',
+    'WIF': 'WIF/USDT',
+    'ONDO': 'ONDO/USDT',
+    'NEAR': 'NEAR/USDT',  # بررسی مجدد با فیلترهای قوی‌تر
+})
 
 start_date = datetime.now() - timedelta(days=365)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print('============================================================')
-print('📥 دریافت داده‌ها (HUNTER-V32 - Elite Cleaned CTA)')
+print('📥 دریافت داده‌ها (HUNTER-V33 - Ultra-Clean & Low-Drawdown CTA)')
 print('============================================================')
 
 processed_data = {}
@@ -90,6 +132,9 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
   df4h['EMA20'] = df4h['Close'].ewm(span=20, adjust=False).mean()
   df4h['EMA50'] = df4h['Close'].ewm(span=50, adjust=False).mean()
+  df4h['EMA200'] = (
+      df4h['Close'].ewm(span=200, adjust=False).mean()
+  )  # فیلتر کلانِ روند برای جلوگیری از ورود در رِنج
 
   df4h['Mom_Short'] = (df4h['Close'] - df4h['Close'].shift(10)) / df4h[
       'Close'
@@ -100,7 +145,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
   processed_data[symbol] = df4h.set_index('Date')
 
-print('⚙️ شروع اجرای بک‌تست هوشمند HUNTER-V32...')
+print('⚙️ شروع اجرای بک‌تست هوشمند HUNTER-V33...')
 
 all_timestamps = set()
 for df in processed_data.values():
@@ -122,7 +167,9 @@ for ts in sorted_timestamps:
 
     if c4h['High'] > pos['highest_price']:
       pos['highest_price'] = c4h['High']
-      new_trailing_sl = pos['highest_price'] - (2.0 * c4h['ATR'])
+      new_trailing_sl = pos['highest_price'] - (
+          2.0 * c4h['ATR']
+      )  # تریلینگ استاپ استاندارد
       if new_trailing_sl > pos['stop_loss']:
         pos['stop_loss'] = new_trailing_sl
 
@@ -182,14 +229,19 @@ for ts in sorted_timestamps:
     if match_rows.empty:
       continue
     i = match_rows.index[0]
-    if i < 40:
-      continue
+    if i < 200:
+      continue  # نیاز به تاریخچه کافی برای EMA200
 
     c4h = df.iloc[i]
 
-    regime_bull = (c4h['Close'] > c4h['EMA20']) and (c4h['EMA20'] > c4h['EMA50'])
+    # فیلتر بسیار قدرتمندِ رژیم صعودی و جلوگیری از ورود در بازارهای اصلاحی/رِنج
+    regime_bull = (
+        (c4h['Close'] > c4h['EMA20'])
+        and (c4h['EMA20'] > c4h['EMA50'])
+        and (c4h['Close'] > c4h['EMA200'])
+    )
     valid_trend = (
-        regime_bull and (c4h['Mom_Short'] > 0.01) and (c4h['Mom_Long'] > 0.03)
+        regime_bull and (c4h['Mom_Short'] > 0.012) and (c4h['Mom_Long'] > 0.035)
     )
 
     if valid_trend:
@@ -209,7 +261,7 @@ for ts in sorted_timestamps:
         }
 
 print('\n============================================================')
-print('📊 گزارش نهایی HUNTER-V32 (Elite Cleaned CTA)')
+print('📊 گزارش نهایی HUNTER-V33 (Ultra-Clean & Low-Drawdown CTA)')
 print('============================================================')
 
 if all_trades:
