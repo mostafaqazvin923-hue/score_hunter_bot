@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V53 (Aggressive Streak Defense: Max Pos 3 & Strict CB)
+# HUNTER-V54 (V51 Core + Breakeven Lock for Streak Reduction)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -48,7 +48,7 @@ SYMBOLS = {k: v for k, v in SYMBOLS.items() if k not in REMOVED_COINS}
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
-MAX_POSITIONS = 3  # کاهش پوزیشن‌های همزمان برای ایمنی بیشتر
+MAX_POSITIONS = 5  # برگشت به حالت اصلی و بهینه
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 ATR_PERIOD = 14
@@ -57,20 +57,16 @@ INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
-# تنظیمات مدیریت سرمایه، مارجین و لورج
+# تنظیمات مالی اصلی و تایید شده
 INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
-
-# پارامترهای دفاعی جدید Circuit Breaker
-MAX_CONSECUTIVE_LOSSES_BEFORE_PAUSE = 1  # توقف حتی پس از اولین باخت
-CIRCUIT_BREAKER_COOLDOWN = 6       # ۶ کندل ۴ ساعته (۲۴ ساعت) استراحت
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V53")
+print("📥 دریافت داده‌ها - HUNTER-V54")
 print("=" * 60)
 
 processed_data = {}
@@ -160,7 +156,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V53...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V54...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -170,13 +166,7 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     
-    consecutive_losses = 0
-    cooldown_timer = 0
-    
     for ts in all_timestamps:
-        if cooldown_timer > 0:
-            cooldown_timer -= 1
-            
         symbols_to_close = []
         
         for symbol, pos in list(active_positions.items()):
@@ -185,6 +175,12 @@ def run_backtest(processed_data):
                 continue
             
             c4h = df.loc[ts]
+            
+            # بررسی مکانیزم Breakeven: اگر قیمت به 1R سود رسید، استاپ لاس را به قیمت ورود منتقل کن
+            if not pos["breakeven_locked"]:
+                if c4h["High"] >= pos["entry_price"] + pos["initial_risk"]:
+                    pos["stop_loss"] = pos["entry_price"]
+                    pos["breakeven_locked"] = True
             
             if c4h["High"] > pos["highest_price"]:
                 pos["highest_price"] = c4h["High"]
@@ -208,13 +204,6 @@ def run_backtest(processed_data):
                 
                 outcome = "WIN" if r_real > 0 else "LOSS"
                 
-                if outcome == "LOSS":
-                    consecutive_losses += 1
-                    if consecutive_losses >= MAX_CONSECUTIVE_LOSSES_BEFORE_PAUSE:
-                        cooldown_timer = CIRCUIT_BREAKER_COOLDOWN
-                else:
-                    consecutive_losses = 0
-                
                 position_notional = TRADE_MARGIN * LEVERAGE
                 price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
@@ -231,9 +220,6 @@ def run_backtest(processed_data):
         
         for sym in symbols_to_close:
             del active_positions[sym]
-        
-        if cooldown_timer > 0:
-            continue
         
         current_scores = {}
         for symbol, df in processed_data.items():
@@ -289,6 +275,7 @@ def run_backtest(processed_data):
                         "stop_loss": initial_sl,
                         "highest_price": entry_price,
                         "initial_risk": initial_risk,
+                        "breakeven_locked": False,
                         "entry_index": i,
                     }
                     
@@ -296,7 +283,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی دفاعی - HUNTER-V53")
+    print("📊 گزارش نهایی استراتژی با مکانیزم سر به سر - HUNTER-V54")
     print("=" * 68)
 
     if trades_df.empty:
@@ -334,17 +321,17 @@ def summarize_result(trades_df):
         loss_sequences.append(temp_loss_seq)
 
     print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
-    print(f"🔸 مارجین: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x | حداکثر پوزیشن همزمان: {MAX_POSITIONS}")
+    print(f"🔸 مارجین: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
     print(f"🔸 تعداد کل معاملات: {trades}")
     print(f"🔸 معاملات برنده (WIN): {wins} | بازنده (LOSS): {losses}")
     print(f"🎯 وین‌ریت کلی (Win Rate): {wr:.2f}%")
     print(f"💰 مجموع بازدهی خالص: {net_r:.2f}R")
     print(f"💵 مجموع سود/زیان دلاری خالص: ${total_dollar_pnl:,.2f}")
     print(f"🏦 سرمایه نهایی: ${final_capital:,.2f}")
-    print(f"❄️ حداکثر ضررهای متوالی جدید: {max_losses}")
+    print(f"❄️ حداکثر ضررهای متوالی: {max_losses}")
 
     print("\n------------------------------------------------------------")
-    print("📉 لیست کامل زنجیره‌های ضرر متوالی جدید:")
+    print("📉 لیست کامل زنجیره‌های ضرر متوالی:")
     print("------------------------------------------------------------")
     if loss_sequences:
         print(", ".join(map(str, loss_sequences)))
@@ -354,4 +341,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V53 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V54 به پایان رسید.")
