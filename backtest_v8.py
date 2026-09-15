@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 (Golden Core + Market Breadth Shield)
+# HUNTER-V75 (Golden Core + Breadth Shield + Streak Breaker)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -56,6 +56,7 @@ TRAILING_ATR_MULTIPLIER = 2.0
 INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
+MAX_ALLOWED_CONSECUTIVE_LOSSES = 4  # مدارشکن: توقف موقت پس از ۴ باخت متوالی
 
 # تنظیمات مالی
 INITIAL_CAPITAL = 1000.0
@@ -66,7 +67,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V74 (هسته طلایی + سپر حفاظتی سبد)")
+print("📥 دریافت داده‌ها - HUNTER-V75 (مدارشکن زنجیره ضرر)")
 print("=" * 60)
 
 processed_data = {}
@@ -156,7 +157,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V74...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V75...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -165,6 +166,7 @@ def run_backtest(processed_data):
     
     active_positions = {}
     all_trades = []
+    current_consecutive_losses = 0
     
     for ts in all_timestamps:
         symbols_to_close = []
@@ -207,6 +209,13 @@ def run_backtest(processed_data):
                     price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
                 
                 outcome = "WIN" if r_real > 0 else "LOSS"
+                
+                # بروزرسانی شمارنده باخت‌های متوالی برای مدارشکن
+                if outcome == "LOSS":
+                    current_consecutive_losses += 1
+                else:
+                    current_consecutive_losses = 0
+
                 position_notional = TRADE_MARGIN * LEVERAGE
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
                 
@@ -224,13 +233,15 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
         
+        # مدارشکن: اگر تعداد باخت‌های متوالی به سقف مجاز رسید، ورودهای جدید تا زمان برد بعدی متوقف می‌شود
+        if current_consecutive_losses >= MAX_ALLOWED_CONSECUTIVE_LOSSES:
+            continue
+
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
             btc_c = processed_data["BTC"].loc[ts]
             market_bull = btc_c["Close"] > btc_c["EMA200"]
         
-        # محاسبه میزان سلامت و پهنای بازار (Market Breadth)
-        # بررسی اینکه چند درصد از نمادها بالای EMA200 خود قرار دارند
         bullish_count = 0
         total_active_syms = 0
         for symbol, df in processed_data.items():
@@ -240,8 +251,6 @@ def run_backtest(processed_data):
                     bullish_count += 1
         
         market_breadth_ratio = (bullish_count / total_active_syms) if total_active_syms > 0 else 0.5
-        
-        # اگر بازار از نظر پهنای کلی شکننده است (مثلاً کمتر از 35 درصد بازار صعودی است)، اجازه باز کردن لانگ جدید داده نمی‌شود
         allow_longs = market_breadth_ratio >= 0.35
         allow_shorts = market_breadth_ratio <= 0.65
 
@@ -312,7 +321,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با سپر حفاظتی سبد - HUNTER-V74")
+    print("📊 گزارش نهایی استراتژی با مدارشکن زنجیره - HUNTER-V75")
     print("=" * 68)
 
     if trades_df.empty:
@@ -384,4 +393,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V74 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V75 به پایان رسید.")
