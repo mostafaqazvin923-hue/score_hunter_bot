@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V66 (Global Portfolio Circuit Breaker + Elite Short Engine)
+# HUNTER-V67 (Core Stable Strategy + Structural Pullback Filter)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -53,8 +53,7 @@ SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 ATR_PERIOD = 14
 TRAILING_ATR_MULTIPLIER = 2.0
-INITIAL_ATR_MULTIPLIER_LONG = 1.8
-INITIAL_ATR_MULTIPLIER_SHORT = 1.6  # فشرده‌تر کردن استاپ شورت برای افزایش وین‌ریت
+INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
@@ -67,7 +66,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V66 (مدارشکن سراسری پورتفو)")
+print("📥 دریافت داده‌ها - HUNTER-V67 (هسته پایدار + فیلتر پولبک ساختاری)")
 print("=" * 60)
 
 processed_data = {}
@@ -157,7 +156,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V66...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V67...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -167,15 +166,7 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     
-    # متغیرهای مدارشکن سراسری پورتفو
-    global_loss_streak = 0
-    global_cooldown_counter = 0
-    
     for ts in all_timestamps:
-        # کاهش تایمر مدارشکن سراسری در هر کندل جدید
-        if global_cooldown_counter > 0:
-            global_cooldown_counter -= 1
-
         symbols_to_close = []
         
         for symbol, pos in list(active_positions.items()):
@@ -219,14 +210,6 @@ def run_backtest(processed_data):
                 position_notional = TRADE_MARGIN * LEVERAGE
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
                 
-                # بروزرسانی مدارشکن سراسری پورتفو
-                if outcome == "LOSS":
-                    global_loss_streak += 1
-                    if global_loss_streak >= 2:
-                        global_cooldown_counter = 2  # ۲ کندل (۸ ساعت) تعطیلی کامل کل ربات در سراسر پورتفو
-                else:
-                    global_loss_streak = 0
-
                 all_trades.append({
                     "Timestamp": ts,
                     "Symbol": symbol,
@@ -240,10 +223,6 @@ def run_backtest(processed_data):
         
         for sym in symbols_to_close:
             del active_positions[sym]
-        
-        # اگر مدارشکن سراسری فعال باشد، هیچ پوزیشن جدیدی باز نکن
-        if global_cooldown_counter > 0:
-            continue
         
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -275,26 +254,28 @@ def run_backtest(processed_data):
                 continue
             
             i = df.index.get_loc(ts)
-            if i < EMA_WARMUP:
+            if i < EMA_WARMUP + 1:
                 continue
             
             c4h = df.iloc[i]
+            prev_c = df.iloc[i - 1]
             
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"]) and (c4h["EMA20"] > c4h["EMA50"]) and (c4h["Close"] > c4h["EMA200"])
-                valid_signal = regime_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
+                # فیلتر پولبک ساختاری: قیمت در کندل قبل به EMA20 نزدیک شده بود (Low به EMA20 نزدیک بوده) و الان برمی‌گردد بالا
+                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
                 side = "LONG"
-                atr_mult = INITIAL_ATR_MULTIPLIER_LONG
             else:
-                # شرایط فوق‌العاده سخت‌گیرانه شورت برای تضمین وین‌ریت بالای ۶۰٪
                 regime_ok = (c4h["Close"] < c4h["EMA20"]) and (c4h["EMA20"] < c4h["EMA50"]) and (c4h["Close"] < c4h["EMA200"])
-                valid_signal = regime_ok and (c4h["Mom_Short"] < -0.018) and (c4h["Mom_Long"] < -0.045)
+                # پولبک برای شورت: قیمت در کندل قبل بالا آمده و به EMA20 نزدیک شده بود و الان ریجکت شده
+                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
                 side = "SHORT"
-                atr_mult = INITIAL_ATR_MULTIPLIER_SHORT
             
             if valid_signal:
                 entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
-                initial_sl = (entry_price - atr_mult * c4h["ATR"]) if side == "LONG" else (entry_price + atr_mult * c4h["ATR"])
+                initial_sl = (entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"]) if side == "LONG" else (entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"])
                 initial_risk = abs(entry_price - initial_sl)
                 sl_dist_pct = initial_risk / entry_price
                 
@@ -313,7 +294,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با مدارشکن سراسری و شورت Elite - HUNTER-V66")
+    print("📊 گزارش نهایی استراتژی با فیلتر پولبک ساختاری - HUNTER-V67")
     print("=" * 68)
 
     if trades_df.empty:
@@ -385,4 +366,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V66 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V67 به پایان رسید.")
