@@ -19,7 +19,8 @@
 import sys
 import time
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
 
 # ============================================================
 # DEPENDENCIES
@@ -78,6 +79,7 @@ TRAILING_ATR_MULTIPLIER = 2.0
 
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
+
 
 # ============================================================
 # V77 FILTERS
@@ -148,7 +150,6 @@ def fetch_ohlcv_full(symbol, timeframe, since_ms, until_ms):
     rows_all = []
 
     limit = 1000
-    current_since = since_ms
 
     for attempt in range(3):
 
@@ -163,7 +164,7 @@ def fetch_ohlcv_full(symbol, timeframe, since_ms, until_ms):
                     symbol,
                     timeframe=timeframe,
                     since=current_since,
-                    limit=limit
+                    limit=limit,
                 )
 
                 if not rows:
@@ -241,14 +242,9 @@ def fetch_ohlcv_full(symbol, timeframe, since_ms, until_ms):
             * 1000
         )
 
-        candle_ms = (
-            4 * 60 * 60 * 1000
-        )
+        candle_ms = 4 * 60 * 60 * 1000
 
-        if (
-            last_ms + candle_ms
-            > now_ms
-        ):
+        if last_ms + candle_ms > now_ms:
 
             df = df.iloc[:-1]
 
@@ -297,12 +293,15 @@ def add_indicators(df):
 
     df = df.copy()
 
+    # --------------------------------------------------------
     # EMA
+    # --------------------------------------------------------
+
     df["EMA20"] = (
         df["Close"]
         .ewm(
             span=20,
-            adjust=False
+            adjust=False,
         )
         .mean()
     )
@@ -311,7 +310,7 @@ def add_indicators(df):
         df["Close"]
         .ewm(
             span=50,
-            adjust=False
+            adjust=False,
         )
         .mean()
     )
@@ -320,12 +319,15 @@ def add_indicators(df):
         df["Close"]
         .ewm(
             span=200,
-            adjust=False
+            adjust=False,
         )
         .mean()
     )
 
+    # --------------------------------------------------------
     # ATR
+    # --------------------------------------------------------
+
     previous_close = (
         df["Close"].shift(1)
     )
@@ -347,7 +349,7 @@ def add_indicators(df):
 
     df["TR"] = pd.concat(
         [tr1, tr2, tr3],
-        axis=1
+        axis=1,
     ).max(axis=1)
 
     df["ATR"] = (
@@ -358,7 +360,10 @@ def add_indicators(df):
         .mean()
     )
 
+    # --------------------------------------------------------
     # Momentum
+    # --------------------------------------------------------
+
     df["Mom_Short"] = (
         df["Close"] /
         df["Close"].shift(10)
@@ -371,13 +376,19 @@ def add_indicators(df):
         - 1.0
     )
 
+    # --------------------------------------------------------
     # ATR percentage
+    # --------------------------------------------------------
+
     df["ATR_Pct"] = (
         df["ATR"] /
         df["Close"]
     )
 
+    # --------------------------------------------------------
     # Previous values
+    # --------------------------------------------------------
+
     df["Prev_Low"] = (
         df["Low"].shift(1)
     )
@@ -403,7 +414,12 @@ print("=" * 70)
 print(VERSION)
 print("=" * 70)
 
-end_time = datetime.utcnow()
+# UTC-aware datetime
+end_time = datetime.now(
+    timezone.utc
+).replace(
+    tzinfo=None
+)
 
 start_time = (
     end_time -
@@ -435,18 +451,17 @@ for name, symbol in SYMBOLS.items():
             symbol,
             TIMEFRAME,
             since_ms,
-            until_ms
+            until_ms,
         )
 
         if (
             df is None
-            or len(df) <
-            EMA_WARMUP + 50
+            or len(df) < EMA_WARMUP + 50
         ):
 
             print(
-                f"  INVALID: "
-                f"insufficient candles"
+                "  INVALID: "
+                "insufficient candles"
             )
 
             continue
@@ -456,7 +471,7 @@ for name, symbol in SYMBOLS.items():
         if len(df) < EMA_WARMUP:
 
             print(
-                f"  INVALID after indicators"
+                "  INVALID after indicators"
             )
 
             continue
@@ -476,6 +491,7 @@ for name, symbol in SYMBOLS.items():
 
 
 print()
+
 print(
     f"{len(valid_symbols)}/"
     f"{len(SYMBOLS)} valid symbols"
@@ -504,7 +520,6 @@ ALL_TIMESTAMPS = sorted(
         ]
     )
 )
-
 
 BTC = DATA["BTC"]
 
@@ -565,17 +580,9 @@ def calculate_equity():
 
     for position in open_positions:
 
-        current = position[
-            "last_price"
-        ]
-
-        entry = position[
-            "entry"
-        ]
-
-        qty = position[
-            "qty"
-        ]
+        current = position["last_price"]
+        entry = position["entry"]
+        qty = position["qty"]
 
         if position["side"] == "LONG":
 
@@ -648,7 +655,7 @@ def close_position(
 
     capital += pnl
 
-    sl_dist_pct = (
+    sl_dist_pct = float(
         position[
             "initial_sl_distance_pct"
         ]
@@ -678,18 +685,42 @@ def close_position(
     closed_trades.append({
 
         "Timestamp": timestamp,
-        "Symbol": position["name"],
-        "Side": side,
-        "Entry": entry,
-        "Exit": exit_price,
-        "Qty": qty,
-        "Margin": margin,
-        "Notional": notional,
-        "RawPnL": raw_pnl,
-        "Fees": total_fee,
-        "PnL": pnl,
-        "R": real_r,
-        "Reason": reason,
+
+        "Symbol":
+            position["name"],
+
+        "Side":
+            side,
+
+        "Entry":
+            entry,
+
+        "Exit":
+            exit_price,
+
+        "Qty":
+            qty,
+
+        "Margin":
+            margin,
+
+        "Notional":
+            notional,
+
+        "RawPnL":
+            raw_pnl,
+
+        "Fees":
+            total_fee,
+
+        "PnL":
+            pnl,
+
+        "R":
+            real_r,
+
+        "Reason":
+            reason,
 
         "EntryATR":
             position["entry_atr"],
@@ -746,17 +777,14 @@ for timestamp in ALL_TIMESTAMPS:
         side = position["side"]
 
         # ----------------------------------------------------
-        # Check OLD stop first
+        # OLD STOP FIRST
         # ----------------------------------------------------
 
         old_stop = position["stop"]
 
         if side == "LONG":
 
-            if (
-                candle["Low"]
-                <= old_stop
-            ):
+            if candle["Low"] <= old_stop:
 
                 exit_price = (
                     old_stop *
@@ -767,7 +795,7 @@ for timestamp in ALL_TIMESTAMPS:
                     (
                         position,
                         exit_price,
-                        "STOP"
+                        "STOP",
                     )
                 )
 
@@ -775,10 +803,7 @@ for timestamp in ALL_TIMESTAMPS:
 
         else:
 
-            if (
-                candle["High"]
-                >= old_stop
-            ):
+            if candle["High"] >= old_stop:
 
                 exit_price = (
                     old_stop *
@@ -789,14 +814,14 @@ for timestamp in ALL_TIMESTAMPS:
                     (
                         position,
                         exit_price,
-                        "STOP"
+                        "STOP",
                     )
                 )
 
                 continue
 
         # ----------------------------------------------------
-        # Timeout
+        # TIMEOUT
         # ----------------------------------------------------
 
         if (
@@ -808,14 +833,14 @@ for timestamp in ALL_TIMESTAMPS:
                 (
                     position,
                     float(candle["Close"]),
-                    "TIMEOUT"
+                    "TIMEOUT",
                 )
             )
 
             continue
 
         # ----------------------------------------------------
-        # Trailing update
+        # TRAILING UPDATE
         # ----------------------------------------------------
 
         atr = float(
@@ -833,9 +858,7 @@ for timestamp in ALL_TIMESTAMPS:
 
             if new_stop > position["stop"]:
 
-                position["stop"] = (
-                    new_stop
-                )
+                position["stop"] = new_stop
 
         else:
 
@@ -848,12 +871,10 @@ for timestamp in ALL_TIMESTAMPS:
 
             if new_stop < position["stop"]:
 
-                position["stop"] = (
-                    new_stop
-                )
+                position["stop"] = new_stop
 
     # --------------------------------------------------------
-    # Close positions
+    # CLOSE POSITIONS
     # --------------------------------------------------------
 
     for (
@@ -869,13 +890,12 @@ for timestamp in ALL_TIMESTAMPS:
             position,
             exit_price,
             timestamp,
-            reason
+            reason,
         )
 
         open_positions.remove(
             position
         )
-
 
     # ========================================================
     # BTC
@@ -920,7 +940,6 @@ for timestamp in ALL_TIMESTAMPS:
         btc_mom_long < 0
     )
 
-
     # ========================================================
     # BREADTH
     # ========================================================
@@ -957,21 +976,17 @@ for timestamp in ALL_TIMESTAMPS:
 
         breadth = 0.5
 
-
     allow_longs = (
         btc_bull
         and
-        breadth >=
-        LONG_BREADTH_MIN
+        breadth >= LONG_BREADTH_MIN
     )
 
     allow_shorts = (
         btc_bear
         and
-        breadth <=
-        SHORT_BREADTH_MAX
+        breadth <= SHORT_BREADTH_MAX
     )
-
 
     # ========================================================
     # CANDIDATES
@@ -1053,7 +1068,6 @@ for timestamp in ALL_TIMESTAMPS:
             btc_mom_long
         )
 
-
         # ====================================================
         # LONG
         # ====================================================
@@ -1097,11 +1111,9 @@ for timestamp in ALL_TIMESTAMPS:
             ] += 1
 
         elif not (
-            mom_long >
-            MOM_LONG_LONG_MIN
+            mom_long > MOM_LONG_LONG_MIN
             and
-            mom_long <
-            MAX_MOM
+            mom_long < MAX_MOM
         ):
 
             long_ok = False
@@ -1172,23 +1184,42 @@ for timestamp in ALL_TIMESTAMPS:
 
                 long_candidates.append({
 
-                    "name": name,
-                    "side": "LONG",
-                    "score": float(mom_long),
-                    "atr": atr,
-                    "atr_pct": atr_pct,
-                    "mom_short": mom_short,
-                    "mom_long": mom_long,
+                    "name":
+                        name,
+
+                    "side":
+                        "LONG",
+
+                    "score":
+                        float(mom_long),
+
+                    "atr":
+                        atr,
+
+                    "atr_pct":
+                        atr_pct,
+
+                    "mom_short":
+                        mom_short,
+
+                    "mom_long":
+                        mom_long,
+
                     "relative_momentum":
                         relative_momentum,
-                    "breadth": breadth,
+
+                    "breadth":
+                        breadth,
+
                     "btc_mom_long":
                         btc_mom_long,
-                    "stop": stop,
+
+                    "stop":
+                        stop,
+
                     "sl_distance_pct":
                         sl_distance_pct,
                 })
-
 
         # ====================================================
         # SHORT
@@ -1233,11 +1264,9 @@ for timestamp in ALL_TIMESTAMPS:
             ] += 1
 
         elif not (
-            mom_long <
-            MOM_LONG_SHORT_MAX
+            mom_long < MOM_LONG_SHORT_MAX
             and
-            mom_long >
-            -MAX_MOM
+            mom_long > -MAX_MOM
         ):
 
             short_ok = False
@@ -1308,23 +1337,42 @@ for timestamp in ALL_TIMESTAMPS:
 
                 short_candidates.append({
 
-                    "name": name,
-                    "side": "SHORT",
-                    "score": float(-mom_long),
-                    "atr": atr,
-                    "atr_pct": atr_pct,
-                    "mom_short": mom_short,
-                    "mom_long": mom_long,
+                    "name":
+                        name,
+
+                    "side":
+                        "SHORT",
+
+                    "score":
+                        float(-mom_long),
+
+                    "atr":
+                        atr,
+
+                    "atr_pct":
+                        atr_pct,
+
+                    "mom_short":
+                        mom_short,
+
+                    "mom_long":
+                        mom_long,
+
                     "relative_momentum":
                         relative_momentum,
-                    "breadth": breadth,
+
+                    "breadth":
+                        breadth,
+
                     "btc_mom_long":
                         btc_mom_long,
-                    "stop": stop,
+
+                    "stop":
+                        stop,
+
                     "sl_distance_pct":
                         sl_distance_pct,
                 })
-
 
     # ========================================================
     # RANK
@@ -1334,16 +1382,15 @@ for timestamp in ALL_TIMESTAMPS:
         key=lambda item: float(
             item["score"]
         ),
-        reverse=True
+        reverse=True,
     )
 
     short_candidates.sort(
         key=lambda item: float(
             item["score"]
         ),
-        reverse=True
+        reverse=True,
     )
-
 
     # ========================================================
     # ENTRY
@@ -1353,7 +1400,6 @@ for timestamp in ALL_TIMESTAMPS:
         MAX_POSITIONS -
         len(open_positions)
     )
-
 
     # --------------------------------------------------------
     # LONG
@@ -1412,7 +1458,6 @@ for timestamp in ALL_TIMESTAMPS:
                 sl_distance_pct <=
                 0.04
             ):
-
                 continue
 
             margin = TRADE_MARGIN
@@ -1477,9 +1522,7 @@ for timestamp in ALL_TIMESTAMPS:
                     ],
 
                 "entry_breadth":
-                    candidate[
-                        "breadth"
-                    ],
+                    candidate["breadth"],
 
                 "entry_btc_mom_long":
                     candidate[
@@ -1496,7 +1539,6 @@ for timestamp in ALL_TIMESTAMPS:
             filter_stats[
                 "accepted"
             ] += 1
-
 
     # --------------------------------------------------------
     # SHORT
@@ -1555,7 +1597,6 @@ for timestamp in ALL_TIMESTAMPS:
                 sl_distance_pct <=
                 0.04
             ):
-
                 continue
 
             margin = TRADE_MARGIN
@@ -1620,9 +1661,7 @@ for timestamp in ALL_TIMESTAMPS:
                     ],
 
                 "entry_breadth":
-                    candidate[
-                        "breadth"
-                    ],
+                    candidate["breadth"],
 
                 "entry_btc_mom_long":
                     candidate[
@@ -1639,7 +1678,6 @@ for timestamp in ALL_TIMESTAMPS:
             filter_stats[
                 "accepted"
             ] += 1
-
 
     # ========================================================
     # EQUITY
@@ -1724,7 +1762,7 @@ if open_positions:
             position,
             final_price,
             final_timestamp,
-            "END"
+            "END",
         )
 
         open_positions.remove(
@@ -1746,6 +1784,7 @@ if trades_df.empty:
     print("=" * 70)
     print("NO TRADES")
     print("=" * 70)
+
     sys.exit(0)
 
 
@@ -1786,6 +1825,17 @@ final_capital = (
     INITIAL_CAPITAL +
     net_pnl
 )
+
+# ------------------------------------------------------------
+# IMPORTANT:
+# Calculate Return separately.
+# This avoids invalid multi-line f-string syntax.
+# ------------------------------------------------------------
+
+return_pct = (
+    (final_capital / INITIAL_CAPITAL)
+    - 1.0
+) * 100.0
 
 
 # ============================================================
@@ -1895,13 +1945,12 @@ if not equity_df.empty:
     equity_df["DrawdownPct"] = (
         np.where(
             equity_df["Peak"] != 0,
-            equity_df[
-                "DrawdownDollar"
-            ]
+            equity_df["DrawdownDollar"]
             /
             equity_df["Peak"]
-            * 100,
-            0
+            *
+            100,
+            0,
         )
     )
 
@@ -1929,7 +1978,7 @@ else:
 
 def get_direction_stats(
     df,
-    side
+    side,
 ):
 
     subset = df[
@@ -1957,6 +2006,7 @@ def get_direction_stats(
     ]
 
     return {
+
         "Trades":
             len(subset),
 
@@ -1992,12 +2042,12 @@ def get_direction_stats(
 
 long_stats = get_direction_stats(
     trades_df,
-    "LONG"
+    "LONG",
 )
 
 short_stats = get_direction_stats(
     trades_df,
-    "SHORT"
+    "SHORT",
 )
 
 
@@ -2039,7 +2089,6 @@ for name in valid_symbols:
 
         continue
 
-
     symbol_wins = subset[
         subset["PnL"] > 0
     ]
@@ -2047,7 +2096,6 @@ for name in valid_symbols:
     symbol_losses = subset[
         subset["PnL"] <= 0
     ]
-
 
     # --------------------------------------------------------
     # Symbol loss streak
@@ -2064,13 +2112,12 @@ for name in valid_symbols:
 
             max_symbol_streak = max(
                 max_symbol_streak,
-                current_symbol_streak
+                current_symbol_streak,
             )
 
         else:
 
             current_symbol_streak = 0
-
 
     # --------------------------------------------------------
     # Long
@@ -2103,7 +2150,6 @@ for name in valid_symbols:
         long_wr = 0.0
         long_pnl = 0.0
 
-
     # --------------------------------------------------------
     # Short
     # --------------------------------------------------------
@@ -2134,7 +2180,6 @@ for name in valid_symbols:
 
         short_wr = 0.0
         short_pnl = 0.0
-
 
     symbol_rows.append({
 
@@ -2216,7 +2261,7 @@ symbol_df = pd.DataFrame(
 
 symbol_df = symbol_df.sort_values(
     "PnL",
-    ascending=False
+    ascending=False,
 )
 
 
@@ -2229,14 +2274,18 @@ exit_df = (
     .groupby("Reason")
     .agg(
         Trades=("PnL", "count"),
+
         Wins=(
             "PnL",
             lambda x: int(
                 (x > 0).sum()
-            )
+            ),
         ),
+
         PnL=("PnL", "sum"),
+
         NetR=("R", "sum"),
+
         AvgR=("R", "mean"),
     )
     .reset_index()
@@ -2247,8 +2296,9 @@ exit_df["WinRate"] = np.where(
     exit_df["Wins"]
     /
     exit_df["Trades"]
-    * 100,
-    0.0
+    *
+    100,
+    0.0,
 )
 
 
@@ -2303,11 +2353,7 @@ print(
 
 print(
     f"Return        : "
-    f"{(
-        final_capital /
-        INITIAL_CAPITAL
-        - 1
-    ) * 100:.2f}%"
+    f"{return_pct:.2f}%"
 )
 
 print(
@@ -2375,7 +2421,9 @@ if streak_counts:
 
 else:
 
-    print("No loss streaks.")
+    print(
+        "No loss streaks."
+    )
 
 
 # ============================================================
@@ -2562,6 +2610,7 @@ for threshold in [
     ]
 
     print()
+
     print(
         f"Below {threshold}% WR "
         f"(minimum 5 trades):"
@@ -2569,7 +2618,9 @@ for threshold in [
 
     if weak.empty:
 
-        print("  None")
+        print(
+            "  None"
+        )
 
     else:
 
@@ -2595,7 +2646,7 @@ for _, row in (
     symbol_df
     .sort_values(
         "PnL",
-        ascending=False
+        ascending=False,
     )
     .head(10)
     .iterrows()
@@ -2622,7 +2673,7 @@ for _, row in (
     symbol_df
     .sort_values(
         "PnL",
-        ascending=True
+        ascending=True,
     )
     .head(10)
     .iterrows()
@@ -2642,27 +2693,27 @@ for _, row in (
 
 trades_df.to_csv(
     "hunter_v77_trades.csv",
-    index=False
+    index=False,
 )
 
 symbol_df.to_csv(
     "hunter_v77_symbols.csv",
-    index=False
+    index=False,
 )
 
 streak_df.to_csv(
     "hunter_v77_loss_streaks.csv",
-    index=False
+    index=False,
 )
 
 exit_df.to_csv(
     "hunter_v77_exit_stats.csv",
-    index=False
+    index=False,
 )
 
 equity_df.to_csv(
     "hunter_v77_equity.csv",
-    index=False
+    index=False,
 )
 
 filter_df = pd.DataFrame(
@@ -2678,7 +2729,7 @@ filter_df = pd.DataFrame(
 
 filter_df.to_csv(
     "hunter_v77_filter_diagnostics.csv",
-    index=False
+    index=False,
 )
 
 
