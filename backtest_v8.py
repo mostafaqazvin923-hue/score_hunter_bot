@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V62 (Institutional Adaptive Volatility & Regime Filter)
+# HUNTER-V63 (Smart Long/Short Regime Switch + Detailed Metrics)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -66,7 +66,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V62 (فیلتر رژیم تطبیقی پیشرفته)")
+print("📥 دریافت داده‌ها - HUNTER-V63 (لانگ/شورت هوشمند با گزارش تفکیکی)")
 print("=" * 60)
 
 processed_data = {}
@@ -139,10 +139,6 @@ def fetch_symbol_data(lbank_symbol):
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
-    
-    # شاخص انحراف نوسان (Volatility Ratio) برای تشخیص فازهای رِنج مخرب
-    df["ATR_SMA"] = df["ATR"].rolling(50).mean()
-    df["Vol_Ratio"] = df["ATR"] / df["ATR_SMA"]
 
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
@@ -160,7 +156,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V62...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V63...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -180,35 +176,44 @@ def run_backtest(processed_data):
             
             c4h = df.loc[ts]
             
-            if c4h["High"] > pos["highest_price"]:
-                pos["highest_price"] = c4h["High"]
-                new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
-                if new_trailing_sl > pos["stop_loss"]:
-                    pos["stop_loss"] = new_trailing_sl
+            if pos["side"] == "LONG":
+                if c4h["High"] > pos["highest_price"]:
+                    pos["highest_price"] = c4h["High"]
+                    new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
+                    if new_trailing_sl > pos["stop_loss"]:
+                        pos["stop_loss"] = new_trailing_sl
+                hit_sl = c4h["Low"] <= pos["stop_loss"]
+            else: # SHORT
+                if c4h["Low"] < pos["lowest_price"]:
+                    pos["lowest_price"] = c4h["Low"]
+                    new_trailing_sl = pos["lowest_price"] + TRAILING_ATR_MULTIPLIER * c4h["ATR"]
+                    if new_trailing_sl < pos["stop_loss"]:
+                        pos["stop_loss"] = new_trailing_sl
+                hit_sl = c4h["High"] >= pos["stop_loss"]
             
-            hit_sl = c4h["Low"] <= pos["stop_loss"]
             curr_i = df.index.get_loc(ts)
             candles_held = curr_i - pos["entry_index"]
             is_timeout = candles_held >= TIMEOUT_CANDLES
             
             if hit_sl or is_timeout:
                 initial_risk = pos["initial_risk"]
-                exit_p = min(pos["stop_loss"], c4h["Open"]) if hit_sl else c4h["Close"]
-                
-                r_real = (
-                    (exit_p - pos["entry_price"]) / initial_risk
-                    - (FEE_RATE * 2)
-                )
+                if pos["side"] == "LONG":
+                    exit_p = min(pos["stop_loss"], c4h["Open"]) if hit_sl else c4h["Close"]
+                    r_real = ((exit_p - pos["entry_price"]) / initial_risk) - (FEE_RATE * 2)
+                    price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
+                else: # SHORT
+                    exit_p = max(pos["stop_loss"], c4h["Open"]) if hit_sl else c4h["Close"]
+                    r_real = ((pos["entry_price"] - exit_p) / initial_risk) - (FEE_RATE * 2)
+                    price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
                 
                 outcome = "WIN" if r_real > 0 else "LOSS"
-                
                 position_notional = TRADE_MARGIN * LEVERAGE
-                price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
                 
                 all_trades.append({
                     "Timestamp": ts,
                     "Symbol": symbol,
+                    "Side": pos["side"],
                     "Outcome": outcome,
                     "Return": r_real,
                     "Dollar_PnL": dollar_pnl,
@@ -218,6 +223,12 @@ def run_backtest(processed_data):
         
         for sym in symbols_to_close:
             del active_positions[sym]
+        
+        # تعیین رژیم کلی بازار در این کندل (بر اساس شاخص لیدر مثل BTC یا میانگین بازار)
+        market_bull = True
+        if "BTC" in processed_data and ts in processed_data["BTC"].index:
+            btc_c = processed_data["BTC"].loc[ts]
+            market_bull = btc_c["Close"] > btc_c["EMA200"]
         
         current_scores = {}
         for symbol, df in processed_data.items():
@@ -229,8 +240,9 @@ def run_backtest(processed_data):
         if not current_scores:
             continue
         
+        # اگر بازار صعودی باشد سیگنال لانگ، اگر نزولی باشد سیگنال شورت برعکس مرتب می‌شود
         ranked_symbols = sorted(
-            current_scores.keys(), key=lambda x: current_scores[x], reverse=True
+            current_scores.keys(), key=lambda x: current_scores[x], reverse=market_bull
         )
         
         for symbol in ranked_symbols:
@@ -249,35 +261,28 @@ def run_backtest(processed_data):
             
             c4h = df.iloc[i]
             
-            # فیلتر رژیم تطبیقی: حذف بازارهای بیش از حد متلاطم یا کاملاً فشرده (جلوگیری از فیک‌اوت)
-            vol_ratio = c4h["Vol_Ratio"]
-            if np.isnan(vol_ratio) or vol_ratio < 0.65 or vol_ratio > 2.2:
-                continue
-
-            regime_bull = (
-                (c4h["Close"] > c4h["EMA20"])
-                and (c4h["EMA20"] > c4h["EMA50"])
-                and (c4h["Close"] > c4h["EMA200"])
-            )
+            if market_bull:
+                regime_ok = (c4h["Close"] > c4h["EMA20"]) and (c4h["EMA20"] > c4h["EMA50"]) and (c4h["Close"] > c4h["EMA200"])
+                valid_signal = regime_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
+                side = "LONG"
+            else:
+                regime_ok = (c4h["Close"] < c4h["EMA20"]) and (c4h["EMA20"] < c4h["EMA50"]) and (c4h["Close"] < c4h["EMA200"])
+                valid_signal = regime_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
+                side = "SHORT"
             
-            valid_trend = (
-                regime_bull
-                and (c4h["Mom_Short"] > 0.012)
-                and (c4h["Mom_Long"] > 0.035)
-            )
-            
-            if valid_trend:
-                entry_price = c4h["Open"] * (1 + SLIPPAGE)
-                initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"]
-                initial_risk = entry_price - initial_sl
+            if valid_signal:
+                entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
+                initial_sl = (entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"]) if side == "LONG" else (entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"])
+                initial_risk = abs(entry_price - initial_sl)
                 sl_dist_pct = initial_risk / entry_price
                 
                 if 0.01 <= sl_dist_pct <= 0.04:
                     active_positions[symbol] = {
-                        "side": "LONG",
+                        "side": side,
                         "entry_price": entry_price,
                         "stop_loss": initial_sl,
                         "highest_price": entry_price,
+                        "lowest_price": entry_price,
                         "initial_risk": initial_risk,
                         "entry_index": i,
                     }
@@ -286,7 +291,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با فیلتر رژیم نوسانی تطبیقی - HUNTER-V62")
+    print("📊 گزارش نهایی استراتژی هوشمند لانگ/شورت - HUNTER-V63")
     print("=" * 68)
 
     if trades_df.empty:
@@ -295,14 +300,28 @@ def summarize_result(trades_df):
 
     trades_df = trades_df.sort_values(["Timestamp", "ExitOrder"], kind="stable").reset_index(drop=True)
 
+    total_trades = len(trades_df)
     wins = int((trades_df["Outcome"] == "WIN").sum())
     losses = int((trades_df["Outcome"] == "LOSS").sum())
-    trades = len(trades_df)
-    wr = (wins / trades * 100) if trades > 0 else 0
+    wr = (wins / total_trades * 100) if total_trades > 0 else 0
     net_r = float(trades_df["Return"].sum())
     
     total_dollar_pnl = float(trades_df["Dollar_PnL"].sum())
     final_capital = INITIAL_CAPITAL + total_dollar_pnl
+
+    # تفکیک لانگ و شورت
+    longs_df = trades_df[trades_df["Side"] == "LONG"]
+    shorts_df = trades_df[trades_df["Side"] == "SHORT"]
+
+    long_total = len(longs_df)
+    long_wins = int((longs_df["Outcome"] == "WIN").sum()) if long_total > 0 else 0
+    long_losses = int((longs_df["Outcome"] == "LOSS").sum()) if long_total > 0 else 0
+    long_wr = (long_wins / long_total * 100) if long_total > 0 else 0
+
+    short_total = len(shorts_df)
+    short_wins = int((shorts_df["Outcome"] == "WIN").sum()) if short_total > 0 else 0
+    short_losses = int((shorts_df["Outcome"] == "LOSS").sum()) if short_total > 0 else 0
+    short_wr = (short_wins / short_total * 100) if short_total > 0 else 0
 
     max_losses = 0
     current_losses = 0
@@ -325,13 +344,14 @@ def summarize_result(trades_df):
 
     print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
     print(f"🔸 مارجین: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
-    print(f"🔸 تعداد کل معاملات: {trades}")
-    print(f"🔸 معاملات برنده (WIN): {wins} | بازنده (LOSS): {losses}")
-    print(f"🎯 وین‌ریت کلی (Win Rate): {wr:.2f}%")
+    print(f"🔸 تعداد کل معاملات: {total_trades}")
+    print(f"   🔹 معاملات لانگ: کل = {long_total} | برنده = {long_wins} | بازنده (استاپ خورده) = {long_losses} | وین‌ریت = {long_wr:.2f}%")
+    print(f"   🔸 معاملات شورت: کل = {short_total} | برنده = {short_wins} | بازنده (استاپ خورده) = {short_losses} | وین‌ریت = {short_wr:.2f}%")
+    print(f"🎯 وین‌ریت کلی کل سبد: {wr:.2f}%")
     print(f"💰 مجموع بازدهی خالص: {net_r:.2f}R")
     print(f"💵 مجموع سود/زیان دلاری خالص: ${total_dollar_pnl:,.2f}")
     print(f"🏦 سرمایه نهایی: ${final_capital:,.2f}")
-    print(f"❄️ حداکثر ضررهای متوالی: {max_losses}")
+    print(f"❄️ حداکثر ضررهای متوالی کل سبد: {max_losses}")
 
     print("\n------------------------------------------------------------")
     print("📉 لیست کامل زنجیره‌های ضرر متوالی:")
@@ -344,4 +364,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V62 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V63 به پایان رسید.")
