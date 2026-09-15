@@ -1,13 +1,4 @@
 {
-    "active": {
-        "ETH": {
-            "symbol": "ETH/USDT",
-            "direction": "LONG",
-            "entry_price": 2538.86,
-            "tp": 2648.8825,
-            "sl": 2483.84875,
-            "time": "2026-09-14 18:00:00"
-        }
-    },
+    "active": {},
     "cooldown": {}
 }
