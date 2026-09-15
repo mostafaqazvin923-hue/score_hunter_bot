@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V80 (Anti-Loss Cluster + No ADX + Smart Early Exit + Heat Control)
+# HUNTER-V81 (Restored Profit Engine + Soft Anti-Loss + Heat = 4)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -53,7 +53,7 @@ SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 ATR_PERIOD = 14
 INITIAL_ATR_MULTIPLIER = 1.8
-TRAILING_ATR_MULTIPLIER = 2.0  # اصلاح به درخواست همکار برای بهبود خروج
+TRAILING_ATR_MULTIPLIER = 2.0
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
@@ -66,7 +66,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V80 (بدون ADX + آنتی لاس کلستر + خروج زودهنگام)")
+print("📥 دریافت داده‌ها - HUNTER-V81 (بازیابی موتور سود + کلستر نرم)")
 print("=" * 60)
 
 processed_data = {}
@@ -158,7 +158,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V80...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V81...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -198,17 +198,7 @@ def run_backtest(processed_data):
             candles_held = curr_i - pos["entry_index"]
             is_timeout = candles_held >= TIMEOUT_CANDLES
             
-            # سیستم خروج زودهنگام هوشمند (Smart Early Exit)
-            early_exit = False
-            if candles_held >= 15 and not hit_sl:
-                if pos["side"] == "LONG":
-                    current_r = (c4h["Close"] - pos["entry_price"]) / pos["initial_risk"]
-                else:
-                    current_r = (pos["entry_price"] - c4h["Close"]) / pos["initial_risk"]
-                if current_r < 0.5:
-                    early_exit = True
-
-            if hit_sl or is_timeout or early_exit:
+            if hit_sl or is_timeout:
                 initial_risk = pos["initial_risk"]
                 if pos["side"] == "LONG":
                     exit_p = min(pos["stop_loss"], c4h["Open"]) if hit_sl else c4h["Close"]
@@ -225,7 +215,7 @@ def run_backtest(processed_data):
                     consecutive_losses += 1
                 else:
                     if consecutive_losses > 0:
-                        consecutive_losses -= 1  # کاهش پله‌پله با هر برد
+                        consecutive_losses -= 1  # بازگشت پله‌پله با هر برد
 
                 position_notional = pos["used_margin"] * LEVERAGE
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
@@ -244,28 +234,28 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
         
-        # سیستم Anti-Loss Cluster برای حجم
+        # سیستم Anti-Loss Cluster نرم‌تر برای حفظ موتور سود
         if consecutive_losses == 0:
             cluster_multiplier = 1.0
         elif consecutive_losses == 1:
-            cluster_multiplier = 0.7
+            cluster_multiplier = 0.9
         elif consecutive_losses == 2:
-            cluster_multiplier = 0.5
+            cluster_multiplier = 0.75
         else:
-            cluster_multiplier = 0.3
+            cluster_multiplier = 0.6  # حداقل ۶۰٪ حجم حفظ می‌شود
 
-        # رژیم بازار (فقط برای تعیین ضریب مارجین)
+        # رژیم بازار برای ضریب مارجین
         btc_c = None
         regime_multiplier = 1.0
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
             btc_c = processed_data["BTC"].loc[ts]
             atr_ratio = btc_c["ATR_Ratio"]
             if atr_ratio > 1.5:
-                regime_multiplier = 0.25  # CHAOS
+                regime_multiplier = 0.4   # CHAOS ملایم‌تر
             elif btc_c["Close"] > btc_c["EMA20"] and btc_c["EMA20"] > btc_c["EMA50"]:
                 regime_multiplier = 1.0   # TREND
             else:
-                regime_multiplier = 0.5   # RANGE
+                regime_multiplier = 0.7   # RANGE ملایم‌تر
 
         current_trade_margin = BASE_TRADE_MARGIN * regime_multiplier * cluster_multiplier
 
@@ -283,7 +273,6 @@ def run_backtest(processed_data):
         
         market_breadth_ratio = (bullish_count / total_active_syms) if total_active_syms > 0 else 0.5
 
-        # فیلتر ترکیبی بازار و Breadth (قاعده V80)
         allow_longs = True
         allow_shorts = True
         if btc_c is not None:
@@ -324,19 +313,19 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
             
-            # بررسی Portfolio Heat (حداکثر ۲ پوزیشن هم‌جهت مشابه)
             side = "LONG" if market_bull else "SHORT"
             if not allow_longs and side == "LONG":
                 continue
             if not allow_shorts and side == "SHORT":
                 continue
 
+            # افزایش Portfolio Heat از ۲ به ۴ پوزیشن هم‌جهت برای سوار شدن روی روندها
             current_side_count = sum(1 for p in active_positions.values() if p["side"] == side)
-            if current_side_count >= 2:
+            if current_side_count >= 4:
                 continue
 
             if market_bull:
-                regime_ok = (c4h["Close"] > c4h["EMA20"]) and (c4h["EMA20"] > c4h["EMA50"])
+                regime_ok = (c4h["Close"] > c4h["EMA20"]) and (c4h["EMA20"] > c4h["EMA50"]) and (c4h["EMA20"] > c4h["EMA50"])
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
                 valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.01) and (c4h["Mom_Long"] > 0.03)
                 side = "LONG"
@@ -369,7 +358,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی هوشمند - HUNTER-V80")
+    print("📊 گزارش نهایی استراتژی هوشمند - HUNTER-V81")
     print("=" * 68)
 
     if trades_df.empty:
@@ -441,4 +430,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V80 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V81 به پایان رسید.")
