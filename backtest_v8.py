@@ -1,52 +1,74 @@
 # ============================================================
-# HUNTER-V76 — UNIFIED BACKTEST SCRIPT
+# HUNTER-V77
+# Research Version
+#
+# Changes vs V76:
+# 1) BTC momentum regime
+# 2) Breadth: LONG >= 55%, SHORT <= 45%
+# 3) Relative momentum vs BTC
+# 4) ATR volatility filter
+# 5) Extreme momentum filter
+# 6) Max 3 positions per direction
+# 7) Fixed $100 margin
+# 8) Conservative trailing-stop management
+# 9) Detailed loss-streak analysis
+# 10) Per-symbol complete statistics
+# 11) Filter rejection diagnostics
 # ============================================================
 
 import os
 import sys
 import time
-import math
-import warnings
 import subprocess
-from datetime import datetime, timedelta, timezone
-
-warnings.filterwarnings("ignore")
+from datetime import datetime, timedelta
 
 # ------------------------------------------------------------
-# Auto install dependencies
+# Install/import dependencies
 # ------------------------------------------------------------
 
 try:
     import ccxt
 except ImportError:
-    print("📦 Installing ccxt...")
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install", "ccxt", "--quiet"
-    ])
+    print("Installing ccxt...")
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "ccxt"]
+    )
     import ccxt
 
 try:
     import pandas as pd
-    import numpy as np
 except ImportError:
-    print("📦 Installing pandas/numpy...")
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install", "pandas", "numpy", "--quiet"
-    ])
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "pandas"]
+    )
     import pandas as pd
-    import numpy as np
+
+import numpy as np
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-VERSION = "HUNTER-V76"
+VERSION = "HUNTER-V77"
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
+# ------------------------------------------------------------
+# Portfolio
+# ------------------------------------------------------------
+
+INITIAL_CAPITAL = 1000.0
+
+TRADE_MARGIN = 100.0
+LEVERAGE = 80.0
+
 MAX_POSITIONS = 5
+
+# Maximum simultaneous positions in same direction
+MAX_LONG_POSITIONS = 3
+MAX_SHORT_POSITIONS = 3
 
 # ------------------------------------------------------------
 # Trading costs
@@ -56,33 +78,56 @@ SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
 # ------------------------------------------------------------
-# ATR / exits
+# Indicators
 # ------------------------------------------------------------
 
 ATR_PERIOD = 14
 
-TRAILING_ATR_MULTIPLIER = 2.0
 INITIAL_ATR_MULTIPLIER = 1.8
+TRAILING_ATR_MULTIPLIER = 2.0
 
 TIMEOUT_CANDLES = 45
-
-# ------------------------------------------------------------
-# EMA
-# ------------------------------------------------------------
 
 EMA_WARMUP = 200
 
 # ------------------------------------------------------------
-# MONEY MANAGEMENT
+# V77 filters
 # ------------------------------------------------------------
 
-INITIAL_CAPITAL = 1000.0
-TRADE_MARGIN = 100.0
-LEVERAGE = 80.0
+# Breadth
+LONG_BREADTH_MIN = 0.55
+SHORT_BREADTH_MAX = 0.45
+
+# Relative momentum vs BTC
+REQUIRE_RELATIVE_MOMENTUM = True
+
+# ATR / Close
+#
+# 0.03 = 3%
+#
+# Candidate is rejected if ATR percentage is above this.
+ATR_MAX_PCT = 0.03
+
+# Extreme momentum filter
+#
+# Long:
+#     0.035 < Mom_Long < 0.25
+#
+# Short:
+#    -0.25 < Mom_Long < -0.035
+#
+MAX_MOM = 0.25
+
+# Original momentum thresholds
+MOM_SHORT_LONG_MIN = 0.012
+MOM_LONG_LONG_MIN = 0.035
+
+MOM_SHORT_SHORT_MAX = -0.012
+MOM_LONG_SHORT_MAX = -0.035
 
 
 # ============================================================
-# UNIVERSE — 20 COINS
+# 20 COIN UNIVERSE
 # ============================================================
 
 SYMBOLS = {
@@ -110,90 +155,143 @@ SYMBOLS = {
 
 
 # ============================================================
-# EXCHANGE
+# LBank
 # ============================================================
 
 exchange = ccxt.lbank({
     "enableRateLimit": True,
-    "timeout": 30000,
 })
 
 
 # ============================================================
-# GLOBAL DATA CONTAINERS
+# DATA FETCH
 # ============================================================
 
-DATA = {}
-FAILED_SYMBOLS = []
+def fetch_ohlcv_full(symbol, timeframe, since_ms, until_ms):
+    """
+    Fetch complete OHLCV history using LBank pagination.
+    """
 
-
-# ============================================================
-# FETCH OHLCV
-# ============================================================
-
-def fetch_ohlcv_full(exchange, symbol, timeframe, since_ms):
     all_rows = []
+
+    limit = 1000
+
     current_since = since_ms
-    max_retries = 3
-    page_limit = 1000
 
-    while True:
-        success = False
-        for attempt in range(max_retries):
-            try:
+    for attempt in range(3):
+
+        try:
+
+            while current_since < until_ms:
+
                 rows = exchange.fetch_ohlcv(
-                    symbol, timeframe=timeframe, since=current_since, limit=page_limit
+                    symbol,
+                    timeframe=timeframe,
+                    since=current_since,
+                    limit=limit
                 )
-                success = True
-                break
-            except Exception as e:
-                print(f"⚠️ {symbol} fetch attempt {attempt + 1}/{max_retries}: {e}")
-                time.sleep(2)
 
-        if not success:
-            raise RuntimeError(f"Failed to fetch {symbol}")
+                if not rows:
+                    break
 
-        if not rows:
+                all_rows.extend(rows)
+
+                last_ts = rows[-1][0]
+
+                # Protection against repeated pagination
+                if last_ts <= current_since:
+                    break
+
+                current_since = last_ts + 1
+
+                # Small delay
+                time.sleep(exchange.rateLimit / 1000)
+
+                # If fewer than limit returned,
+                # probably reached available history
+                if len(rows) < limit:
+                    break
+
             break
 
-        all_rows.extend(rows)
-        last_timestamp = rows[-1][0]
+        except Exception as e:
 
-        if last_timestamp <= current_since:
-            break
+            print(
+                f"  Fetch error {symbol}, attempt "
+                f"{attempt + 1}/3: {e}"
+            )
 
-        current_since = last_timestamp + 1
-        now_ms = exchange.milliseconds()
-
-        if last_timestamp >= now_ms - (4 * 60 * 60 * 1000):
-            break
-
-        if len(all_rows) > 200000:
-            break
-
-        time.sleep(exchange.rateLimit / 1000)
+            if attempt < 2:
+                time.sleep(3)
+                current_since = since_ms
+                all_rows = []
 
     if not all_rows:
-        raise RuntimeError(f"No OHLCV data returned for {symbol}")
+        return None
 
     df = pd.DataFrame(
-        all_rows, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
+        all_rows,
+        columns=[
+            "Timestamp",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+        ]
     )
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
-    df = df.drop_duplicates(subset=["Timestamp"]).sort_values("Timestamp").set_index("Timestamp")
 
-    now = pd.Timestamp.now(tz="UTC")
-    candle_duration = pd.Timedelta(hours=4)
+    df["Timestamp"] = pd.to_datetime(
+        df["Timestamp"],
+        unit="ms",
+        utc=True
+    )
+
+    df = df.drop_duplicates(
+        subset=["Timestamp"]
+    )
+
+    df = df.sort_values("Timestamp")
+
+    # Remove incomplete last candle
+    now_ms = int(time.time() * 1000)
+
     if len(df) > 0:
-        last_candle_start = df.index[-1]
-        if now < last_candle_start + candle_duration:
+
+        last_ms = int(
+            df["Timestamp"].iloc[-1].timestamp() * 1000
+        )
+
+        candle_duration_ms = 4 * 60 * 60 * 1000
+
+        if last_ms + candle_duration_ms > now_ms:
             df = df.iloc[:-1]
 
-    numeric_cols = ["Open", "High", "Low", "Close", "Volume"]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # --------------------------------------------------------
+    # Gap check
+    # --------------------------------------------------------
 
-    df = df.dropna(subset=numeric_cols)
+    if len(df) > 1:
+
+        diffs = df["Timestamp"].diff().dropna()
+
+        max_gap = diffs.max()
+
+        expected = pd.Timedelta(hours=4)
+
+        tolerance = pd.Timedelta(minutes=10)
+
+        if max_gap > expected + tolerance:
+
+            print(
+                f"  WARNING: {symbol} has gap "
+                f"{max_gap}"
+            )
+
+    df = df.set_index("Timestamp")
+
+    df = df.dropna()
+
     return df
 
 
@@ -202,491 +300,1807 @@ def fetch_ohlcv_full(exchange, symbol, timeframe, since_ms):
 # ============================================================
 
 def add_indicators(df):
+
     df = df.copy()
-    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
-    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
-    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
+
+    # --------------------------------------------------------
+    # EMA
+    # --------------------------------------------------------
+
+    df["EMA20"] = (
+        df["Close"]
+        .ewm(span=20, adjust=False)
+        .mean()
+    )
+
+    df["EMA50"] = (
+        df["Close"]
+        .ewm(span=50, adjust=False)
+        .mean()
+    )
+
+    df["EMA200"] = (
+        df["Close"]
+        .ewm(span=200, adjust=False)
+        .mean()
+    )
+
+    # --------------------------------------------------------
+    # ATR
+    # --------------------------------------------------------
 
     prev_close = df["Close"].shift(1)
-    tr1 = df["High"] - df["Low"]
-    tr2 = (df["High"] - prev_close).abs()
-    tr3 = (df["Low"] - prev_close).abs()
-    df["TR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df["ATR"] = df["TR"].rolling(ATR_PERIOD).mean()
 
-    df["Mom_Short"] = df["Close"].pct_change(10)
-    df["Mom_Long"] = df["Close"].pct_change(30)
+    tr1 = df["High"] - df["Low"]
+
+    tr2 = (df["High"] - prev_close).abs()
+
+    tr3 = (df["Low"] - prev_close).abs()
+
+    df["TR"] = pd.concat(
+        [tr1, tr2, tr3],
+        axis=1
+    ).max(axis=1)
+
+    df["ATR"] = (
+        df["TR"]
+        .rolling(ATR_PERIOD)
+        .mean()
+    )
+
+    # --------------------------------------------------------
+    # Momentum
+    # --------------------------------------------------------
+
+    df["Mom_Short"] = (
+        df["Close"] /
+        df["Close"].shift(10)
+        - 1.0
+    )
+
+    df["Mom_Long"] = (
+        df["Close"] /
+        df["Close"].shift(30)
+        - 1.0
+    )
+
+    # --------------------------------------------------------
+    # ATR percentage
+    # --------------------------------------------------------
+
+    df["ATR_Pct"] = (
+        df["ATR"] /
+        df["Close"]
+    )
+
+    # --------------------------------------------------------
+    # Previous candle values
+    # --------------------------------------------------------
 
     df["Prev_Low"] = df["Low"].shift(1)
+
     df["Prev_High"] = df["High"].shift(1)
+
     df["Prev_EMA20"] = df["EMA20"].shift(1)
+
     return df
 
 
 # ============================================================
-# LOAD ALL SYMBOLS
+# LOAD ALL DATA
 # ============================================================
 
-def load_market_data():
-    print("=" * 70)
-    print(f"🚀 {VERSION}")
-    print("=" * 70)
-    print(f"Exchange : LBank")
-    print(f"Timeframe: {TIMEFRAME}")
-    print(f"Lookback : {LOOKBACK_DAYS} days")
-    print(f"Universe : {len(SYMBOLS)} symbols")
-    print(f"Margin   : ${TRADE_MARGIN:.2f}")
-    print(f"Leverage : {LEVERAGE:.0f}x")
-    print("=" * 70)
+print("=" * 70)
+print(VERSION)
+print("=" * 70)
 
-    since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
-    since_ms = int(since.timestamp() * 1000)
+print(
+    f"Fetching {LOOKBACK_DAYS} days of "
+    f"{TIMEFRAME} LBank data..."
+)
 
-    for name, symbol in SYMBOLS.items():
-        print(f"\n📥 [{name}] {symbol}")
-        try:
-            df = fetch_ohlcv_full(exchange, symbol, TIMEFRAME, since_ms)
-            if len(df) < EMA_WARMUP + 50:
-                print(f"❌ {name}: not enough candles ({len(df)})")
-                FAILED_SYMBOLS.append(name)
-                continue
-            df = add_indicators(df)
-            DATA[name] = df
-            print(f"✅ {name}: {len(df)} candles | {df.index[0]} → {df.index[-1]}")
-        except Exception as e:
-            print(f"❌ {name}: {e}")
-            FAILED_SYMBOLS.append(name)
+end_time = datetime.utcnow()
 
-    print("\n" + "=" * 70)
-    print(f"VALID SYMBOLS: {len(DATA)}/{len(SYMBOLS)}")
-    if FAILED_SYMBOLS:
-        print("FAILED:", ", ".join(FAILED_SYMBOLS))
-    print("=" * 70)
+start_time = end_time - timedelta(
+    days=LOOKBACK_DAYS
+)
 
-    if "BTC" not in DATA:
-        raise RuntimeError("BTC data is required for HUNTER-V76")
+since_ms = int(
+    start_time.timestamp() * 1000
+)
 
-load_market_data()
+until_ms = int(
+    end_time.timestamp() * 1000
+)
 
-ALL_TIMESTAMPS = sorted(set().union(*(set(df.index) for df in DATA.values())))
+
+DATA = {}
+
+valid_symbols = []
+
+for name, symbol in SYMBOLS.items():
+
+    print(f"Fetching {name} ...")
+
+    try:
+
+        df = fetch_ohlcv_full(
+            symbol,
+            TIMEFRAME,
+            since_ms,
+            until_ms
+        )
+
+        if df is None or len(df) < EMA_WARMUP + 50:
+
+            print(
+                f"  INVALID: insufficient data"
+            )
+
+            continue
+
+        df = add_indicators(df)
+
+        df = df.dropna()
+
+        if len(df) < EMA_WARMUP:
+
+            print(
+                f"  INVALID after indicators"
+            )
+
+            continue
+
+        DATA[name] = df
+
+        valid_symbols.append(name)
+
+        print(
+            f"  OK: {len(df)} candles"
+        )
+
+    except Exception as e:
+
+        print(
+            f"  FAILED: {e}"
+        )
+
+
+print()
+print(
+    f"{len(valid_symbols)}/{len(SYMBOLS)} "
+    f"valid symbols"
+)
+
+print(valid_symbols)
+
+
+if "BTC" not in DATA:
+
+    raise RuntimeError(
+        "BTC data is required."
+    )
 
 
 # ============================================================
-# BACKTEST STATE
+# COMMON TIMESTAMPS
+# ============================================================
+
+ALL_TIMESTAMPS = sorted(
+    set().union(
+        *[
+            set(df.index)
+            for df in DATA.values()
+        ]
+    )
+)
+
+
+# ============================================================
+# BTC DATA
+# ============================================================
+
+BTC = DATA["BTC"]
+
+
+# ============================================================
+# PORTFOLIO STATE
 # ============================================================
 
 capital = INITIAL_CAPITAL
-open_positions = {}
+
+open_positions = []
+
 closed_trades = []
+
 equity_curve = []
+
 peak_equity = INITIAL_CAPITAL
+
 max_drawdown_dollar = 0.0
+
 max_drawdown_pct = 0.0
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# FILTER DIAGNOSTICS
 # ============================================================
 
-def safe_float(value, default=np.nan):
-    try:
-        value = float(value)
-        if np.isfinite(value):
-            return value
-        return default
-    except Exception:
-        return default
+filter_stats = {
 
-def get_row(symbol, timestamp):
-    df = DATA.get(symbol)
-    if df is None:
-        return None
-    try:
-        row = df.loc[timestamp]
-    except KeyError:
-        return None
-    if isinstance(row, pd.DataFrame):
-        if len(row) == 0:
-            return None
-        row = row.iloc[-1]
-    return row
+    "total_symbol_checks": 0,
 
-def get_btc_regime(timestamp):
-    row = get_row("BTC", timestamp)
-    if row is None:
-        return {"bull": False, "bear": False, "valid": False}
-    close = safe_float(row["Close"])
-    ema50 = safe_float(row["EMA50"])
-    ema200 = safe_float(row["EMA200"])
-    if not all(np.isfinite(x) for x in [close, ema50, ema200]):
-        return {"bull": False, "bear": False, "valid": False}
-    bull = (close > ema200 and ema50 > ema200)
-    bear = (close < ema200 and ema50 < ema200)
-    return {"bull": bull, "bear": bear, "valid": True, "close": close, "ema50": ema50, "ema200": ema200}
+    "btc_regime_rejected": 0,
 
-def get_market_breadth(timestamp):
-    bullish_count = 0
-    active_count = 0
-    for symbol, df in DATA.items():
-        row = get_row(symbol, timestamp)
-        if row is None:
-            continue
-        close = safe_float(row["Close"])
-        ema200 = safe_float(row["EMA200"])
-        if not np.isfinite(close) or not np.isfinite(ema200):
-            continue
-        active_count += 1
-        if close > ema200:
-            bullish_count += 1
-    if active_count == 0:
-        return {"bullish_count": 0, "active_count": 0, "ratio": 0.0}
-    return {"bullish_count": bullish_count, "active_count": active_count, "ratio": bullish_count / active_count}
+    "breadth_rejected": 0,
 
-def get_direction_permissions(timestamp):
-    btc = get_btc_regime(timestamp)
-    breadth = get_market_breadth(timestamp)
-    if not btc["valid"]:
-        return {"allow_longs": False, "allow_shorts": False, "btc_bull": False, "btc_bear": False, "breadth_ratio": breadth["ratio"]}
-    breadth_ratio = breadth["ratio"]
-    return {
-        "allow_longs": (btc["bull"] and breadth_ratio >= 0.35),
-        "allow_shorts": (btc["bear"] and breadth_ratio <= 0.65),
-        "btc_bull": btc["bull"],
-        "btc_bear": btc["bear"],
-        "breadth_ratio": breadth_ratio
-    }
+    "relative_momentum_rejected": 0,
 
-def get_position_size(entry_price):
-    if entry_price <= 0:
-        return None
-    notional = TRADE_MARGIN * LEVERAGE
-    return {"margin": TRADE_MARGIN, "notional": notional, "quantity": notional / entry_price}
+    "atr_rejected": 0,
 
-def calculate_initial_stop(side, entry_price, atr):
-    if entry_price is None or atr is None:
-        return None
-    entry_price, atr = safe_float(entry_price), safe_float(atr)
-    if not np.isfinite(entry_price) or not np.isfinite(atr) or entry_price <= 0 or atr <= 0:
-        return None
-    distance = atr * INITIAL_ATR_MULTIPLIER
-    distance_pct = distance / entry_price
-    if not (0.01 <= distance_pct <= 0.04):
-        return None
-    stop_price = (entry_price - distance) if side == "LONG" else (entry_price + distance)
-    if stop_price <= 0:
-        return None
-    return {"stop_price": stop_price, "stop_distance": distance, "stop_distance_pct": distance_pct}
+    "extreme_momentum_rejected": 0,
 
-def update_trailing_stop(position, candle):
-    side = position["side"]
-    current_stop = position["stop_price"]
-    atr = safe_float(candle["ATR"])
-    if not np.isfinite(atr) or atr <= 0:
-        return current_stop
-    if side == "LONG":
-        high = safe_float(candle["High"])
-        if not np.isfinite(high):
-            return current_stop
-        return max(current_stop, high - atr * TRAILING_ATR_MULTIPLIER)
-    else:
-        low = safe_float(candle["Low"])
-        if not np.isfinite(low):
-            return current_stop
-        return min(current_stop, low + atr * TRAILING_ATR_MULTIPLIER)
+    "trend_rejected": 0,
 
-def determine_stop_exit(position, candle):
-    side, stop_price = position["side"], position["stop_price"]
-    high, low = safe_float(candle["High"]), safe_float(candle["Low"])
-    if not np.isfinite(high) or not np.isfinite(low):
-        return None, None
-    if side == "LONG" and low <= stop_price:
-        return stop_price, "STOP"
-    if side == "SHORT" and high >= stop_price:
-        return stop_price, "STOP"
-    return None, None
+    "momentum_rejected": 0,
 
-def calculate_trade_pnl(position, exit_price):
-    entry_price, notional, side = position["entry_price"], position["notional"], position["side"]
-    if entry_price <= 0 or exit_price <= 0 or notional <= 0:
-        return 0.0, 0.0
-    raw_return = (exit_price - entry_price) / entry_price if side == "LONG" else (entry_price - exit_price) / entry_price
-    gross_pnl = raw_return * notional
-    total_fee = (notional * FEE_RATE) + (abs(notional * (exit_price / entry_price)) * FEE_RATE)
-    net_pnl = gross_pnl - total_fee
-    stop_pct = position["initial_stop_distance_pct"]
-    net_r = (raw_return / stop_pct - (total_fee / notional) / stop_pct) if (stop_pct and stop_pct > 0) else np.nan
-    return net_pnl, net_r
+    "pullback_rejected": 0,
 
-def close_position(symbol, timestamp, exit_price, reason):
-    global capital
-    if symbol not in open_positions:
-        return None
-    position = open_positions[symbol]
-    exit_price = safe_float(exit_price)
-    if not np.isfinite(exit_price) or exit_price <= 0:
-        return None
-    pnl, net_r = calculate_trade_pnl(position, exit_price)
-    capital_before = capital
-    capital += pnl
-    trade = {
-        "symbol": symbol, "side": position["side"],
-        "entry_timestamp": position["entry_timestamp"], "exit_timestamp": timestamp,
-        "entry_price": position["entry_price"], "exit_price": exit_price,
-        "margin": position["margin"], "notional": position["notional"], "quantity": position["quantity"],
-        "initial_stop": position["initial_stop"], "initial_stop_distance_pct": position["initial_stop_distance_pct"],
-        "pnl": pnl, "R": net_r, "result": "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BE"),
-        "exit_reason": reason, "capital_before": capital_before, "capital_after": capital,
-        "bars_held": position.get("bars_held", 0)
-    }
-    closed_trades.append(trade)
-    del open_positions[symbol]
-    return trade
+    "already_open_rejected": 0,
 
-def manage_open_positions(timestamp):
-    for symbol in list(open_positions.keys()):
-        position = open_positions[symbol]
-        candle = get_row(symbol, timestamp)
-        if candle is None:
-            continue
-        position["bars_held"] = position.get("bars_held", 0) + 1
-        exit_price, reason = determine_stop_exit(position, candle)
-        if exit_price is not None:
-            close_position(symbol, timestamp, exit_price, reason)
-            continue
-        if (timestamp - position["entry_timestamp"]).total_seconds() / (4 * 3600) >= TIMEOUT_CANDLES:
-            exit_price = safe_float(candle["Close"])
-            if exit_price is not None:
-                close_position(symbol, timestamp, exit_price, "TIMEOUT")
-                continue
-        position["stop_price"] = update_trailing_stop(position, candle)
+    "direction_limit_rejected": 0,
 
-def update_equity(timestamp):
-    global peak_equity, max_drawdown_dollar, max_drawdown_pct
+    "max_positions_rejected": 0,
+
+    "accepted_candidates": 0,
+}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def count_direction(direction):
+
+    return sum(
+        1
+        for p in open_positions
+        if p["side"] == direction
+    )
+
+
+def calculate_unrealized_equity():
+
     equity = capital
-    if equity > peak_equity:
-        peak_equity = equity
-    drawdown = equity - peak_equity
-    if drawdown < max_drawdown_dollar:
-        max_drawdown_dollar = drawdown
-    dd_pct = (drawdown / peak_equity * 100) if peak_equity > 0 else 0.0
-    if dd_pct < max_drawdown_pct:
-        max_drawdown_pct = dd_pct
-    equity_curve.append({"timestamp": timestamp, "capital": capital, "equity": equity, "drawdown": drawdown, "drawdown_pct": dd_pct})
 
-def has_open_position(symbol):
-    return symbol in open_positions
+    for p in open_positions:
 
-def create_position(symbol, side, timestamp, entry_price, atr):
-    if has_open_position(symbol):
-        return None
-    sizing = get_position_size(entry_price)
-    if sizing is None:
-        return None
-    stop_data = calculate_initial_stop(side, entry_price, atr)
-    if stop_data is None:
-        return None
-    position = {
-        "symbol": symbol, "side": side, "entry_timestamp": timestamp,
-        "entry_price": float(entry_price), "margin": float(sizing["margin"]),
-        "notional": float(sizing["notional"]), "quantity": float(sizing["quantity"]),
-        "initial_stop": float(stop_data["stop_price"]), "stop_price": float(stop_data["stop_price"]),
-        "initial_stop_distance": float(stop_data["stop_distance"]),
-        "initial_stop_distance_pct": float(stop_data["stop_distance_pct"]), "bars_held": 0
+        name = p["name"]
+
+        side = p["side"]
+
+        entry = p["entry"]
+
+        current = p["last_price"]
+
+        qty = p["qty"]
+
+        if side == "LONG":
+
+            raw_pnl = (
+                current - entry
+            ) * qty
+
+        else:
+
+            raw_pnl = (
+                entry - current
+            ) * qty
+
+        equity += raw_pnl
+
+    return equity
+
+
+def close_position(
+    position,
+    exit_price,
+    timestamp,
+    reason
+):
+
+    global capital
+
+    side = position["side"]
+
+    entry = position["entry"]
+
+    qty = position["qty"]
+
+    margin = position["margin"]
+
+    notional = position["notional"]
+
+    if side == "LONG":
+
+        raw_pnl = (
+            exit_price - entry
+        ) * qty
+
+    else:
+
+        raw_pnl = (
+            entry - exit_price
+        ) * qty
+
+    # --------------------------------------------------------
+    # Fees
+    # --------------------------------------------------------
+
+    entry_fee = (
+        notional *
+        FEE_RATE
+    )
+
+    exit_notional = (
+        exit_price *
+        qty
+    )
+
+    exit_fee = (
+        exit_notional *
+        FEE_RATE
+    )
+
+    total_fee = (
+        entry_fee +
+        exit_fee
+    )
+
+    pnl = raw_pnl - total_fee
+
+    capital += pnl
+
+    # --------------------------------------------------------
+    # R calculation
+    # --------------------------------------------------------
+
+    sl_dist_pct = (
+        position["initial_sl_distance_pct"]
+    )
+
+    if sl_dist_pct > 0:
+
+        raw_r = (
+            raw_pnl /
+            margin /
+            sl_dist_pct
+        )
+
+        fee_r = (
+            (FEE_RATE * 2) /
+            sl_dist_pct
+        )
+
+        r_real = raw_r - fee_r
+
+    else:
+
+        r_real = 0.0
+
+    trade = {
+
+        "Timestamp": timestamp,
+
+        "Symbol": position["name"],
+
+        "Side": side,
+
+        "Entry": entry,
+
+        "Exit": exit_price,
+
+        "Qty": qty,
+
+        "Margin": margin,
+
+        "Notional": notional,
+
+        "RawPnL": raw_pnl,
+
+        "Fees": total_fee,
+
+        "PnL": pnl,
+
+        "R": r_real,
+
+        "Reason": reason,
+
+        "EntryATR": position["entry_atr"],
+
+        "EntryATR_Pct": position["entry_atr_pct"],
+
+        "EntryMomShort": position["entry_mom_short"],
+
+        "EntryMomLong": position["entry_mom_long"],
+
+        "EntryRelativeMom": position[
+            "entry_relative_mom"
+        ],
+
+        "EntryBreadth": position[
+            "entry_breadth"
+        ],
+
+        "EntryBTCMomLong": position[
+            "entry_btc_mom_long"
+        ],
     }
-    open_positions[symbol] = position
-    return position
 
-
-# ============================================================
-# SIGNAL ENGINE
-# ============================================================
-
-LONG_MOM_SHORT_MIN = 0.012
-LONG_MOM_LONG_MIN = 0.035
-SHORT_MOM_SHORT_MAX = -0.012
-SHORT_MOM_LONG_MAX = -0.035
-LONG_PULLBACK_MAX = 1.015
-SHORT_PULLBACK_MIN = 0.985
-
-def get_signal(symbol, timestamp):
-    row = get_row(symbol, timestamp)
-    if row is None:
-        return None
-    req = ["Close", "EMA20", "EMA50", "EMA200", "Prev_Low", "Prev_High", "Prev_EMA20", "Mom_Short", "Mom_Long", "ATR"]
-    val = {c: safe_float(row[c]) for c in req}
-    if not all(np.isfinite(v) for v in val.values()):
-        return None
-
-    if val["Close"] > val["EMA20"] > val["EMA50"] and val["Close"] > val["EMA200"] and val["Prev_Low"] <= val["Prev_EMA20"] * LONG_PULLBACK_MAX and val["Mom_Short"] > LONG_MOM_SHORT_MIN and val["Mom_Long"] > LONG_MOM_LONG_MIN:
-        return "LONG"
-    if val["Close"] < val["EMA20"] < val["EMA50"] and val["Close"] < val["EMA200"] and val["Prev_High"] >= val["Prev_EMA20"] * SHORT_PULLBACK_MIN and val["Mom_Short"] < SHORT_MOM_SHORT_MAX and val["Mom_Long"] < SHORT_MOM_LONG_MAX:
-        return "SHORT"
-    return None
-
-def get_signal_score(symbol, timestamp, side):
-    row = get_row(symbol, timestamp)
-    if row is None:
-        return None
-    mom_long = safe_float(row["Mom_Long"])
-    if not np.isfinite(mom_long):
-        return None
-    return float(mom_long if side == "LONG" else -mom_long)
-
-def collect_candidates(timestamp, permissions):
-    long_c, short_c = [], []
-    if permissions["allow_longs"]:
-        for symbol in DATA.keys():
-            if not has_open_position(symbol) and get_signal(symbol, timestamp) == "LONG":
-                score = get_signal_score(symbol, timestamp, "LONG")
-                if score is not None:
-                    long_c.append({"symbol": symbol, "side": "LONG", "score": score})
-    if permissions["allow_shorts"]:
-        for symbol in DATA.keys():
-            if not has_open_position(symbol) and get_signal(symbol, timestamp) == "SHORT":
-                score = get_signal_score(symbol, timestamp, "SHORT")
-                if score is not None:
-                    short_c.append({"symbol": symbol, "side": "SHORT", "score": score})
-    long_c.sort(key=lambda x: x["score"], reverse=True)
-    short_c.sort(key=lambda x: x["score"], reverse=True)
-    return long_c, short_c
-
-def get_entry_price(row, side):
-    op = safe_float(row["Open"])
-    if not np.isfinite(op) or op <= 0:
-        return None
-    return float(op * (1.0 + SLIPPAGE) if side == "LONG" else op * (1.0 - SLIPPAGE))
-
-def execute_entry(candidate, timestamp):
-    if has_open_position(candidate["symbol"]) or len(open_positions) >= MAX_POSITIONS:
-        return None
-    row = get_row(candidate["symbol"], timestamp)
-    if row is None:
-        return None
-    entry_price = get_entry_price(row, candidate["side"])
-    atr = safe_float(row["ATR"])
-    if entry_price is None or not np.isfinite(atr) or atr <= 0:
-        return None
-    return create_position(candidate["symbol"], candidate["side"], timestamp, entry_price, atr)
+    closed_trades.append(trade)
 
 
 # ============================================================
 # MAIN BACKTEST LOOP
 # ============================================================
 
-def run_backtest():
-    global capital
-    print("\n" + "=" * 70 + "\n🚀 STARTING HUNTER-V76 BACKTEST\n" + "=" * 70)
-    total_timestamps = len(ALL_TIMESTAMPS)
-    processed = 0
+for timestamp in ALL_TIMESTAMPS:
 
-    for timestamp in ALL_TIMESTAMPS:
-        processed += 1
-        btc_row = get_row("BTC", timestamp)
-        if btc_row is None or not np.isfinite(safe_float(btc_row["EMA200"])):
+    # ========================================================
+    # 1. MANAGE OPEN POSITIONS
+    # ========================================================
+
+    positions_to_close = []
+
+    for p in list(open_positions):
+
+        name = p["name"]
+
+        df = DATA[name]
+
+        if timestamp not in df.index:
             continue
 
-        manage_open_positions(timestamp)
-        permissions = get_direction_permissions(timestamp)
-        long_c, short_c = collect_candidates(timestamp, permissions)
+        candle = df.loc[timestamp]
 
-        available_slots = MAX_POSITIONS - len(open_positions)
-        if available_slots > 0:
-            candidates = []
-            if permissions["allow_longs"]: candidates.extend(long_c)
-            if permissions["allow_shorts"]: candidates.extend(short_c)
-            candidates.sort(key=lambda x: x["score"], reverse=True)
+        p["last_price"] = float(
+            candle["Close"]
+        )
 
-            for candidate in candidates:
-                if len(open_positions) >= MAX_POSITIONS:
-                    break
-                execute_entry(candidate, timestamp)
+        p["bars"] += 1
 
-        update_equity(timestamp)
+        side = p["side"]
 
-        progress = int(processed / total_timestamps * 100)
-        if progress % 10 == 0 and processed == int(total_timestamps * (progress / 100)):
-            print(f"📈 Progress: {progress}% | Trades={len(closed_trades)} | Open={len(open_positions)} | Capital=${capital:,.2f}")
+        # ----------------------------------------------------
+        # FIRST:
+        # check existing stop BEFORE modifying trailing stop
+        #
+        # This avoids same-candle trail/recheck bias.
+        # ----------------------------------------------------
 
-    if len(open_positions) > 0:
-        for symbol in list(open_positions.keys()):
-            row = get_row(symbol, ALL_TIMESTAMPS[-1])
-            if row is not None and np.isfinite(safe_float(row["Close"])):
-                close_position(symbol, ALL_TIMESTAMPS[-1], safe_float(row["Close"]), "END_OF_TEST")
+        if side == "LONG":
 
-    if len(ALL_TIMESTAMPS) > 0:
-        update_equity(ALL_TIMESTAMPS[-1])
+            old_stop = p["stop"]
 
-    return {"capital": capital, "trades": closed_trades, "equity_curve": equity_curve}
+            if candle["Low"] <= old_stop:
 
-RESULT = run_backtest()
-trades_df = pd.DataFrame(closed_trades) if closed_trades else pd.DataFrame()
-equity_df = pd.DataFrame(equity_curve) if equity_curve else pd.DataFrame()
+                positions_to_close.append(
+                    (
+                        p,
+                        old_stop * (
+                            1 - SLIPPAGE
+                        ),
+                        "STOP"
+                    )
+                )
 
+                continue
 
-# ============================================================
-# FINAL REPORTING & METRICS
-# ============================================================
-
-def calculate_basic_stats(trades):
-    if trades is None or len(trades) == 0:
-        return {"trades": 0, "wins": 0, "losses": 0, "breakeven": 0, "win_rate": 0.0, "net_pnl": 0.0, "net_r": 0.0, "avg_pnl": 0.0, "avg_r": 0.0}
-    pnl = pd.to_numeric(trades["pnl"], errors="coerce").fillna(0.0)
-    r = pd.to_numeric(trades["R"], errors="coerce")
-    wins, losses, total = int((pnl > 0).sum()), int((pnl < 0).sum()), len(pnl)
-    valid_r = r[np.isfinite(r)]
-    return {
-        "trades": total, "wins": wins, "losses": losses, "breakeven": int((pnl == 0).sum()),
-        "win_rate": (wins / total * 100) if total > 0 else 0.0, "net_pnl": float(pnl.sum()),
-        "net_r": float(valid_r.sum()) if len(valid_r) > 0 else 0.0, "avg_pnl": float(pnl.mean()),
-        "avg_r": float(valid_r.mean()) if len(valid_r) > 0 else 0.0
-    }
-
-def calculate_loss_streaks(trades):
-    if trades is None or len(trades) == 0:
-        return {"max_streak": 0, "average_streak": 0.0, "total_streaks": 0, "streak_counts": {}, "losses_inside_streaks": 0}
-    current, streaks = 0, []
-    for _, trade in trades.iterrows():
-        pnl = safe_float(trade["pnl"])
-        if np.isfinite(pnl) and pnl < 0:
-            current += 1
         else:
-            if current > 0:
-                streaks.append(current)
-                current = 0
-    if current > 0:
-        streaks.append(current)
-    if not streaks:
-        return {"max_streak": 0, "average_streak": 0.0, "total_streaks": 0, "streak_counts": {}, "losses_inside_streaks": 0}
-    counts = {}
-    for length in streaks:
-        counts[length] = counts.get(length, 0) + 1
-    return {"max_streak": max(streaks), "average_streak": sum(streaks) / len(streaks), "total_streaks": len(streaks), "streak_counts": counts, "losses_inside_streaks": sum(streaks)}
 
-def calculate_drawdown_stats(trades):
-    if trades is None or len(trades) == 0:
-        return {"max_dd_dollar": 0.0, "max_dd_pct": 0.0, "peak_capital": INITIAL_CAPITAL, "trough_capital": INITIAL_CAPITAL}
-    cap = pd.to_numeric(trades["capital_after"], errors="coerce").dropna()
-    if len(cap) == 0:
-        return {"max_dd_dollar": 0.0, "max_dd_pct": 0.0, "peak_capital": INITIAL_CAPITAL, "trough_capital": INITIAL_CAPITAL}
-    peak = cap.cummax()
-    dd_dl = cap - peak
-    dd_pct = dd_dl / peak * 100
-    min_idx = dd_dl.idxmin()
-    return {"max_dd_dollar": float(dd_dl.min()), "max_dd_pct": float(dd_pct.min()), "peak_capital": float(peak.loc[min_idx]), "trough_capital": float(cap.loc[min_idx])}
+            old_stop = p["stop"]
 
-def print_final_report():
-    stats = calculate_basic_stats(trades_df)
-    dd = calculate_drawdown_stats(trades_df)
-    streaks = calculate_loss_streaks(trades_df)
-    
-    print("\n\n" + "=" * 80 + "\n🔥🔥🔥 HUNTER-V76 FINAL REPORT 🔥🔥🔥\n" + "=" * 80)
-    print(f"Initial Capital : ${INITIAL_CAPITAL:,.2f}")
-    print(f"Final Capital   : ${capital:,.2f}")
-    print(f"Net PnL         : ${stats['net_pnl']:,.2f}")
-    print(f"Return          : {((capital - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100):.2f}%")
-    print(f"Win Rate        : {stats['win_rate']:.2f}% | Trades: {stats['trades']} (Wins: {stats['wins']}, Losses: {stats['losses']})")
-    print(f"Max Drawdown    : ${dd['max_dd_dollar']:,.2f} ({dd['max_dd_pct']:.2f}%)")
-    print(f"Max Loss Streak : {streaks['max_streak']} | Avg Loss Streak: {streaks['average_streak']:.2f}")
-    print("=" * 80)
+            if candle["High"] >= old_stop:
 
-print_final_report()
+                positions_to_close.append(
+                    (
+                        p,
+                        old_stop * (
+                            1 + SLIPPAGE
+                        ),
+                        "STOP"
+                    )
+                )
+
+                continue
+
+        # ----------------------------------------------------
+        # TIMEOUT
+        # ----------------------------------------------------
+
+        if p["bars"] >= TIMEOUT_CANDLES:
+
+            exit_price = float(
+                candle["Close"]
+            )
+
+            positions_to_close.append(
+                (
+                    p,
+                    exit_price,
+                    "TIMEOUT"
+                )
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # UPDATE TRAILING STOP
+        #
+        # Do NOT recheck this updated stop on the same candle.
+        # ----------------------------------------------------
+
+        atr = float(candle["ATR"])
+
+        if side == "LONG":
+
+            new_stop = (
+                candle["Close"]
+                - atr *
+                TRAILING_ATR_MULTIPLIER
+            )
+
+            if new_stop > p["stop"]:
+
+                p["stop"] = new_stop
+
+        else:
+
+            new_stop = (
+                candle["Close"]
+                + atr *
+                TRAILING_ATR_MULTIPLIER
+            )
+
+            if new_stop < p["stop"]:
+
+                p["stop"] = new_stop
+
+    # --------------------------------------------------------
+    # Execute closes
+    # --------------------------------------------------------
+
+    for p, exit_price, reason in positions_to_close:
+
+        if p not in open_positions:
+            continue
+
+        close_position(
+            p,
+            exit_price,
+            timestamp,
+            reason
+        )
+
+        open_positions.remove(p)
+
+
+    # ========================================================
+    # 2. GET BTC REGIME
+    # ========================================================
+
+    if timestamp not in BTC.index:
+
+        continue
+
+    btc = BTC.loc[timestamp]
+
+    btc_close = float(
+        btc["Close"]
+    )
+
+    btc_ema50 = float(
+        btc["EMA50"]
+    )
+
+    btc_ema200 = float(
+        btc["EMA200"]
+    )
+
+    btc_mom_long = float(
+        btc["Mom_Long"]
+    )
+
+    # --------------------------------------------------------
+    # V77 BTC regime
+    # --------------------------------------------------------
+
+    btc_bull = (
+        btc_close > btc_ema200
+        and
+        btc_ema50 > btc_ema200
+        and
+        btc_mom_long > 0
+    )
+
+    btc_bear = (
+        btc_close < btc_ema200
+        and
+        btc_ema50 < btc_ema200
+        and
+        btc_mom_long < 0
+    )
+
+
+    # ========================================================
+    # 3. MARKET BREADTH
+    # ========================================================
+
+    active_symbols = 0
+
+    bullish_symbols = 0
+
+    for name in valid_symbols:
+
+        df = DATA[name]
+
+        if timestamp not in df.index:
+            continue
+
+        row = df.loc[timestamp]
+
+        if pd.isna(row["EMA200"]):
+            continue
+
+        active_symbols += 1
+
+        if row["Close"] > row["EMA200"]:
+
+            bullish_symbols += 1
+
+
+    if active_symbols > 0:
+
+        breadth_ratio = (
+            bullish_symbols /
+            active_symbols
+        )
+
+    else:
+
+        breadth_ratio = 0.5
+
+
+    # ========================================================
+    # 4. MARKET PERMISSIONS
+    # ========================================================
+
+    allow_longs = (
+        btc_bull
+        and
+        breadth_ratio >=
+        LONG_BREADTH_MIN
+    )
+
+    allow_shorts = (
+        btc_bear
+        and
+        breadth_ratio <=
+        SHORT_BREADTH_MAX
+    )
+
+
+    # ========================================================
+    # 5. BUILD CANDIDATES
+    # ========================================================
+
+    long_candidates = []
+
+    short_candidates = []
+
+
+    for name in valid_symbols:
+
+        if name == "BTC":
+
+            # BTC itself can trade,
+            # but still follows all filters.
+            pass
+
+
+        df = DATA[name]
+
+        if timestamp not in df.index:
+
+            continue
+
+        row = df.loc[timestamp]
+
+        filter_stats[
+            "total_symbol_checks"
+        ] += 1
+
+
+        # ----------------------------------------------------
+        # Already open?
+        # ----------------------------------------------------
+
+        if any(
+            p["name"] == name
+            for p in open_positions
+        ):
+
+            filter_stats[
+                "already_open_rejected"
+            ] += 1
+
+            continue
+
+
+        # ----------------------------------------------------
+        # Basic values
+        # ----------------------------------------------------
+
+        close = float(row["Close"])
+
+        ema20 = float(row["EMA20"])
+
+        ema50 = float(row["EMA50"])
+
+        ema200 = float(row["EMA200"])
+
+        atr = float(row["ATR"])
+
+        atr_pct = float(row["ATR_Pct"])
+
+        mom_short = float(
+            row["Mom_Short"]
+        )
+
+        mom_long = float(
+            row["Mom_Long"]
+        )
+
+        prev_low = float(
+            row["Prev_Low"]
+        )
+
+        prev_high = float(
+            row["Prev_High"]
+        )
+
+        prev_ema20 = float(
+            row["Prev_EMA20"]
+        )
+
+
+        # ----------------------------------------------------
+        # Relative Momentum
+        # ----------------------------------------------------
+
+        relative_momentum = (
+            mom_long -
+            btc_mom_long
+        )
+
+
+        # ====================================================
+        # LONG
+        # ====================================================
+
+        long_ok = True
+
+        # ----------------------------------------------------
+        # BTC regime
+        # ----------------------------------------------------
+
+        if not btc_bull:
+
+            long_ok = False
+
+            filter_stats[
+                "btc_regime_rejected"
+            ] += 1
+
+        # ----------------------------------------------------
+        # Breadth
+        # ----------------------------------------------------
+
+        if long_ok:
+
+            if breadth_ratio < LONG_BREADTH_MIN:
+
+                long_ok = False
+
+                filter_stats[
+                    "breadth_rejected"
+                ] += 1
+
+        # ----------------------------------------------------
+        # Relative momentum
+        # ----------------------------------------------------
+
+        if long_ok and REQUIRE_RELATIVE_MOMENTUM:
+
+            if relative_momentum <= 0:
+
+                long_ok = False
+
+                filter_stats[
+                    "relative_momentum_rejected"
+                ] += 1
+
+        # ----------------------------------------------------
+        # ATR filter
+        # ----------------------------------------------------
+
+        if long_ok:
+
+            if atr_pct > ATR_MAX_PCT:
+
+                long_ok = False
+
+                filter_stats[
+                    "atr_rejected"
+                ] += 1
+
+        # ----------------------------------------------------
+        # Extreme momentum
+        # ----------------------------------------------------
+
+        if long_ok:
+
+            if not (
+                mom_long >
+                MOM_LONG_LONG_MIN
+                and
+                mom_long <
+                MAX_MOM
+            ):
+
+                long_ok = False
+
+                filter_stats[
+                    "extreme_momentum_rejected"
+                ] += 1
+
+        # ----------------------------------------------------
+        # Trend
+        # ----------------------------------------------------
+
+        if long_ok:
+
+            if not (
+                close > ema20
+                and
+                ema20 > ema50
+                and
+                close > ema200
+            ):
+
+                long_ok = False
+
+                filter_stats[
+                    "trend_rejected"
+                ] += 1
+
+        # ----------------------------------------------------
+        # Short momentum
+        # ----------------------------------------------------
+
+        if long_ok:
+
+            if mom_short <= MOM_SHORT_LONG_MIN:
+
+                long_ok = False
+
+                filter_stats[
+                    "momentum_rejected"
+                ] += 1
+
+        # ----------------------------------------------------
+        # Pullback
+        # ----------------------------------------------------
+
+        if long_ok:
+
+            if not (
+                prev_low <=
+                prev_ema20 * 1.015
+            ):
+
+                long_ok = False
+
+                filter_stats[
+                    "pullback_rejected"
+                ] += 1
+
+
+        if long_ok:
+
+            # ------------------------------------------------
+            # Stop distance
+            # ------------------------------------------------
+
+            stop = (
+                close -
+                atr *
+                INITIAL_ATR_MULTIPLIER
+            )
+
+            sl_dist_pct = (
+                close - stop
+            ) / close
+
+            if not (
+                0.01 <=
+                sl_dist_pct <=
+                0.04
+            ):
+
+                long_ok = False
+
+            else:
+
+                long_candidates.append({
+
+                    "name": name,
+
+                    "side": "LONG",
+
+                    "score": float(
+                        mom_long
+                    ),
+
+                    "row": row,
+
+                    "atr": atr,
+
+                    "atr_pct": atr_pct,
+
+                    "mom_short": mom_short,
+
+                    "mom_long": mom_long,
+
+                    "relative_momentum":
+                        relative_momentum,
+
+                    "breadth":
+                        breadth_ratio,
+
+                    "btc_mom_long":
+                        btc_mom_long,
+
+                    "stop":
+                        stop,
+
+                    "sl_dist_pct":
+                        sl_dist_pct,
+                })
+
+
+        # ====================================================
+        # SHORT
+        # ====================================================
+
+        short_ok = True
+
+        # ----------------------------------------------------
+        # BTC regime
+        # ----------------------------------------------------
+
+        if not btc_bear:
+
+            short_ok = False
+
+            filter_stats[
+                "btc_regime_rejected"
+            ] += 1
+
+        # ----------------------------------------------------
+        # Breadth
+        # ----------------------------------------------------
+
+        if short_ok:
+
+            if breadth_ratio > SHORT_BREADTH_MAX:
+
+                short_ok = False
+
+                filter_stats[
+                    "breadth_rejected"
+                ] += 1
+
+        # ----------------------------------------------------
+        # Relative momentum
+        # ----------------------------------------------------
+
+        if short_ok and REQUIRE_RELATIVE_MOMENTUM:
+
+            if relative_momentum >= 0:
+
+                short_ok = False
+
+                filter_stats[
+                    "relative_momentum_rejected"
+                ] += 1
+
+        # ----------------------------------------------------
+        # ATR
+        # ----------------------------------------------------
+
+        if short_ok:
+
+            if atr_pct > ATR_MAX_PCT:
+
+                short_ok = False
+
+                filter_stats[
+                    "atr_rejected"
+                ] += 1
+
+        # ----------------------------------------------------
+        # Extreme momentum
+        # ----------------------------------------------------
+
+        if short_ok:
+
+            if not (
+                mom_long <
+                MOM_LONG_SHORT_MAX
+                and
+                mom_long >
+                -MAX_MOM
+            ):
+
+                short_ok = False
+
+                filter_stats[
+                    "extreme_momentum_rejected"
+                ] += 1
+
+        # ----------------------------------------------------
+        # Trend
+        # ----------------------------------------------------
+
+        if short_ok:
+
+            if not (
+                close < ema20
+                and
+                ema20 < ema50
+                and
+                close < ema200
+            ):
+
+                short_ok = False
+
+                filter_stats[
+                    "trend_rejected"
+                ] += 1
+
+        # ----------------------------------------------------
+        # Momentum
+        # ----------------------------------------------------
+
+        if short_ok:
+
+            if mom_short >= MOM_SHORT_SHORT_MAX:
+
+                short_ok = False
+
+                filter_stats[
+                    "momentum_rejected"
+                ] += 1
+
+        # ----------------------------------------------------
+        # Pullback
+        # ----------------------------------------------------
+
+        if short_ok:
+
+            if not (
+                prev_high >=
+                prev_ema20 * 0.985
+            ):
+
+                short_ok = False
+
+                filter_stats[
+                    "pullback_rejected"
+                ] += 1
+
+
+        if short_ok:
+
+            stop = (
+                close +
+                atr *
+                INITIAL_ATR_MULTIPLIER
+            )
+
+            sl_dist_pct = (
+                stop - close
+            ) / close
+
+            if not (
+                0.01 <=
+                sl_dist_pct <=
+                0.04
+            ):
+
+                short_ok = False
+
+            else:
+
+                short_candidates.append({
+
+                    "name": name,
+
+                    "side": "SHORT",
+
+                    "score": float(
+                        -mom_long
+                    ),
+
+                    "row": row,
+
+                    "atr": atr,
+
+                    "atr_pct": atr_pct,
+
+                    "mom_short": mom_short,
+
+                    "mom_long": mom_long,
+
+                    "relative_momentum":
+                        relative_momentum,
+
+                    "breadth":
+                        breadth_ratio,
+
+                    "btc_mom_long":
+                        btc_mom_long,
+
+                    "stop":
+                        stop,
+
+                    "sl_dist_pct":
+                        sl_dist_pct,
+                })
+
+
+    # ========================================================
+    # 6. RANK
+    # ========================================================
+
+    long_candidates.sort(
+        key=lambda x: float(x["score"]),
+        reverse=True
+    )
+
+    short_candidates.sort(
+        key=lambda x: float(x["score"]),
+        reverse=True
+    )
+
+
+    # ========================================================
+    # 7. ENTRY
+    # ========================================================
+
+    slots_available = (
+        MAX_POSITIONS -
+        len(open_positions)
+    )
+
+
+    # --------------------------------------------------------
+    # LONG entries
+    # --------------------------------------------------------
+
+    if allow_longs and slots_available > 0:
+
+        current_longs = count_direction(
+            "LONG"
+        )
+
+        for candidate in long_candidates:
+
+            if slots_available <= 0:
+                break
+
+            if current_longs >= MAX_LONG_POSITIONS:
+
+                filter_stats[
+                    "direction_limit_rejected"
+                ] += 1
+
+                break
+
+            # ------------------------------------------------
+            # SAME-CANDLE OPEN
+            #
+            # Kept intentionally for V74/V75/V76
+            # comparability.
+            #
+            # IMPORTANT:
+            # This remains a look-ahead bias because the
+            # signal uses current candle Close.
+            # A clean no-lookahead benchmark should be run
+            # separately.
+            # ------------------------------------------------
+
+            row = candidate["row"]
+
+            entry = (
+                float(row["Open"]) *
+                (1 + SLIPPAGE)
+            )
+
+            atr = candidate["atr"]
+
+            stop = (
+                entry -
+                atr *
+                INITIAL_ATR_MULTIPLIER
+            )
+
+            sl_dist_pct = (
+                entry - stop
+            ) / entry
+
+            if not (
+                0.01 <=
+                sl_dist_pct <=
+                0.04
+            ):
+                continue
+
+            margin = TRADE_MARGIN
+
+            notional = (
+                margin *
+                LEVERAGE
+            )
+
+            qty = (
+                notional /
+                entry
+            )
+
+            position = {
+
+                "name":
+                    candidate["name"],
+
+                "side":
+                    "LONG",
+
+                "entry":
+                    entry,
+
+                "qty":
+                    qty,
+
+                "margin":
+                    margin,
+
+                "notional":
+                    notional,
+
+                "stop":
+                    stop,
+
+                "initial_stop":
+                    stop,
+
+                "bars":
+                    0,
+
+                "last_price":
+                    entry,
+
+                "entry_atr":
+                    atr,
+
+                "entry_atr_pct":
+                    candidate["atr_pct"],
+
+                "entry_mom_short":
+                    candidate["mom_short"],
+
+                "entry_mom_long":
+                    candidate["mom_long"],
+
+                "entry_relative_mom":
+                    candidate[
+                        "relative_momentum"
+                    ],
+
+                "entry_breadth":
+                    candidate[
+                        "breadth"
+                    ],
+
+                "entry_btc_mom_long":
+                    candidate[
+                        "btc_mom_long"
+                    ],
+
+                "initial_sl_distance_pct":
+                    sl_dist_pct,
+            }
+
+            open_positions.append(
+                position
+            )
+
+            current_longs += 1
+
+            slots_available -= 1
+
+            filter_stats[
+                "accepted_candidates"
+            ] += 1
+
+
+    # --------------------------------------------------------
+    # SHORT entries
+    # --------------------------------------------------------
+
+    if allow_shorts and slots_available > 0:
+
+        current_shorts = count_direction(
+            "SHORT"
+        )
+
+        for candidate in short_candidates:
+
+            if slots_available <= 0:
+                break
+
+            if current_shorts >= MAX_SHORT_POSITIONS:
+
+                filter_stats[
+                    "direction_limit_rejected"
+                ] += 1
+
+                break
+
+            row = candidate["row"]
+
+            entry = (
+                float(row["Open"]) *
+                (1 - SLIPPAGE)
+            )
+
+            atr = candidate["atr"]
+
+            stop = (
+                entry +
+                atr *
+                INITIAL_ATR_MULTIPLIER
+            )
+
+            sl_dist_pct = (
+                stop - entry
+            ) / entry
+
+            if not (
+                0.01 <=
+                sl_dist_pct <=
+                0.04
+            ):
+                continue
+
+            margin = TRADE_MARGIN
+
+            notional = (
+                margin *
+                LEVERAGE
+            )
+
+            qty = (
+                notional /
+                entry
+            )
+
+            position = {
+
+                "name":
+                    candidate["name"],
+
+                "side":
+                    "SHORT",
+
+                "entry":
+                    entry,
+
+                "qty":
+                    qty,
+
+                "margin":
+                    margin,
+
+                "notional":
+                    notional,
+
+                "stop":
+                    stop,
+
+                "initial_stop":
+                    stop,
+
+                "bars":
+                    0,
+
+                "last_price":
+                    entry,
+
+                "entry_atr":
+                    atr,
+
+                "entry_atr_pct":
+                    candidate["atr_pct"],
+
+                "entry_mom_short":
+                    candidate["mom_short"],
+
+                "entry_mom_long":
+                    candidate["mom_long"],
+
+                "entry_relative_mom":
+                    candidate[
+                        "relative_momentum"
+                    ],
+
+                "entry_breadth":
+                    candidate[
+                        "breadth"
+                    ],
+
+                "entry_btc_mom_long":
+                    candidate[
+                        "btc_mom_long"
+                    ],
+
+                "initial_sl_distance_pct":
+                    sl_dist_pct,
+            }
+
+            open_positions.append(
+                position
+            )
+
+            current_shorts += 1
+
+            slots_available -= 1
+
+            filter_stats[
+                "accepted_candidates"
+            ] += 1
+
+
+    # ========================================================
+    # 8. EQUITY
+    # ========================================================
+
+    equity = calculate_unrealized_equity()
+
+    equity_curve.append({
+
+        "Timestamp":
+            timestamp,
+
+        "Capital":
+            capital,
+
+        "Equity":
+            equity,
+
+        "OpenPositions":
+            len(open_positions),
+
+        "LongPositions":
+            count_direction("LONG"),
+
+        "ShortPositions":
+            count_direction("SHORT"),
+
+        "Breadth":
+            breadth_ratio,
+
+        "BTC_MomLong":
+            btc_mom_long,
+
+        "BTC_Bull":
+            btc_bull,
+
+        "BTC_Bear":
+            btc_bear,
+    })
+
+
+    # ========================================================
+    # 9. DRAWDOWN
+    # ========================================================
+
+    if equity > peak_equity:
+
+        peak_equity = equity
+
+    dd_dollar = (
+        equity -
+        peak_equity
+    )
+
+    dd_pct = (
+        dd_dollar /
+        peak_equity
+        if peak_equity > 0
+        else 0
+    )
+
+    if dd_dollar < max_drawdown_dollar:
+
+        max_drawdown_dollar = (
+            dd_dollar
+        )
+
+    if dd_pct < max_drawdown_pct:
+
+        max_drawdown_pct = (
+            dd_pct
+        )
+
+
+# ============================================================
+# FORCE CLOSE REMAINING POSITIONS
+# ============================================================
+
+if open_positions:
+
+    final_timestamp = ALL_TIMESTAMPS[-1]
+
+    for p in list(open_positions):
+
+        name = p["name"]
+
+        df = DATA[name]
+
+        if final_timestamp in df.index:
+
+            final_price = float(
+                df.loc[
+                    final_timestamp,
+                    "Close"
+                ]
+            )
+
+        else:
+
+            final_price = p["last_price"]
+
+        close_position(
+            p,
+            final_price,
+            final_timestamp,
+            "END"
+        )
+
+        open_positions.remove(p)
+
+
+# ============================================================
+# TRADES DATAFRAME
+# ============================================================
+
+trades_df = pd.DataFrame(
+    closed_trades
+)
+
+
+if trades_df.empty:
+
+    print()
+    print("NO TRADES GENERATED.")
+    sys.exit(0)
+
+
+# ============================================================
+# BASIC STATS
+# ============================================================
+
+total_trades = len(
+    trades_df
+)
+
+wins_df = trades_df[
+    trades_df["PnL"] > 0
+]
+
+losses_df = trades_df[
+    trades_df["PnL"] <= 0
+]
+
+wins = len(wins_df)
+
+losses = len(losses_df)
+
+win_rate = (
+    wins /
+    total_trades *
+    100
+)
+
+net_pnl = trades_df[
+    "PnL"
+].sum()
+
+net_r = trades_df[
+    "R"
+].sum()
+
+final_capital = (
+    INITIAL_CAPITAL +
+    net_pnl
+)
+
+
+# ============================================================
+# LOSS STREAK ANALYSIS
+# ============================================================
+
+results = [
+    1 if x > 0 else 0
+    for x in trades_df["PnL"]
+]
+
+streaks = []
+
+current_streak = 0
+
+for result in results:
+
+    if result == 0:
+
+        current_streak += 1
+
+    else:
+
+        if current_streak > 0:
+
+            streaks.append(
+                current_streak
+            )
+
+        current_streak = 0
+
+
+if current_streak > 0:
+
+    streaks.append(
+        current_streak
+    )
+
+
+if streaks:
+
+    max_loss_streak = max(
+        streaks
+    )
+
+    avg_loss_streak = np.mean(
+        streaks
+    )
+
+else:
+
+    max_loss_streak = 0
+
+    avg_loss_streak = 0
+
+
+# ------------------------------------------------------------
+# Exact distribution
+# ------------------------------------------------------------
+
+streak_distribution = {}
+
+for s in streaks:
+
+    streak_distribution[s] = (
+        streak_distribution.get(s, 0)
+        + 1
+    )
+
+
+streak_rows = []
+
+for length, count in sorted(
+    streak_distribution.items()
+):
+
+    streak_rows.append({
+
+        "LossStreak":
+            length,
+
+        "Occurrences":
+            count,
+    })
+
+
+streak_df = pd.DataFrame(
+    streak_rows
+)
+
+
+# ============================================================
+# PORTFOLIO DRAW DOWN FROM EQUITY CURVE
+# ============================================================
+
+equity_df = pd.DataFrame(
+    equity_curve
+)
+
+if not equity_df.empty:
+
+    equity_df["Peak"] = (
+        equity_df["Equity"]
+        .cummax()
+    )
+
+    equity_df["DrawdownDollar"] = (
+        equity_df["Equity"] -
+        equity_df["Peak"]
+    )
+
+    equity_df["DrawdownPct"] = np.where(
+        equity_df["Peak"] != 0,
+        equity_df["DrawdownDollar"] /
+        equity_df["Peak"] * 100,
+        0
+    )
+
+    portfolio_max_dd_dollar = (
+        equity_df[
+            "DrawdownDollar"
+        ].min()
+    )
+
+    portfolio_max_dd_pct = (
+        equity_df[
+            "DrawdownPct"
+        ].min()
+    )
+
+else:
+
+    portfolio_max_dd_dollar = 0
+
+    portfolio_max_dd_pct = 0
+
+
+# ============================================================
+# LONG / SHORT STATS
+# ============================================================
+
+def direction_stats(df, side):
+
+    x = df[
+        df["Side"] == side
+    ]
+
+    if x.empty:
+
+        return {
+
+            "Trades": 0,
+
+            "Wins": 0,
+
+            "Losses": 0,
+
+           
