@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V71 (Golden Core + Global Portfolio Circuit Breaker)
+# HUNTER-V72 (Golden Core + ADX Trend Filter for Streak Control)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -56,6 +56,7 @@ TRAILING_ATR_MULTIPLIER = 2.0
 INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
+ADX_THRESHOLD = 22  # آستانه قدرت روند برای جلوگیری از فیک‌اوت
 
 # تنظیمات مالی
 INITIAL_CAPITAL = 1000.0
@@ -66,7 +67,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V71 (هسته طلایی + مدارشکن سراسری سبد)")
+print("📥 دریافت داده‌ها - HUNTER-V72 (هسته طلایی + فیلتر ADX)")
 print("=" * 60)
 
 processed_data = {}
@@ -138,7 +139,22 @@ def fetch_symbol_data(lbank_symbol):
     tr1 = df["High"] - df["Low"]
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
-    df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["ATR"] = tr.rolling(ATR_PERIOD).mean()
+
+    # محاسبه ADX برای سنجش قدرت روند
+    plus_dm = df["High"].diff()
+    minus_dm = df["Low"].diff()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm > 0] = 0
+    minus_dm = abs(minus_dm)
+
+    plus_di = 100 * (plus_dm.rolling(ATR_PERIOD).mean() / df["ATR"])
+    minus_di = 100 * (minus_dm.rolling(ATR_PERIOD).mean() / df["ATR"])
+    sum_di = plus_di + minus_di
+    sum_di = sum_di.replace(0, 1) # جلوگیری از تقسیم بر صفر
+    dx = 100 * abs(plus_di - minus_di) / sum_di
+    df["ADX"] = dx.rolling(ATR_PERIOD).mean()
 
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
@@ -156,7 +172,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V71...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V72...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -166,15 +182,7 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     
-    # متغیرهای مدارشکن سراسری سبد
-    global_consecutive_losses = 0
-    global_cooldown_candles = 0
-    
     for ts in all_timestamps:
-        # کاهش تایمر استراحت کلی بازار در هر کندل جدید
-        if global_cooldown_candles > 0:
-            global_cooldown_candles -= 1
-
         symbols_to_close = []
         
         for symbol, pos in list(active_positions.items()):
@@ -218,15 +226,6 @@ def run_backtest(processed_data):
                 position_notional = TRADE_MARGIN * LEVERAGE
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
                 
-                # بروزرسانی وضعیت مدارشکن سراسری
-                if outcome == "LOSS":
-                    global_consecutive_losses += 1
-                    if global_consecutive_losses >= 2:
-                        global_cooldown_candles = 2  # ۲ کندل (۸ ساعت) توقف کامل کل ربات
-                else:
-                    global_consecutive_losses = 0
-                    global_cooldown_candles = 0
-
                 all_trades.append({
                     "Timestamp": ts,
                     "Symbol": symbol,
@@ -240,10 +239,6 @@ def run_backtest(processed_data):
         
         for sym in symbols_to_close:
             del active_positions[sym]
-        
-        # اگر مدارشکن سراسری فعال است، اجازه باز کردن پوزیشن جدید را نده
-        if global_cooldown_candles > 0:
-            continue
         
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -281,6 +276,11 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
             
+            # بررسی فیلتر قدرت روند ADX
+            adx_ok = (not np.isnan(c4h["ADX"])) and (c4h["ADX"] > ADX_THRESHOLD)
+            if not adx_ok:
+                continue
+
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"]) and (c4h["EMA20"] > c4h["EMA50"]) and (c4h["Close"] > c4h["EMA200"])
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
@@ -313,7 +313,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با مدارشکن سراسری - HUNTER-V71")
+    print("📊 گزارش نهایی استراتژی با فیلتر ADX - HUNTER-V72")
     print("=" * 68)
 
     if trades_df.empty:
@@ -385,4 +385,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V71 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V72 به پایان رسید.")
