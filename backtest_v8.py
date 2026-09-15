@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V70 (Golden Core V67 + Smart Break-Even Mechanism)
+# HUNTER-V71 (Golden Core + Global Portfolio Circuit Breaker)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -66,7 +66,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V70 (هسته طلایی + مکانیزم Break-Even)")
+print("📥 دریافت داده‌ها - HUNTER-V71 (هسته طلایی + مدارشکن سراسری سبد)")
 print("=" * 60)
 
 processed_data = {}
@@ -156,7 +156,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V70...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V71...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -166,7 +166,15 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     
+    # متغیرهای مدارشکن سراسری سبد
+    global_consecutive_losses = 0
+    global_cooldown_candles = 0
+    
     for ts in all_timestamps:
+        # کاهش تایمر استراحت کلی بازار در هر کندل جدید
+        if global_cooldown_candles > 0:
+            global_cooldown_candles -= 1
+
         symbols_to_close = []
         
         for symbol, pos in list(active_positions.items()):
@@ -177,12 +185,6 @@ def run_backtest(processed_data):
             c4h = df.loc[ts]
             
             if pos["side"] == "LONG":
-                # بررسی رسیدن به سود معادل 1R برای فعال‌سازی Break-Even
-                current_unrealized_r = (c4h["High"] - pos["entry_price"]) / pos["initial_risk"]
-                if not pos["break_even_triggered"] and current_unrealized_r >= 1.0:
-                    pos["break_even_triggered"] = True
-                    pos["stop_loss"] = pos["entry_price"]  # انتقال استاپ به نقطه ورود
-                
                 if c4h["High"] > pos["highest_price"]:
                     pos["highest_price"] = c4h["High"]
                     new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
@@ -190,11 +192,6 @@ def run_backtest(processed_data):
                         pos["stop_loss"] = new_trailing_sl
                 hit_sl = c4h["Low"] <= pos["stop_loss"]
             else: # SHORT
-                current_unrealized_r = (pos["entry_price"] - c4h["Low"]) / pos["initial_risk"]
-                if not pos["break_even_triggered"] and current_unrealized_r >= 1.0:
-                    pos["break_even_triggered"] = True
-                    pos["stop_loss"] = pos["entry_price"]  # انتقال استاپ به نقطه ورود
-                
                 if c4h["Low"] < pos["lowest_price"]:
                     pos["lowest_price"] = c4h["Low"]
                     new_trailing_sl = pos["lowest_price"] + TRAILING_ATR_MULTIPLIER * c4h["ATR"]
@@ -221,6 +218,15 @@ def run_backtest(processed_data):
                 position_notional = TRADE_MARGIN * LEVERAGE
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
                 
+                # بروزرسانی وضعیت مدارشکن سراسری
+                if outcome == "LOSS":
+                    global_consecutive_losses += 1
+                    if global_consecutive_losses >= 2:
+                        global_cooldown_candles = 2  # ۲ کندل (۸ ساعت) توقف کامل کل ربات
+                else:
+                    global_consecutive_losses = 0
+                    global_cooldown_candles = 0
+
                 all_trades.append({
                     "Timestamp": ts,
                     "Symbol": symbol,
@@ -234,6 +240,10 @@ def run_backtest(processed_data):
         
         for sym in symbols_to_close:
             del active_positions[sym]
+        
+        # اگر مدارشکن سراسری فعال است، اجازه باز کردن پوزیشن جدید را نده
+        if global_cooldown_candles > 0:
+            continue
         
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -297,14 +307,13 @@ def run_backtest(processed_data):
                         "lowest_price": entry_price,
                         "initial_risk": initial_risk,
                         "entry_index": i,
-                        "break_even_triggered": False,
                     }
                     
     return pd.DataFrame(all_trades)
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با مکانیزم Break-Even - HUNTER-V70")
+    print("📊 گزارش نهایی استراتژی با مدارشکن سراسری - HUNTER-V71")
     print("=" * 68)
 
     if trades_df.empty:
@@ -376,4 +385,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V70 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V71 به پایان رسید.")
