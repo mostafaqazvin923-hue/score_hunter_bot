@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V77 (Golden Core + Cooldown + Volatility Filter + Score Entry)
+# HUNTER-V78 (Golden Core + ADX + Regime Classifier + Dynamic Risk + Correlation)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -52,7 +52,8 @@ MAX_POSITIONS = 5
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 ATR_PERIOD = 14
-TRAILING_ATR_MULTIPLIER = 2.0
+ADX_PERIOD = 14
+TRAILING_ATR_MULTIPLIER = 2.2  # اصلاح برای جلوگیری از خروج زودرس
 INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
@@ -66,7 +67,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V77 (کول‌دان + فیلتر نوسان + امتیازدهی)")
+print("📥 دریافت داده‌ها - HUNTER-V78 (رژیم سه حالته + ADX + ریسک پویا)")
 print("=" * 60)
 
 processed_data = {}
@@ -135,12 +136,29 @@ def fetch_symbol_data(lbank_symbol):
     if not deltas.empty and deltas.max() > pd.Timedelta(hours=4, minutes=10):
         return None
 
+    # محاسبه ATR و فیلترهای نوسان
     tr1 = df["High"] - df["Low"]
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
     df["ATR_Avg50"] = df["ATR"].rolling(50).mean()
     df["ATR_Ratio"] = df["ATR"] / df["ATR_Avg50"]
+
+    # محاسبه ADX و +DI / -DI
+    plus_dm = df["High"].diff()
+    minus_dm = df["Low"].diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+    
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr_val = tr.ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
+    
+    plus_di = 100 * pd.Series(plus_dm).ewm(alpha=1/ADX_PERIOD, adjust=False).mean() / atr_val
+    minus_di = 100 * pd.Series(minus_dm).ewm(alpha=1/ADX_PERIOD, adjust=False).mean() / atr_val
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+    df["ADX"] = dx.ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
+    df["Plus_DI"] = plus_di
+    df["Minus_DI"] = minus_di
 
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
@@ -158,7 +176,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V77...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V78...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -167,15 +185,9 @@ def run_backtest(processed_data):
     
     active_positions = {}
     all_trades = []
-    current_consecutive_losses = 0
-    consecutive_wins = 0
-    cooldown_candles_left = 0  # شمارشگر کول‌دان
+    dynamic_risk_factor = 1.0  # شروع با ریسک کامل (100%)
     
     for ts in all_timestamps:
-        # مدیریت کاهش کول‌دان در هر کندل جدید
-        if cooldown_candles_left > 0:
-            cooldown_candles_left -= 1
-
         symbols_to_close = []
         
         for symbol, pos in list(active_positions.items()):
@@ -217,19 +229,11 @@ def run_backtest(processed_data):
                 
                 outcome = "WIN" if r_real > 0 else "LOSS"
                 
-                # مدیریت زنجیره برد/باخت و کول‌دان پویا
-                if outcome == "LOSS":
-                    current_consecutive_losses += 1
-                    consecutive_wins = 0
-                    if current_consecutive_losses >= 8:
-                        cooldown_candles_left = max(cooldown_candles_left, 12)  # توقف طولانی
-                    elif current_consecutive_losses >= 5:
-                        cooldown_candles_left = max(cooldown_candles_left, 8)   # توقف 8 کندل
-                    elif current_consecutive_losses >= 3:
-                        cooldown_candles_left = max(cooldown_candles_left, 3)   # توقف 3 کندل
+                # مدیریت ریسک پویای واقعی (بدون از دست رفتن فرصت‌ها)
+                if outcome == "WIN":
+                    dynamic_risk_factor = min(1.5, dynamic_risk_factor + 0.10)  # افزایش تدریجی تا 150٪
                 else:
-                    current_consecutive_losses = 0
-                    consecutive_wins += 1
+                    dynamic_risk_factor = max(0.3, dynamic_risk_factor - 0.20)  # کاهش پله‌ای تا 30٪
 
                 position_notional = pos["used_margin"] * LEVERAGE
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
@@ -248,43 +252,35 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
         
-        # اگر در حالت کول‌دان هستیم، اجازه ورود جدید نداریم
-        if cooldown_candles_left > 0:
-            continue
+        current_trade_margin = BASE_TRADE_MARGIN * dynamic_risk_factor
 
-        # آنتی‌مارتینگل هوشمند برای تنظیم مارجین
-        if current_consecutive_losses >= 4:
-            current_trade_margin = BASE_TRADE_MARGIN * 0.2
-        elif current_consecutive_losses >= 3:
-            current_trade_margin = BASE_TRADE_MARGIN * 0.4
-        elif current_consecutive_losses >= 2:
-            current_trade_margin = BASE_TRADE_MARGIN * 0.7
-        elif consecutive_wins >= 2:
-            current_trade_margin = BASE_TRADE_MARGIN * 1.4
-        elif consecutive_wins == 1:
-            current_trade_margin = BASE_TRADE_MARGIN * 1.2
-        else:
-            current_trade_margin = BASE_TRADE_MARGIN
-
-        market_bull = True
         btc_c = None
+        market_trend = "RANGE"
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
             btc_c = processed_data["BTC"].loc[ts]
-            market_bull = btc_c["Close"] > btc_c["EMA200"]
-            # اگر باخت متوالی >= 8 است و بیت‌کوین زیر EMA50 است، کاملا متوقف بمان
-            if current_consecutive_losses >= 8 and btc_c["Close"] < btc_c["EMA50"]:
-                continue
+            adx_val = btc_c["ADX"]
+            atr_ratio = btc_c["ATR_Ratio"]
+            ema_dist = abs(btc_c["EMA50"] - btc_c["EMA200"]) / btc_c["EMA200"]
+            
+            # تشخیص رژیم بازار سه حالته
+            if atr_ratio > 1.5:
+                market_trend = "CHAOS"
+            elif adx_val > 20 and ema_dist >= 0.02:
+                market_trend = "TREND"
+            else:
+                market_trend = "RANGE"
 
-        # بررسی فیلتر نوسان بازار (ATR Ratio)
-        if btc_c is not None and not np.isnan(btc_c["ATR_Ratio"]) and btc_c["ATR_Ratio"] > 1.5:
+        # اگر بازار در حالت RANGE است، مطلقاً معامله ممنوع
+        if market_trend == "RANGE":
             continue
 
-        # فیلتر بازار رنج (فاصله EMA50 و EMA200 کمتر از 3 درصد باشد)
+        # اگر CHAOS است، مارجین را نصف کن
+        if market_trend == "CHAOS":
+            current_trade_margin *= 0.5
+
+        market_bull = True
         if btc_c is not None:
-            ema50_val = btc_c["EMA50"]
-            ema200_val = btc_c["EMA200"]
-            if abs(ema50_val - ema200_val) / ema200_val < 0.03:
-                continue
+            market_bull = btc_c["Close"] > btc_c["EMA200"]
 
         bullish_count = 0
         total_active_syms = 0
@@ -329,54 +325,57 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
             
+            # بررسی همبستگی با بیت‌کوین (اجازه حداکثر 2 پوزیشن با همبستگی بالا)
+            if symbol != "BTC" and "BTC" in processed_data and ts in processed_data["BTC"].index:
+                btc_df = processed_data["BTC"]
+                if ts in btc_df.index:
+                    recent_corr = df["Close"].iloc[i-30:i].corr(btc_df["Close"].iloc[i-30:i])
+                    if not np.isnan(recent_corr) and recent_corr > 0.85:
+                        high_corr_count = sum(1 for p_sym, p_data in active_positions.items() if p_sym != "BTC")
+                        if high_corr_count >= 2:
+                            continue
+
             if market_bull:
                 if not allow_longs:
                     continue
                 regime_ok = (c4h["Close"] > c4h["EMA20"]) and (c4h["EMA20"] > c4h["EMA50"]) and (c4h["Close"] > c4h["EMA200"])
+                adx_ok = c4h["ADX"] > 20 and c4h["Plus_DI"] > c4h["Minus_DI"]
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                mom_ok = (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
+                valid_signal = regime_ok and adx_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
                 side = "LONG"
             else:
                 if not allow_shorts:
                     continue
                 regime_ok = (c4h["Close"] < c4h["EMA20"]) and (c4h["EMA20"] < c4h["EMA50"]) and (c4h["Close"] < c4h["EMA200"])
+                adx_ok = c4h["ADX"] > 22 and c4h["Minus_DI"] > c4h["Plus_DI"]  # سخت‌گیری روی شورت
                 pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                mom_ok = (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.05)  # سخت‌گیری بیشتر روی شورت
+                mom_short_ok = (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.05)
+                valid_signal = regime_ok and adx_ok and pullback_ok and mom_short_ok and (market_breadth_ratio < 0.35)
                 side = "SHORT"
             
-            if regime_ok and pullback_ok and mom_ok:
-                # سیستم امتیازدهی به سیگنال (حداقل امتیاز 7 از 10 برای ورود)
-                signal_score = 0
-                if c4h["Close"] > c4h["EMA200"]: signal_score += 2
-                if side == "LONG" and c4h["EMA20"] > c4h["EMA50"]: signal_score += 2
-                if side == "SHORT" and c4h["EMA20"] < c4h["EMA50"]: signal_score += 2
-                if abs(c4h["Mom_Long"]) > 0.05: signal_score += 2
-                if market_bull == (side == "LONG"): signal_score += 2
-                if market_breadth_ratio >= 0.5 if side == "LONG" else market_breadth_ratio <= 0.5: signal_score += 2
-
-                if signal_score >= 7:
-                    entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
-                    initial_sl = (entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"]) if side == "LONG" else (entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"])
-                    initial_risk = abs(entry_price - initial_sl)
-                    sl_dist_pct = initial_risk / entry_price
-                    
-                    if 0.01 <= sl_dist_pct <= 0.04:
-                        active_positions[symbol] = {
-                            "side": side,
-                            "entry_price": entry_price,
-                            "stop_loss": initial_sl,
-                            "highest_price": entry_price,
-                            "lowest_price": entry_price,
-                            "initial_risk": initial_risk,
-                            "entry_index": i,
-                            "used_margin": current_trade_margin,
-                        }
+            if valid_signal:
+                entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
+                initial_sl = (entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"]) if side == "LONG" else (entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"])
+                initial_risk = abs(entry_price - initial_sl)
+                sl_dist_pct = initial_risk / entry_price
+                
+                if 0.01 <= sl_dist_pct <= 0.04:
+                    active_positions[symbol] = {
+                        "side": side,
+                        "entry_price": entry_price,
+                        "stop_loss": initial_sl,
+                        "highest_price": entry_price,
+                        "lowest_price": entry_price,
+                        "initial_risk": initial_risk,
+                        "entry_index": i,
+                        "used_margin": current_trade_margin,
+                    }
                     
     return pd.DataFrame(all_trades)
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی هوشمند - HUNTER-V77")
+    print("📊 گزارش نهایی استراتژی هوشمند - HUNTER-V78")
     print("=" * 68)
 
     if trades_df.empty:
@@ -448,4 +447,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V77 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V78 به پایان رسید.")
