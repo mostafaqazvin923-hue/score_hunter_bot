@@ -1,35 +1,33 @@
 # ============================================================
-# HUNTER-V77
-# Research Version
-#
-# Changes vs V76:
-# 1) BTC momentum regime
-# 2) Breadth: LONG >= 55%, SHORT <= 45%
-# 3) Relative momentum vs BTC
-# 4) ATR volatility filter
-# 5) Extreme momentum filter
-# 6) Max 3 positions per direction
-# 7) Fixed $100 margin
-# 8) Conservative trailing-stop management
-# 9) Detailed loss-streak analysis
-# 10) Per-symbol complete statistics
-# 11) Filter rejection diagnostics
+# HUNTER-V77 FIXED
+# ============================================================
+# 20 coins
+# BTC regime + BTC momentum
+# Breadth filter
+# Relative momentum vs BTC
+# ATR volatility filter
+# Extreme momentum filter
+# Max 3 positions per direction
+# Fixed $100 margin x 80 leverage
+# Conservative trailing stop
+# Detailed loss streak
+# Detailed per-symbol statistics
+# Filter diagnostics
+# CSV exports
 # ============================================================
 
-import os
 import sys
 import time
 import subprocess
 from datetime import datetime, timedelta
 
-# ------------------------------------------------------------
-# Install/import dependencies
-# ------------------------------------------------------------
+# ============================================================
+# DEPENDENCIES
+# ============================================================
 
 try:
     import ccxt
 except ImportError:
-    print("Installing ccxt...")
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install", "ccxt"]
     )
@@ -43,21 +41,23 @@ except ImportError:
     )
     import pandas as pd
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "numpy"]
+    )
+    import numpy as np
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-VERSION = "HUNTER-V77"
+VERSION = "HUNTER-V77-FIXED"
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
-
-# ------------------------------------------------------------
-# Portfolio
-# ------------------------------------------------------------
 
 INITIAL_CAPITAL = 1000.0
 
@@ -65,21 +65,11 @@ TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
 MAX_POSITIONS = 5
-
-# Maximum simultaneous positions in same direction
 MAX_LONG_POSITIONS = 3
 MAX_SHORT_POSITIONS = 3
 
-# ------------------------------------------------------------
-# Trading costs
-# ------------------------------------------------------------
-
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
-
-# ------------------------------------------------------------
-# Indicators
-# ------------------------------------------------------------
 
 ATR_PERIOD = 14
 
@@ -87,35 +77,21 @@ INITIAL_ATR_MULTIPLIER = 1.8
 TRAILING_ATR_MULTIPLIER = 2.0
 
 TIMEOUT_CANDLES = 45
-
 EMA_WARMUP = 200
 
-# ------------------------------------------------------------
-# V77 filters
-# ------------------------------------------------------------
+# ============================================================
+# V77 FILTERS
+# ============================================================
 
-# Breadth
 LONG_BREADTH_MIN = 0.55
 SHORT_BREADTH_MAX = 0.45
 
-# Relative momentum vs BTC
 REQUIRE_RELATIVE_MOMENTUM = True
 
-# ATR / Close
-#
-# 0.03 = 3%
-#
-# Candidate is rejected if ATR percentage is above this.
+# Maximum ATR / Close
 ATR_MAX_PCT = 0.03
 
-# Extreme momentum filter
-#
-# Long:
-#     0.035 < Mom_Long < 0.25
-#
-# Short:
-#    -0.25 < Mom_Long < -0.035
-#
+# Maximum 30-candle momentum
 MAX_MOM = 0.25
 
 # Original momentum thresholds
@@ -127,7 +103,7 @@ MOM_LONG_SHORT_MAX = -0.035
 
 
 # ============================================================
-# 20 COIN UNIVERSE
+# UNIVERSE
 # ============================================================
 
 SYMBOLS = {
@@ -155,7 +131,7 @@ SYMBOLS = {
 
 
 # ============================================================
-# LBank
+# EXCHANGE
 # ============================================================
 
 exchange = ccxt.lbank({
@@ -164,23 +140,22 @@ exchange = ccxt.lbank({
 
 
 # ============================================================
-# DATA FETCH
+# FETCH DATA
 # ============================================================
 
 def fetch_ohlcv_full(symbol, timeframe, since_ms, until_ms):
-    """
-    Fetch complete OHLCV history using LBank pagination.
-    """
 
-    all_rows = []
+    rows_all = []
 
     limit = 1000
-
     current_since = since_ms
 
     for attempt in range(3):
 
         try:
+
+            rows_all = []
+            current_since = since_ms
 
             while current_since < until_ms:
 
@@ -194,43 +169,39 @@ def fetch_ohlcv_full(symbol, timeframe, since_ms, until_ms):
                 if not rows:
                     break
 
-                all_rows.extend(rows)
+                rows_all.extend(rows)
 
                 last_ts = rows[-1][0]
 
-                # Protection against repeated pagination
                 if last_ts <= current_since:
                     break
 
                 current_since = last_ts + 1
 
-                # Small delay
-                time.sleep(exchange.rateLimit / 1000)
-
-                # If fewer than limit returned,
-                # probably reached available history
                 if len(rows) < limit:
                     break
+
+                time.sleep(
+                    max(exchange.rateLimit, 100) / 1000
+                )
 
             break
 
         except Exception as e:
 
             print(
-                f"  Fetch error {symbol}, attempt "
-                f"{attempt + 1}/3: {e}"
+                f"  Fetch error {symbol} "
+                f"attempt {attempt + 1}/3: {e}"
             )
 
             if attempt < 2:
                 time.sleep(3)
-                current_since = since_ms
-                all_rows = []
 
-    if not all_rows:
+    if not rows_all:
         return None
 
     df = pd.DataFrame(
-        all_rows,
+        rows_all,
         columns=[
             "Timestamp",
             "Open",
@@ -238,57 +209,80 @@ def fetch_ohlcv_full(symbol, timeframe, since_ms, until_ms):
             "Low",
             "Close",
             "Volume",
-        ]
+        ],
     )
 
     df["Timestamp"] = pd.to_datetime(
         df["Timestamp"],
         unit="ms",
-        utc=True
+        utc=True,
     )
 
     df = df.drop_duplicates(
         subset=["Timestamp"]
     )
 
-    df = df.sort_values("Timestamp")
+    df = df.sort_values(
+        "Timestamp"
+    )
 
+    # --------------------------------------------------------
     # Remove incomplete last candle
-    now_ms = int(time.time() * 1000)
+    # --------------------------------------------------------
 
     if len(df) > 0:
 
-        last_ms = int(
-            df["Timestamp"].iloc[-1].timestamp() * 1000
+        now_ms = int(
+            time.time() * 1000
         )
 
-        candle_duration_ms = 4 * 60 * 60 * 1000
+        last_ms = int(
+            df["Timestamp"].iloc[-1].timestamp()
+            * 1000
+        )
 
-        if last_ms + candle_duration_ms > now_ms:
+        candle_ms = (
+            4 * 60 * 60 * 1000
+        )
+
+        if (
+            last_ms + candle_ms
+            > now_ms
+        ):
+
             df = df.iloc[:-1]
 
     # --------------------------------------------------------
-    # Gap check
+    # Gap warning
     # --------------------------------------------------------
 
     if len(df) > 1:
 
-        diffs = df["Timestamp"].diff().dropna()
+        diffs = (
+            df["Timestamp"]
+            .diff()
+            .dropna()
+        )
 
-        max_gap = diffs.max()
+        if not diffs.empty:
 
-        expected = pd.Timedelta(hours=4)
+            max_gap = diffs.max()
 
-        tolerance = pd.Timedelta(minutes=10)
-
-        if max_gap > expected + tolerance:
-
-            print(
-                f"  WARNING: {symbol} has gap "
-                f"{max_gap}"
+            allowed_gap = (
+                pd.Timedelta(hours=4)
+                + pd.Timedelta(minutes=10)
             )
 
-    df = df.set_index("Timestamp")
+            if max_gap > allowed_gap:
+
+                print(
+                    f"  WARNING {symbol}: "
+                    f"largest gap = {max_gap}"
+                )
+
+    df = df.set_index(
+        "Timestamp"
+    )
 
     df = df.dropna()
 
@@ -303,39 +297,53 @@ def add_indicators(df):
 
     df = df.copy()
 
-    # --------------------------------------------------------
     # EMA
-    # --------------------------------------------------------
-
     df["EMA20"] = (
         df["Close"]
-        .ewm(span=20, adjust=False)
+        .ewm(
+            span=20,
+            adjust=False
+        )
         .mean()
     )
 
     df["EMA50"] = (
         df["Close"]
-        .ewm(span=50, adjust=False)
+        .ewm(
+            span=50,
+            adjust=False
+        )
         .mean()
     )
 
     df["EMA200"] = (
         df["Close"]
-        .ewm(span=200, adjust=False)
+        .ewm(
+            span=200,
+            adjust=False
+        )
         .mean()
     )
 
-    # --------------------------------------------------------
     # ATR
-    # --------------------------------------------------------
+    previous_close = (
+        df["Close"].shift(1)
+    )
 
-    prev_close = df["Close"].shift(1)
+    tr1 = (
+        df["High"] -
+        df["Low"]
+    )
 
-    tr1 = df["High"] - df["Low"]
+    tr2 = (
+        df["High"] -
+        previous_close
+    ).abs()
 
-    tr2 = (df["High"] - prev_close).abs()
-
-    tr3 = (df["Low"] - prev_close).abs()
+    tr3 = (
+        df["Low"] -
+        previous_close
+    ).abs()
 
     df["TR"] = pd.concat(
         [tr1, tr2, tr3],
@@ -344,14 +352,13 @@ def add_indicators(df):
 
     df["ATR"] = (
         df["TR"]
-        .rolling(ATR_PERIOD)
+        .rolling(
+            ATR_PERIOD
+        )
         .mean()
     )
 
-    # --------------------------------------------------------
     # Momentum
-    # --------------------------------------------------------
-
     df["Mom_Short"] = (
         df["Close"] /
         df["Close"].shift(10)
@@ -364,45 +371,43 @@ def add_indicators(df):
         - 1.0
     )
 
-    # --------------------------------------------------------
     # ATR percentage
-    # --------------------------------------------------------
-
     df["ATR_Pct"] = (
         df["ATR"] /
         df["Close"]
     )
 
-    # --------------------------------------------------------
-    # Previous candle values
-    # --------------------------------------------------------
+    # Previous values
+    df["Prev_Low"] = (
+        df["Low"].shift(1)
+    )
 
-    df["Prev_Low"] = df["Low"].shift(1)
+    df["Prev_High"] = (
+        df["High"].shift(1)
+    )
 
-    df["Prev_High"] = df["High"].shift(1)
+    df["Prev_EMA20"] = (
+        df["EMA20"].shift(1)
+    )
 
-    df["Prev_EMA20"] = df["EMA20"].shift(1)
+    df = df.dropna()
 
     return df
 
 
 # ============================================================
-# LOAD ALL DATA
+# LOAD DATA
 # ============================================================
 
 print("=" * 70)
 print(VERSION)
 print("=" * 70)
 
-print(
-    f"Fetching {LOOKBACK_DAYS} days of "
-    f"{TIMEFRAME} LBank data..."
-)
-
 end_time = datetime.utcnow()
 
-start_time = end_time - timedelta(
-    days=LOOKBACK_DAYS
+start_time = (
+    end_time -
+    timedelta(days=LOOKBACK_DAYS)
 )
 
 since_ms = int(
@@ -413,14 +418,16 @@ until_ms = int(
     end_time.timestamp() * 1000
 )
 
-
 DATA = {}
 
 valid_symbols = []
 
 for name, symbol in SYMBOLS.items():
 
-    print(f"Fetching {name} ...")
+    print(
+        f"Fetching {name} "
+        f"({symbol}) ..."
+    )
 
     try:
 
@@ -431,17 +438,20 @@ for name, symbol in SYMBOLS.items():
             until_ms
         )
 
-        if df is None or len(df) < EMA_WARMUP + 50:
+        if (
+            df is None
+            or len(df) <
+            EMA_WARMUP + 50
+        ):
 
             print(
-                f"  INVALID: insufficient data"
+                f"  INVALID: "
+                f"insufficient candles"
             )
 
             continue
 
         df = add_indicators(df)
-
-        df = df.dropna()
 
         if len(df) < EMA_WARMUP:
 
@@ -452,7 +462,6 @@ for name, symbol in SYMBOLS.items():
             continue
 
         DATA[name] = df
-
         valid_symbols.append(name)
 
         print(
@@ -468,22 +477,23 @@ for name, symbol in SYMBOLS.items():
 
 print()
 print(
-    f"{len(valid_symbols)}/{len(SYMBOLS)} "
-    f"valid symbols"
+    f"{len(valid_symbols)}/"
+    f"{len(SYMBOLS)} valid symbols"
 )
 
-print(valid_symbols)
-
+print(
+    ", ".join(valid_symbols)
+)
 
 if "BTC" not in DATA:
 
     raise RuntimeError(
-        "BTC data is required."
+        "BTC data unavailable."
     )
 
 
 # ============================================================
-# COMMON TIMESTAMPS
+# TIMESTAMPS
 # ============================================================
 
 ALL_TIMESTAMPS = sorted(
@@ -496,15 +506,11 @@ ALL_TIMESTAMPS = sorted(
 )
 
 
-# ============================================================
-# BTC DATA
-# ============================================================
-
 BTC = DATA["BTC"]
 
 
 # ============================================================
-# PORTFOLIO STATE
+# PORTFOLIO
 # ============================================================
 
 capital = INITIAL_CAPITAL
@@ -517,42 +523,26 @@ equity_curve = []
 
 peak_equity = INITIAL_CAPITAL
 
-max_drawdown_dollar = 0.0
-
-max_drawdown_pct = 0.0
-
 
 # ============================================================
 # FILTER DIAGNOSTICS
 # ============================================================
 
 filter_stats = {
-
-    "total_symbol_checks": 0,
-
-    "btc_regime_rejected": 0,
-
-    "breadth_rejected": 0,
-
-    "relative_momentum_rejected": 0,
-
-    "atr_rejected": 0,
-
-    "extreme_momentum_rejected": 0,
-
-    "trend_rejected": 0,
-
-    "momentum_rejected": 0,
-
-    "pullback_rejected": 0,
-
-    "already_open_rejected": 0,
-
-    "direction_limit_rejected": 0,
-
-    "max_positions_rejected": 0,
-
-    "accepted_candidates": 0,
+    "symbol_checks": 0,
+    "already_open": 0,
+    "btc_regime": 0,
+    "breadth": 0,
+    "relative_momentum": 0,
+    "atr": 0,
+    "extreme_momentum": 0,
+    "trend": 0,
+    "momentum": 0,
+    "pullback": 0,
+    "invalid_stop_distance": 0,
+    "accepted": 0,
+    "direction_limit": 0,
+    "position_limit": 0,
 }
 
 
@@ -564,40 +554,42 @@ def count_direction(direction):
 
     return sum(
         1
-        for p in open_positions
-        if p["side"] == direction
+        for position in open_positions
+        if position["side"] == direction
     )
 
 
-def calculate_unrealized_equity():
+def calculate_equity():
 
     equity = capital
 
-    for p in open_positions:
+    for position in open_positions:
 
-        name = p["name"]
+        current = position[
+            "last_price"
+        ]
 
-        side = p["side"]
+        entry = position[
+            "entry"
+        ]
 
-        entry = p["entry"]
+        qty = position[
+            "qty"
+        ]
 
-        current = p["last_price"]
+        if position["side"] == "LONG":
 
-        qty = p["qty"]
-
-        if side == "LONG":
-
-            raw_pnl = (
+            unrealized = (
                 current - entry
             ) * qty
 
         else:
 
-            raw_pnl = (
+            unrealized = (
                 entry - current
             ) * qty
 
-        equity += raw_pnl
+        equity += unrealized
 
     return equity
 
@@ -606,19 +598,15 @@ def close_position(
     position,
     exit_price,
     timestamp,
-    reason
+    reason,
 ):
 
     global capital
 
-    side = position["side"]
-
     entry = position["entry"]
-
     qty = position["qty"]
-
+    side = position["side"]
     margin = position["margin"]
-
     notional = position["notional"]
 
     if side == "LONG":
@@ -632,10 +620,6 @@ def close_position(
         raw_pnl = (
             entry - exit_price
         ) * qty
-
-    # --------------------------------------------------------
-    # Fees
-    # --------------------------------------------------------
 
     entry_fee = (
         notional *
@@ -657,16 +641,17 @@ def close_position(
         exit_fee
     )
 
-    pnl = raw_pnl - total_fee
+    pnl = (
+        raw_pnl -
+        total_fee
+    )
 
     capital += pnl
 
-    # --------------------------------------------------------
-    # R calculation
-    # --------------------------------------------------------
-
     sl_dist_pct = (
-        position["initial_sl_distance_pct"]
+        position[
+            "initial_sl_distance_pct"
+        ]
     )
 
     if sl_dist_pct > 0:
@@ -678,118 +663,110 @@ def close_position(
         )
 
         fee_r = (
-            (FEE_RATE * 2) /
-            sl_dist_pct
-        )
+            FEE_RATE * 2
+        ) / sl_dist_pct
 
-        r_real = raw_r - fee_r
+        real_r = (
+            raw_r -
+            fee_r
+        )
 
     else:
 
-        r_real = 0.0
+        real_r = 0.0
 
-    trade = {
+    closed_trades.append({
 
         "Timestamp": timestamp,
-
         "Symbol": position["name"],
-
         "Side": side,
-
         "Entry": entry,
-
         "Exit": exit_price,
-
         "Qty": qty,
-
         "Margin": margin,
-
         "Notional": notional,
-
         "RawPnL": raw_pnl,
-
         "Fees": total_fee,
-
         "PnL": pnl,
-
-        "R": r_real,
-
+        "R": real_r,
         "Reason": reason,
 
-        "EntryATR": position["entry_atr"],
+        "EntryATR":
+            position["entry_atr"],
 
-        "EntryATR_Pct": position["entry_atr_pct"],
+        "EntryATR_Pct":
+            position["entry_atr_pct"],
 
-        "EntryMomShort": position["entry_mom_short"],
+        "EntryMomShort":
+            position["entry_mom_short"],
 
-        "EntryMomLong": position["entry_mom_long"],
+        "EntryMomLong":
+            position["entry_mom_long"],
 
-        "EntryRelativeMom": position[
-            "entry_relative_mom"
-        ],
+        "EntryRelativeMom":
+            position["entry_relative_mom"],
 
-        "EntryBreadth": position[
-            "entry_breadth"
-        ],
+        "EntryBreadth":
+            position["entry_breadth"],
 
-        "EntryBTCMomLong": position[
-            "entry_btc_mom_long"
-        ],
-    }
-
-    closed_trades.append(trade)
+        "EntryBTCMomLong":
+            position["entry_btc_mom_long"],
+    })
 
 
 # ============================================================
-# MAIN BACKTEST LOOP
+# MAIN BACKTEST
 # ============================================================
 
 for timestamp in ALL_TIMESTAMPS:
 
     # ========================================================
-    # 1. MANAGE OPEN POSITIONS
+    # MANAGE OPEN POSITIONS
     # ========================================================
 
-    positions_to_close = []
+    to_close = []
 
-    for p in list(open_positions):
+    for position in list(open_positions):
 
-        name = p["name"]
+        name = position["name"]
 
-        df = DATA[name]
-
-        if timestamp not in df.index:
+        if timestamp not in DATA[name].index:
             continue
 
-        candle = df.loc[timestamp]
+        candle = DATA[name].loc[
+            timestamp
+        ]
 
-        p["last_price"] = float(
+        position["last_price"] = float(
             candle["Close"]
         )
 
-        p["bars"] += 1
+        position["bars"] += 1
 
-        side = p["side"]
+        side = position["side"]
 
         # ----------------------------------------------------
-        # FIRST:
-        # check existing stop BEFORE modifying trailing stop
-        #
-        # This avoids same-candle trail/recheck bias.
+        # Check OLD stop first
         # ----------------------------------------------------
+
+        old_stop = position["stop"]
 
         if side == "LONG":
 
-            old_stop = p["stop"]
+            if (
+                candle["Low"]
+                <= old_stop
+            ):
 
-            if candle["Low"] <= old_stop:
+                exit_price = (
+                    old_stop *
+                    (1 - SLIPPAGE)
+                )
 
-                positions_to_close.append(
+                to_close.append(
                     (
-                        p,
-                        old_stop * (
-                            1 - SLIPPAGE
-                        ),
+                        position,
+                        exit_price,
                         "STOP"
                     )
                 )
@@ -798,16 +775,20 @@ for timestamp in ALL_TIMESTAMPS:
 
         else:
 
-            old_stop = p["stop"]
+            if (
+                candle["High"]
+                >= old_stop
+            ):
 
-            if candle["High"] >= old_stop:
+                exit_price = (
+                    old_stop *
+                    (1 + SLIPPAGE)
+                )
 
-                positions_to_close.append(
+                to_close.append(
                     (
-                        p,
-                        old_stop * (
-                            1 + SLIPPAGE
-                        ),
+                        position,
+                        exit_price,
                         "STOP"
                     )
                 )
@@ -815,19 +796,18 @@ for timestamp in ALL_TIMESTAMPS:
                 continue
 
         # ----------------------------------------------------
-        # TIMEOUT
+        # Timeout
         # ----------------------------------------------------
 
-        if p["bars"] >= TIMEOUT_CANDLES:
+        if (
+            position["bars"]
+            >= TIMEOUT_CANDLES
+        ):
 
-            exit_price = float(
-                candle["Close"]
-            )
-
-            positions_to_close.append(
+            to_close.append(
                 (
-                    p,
-                    exit_price,
+                    position,
+                    float(candle["Close"]),
                     "TIMEOUT"
                 )
             )
@@ -835,65 +815,78 @@ for timestamp in ALL_TIMESTAMPS:
             continue
 
         # ----------------------------------------------------
-        # UPDATE TRAILING STOP
-        #
-        # Do NOT recheck this updated stop on the same candle.
+        # Trailing update
         # ----------------------------------------------------
 
-        atr = float(candle["ATR"])
+        atr = float(
+            candle["ATR"]
+        )
 
         if side == "LONG":
 
             new_stop = (
                 candle["Close"]
-                - atr *
+                -
+                atr *
                 TRAILING_ATR_MULTIPLIER
             )
 
-            if new_stop > p["stop"]:
+            if new_stop > position["stop"]:
 
-                p["stop"] = new_stop
+                position["stop"] = (
+                    new_stop
+                )
 
         else:
 
             new_stop = (
                 candle["Close"]
-                + atr *
+                +
+                atr *
                 TRAILING_ATR_MULTIPLIER
             )
 
-            if new_stop < p["stop"]:
+            if new_stop < position["stop"]:
 
-                p["stop"] = new_stop
+                position["stop"] = (
+                    new_stop
+                )
 
     # --------------------------------------------------------
-    # Execute closes
+    # Close positions
     # --------------------------------------------------------
 
-    for p, exit_price, reason in positions_to_close:
+    for (
+        position,
+        exit_price,
+        reason,
+    ) in to_close:
 
-        if p not in open_positions:
+        if position not in open_positions:
             continue
 
         close_position(
-            p,
+            position,
             exit_price,
             timestamp,
             reason
         )
 
-        open_positions.remove(p)
+        open_positions.remove(
+            position
+        )
 
 
     # ========================================================
-    # 2. GET BTC REGIME
+    # BTC
     # ========================================================
 
     if timestamp not in BTC.index:
-
         continue
 
-    btc = BTC.loc[timestamp]
+    btc = BTC.loc[
+        timestamp
+    ]
 
     btc_close = float(
         btc["Close"]
@@ -910,10 +903,6 @@ for timestamp in ALL_TIMESTAMPS:
     btc_mom_long = float(
         btc["Mom_Long"]
     )
-
-    # --------------------------------------------------------
-    # V77 BTC regime
-    # --------------------------------------------------------
 
     btc_bull = (
         btc_close > btc_ema200
@@ -933,125 +922,111 @@ for timestamp in ALL_TIMESTAMPS:
 
 
     # ========================================================
-    # 3. MARKET BREADTH
+    # BREADTH
     # ========================================================
 
-    active_symbols = 0
-
-    bullish_symbols = 0
+    active = 0
+    bullish = 0
 
     for name in valid_symbols:
 
-        df = DATA[name]
-
-        if timestamp not in df.index:
+        if timestamp not in DATA[name].index:
             continue
 
-        row = df.loc[timestamp]
+        row = DATA[name].loc[
+            timestamp
+        ]
 
-        if pd.isna(row["EMA200"]):
-            continue
+        active += 1
 
-        active_symbols += 1
+        if (
+            row["Close"] >
+            row["EMA200"]
+        ):
 
-        if row["Close"] > row["EMA200"]:
+            bullish += 1
 
-            bullish_symbols += 1
+    if active > 0:
 
-
-    if active_symbols > 0:
-
-        breadth_ratio = (
-            bullish_symbols /
-            active_symbols
+        breadth = (
+            bullish /
+            active
         )
 
     else:
 
-        breadth_ratio = 0.5
+        breadth = 0.5
 
-
-    # ========================================================
-    # 4. MARKET PERMISSIONS
-    # ========================================================
 
     allow_longs = (
         btc_bull
         and
-        breadth_ratio >=
+        breadth >=
         LONG_BREADTH_MIN
     )
 
     allow_shorts = (
         btc_bear
         and
-        breadth_ratio <=
+        breadth <=
         SHORT_BREADTH_MAX
     )
 
 
     # ========================================================
-    # 5. BUILD CANDIDATES
+    # CANDIDATES
     # ========================================================
 
     long_candidates = []
-
     short_candidates = []
-
 
     for name in valid_symbols:
 
-        if name == "BTC":
-
-            # BTC itself can trade,
-            # but still follows all filters.
-            pass
-
-
-        df = DATA[name]
-
-        if timestamp not in df.index:
-
-            continue
-
-        row = df.loc[timestamp]
-
         filter_stats[
-            "total_symbol_checks"
+            "symbol_checks"
         ] += 1
 
-
-        # ----------------------------------------------------
-        # Already open?
-        # ----------------------------------------------------
-
         if any(
-            p["name"] == name
-            for p in open_positions
+            position["name"] == name
+            for position in open_positions
         ):
 
             filter_stats[
-                "already_open_rejected"
+                "already_open"
             ] += 1
 
             continue
 
+        if timestamp not in DATA[name].index:
+            continue
 
-        # ----------------------------------------------------
-        # Basic values
-        # ----------------------------------------------------
+        row = DATA[name].loc[
+            timestamp
+        ]
 
-        close = float(row["Close"])
+        close = float(
+            row["Close"]
+        )
 
-        ema20 = float(row["EMA20"])
+        ema20 = float(
+            row["EMA20"]
+        )
 
-        ema50 = float(row["EMA50"])
+        ema50 = float(
+            row["EMA50"]
+        )
 
-        ema200 = float(row["EMA200"])
+        ema200 = float(
+            row["EMA200"]
+        )
 
-        atr = float(row["ATR"])
+        atr = float(
+            row["ATR"]
+        )
 
-        atr_pct = float(row["ATR_Pct"])
+        atr_pct = float(
+            row["ATR_Pct"]
+        )
 
         mom_short = float(
             row["Mom_Short"]
@@ -1073,11 +1048,6 @@ for timestamp in ALL_TIMESTAMPS:
             row["Prev_EMA20"]
         )
 
-
-        # ----------------------------------------------------
-        # Relative Momentum
-        # ----------------------------------------------------
-
         relative_momentum = (
             mom_long -
             btc_mom_long
@@ -1090,137 +1060,93 @@ for timestamp in ALL_TIMESTAMPS:
 
         long_ok = True
 
-        # ----------------------------------------------------
-        # BTC regime
-        # ----------------------------------------------------
-
         if not btc_bull:
 
             long_ok = False
 
             filter_stats[
-                "btc_regime_rejected"
+                "btc_regime"
             ] += 1
 
-        # ----------------------------------------------------
-        # Breadth
-        # ----------------------------------------------------
+        elif breadth < LONG_BREADTH_MIN:
+
+            long_ok = False
+
+            filter_stats[
+                "breadth"
+            ] += 1
+
+        elif (
+            REQUIRE_RELATIVE_MOMENTUM
+            and
+            relative_momentum <= 0
+        ):
+
+            long_ok = False
+
+            filter_stats[
+                "relative_momentum"
+            ] += 1
+
+        elif atr_pct > ATR_MAX_PCT:
+
+            long_ok = False
+
+            filter_stats[
+                "atr"
+            ] += 1
+
+        elif not (
+            mom_long >
+            MOM_LONG_LONG_MIN
+            and
+            mom_long <
+            MAX_MOM
+        ):
+
+            long_ok = False
+
+            filter_stats[
+                "extreme_momentum"
+            ] += 1
+
+        elif not (
+            close > ema20
+            and
+            ema20 > ema50
+            and
+            close > ema200
+        ):
+
+            long_ok = False
+
+            filter_stats[
+                "trend"
+            ] += 1
+
+        elif (
+            mom_short <=
+            MOM_SHORT_LONG_MIN
+        ):
+
+            long_ok = False
+
+            filter_stats[
+                "momentum"
+            ] += 1
+
+        elif not (
+            prev_low <=
+            prev_ema20 * 1.015
+        ):
+
+            long_ok = False
+
+            filter_stats[
+                "pullback"
+            ] += 1
 
         if long_ok:
-
-            if breadth_ratio < LONG_BREADTH_MIN:
-
-                long_ok = False
-
-                filter_stats[
-                    "breadth_rejected"
-                ] += 1
-
-        # ----------------------------------------------------
-        # Relative momentum
-        # ----------------------------------------------------
-
-        if long_ok and REQUIRE_RELATIVE_MOMENTUM:
-
-            if relative_momentum <= 0:
-
-                long_ok = False
-
-                filter_stats[
-                    "relative_momentum_rejected"
-                ] += 1
-
-        # ----------------------------------------------------
-        # ATR filter
-        # ----------------------------------------------------
-
-        if long_ok:
-
-            if atr_pct > ATR_MAX_PCT:
-
-                long_ok = False
-
-                filter_stats[
-                    "atr_rejected"
-                ] += 1
-
-        # ----------------------------------------------------
-        # Extreme momentum
-        # ----------------------------------------------------
-
-        if long_ok:
-
-            if not (
-                mom_long >
-                MOM_LONG_LONG_MIN
-                and
-                mom_long <
-                MAX_MOM
-            ):
-
-                long_ok = False
-
-                filter_stats[
-                    "extreme_momentum_rejected"
-                ] += 1
-
-        # ----------------------------------------------------
-        # Trend
-        # ----------------------------------------------------
-
-        if long_ok:
-
-            if not (
-                close > ema20
-                and
-                ema20 > ema50
-                and
-                close > ema200
-            ):
-
-                long_ok = False
-
-                filter_stats[
-                    "trend_rejected"
-                ] += 1
-
-        # ----------------------------------------------------
-        # Short momentum
-        # ----------------------------------------------------
-
-        if long_ok:
-
-            if mom_short <= MOM_SHORT_LONG_MIN:
-
-                long_ok = False
-
-                filter_stats[
-                    "momentum_rejected"
-                ] += 1
-
-        # ----------------------------------------------------
-        # Pullback
-        # ----------------------------------------------------
-
-        if long_ok:
-
-            if not (
-                prev_low <=
-                prev_ema20 * 1.015
-            ):
-
-                long_ok = False
-
-                filter_stats[
-                    "pullback_rejected"
-                ] += 1
-
-
-        if long_ok:
-
-            # ------------------------------------------------
-            # Stop distance
-            # ------------------------------------------------
 
             stop = (
                 close -
@@ -1228,54 +1154,39 @@ for timestamp in ALL_TIMESTAMPS:
                 INITIAL_ATR_MULTIPLIER
             )
 
-            sl_dist_pct = (
+            sl_distance_pct = (
                 close - stop
             ) / close
 
             if not (
                 0.01 <=
-                sl_dist_pct <=
+                sl_distance_pct <=
                 0.04
             ):
 
-                long_ok = False
+                filter_stats[
+                    "invalid_stop_distance"
+                ] += 1
 
             else:
 
                 long_candidates.append({
 
                     "name": name,
-
                     "side": "LONG",
-
-                    "score": float(
-                        mom_long
-                    ),
-
-                    "row": row,
-
+                    "score": float(mom_long),
                     "atr": atr,
-
                     "atr_pct": atr_pct,
-
                     "mom_short": mom_short,
-
                     "mom_long": mom_long,
-
                     "relative_momentum":
                         relative_momentum,
-
-                    "breadth":
-                        breadth_ratio,
-
+                    "breadth": breadth,
                     "btc_mom_long":
                         btc_mom_long,
-
-                    "stop":
-                        stop,
-
-                    "sl_dist_pct":
-                        sl_dist_pct,
+                    "stop": stop,
+                    "sl_distance_pct":
+                        sl_distance_pct,
                 })
 
 
@@ -1285,131 +1196,91 @@ for timestamp in ALL_TIMESTAMPS:
 
         short_ok = True
 
-        # ----------------------------------------------------
-        # BTC regime
-        # ----------------------------------------------------
-
         if not btc_bear:
 
             short_ok = False
 
             filter_stats[
-                "btc_regime_rejected"
+                "btc_regime"
             ] += 1
 
-        # ----------------------------------------------------
-        # Breadth
-        # ----------------------------------------------------
+        elif breadth > SHORT_BREADTH_MAX:
 
-        if short_ok:
+            short_ok = False
 
-            if breadth_ratio > SHORT_BREADTH_MAX:
+            filter_stats[
+                "breadth"
+            ] += 1
 
-                short_ok = False
+        elif (
+            REQUIRE_RELATIVE_MOMENTUM
+            and
+            relative_momentum >= 0
+        ):
 
-                filter_stats[
-                    "breadth_rejected"
-                ] += 1
+            short_ok = False
 
-        # ----------------------------------------------------
-        # Relative momentum
-        # ----------------------------------------------------
+            filter_stats[
+                "relative_momentum"
+            ] += 1
 
-        if short_ok and REQUIRE_RELATIVE_MOMENTUM:
+        elif atr_pct > ATR_MAX_PCT:
 
-            if relative_momentum >= 0:
+            short_ok = False
 
-                short_ok = False
+            filter_stats[
+                "atr"
+            ] += 1
 
-                filter_stats[
-                    "relative_momentum_rejected"
-                ] += 1
+        elif not (
+            mom_long <
+            MOM_LONG_SHORT_MAX
+            and
+            mom_long >
+            -MAX_MOM
+        ):
 
-        # ----------------------------------------------------
-        # ATR
-        # ----------------------------------------------------
+            short_ok = False
 
-        if short_ok:
+            filter_stats[
+                "extreme_momentum"
+            ] += 1
 
-            if atr_pct > ATR_MAX_PCT:
+        elif not (
+            close < ema20
+            and
+            ema20 < ema50
+            and
+            close < ema200
+        ):
 
-                short_ok = False
+            short_ok = False
 
-                filter_stats[
-                    "atr_rejected"
-                ] += 1
+            filter_stats[
+                "trend"
+            ] += 1
 
-        # ----------------------------------------------------
-        # Extreme momentum
-        # ----------------------------------------------------
+        elif (
+            mom_short >=
+            MOM_SHORT_SHORT_MAX
+        ):
 
-        if short_ok:
+            short_ok = False
 
-            if not (
-                mom_long <
-                MOM_LONG_SHORT_MAX
-                and
-                mom_long >
-                -MAX_MOM
-            ):
+            filter_stats[
+                "momentum"
+            ] += 1
 
-                short_ok = False
+        elif not (
+            prev_high >=
+            prev_ema20 * 0.985
+        ):
 
-                filter_stats[
-                    "extreme_momentum_rejected"
-                ] += 1
+            short_ok = False
 
-        # ----------------------------------------------------
-        # Trend
-        # ----------------------------------------------------
-
-        if short_ok:
-
-            if not (
-                close < ema20
-                and
-                ema20 < ema50
-                and
-                close < ema200
-            ):
-
-                short_ok = False
-
-                filter_stats[
-                    "trend_rejected"
-                ] += 1
-
-        # ----------------------------------------------------
-        # Momentum
-        # ----------------------------------------------------
-
-        if short_ok:
-
-            if mom_short >= MOM_SHORT_SHORT_MAX:
-
-                short_ok = False
-
-                filter_stats[
-                    "momentum_rejected"
-                ] += 1
-
-        # ----------------------------------------------------
-        # Pullback
-        # ----------------------------------------------------
-
-        if short_ok:
-
-            if not (
-                prev_high >=
-                prev_ema20 * 0.985
-            ):
-
-                short_ok = False
-
-                filter_stats[
-                    "pullback_rejected"
-                ] += 1
-
+            filter_stats[
+                "pullback"
+            ] += 1
 
         if short_ok:
 
@@ -1419,87 +1290,76 @@ for timestamp in ALL_TIMESTAMPS:
                 INITIAL_ATR_MULTIPLIER
             )
 
-            sl_dist_pct = (
+            sl_distance_pct = (
                 stop - close
             ) / close
 
             if not (
                 0.01 <=
-                sl_dist_pct <=
+                sl_distance_pct <=
                 0.04
             ):
 
-                short_ok = False
+                filter_stats[
+                    "invalid_stop_distance"
+                ] += 1
 
             else:
 
                 short_candidates.append({
 
                     "name": name,
-
                     "side": "SHORT",
-
-                    "score": float(
-                        -mom_long
-                    ),
-
-                    "row": row,
-
+                    "score": float(-mom_long),
                     "atr": atr,
-
                     "atr_pct": atr_pct,
-
                     "mom_short": mom_short,
-
                     "mom_long": mom_long,
-
                     "relative_momentum":
                         relative_momentum,
-
-                    "breadth":
-                        breadth_ratio,
-
+                    "breadth": breadth,
                     "btc_mom_long":
                         btc_mom_long,
-
-                    "stop":
-                        stop,
-
-                    "sl_dist_pct":
-                        sl_dist_pct,
+                    "stop": stop,
+                    "sl_distance_pct":
+                        sl_distance_pct,
                 })
 
 
     # ========================================================
-    # 6. RANK
+    # RANK
     # ========================================================
 
     long_candidates.sort(
-        key=lambda x: float(x["score"]),
+        key=lambda item: float(
+            item["score"]
+        ),
         reverse=True
     )
 
     short_candidates.sort(
-        key=lambda x: float(x["score"]),
+        key=lambda item: float(
+            item["score"]
+        ),
         reverse=True
     )
 
 
     # ========================================================
-    # 7. ENTRY
+    # ENTRY
     # ========================================================
 
-    slots_available = (
+    slots = (
         MAX_POSITIONS -
         len(open_positions)
     )
 
 
     # --------------------------------------------------------
-    # LONG entries
+    # LONG
     # --------------------------------------------------------
 
-    if allow_longs and slots_available > 0:
+    if allow_longs and slots > 0:
 
         current_longs = count_direction(
             "LONG"
@@ -1507,35 +1367,32 @@ for timestamp in ALL_TIMESTAMPS:
 
         for candidate in long_candidates:
 
-            if slots_available <= 0:
+            if slots <= 0:
                 break
 
-            if current_longs >= MAX_LONG_POSITIONS:
+            if (
+                current_longs
+                >=
+                MAX_LONG_POSITIONS
+            ):
 
                 filter_stats[
-                    "direction_limit_rejected"
+                    "direction_limit"
                 ] += 1
 
                 break
 
-            # ------------------------------------------------
-            # SAME-CANDLE OPEN
-            #
-            # Kept intentionally for V74/V75/V76
-            # comparability.
-            #
-            # IMPORTANT:
-            # This remains a look-ahead bias because the
-            # signal uses current candle Close.
-            # A clean no-lookahead benchmark should be run
-            # separately.
-            # ------------------------------------------------
+            entry = float(
+                DATA[
+                    candidate["name"]
+                ].loc[
+                    timestamp,
+                    "Open"
+                ]
+            )
 
-            row = candidate["row"]
-
-            entry = (
-                float(row["Open"]) *
-                (1 + SLIPPAGE)
+            entry *= (
+                1 + SLIPPAGE
             )
 
             atr = candidate["atr"]
@@ -1546,15 +1403,16 @@ for timestamp in ALL_TIMESTAMPS:
                 INITIAL_ATR_MULTIPLIER
             )
 
-            sl_dist_pct = (
+            sl_distance_pct = (
                 entry - stop
             ) / entry
 
             if not (
                 0.01 <=
-                sl_dist_pct <=
+                sl_distance_pct <=
                 0.04
             ):
+
                 continue
 
             margin = TRADE_MARGIN
@@ -1569,7 +1427,7 @@ for timestamp in ALL_TIMESTAMPS:
                 entry
             )
 
-            position = {
+            open_positions.append({
 
                 "name":
                     candidate["name"],
@@ -1629,27 +1487,22 @@ for timestamp in ALL_TIMESTAMPS:
                     ],
 
                 "initial_sl_distance_pct":
-                    sl_dist_pct,
-            }
-
-            open_positions.append(
-                position
-            )
+                    sl_distance_pct,
+            })
 
             current_longs += 1
-
-            slots_available -= 1
+            slots -= 1
 
             filter_stats[
-                "accepted_candidates"
+                "accepted"
             ] += 1
 
 
     # --------------------------------------------------------
-    # SHORT entries
+    # SHORT
     # --------------------------------------------------------
 
-    if allow_shorts and slots_available > 0:
+    if allow_shorts and slots > 0:
 
         current_shorts = count_direction(
             "SHORT"
@@ -1657,22 +1510,32 @@ for timestamp in ALL_TIMESTAMPS:
 
         for candidate in short_candidates:
 
-            if slots_available <= 0:
+            if slots <= 0:
                 break
 
-            if current_shorts >= MAX_SHORT_POSITIONS:
+            if (
+                current_shorts
+                >=
+                MAX_SHORT_POSITIONS
+            ):
 
                 filter_stats[
-                    "direction_limit_rejected"
+                    "direction_limit"
                 ] += 1
 
                 break
 
-            row = candidate["row"]
+            entry = float(
+                DATA[
+                    candidate["name"]
+                ].loc[
+                    timestamp,
+                    "Open"
+                ]
+            )
 
-            entry = (
-                float(row["Open"]) *
-                (1 - SLIPPAGE)
+            entry *= (
+                1 - SLIPPAGE
             )
 
             atr = candidate["atr"]
@@ -1683,15 +1546,16 @@ for timestamp in ALL_TIMESTAMPS:
                 INITIAL_ATR_MULTIPLIER
             )
 
-            sl_dist_pct = (
+            sl_distance_pct = (
                 stop - entry
             ) / entry
 
             if not (
                 0.01 <=
-                sl_dist_pct <=
+                sl_distance_pct <=
                 0.04
             ):
+
                 continue
 
             margin = TRADE_MARGIN
@@ -1706,7 +1570,7 @@ for timestamp in ALL_TIMESTAMPS:
                 entry
             )
 
-            position = {
+            open_positions.append({
 
                 "name":
                     candidate["name"],
@@ -1766,27 +1630,22 @@ for timestamp in ALL_TIMESTAMPS:
                     ],
 
                 "initial_sl_distance_pct":
-                    sl_dist_pct,
-            }
-
-            open_positions.append(
-                position
-            )
+                    sl_distance_pct,
+            })
 
             current_shorts += 1
-
-            slots_available -= 1
+            slots -= 1
 
             filter_stats[
-                "accepted_candidates"
+                "accepted"
             ] += 1
 
 
     # ========================================================
-    # 8. EQUITY
+    # EQUITY
     # ========================================================
 
-    equity = calculate_unrealized_equity()
+    equity = calculate_equity()
 
     equity_curve.append({
 
@@ -1809,7 +1668,7 @@ for timestamp in ALL_TIMESTAMPS:
             count_direction("SHORT"),
 
         "Breadth":
-            breadth_ratio,
+            breadth,
 
         "BTC_MomLong":
             btc_mom_long,
@@ -1821,58 +1680,35 @@ for timestamp in ALL_TIMESTAMPS:
             btc_bear,
     })
 
-
-    # ========================================================
-    # 9. DRAWDOWN
-    # ========================================================
-
     if equity > peak_equity:
 
         peak_equity = equity
 
-    dd_dollar = (
-        equity -
-        peak_equity
-    )
-
-    dd_pct = (
-        dd_dollar /
-        peak_equity
-        if peak_equity > 0
-        else 0
-    )
-
-    if dd_dollar < max_drawdown_dollar:
-
-        max_drawdown_dollar = (
-            dd_dollar
-        )
-
-    if dd_pct < max_drawdown_pct:
-
-        max_drawdown_pct = (
-            dd_pct
-        )
-
 
 # ============================================================
-# FORCE CLOSE REMAINING POSITIONS
+# FORCE CLOSE
 # ============================================================
 
 if open_positions:
 
-    final_timestamp = ALL_TIMESTAMPS[-1]
+    final_timestamp = (
+        ALL_TIMESTAMPS[-1]
+    )
 
-    for p in list(open_positions):
+    for position in list(
+        open_positions
+    ):
 
-        name = p["name"]
+        name = position["name"]
 
-        df = DATA[name]
-
-        if final_timestamp in df.index:
+        if (
+            final_timestamp
+            in DATA[name].index
+        ):
 
             final_price = float(
-                df.loc[
+                DATA[name]
+                .loc[
                     final_timestamp,
                     "Close"
                 ]
@@ -1880,16 +1716,20 @@ if open_positions:
 
         else:
 
-            final_price = p["last_price"]
+            final_price = position[
+                "last_price"
+            ]
 
         close_position(
-            p,
+            position,
             final_price,
             final_timestamp,
             "END"
         )
 
-        open_positions.remove(p)
+        open_positions.remove(
+            position
+        )
 
 
 # ============================================================
@@ -1900,16 +1740,17 @@ trades_df = pd.DataFrame(
     closed_trades
 )
 
-
 if trades_df.empty:
 
     print()
-    print("NO TRADES GENERATED.")
+    print("=" * 70)
+    print("NO TRADES")
+    print("=" * 70)
     sys.exit(0)
 
 
 # ============================================================
-# BASIC STATS
+# OVERALL STATS
 # ============================================================
 
 total_trades = len(
@@ -1925,7 +1766,6 @@ losses_df = trades_df[
 ]
 
 wins = len(wins_df)
-
 losses = len(losses_df)
 
 win_rate = (
@@ -1934,13 +1774,13 @@ win_rate = (
     100
 )
 
-net_pnl = trades_df[
-    "PnL"
-].sum()
+net_pnl = float(
+    trades_df["PnL"].sum()
+)
 
-net_r = trades_df[
-    "R"
-].sum()
+net_r = float(
+    trades_df["R"].sum()
+)
 
 final_capital = (
     INITIAL_CAPITAL +
@@ -1949,15 +1789,15 @@ final_capital = (
 
 
 # ============================================================
-# LOSS STREAK ANALYSIS
+# LOSS STREAK
 # ============================================================
 
 results = [
-    1 if x > 0 else 0
-    for x in trades_df["PnL"]
+    1 if pnl > 0 else 0
+    for pnl in trades_df["PnL"]
 ]
 
-streaks = []
+loss_streaks = []
 
 current_streak = 0
 
@@ -1971,66 +1811,60 @@ for result in results:
 
         if current_streak > 0:
 
-            streaks.append(
+            loss_streaks.append(
                 current_streak
             )
 
         current_streak = 0
 
-
 if current_streak > 0:
 
-    streaks.append(
+    loss_streaks.append(
         current_streak
     )
 
-
-if streaks:
+if loss_streaks:
 
     max_loss_streak = max(
-        streaks
+        loss_streaks
     )
 
-    avg_loss_streak = np.mean(
-        streaks
+    avg_loss_streak = float(
+        np.mean(loss_streaks)
     )
 
 else:
 
     max_loss_streak = 0
+    avg_loss_streak = 0.0
 
-    avg_loss_streak = 0
 
+streak_counts = {}
 
-# ------------------------------------------------------------
-# Exact distribution
-# ------------------------------------------------------------
+for streak in loss_streaks:
 
-streak_distribution = {}
-
-for s in streaks:
-
-    streak_distribution[s] = (
-        streak_distribution.get(s, 0)
-        + 1
+    streak_counts[streak] = (
+        streak_counts.get(
+            streak,
+            0
+        ) + 1
     )
 
 
 streak_rows = []
 
-for length, count in sorted(
-    streak_distribution.items()
+for streak, count in sorted(
+    streak_counts.items()
 ):
 
     streak_rows.append({
 
         "LossStreak":
-            length,
+            streak,
 
         "Occurrences":
             count,
     })
-
 
 streak_df = pd.DataFrame(
     streak_rows
@@ -2038,7 +1872,7 @@ streak_df = pd.DataFrame(
 
 
 # ============================================================
-# PORTFOLIO DRAW DOWN FROM EQUITY CURVE
+# EQUITY / DRAWDOWN
 # ============================================================
 
 equity_df = pd.DataFrame(
@@ -2053,24 +1887,31 @@ if not equity_df.empty:
     )
 
     equity_df["DrawdownDollar"] = (
-        equity_df["Equity"] -
+        equity_df["Equity"]
+        -
         equity_df["Peak"]
     )
 
-    equity_df["DrawdownPct"] = np.where(
-        equity_df["Peak"] != 0,
-        equity_df["DrawdownDollar"] /
-        equity_df["Peak"] * 100,
-        0
+    equity_df["DrawdownPct"] = (
+        np.where(
+            equity_df["Peak"] != 0,
+            equity_df[
+                "DrawdownDollar"
+            ]
+            /
+            equity_df["Peak"]
+            * 100,
+            0
+        )
     )
 
-    portfolio_max_dd_dollar = (
+    max_dd_dollar = float(
         equity_df[
             "DrawdownDollar"
         ].min()
     )
 
-    portfolio_max_dd_pct = (
+    max_dd_pct = float(
         equity_df[
             "DrawdownPct"
         ].min()
@@ -2078,29 +1919,803 @@ if not equity_df.empty:
 
 else:
 
-    portfolio_max_dd_dollar = 0
-
-    portfolio_max_dd_pct = 0
+    max_dd_dollar = 0.0
+    max_dd_pct = 0.0
 
 
 # ============================================================
-# LONG / SHORT STATS
+# DIRECTION STATS
 # ============================================================
 
-def direction_stats(df, side):
+def get_direction_stats(
+    df,
+    side
+):
 
-    x = df[
+    subset = df[
         df["Side"] == side
     ]
 
-    if x.empty:
+    if subset.empty:
 
         return {
-
             "Trades": 0,
-
             "Wins": 0,
-
             "Losses": 0,
+            "WinRate": 0.0,
+            "PnL": 0.0,
+            "R": 0.0,
+            "AvgR": 0.0,
+        }
 
-           
+    side_wins = subset[
+        subset["PnL"] > 0
+    ]
+
+    side_losses = subset[
+        subset["PnL"] <= 0
+    ]
+
+    return {
+        "Trades":
+            len(subset),
+
+        "Wins":
+            len(side_wins),
+
+        "Losses":
+            len(side_losses),
+
+        "WinRate":
+            len(side_wins)
+            /
+            len(subset)
+            *
+            100,
+
+        "PnL":
+            float(
+                subset["PnL"].sum()
+            ),
+
+        "R":
+            float(
+                subset["R"].sum()
+            ),
+
+        "AvgR":
+            float(
+                subset["R"].mean()
+            ),
+    }
+
+
+long_stats = get_direction_stats(
+    trades_df,
+    "LONG"
+)
+
+short_stats = get_direction_stats(
+    trades_df,
+    "SHORT"
+)
+
+
+# ============================================================
+# PER SYMBOL
+# ============================================================
+
+symbol_rows = []
+
+for name in valid_symbols:
+
+    subset = trades_df[
+        trades_df["Symbol"] == name
+    ]
+
+    if subset.empty:
+
+        symbol_rows.append({
+
+            "Symbol": name,
+            "Trades": 0,
+            "Wins": 0,
+            "Losses": 0,
+            "WinRate": 0.0,
+            "PnL": 0.0,
+            "NetR": 0.0,
+            "AvgR": 0.0,
+            "AvgPnL": 0.0,
+            "BestTrade": 0.0,
+            "WorstTrade": 0.0,
+            "LongTrades": 0,
+            "LongWR": 0.0,
+            "LongPnL": 0.0,
+            "ShortTrades": 0,
+            "ShortWR": 0.0,
+            "ShortPnL": 0.0,
+            "MaxLossStreak": 0,
+        })
+
+        continue
+
+
+    symbol_wins = subset[
+        subset["PnL"] > 0
+    ]
+
+    symbol_losses = subset[
+        subset["PnL"] <= 0
+    ]
+
+
+    # --------------------------------------------------------
+    # Symbol loss streak
+    # --------------------------------------------------------
+
+    max_symbol_streak = 0
+    current_symbol_streak = 0
+
+    for pnl in subset["PnL"]:
+
+        if pnl <= 0:
+
+            current_symbol_streak += 1
+
+            max_symbol_streak = max(
+                max_symbol_streak,
+                current_symbol_streak
+            )
+
+        else:
+
+            current_symbol_streak = 0
+
+
+    # --------------------------------------------------------
+    # Long
+    # --------------------------------------------------------
+
+    long_subset = subset[
+        subset["Side"] == "LONG"
+    ]
+
+    if not long_subset.empty:
+
+        long_wins = long_subset[
+            long_subset["PnL"] > 0
+        ]
+
+        long_wr = (
+            len(long_wins)
+            /
+            len(long_subset)
+            *
+            100
+        )
+
+        long_pnl = float(
+            long_subset["PnL"].sum()
+        )
+
+    else:
+
+        long_wr = 0.0
+        long_pnl = 0.0
+
+
+    # --------------------------------------------------------
+    # Short
+    # --------------------------------------------------------
+
+    short_subset = subset[
+        subset["Side"] == "SHORT"
+    ]
+
+    if not short_subset.empty:
+
+        short_wins = short_subset[
+            short_subset["PnL"] > 0
+        ]
+
+        short_wr = (
+            len(short_wins)
+            /
+            len(short_subset)
+            *
+            100
+        )
+
+        short_pnl = float(
+            short_subset["PnL"].sum()
+        )
+
+    else:
+
+        short_wr = 0.0
+        short_pnl = 0.0
+
+
+    symbol_rows.append({
+
+        "Symbol":
+            name,
+
+        "Trades":
+            len(subset),
+
+        "Wins":
+            len(symbol_wins),
+
+        "Losses":
+            len(symbol_losses),
+
+        "WinRate":
+            len(symbol_wins)
+            /
+            len(subset)
+            *
+            100,
+
+        "PnL":
+            float(
+                subset["PnL"].sum()
+            ),
+
+        "NetR":
+            float(
+                subset["R"].sum()
+            ),
+
+        "AvgR":
+            float(
+                subset["R"].mean()
+            ),
+
+        "AvgPnL":
+            float(
+                subset["PnL"].mean()
+            ),
+
+        "BestTrade":
+            float(
+                subset["PnL"].max()
+            ),
+
+        "WorstTrade":
+            float(
+                subset["PnL"].min()
+            ),
+
+        "LongTrades":
+            len(long_subset),
+
+        "LongWR":
+            long_wr,
+
+        "LongPnL":
+            long_pnl,
+
+        "ShortTrades":
+            len(short_subset),
+
+        "ShortWR":
+            short_wr,
+
+        "ShortPnL":
+            short_pnl,
+
+        "MaxLossStreak":
+            max_symbol_streak,
+    })
+
+
+symbol_df = pd.DataFrame(
+    symbol_rows
+)
+
+symbol_df = symbol_df.sort_values(
+    "PnL",
+    ascending=False
+)
+
+
+# ============================================================
+# EXIT STATS
+# ============================================================
+
+exit_df = (
+    trades_df
+    .groupby("Reason")
+    .agg(
+        Trades=("PnL", "count"),
+        Wins=(
+            "PnL",
+            lambda x: int(
+                (x > 0).sum()
+            )
+        ),
+        PnL=("PnL", "sum"),
+        NetR=("R", "sum"),
+        AvgR=("R", "mean"),
+    )
+    .reset_index()
+)
+
+exit_df["WinRate"] = np.where(
+    exit_df["Trades"] > 0,
+    exit_df["Wins"]
+    /
+    exit_df["Trades"]
+    * 100,
+    0.0
+)
+
+
+# ============================================================
+# PRINT RESULTS
+# ============================================================
+
+print()
+print("=" * 70)
+print(f"{VERSION} RESULTS")
+print("=" * 70)
+
+print(
+    f"Valid Symbols : "
+    f"{len(valid_symbols)}/{len(SYMBOLS)}"
+)
+
+print(
+    f"Total Trades  : "
+    f"{total_trades}"
+)
+
+print(
+    f"Wins          : "
+    f"{wins}"
+)
+
+print(
+    f"Losses        : "
+    f"{losses}"
+)
+
+print(
+    f"Win Rate      : "
+    f"{win_rate:.2f}%"
+)
+
+print(
+    f"Net R         : "
+    f"{net_r:.2f}R"
+)
+
+print(
+    f"Net PnL       : "
+    f"${net_pnl:,.2f}"
+)
+
+print(
+    f"Final Capital : "
+    f"${final_capital:,.2f}"
+)
+
+print(
+    f"Return        : "
+    f"{(
+        final_capital /
+        INITIAL_CAPITAL
+        - 1
+    ) * 100:.2f}%"
+)
+
+print(
+    f"Max Drawdown  : "
+    f"${max_dd_dollar:,.2f} "
+    f"({max_dd_pct:.2f}%)"
+)
+
+print(
+    f"Max Loss Streak: "
+    f"{max_loss_streak}"
+)
+
+print(
+    f"Avg Loss Streak: "
+    f"{avg_loss_streak:.2f}"
+)
+
+
+# ============================================================
+# LONG / SHORT
+# ============================================================
+
+print()
+print("-" * 70)
+print("LONG / SHORT")
+print("-" * 70)
+
+print(
+    f"LONG  | "
+    f"Trades={long_stats['Trades']} | "
+    f"WR={long_stats['WinRate']:.2f}% | "
+    f"PnL=${long_stats['PnL']:,.2f} | "
+    f"R={long_stats['R']:.2f}"
+)
+
+print(
+    f"SHORT | "
+    f"Trades={short_stats['Trades']} | "
+    f"WR={short_stats['WinRate']:.2f}% | "
+    f"PnL=${short_stats['PnL']:,.2f} | "
+    f"R={short_stats['R']:.2f}"
+)
+
+
+# ============================================================
+# LOSS STREAK DISTRIBUTION
+# ============================================================
+
+print()
+print("=" * 70)
+print("LOSS STREAK DISTRIBUTION")
+print("=" * 70)
+
+if streak_counts:
+
+    for length in sorted(
+        streak_counts
+    ):
+
+        print(
+            f"{length:>2} consecutive losses "
+            f": {streak_counts[length]} times"
+        )
+
+else:
+
+    print("No loss streaks.")
+
+
+# ============================================================
+# PER SYMBOL SUMMARY
+# ============================================================
+
+print()
+print("=" * 70)
+print("PER SYMBOL RESULTS")
+print("=" * 70)
+
+print(
+    f"{'SYMBOL':<10}"
+    f"{'TRADES':>8}"
+    f"{'WR':>9}"
+    f"{'PNL':>14}"
+    f"{'R':>10}"
+    f"{'AVG R':>10}"
+    f"{'MAX LS':>10}"
+)
+
+print("-" * 70)
+
+for _, row in symbol_df.iterrows():
+
+    print(
+        f"{row['Symbol']:<10}"
+        f"{int(row['Trades']):>8}"
+        f"{row['WinRate']:>8.2f}%"
+        f"{row['PnL']:>14,.2f}"
+        f"{row['NetR']:>10.2f}"
+        f"{row['AvgR']:>10.3f}"
+        f"{int(row['MaxLossStreak']):>10}"
+    )
+
+
+# ============================================================
+# DETAILED EACH SYMBOL
+# ============================================================
+
+print()
+print("=" * 70)
+print("DETAILED SYMBOL REPORT")
+print("=" * 70)
+
+for _, row in symbol_df.iterrows():
+
+    print()
+    print(
+        f"### {row['Symbol']}"
+    )
+
+    print(
+        f"Trades       : "
+        f"{int(row['Trades'])}"
+    )
+
+    print(
+        f"Wins         : "
+        f"{int(row['Wins'])}"
+    )
+
+    print(
+        f"Losses       : "
+        f"{int(row['Losses'])}"
+    )
+
+    print(
+        f"Win Rate     : "
+        f"{row['WinRate']:.2f}%"
+    )
+
+    print(
+        f"PnL          : "
+        f"${row['PnL']:,.2f}"
+    )
+
+    print(
+        f"Net R        : "
+        f"{row['NetR']:.2f}R"
+    )
+
+    print(
+        f"Average R    : "
+        f"{row['AvgR']:.3f}"
+    )
+
+    print(
+        f"Average PnL  : "
+        f"${row['AvgPnL']:,.2f}"
+    )
+
+    print(
+        f"Best Trade   : "
+        f"${row['BestTrade']:,.2f}"
+    )
+
+    print(
+        f"Worst Trade  : "
+        f"${row['WorstTrade']:,.2f}"
+    )
+
+    print(
+        f"Max Loss Streak: "
+        f"{int(row['MaxLossStreak'])}"
+    )
+
+    print(
+        f"LONG         : "
+        f"{int(row['LongTrades'])} trades | "
+        f"WR={row['LongWR']:.2f}% | "
+        f"PnL=${row['LongPnL']:,.2f}"
+    )
+
+    print(
+        f"SHORT        : "
+        f"{int(row['ShortTrades'])} trades | "
+        f"WR={row['ShortWR']:.2f}% | "
+        f"PnL=${row['ShortPnL']:,.2f}"
+    )
+
+
+# ============================================================
+# EXIT ANALYSIS
+# ============================================================
+
+print()
+print("=" * 70)
+print("EXIT REASON ANALYSIS")
+print("=" * 70)
+
+for _, row in exit_df.iterrows():
+
+    print(
+        f"{row['Reason']:<10}"
+        f" Trades={int(row['Trades']):>5}"
+        f" WR={row['WinRate']:>8.2f}%"
+        f" PnL=${row['PnL']:>12,.2f}"
+        f" R={row['NetR']:>9.2f}"
+    )
+
+
+# ============================================================
+# FILTER DIAGNOSTICS
+# ============================================================
+
+print()
+print("=" * 70)
+print("FILTER DIAGNOSTICS")
+print("=" * 70)
+
+for key, value in filter_stats.items():
+
+    print(
+        f"{key:<25}: {value}"
+    )
+
+
+# ============================================================
+# WEAK COINS
+# ============================================================
+
+print()
+print("=" * 70)
+print("WEAK COIN DIAGNOSTICS")
+print("=" * 70)
+
+for threshold in [
+    50,
+    55,
+    60,
+]:
+
+    weak = symbol_df[
+        (
+            symbol_df["Trades"] >= 5
+        )
+        &
+        (
+            symbol_df["WinRate"]
+            <
+            threshold
+        )
+    ]
+
+    print()
+    print(
+        f"Below {threshold}% WR "
+        f"(minimum 5 trades):"
+    )
+
+    if weak.empty:
+
+        print("  None")
+
+    else:
+
+        print(
+            "  "
+            +
+            ", ".join(
+                weak["Symbol"].tolist()
+            )
+        )
+
+
+# ============================================================
+# TOP COINS
+# ============================================================
+
+print()
+print("=" * 70)
+print("TOP 10 BY PNL")
+print("=" * 70)
+
+for _, row in (
+    symbol_df
+    .sort_values(
+        "PnL",
+        ascending=False
+    )
+    .head(10)
+    .iterrows()
+):
+
+    print(
+        f"{row['Symbol']:<10}"
+        f" PnL=${row['PnL']:>12,.2f}"
+        f" WR={row['WinRate']:>7.2f}%"
+        f" Trades={int(row['Trades'])}"
+    )
+
+
+# ============================================================
+# WORST COINS
+# ============================================================
+
+print()
+print("=" * 70)
+print("BOTTOM 10 BY PNL")
+print("=" * 70)
+
+for _, row in (
+    symbol_df
+    .sort_values(
+        "PnL",
+        ascending=True
+    )
+    .head(10)
+    .iterrows()
+):
+
+    print(
+        f"{row['Symbol']:<10}"
+        f" PnL=${row['PnL']:>12,.2f}"
+        f" WR={row['WinRate']:>7.2f}%"
+        f" Trades={int(row['Trades'])}"
+    )
+
+
+# ============================================================
+# SAVE CSV
+# ============================================================
+
+trades_df.to_csv(
+    "hunter_v77_trades.csv",
+    index=False
+)
+
+symbol_df.to_csv(
+    "hunter_v77_symbols.csv",
+    index=False
+)
+
+streak_df.to_csv(
+    "hunter_v77_loss_streaks.csv",
+    index=False
+)
+
+exit_df.to_csv(
+    "hunter_v77_exit_stats.csv",
+    index=False
+)
+
+equity_df.to_csv(
+    "hunter_v77_equity.csv",
+    index=False
+)
+
+filter_df = pd.DataFrame(
+    [
+        {
+            "Filter": key,
+            "Count": value,
+        }
+        for key, value
+        in filter_stats.items()
+    ]
+)
+
+filter_df.to_csv(
+    "hunter_v77_filter_diagnostics.csv",
+    index=False
+)
+
+
+# ============================================================
+# FINAL
+# ============================================================
+
+print()
+print("=" * 70)
+print("CSV FILES")
+print("=" * 70)
+
+print(
+    "hunter_v77_trades.csv"
+)
+
+print(
+    "hunter_v77_symbols.csv"
+)
+
+print(
+    "hunter_v77_loss_streaks.csv"
+)
+
+print(
+    "hunter_v77_exit_stats.csv"
+)
+
+print(
+    "hunter_v77_equity.csv"
+)
+
+print(
+    "hunter_v77_filter_diagnostics.csv"
+)
+
+print()
+print("=" * 70)
+print("BACKTEST COMPLETE")
+print("=" * 70)
