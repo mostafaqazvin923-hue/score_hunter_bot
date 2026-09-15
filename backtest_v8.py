@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V76 (Golden Core + Breadth Shield + Dynamic Risk Scaling)
+# HUNTER-V77 (Golden Core + Cooldown + Volatility Filter + Score Entry)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -66,7 +66,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V76 (کاهش پویای ریسک در زنجیره ضرر)")
+print("📥 دریافت داده‌ها - HUNTER-V77 (کول‌دان + فیلتر نوسان + امتیازدهی)")
 print("=" * 60)
 
 processed_data = {}
@@ -139,6 +139,8 @@ def fetch_symbol_data(lbank_symbol):
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
+    df["ATR_Avg50"] = df["ATR"].rolling(50).mean()
+    df["ATR_Ratio"] = df["ATR"] / df["ATR_Avg50"]
 
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
@@ -156,7 +158,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V76...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V77...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -166,8 +168,14 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     current_consecutive_losses = 0
+    consecutive_wins = 0
+    cooldown_candles_left = 0  # شمارشگر کول‌دان
     
     for ts in all_timestamps:
+        # مدیریت کاهش کول‌دان در هر کندل جدید
+        if cooldown_candles_left > 0:
+            cooldown_candles_left -= 1
+
         symbols_to_close = []
         
         for symbol, pos in list(active_positions.items()):
@@ -209,10 +217,19 @@ def run_backtest(processed_data):
                 
                 outcome = "WIN" if r_real > 0 else "LOSS"
                 
+                # مدیریت زنجیره برد/باخت و کول‌دان پویا
                 if outcome == "LOSS":
                     current_consecutive_losses += 1
+                    consecutive_wins = 0
+                    if current_consecutive_losses >= 8:
+                        cooldown_candles_left = max(cooldown_candles_left, 12)  # توقف طولانی
+                    elif current_consecutive_losses >= 5:
+                        cooldown_candles_left = max(cooldown_candles_left, 8)   # توقف 8 کندل
+                    elif current_consecutive_losses >= 3:
+                        cooldown_candles_left = max(cooldown_candles_left, 3)   # توقف 3 کندل
                 else:
                     current_consecutive_losses = 0
+                    consecutive_wins += 1
 
                 position_notional = pos["used_margin"] * LEVERAGE
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
@@ -231,19 +248,44 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
         
-        # محاسبه مارجین پویا بر اساس تعداد باخت‌های متوالی (کاهش ریسک به جای قفل کردن)
+        # اگر در حالت کول‌دان هستیم، اجازه ورود جدید نداریم
+        if cooldown_candles_left > 0:
+            continue
+
+        # آنتی‌مارتینگل هوشمند برای تنظیم مارجین
         if current_consecutive_losses >= 4:
-            current_trade_margin = BASE_TRADE_MARGIN * 0.4  # کاهش ۶۰٪ حجم در زنجیره سنگین
+            current_trade_margin = BASE_TRADE_MARGIN * 0.2
+        elif current_consecutive_losses >= 3:
+            current_trade_margin = BASE_TRADE_MARGIN * 0.4
         elif current_consecutive_losses >= 2:
-            current_trade_margin = BASE_TRADE_MARGIN * 0.7  # کاهش ۳۰٪ حجم در زنجیره متوسط
+            current_trade_margin = BASE_TRADE_MARGIN * 0.7
+        elif consecutive_wins >= 2:
+            current_trade_margin = BASE_TRADE_MARGIN * 1.4
+        elif consecutive_wins == 1:
+            current_trade_margin = BASE_TRADE_MARGIN * 1.2
         else:
             current_trade_margin = BASE_TRADE_MARGIN
 
         market_bull = True
+        btc_c = None
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
             btc_c = processed_data["BTC"].loc[ts]
             market_bull = btc_c["Close"] > btc_c["EMA200"]
-        
+            # اگر باخت متوالی >= 8 است و بیت‌کوین زیر EMA50 است، کاملا متوقف بمان
+            if current_consecutive_losses >= 8 and btc_c["Close"] < btc_c["EMA50"]:
+                continue
+
+        # بررسی فیلتر نوسان بازار (ATR Ratio)
+        if btc_c is not None and not np.isnan(btc_c["ATR_Ratio"]) and btc_c["ATR_Ratio"] > 1.5:
+            continue
+
+        # فیلتر بازار رنج (فاصله EMA50 و EMA200 کمتر از 3 درصد باشد)
+        if btc_c is not None:
+            ema50_val = btc_c["EMA50"]
+            ema200_val = btc_c["EMA200"]
+            if abs(ema50_val - ema200_val) / ema200_val < 0.03:
+                continue
+
         bullish_count = 0
         total_active_syms = 0
         for symbol, df in processed_data.items():
@@ -292,39 +334,49 @@ def run_backtest(processed_data):
                     continue
                 regime_ok = (c4h["Close"] > c4h["EMA20"]) and (c4h["EMA20"] > c4h["EMA50"]) and (c4h["Close"] > c4h["EMA200"])
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
+                mom_ok = (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
                 side = "LONG"
             else:
                 if not allow_shorts:
                     continue
                 regime_ok = (c4h["Close"] < c4h["EMA20"]) and (c4h["EMA20"] < c4h["EMA50"]) and (c4h["Close"] < c4h["EMA200"])
                 pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
+                mom_ok = (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.05)  # سخت‌گیری بیشتر روی شورت
                 side = "SHORT"
             
-            if valid_signal:
-                entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
-                initial_sl = (entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"]) if side == "LONG" else (entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"])
-                initial_risk = abs(entry_price - initial_sl)
-                sl_dist_pct = initial_risk / entry_price
-                
-                if 0.01 <= sl_dist_pct <= 0.04:
-                    active_positions[symbol] = {
-                        "side": side,
-                        "entry_price": entry_price,
-                        "stop_loss": initial_sl,
-                        "highest_price": entry_price,
-                        "lowest_price": entry_price,
-                        "initial_risk": initial_risk,
-                        "entry_index": i,
-                        "used_margin": current_trade_margin,
-                    }
+            if regime_ok and pullback_ok and mom_ok:
+                # سیستم امتیازدهی به سیگنال (حداقل امتیاز 7 از 10 برای ورود)
+                signal_score = 0
+                if c4h["Close"] > c4h["EMA200"]: signal_score += 2
+                if side == "LONG" and c4h["EMA20"] > c4h["EMA50"]: signal_score += 2
+                if side == "SHORT" and c4h["EMA20"] < c4h["EMA50"]: signal_score += 2
+                if abs(c4h["Mom_Long"]) > 0.05: signal_score += 2
+                if market_bull == (side == "LONG"): signal_score += 2
+                if market_breadth_ratio >= 0.5 if side == "LONG" else market_breadth_ratio <= 0.5: signal_score += 2
+
+                if signal_score >= 7:
+                    entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
+                    initial_sl = (entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"]) if side == "LONG" else (entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"])
+                    initial_risk = abs(entry_price - initial_sl)
+                    sl_dist_pct = initial_risk / entry_price
+                    
+                    if 0.01 <= sl_dist_pct <= 0.04:
+                        active_positions[symbol] = {
+                            "side": side,
+                            "entry_price": entry_price,
+                            "stop_loss": initial_sl,
+                            "highest_price": entry_price,
+                            "lowest_price": entry_price,
+                            "initial_risk": initial_risk,
+                            "entry_index": i,
+                            "used_margin": current_trade_margin,
+                        }
                     
     return pd.DataFrame(all_trades)
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با ریسک پویا - HUNTER-V76")
+    print("📊 گزارش نهایی استراتژی هوشمند - HUNTER-V77")
     print("=" * 68)
 
     if trades_df.empty:
@@ -396,4 +448,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V76 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V77 به پایان رسید.")
