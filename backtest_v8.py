@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V68 (Golden Core V67 + Per-Symbol Loss Cooldown)
+# HUNTER-V69 (Golden Core + ADX Trend Strength Filter)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -66,7 +66,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V68 (هسته طلایی + مدارشکن موضعی نمادها)")
+print("📥 دریافت داده‌ها - HUNTER-V69 (هسته طلایی + فیلتر ADX)")
 print("=" * 60)
 
 processed_data = {}
@@ -140,6 +140,21 @@ def fetch_symbol_data(lbank_symbol):
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
 
+    # محاسبه ADX (شاخص میانگین جهت‌دار) برای سنجش قدرت روند
+    plus_dm = df["High"].diff()
+    minus_dm = df["Low"].diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+    
+    df["Plus_DM"] = pd.Series(plus_dm, index=df.index)
+    df["Minus_DM"] = pd.Series(minus_dm, index=df.index)
+    
+    tr_smoothed = df["ATR"].rolling(14).mean()
+    plus_di = 100 * (df["Plus_DM"].rolling(14).mean() / (tr_smoothed + 1e-9))
+    minus_di = 100 * (df["Minus_DM"].rolling(14).mean() / (tr_smoothed + 1e-9))
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+    df["ADX"] = dx.rolling(14).mean()
+
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
@@ -156,7 +171,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V68...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V69...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -166,16 +181,7 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     
-    # دیکشنری برای رصد تعداد باخت پشت سر هم و تایمر استراحت هر نماد
-    symbol_loss_streaks = {symbol: 0 for symbol in processed_data.keys()}
-    symbol_cooldown_timers = {symbol: 0 for symbol in processed_data.keys()}
-    
     for ts in all_timestamps:
-        # کاهش تایمر استراحت نمادها در هر کندل جدید
-        for symbol in symbol_cooldown_timers:
-            if symbol_cooldown_timers[symbol] > 0:
-                symbol_cooldown_timers[symbol] -= 1
-
         symbols_to_close = []
         
         for symbol, pos in list(active_positions.items()):
@@ -219,15 +225,6 @@ def run_backtest(processed_data):
                 position_notional = TRADE_MARGIN * LEVERAGE
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
                 
-                # بروزرسانی مدارشکن اختصاصی همان نماد
-                if outcome == "LOSS":
-                    symbol_loss_streaks[symbol] += 1
-                    if symbol_loss_streaks[symbol] >= 2:
-                        symbol_cooldown_timers[symbol] = 4  # ۴ کندل (۱۶ ساعت) استراحت برای این نماد خاص
-                else:
-                    symbol_loss_streaks[symbol] = 0
-                    symbol_cooldown_timers[symbol] = 0
-
                 all_trades.append({
                     "Timestamp": ts,
                     "Symbol": symbol,
@@ -267,10 +264,6 @@ def run_backtest(processed_data):
             if symbol in active_positions:
                 continue
             
-            # اگر این نماد در حالت استراحت (Cooldown) است، از آن عبور کن
-            if symbol_cooldown_timers.get(symbol, 0) > 0:
-                continue
-            
             df = processed_data[symbol]
             if ts not in df.index:
                 continue
@@ -282,6 +275,11 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
             
+            # فیلتر قدرت روند ADX: اگر روند ضعیف باشد (ADX < 20)، به هیچ وجه وارد معامله نمی‌شویم
+            adx_val = c4h["ADX"]
+            if np.isnan(adx_val) or adx_val < 20.0:
+                continue
+
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"]) and (c4h["EMA20"] > c4h["EMA50"]) and (c4h["Close"] > c4h["EMA200"])
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
@@ -314,7 +312,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با مدارشکن موضعی نمادها - HUNTER-V68")
+    print("📊 گزارش نهایی استراتژی با فیلتر قدرت روند ADX - HUNTER-V69")
     print("=" * 68)
 
     if trades_df.empty:
@@ -386,4 +384,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V68 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V69 به پایان رسید.")
