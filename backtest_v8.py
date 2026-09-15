@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V73 (Golden Core + Dynamic Risk Neutralizer)
+# HUNTER-V74 (Golden Core + Market Breadth Shield)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -57,16 +57,16 @@ INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
-# تنظیمات مالی پایه
+# تنظیمات مالی
 INITIAL_CAPITAL = 1000.0
-BASE_TRADE_MARGIN = 100.0
+TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V73 (هسته طلایی + خنثی‌ساز پویای ریسک)")
+print("📥 دریافت داده‌ها - HUNTER-V74 (هسته طلایی + سپر حفاظتی سبد)")
 print("=" * 60)
 
 processed_data = {}
@@ -156,7 +156,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V73...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V74...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -165,9 +165,6 @@ def run_backtest(processed_data):
     
     active_positions = {}
     all_trades = []
-    
-    # متغیرهای کنترل زنجیره و ریسک پویا
-    current_consecutive_losses = 0
     
     for ts in all_timestamps:
         symbols_to_close = []
@@ -210,15 +207,7 @@ def run_backtest(processed_data):
                     price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
                 
                 outcome = "WIN" if r_real > 0 else "LOSS"
-                
-                # به‌روزرسانی زنجیره باخت برای تعدیل ریسک پوزیشن بعدی
-                if outcome == "LOSS":
-                    current_consecutive_losses += 1
-                else:
-                    current_consecutive_losses = 0
-
-                used_margin = pos["assigned_margin"]
-                position_notional = used_margin * LEVERAGE
+                position_notional = TRADE_MARGIN * LEVERAGE
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
                 
                 all_trades.append({
@@ -240,6 +229,22 @@ def run_backtest(processed_data):
             btc_c = processed_data["BTC"].loc[ts]
             market_bull = btc_c["Close"] > btc_c["EMA200"]
         
+        # محاسبه میزان سلامت و پهنای بازار (Market Breadth)
+        # بررسی اینکه چند درصد از نمادها بالای EMA200 خود قرار دارند
+        bullish_count = 0
+        total_active_syms = 0
+        for symbol, df in processed_data.items():
+            if ts in df.index:
+                total_active_syms += 1
+                if df.loc[ts, "Close"] > df.loc[ts, "EMA200"]:
+                    bullish_count += 1
+        
+        market_breadth_ratio = (bullish_count / total_active_syms) if total_active_syms > 0 else 0.5
+        
+        # اگر بازار از نظر پهنای کلی شکننده است (مثلاً کمتر از 35 درصد بازار صعودی است)، اجازه باز کردن لانگ جدید داده نمی‌شود
+        allow_longs = market_breadth_ratio >= 0.35
+        allow_shorts = market_breadth_ratio <= 0.65
+
         current_scores = {}
         for symbol, df in processed_data.items():
             if ts in df.index:
@@ -272,11 +277,15 @@ def run_backtest(processed_data):
             prev_c = df.iloc[i - 1]
             
             if market_bull:
+                if not allow_longs:
+                    continue
                 regime_ok = (c4h["Close"] > c4h["EMA20"]) and (c4h["EMA20"] > c4h["EMA50"]) and (c4h["Close"] > c4h["EMA200"])
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
                 valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
                 side = "LONG"
             else:
+                if not allow_shorts:
+                    continue
                 regime_ok = (c4h["Close"] < c4h["EMA20"]) and (c4h["EMA20"] < c4h["EMA50"]) and (c4h["Close"] < c4h["EMA200"])
                 pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
                 valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
@@ -289,16 +298,6 @@ def run_backtest(processed_data):
                 sl_dist_pct = initial_risk / entry_price
                 
                 if 0.01 <= sl_dist_pct <= 0.04:
-                    # تعیین حجم پویا بر اساس تعداد باخت‌های پشت سر هم (مکانیزم خنث‌ساز)
-                    if current_consecutive_losses == 0:
-                        assigned_margin = BASE_TRADE_MARGIN        # $100
-                    elif current_consecutive_losses == 1:
-                        assigned_margin = BASE_TRADE_MARGIN * 0.75 # $75
-                    elif current_consecutive_losses == 2:
-                        assigned_margin = BASE_TRADE_MARGIN * 0.50 # $50
-                    else:
-                        assigned_margin = BASE_TRADE_MARGIN * 0.35 # $35 (حداقل ریسک در اوج طوفان)
-
                     active_positions[symbol] = {
                         "side": side,
                         "entry_price": entry_price,
@@ -306,7 +305,6 @@ def run_backtest(processed_data):
                         "highest_price": entry_price,
                         "lowest_price": entry_price,
                         "initial_risk": initial_risk,
-                        "assigned_margin": assigned_margin,
                         "entry_index": i,
                     }
                     
@@ -314,7 +312,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با خنث‌ساز پویای ریسک - HUNTER-V73")
+    print("📊 گزارش نهایی استراتژی با سپر حفاظتی سبد - HUNTER-V74")
     print("=" * 68)
 
     if trades_df.empty:
@@ -365,7 +363,7 @@ def summarize_result(trades_df):
         loss_sequences.append(temp_loss_seq)
 
     print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
-    print(f"🔸 مارجین پایه: ${BASE_TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
+    print(f"🔸 مارجین: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
     print(f"🔸 تعداد کل معاملات: {total_trades}")
     print(f"   🔹 معاملات لانگ: کل = {long_total} | برنده = {long_wins} | بازنده = {long_losses} | وین‌ریت = {long_wr:.2f}%")
     print(f"   🔸 معاملات شورت: کل = {short_total} | برنده = {short_wins} | بازنده = {short_losses} | وین‌ریت = {short_wr:.2f}%")
@@ -373,7 +371,7 @@ def summarize_result(trades_df):
     print(f"💰 مجموع بازدهی خالص: {net_r:.2f}R")
     print(f"💵 مجموع سود/زیان دلاری خالص: ${total_dollar_pnl:,.2f}")
     print(f"🏦 سرمایه نهایی: ${final_capital:,.2f}")
-    print(f"❄️ حداکثر ضررهای متوالی کل سبد (شمارش تعداد): {max_losses}")
+    print(f"❄️ حداکثر ضررهای متوالی کل سبد: {max_losses}")
 
     print("\n------------------------------------------------------------")
     print("📉 لیست کامل زنجیره‌های ضرر متوالی:")
@@ -386,4 +384,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V73 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V74 به پایان رسید.")
