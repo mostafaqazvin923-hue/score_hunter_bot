@@ -6,9 +6,13 @@ from datetime import datetime, timedelta
 try:
     import ccxt
 except ImportError:
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "ccxt"]
-    )
+    subprocess.check_call([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "ccxt"
+    ])
     import ccxt
 
 import numpy as np
@@ -16,20 +20,12 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V74.2
-# Golden Core + Market Breadth Shield
-# Fixed Fee / PnL / Position Handling
+# EXCHANGE & UNIVERSE SETTINGS
 # ============================================================
-
 
 exchange = ccxt.lbank({
     "enableRateLimit": True
 })
-
-
-# ============================================================
-# SYMBOLS
-# ============================================================
 
 SYMBOLS = {
     "BTC": "BTC/USDT",
@@ -60,13 +56,14 @@ REMOVED_COINS = {
 }
 
 SYMBOLS = {
-    k: v for k, v in SYMBOLS.items()
-    if k not in REMOVED_COINS
+    symbol: market
+    for symbol, market in SYMBOLS.items()
+    if symbol not in REMOVED_COINS
 }
 
 
 # ============================================================
-# STRATEGY SETTINGS
+# BACKTEST & RISK SETTINGS
 # ============================================================
 
 LOOKBACK_DAYS = 365
@@ -84,30 +81,22 @@ TRAILING_ATR_MULTIPLIER = 2.0
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
-
-# ============================================================
-# MONEY MANAGEMENT (V74 CORE)
-# ============================================================
-
 INITIAL_CAPITAL = 1000.0
-TRADE_MARGIN = 100.0
-LEVERAGE = 80.0
+BASE_MARGIN_PCT = 0.02
+MAX_TOTAL_MARGIN_PCT = 0.12
+LEVERAGE = 30.0
 
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 
-print("=" * 65)
-print("📥 دریافت داده‌ها - HUNTER-V74.2")
-print("=" * 65)
+print("=" * 68)
+print("📥 دریافت داده‌ها - HUNTER-V74.3")
+print("=" * 68)
 
 processed_data = {}
 
-
-# ============================================================
-# FETCH DATA
-# ============================================================
 
 def fetch_symbol_data(lbank_symbol):
     all_ohlcv = []
@@ -122,7 +111,7 @@ def fetch_symbol_data(lbank_symbol):
                     lbank_symbol,
                     timeframe=TIMEFRAME,
                     since=current_since,
-                    limit=1000
+                    limit=1000,
                 )
                 break
             except Exception:
@@ -148,7 +137,7 @@ def fetch_symbol_data(lbank_symbol):
 
     df = pd.DataFrame(
         all_ohlcv,
-        columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
+        columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"],
     )
 
     df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms")
@@ -159,7 +148,6 @@ def fetch_symbol_data(lbank_symbol):
     df.sort_values("Date", inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # حذف کندل ناقص آخر
     if len(df) >= 2:
         now_ms = exchange.milliseconds()
         last_ms = int(df.iloc[-1]["Date"].timestamp() * 1000)
@@ -169,57 +157,148 @@ def fetch_symbol_data(lbank_symbol):
     if len(df) < EMA_WARMUP + 50:
         return None
 
-    # کنترل گپ دیتا
     deltas = df["Date"].diff().dropna()
     if not deltas.empty and deltas.max() > pd.Timedelta(hours=4, minutes=10):
         return None
 
-    # ====================================================
-    # INDICATORS
-    # ====================================================
-
     tr1 = df["High"] - df["Low"]
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    df["ATR"] = (
-        pd.concat([tr1, tr2, tr3], axis=1)
-        .max(axis=1)
-        .rolling(ATR_PERIOD)
-        .mean()
-    )
-
+    df["ATR"] = true_range.rolling(ATR_PERIOD).mean()
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
-    df["Mom_Short"] = (
-        df["Close"] - df["Close"].shift(10)
-    ) / df["Close"].shift(10)
-
-    df["Mom_Long"] = (
-        df["Close"] - df["Close"].shift(30)
-    ) / df["Close"].shift(30)
+    df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
+    df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
 
     df.set_index("Date", inplace=True)
     return df
 
-
-# ============================================================
-# LOAD ALL SYMBOL DATA
-# ============================================================
 
 for symbol, lbank_symbol in SYMBOLS.items():
     df4h = fetch_symbol_data(lbank_symbol)
     if df4h is not None:
         processed_data[symbol] = df4h
 
-print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V74.2...")
+
+# ============================================================
+# CAPITAL & RISK MANAGEMENT UTILS
+# ============================================================
+
+def calculate_trade_margin(equity, base_margin_pct, max_total_margin_pct, current_margin_used):
+    if equity <= 0:
+        return 0.0
+    proposed_margin = equity * base_margin_pct
+    max_total_margin = equity * max_total_margin_pct
+    remaining_margin = max_total_margin - current_margin_used
+    if remaining_margin <= 0:
+        return 0.0
+    return float(min(proposed_margin, remaining_margin))
+
+
+def get_current_margin_used(active_positions):
+    return sum(pos["margin"] for pos in active_positions.values())
+
+
+def calculate_dollar_pnl(side, entry_price, exit_price, notional):
+    if entry_price <= 0 or exit_price <= 0 or notional <= 0:
+        return 0.0
+    if side == "LONG":
+        price_return_pct = (exit_price - entry_price) / entry_price
+    else:
+        price_return_pct = (entry_price - exit_price) / entry_price
+    gross_pnl = notional * price_return_pct
+    fees = notional * FEE_RATE * 2
+    return float(gross_pnl - fees)
+
+
+def calculate_r_result(side, entry_price, exit_price, initial_risk, sl_dist_pct):
+    if entry_price <= 0 or exit_price <= 0 or initial_risk <= 0 or sl_dist_pct <= 0:
+        return 0.0, 0.0, 0.0
+    if side == "LONG":
+        raw_r = (exit_price - entry_price) / initial_risk
+    else:
+        raw_r = (entry_price - exit_price) / initial_risk
+    total_fee_pct = FEE_RATE * 2
+    fee_r = total_fee_pct / sl_dist_pct
+    net_r = raw_r - fee_r
+    return float(net_r), float(raw_r), float(fee_r)
+
+
+def validate_stop_distance(entry, stop):
+    dist_pct = abs(entry - stop) / entry
+    is_valid = 0.01 <= dist_pct <= 0.04
+    return is_valid, dist_pct
+
+
+def get_current_equity(realized_pnl):
+    return float(INITIAL_CAPITAL + realized_pnl)
+
+
+def capital_safety_check(equity):
+    return equity > 0
+
+
+def calculate_capital_statistics(trades_df):
+    if trades_df.empty:
+        return {"MaxDrawdownPct": 0.0}
+    cum_pnl = trades_df["Dollar_PnL"].cumsum()
+    equity = INITIAL_CAPITAL + cum_pnl
+    running_max = equity.cummax()
+    dd = (equity - running_max) / running_max * 100
+    max_dd_pct = dd.min() if not dd.empty else 0.0
+    return {"MaxDrawdownPct": abs(max_dd_pct)}
+
+
+def calculate_side_statistics(trades_df):
+    sides = {}
+    for side in ["LONG", "SHORT"]:
+        sub = trades_df[trades_df["Side"] == side]
+        if sub.empty:
+            sides[side] = "No trades"
+        else:
+            wr = (sub["Outcome"] == "WIN").mean() * 100
+            pnl = sub["Dollar_PnL"].sum()
+            sides[side] = f"Trades: {len(sub)} | WR: {wr:.2f}% | PnL: ${pnl:,.2f}"
+    return sides
+
+
+def calculate_loss_streak(trades_df):
+    if trades_df.empty:
+        return 0
+    outcomes = (trades_df["Outcome"] == "LOSS").astype(int)
+    max_streak = 0
+    current_streak = 0
+    for val in outcomes:
+        if val == 1:
+            current_streak += 1
+            if current_streak > max_streak:
+                max_streak = current_streak
+        else:
+            current_streak = 0
+    return max_streak
+
+
+def calculate_symbol_statistics(trades_df):
+    if trades_df.empty:
+        return pd.DataFrame()
+    summary = (
+        trades_df.groupby("Symbol")
+        .agg(
+            Trades=("Outcome", "count"),
+            WinRate=("Outcome", lambda x: (x == "WIN").mean() * 100),
+            Total_PnL=("Dollar_PnL", "sum"),
+        )
+        .sort_values(by="Total_PnL", ascending=False)
+    )
+    return summary
 
 
 # ============================================================
-# BACKTEST ENGINE
+# FINAL BACKTEST ENGINE
 # ============================================================
 
 def run_backtest(processed_data):
@@ -231,13 +310,13 @@ def run_backtest(processed_data):
 
     active_positions = {}
     all_trades = []
+    realized_pnl = 0.0
 
     for ts in all_timestamps:
+        # ====================================================
+        # 1) مدیریت پوزیشن‌های باز
+        # ====================================================
         symbols_to_close = []
-
-        # ====================================================
-        # POSITION MANAGEMENT
-        # ====================================================
 
         for symbol, pos in list(active_positions.items()):
             df = processed_data[symbol]
@@ -246,34 +325,20 @@ def run_backtest(processed_data):
 
             c4h = df.loc[ts]
 
-            # -----------------------------
-            # LONG TRAILING
-            # -----------------------------
+            # Trailing Stop
             if pos["side"] == "LONG":
                 if c4h["High"] > pos["highest_price"]:
                     pos["highest_price"] = c4h["High"]
-                    new_sl = (
-                        pos["highest_price"]
-                        - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
-                    )
+                    new_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
                     if new_sl > pos["stop_loss"]:
                         pos["stop_loss"] = new_sl
-
                 hit_sl = c4h["Low"] <= pos["stop_loss"]
-
-            # -----------------------------
-            # SHORT TRAILING
-            # -----------------------------
             else:
                 if c4h["Low"] < pos["lowest_price"]:
                     pos["lowest_price"] = c4h["Low"]
-                    new_sl = (
-                        pos["lowest_price"]
-                        + TRAILING_ATR_MULTIPLIER * c4h["ATR"]
-                    )
+                    new_sl = pos["lowest_price"] + TRAILING_ATR_MULTIPLIER * c4h["ATR"]
                     if new_sl < pos["stop_loss"]:
                         pos["stop_loss"] = new_sl
-
                 hit_sl = c4h["High"] >= pos["stop_loss"]
 
             current_index = df.index.get_loc(ts)
@@ -281,115 +346,103 @@ def run_backtest(processed_data):
             timeout = candles_held >= TIMEOUT_CANDLES
 
             if hit_sl or timeout:
-                entry = pos["entry_price"]
-                risk = pos["initial_risk"]
-
-                if pos["side"] == "LONG":
-                    if hit_sl:
+                if hit_sl:
+                    if pos["side"] == "LONG":
                         exit_price = min(pos["stop_loss"], c4h["Open"])
                     else:
-                        exit_price = c4h["Close"]
-
-                    raw_r = (exit_price - entry) / risk
-                    price_return = (exit_price - entry) / entry
-                else:
-                    if hit_sl:
                         exit_price = max(pos["stop_loss"], c4h["Open"])
-                    else:
-                        exit_price = c4h["Close"]
+                else:
+                    exit_price = c4h["Close"]
 
-                    raw_r = (entry - exit_price) / risk
-                    price_return = (entry - exit_price) / entry
-
-                # اصلاح کارمزد بر اساس R واقعی
-                fee_r = (FEE_RATE * 2) / pos["sl_dist_pct"]
-                real_r = raw_r - fee_r
-
-                outcome = "WIN" if real_r > 0 else "LOSS"
-                notional = TRADE_MARGIN * LEVERAGE
-
-                dollar_pnl = (
-                    notional * price_return
-                ) - (
-                    notional * FEE_RATE * 2
+                r_real, raw_r, fee_r = calculate_r_result(
+                    pos["side"],
+                    pos["entry_price"],
+                    exit_price,
+                    pos["initial_risk"],
+                    pos["sl_dist_pct"]
                 )
+
+                dollar_pnl = calculate_dollar_pnl(
+                    pos["side"],
+                    pos["entry_price"],
+                    exit_price,
+                    pos["notional"]
+                )
+
+                realized_pnl += dollar_pnl
+                outcome = "WIN" if r_real > 0 else "LOSS"
 
                 all_trades.append({
                     "Timestamp": ts,
                     "Symbol": symbol,
                     "Side": pos["side"],
                     "Outcome": outcome,
-                    "Return": real_r,
+                    "Return": r_real,
+                    "Raw_R": raw_r,
+                    "Fee_R": fee_r,
                     "Dollar_PnL": dollar_pnl,
-                    "ExitOrder": len(all_trades)
+                    "Entry": pos["entry_price"],
+                    "Exit": exit_price,
+                    "Hold": candles_held,
+                    "ExitOrder": len(all_trades),
                 })
-
                 symbols_to_close.append(symbol)
 
-        for sym in symbols_to_close:
-            del active_positions[sym]
+        for symbol in symbols_to_close:
+            del active_positions[symbol]
 
         # ====================================================
-        # MARKET REGIME
+        # 2) محاسبه Equity
         # ====================================================
+        current_equity = get_current_equity(realized_pnl)
+        if not capital_safety_check(current_equity):
+            break
 
+        # ====================================================
+        # 3) وضعیت بازار BTC + Breadth
+        # ====================================================
         market_bull = True
-        btc_c = None
-
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
             btc_c = processed_data["BTC"].loc[ts]
             market_bull = btc_c["Close"] > btc_c["EMA200"]
 
-        # ====================================================
-        # MARKET BREADTH SHIELD
-        # ====================================================
-
         bullish_count = 0
         total_symbols = 0
-
         for symbol, df in processed_data.items():
             if ts in df.index:
                 total_symbols += 1
                 if df.loc[ts, "Close"] > df.loc[ts, "EMA200"]:
                     bullish_count += 1
 
-        market_breadth = (
-            bullish_count / total_symbols
-            if total_symbols > 0
-            else 0.5
-        )
-
-        allow_longs = market_breadth >= 0.35
-        allow_shorts = market_breadth <= 0.65
+        breadth = bullish_count / total_symbols if total_symbols > 0 else 0.5
+        allow_longs = breadth >= 0.35
+        allow_shorts = breadth <= 0.65
 
         # ====================================================
-        # RANKING SYMBOLS
+        # 4) رتبه‌بندی Momentum
         # ====================================================
-
         scores = {}
         for symbol, df in processed_data.items():
             if ts in df.index:
-                mom = df.loc[ts, "Mom_Long"]
-                if not np.isnan(mom):
-                    scores[symbol] = mom
+                value = df.loc[ts, "Mom_Long"]
+                if not np.isnan(value):
+                    scores[symbol] = value
 
         if not scores:
             continue
 
-        ranked_symbols = sorted(
+        ranked = sorted(
             scores.keys(),
-            key=lambda x: scores[x],
-            reverse=market_bull
+            key=lambda x: float(scores[x]),
+            reverse=bool(market_bull)
         )
 
         # ====================================================
-        # ENTRY ENGINE
+        # 5) ساخت Entry
         # ====================================================
-
-        for symbol in ranked_symbols:
+        for symbol in ranked:
             if len(active_positions) >= MAX_POSITIONS:
                 break
-
             if symbol in active_positions:
                 continue
 
@@ -398,176 +451,131 @@ def run_backtest(processed_data):
                 continue
 
             i = df.index.get_loc(ts)
-            if i < EMA_WARMUP + 1:
+            if i < EMA_WARMUP + 1 or i + 1 >= len(df):
                 continue
 
             c4h = df.iloc[i]
             prev = df.iloc[i - 1]
 
-            # -----------------------------
-            # LONG SETUP
-            # -----------------------------
             if market_bull:
                 if not allow_longs:
                     continue
-
-                regime_ok = (
+                regime = (
                     c4h["Close"] > c4h["EMA20"]
                     and c4h["EMA20"] > c4h["EMA50"]
                     and c4h["Close"] > c4h["EMA200"]
                 )
-
-                pullback_ok = prev["Low"] <= prev["EMA20"] * 1.015
-
-                momentum_ok = (
-                    c4h["Mom_Short"] > 0.012
-                    and c4h["Mom_Long"] > 0.035
-                )
-
-                valid_signal = regime_ok and pullback_ok and momentum_ok
+                pullback = prev["Low"] <= prev["EMA20"] * 1.015
+                momentum = c4h["Mom_Short"] > 0.012 and c4h["Mom_Long"] > 0.035
+                valid_signal = regime and pullback and momentum
                 side = "LONG"
-
-            # -----------------------------
-            # SHORT SETUP
-            # -----------------------------
             else:
                 if not allow_shorts:
                     continue
-
-                regime_ok = (
+                regime = (
                     c4h["Close"] < c4h["EMA20"]
                     and c4h["EMA20"] < c4h["EMA50"]
                     and c4h["Close"] < c4h["EMA200"]
                 )
-
-                pullback_ok = prev["High"] >= prev["EMA20"] * 0.985
-
-                momentum_ok = (
-                    c4h["Mom_Short"] < -0.012
-                    and c4h["Mom_Long"] < -0.035
-                )
-
-                valid_signal = regime_ok and pullback_ok and momentum_ok
+                pullback = prev["High"] >= prev["EMA20"] * 0.985
+                momentum = c4h["Mom_Short"] < -0.012 and c4h["Mom_Long"] < -0.035
+                valid_signal = regime and pullback and momentum
                 side = "SHORT"
 
             if not valid_signal:
                 continue
 
-            # ====================================================
-            # CREATE POSITION
-            # ====================================================
+            entry = (
+                c4h["Open"] * (1 + SLIPPAGE)
+                if side == "LONG"
+                else c4h["Open"] * (1 - SLIPPAGE)
+            )
 
-            if side == "LONG":
-                entry_price = c4h["Open"] * (1 + SLIPPAGE)
-                stop_loss = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"]
-            else:
-                entry_price = c4h["Open"] * (1 - SLIPPAGE)
-                stop_loss = entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"]
+            stop = (
+                entry - INITIAL_ATR_MULTIPLIER * c4h["ATR"]
+                if side == "LONG"
+                else entry + INITIAL_ATR_MULTIPLIER * c4h["ATR"]
+            )
 
-            initial_risk = abs(entry_price - stop_loss)
-            sl_dist_pct = initial_risk / entry_price
-
-            # جلوگیری از استاپ خیلی کوچک یا خیلی بزرگ
-            if not (0.01 <= sl_dist_pct <= 0.04):
+            valid_stop, sl_pct = validate_stop_distance(entry, stop)
+            if not valid_stop:
                 continue
 
-            active_positions[symbol] = {
+            margin = calculate_trade_margin(
+                current_equity,
+                BASE_MARGIN_PCT,
+                MAX_TOTAL_MARGIN_PCT,
+                get_current_margin_used(active_positions)
+            )
+
+            if margin <= 0:
+                continue
+
+            position = {
                 "side": side,
-                "entry_price": entry_price,
-                "stop_loss": stop_loss,
-                "highest_price": entry_price,
-                "lowest_price": entry_price,
-                "initial_risk": initial_risk,
-                "sl_dist_pct": sl_dist_pct,
+                "entry_price": entry,
+                "stop_loss": stop,
+                "highest_price": entry,
+                "lowest_price": entry,
+                "initial_risk": abs(entry - stop),
+                "sl_dist_pct": sl_pct,
                 "entry_index": i,
+                "margin": margin,
+                "notional": margin * LEVERAGE,
             }
+
+            active_positions[symbol] = position
 
     return pd.DataFrame(all_trades)
 
 
 # ============================================================
-# SUMMARY REPORT
+# FINAL REPORT
 # ============================================================
 
 def summarize_result(trades_df):
-    print("\n" + "=" * 68)
-    print("📊 گزارش نهایی HUNTER-V74.2")
-    print("=" * 68)
+    print("\n" + "=" * 70)
+    print("📊 HUNTER-V74.3 FINAL REPORT")
+    print("=" * 70)
 
     if trades_df.empty:
-        print("⚠️ هیچ معامله‌ای ثبت نشد.")
+        print("هیچ معامله‌ای ثبت نشد")
         return
 
-    trades_df = trades_df.sort_values(
-        ["Timestamp", "ExitOrder"],
-        kind="stable"
-    ).reset_index(drop=True)
-
-    total_trades = len(trades_df)
+    total = len(trades_df)
     wins = int((trades_df["Outcome"] == "WIN").sum())
-    losses = int((trades_df["Outcome"] == "LOSS").sum())
+    losses = total - wins
+    wr = wins / total * 100
+    pnl = float(trades_df["Dollar_PnL"].sum())
+    final = INITIAL_CAPITAL + pnl
 
-    win_rate = (
-        wins / total_trades * 100
-        if total_trades > 0
-        else 0
-    )
+    stats = calculate_capital_statistics(trades_df)
+    sides = calculate_side_statistics(trades_df)
 
-    net_r = float(trades_df["Return"].sum())
-    total_pnl = float(trades_df["Dollar_PnL"].sum())
-    final_capital = INITIAL_CAPITAL + total_pnl
+    print(f"Trades: {total}")
+    print(f"Win Rate: {wr:.2f}%")
+    print(f"Wins: {wins} | Losses: {losses}")
+    print(f"Net R: {trades_df['Return'].sum():.2f}")
+    print(f"PnL: ${pnl:,.2f}")
+    print(f"Final Capital: ${final:,.2f}")
+    print(f"Max DD: {stats['MaxDrawdownPct']:.2f}%")
+    print(f"Max Loss Streak: {calculate_loss_streak(trades_df)}")
 
-    longs = trades_df[trades_df["Side"] == "LONG"]
-    shorts = trades_df[trades_df["Side"] == "SHORT"]
+    print("\nLONG:")
+    print(sides["LONG"])
 
-    long_wr = (
-        (longs["Outcome"] == "WIN").sum() / len(longs) * 100
-        if len(longs)
-        else 0
-    )
+    print("\nSHORT:")
+    print(sides["SHORT"])
 
-    short_wr = (
-        (shorts["Outcome"] == "WIN").sum() / len(shorts) * 100
-        if len(shorts)
-        else 0
-    )
+    print("\nTop Symbols:")
+    print(calculate_symbol_statistics(trades_df).head(10))
 
-    max_loss_streak = 0
-    current_loss = 0
 
-    for outcome in trades_df["Outcome"]:
-        if outcome == "LOSS":
-            current_loss += 1
-            max_loss_streak = max(max_loss_streak, current_loss)
-        else:
-            current_loss = 0
-
-    equity = INITIAL_CAPITAL
-    curve = []
-
-    for pnl in trades_df["Dollar_PnL"]:
-        equity += pnl
-        curve.append(equity)
-
-    curve = pd.Series(curve)
-    peak = curve.cummax()
-    dd = curve - peak
-    max_dd = float(dd.min())
-
-    print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
-    print(f"🔸 Margin هر معامله: ${TRADE_MARGIN:,.2f} | Leverage: {LEVERAGE}x")
-    print(f"🔸 تعداد معاملات: {total_trades}\n")
-    print(f"📈 LONG: تعداد={len(longs)} | WinRate={long_wr:.2f}%")
-    print(f"📉 SHORT: تعداد={len(shorts)} | WinRate={short_wr:.2f}%\n")
-    print(f"🎯 Win Rate کلی: {win_rate:.2f}%")
-    print(f"💰 مجموع R: {net_r:.2f}R")
-    print(f"💵 سود/زیان: ${total_pnl:,.2f}")
-    print(f"🏦 سرمایه نهایی: ${final_capital:,.2f}")
-    print(f"📉 Max Drawdown: ${max_dd:,.2f}")
-    print(f"❄️ Max Loss Streak: {max_loss_streak}")
-
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V74.2 تمام شد.")
+    print("\n✨ HUNTER-V74.3 FINISHED")
