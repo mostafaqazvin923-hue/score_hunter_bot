@@ -15,7 +15,7 @@ import pandas as pd
 
 # ============================================================
 # HUNTER-V75
-# Adaptive Risk + Anti Loss Cluster Engine
+# Golden Core + Market Breadth + Loss Shield
 # ============================================================
 
 
@@ -23,6 +23,8 @@ exchange = ccxt.lbank({
     "enableRateLimit": True
 })
 
+
+# ================= SYMBOLS =================
 
 SYMBOLS = {
     "BTC": "BTC/USDT",
@@ -46,74 +48,98 @@ SYMBOLS = {
 
 
 REMOVED_COINS = {
-    "NEAR","OP","HYPE","HBAR","AVAX","SUI",
-    "PENDLE","TIA","FET","SEI","ARB",
-    "DOT","ETC","SHIB","STX","RUNE",
-    "MKR","APT","LTC","AR","IMX",
-    "PEPE","BONK"
+    "NEAR", "OP", "HYPE", "HBAR",
+    "AVAX", "SUI", "PENDLE",
+    "TIA", "FET", "SEI",
+    "ARB", "DOT", "ETC",
+    "SHIB", "STX", "RUNE",
+    "MKR", "APT", "LTC",
+    "AR", "IMX", "PEPE",
+    "BONK"
 }
 
 
 SYMBOLS = {
-    k:v for k,v in SYMBOLS.items()
+    k: v for k, v in SYMBOLS.items()
     if k not in REMOVED_COINS
 }
 
 
+# ================= BACKTEST SETTINGS =================
+
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
-
 MAX_POSITIONS = 5
 
-
-# هزینه‌ها
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
 
-# ATR
 ATR_PERIOD = 14
+
 INITIAL_ATR_MULTIPLIER = 1.8
-TRAILING_ATR_MULTIPLIER = 2.2
+TRAILING_ATR_MULTIPLIER = 2.0
 
 
-# مدیریت ضرر
-TIMEOUT_CANDLES = 35
-
-# بعد از ضرر روی یک کوین
-COOLDOWN_CANDLES = 12
-
-
+TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
 
-INITIAL_CAPITAL = 1000
-TRADE_MARGIN = 100
-LEVERAGE = 80
+
+# ================= LOSS SHIELD =================
+
+# بعد از ضررهای متوالی ورودها محدود می‌شوند
+
+MAX_LOSS_CHAIN_SOFT = 3
+MAX_LOSS_CHAIN_HARD = 5
+
+COOLDOWN_SOFT = 3
+COOLDOWN_HARD = 8
 
 
+
+# ================= FINANCE =================
+
+INITIAL_CAPITAL = 1000.0
+
+TRADE_MARGIN = 100.0
+
+LEVERAGE = 80.0
+
+
+
+# ================= DATA RANGE =================
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
-since_timestamp = int(start_date.timestamp()*1000)
+
+since_timestamp = int(
+    start_date.timestamp() * 1000
+)
 
 
 
-print("="*70)
-print("🚀 HUNTER-V75 Adaptive Risk Engine")
-print("="*70)
+print("=" * 70)
+print(
+    "📥 HUNTER-V75 "
+    "Golden Core + Loss Shield"
+)
+print("=" * 70)
 
 
 
 processed_data = {}
+# ============================================================
+# DATA FETCH
+# ============================================================
 
 
+def fetch_symbol_data(lbank_symbol):
 
-def fetch_symbol_data(symbol):
-
-    candles = []
+    all_ohlcv = []
 
     current_since = since_timestamp
+
     last_seen = None
 
 
@@ -121,53 +147,61 @@ def fetch_symbol_data(symbol):
 
         batch = None
 
+
         for attempt in range(3):
 
             try:
+
                 batch = exchange.fetch_ohlcv(
-                    symbol,
+                    lbank_symbol,
                     timeframe=TIMEFRAME,
                     since=current_since,
                     limit=1000
                 )
+
                 break
 
-            except:
+
+            except Exception:
 
                 if attempt == 2:
                     return None
+
 
 
         if not batch:
             break
 
 
+
         last_ts = batch[-1][0]
 
 
-        if last_seen and last_ts <= last_seen:
+        if last_seen is not None and last_ts <= last_seen:
             return None
 
 
-        candles.extend(batch)
+
+        all_ohlcv.extend(batch)
 
         last_seen = last_ts
 
         current_since = last_ts + 1
 
 
-        if len(batch)<1000:
+
+        if len(batch) < 1000:
             break
 
 
 
-    if not candles:
+    if not all_ohlcv:
         return None
 
 
 
     df = pd.DataFrame(
-        candles,
+        all_ohlcv,
         columns=[
             "Timestamp",
             "Open",
@@ -179,10 +213,12 @@ def fetch_symbol_data(symbol):
     )
 
 
+
     df["Date"] = pd.to_datetime(
         df["Timestamp"],
         unit="ms"
     )
+
 
 
     df = df[
@@ -197,8 +233,12 @@ def fetch_symbol_data(symbol):
     ]
 
 
+
+    df.dropna(inplace=True)
+
+
     df.drop_duplicates(
-        "Date",
+        subset=["Date"],
         keep="last",
         inplace=True
     )
@@ -216,65 +256,154 @@ def fetch_symbol_data(symbol):
     )
 
 
-    if len(df)<EMA_WARMUP+50:
+
+    # حذف کندل در حال تشکیل
+
+    if len(df) >= 2:
+
+        now_ms = exchange.milliseconds()
+
+        last_ms = int(
+            df.iloc[-1]["Date"].timestamp()
+            * 1000
+        )
+
+
+        if last_ms + (
+            4 * 60 * 60 * 1000
+        ) > now_ms:
+
+            df = df.iloc[:-1].copy()
+
+
+
+    if len(df) < EMA_WARMUP + 50:
+
         return None
 
 
 
-    # ATR
+    # چک گپ دیتا
 
-    tr1 = df["High"]-df["Low"]
+    deltas = df["Date"].diff().dropna()
 
-    tr2 = abs(
-        df["High"]-
+
+    if (
+        not deltas.empty
+        and deltas.max()
+        > pd.Timedelta(
+            hours=4,
+            minutes=10
+        )
+    ):
+
+        return None
+
+
+
+    # ================= ATR =================
+
+
+    tr1 = (
+        df["High"]
+        -
+        df["Low"]
+    )
+
+
+    tr2 = np.abs(
+        df["High"]
+        -
         df["Close"].shift(1)
     )
 
-    tr3 = abs(
-        df["Low"]-
+
+    tr3 = np.abs(
+        df["Low"]
+        -
         df["Close"].shift(1)
     )
 
 
-    df["ATR"] = pd.concat(
-        [tr1,tr2,tr3],
+    true_range = pd.concat(
+        [
+            tr1,
+            tr2,
+            tr3
+        ],
         axis=1
-    ).max(axis=1).rolling(
-        ATR_PERIOD
-    ).mean()
+    ).max(axis=1)
 
 
 
-    df["EMA20"] = df["Close"].ewm(
-        span=20,
-        adjust=False
-    ).mean()
+    df["ATR"] = (
+        true_range
+        .rolling(ATR_PERIOD)
+        .mean()
+    )
 
 
-    df["EMA50"] = df["Close"].ewm(
-        span=50,
-        adjust=False
-    ).mean()
+
+    # ================= EMA =================
 
 
-    df["EMA200"] = df["Close"].ewm(
-        span=200,
-        adjust=False
-    ).mean()
+    df["EMA20"] = (
+        df["Close"]
+        .ewm(
+            span=20,
+            adjust=False
+        )
+        .mean()
+    )
 
+
+    df["EMA50"] = (
+        df["Close"]
+        .ewm(
+            span=50,
+            adjust=False
+        )
+        .mean()
+    )
+
+
+    df["EMA200"] = (
+        df["Close"]
+        .ewm(
+            span=200,
+            adjust=False
+        )
+        .mean()
+    )
+
+
+
+    # ================= MOMENTUM =================
 
 
     df["Mom_Short"] = (
-        df["Close"]-
+        df["Close"]
+        -
         df["Close"].shift(10)
     ) / df["Close"].shift(10)
 
 
 
     df["Mom_Long"] = (
-        df["Close"]-
+        df["Close"]
+        -
         df["Close"].shift(30)
     ) / df["Close"].shift(30)
+
+
+
+    # فاصله قیمت از EMA200 برای امتیازدهی
+
+    df["EMA200_Distance"] = (
+        df["Close"]
+        -
+        df["EMA200"]
+    ) / df["EMA200"]
 
 
 
@@ -288,18 +417,39 @@ def fetch_symbol_data(symbol):
 
 
 
-for name,symbol in SYMBOLS.items():
+# ============================================================
+# LOAD ALL SYMBOLS
+# ============================================================
 
-    data = fetch_symbol_data(symbol)
 
-    if data is not None:
-        processed_data[name]=data
+for symbol, lbank_symbol in SYMBOLS.items():
+
+    df4h = fetch_symbol_data(
+        lbank_symbol
+    )
+
+
+    if df4h is not None:
+
+        processed_data[symbol] = df4h
 
 
 
 print(
-    f"✅ Valid symbols: {len(processed_data)}"
+    f"✅ تعداد نمادهای معتبر: "
+    f"{len(processed_data)} "
+    f"از {len(SYMBOLS)}"
 )
+
+
+print(
+    "⚙️ شروع اجرای بک‌تست HUNTER-V75..."
+    
+)# ============================================================
+# BACKTEST ENGINE
+# ============================================================
+
+
 def run_backtest(processed_data):
 
     all_timestamps = sorted(
@@ -316,12 +466,11 @@ def run_backtest(processed_data):
     all_trades = []
 
 
-    # ثبت آخرین ضرر هر نماد
-    symbol_cooldown = {}
+    # کنترل ضررهای متوالی
 
+    loss_chain = 0
 
-    # شمارنده ضرر کلی
-    consecutive_losses = 0
+    cooldown_counter = 0
 
 
 
@@ -333,16 +482,18 @@ def run_backtest(processed_data):
 
 
         # ====================================================
-        # مدیریت معاملات باز
+        # مدیریت پوزیشن های باز
         # ====================================================
 
-        for symbol,pos in list(active_positions.items()):
+
+        for symbol, pos in list(active_positions.items()):
 
 
             df = processed_data[symbol]
 
 
             if ts not in df.index:
+
                 continue
 
 
@@ -351,11 +502,10 @@ def run_backtest(processed_data):
 
 
 
-            # -----------------------------
-            # LONG TRAILING
-            # -----------------------------
+            # ---------------- LONG ----------------
 
-            if pos["side"]=="LONG":
+
+            if pos["side"] == "LONG":
 
 
                 if c4h["High"] > pos["highest_price"]:
@@ -367,12 +517,15 @@ def run_backtest(processed_data):
                     new_sl = (
                         pos["highest_price"]
                         -
-                        TRAILING_ATR_MULTIPLIER*c4h["ATR"]
+                        TRAILING_ATR_MULTIPLIER
+                        *
+                        c4h["ATR"]
                     )
 
 
                     if new_sl > pos["stop_loss"]:
-                        pos["stop_loss"]=new_sl
+
+                        pos["stop_loss"] = new_sl
 
 
 
@@ -384,9 +537,8 @@ def run_backtest(processed_data):
 
 
 
-            # -----------------------------
-            # SHORT TRAILING
-            # -----------------------------
+            # ---------------- SHORT ----------------
+
 
             else:
 
@@ -394,18 +546,21 @@ def run_backtest(processed_data):
                 if c4h["Low"] < pos["lowest_price"]:
 
 
-                    pos["lowest_price"]=c4h["Low"]
+                    pos["lowest_price"] = c4h["Low"]
 
 
                     new_sl = (
                         pos["lowest_price"]
                         +
-                        TRAILING_ATR_MULTIPLIER*c4h["ATR"]
+                        TRAILING_ATR_MULTIPLIER
+                        *
+                        c4h["ATR"]
                     )
 
 
                     if new_sl < pos["stop_loss"]:
-                        pos["stop_loss"]=new_sl
+
+                        pos["stop_loss"] = new_sl
 
 
 
@@ -418,19 +573,19 @@ def run_backtest(processed_data):
 
 
 
-            current_index = (
-                df.index.get_loc(ts)
+            curr_i = (
+                df.index
+                .get_loc(ts)
             )
 
 
             candles_held = (
-                current_index -
+                curr_i
+                -
                 pos["entry_index"]
             )
 
 
-
-            # خروج زمانی
             timeout = (
                 candles_held
                 >=
@@ -439,327 +594,380 @@ def run_backtest(processed_data):
 
 
 
-            # خروج زود هنگام معامله بی‌جان
-            dead_trade = False
-
-            if candles_held >= 12:
+            if hit_sl or timeout:
 
 
-                if pos["side"]=="LONG":
-
-                    if (
-                        c4h["Close"]
-                        <
-                        pos["entry_price"]
-                    ):
-                        dead_trade=True
-
-
-                else:
-
-                    if (
-                        c4h["Close"]
-                        >
-                        pos["entry_price"]
-                    ):
-                        dead_trade=True
+                initial_risk = pos["initial_risk"]
 
 
 
+                # ================= EXIT PRICE =================
 
 
-            if hit_sl or timeout or dead_trade:
+                if pos["side"] == "LONG":
 
 
-
-                if pos["side"]=="LONG":
-
-
-                    exit_price = (
+                    exit_p = (
                         min(
                             pos["stop_loss"],
                             c4h["Open"]
                         )
                         if hit_sl
-                        else
-                        c4h["Close"]
+                        else c4h["Close"]
                     )
-
-
-                    pnl_pct = (
-                        exit_price -
-                        pos["entry_price"]
-                    ) / pos["entry_price"]
 
 
 
                     r_real = (
                         (
-                        exit_price -
-                        pos["entry_price"]
+                            exit_p
+                            -
+                            pos["entry_price"]
                         )
                         /
-                        pos["initial_risk"]
+                        initial_risk
+                    ) - (
+                        FEE_RATE * 2
                     )
+
+
+
+                    price_return_pct = (
+                        exit_p
+                        -
+                        pos["entry_price"]
+                    ) / pos["entry_price"]
 
 
 
                 else:
 
 
-                    exit_price = (
+                    exit_p = (
                         max(
                             pos["stop_loss"],
                             c4h["Open"]
                         )
                         if hit_sl
-                        else
-                        c4h["Close"]
+                        else c4h["Close"]
                     )
-
-
-                    pnl_pct = (
-                        pos["entry_price"]
-                        -
-                        exit_price
-                    ) / pos["entry_price"]
 
 
 
                     r_real = (
                         (
-                        pos["entry_price"]
-                        -
-                        exit_price
+                            pos["entry_price"]
+                            -
+                            exit_p
                         )
                         /
-                        pos["initial_risk"]
+                        initial_risk
+                    ) - (
+                        FEE_RATE * 2
                     )
 
 
 
+                    price_return_pct = (
+                        pos["entry_price"]
+                        -
+                        exit_p
+                    ) / pos["entry_price"]
 
-                r_real -= (
-                    FEE_RATE*2
-                )
+
 
 
 
                 outcome = (
                     "WIN"
-                    if r_real>0
+                    if r_real > 0
                     else
                     "LOSS"
                 )
 
 
 
-                if outcome=="LOSS":
-
-                    symbol_cooldown[symbol]=(
-                        current_index
-                        +
-                        COOLDOWN_CANDLES
-                    )
+                # ================= LOSS SHIELD UPDATE =================
 
 
-                    consecutive_losses += 1
+                if outcome == "LOSS":
+
+                    loss_chain += 1
 
 
                 else:
 
-                    consecutive_losses=0
+                    loss_chain = 0
 
 
 
-
-
-                notional = (
-                    TRADE_MARGIN*
+                position_notional = (
+                    TRADE_MARGIN
+                    *
                     LEVERAGE
                 )
 
 
                 dollar_pnl = (
-                    notional*pnl_pct
-                    -
-                    notional*FEE_RATE*2
+                    position_notional
+                    *
+                    price_return_pct
+                ) - (
+                    position_notional
+                    *
+                    FEE_RATE
+                    *
+                    2
                 )
-
 
 
 
                 all_trades.append(
                     {
-
-                    "Timestamp":ts,
-
-                    "Symbol":symbol,
-
-                    "Side":pos["side"],
-
-                    "Outcome":outcome,
-
-                    "Return":r_real,
-
-                    "Dollar_PnL":dollar_pnl,
-
-                    "ExitOrder":len(all_trades)
-
+                        "Timestamp": ts,
+                        "Symbol": symbol,
+                        "Side": pos["side"],
+                        "Outcome": outcome,
+                        "Return": r_real,
+                        "Dollar_PnL": dollar_pnl,
+                        "ExitOrder": len(all_trades),
+                        "LossChain": loss_chain,
                     }
                 )
+
 
 
                 symbols_to_close.append(symbol)
 
 
 
+        # حذف پوزیشن های بسته شده
 
 
-        for s in symbols_to_close:
+        for sym in symbols_to_close:
 
-            del active_positions[s]
-
-
+            del active_positions[sym]
 
 
 
         # ====================================================
-        # وضعیت کلی بازار
+        # COOLDOWN AFTER LOSING STREAK
         # ====================================================
 
 
-        btc_bull=True
+        if cooldown_counter > 0:
+
+            cooldown_counter -= 1
 
 
-        if (
-            "BTC" in processed_data
-            and
-            ts in processed_data["BTC"].index
-        ):
+
+        if loss_chain >= MAX_LOSS_CHAIN_HARD:
+
+            cooldown_counter = max(
+                cooldown_counter,
+                COOLDOWN_HARD
+            )
 
 
-            btc=processed_data["BTC"].loc[ts]
+        elif loss_chain >= MAX_LOSS_CHAIN_SOFT:
 
-
-            btc_bull = (
-                btc["Close"]
-                >
-                btc["EMA200"]
+            cooldown_counter = max(
+                cooldown_counter,
+                COOLDOWN_SOFT
             )
 
 
 
+        # اگر cooldown فعال است،
+        # فقط مدیریت معاملات باز انجام شود
 
+
+        if cooldown_counter > 0:
+
+            continue
+                    # ====================================================
+        # MARKET REGIME + BREADTH FILTER
         # ====================================================
-        # Market Breadth Dynamic
-        # ====================================================
 
 
-        bullish=0
-        total=0
+        market_bull = True
+
+
+        if (
+            "BTC" in processed_data
+            and ts in processed_data["BTC"].index
+        ):
+
+            btc_c = processed_data["BTC"].loc[ts]
+
+            market_bull = (
+                btc_c["Close"]
+                >
+                btc_c["EMA200"]
+            )
 
 
 
-        for symbol,df in processed_data.items():
+        # ================= MARKET BREADTH =================
+
+
+        bullish_count = 0
+
+        total_active = 0
+
+
+
+        for symbol, df in processed_data.items():
+
 
             if ts in df.index:
 
-                total+=1
+
+                total_active += 1
 
 
                 if (
-                    df.loc[ts,"Close"]
+                    df.loc[ts, "Close"]
                     >
-                    df.loc[ts,"EMA200"]
+                    df.loc[ts, "EMA200"]
                 ):
-                    bullish+=1
+
+                    bullish_count += 1
 
 
 
 
-        breadth = (
-            bullish/total
-            if total>0
-            else .5
+        breadth_ratio = (
+            bullish_count
+            /
+            total_active
+            if total_active > 0
+            else 0.5
         )
 
 
 
-        # بازار ضعیف = سختگیری بیشتر
+        # فیلتر جهت بازار
 
-        if breadth < .35:
-
-            max_allowed_positions=2
-
-
-        elif breadth > .70:
-
-            max_allowed_positions=MAX_POSITIONS
+        allow_longs = (
+            breadth_ratio >= 0.35
+        )
 
 
-        else:
-
-            max_allowed_positions=3
+        allow_shorts = (
+            breadth_ratio <= 0.65
+        )
 
 
 
 
-        # جلوگیری از ورود هنگام زنجیره ضرر شدید
 
-        if consecutive_losses >= 5:
-
-            max_allowed_positions=2
-
+        # ====================================================
+        # BUILD SMART SCORE
+        # ====================================================
 
 
-        current_scores={}
+        current_scores = {}
 
 
 
-        for symbol,df in processed_data.items():
-
-            if ts in df.index:
+        for symbol, df in processed_data.items():
 
 
-                score=df.loc[
-                    ts,
-                    "Mom_Long"
-                ]
+            if ts not in df.index:
+
+                continue
 
 
-                if not np.isnan(score):
 
-                    current_scores[symbol]=score
+            row = df.loc[ts]
+
+
+
+            if np.isnan(row["Mom_Long"]):
+
+                continue
+
+
+
+            score = (
+
+                row["Mom_Long"] * 0.5
+
+                +
+
+                row["Mom_Short"] * 0.2
+
+                +
+
+                row["EMA200_Distance"] * 0.3
+
+            )
+
+
+
+            current_scores[symbol] = score
 
 
 
 
         if not current_scores:
+
             continue
 
 
 
 
-        ranked_symbols=sorted(
+
+        ranked_symbols = sorted(
+
             current_scores.keys(),
-            key=lambda x:current_scores[x],
-            reverse=btc_bull
+
+            key=lambda x:
+                current_scores[x],
+
+            reverse=True
+
         )
-                # ====================================================
-        # ساخت پوزیشن‌های جدید
+
+
+
+        # در بازار نزولی برعکس مرتب می‌کنیم
+
+        if not market_bull:
+
+
+            ranked_symbols = sorted(
+
+                current_scores.keys(),
+
+                key=lambda x:
+                    current_scores[x],
+
+                reverse=False
+
+            )
+
+
+
+
+
+        # ====================================================
+        # ENTRY LOGIC
         # ====================================================
 
 
         for symbol in ranked_symbols:
 
 
-            if len(active_positions) >= max_allowed_positions:
+            if len(active_positions) >= MAX_POSITIONS:
+
                 break
 
 
 
             if symbol in active_positions:
+
                 continue
 
 
@@ -769,6 +977,7 @@ def run_backtest(processed_data):
 
 
             if ts not in df.index:
+
                 continue
 
 
@@ -777,39 +986,32 @@ def run_backtest(processed_data):
 
 
 
-            if i < EMA_WARMUP + 5:
+            if i < EMA_WARMUP + 1:
+
                 continue
-
-
-
-
-            # بررسی Cooldown
-
-            if symbol in symbol_cooldown:
-
-
-                if i < symbol_cooldown[symbol]:
-                    continue
-
 
 
 
             c4h = df.iloc[i]
 
-            prev = df.iloc[i-1]
+            prev_c = df.iloc[i-1]
 
 
 
 
-            # ====================================================
-            # تعیین سمت بازار
-            # ====================================================
+
+            # ================= LONG =================
 
 
-            if btc_bull:
+            if market_bull:
 
 
-                # فقط لانگ‌های با کیفیت
+
+                if not allow_longs:
+
+                    continue
+
+
 
                 regime_ok = (
 
@@ -835,15 +1037,26 @@ def run_backtest(processed_data):
 
                 pullback_ok = (
 
-                    prev["Low"]
+                    prev_c["Low"]
                     <=
-                    prev["EMA20"]*1.02
+
+                    prev_c["EMA20"]
+                    *
+                    1.015
 
                 )
 
 
 
-                momentum_ok = (
+                valid_signal = (
+
+                    regime_ok
+
+                    and
+
+                    pullback_ok
+
+                    and
 
                     c4h["Mom_Short"]
                     >
@@ -859,54 +1072,23 @@ def run_backtest(processed_data):
 
 
 
-                # در بازار خیلی ضعیف سختگیری بیشتر
-
-                if breadth < 0.45:
-
-
-                    momentum_ok = (
-
-                        c4h["Mom_Short"]
-                        >
-                        0.018
-
-                        and
-
-                        c4h["Mom_Long"]
-                        >
-                        0.045
-
-                    )
+                side = "LONG"
 
 
 
-                valid_signal = (
-
-                    regime_ok
-
-                    and
-
-                    pullback_ok
-
-                    and
-
-                    momentum_ok
-
-                )
 
 
-
-                side="LONG"
-
-
+            # ================= SHORT =================
 
 
             else:
 
 
-                # ====================================================
-                # SHORT FILTER
-                # ====================================================
+
+                if not allow_shorts:
+
+                    continue
+
 
 
                 regime_ok = (
@@ -933,15 +1115,26 @@ def run_backtest(processed_data):
 
                 pullback_ok = (
 
-                    prev["High"]
+                    prev_c["High"]
                     >=
-                    prev["EMA20"]*0.98
+
+                    prev_c["EMA20"]
+                    *
+                    0.985
 
                 )
 
 
 
-                momentum_ok = (
+                valid_signal = (
+
+                    regime_ok
+
+                    and
+
+                    pullback_ok
+
+                    and
 
                     c4h["Mom_Short"]
                     <
@@ -957,244 +1150,209 @@ def run_backtest(processed_data):
 
 
 
+                side = "SHORT"
+                            # ====================================================
+            # OPEN POSITION
+            # ====================================================
 
-                # شورت‌ها کمی سخت‌تر
 
-                if breadth > 0.55:
+            if valid_signal:
 
 
-                    momentum_ok = (
+                if side == "LONG":
 
-                        c4h["Mom_Short"]
-                        <
-                        -0.018
 
-                        and
+                    entry_price = (
+                        c4h["Open"]
+                        *
+                        (1 + SLIPPAGE)
+                    )
 
-                        c4h["Mom_Long"]
-                        <
-                        -0.045
 
+                    initial_sl = (
+                        entry_price
+                        -
+                        INITIAL_ATR_MULTIPLIER
+                        *
+                        c4h["ATR"]
+                    )
+
+
+
+                else:
+
+
+                    entry_price = (
+                        c4h["Open"]
+                        *
+                        (1 - SLIPPAGE)
+                    )
+
+
+                    initial_sl = (
+                        entry_price
+                        +
+                        INITIAL_ATR_MULTIPLIER
+                        *
+                        c4h["ATR"]
                     )
 
 
 
 
-                valid_signal = (
-
-                    regime_ok
-
-                    and
-
-                    pullback_ok
-
-                    and
-
-                    momentum_ok
-
-                )
-
-
-
-                side="SHORT"
-
-
-
-
-
-
-
-            if not valid_signal:
-                continue
-
-
-
-
-            # ====================================================
-            # جلوگیری از ورودهای همبسته
-            # ====================================================
-
-
-            same_side_count=0
-
-
-            for p in active_positions.values():
-
-                if p["side"]==side:
-
-                    same_side_count += 1
-
-
-
-            if same_side_count >= 3:
-                continue
-
-
-
-
-
-
-            # ====================================================
-            # ساخت قیمت ورود و استاپ
-            # ====================================================
-
-
-            if side=="LONG":
-
-
-                entry_price = (
-                    c4h["Open"]
-                    *
-                    (1+SLIPPAGE)
-                )
-
-
-                stop_loss = (
-
+                initial_risk = abs(
                     entry_price
-
                     -
-                    INITIAL_ATR_MULTIPLIER
-                    *
-                    c4h["ATR"]
-
+                    initial_sl
                 )
 
 
 
-            else:
-
-
-                entry_price = (
-
-                    c4h["Open"]
-                    *
-                    (1-SLIPPAGE)
-
-                )
-
-
-                stop_loss = (
-
+                sl_dist_pct = (
+                    initial_risk
+                    /
                     entry_price
-
-                    +
-                    INITIAL_ATR_MULTIPLIER
-                    *
-                    c4h["ATR"]
-
                 )
 
 
 
+                # جلوگیری از استاپ خیلی نزدیک یا خیلی دور
 
-
-            initial_risk = abs(
-                entry_price-stop_loss
-            )
-
-
-
-            sl_percent = (
-                initial_risk /
-                entry_price
-            )
+                if (
+                    0.01
+                    <=
+                    sl_dist_pct
+                    <=
+                    0.04
+                ):
 
 
 
-            # حذف استاپ‌های خیلی کوچک یا خیلی بزرگ
-
-            if not (
-                0.012
-                <=
-                sl_percent
-                <=
-                0.045
-            ):
-
-                continue
+                    active_positions[symbol] = {
 
 
+                        "side": side,
 
 
-
-            active_positions[symbol]={
-
-
-                "side":side,
+                        "entry_price":
+                            entry_price,
 
 
-                "entry_price":entry_price,
+                        "stop_loss":
+                            initial_sl,
 
 
-                "stop_loss":stop_loss,
+                        "highest_price":
+                            entry_price,
 
 
-                "highest_price":entry_price,
+                        "lowest_price":
+                            entry_price,
 
 
-                "lowest_price":entry_price,
+                        "initial_risk":
+                            initial_risk,
 
 
-                "initial_risk":initial_risk,
+                        "entry_index":
+                            i,
 
-
-                "entry_index":i
-
-            }
-            def summarize_result(trades_df):
-
-    print("\n" + "="*70)
-    print("📊 HUNTER-V75 FINAL REPORT")
-    print("="*70)
-
-
-    if trades_df.empty:
-
-        print("⚠️ هیچ معامله‌ای ثبت نشد")
-        return
+                    }
 
 
 
-    trades_df = trades_df.sort_values(
-        ["Timestamp","ExitOrder"],
-        kind="stable"
-    ).reset_index(drop=True)
 
-
-
-    total = len(trades_df)
-
-
-    wins = (
-        trades_df["Outcome"]
-        ==
-        "WIN"
-    ).sum()
-
-
-    losses = (
-        trades_df["Outcome"]
-        ==
-        "LOSS"
-    ).sum()
-
-
-
-    winrate = (
-        wins/total*100
+    return pd.DataFrame(
+        all_trades
     )
 
 
 
-    net_r = (
+# ============================================================
+# RESULT SUMMARY
+# ============================================================
+
+
+def summarize_result(trades_df):
+
+
+    print("\n" + "=" * 70)
+
+    print(
+        "📊 HUNTER-V75 FINAL REPORT"
+    )
+
+    print("=" * 70)
+
+
+
+    if trades_df.empty:
+
+
+        print(
+            "⚠️ هیچ معامله‌ای ثبت نشد."
+        )
+
+        return
+
+
+
+
+    trades_df = trades_df.sort_values(
+        [
+            "Timestamp",
+            "ExitOrder"
+        ],
+        kind="stable"
+    ).reset_index(
+        drop=True
+    )
+
+
+
+
+    total_trades = len(
+        trades_df
+    )
+
+
+    wins = int(
+        (
+            trades_df["Outcome"]
+            ==
+            "WIN"
+        ).sum()
+    )
+
+
+    losses = int(
+        (
+            trades_df["Outcome"]
+            ==
+            "LOSS"
+        ).sum()
+    )
+
+
+
+    win_rate = (
+        wins
+        /
+        total_trades
+        *
+        100
+    )
+
+
+
+    net_r = float(
         trades_df["Return"]
         .sum()
     )
 
 
 
-    pnl = (
+    total_pnl = float(
         trades_df["Dollar_PnL"]
         .sum()
     )
@@ -1202,152 +1360,119 @@ def run_backtest(processed_data):
 
 
     final_capital = (
-        INITIAL_CAPITAL+pnl
+        INITIAL_CAPITAL
+        +
+        total_pnl
     )
 
 
 
 
-    # Profit Factor
+    # ================= LONG / SHORT =================
 
-    gross_profit = (
-        trades_df.loc[
-            trades_df["Dollar_PnL"]>0,
-            "Dollar_PnL"
-        ].sum()
+
+    longs = trades_df[
+        trades_df["Side"]
+        ==
+        "LONG"
+    ]
+
+
+    shorts = trades_df[
+        trades_df["Side"]
+        ==
+        "SHORT"
+    ]
+
+
+
+    def calc_wr(df):
+
+        if len(df) == 0:
+
+            return 0
+
+        return (
+            (
+                df["Outcome"]
+                ==
+                "WIN"
+            ).sum()
+            /
+            len(df)
+            *
+            100
+        )
+
+
+
+    long_wr = calc_wr(
+        longs
     )
 
 
-    gross_loss = abs(
-        trades_df.loc[
-            trades_df["Dollar_PnL"]<0,
-            "Dollar_PnL"
-        ].sum()
-    )
-
-
-    profit_factor = (
-
-        gross_profit/gross_loss
-
-        if gross_loss>0
-
-        else 0
-
+    short_wr = calc_wr(
+        shorts
     )
 
 
 
 
-    # زنجیره ضرر
-
-    max_loss_streak=0
-
-    current=0
+    # ================= LOSS STREAK =================
 
 
-    loss_list=[]
+    max_losses = 0
 
-    temp=0
-
-
-
-    for x in trades_df["Outcome"]:
+    current_losses = 0
 
 
-        if x=="LOSS":
+    streaks = []
 
-            current+=1
-
-            temp+=1
+    temp = 0
 
 
-            max_loss_streak=max(
-                max_loss_streak,
-                current
-            )
+
+    for outcome in trades_df["Outcome"]:
+
+
+        if outcome == "WIN":
+
+
+            current_losses = 0
+
+
+            if temp > 0:
+
+                streaks.append(temp)
+
+                temp = 0
+
 
 
         else:
 
 
-            current=0
+            current_losses += 1
+
+            temp += 1
 
 
-            if temp>0:
-
-                loss_list.append(temp)
-
-                temp=0
-
-
-
-
-    if temp>0:
-
-        loss_list.append(temp)
+            max_losses = max(
+                max_losses,
+                current_losses
+            )
 
 
 
+    if temp > 0:
 
-
-
-    # تفکیک معاملات
-
-
-    long_df = trades_df[
-        trades_df["Side"]=="LONG"
-    ]
-
-
-    short_df = trades_df[
-        trades_df["Side"]=="SHORT"
-    ]
-
-
-
-    long_wr = (
-
-        (
-            long_df["Outcome"]
-            =="WIN"
-        ).sum()
-        /
-        len(long_df)
-        *
-        100
-
-        if len(long_df)>0
-
-        else 0
-
-    )
-
-
-
-    short_wr = (
-
-        (
-            short_df["Outcome"]
-            =="WIN"
-        ).sum()
-        /
-        len(short_df)
-        *
-        100
-
-        if len(short_df)>0
-
-        else 0
-
-    )
-
+        streaks.append(temp)
 
 
 
 
     print(
-        f"🔹 Total Trades : {total}"
+        f"🔹 Total Trades : {total_trades}"
     )
 
 
@@ -1362,7 +1487,7 @@ def run_backtest(processed_data):
 
 
     print(
-        f"🎯 Win Rate     : {winrate:.2f}%"
+        f"🎯 Win Rate     : {win_rate:.2f}%"
     )
 
 
@@ -1372,71 +1497,83 @@ def run_backtest(processed_data):
 
 
     print(
-        f"💵 Net PnL      : ${pnl:,.2f}"
+        f"💵 Net PnL      : ${total_pnl:,.2f}"
     )
 
 
     print(
-        f"📈 Profit Factor : {profit_factor:.2f}"
+        f"🏦 Capital      : ${final_capital:,.2f}"
     )
 
 
     print(
-        f"🏦 Final Capital : ${final_capital:,.2f}"
+        f"❄️ Max Loss Streak : {max_losses}"
     )
+
 
 
     print("\n------------------------------")
 
 
     print(
-        f"LONG  : {len(long_df)} trades | WR={long_wr:.2f}%"
+        f"🟢 Long Trades  : {len(longs)}"
     )
 
 
     print(
-        f"SHORT : {len(short_df)} trades | WR={short_wr:.2f}%"
+        f"LONG WR        : {long_wr:.2f}%"
     )
 
 
     print(
-        f"\n❄️ Max Loss Streak : {max_loss_streak}"
+        f"🔴 Short Trades : {len(shorts)}"
     )
 
 
     print(
-        "\nLoss sequences:"
+        f"SHORT WR       : {short_wr:.2f}%"
     )
 
+
+
+    print("\nLoss sequences:")
 
     print(
-        ", ".join(
-            map(str,loss_list)
-        )
+        streaks
+        # ============================================================
+# MAIN EXECUTION
+# ============================================================
+
+
+if __name__ == "__main__":
+
+
+    print("\n")
+    print("=" * 70)
+    print(
+        "🚀 RUNNING HUNTER-V75"
     )
+    print(
+        "Golden Core + Market Breadth + Loss Shield"
+    )
+    print("=" * 70)
 
 
 
-    print("="*70)
-
-
-
-
-
-
-if __name__=="__main__":
-
-
-    trades = run_backtest(
+    df_trades = run_backtest(
         processed_data
     )
 
 
+
     summarize_result(
-        trades
+        df_trades
     )
 
 
+
+    print("\n")
     print(
-        "\n✨ HUNTER-V75 FINISHED"
+        "✨ HUNTER-V75 FINISHED"
+    )
     )
