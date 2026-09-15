@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V67 (Core Stable Strategy + Structural Pullback Filter)
+# HUNTER-V68 (Golden Core V67 + Per-Symbol Loss Cooldown)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -66,7 +66,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V67 (هسته پایدار + فیلتر پولبک ساختاری)")
+print("📥 دریافت داده‌ها - HUNTER-V68 (هسته طلایی + مدارشکن موضعی نمادها)")
 print("=" * 60)
 
 processed_data = {}
@@ -156,7 +156,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V67...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V68...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -166,7 +166,16 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     
+    # دیکشنری برای رصد تعداد باخت پشت سر هم و تایمر استراحت هر نماد
+    symbol_loss_streaks = {symbol: 0 for symbol in processed_data.keys()}
+    symbol_cooldown_timers = {symbol: 0 for symbol in processed_data.keys()}
+    
     for ts in all_timestamps:
+        # کاهش تایمر استراحت نمادها در هر کندل جدید
+        for symbol in symbol_cooldown_timers:
+            if symbol_cooldown_timers[symbol] > 0:
+                symbol_cooldown_timers[symbol] -= 1
+
         symbols_to_close = []
         
         for symbol, pos in list(active_positions.items()):
@@ -210,6 +219,15 @@ def run_backtest(processed_data):
                 position_notional = TRADE_MARGIN * LEVERAGE
                 dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
                 
+                # بروزرسانی مدارشکن اختصاصی همان نماد
+                if outcome == "LOSS":
+                    symbol_loss_streaks[symbol] += 1
+                    if symbol_loss_streaks[symbol] >= 2:
+                        symbol_cooldown_timers[symbol] = 4  # ۴ کندل (۱۶ ساعت) استراحت برای این نماد خاص
+                else:
+                    symbol_loss_streaks[symbol] = 0
+                    symbol_cooldown_timers[symbol] = 0
+
                 all_trades.append({
                     "Timestamp": ts,
                     "Symbol": symbol,
@@ -249,6 +267,10 @@ def run_backtest(processed_data):
             if symbol in active_positions:
                 continue
             
+            # اگر این نماد در حالت استراحت (Cooldown) است، از آن عبور کن
+            if symbol_cooldown_timers.get(symbol, 0) > 0:
+                continue
+            
             df = processed_data[symbol]
             if ts not in df.index:
                 continue
@@ -262,13 +284,11 @@ def run_backtest(processed_data):
             
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"]) and (c4h["EMA20"] > c4h["EMA50"]) and (c4h["Close"] > c4h["EMA200"])
-                # فیلتر پولبک ساختاری: قیمت در کندل قبل به EMA20 نزدیک شده بود (Low به EMA20 نزدیک بوده) و الان برمی‌گردد بالا
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
                 valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
                 side = "LONG"
             else:
                 regime_ok = (c4h["Close"] < c4h["EMA20"]) and (c4h["EMA20"] < c4h["EMA50"]) and (c4h["Close"] < c4h["EMA200"])
-                # پولبک برای شورت: قیمت در کندل قبل بالا آمده و به EMA20 نزدیک شده بود و الان ریجکت شده
                 pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
                 valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
                 side = "SHORT"
@@ -294,7 +314,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با فیلتر پولبک ساختاری - HUNTER-V67")
+    print("📊 گزارش نهایی استراتژی با مدارشکن موضعی نمادها - HUNTER-V68")
     print("=" * 68)
 
     if trades_df.empty:
@@ -366,4 +386,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V67 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V68 به پایان رسید.")
