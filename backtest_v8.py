@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V69 (Golden Core + ADX Trend Strength Filter)
+# HUNTER-V70 (Golden Core V67 + Smart Break-Even Mechanism)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -66,7 +66,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V69 (هسته طلایی + فیلتر ADX)")
+print("📥 دریافت داده‌ها - HUNTER-V70 (هسته طلایی + مکانیزم Break-Even)")
 print("=" * 60)
 
 processed_data = {}
@@ -140,21 +140,6 @@ def fetch_symbol_data(lbank_symbol):
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
 
-    # محاسبه ADX (شاخص میانگین جهت‌دار) برای سنجش قدرت روند
-    plus_dm = df["High"].diff()
-    minus_dm = df["Low"].diff()
-    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
-    
-    df["Plus_DM"] = pd.Series(plus_dm, index=df.index)
-    df["Minus_DM"] = pd.Series(minus_dm, index=df.index)
-    
-    tr_smoothed = df["ATR"].rolling(14).mean()
-    plus_di = 100 * (df["Plus_DM"].rolling(14).mean() / (tr_smoothed + 1e-9))
-    minus_di = 100 * (df["Minus_DM"].rolling(14).mean() / (tr_smoothed + 1e-9))
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-    df["ADX"] = dx.rolling(14).mean()
-
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
@@ -171,7 +156,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V69...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V70...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -192,6 +177,12 @@ def run_backtest(processed_data):
             c4h = df.loc[ts]
             
             if pos["side"] == "LONG":
+                # بررسی رسیدن به سود معادل 1R برای فعال‌سازی Break-Even
+                current_unrealized_r = (c4h["High"] - pos["entry_price"]) / pos["initial_risk"]
+                if not pos["break_even_triggered"] and current_unrealized_r >= 1.0:
+                    pos["break_even_triggered"] = True
+                    pos["stop_loss"] = pos["entry_price"]  # انتقال استاپ به نقطه ورود
+                
                 if c4h["High"] > pos["highest_price"]:
                     pos["highest_price"] = c4h["High"]
                     new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
@@ -199,6 +190,11 @@ def run_backtest(processed_data):
                         pos["stop_loss"] = new_trailing_sl
                 hit_sl = c4h["Low"] <= pos["stop_loss"]
             else: # SHORT
+                current_unrealized_r = (pos["entry_price"] - c4h["Low"]) / pos["initial_risk"]
+                if not pos["break_even_triggered"] and current_unrealized_r >= 1.0:
+                    pos["break_even_triggered"] = True
+                    pos["stop_loss"] = pos["entry_price"]  # انتقال استاپ به نقطه ورود
+                
                 if c4h["Low"] < pos["lowest_price"]:
                     pos["lowest_price"] = c4h["Low"]
                     new_trailing_sl = pos["lowest_price"] + TRAILING_ATR_MULTIPLIER * c4h["ATR"]
@@ -275,11 +271,6 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
             
-            # فیلتر قدرت روند ADX: اگر روند ضعیف باشد (ADX < 20)، به هیچ وجه وارد معامله نمی‌شویم
-            adx_val = c4h["ADX"]
-            if np.isnan(adx_val) or adx_val < 20.0:
-                continue
-
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"]) and (c4h["EMA20"] > c4h["EMA50"]) and (c4h["Close"] > c4h["EMA200"])
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
@@ -306,13 +297,14 @@ def run_backtest(processed_data):
                         "lowest_price": entry_price,
                         "initial_risk": initial_risk,
                         "entry_index": i,
+                        "break_even_triggered": False,
                     }
                     
     return pd.DataFrame(all_trades)
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی با فیلتر قدرت روند ADX - HUNTER-V69")
+    print("📊 گزارش نهایی استراتژی با مکانیزم Break-Even - HUNTER-V70")
     print("=" * 68)
 
     if trades_df.empty:
@@ -384,4 +376,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V69 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V70 به پایان رسید.")
