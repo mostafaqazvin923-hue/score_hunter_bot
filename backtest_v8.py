@@ -1,8 +1,8 @@
 
 import os
-import sys
 import subprocess
-from datetime import datetime, timedelta, timezone
+import sys
+from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 
 try:
@@ -16,145 +16,152 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V79
-# Quality-score allocation + loss-cluster penalty
+# HUNTER-V74-LSP
+#
+# Golden Core = EXACT V74 signal / execution logic
+# ONLY ADDITION = Loss-Streak Protection in candidate priority
+#
+# IMPORTANT:
+# - No new indicator filter
+# - No new coin
+# - No change to leverage / margin
+# - No change to SL / trailing / timeout
+# - No hard "stop trading" after losses
+# - Valid signal count is preserved; LSP only changes priority
+#   when the 5-position portfolio is full.
 # ============================================================
 
-TIMEFRAME = "4h"
-LOOKBACK_DAYS = 365
+exchange = ccxt.lbank({"enableRateLimit": True})
 
 SYMBOLS = {
     "BTC": "BTC/USDT",
     "ETH": "ETH/USDT",
-    "BNB": "BNB/USDT",
-    "XRP": "XRP/USDT",
     "SOL": "SOL/USDT",
-    "DOGE": "DOGE/USDT",
-    "ADA": "ADA/USDT",
+    "XRP": "XRP/USDT",
     "LINK": "LINK/USDT",
-    "TRX": "TRX/USDT",
-    "HYPE": "HYPE/USDT",
-    "ZEC": "ZEC/USDT",
-    "AVAX": "AVAX/USDT",
-    "SUI": "SUI/USDT",
-    "XLM": "XLM/USDT",
-    "AAVE": "AAVE/USDT",
-    "ATOM": "ATOM/USDT",
+    "UNI": "UNI/USDT",
     "ICP": "ICP/USDT",
     "INJ": "INJ/USDT",
+    "ATOM": "ATOM/USDT",
     "RENDER": "RENDER/USDT",
+    "XLM": "XLM/USDT",
+    "AAVE": "AAVE/USDT",
+    "WIF": "WIF/USDT",
     "ONDO": "ONDO/USDT",
+    "DOGE": "DOGE/USDT",
+    "BNB": "BNB/USDT",
+    "ADA": "ADA/USDT",
 }
 
-MAX_POSITIONS = 5
-MAX_SAME_SYMBOL = 2
+REMOVED_COINS = {
+    "NEAR", "OP", "HYPE", "HBAR", "AVAX", "SUI", "PENDLE", "TIA",
+    "FET", "SEI", "ARB", "DOT", "ETC", "SHIB", "STX", "RUNE",
+    "MKR", "APT", "LTC", "AR", "IMX", "PEPE", "BONK",
+}
 
-INITIAL_CAPITAL = 1000.0
-TRADE_MARGIN = 100.0
-LEVERAGE = 80.0
+SYMBOLS = {
+    k: v for k, v in SYMBOLS.items()
+    if k not in REMOVED_COINS
+}
+
+LOOKBACK_DAYS = 365
+TIMEFRAME = "4h"
+
+MAX_POSITIONS = 5
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-EMA_WARMUP = 200
-INITIAL_ATR_MULTIPLIER = 1.8
 TRAILING_ATR_MULTIPLIER = 2.0
+INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
+EMA_WARMUP = 200
 
-# V76 signal core
-MIN_LONG_MOM_SHORT = 0.012
-MIN_LONG_MOM_LONG = 0.035
-MIN_SHORT_MOM_SHORT = -0.012
-MIN_SHORT_MOM_LONG = -0.035
+INITIAL_CAPITAL = 1000.0
+TRADE_MARGIN = 100.0
+LEVERAGE = 80.0
 
-# V79: ranking penalty for recent same-symbol/same-direction losses.
-LOSS_PENALTY_1 = 2.0
-LOSS_PENALTY_2 = 4.0
-LOSS_PENALTY_3 = 6.0
+# ------------------------------------------------------------
+# LSP SETTINGS
+#
+# The shield is deliberately SOFT.
+# It never rejects an otherwise valid V74 signal.
+# It only changes priority while portfolio slots are limited.
+# ------------------------------------------------------------
 
-OUTPUT_DIR = "hunter_v79_output"
+# Global loss streak before the shield becomes active.
+LSP_ACTIVATE_AT = 2
 
-exchange = ccxt.lbank({
-    "enableRateLimit": True,
-    "timeout": 30000,
-})
+# Penalty by consecutive losses of the same symbol + side.
+# This is used only for ranking candidates.
+LSP_PENALTY_1 = 0.75
+LSP_PENALTY_2 = 1.50
+LSP_PENALTY_3_PLUS = 2.25
+
+# Extra penalty when the WHOLE portfolio is in a loss streak.
+# Kept deliberately small so V74's signal stream is preserved.
+GLOBAL_STREAK_PENALTY = 0.35
+
+OUTPUT_DIR = "hunter_v74_lsp_output"
+
+start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
+since_timestamp = int(start_date.timestamp() * 1000)
+
+print("=" * 68)
+print("HUNTER-V74-LSP")
+print("Golden Core + Soft Loss-Streak Protection")
+print("=" * 68)
 
 
-def safe_float(value, default=0.0):
-    try:
-        value = float(value)
-        return value if np.isfinite(value) else default
-    except Exception:
-        return default
+# ============================================================
+# DATA
+# ============================================================
+
+processed_data = {}
 
 
-def utc_now():
-    return datetime.now(timezone.utc)
+def fetch_symbol_data(lbank_symbol):
+    all_ohlcv = []
+    current_since = since_timestamp
+    last_seen = None
 
-
-def fetch_symbol_ohlcv(symbol, since_ms, until_ms):
-    rows = []
-    cursor = int(since_ms)
-    last_cursor = None
-
-    for _ in range(100):
+    while current_since < exchange.milliseconds():
         batch = None
-        last_error = None
 
         for attempt in range(3):
             try:
                 batch = exchange.fetch_ohlcv(
-                    symbol,
+                    lbank_symbol,
                     timeframe=TIMEFRAME,
-                    since=cursor,
+                    since=current_since,
                     limit=1000,
                 )
                 break
-            except Exception as exc:
-                last_error = exc
-                if attempt < 2:
-                    import time
-                    time.sleep(2.0 * (attempt + 1))
-
-        if batch is None:
-            raise RuntimeError(
-                f"fetch_ohlcv failed for {symbol}: {last_error}"
-            )
+            except Exception:
+                if attempt == 2:
+                    return None
 
         if not batch:
             break
 
-        rows.extend(batch)
-        newest = int(batch[-1][0])
+        last_ts = batch[-1][0]
 
-        if last_cursor is not None and newest <= last_cursor:
-            break
+        if last_seen is not None and last_ts <= last_seen:
+            return None
 
-        last_cursor = newest
-
-        if newest >= until_ms:
-            break
-
-        cursor = newest + 1
+        all_ohlcv.extend(batch)
+        last_seen = last_ts
+        current_since = last_ts + 1
 
         if len(batch) < 1000:
             break
 
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "Timestamp",
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume",
-            ]
-        )
+    if not all_ohlcv:
+        return None
 
     df = pd.DataFrame(
-        rows,
+        all_ohlcv,
         columns=[
             "Timestamp",
             "Open",
@@ -165,1085 +172,1101 @@ def fetch_symbol_ohlcv(symbol, since_ms, until_ms):
         ],
     )
 
-    df = (
-        df.drop_duplicates(subset=["Timestamp"])
-        .sort_values("Timestamp")
-        .reset_index(drop=True)
+    df["Date"] = pd.to_datetime(
+        df["Timestamp"],
+        unit="ms",
     )
-
-    # Remove the still-forming candle.
-    current_ms = int(utc_now().timestamp() * 1000)
-    candle_ms = 4 * 60 * 60 * 1000
-    df = df[df["Timestamp"] + candle_ms <= current_ms].copy()
 
     df = df[
-        (df["Timestamp"] >= since_ms)
-        & (df["Timestamp"] <= until_ms)
-    ].copy()
+        [
+            "Date",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+        ]
+    ]
 
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = (
-        df.dropna()
-        .drop_duplicates(subset=["Timestamp"])
-        .sort_values("Timestamp")
-        .reset_index(drop=True)
+    df.dropna(inplace=True)
+    df.drop_duplicates(
+        subset=["Date"],
+        keep="last",
+        inplace=True,
+    )
+    df.sort_values(
+        "Date",
+        inplace=True,
+    )
+    df.reset_index(
+        drop=True,
+        inplace=True,
     )
 
-    if df.empty:
-        return df
-
-    diffs = df["Timestamp"].diff().dropna()
-    max_allowed_gap = candle_ms + 10 * 60 * 1000
-
-    if not diffs.empty and diffs.max() > max_allowed_gap:
-        raise RuntimeError(
-            f"Large OHLCV gap detected for {symbol}"
+    # Remove incomplete final candle.
+    if len(df) >= 2:
+        now_ms = exchange.milliseconds()
+        last_ms = int(
+            df.iloc[-1]["Date"].timestamp() * 1000
         )
 
-    return df
+        if (
+            last_ms
+            + 4 * 60 * 60 * 1000
+            > now_ms
+        ):
+            df = df.iloc[:-1].copy()
 
+    if len(df) < EMA_WARMUP + 50:
+        return None
 
-def add_indicators(df):
-    d = df.copy()
+    deltas = df["Date"].diff().dropna()
 
-    prev_close = d["Close"].shift(1)
+    if (
+        not deltas.empty
+        and deltas.max()
+        > pd.Timedelta(
+            hours=4,
+            minutes=10,
+        )
+    ):
+        return None
 
-    tr1 = d["High"] - d["Low"]
-    tr2 = (d["High"] - prev_close).abs()
-    tr3 = (d["Low"] - prev_close).abs()
+    tr1 = (
+        df["High"]
+        - df["Low"]
+    )
 
-    d["TR"] = pd.concat(
-        [tr1, tr2, tr3],
-        axis=1,
-    ).max(axis=1)
+    tr2 = np.abs(
+        df["High"]
+        - df["Close"].shift(1)
+    )
 
-    d["ATR"] = d["TR"].rolling(ATR_PERIOD).mean()
+    tr3 = np.abs(
+        df["Low"]
+        - df["Close"].shift(1)
+    )
 
-    d["EMA20"] = d["Close"].ewm(
+    df["ATR"] = (
+        pd.concat(
+            [tr1, tr2, tr3],
+            axis=1,
+        )
+        .max(axis=1)
+        .rolling(ATR_PERIOD)
+        .mean()
+    )
+
+    df["EMA20"] = df[
+        "Close"
+    ].ewm(
         span=20,
         adjust=False,
     ).mean()
 
-    d["EMA50"] = d["Close"].ewm(
+    df["EMA50"] = df[
+        "Close"
+    ].ewm(
         span=50,
         adjust=False,
     ).mean()
 
-    d["EMA200"] = d["Close"].ewm(
+    df["EMA200"] = df[
+        "Close"
+    ].ewm(
         span=200,
         adjust=False,
     ).mean()
 
-    d["Mom_Short"] = d["Close"].pct_change(10)
-    d["Mom_Long"] = d["Close"].pct_change(30)
+    df["Mom_Short"] = (
+        df["Close"]
+        - df["Close"].shift(10)
+    ) / df["Close"].shift(10)
 
-    d["ATR_PCT"] = (
-        d["ATR"] / d["Close"].replace(0, np.nan)
+    df["Mom_Long"] = (
+        df["Close"]
+        - df["Close"].shift(30)
+    ) / df["Close"].shift(30)
+
+    df.set_index(
+        "Date",
+        inplace=True,
     )
 
-    d["EMA20_SLOPE"] = d["EMA20"].pct_change(5)
-    d["DIST_EMA20"] = (
-        d["Close"] / d["EMA20"] - 1.0
+    return df
+
+
+for symbol, lbank_symbol in SYMBOLS.items():
+    df4h = fetch_symbol_data(
+        lbank_symbol
     )
 
-    d["EMA20_prev"] = d["EMA20"].shift(1)
-    d["Low_prev"] = d["Low"].shift(1)
-    d["High_prev"] = d["High"].shift(1)
+    if df4h is not None:
+        processed_data[
+            symbol
+        ] = df4h
 
-    d["TimestampDT"] = pd.to_datetime(
-        d["Timestamp"],
-        unit="ms",
-        utc=True,
-    )
-
-    return d
-
-
-def load_data():
-    now_ms = int(utc_now().timestamp() * 1000)
-    since_ms = int(
-        (
-            utc_now()
-            - timedelta(days=LOOKBACK_DAYS)
-        ).timestamp() * 1000
-    )
-
-    data = {}
-
-    print("=" * 72)
-    print("HUNTER-V79 DATA LOAD")
-    print("=" * 72)
-
-    for name, symbol in SYMBOLS.items():
-        try:
-            raw = fetch_symbol_ohlcv(
-                symbol,
-                since_ms,
-                now_ms,
-            )
-
-            if len(raw) < EMA_WARMUP + 50:
-                print(
-                    f"{name:8s} INVALID - "
-                    f"only {len(raw)} candles"
-                )
-                continue
-
-            data[name] = add_indicators(raw)
-
-            print(
-                f"{name:8s} OK - "
-                f"{len(data[name])} candles"
-            )
-
-        except Exception as exc:
-            print(
-                f"{name:8s} ERROR - {exc}"
-            )
-
-    print(
-        f"\nValid Symbols: "
-        f"{len(data)}/{len(SYMBOLS)}"
-    )
-
-    return data
+print(
+    f"Valid symbols: "
+    f"{len(processed_data)} / "
+    f"{len(SYMBOLS)}"
+)
 
 
-def row_at_or_before(df, ts):
-    values = df["TimestampDT"].values
-    pos = (
-        values.searchsorted(
-            np.datetime64(ts),
-            side="right",
-        )
-        - 1
-    )
+# ============================================================
+# COMMON HELPERS
+# ============================================================
 
-    if pos < 0:
-        return None
-
-    return df.iloc[int(pos)]
-
-
-def build_time_index(data):
-    all_ts = set()
-
-    for df in data.values():
-        all_ts.update(
-            df["TimestampDT"].tolist()
-        )
-
-    return sorted(all_ts)
-
-
-def get_market_context(data, ts):
-    btc = data.get("BTC")
-
-    btc_row = (
-        row_at_or_before(btc, ts)
-        if btc is not None
-        else None
-    )
-
-    if btc_row is None:
-        return {
-            "btc_bull": False,
-            "btc_bear": False,
-            "btc_mom_long": 0.0,
-            "btc_mom_short": 0.0,
-            "breadth": 0.5,
+def get_all_timestamps(data):
+    return sorted(
+        {
+            ts
+            for df in data.values()
+            for ts in df.index
         }
-
-    btc_bull = (
-        btc_row["Close"] > btc_row["EMA200"]
-        and btc_row["EMA50"] > btc_row["EMA200"]
-    )
-
-    btc_bear = (
-        btc_row["Close"] < btc_row["EMA200"]
-        and btc_row["EMA50"] < btc_row["EMA200"]
-    )
-
-    bull_count = 0
-    active = 0
-
-    for df in data.values():
-        row = row_at_or_before(df, ts)
-
-        if row is None:
-            continue
-
-        if pd.isna(row["EMA200"]):
-            continue
-
-        active += 1
-
-        if row["Close"] > row["EMA200"]:
-            bull_count += 1
-
-    breadth = (
-        bull_count / active
-        if active
-        else 0.5
-    )
-
-    return {
-        "btc_bull": bool(btc_bull),
-        "btc_bear": bool(btc_bear),
-        "btc_mom_long": safe_float(
-            btc_row["Mom_Long"]
-        ),
-        "btc_mom_short": safe_float(
-            btc_row["Mom_Short"]
-        ),
-        "breadth": float(breadth),
-    }
-
-
-def raw_signal(row):
-    if (
-        pd.isna(row["EMA200"])
-        or pd.isna(row["ATR"])
-        or pd.isna(row["EMA20_prev"])
-    ):
-        return None
-
-    long_ok = (
-        row["Close"] > row["EMA20"]
-        and row["EMA20"] > row["EMA50"]
-        and row["Close"] > row["EMA200"]
-        and row["Low_prev"]
-        <= row["EMA20_prev"] * 1.015
-        and row["Mom_Short"]
-        > MIN_LONG_MOM_SHORT
-        and row["Mom_Long"]
-        > MIN_LONG_MOM_LONG
-    )
-
-    short_ok = (
-        row["Close"] < row["EMA20"]
-        and row["EMA20"] < row["EMA50"]
-        and row["Close"] < row["EMA200"]
-        and row["High_prev"]
-        >= row["EMA20_prev"] * 0.985
-        and row["Mom_Short"]
-        < MIN_SHORT_MOM_SHORT
-        and row["Mom_Long"]
-        < MIN_SHORT_MOM_LONG
-    )
-
-    if not long_ok and not short_ok:
-        return None
-
-    if long_ok and short_ok:
-        return (
-            "long"
-            if row["Mom_Long"] >= 0
-            else "short"
-        )
-
-    return (
-        "long"
-        if long_ok
-        else "short"
     )
 
 
-def quality_score(
-    row,
-    side,
-    market,
-    recent_losses,
+def build_valid_candidates(
+    processed_data,
+    ts,
+    active_positions,
+    market_bull,
+    allow_longs,
+    allow_shorts,
 ):
     """
-    Continuous ranking score.
+    EXACT V74 signal construction.
 
-    IMPORTANT:
-    These features rank valid V76-style signals.
-    They do NOT hard-filter the signal stream.
-
-    That is intentional: V78 lost too many trades through
-    direction_limit. V79 uses quality to decide which candidates
-    receive the five available portfolio slots.
+    This function intentionally keeps the original V74 rules.
     """
 
-    mom_long = safe_float(
-        row["Mom_Long"]
-    )
-    mom_short = safe_float(
-        row["Mom_Short"]
-    )
-    atr_pct = safe_float(
-        row["ATR_PCT"]
-    )
-    distance = safe_float(
-        row["DIST_EMA20"]
-    )
-    slope = safe_float(
-        row["EMA20_SLOPE"]
+    current_scores = {}
+
+    for symbol, df in processed_data.items():
+        if ts not in df.index:
+            continue
+
+        val = df.loc[
+            ts,
+            "Mom_Long",
+        ]
+
+        if not np.isnan(val):
+            current_scores[
+                symbol
+            ] = val
+
+    if not current_scores:
+        return []
+
+    # EXACT V74 ranking.
+    ranked_symbols = sorted(
+        current_scores.keys(),
+        key=lambda x: float(
+            current_scores[x]
+        ),
+        reverse=market_bull,
     )
 
-    btc_mom_long = safe_float(
-        market["btc_mom_long"]
-    )
-    breadth = safe_float(
-        market["breadth"]
-    )
+    candidates = []
 
-    score = 0.0
+    for symbol in ranked_symbols:
+        if symbol in active_positions:
+            continue
 
-    if side == "long":
-        # BTC trend agreement.
-        if market["btc_bull"]:
-            score += 3.0
-        elif market["btc_bear"]:
-            score -= 2.5
+        df = processed_data[
+            symbol
+        ]
+
+        if ts not in df.index:
+            continue
+
+        i = df.index.get_loc(ts)
+
+        if i < EMA_WARMUP + 1:
+            continue
+
+        c4h = df.iloc[i]
+        prev_c = df.iloc[i - 1]
+
+        if market_bull:
+            if not allow_longs:
+                continue
+
+            regime_ok = (
+                c4h["Close"]
+                > c4h["EMA20"]
+                and c4h["EMA20"]
+                > c4h["EMA50"]
+                and c4h["Close"]
+                > c4h["EMA200"]
+            )
+
+            pullback_ok = (
+                prev_c["Low"]
+                <= prev_c["EMA20"]
+                * 1.015
+            )
+
+            valid_signal = (
+                regime_ok
+                and pullback_ok
+                and (
+                    c4h["Mom_Short"]
+                    > 0.012
+                )
+                and (
+                    c4h["Mom_Long"]
+                    > 0.035
+                )
+            )
+
+            side = "LONG"
+
         else:
-            score += 0.5
+            if not allow_shorts:
+                continue
 
-        # Breadth agreement.
-        score += 3.0 * (
-            (breadth - 0.50) / 0.50
+            regime_ok = (
+                c4h["Close"]
+                < c4h["EMA20"]
+                and c4h["EMA20"]
+                < c4h["EMA50"]
+                and c4h["Close"]
+                < c4h["EMA200"]
+            )
+
+            pullback_ok = (
+                prev_c["High"]
+                >= prev_c["EMA20"]
+                * 0.985
+            )
+
+            valid_signal = (
+                regime_ok
+                and pullback_ok
+                and (
+                    c4h["Mom_Short"]
+                    < -0.012
+                )
+                and (
+                    c4h["Mom_Long"]
+                    < -0.035
+                )
+            )
+
+            side = "SHORT"
+
+        if not valid_signal:
+            continue
+
+        entry_price = (
+            c4h["Open"]
+            * (
+                1 + SLIPPAGE
+            )
+            if side == "LONG"
+            else
+            c4h["Open"]
+            * (
+                1 - SLIPPAGE
+            )
         )
 
-        # Coin momentum.
-        score += 3.0 * max(
-            -1.0,
-            min(1.0, mom_long / 0.12),
+        initial_sl = (
+            entry_price
+            - INITIAL_ATR_MULTIPLIER
+            * c4h["ATR"]
+            if side == "LONG"
+            else
+            entry_price
+            + INITIAL_ATR_MULTIPLIER
+            * c4h["ATR"]
         )
 
-        score += 1.5 * max(
-            -1.0,
-            min(1.0, mom_short / 0.05),
+        initial_risk = abs(
+            entry_price
+            - initial_sl
         )
 
-        # Relative momentum versus BTC.
-        relative_momentum = (
-            mom_long - btc_mom_long
+        sl_dist_pct = (
+            initial_risk
+            / entry_price
         )
 
-        score += 2.5 * max(
-            -1.0,
-            min(
-                1.0,
-                relative_momentum / 0.10,
-            ),
+        if not (
+            0.01
+            <= sl_dist_pct
+            <= 0.04
+        ):
+            continue
+
+        candidates.append(
+            {
+                "symbol": symbol,
+                "side": side,
+                "entry_price": float(
+                    entry_price
+                ),
+                "initial_sl": float(
+                    initial_sl
+                ),
+                "initial_risk": float(
+                    initial_risk
+                ),
+                "entry_index": int(i),
+                "mom_long": float(
+                    c4h["Mom_Long"]
+                ),
+            }
         )
 
-        # EMA20 slope.
-        score += 1.5 * max(
-            -1.0,
-            min(1.0, slope / 0.03),
-        )
+    return candidates
 
-        # Avoid very stretched continuation entries.
-        if -0.015 <= distance <= 0.035:
-            score += 1.5
-        elif distance > 0.060:
-            score -= 2.0
 
-        # Volatility regime preference.
-        if 0.010 <= atr_pct <= 0.045:
-            score += 1.0
-        elif atr_pct > 0.070:
-            score -= 1.5
+# ============================================================
+# LOSS-STREAK SHIELD
+# ============================================================
+
+def lsp_penalty(
+    symbol,
+    side,
+    symbol_side_losses,
+    global_loss_streak,
+):
+    """
+    Soft penalty only.
+
+    The signal remains valid.
+    No signal is rejected here.
+    """
+
+    streak = symbol_side_losses.get(
+        (symbol, side),
+        0,
+    )
+
+    if streak <= 0:
+        penalty = 0.0
+
+    elif streak == 1:
+        penalty = LSP_PENALTY_1
+
+    elif streak == 2:
+        penalty = LSP_PENALTY_2
 
     else:
-        # BTC trend agreement.
-        if market["btc_bear"]:
-            score += 3.0
-        elif market["btc_bull"]:
-            score -= 2.5
-        else:
-            score += 0.5
+        penalty = LSP_PENALTY_3_PLUS
 
-        # Breadth agreement.
-        score += 3.0 * (
-            (0.50 - breadth) / 0.50
+    if (
+        global_loss_streak
+        >= LSP_ACTIVATE_AT
+    ):
+        penalty += GLOBAL_STREAK_PENALTY
+
+    return penalty
+
+
+def select_candidates_lsp(
+    candidates,
+    slots,
+    symbol_side_losses,
+    global_loss_streak,
+):
+    """
+    LSP selection.
+
+    Crucial behavior:
+    - Does NOT remove valid candidates.
+    - Does NOT impose a direction cap.
+    - Does NOT reduce MAX_POSITIONS.
+    - Only changes which valid candidate gets a scarce slot.
+    """
+
+    if slots <= 0:
+        return []
+
+    if not candidates:
+        return []
+
+    ranked = []
+
+    for original_rank, candidate in enumerate(
+        candidates
+    ):
+        penalty = lsp_penalty(
+            candidate["symbol"],
+            candidate["side"],
+            symbol_side_losses,
+            global_loss_streak,
         )
 
-        # Coin momentum.
-        score += 3.0 * max(
-            -1.0,
-            min(1.0, (-mom_long) / 0.12),
+        # Primary criterion remains the ORIGINAL V74
+        # Momentum ranking. The penalty is only a small
+        # secondary adjustment when candidates compete.
+        #
+        # Convert original rank to a stable quality number:
+        # earlier V74 candidates receive a higher base score.
+        base_score = (
+            len(candidates)
+            - original_rank
         )
 
-        score += 1.5 * max(
-            -1.0,
-            min(1.0, (-mom_short) / 0.05),
+        adjusted_score = (
+            float(base_score)
+            - penalty
         )
 
-        # Relative momentum versus BTC.
-        relative_momentum = (
-            mom_long - btc_mom_long
+        ranked.append(
+            (
+                adjusted_score,
+                original_rank,
+                candidate,
+            )
         )
 
-        score += 2.5 * max(
-            -1.0,
-            min(
-                1.0,
-                (-relative_momentum) / 0.10,
-            ),
-        )
+    ranked.sort(
+        key=lambda x: (
+            x[0],
+            -x[1],
+        ),
+        reverse=True,
+    )
 
-        # EMA20 slope.
-        score += 1.5 * max(
-            -1.0,
-            min(1.0, (-slope) / 0.03),
-        )
+    selected = [
+        item[2]
+        for item in ranked[:slots]
+    ]
 
-        # Avoid very stretched continuation entries.
-        if -0.035 <= distance <= 0.015:
-            score += 1.5
-        elif distance < -0.060:
-            score -= 2.0
-
-        # Volatility regime preference.
-        if 0.010 <= atr_pct <= 0.045:
-            score += 1.0
-        elif atr_pct > 0.070:
-            score -= 1.5
-
-    # Recent losses: ranking penalty only.
-    if recent_losses == 1:
-        score -= LOSS_PENALTY_1
-    elif recent_losses == 2:
-        score -= LOSS_PENALTY_2
-    elif recent_losses >= 3:
-        score -= LOSS_PENALTY_3
-
-    return float(score)
+    return selected
 
 
-def run_backtest(data):
-    timestamps = build_time_index(data)
+# ============================================================
+# BACKTEST
+# ============================================================
 
-    positions = {}
-    trades = []
-    equity_curve = []
+def run_backtest(
+    processed_data,
+    use_lsp=False,
+):
+    all_timestamps = get_all_timestamps(
+        processed_data
+    )
 
-    # Consecutive losses for the exact symbol + direction.
-    loss_cluster = defaultdict(int)
+    active_positions = {}
+    all_trades = []
+
+    # Consecutive losses for exact symbol + side.
+    symbol_side_losses = defaultdict(int)
+
+    # Consecutive losses across portfolio exit order.
+    global_loss_streak = 0
 
     diagnostics = Counter()
 
-    for ts in timestamps:
-        # --------------------------------------------------------
-        # 1. Manage existing positions.
-        # Old stop is checked BEFORE trailing-stop update.
-        # This avoids same-candle trailing look-ahead.
-        # --------------------------------------------------------
-        to_close = []
+    equity_curve = []
 
-        for key, pos in list(
-            positions.items()
+    for ts in all_timestamps:
+        symbols_to_close = []
+
+        # --------------------------------------------------------
+        # 1. EXACT V74 POSITION MANAGEMENT
+        # --------------------------------------------------------
+        for symbol, pos in list(
+            active_positions.items()
         ):
-            df = data[pos["symbol"]]
-            row = row_at_or_before(
-                df,
-                ts,
-            )
+            df = processed_data[
+                symbol
+            ]
 
-            if row is None:
+            if ts not in df.index:
                 continue
 
-            if ts < pos["entry_ts"]:
-                continue
+            c4h = df.loc[ts]
 
-            pos["candles"] += 1
-
-            side = pos["side"]
-            exit_price = None
-            exit_reason = None
-
-            if side == "long":
-                if row["Low"] <= pos["stop"]:
-                    exit_price = (
-                        pos["stop"]
-                        * (1.0 - SLIPPAGE)
-                    )
-                    exit_reason = "STOP"
-
-                elif (
-                    pos["candles"]
-                    >= TIMEOUT_CANDLES
+            if pos["side"] == "LONG":
+                if (
+                    c4h["High"]
+                    > pos["highest_price"]
                 ):
-                    exit_price = (
-                        row["Close"]
-                        * (1.0 - SLIPPAGE)
-                    )
-                    exit_reason = "TIMEOUT"
+                    pos[
+                        "highest_price"
+                    ] = c4h["High"]
 
-                if exit_reason is None:
-                    new_stop = (
-                        row["Close"]
-                        - row["ATR"]
-                        * TRAILING_ATR_MULTIPLIER
+                    new_trailing_sl = (
+                        pos[
+                            "highest_price"
+                        ]
+                        - TRAILING_ATR_MULTIPLIER
+                        * c4h["ATR"]
                     )
 
-                    if np.isfinite(new_stop):
-                        pos["stop"] = max(
-                            pos["stop"],
-                            new_stop,
-                        )
+                    if (
+                        new_trailing_sl
+                        > pos["stop_loss"]
+                    ):
+                        pos[
+                            "stop_loss"
+                        ] = new_trailing_sl
+
+                hit_sl = (
+                    c4h["Low"]
+                    <= pos["stop_loss"]
+                )
 
             else:
-                if row["High"] >= pos["stop"]:
-                    exit_price = (
-                        pos["stop"]
-                        * (1.0 + SLIPPAGE)
-                    )
-                    exit_reason = "STOP"
-
-                elif (
-                    pos["candles"]
-                    >= TIMEOUT_CANDLES
+                if (
+                    c4h["Low"]
+                    < pos["lowest_price"]
                 ):
-                    exit_price = (
-                        row["Close"]
-                        * (1.0 + SLIPPAGE)
+                    pos[
+                        "lowest_price"
+                    ] = c4h["Low"]
+
+                    new_trailing_sl = (
+                        pos[
+                            "lowest_price"
+                        ]
+                        + TRAILING_ATR_MULTIPLIER
+                        * c4h["ATR"]
                     )
-                    exit_reason = "TIMEOUT"
 
-                if exit_reason is None:
-                    new_stop = (
-                        row["Close"]
-                        + row["ATR"]
-                        * TRAILING_ATR_MULTIPLIER
-                    )
+                    if (
+                        new_trailing_sl
+                        < pos["stop_loss"]
+                    ):
+                        pos[
+                            "stop_loss"
+                        ] = new_trailing_sl
 
-                    if np.isfinite(new_stop):
-                        pos["stop"] = min(
-                            pos["stop"],
-                            new_stop,
-                        )
+                hit_sl = (
+                    c4h["High"]
+                    >= pos["stop_loss"]
+                )
 
-            if exit_price is None:
+            curr_i = df.index.get_loc(
+                ts
+            )
+
+            candles_held = (
+                curr_i
+                - pos["entry_index"]
+            )
+
+            is_timeout = (
+                candles_held
+                >= TIMEOUT_CANDLES
+            )
+
+            if not (
+                hit_sl
+                or is_timeout
+            ):
                 continue
 
-            qty = pos["qty"]
-
-            if side == "long":
-                raw_pnl = (
-                    exit_price
-                    - pos["entry"]
-                ) * qty
-            else:
-                raw_pnl = (
-                    pos["entry"]
-                    - exit_price
-                ) * qty
-
-            total_fee = (
-                (
-                    pos["entry"] * qty
-                )
-                + (
-                    exit_price * qty
-                )
-            ) * FEE_RATE
-
-            pnl = raw_pnl - total_fee
-
-            # Correct R definition:
-            # 1R = initial dollar risk.
-            risk_dollar = pos["risk_dollar"]
-
-            real_r = (
-                pnl / risk_dollar
-                if risk_dollar > 0
-                else 0.0
+            initial_risk = (
+                pos["initial_risk"]
             )
 
-            won = pnl > 0
-            cluster_key = (
-                pos["symbol"],
-                side,
+            if pos["side"] == "LONG":
+                exit_p = (
+                    min(
+                        pos["stop_loss"],
+                        c4h["Open"],
+                    )
+                    if hit_sl
+                    else c4h["Close"]
+                )
+
+                r_real = (
+                    (
+                        exit_p
+                        - pos[
+                            "entry_price"
+                        ]
+                    )
+                    / initial_risk
+                ) - (
+                    FEE_RATE * 2
+                )
+
+                price_return_pct = (
+                    exit_p
+                    - pos[
+                        "entry_price"
+                    ]
+                ) / pos[
+                    "entry_price"
+                ]
+
+            else:
+                exit_p = (
+                    max(
+                        pos["stop_loss"],
+                        c4h["Open"],
+                    )
+                    if hit_sl
+                    else c4h["Close"]
+                )
+
+                r_real = (
+                    (
+                        pos[
+                            "entry_price"
+                        ]
+                        - exit_p
+                    )
+                    / initial_risk
+                ) - (
+                    FEE_RATE * 2
+                )
+
+                price_return_pct = (
+                    pos[
+                        "entry_price"
+                    ]
+                    - exit_p
+                ) / pos[
+                    "entry_price"
+                ]
+
+            outcome = (
+                "WIN"
+                if r_real > 0
+                else "LOSS"
             )
 
-            if won:
-                loss_cluster[
-                    cluster_key
-                ] = 0
-            else:
-                loss_cluster[
-                    cluster_key
+            position_notional = (
+                TRADE_MARGIN
+                * LEVERAGE
+            )
+
+            dollar_pnl = (
+                position_notional
+                * price_return_pct
+            ) - (
+                position_notional
+                * FEE_RATE
+                * 2
+            )
+
+            if outcome == "LOSS":
+                global_loss_streak += 1
+
+                symbol_side_losses[
+                    (
+                        symbol,
+                        pos["side"],
+                    )
                 ] += 1
 
-            trades.append({
-                "symbol": pos["symbol"],
-                "side": side.upper(),
-                "entry_ts": pos["entry_ts"],
-                "exit_ts": ts,
-                "entry": pos["entry"],
-                "exit": exit_price,
-                "initial_stop": pos["initial_stop"],
-                "final_stop": pos["stop"],
-                "qty": qty,
-                "margin": pos["margin"],
-                "leverage": LEVERAGE,
-                "risk_dollar": risk_dollar,
-                "pnl": pnl,
-                "r": real_r,
-                "win": int(won),
-                "exit_reason": exit_reason,
-                "quality_score": pos["quality_score"],
-                "loss_cluster_before_entry": (
-                    pos[
-                        "loss_cluster_before_entry"
-                    ]
-                ),
-            })
+            else:
+                global_loss_streak = 0
 
-            to_close.append(key)
+                symbol_side_losses[
+                    (
+                        symbol,
+                        pos["side"],
+                    )
+                ] = 0
 
-        for key in to_close:
-            positions.pop(key, None)
-
-        # --------------------------------------------------------
-        # 2. Build all V76-valid candidates.
-        # --------------------------------------------------------
-        market = get_market_context(
-            data,
-            ts,
-        )
-
-        candidates = []
-
-        for name, df in data.items():
-            diagnostics[
-                "symbol_checks"
-            ] += 1
-
-            row = row_at_or_before(
-                df,
-                ts,
+            all_trades.append(
+                {
+                    "Timestamp": ts,
+                    "Symbol": symbol,
+                    "Side": pos["side"],
+                    "Outcome": outcome,
+                    "Return": r_real,
+                    "Dollar_PnL": dollar_pnl,
+                    "ExitOrder": len(
+                        all_trades
+                    ),
+                    "LSP_Active": int(
+                        use_lsp
+                    ),
+                }
             )
 
-            if row is None:
+            symbols_to_close.append(
+                symbol
+            )
+
+        for sym in symbols_to_close:
+            del active_positions[
+                sym
+            ]
+
+        # --------------------------------------------------------
+        # 2. EXACT V74 MARKET REGIME
+        # --------------------------------------------------------
+        market_bull = True
+
+        if (
+            "BTC"
+            in processed_data
+            and ts
+            in processed_data[
+                "BTC"
+            ].index
+        ):
+            btc_c = processed_data[
+                "BTC"
+            ].loc[ts]
+
+            market_bull = (
+                btc_c["Close"]
+                > btc_c["EMA200"]
+            )
+
+        bullish_count = 0
+        total_active_syms = 0
+
+        for symbol, df in processed_data.items():
+            if ts not in df.index:
                 continue
+
+            total_active_syms += 1
 
             if (
-                pd.isna(row["EMA200"])
-                or pd.isna(row["ATR"])
+                df.loc[
+                    ts,
+                    "Close",
+                ]
+                > df.loc[
+                    ts,
+                    "EMA200",
+                ]
             ):
-                continue
+                bullish_count += 1
 
-            side = raw_signal(row)
+        market_breadth_ratio = (
+            bullish_count
+            / total_active_syms
+            if total_active_syms > 0
+            else 0.5
+        )
 
-            if side is None:
-                continue
+        allow_longs = (
+            market_breadth_ratio
+            >= 0.35
+        )
 
-            diagnostics[
-                f"{side}_signal"
-            ] += 1
+        allow_shorts = (
+            market_breadth_ratio
+            <= 0.65
+        )
 
-            key = (name, side)
-
-            if key in positions:
-                diagnostics[
-                    "already_open"
-                ] += 1
-                continue
-
-            # Keep the V76 execution model for direct comparison:
-            # signal is evaluated on this bar and entry uses this bar
-            # Open. This intentionally matches the historical baseline.
-            if side == "long":
-                entry = (
-                    row["Open"]
-                    * (1.0 + SLIPPAGE)
-                )
-                initial_stop = (
-                    entry
-                    - row["ATR"]
-                    * INITIAL_ATR_MULTIPLIER
-                )
-            else:
-                entry = (
-                    row["Open"]
-                    * (1.0 - SLIPPAGE)
-                )
-                initial_stop = (
-                    entry
-                    + row["ATR"]
-                    * INITIAL_ATR_MULTIPLIER
-                )
-
-            stop_distance_pct = (
-                abs(
-                    entry
-                    - initial_stop
-                )
-                / entry
-            )
-
-            if not np.isfinite(
-                stop_distance_pct
-            ):
-                continue
-
-            # V76 stop sanity range.
-            if not (
-                0.01
-                <= stop_distance_pct
-                <= 0.04
-            ):
-                diagnostics[
-                    "invalid_stop_distance"
-                ] += 1
-                continue
-
-            recent_losses = loss_cluster.get(
-                key,
-                0,
-            )
-
-            score = quality_score(
-                row,
-                side,
-                market,
-                recent_losses,
-            )
-
-            candidates.append({
-                "symbol": name,
-                "side": side,
-                "ts": ts,
-                "entry": float(entry),
-                "initial_stop": float(
-                    initial_stop
-                ),
-                "stop_distance_pct": float(
-                    stop_distance_pct
-                ),
-                "quality_score": float(
-                    score
-                ),
-                "loss_cluster": int(
-                    recent_losses
-                ),
-                "mom_long": safe_float(
-                    row["Mom_Long"]
-                ),
-            })
+        # --------------------------------------------------------
+        # 3. EXACT V74 VALID CANDIDATES
+        # --------------------------------------------------------
+        candidates = build_valid_candidates(
+            processed_data,
+            ts,
+            active_positions,
+            market_bull,
+            allow_longs,
+            allow_shorts,
+        )
 
         diagnostics[
-            "candidates_before_ranking"
+            "valid_candidates"
         ] += len(candidates)
 
-        # --------------------------------------------------------
-        # 3. Rank all valid candidates.
-        #
-        # IMPORTANT:
-        # No MAX_LONGS=3 / MAX_SHORTS=3.
-        # V78 discarded 1007 signals through direction_limit.
-        # V79 has one portfolio limit: MAX_POSITIONS=5.
-        # --------------------------------------------------------
-        candidates.sort(
-            key=lambda item: (
-                safe_float(
-                    item["quality_score"]
-                ),
-                safe_float(
-                    item["mom_long"]
-                ),
-            ),
-            reverse=True,
-        )
+        if not candidates:
+            continue
 
         slots = (
             MAX_POSITIONS
-            - len(positions)
+            - len(active_positions)
         )
 
-        if slots > 0:
-            chosen = []
-            same_symbol_count = Counter()
+        if slots <= 0:
+            diagnostics[
+                "portfolio_full"
+            ] += 1
+            continue
 
-            for candidate in candidates:
-                if len(chosen) >= slots:
-                    break
+        # --------------------------------------------------------
+        # 4. SELECT
+        #
+        # BASELINE:
+        #   first candidates exactly as V74 ranking gives them.
+        #
+        # LSP:
+        #   same candidates, but soft penalty can reorder them.
+        # --------------------------------------------------------
+        if use_lsp:
+            selected = select_candidates_lsp(
+                candidates,
+                slots,
+                symbol_side_losses,
+                global_loss_streak,
+            )
 
-                name = candidate[
-                    "symbol"
-                ]
+            diagnostics[
+                "lsp_selection_events"
+            ] += 1
 
-                side = candidate[
-                    "side"
-                ]
-
-                key = (name, side)
-
-                if key in positions:
-                    continue
-
-                if (
-                    same_symbol_count[name]
-                    >= MAX_SAME_SYMBOL
-                ):
-                    diagnostics[
-                        "symbol_allocation_limit"
-                    ] += 1
-                    continue
-
-                chosen.append(candidate)
-                same_symbol_count[
-                    name
+            if (
+                global_loss_streak
+                >= LSP_ACTIVATE_AT
+            ):
+                diagnostics[
+                    "lsp_active_events"
                 ] += 1
 
-            diagnostics[
-                "accepted"
-            ] += len(chosen)
+        else:
+            selected = candidates[
+                :slots
+            ]
 
-            diagnostics[
-                "ranked_out"
-            ] += max(
-                0,
-                len(candidates)
-                - len(chosen),
-            )
-
-            for candidate in chosen:
-                name = candidate[
-                    "symbol"
-                ]
-
-                side = candidate[
-                    "side"
-                ]
-
-                key = (
-                    name,
-                    side,
-                )
-
-                margin = TRADE_MARGIN
-                notional = (
-                    margin * LEVERAGE
-                )
-
-                qty = (
-                    notional
-                    / candidate["entry"]
-                )
-
-                risk_dollar = (
-                    abs(
-                        candidate["entry"]
-                        - candidate[
-                            "initial_stop"
-                        ]
-                    )
-                    * qty
-                )
-
-                if risk_dollar <= 0:
-                    continue
-
-                positions[key] = {
-                    "symbol": name,
-                    "side": side,
-                    "entry_ts": ts,
-                    "entry": candidate[
-                        "entry"
-                    ],
-                    "initial_stop": candidate[
-                        "initial_stop"
-                    ],
-                    "stop": candidate[
-                        "initial_stop"
-                    ],
-                    "qty": qty,
-                    "margin": margin,
-                    "risk_dollar": risk_dollar,
-                    "candles": 0,
-                    "quality_score": candidate[
-                        "quality_score"
-                    ],
-                    "loss_cluster_before_entry": candidate[
-                        "loss_cluster"
-                    ],
-                }
+        diagnostics[
+            "selected_entries"
+        ] += len(selected)
 
         # --------------------------------------------------------
-        # 4. Mark-to-market equity.
-        # Used only for DD reporting.
+        # 5. EXACT V74 ENTRY
         # --------------------------------------------------------
-        mtm = 0.0
+        for candidate in selected:
+            symbol = candidate[
+                "symbol"
+            ]
 
-        for pos in positions.values():
-            df = data[pos["symbol"]]
+            side = candidate[
+                "side"
+            ]
 
-            row = row_at_or_before(
-                df,
-                ts,
-            )
+            active_positions[
+                symbol
+            ] = {
+                "side": side,
+                "entry_price": candidate[
+                    "entry_price"
+                ],
+                "stop_loss": candidate[
+                    "initial_sl"
+                ],
+                "highest_price": candidate[
+                    "entry_price"
+                ],
+                "lowest_price": candidate[
+                    "entry_price"
+                ],
+                "initial_risk": candidate[
+                    "initial_risk"
+                ],
+                "entry_index": candidate[
+                    "entry_index"
+                ],
+            }
 
-            if row is None:
+        # --------------------------------------------------------
+        # 6. Simple mark-to-market curve.
+        # Does not affect trading logic.
+        # --------------------------------------------------------
+        closed_pnl = sum(
+            trade["Dollar_PnL"]
+            for trade in all_trades
+        )
+
+        unrealized = 0.0
+
+        for pos_symbol, pos in (
+            active_positions.items()
+        ):
+            df = processed_data[
+                pos_symbol
+            ]
+
+            if ts not in df.index:
                 continue
 
-            if pos["side"] == "long":
-                unreal = (
-                    row["Close"]
-                    - pos["entry"]
-                ) * pos["qty"]
+            close_price = df.loc[
+                ts,
+                "Close",
+            ]
+
+            if pos["side"] == "LONG":
+                unrealized += (
+                    close_price
+                    - pos["entry_price"]
+                ) * (
+                    TRADE_MARGIN
+                    * LEVERAGE
+                    / pos["entry_price"]
+                )
+
             else:
-                unreal = (
-                    pos["entry"]
-                    - row["Close"]
-                ) * pos["qty"]
+                unrealized += (
+                    pos["entry_price"]
+                    - close_price
+                ) * (
+                    TRADE_MARGIN
+                    * LEVERAGE
+                    / pos["entry_price"]
+                )
 
-            unreal -= (
-                row["Close"]
-                * pos["qty"]
-                * FEE_RATE
-            )
-
-            mtm += unreal
-
-        # Closed PnL is accumulated directly into capital.
-        closed_capital = (
-            INITIAL_CAPITAL
-            + sum(
-                t["pnl"]
-                for t in trades
-            )
+        equity_curve.append(
+            {
+                "Timestamp": ts,
+                "Equity": (
+                    INITIAL_CAPITAL
+                    + closed_pnl
+                    + unrealized
+                ),
+            }
         )
-
-        equity = (
-            closed_capital
-            + mtm
-        )
-
-        equity_curve.append({
-            "timestamp": ts,
-            "closed_capital": closed_capital,
-            "equity": equity,
-            "open_positions": len(
-                positions
-            ),
-        })
 
     return (
-        trades,
-        equity_curve,
+        pd.DataFrame(all_trades),
+        pd.DataFrame(equity_curve),
         diagnostics,
     )
 
 
-def max_loss_streak(trades):
+# ============================================================
+# REPORTING
+# ============================================================
+
+def calculate_loss_streaks(
+    trades_df
+):
+    if trades_df.empty:
+        return 0, []
+
+    ordered = trades_df.sort_values(
+        [
+            "Timestamp",
+            "ExitOrder",
+        ],
+        kind="stable",
+    )
+
     current = 0
     maximum = 0
-    distribution = Counter()
+    sequences = []
 
-    for trade in trades:
-        if trade["pnl"] < 0:
+    for outcome in ordered[
+        "Outcome"
+    ]:
+        if outcome == "LOSS":
             current += 1
-        else:
-            if current > 0:
-                distribution[
-                    current
-                ] += 1
-
             maximum = max(
                 maximum,
                 current,
             )
-
+        else:
+            if current > 0:
+                sequences.append(
+                    current
+                )
             current = 0
 
     if current > 0:
-        distribution[
+        sequences.append(
             current
-        ] += 1
-
-        maximum = max(
-            maximum,
-            current,
         )
 
     return (
         maximum,
-        distribution,
+        sequences,
     )
 
 
-def calculate_drawdown(equity_curve):
-    if not equity_curve:
-        return (
-            0.0,
-            0.0,
-        )
+def calculate_drawdown(
+    equity_df
+):
+    if equity_df.empty:
+        return 0.0, 0.0
 
-    equity = pd.Series(
-        [
-            item["equity"]
-            for item in equity_curve
-        ],
-        dtype=float,
-    )
+    equity = equity_df[
+        "Equity"
+    ].astype(float)
 
     peak = equity.cummax()
-    drawdown = equity - peak
+    dd = equity - peak
 
-    max_dd_dollar = float(
-        drawdown.min()
+    max_dd = float(
+        dd.min()
     )
 
-    if max_dd_dollar >= 0:
-        return (
-            0.0,
-            0.0,
-        )
+    if max_dd >= 0:
+        return 0.0, 0.0
 
-    trough_idx = drawdown.idxmin()
-    peak_value = float(
-        peak.loc[trough_idx]
+    peak_at_trough = float(
+        peak.loc[
+            dd.idxmin()
+        ]
     )
 
     max_dd_pct = (
-        max_dd_dollar
-        / peak_value
+        max_dd
+        / peak_at_trough
         * 100.0
-        if peak_value > 0
+        if peak_at_trough > 0
         else 0.0
     )
 
     return (
-        max_dd_dollar,
+        max_dd,
         max_dd_pct,
     )
 
 
-def summarize(
-    data,
-    trades,
-    equity_curve,
+def report(
+    name,
+    trades_df,
+    equity_df,
     diagnostics,
 ):
-    total = len(trades)
+    print("\n" + "=" * 68)
+    print(name)
+    print("=" * 68)
 
-    wins = sum(
-        t["pnl"] > 0
-        for t in trades
+    if trades_df.empty:
+        print("No trades.")
+        return {}
+
+    trades_df = trades_df.sort_values(
+        [
+            "Timestamp",
+            "ExitOrder",
+        ],
+        kind="stable",
+    ).reset_index(
+        drop=True
     )
 
-    losses = sum(
-        t["pnl"] <= 0
-        for t in trades
+    total = len(
+        trades_df
     )
 
-    pnl = sum(
-        t["pnl"]
-        for t in trades
+    wins = int(
+        (
+            trades_df["Outcome"]
+            == "WIN"
+        ).sum()
     )
 
-    net_r = sum(
-        t["r"]
-        for t in trades
+    losses = total - wins
+
+    wr = (
+        wins
+        / total
+        * 100.0
+    )
+
+    net_r = float(
+        trades_df[
+            "Return"
+        ].sum()
+    )
+
+    pnl = float(
+        trades_df[
+            "Dollar_PnL"
+        ].sum()
     )
 
     final_capital = (
@@ -1252,39 +1275,25 @@ def summarize(
     )
 
     return_pct = (
-        (
-            final_capital
-            / INITIAL_CAPITAL
-        )
+        final_capital
+        / INITIAL_CAPITAL
         - 1.0
     ) * 100.0
 
-    win_rate = (
-        wins / total * 100.0
-        if total
-        else 0.0
-    )
-
-    max_dd_dollar, max_dd_pct = (
-        calculate_drawdown(
-            equity_curve
+    max_ls, sequences = (
+        calculate_loss_streaks(
+            trades_df
         )
     )
 
-    max_streak, streak_distribution = (
-        max_loss_streak(trades)
+    dd_dollar, dd_pct = (
+        calculate_drawdown(
+            equity_df
+        )
     )
 
-    print("\n" + "=" * 72)
-    print("HUNTER-V79 RESULTS")
-    print("=" * 72)
-
     print(
-        f"Valid Symbols : "
-        f"{len(data)}/{len(SYMBOLS)}"
-    )
-    print(
-        f"Total Trades  : {total}"
+        f"Trades        : {total}"
     )
     print(
         f"Wins          : {wins}"
@@ -1293,341 +1302,366 @@ def summarize(
         f"Losses        : {losses}"
     )
     print(
-        f"Win Rate      : "
-        f"{win_rate:.2f}%"
+        f"Win Rate      : {wr:.2f}%"
     )
     print(
-        f"Net R         : "
-        f"{net_r:.2f}R"
+        f"Net R         : {net_r:.2f}R"
     )
     print(
-        f"Net PnL       : "
-        f"${pnl:,.2f}"
+        f"Net PnL       : ${pnl:,.2f}"
     )
     print(
-        f"Final Capital : "
-        f"${final_capital:,.2f}"
+        f"Final Capital : ${final_capital:,.2f}"
     )
     print(
-        f"Return        : "
-        f"{return_pct:.2f}%"
+        f"Return        : {return_pct:.2f}%"
     )
     print(
         f"Max Drawdown  : "
-        f"${max_dd_dollar:,.2f} "
-        f"({max_dd_pct:.2f}%)"
+        f"${dd_dollar:,.2f} "
+        f"({dd_pct:.2f}%)"
     )
     print(
-        f"Max Loss Streak: "
-        f"{max_streak}"
+        f"Max Loss Streak: {max_ls}"
     )
 
-    print("\n" + "-" * 72)
-    print("DIRECTION")
-    print("-" * 72)
+    print("\nDIRECTION")
 
     for side in [
         "LONG",
         "SHORT",
     ]:
-        side_trades = [
-            t
-            for t in trades
-            if t["side"] == side
+        sdf = trades_df[
+            trades_df["Side"]
+            == side
         ]
 
-        side_wins = sum(
-            t["pnl"] > 0
-            for t in side_trades
-        )
+        side_total = len(sdf)
 
-        side_pnl = sum(
-            t["pnl"]
-            for t in side_trades
-        )
-
-        side_r = sum(
-            t["r"]
-            for t in side_trades
+        side_wins = int(
+            (
+                sdf["Outcome"]
+                == "WIN"
+            ).sum()
         )
 
         side_wr = (
             side_wins
-            / len(side_trades)
+            / side_total
             * 100.0
-            if side_trades
+            if side_total
             else 0.0
+        )
+
+        side_pnl = float(
+            sdf[
+                "Dollar_PnL"
+            ].sum()
         )
 
         print(
             f"{side:5s} | "
-            f"Trades={len(side_trades):4d} | "
+            f"Trades={side_total:4d} | "
             f"WR={side_wr:6.2f}% | "
-            f"PnL=${side_pnl:10,.2f} | "
-            f"R={side_r:8.2f}"
+            f"PnL=${side_pnl:10,.2f}"
         )
 
-    print("\n" + "-" * 72)
-    print("EXIT REASONS")
-    print("-" * 72)
+    print("\nLOSS STREAK DISTRIBUTION")
 
-    for reason in [
-        "STOP",
-        "TIMEOUT",
-    ]:
-        reason_trades = [
-            t
-            for t in trades
-            if t["exit_reason"]
-            == reason
-        ]
+    distribution = Counter(
+        sequences
+    )
 
-        reason_wins = sum(
-            t["pnl"] > 0
-            for t in reason_trades
-        )
-
-        reason_pnl = sum(
-            t["pnl"]
-            for t in reason_trades
-        )
-
-        reason_r = sum(
-            t["r"]
-            for t in reason_trades
-        )
-
-        reason_wr = (
-            reason_wins
-            / len(reason_trades)
-            * 100.0
-            if reason_trades
-            else 0.0
-        )
-
-        print(
-            f"{reason:8s} | "
-            f"Trades={len(reason_trades):4d} | "
-            f"WR={reason_wr:6.2f}% | "
-            f"PnL=${reason_pnl:10,.2f} | "
-            f"R={reason_r:8.2f}"
-        )
-
-    print("\n" + "-" * 72)
-    print("PER SYMBOL")
-    print("-" * 72)
-
-    for name in SYMBOLS:
-        symbol_trades = [
-            t
-            for t in trades
-            if t["symbol"] == name
-        ]
-
-        if not symbol_trades:
+    if distribution:
+        for length in sorted(
+            distribution
+        ):
             print(
-                f"{name:8s} | "
-                f"Trades={0:3d} | "
-                f"WR={0.00:6.2f}% | "
-                f"PnL=${0.00:10,.2f} | "
-                f"R={0.00:8.2f} | "
-                f"MaxLS=0"
+                f"{length:2d} loss: "
+                f"{distribution[length]} times"
             )
+    else:
+        print(
+            "No loss streaks."
+        )
+
+    print("\nPER SYMBOL")
+
+    for symbol in SYMBOLS:
+        sdf = trades_df[
+            trades_df["Symbol"]
+            == symbol
+        ]
+
+        if sdf.empty:
             continue
 
-        symbol_wins = sum(
-            t["pnl"] > 0
-            for t in symbol_trades
-        )
+        symbol_total = len(sdf)
 
-        symbol_pnl = sum(
-            t["pnl"]
-            for t in symbol_trades
-        )
-
-        symbol_r = sum(
-            t["r"]
-            for t in symbol_trades
+        symbol_wins = int(
+            (
+                sdf["Outcome"]
+                == "WIN"
+            ).sum()
         )
 
         symbol_wr = (
             symbol_wins
-            / len(symbol_trades)
+            / symbol_total
             * 100.0
         )
 
-        local_streak, _ = (
-            max_loss_streak(
-                symbol_trades
+        symbol_pnl = float(
+            sdf[
+                "Dollar_PnL"
+            ].sum()
+        )
+
+        symbol_max_ls, _ = (
+            calculate_loss_streaks(
+                sdf
             )
         )
 
         print(
-            f"{name:8s} | "
-            f"Trades={len(symbol_trades):3d} | "
+            f"{symbol:8s} | "
+            f"Trades={symbol_total:3d} | "
             f"WR={symbol_wr:6.2f}% | "
             f"PnL=${symbol_pnl:10,.2f} | "
-            f"R={symbol_r:8.2f} | "
-            f"MaxLS={local_streak}"
+            f"MaxLS={symbol_max_ls}"
         )
 
-    print("\n" + "-" * 72)
-    print("LOSS STREAK DISTRIBUTION")
-    print("-" * 72)
+    print("\nDIAGNOSTICS")
 
-    if streak_distribution:
-        for length in sorted(
-            streak_distribution
-        ):
-            print(
-                f"{length:2d} loss: "
-                f"{streak_distribution[length]} times"
-            )
-    else:
-        print("No losing streaks.")
-
-    print("\n" + "-" * 72)
-    print("DIAGNOSTICS")
-    print("-" * 72)
-
-    for key in sorted(diagnostics):
+    for key in sorted(
+        diagnostics
+    ):
         print(
-            f"{key:32s}: "
+            f"{key:28s}: "
             f"{diagnostics[key]}"
         )
 
     return {
-        "total_trades": total,
+        "trades": total,
         "wins": wins,
         "losses": losses,
-        "win_rate": win_rate,
+        "wr": wr,
         "net_r": net_r,
         "pnl": pnl,
         "final_capital": final_capital,
         "return_pct": return_pct,
-        "max_dd_dollar": max_dd_dollar,
-        "max_dd_pct": max_dd_pct,
-        "max_loss_streak": max_streak,
+        "max_dd": dd_dollar,
+        "max_dd_pct": dd_pct,
+        "max_loss_streak": max_ls,
     }
 
 
-def save_outputs(
-    trades,
-    equity_curve,
-    diagnostics,
-    summary,
+def save_csvs(
+    baseline_trades,
+    baseline_equity,
+    lsp_trades,
+    lsp_equity,
 ):
     os.makedirs(
         OUTPUT_DIR,
         exist_ok=True,
     )
 
-    trades_df = pd.DataFrame(
-        trades
-    )
-
-    if not trades_df.empty:
-        trades_df[
-            "entry_ts"
-        ] = pd.to_datetime(
-            trades_df["entry_ts"],
-            utc=True,
-        )
-
-        trades_df[
-            "exit_ts"
-        ] = pd.to_datetime(
-            trades_df["exit_ts"],
-            utc=True,
-        )
-
-        trades_df.to_csv(
+    if not baseline_trades.empty:
+        baseline_trades.to_csv(
             os.path.join(
                 OUTPUT_DIR,
-                "trades.csv",
+                "baseline_v74_trades.csv",
             ),
             index=False,
         )
 
-    equity_df = pd.DataFrame(
-        equity_curve
-    )
-
-    if not equity_df.empty:
-        equity_df[
-            "timestamp"
-        ] = pd.to_datetime(
-            equity_df["timestamp"],
-            utc=True,
-        )
-
-        equity_df.to_csv(
+    if not lsp_trades.empty:
+        lsp_trades.to_csv(
             os.path.join(
                 OUTPUT_DIR,
-                "equity_curve.csv",
+                "v74_lsp_trades.csv",
             ),
             index=False,
         )
 
-    diagnostics_df = pd.DataFrame(
-        sorted(
-            diagnostics.items()
-        ),
-        columns=[
-            "metric",
-            "value",
-        ],
+    if not baseline_equity.empty:
+        baseline_equity.to_csv(
+            os.path.join(
+                OUTPUT_DIR,
+                "baseline_v74_equity.csv",
+            ),
+            index=False,
+        )
+
+    if not lsp_equity.empty:
+        lsp_equity.to_csv(
+            os.path.join(
+                OUTPUT_DIR,
+                "v74_lsp_equity.csv",
+            ),
+            index=False,
+        )
+
+    print(
+        f"\nCSV output: "
+        f"{OUTPUT_DIR}/"
     )
 
-    diagnostics_df.to_csv(
-        os.path.join(
-            OUTPUT_DIR,
-            "diagnostics.csv",
-        ),
-        index=False,
+
+def print_comparison(
+    baseline,
+    lsp,
+):
+    print("\n" + "=" * 68)
+    print("V74 BASELINE vs V74-LSP")
+    print("=" * 68)
+
+    if not baseline or not lsp:
+        return
+
+    print(
+        f"{'Metric':24s}"
+        f"{'V74':>16s}"
+        f"{'V74-LSP':>16s}"
+        f"{'Delta':>16s}"
     )
 
-    pd.DataFrame(
-        [summary]
-    ).to_csv(
-        os.path.join(
-            OUTPUT_DIR,
-            "summary.csv",
+    print("-" * 72)
+
+    rows = [
+        (
+            "Trades",
+            baseline["trades"],
+            lsp["trades"],
         ),
-        index=False,
+        (
+            "Win Rate %",
+            baseline["wr"],
+            lsp["wr"],
+        ),
+        (
+            "Net PnL $",
+            baseline["pnl"],
+            lsp["pnl"],
+        ),
+        (
+            "Net R",
+            baseline["net_r"],
+            lsp["net_r"],
+        ),
+        (
+            "Max DD $",
+            baseline["max_dd"],
+            lsp["max_dd"],
+        ),
+        (
+            "Max DD %",
+            baseline["max_dd_pct"],
+            lsp["max_dd_pct"],
+        ),
+        (
+            "Max Loss Streak",
+            baseline["max_loss_streak"],
+            lsp["max_loss_streak"],
+        ),
+    ]
+
+    for metric, b, v in rows:
+        delta = v - b
+
+        if (
+            "Rate" in metric
+            or "DD %" in metric
+        ):
+            print(
+                f"{metric:24s}"
+                f"{b:16.2f}"
+                f"{v:16.2f}"
+                f"{delta:16.2f}"
+            )
+
+        elif (
+            "PnL" in metric
+            or "DD $" in metric
+        ):
+            print(
+                f"{metric:24s}"
+                f"${b:15,.2f}"
+                f"${v:15,.2f}"
+                f"${delta:15,.2f}"
+            )
+
+        else:
+            print(
+                f"{metric:24s}"
+                f"{b:16.2f}"
+                f"{v:16.2f}"
+                f"{delta:16.2f}"
+            )
+
+    print("\nIMPORTANT:")
+    print(
+        "V74-LSP never rejects a valid V74 signal."
+    )
+    print(
+        "It only changes priority when MAX_POSITIONS slots are scarce."
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    print(
+        "\nRunning EXACT V74 baseline..."
+    )
+
+    baseline_trades, baseline_equity, baseline_diag = (
+        run_backtest(
+            processed_data,
+            use_lsp=False,
+        )
+    )
+
+    baseline_summary = report(
+        "V74 BASELINE (UNCHANGED CORE)",
+        baseline_trades,
+        baseline_equity,
+        baseline_diag,
     )
 
     print(
-        f"\nCSV: {OUTPUT_DIR}/"
+        "\nRunning V74-LSP..."
     )
 
-
-def main():
-    data = load_data()
-
-    if not data:
-        raise RuntimeError(
-            "No valid symbols loaded."
+    lsp_trades, lsp_equity, lsp_diag = (
+        run_backtest(
+            processed_data,
+            use_lsp=True,
         )
-
-    trades, equity_curve, diagnostics = (
-        run_backtest(data)
     )
 
-    summary = summarize(
-        data,
-        trades,
-        equity_curve,
-        diagnostics,
+    lsp_summary = report(
+        "V74-LSP (ONLY LOSS-STREAK PRIORITY SHIELD)",
+        lsp_trades,
+        lsp_equity,
+        lsp_diag,
     )
 
-    save_outputs(
-        trades,
-        equity_curve,
-        diagnostics,
-        summary,
+    print_comparison(
+        baseline_summary,
+        lsp_summary,
     )
 
+    save_csvs(
+        baseline_trades,
+        baseline_equity,
+        lsp_trades,
+        lsp_equity,
+    )
 
-if __name__ == "__main__":
-    main()
+    print(
+        "\nHUNTER-V74-LSP BACKTEST COMPLETE."
+    )
