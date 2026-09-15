@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V63 (Smart Long/Short Regime Switch + Detailed Metrics)
+# HUNTER-V64 (Smart Long/Short + ADX Trend Strength Filter)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -66,7 +66,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - HUNTER-V63 (لانگ/شورت هوشمند با گزارش تفکیکی)")
+print("📥 دریافت داده‌ها - HUNTER-V64 (با فیلتر تخصصی ADX)")
 print("=" * 60)
 
 processed_data = {}
@@ -140,6 +140,18 @@ def fetch_symbol_data(lbank_symbol):
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
 
+    # محاسبه ADX (شاخص میانگین جهت‌دار) برای تشخیص روند واقعی از بازار رِنج
+    plus_dm = df["High"].diff()
+    minus_dm = df["Low"].diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+    
+    tr = df["ATR"]
+    plus_di = 100 * pd.Series(plus_dm).rolling(14).mean() / (tr.rolling(14).mean() + 1e-9)
+    minus_di = 100 * pd.Series(minus_dm).rolling(14).mean() / (tr.rolling(14).mean() + 1e-9)
+    dx = 100 * np.abs(plus_di - minus_di) / (np.abs(plus_di + minus_di) + 1e-9)
+    df["ADX"] = pd.Series(dx).rolling(14).mean().values
+
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
@@ -156,7 +168,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست HUNTER-V63...")
+print("⚙️ شروع اجرای بک‌تست HUNTER-V64...")
 
 def run_backtest(processed_data):
     all_timestamps = sorted({
@@ -224,7 +236,6 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
         
-        # تعیین رژیم کلی بازار در این کندل (بر اساس شاخص لیدر مثل BTC یا میانگین بازار)
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
             btc_c = processed_data["BTC"].loc[ts]
@@ -240,7 +251,6 @@ def run_backtest(processed_data):
         if not current_scores:
             continue
         
-        # اگر بازار صعودی باشد سیگنال لانگ، اگر نزولی باشد سیگنال شورت برعکس مرتب می‌شود
         ranked_symbols = sorted(
             current_scores.keys(), key=lambda x: current_scores[x], reverse=market_bull
         )
@@ -261,6 +271,11 @@ def run_backtest(processed_data):
             
             c4h = df.iloc[i]
             
+            # فیلتر قدرت روند ADX: اجازه ورود فقط زمانی که روند واقعی شکل گرفته باشد (جلوگیری از زنجیره باخت در رِنج)
+            adx_val = c4h["ADX"]
+            if np.isnan(adx_val) or adx_val < 22:
+                continue
+
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"]) and (c4h["EMA20"] > c4h["EMA50"]) and (c4h["Close"] > c4h["EMA200"])
                 valid_signal = regime_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
@@ -291,7 +306,7 @@ def run_backtest(processed_data):
 
 def summarize_result(trades_df):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی هوشمند لانگ/شورت - HUNTER-V63")
+    print("📊 گزارش نهایی استراتژی با فیلتر ADX - HUNTER-V64")
     print("=" * 68)
 
     if trades_df.empty:
@@ -309,7 +324,6 @@ def summarize_result(trades_df):
     total_dollar_pnl = float(trades_df["Dollar_PnL"].sum())
     final_capital = INITIAL_CAPITAL + total_dollar_pnl
 
-    # تفکیک لانگ و شورت
     longs_df = trades_df[trades_df["Side"] == "LONG"]
     shorts_df = trades_df[trades_df["Side"] == "SHORT"]
 
@@ -345,8 +359,8 @@ def summarize_result(trades_df):
     print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
     print(f"🔸 مارجین: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
     print(f"🔸 تعداد کل معاملات: {total_trades}")
-    print(f"   🔹 معاملات لانگ: کل = {long_total} | برنده = {long_wins} | بازنده (استاپ خورده) = {long_losses} | وین‌ریت = {long_wr:.2f}%")
-    print(f"   🔸 معاملات شورت: کل = {short_total} | برنده = {short_wins} | بازنده (استاپ خورده) = {short_losses} | وین‌ریت = {short_wr:.2f}%")
+    print(f"   🔹 معاملات لانگ: کل = {long_total} | برنده = {long_wins} | بازنده = {long_losses} | وین‌ریت = {long_wr:.2f}%")
+    print(f"   🔸 معاملات شورت: کل = {short_total} | برنده = {short_wins} | بازنده = {short_losses} | وین‌ریت = {short_wr:.2f}%")
     print(f"🎯 وین‌ریت کلی کل سبد: {wr:.2f}%")
     print(f"💰 مجموع بازدهی خالص: {net_r:.2f}R")
     print(f"💵 مجموع سود/زیان دلاری خالص: ${total_dollar_pnl:,.2f}")
@@ -364,4 +378,4 @@ def summarize_result(trades_df):
 if __name__ == "__main__":
     df_trades = run_backtest(processed_data)
     summarize_result(df_trades)
-    print("\n✨ بک‌تست HUNTER-V63 به پایان رسید.")
+    print("\n✨ بک‌تست HUNTER-V64 به پایان رسید.")
