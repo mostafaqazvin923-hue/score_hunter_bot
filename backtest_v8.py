@@ -1125,6 +1125,711 @@ def run_backtest(
     )
 
 
+
+# ============================================================
+# LOSS-STREAK FORENSICS
+# ============================================================
+
+def loss_streak_forensics(trades_df, top_n=20):
+    """
+    Finds every consecutive-loss sequence in exit order and prints
+    the exact trades inside the largest sequences.
+
+    This is diagnostic only. It does NOT change the backtest.
+    """
+
+    if trades_df.empty:
+        print("\nNo trades available for loss-streak forensics.")
+        return pd.DataFrame()
+
+    df = trades_df.sort_values(
+        ["Timestamp", "ExitOrder"],
+        kind="stable",
+    ).reset_index(drop=True).copy()
+
+    sequences = []
+    current = []
+
+    for _, row in df.iterrows():
+        if row["Outcome"] == "LOSS":
+            current.append(row)
+        else:
+            if current:
+                sequences.append(current)
+                current = []
+
+    if current:
+        sequences.append(current)
+
+    records = []
+
+    for seq_id, seq in enumerate(
+        sequences,
+        start=1,
+    ):
+        if not seq:
+            continue
+
+        start = seq[0]
+        end = seq[-1]
+
+        records.append(
+            {
+                "Sequence_ID": seq_id,
+                "Length": len(seq),
+                "Start": start["Timestamp"],
+                "End": end["Timestamp"],
+                "Total_PnL": sum(
+                    float(x["Dollar_PnL"])
+                    for x in seq
+                ),
+                "Symbols": ",".join(
+                    str(x["Symbol"])
+                    for x in seq
+                ),
+                "Sides": ",".join(
+                    str(x["Side"])
+                    for x in seq
+                ),
+            }
+        )
+
+    seq_df = pd.DataFrame(records)
+
+    if seq_df.empty:
+        print("\nNo loss streaks found.")
+        return seq_df
+
+    seq_df = seq_df.sort_values(
+        ["Length", "Start"],
+        ascending=[False, True],
+        kind="stable",
+    ).reset_index(drop=True)
+
+    print("\n" + "=" * 68)
+    print("LOSS-STREAK FORENSICS — BASELINE")
+    print("=" * 68)
+
+    print(
+        f"Total loss sequences: {len(seq_df)}"
+    )
+    print(
+        f"Maximum loss streak: "
+        f"{int(seq_df.iloc[0]['Length'])}"
+    )
+
+    print("\nTOP LOSS SEQUENCES")
+
+    for _, r in seq_df.head(top_n).iterrows():
+        print(
+            f"#{int(r['Sequence_ID']):3d} | "
+            f"Length={int(r['Length']):2d} | "
+            f"PnL=${float(r['Total_PnL']):,.2f} | "
+            f"{r['Start']} -> {r['End']}"
+        )
+        print(
+            f"    Symbols: {r['Symbols']}"
+        )
+        print(
+            f"    Sides:   {r['Sides']}"
+        )
+
+    # Detailed trades for the single largest sequence.
+    longest_id = int(
+        seq_df.iloc[0]["Sequence_ID"]
+    )
+
+    current = []
+    sequence_counter = 0
+
+    for _, row in df.iterrows():
+        if row["Outcome"] == "LOSS":
+            current.append(row)
+        else:
+            if current:
+                sequence_counter += 1
+
+                if (
+                    sequence_counter
+                    == longest_id
+                ):
+                    break
+
+                current = []
+
+    if not current:
+        current = [
+            row
+            for _, row in df.iterrows()
+            if row["Outcome"] == "LOSS"
+        ]
+
+    detail_rows = []
+
+    for n, row in enumerate(
+        current,
+        start=1,
+    ):
+        detail_rows.append(
+            {
+                "Streak_Position": n,
+                "Timestamp": row["Timestamp"],
+                "Symbol": row["Symbol"],
+                "Side": row["Side"],
+                "Return_R": float(
+                    row["Return"]
+                ),
+                "Dollar_PnL": float(
+                    row["Dollar_PnL"]
+                ),
+            }
+        )
+
+    detail_df = pd.DataFrame(
+        detail_rows
+    )
+
+    print("\nLONGEST STREAK — TRADE BY TRADE")
+
+    if detail_df.empty:
+        print("No detail available.")
+    else:
+        for _, r in detail_df.iterrows():
+            print(
+                f"{int(r['Streak_Position']):2d}. "
+                f"{r['Timestamp']} | "
+                f"{str(r['Symbol']):8s} | "
+                f"{str(r['Side']):5s} | "
+                f"R={float(r['Return_R']):7.3f} | "
+                f"PnL=${float(r['Dollar_PnL']):9,.2f}"
+            )
+
+    # Useful cluster statistics.
+    symbol_counter = Counter(
+        x["Symbol"]
+        for x in current
+    )
+
+    side_counter = Counter(
+        x["Side"]
+        for x in current
+    )
+
+    print("\nLONGEST STREAK COMPOSITION")
+
+    print(
+        "Symbols: "
+        + ", ".join(
+            f"{k}={v}"
+            for k, v in symbol_counter.most_common()
+        )
+    )
+
+    print(
+        "Sides: "
+        + ", ".join(
+            f"{k}={v}"
+            for k, v in side_counter.most_common()
+        )
+    )
+
+    # Save forensic CSV.
+    os.makedirs(
+        OUTPUT_DIR,
+        exist_ok=True,
+    )
+
+    seq_path = os.path.join(
+        OUTPUT_DIR,
+        "baseline_loss_streak_sequences.csv",
+    )
+
+    detail_path = os.path.join(
+        OUTPUT_DIR,
+        "baseline_longest_loss_streak.csv",
+    )
+
+    seq_df.to_csv(
+        seq_path,
+        index=False,
+    )
+
+    detail_df.to_csv(
+        detail_path,
+        index=False,
+    )
+
+    print(
+        f"\nSaved: {seq_path}"
+    )
+    print(
+        f"Saved: {detail_path}"
+    )
+
+    return seq_df
+
+
+# ============================================================
+# V74-LSP2 DESIGN
+# ============================================================
+
+def build_lsp2_priority(
+    candidates,
+    symbol_side_losses,
+    global_loss_streak,
+):
+    """
+    LSP2 is intentionally diagnostic-first.
+
+    Unlike V74-LSP1, it does NOT use a numeric penalty that can
+    accidentally overpower V74's Momentum ranking.
+
+    It performs a very narrow priority swap ONLY when:
+      1) the portfolio has a live global loss streak >= 2, and
+      2) two candidates are competing for the same scarce slot, and
+      3) one candidate has a recent same-symbol+side loss streak.
+
+    The original V74 ordering remains the default.
+
+    No signal is rejected.
+    """
+
+    if not candidates:
+        return []
+
+    ranked = list(candidates)
+
+    if global_loss_streak < 2:
+        return ranked
+
+    # Partition into candidates that are currently carrying a
+    # same-symbol+side loss streak and those that are not.
+    clean = []
+    clustered = []
+
+    for idx, candidate in enumerate(ranked):
+        streak = symbol_side_losses.get(
+            (
+                candidate["symbol"],
+                candidate["side"],
+            ),
+            0,
+        )
+
+        item = (
+            idx,
+            candidate,
+            streak,
+        )
+
+        if streak >= 2:
+            clustered.append(item)
+        else:
+            clean.append(item)
+
+    # Only move a clustered candidate behind a clean candidate
+    # if the clean candidate was already very close in original
+    # V74 rank. This prevents LSP2 from rewriting the whole
+    # ranking and protects the Golden Core.
+    #
+    # "Near" means one adjacent rank only.
+    #
+    # This is deliberately conservative.
+    result = list(ranked)
+
+    for idx, candidate, streak in clustered:
+        if idx <= 0:
+            continue
+
+        prev_candidate = result[idx - 1]
+
+        prev_streak = symbol_side_losses.get(
+            (
+                prev_candidate["symbol"],
+                prev_candidate["side"],
+            ),
+            0,
+        )
+
+        if prev_streak < 2:
+            result[idx - 1], result[idx] = (
+                result[idx],
+                result[idx - 1],
+            )
+
+    return result
+
+
+def run_lsp2(
+    processed_data,
+):
+    """
+    Runs V74 with the conservative LSP2 priority rule.
+
+    This function is intentionally separate from run_backtest()
+    so the original baseline and V74-LSP1 remain untouched.
+    """
+
+    all_timestamps = get_all_timestamps(
+        processed_data
+    )
+
+    active_positions = {}
+    all_trades = []
+
+    symbol_side_losses = defaultdict(int)
+    global_loss_streak = 0
+
+    diagnostics = Counter()
+
+    equity_curve = []
+
+    for ts in all_timestamps:
+
+        symbols_to_close = []
+
+        # EXACT V74 position management.
+        for symbol, pos in list(
+            active_positions.items()
+        ):
+            df = processed_data[symbol]
+
+            if ts not in df.index:
+                continue
+
+            c4h = df.loc[ts]
+
+            if pos["side"] == "LONG":
+                if c4h["High"] > pos["highest_price"]:
+                    pos["highest_price"] = c4h["High"]
+
+                    new_trailing_sl = (
+                        pos["highest_price"]
+                        - TRAILING_ATR_MULTIPLIER
+                        * c4h["ATR"]
+                    )
+
+                    if new_trailing_sl > pos["stop_loss"]:
+                        pos["stop_loss"] = new_trailing_sl
+
+                hit_sl = (
+                    c4h["Low"]
+                    <= pos["stop_loss"]
+                )
+
+            else:
+                if c4h["Low"] < pos["lowest_price"]:
+                    pos["lowest_price"] = c4h["Low"]
+
+                    new_trailing_sl = (
+                        pos["lowest_price"]
+                        + TRAILING_ATR_MULTIPLIER
+                        * c4h["ATR"]
+                    )
+
+                    if new_trailing_sl < pos["stop_loss"]:
+                        pos["stop_loss"] = new_trailing_sl
+
+                hit_sl = (
+                    c4h["High"]
+                    >= pos["stop_loss"]
+                )
+
+            curr_i = df.index.get_loc(ts)
+            candles_held = (
+                curr_i
+                - pos["entry_index"]
+            )
+
+            is_timeout = (
+                candles_held
+                >= TIMEOUT_CANDLES
+            )
+
+            if not (
+                hit_sl
+                or is_timeout
+            ):
+                continue
+
+            initial_risk = pos["initial_risk"]
+
+            if pos["side"] == "LONG":
+                exit_p = (
+                    min(
+                        pos["stop_loss"],
+                        c4h["Open"],
+                    )
+                    if hit_sl
+                    else c4h["Close"]
+                )
+
+                r_real = (
+                    (
+                        exit_p
+                        - pos["entry_price"]
+                    )
+                    / initial_risk
+                ) - (
+                    FEE_RATE * 2
+                )
+
+                price_return_pct = (
+                    exit_p
+                    - pos["entry_price"]
+                ) / pos["entry_price"]
+
+            else:
+                exit_p = (
+                    max(
+                        pos["stop_loss"],
+                        c4h["Open"],
+                    )
+                    if hit_sl
+                    else c4h["Close"]
+                )
+
+                r_real = (
+                    (
+                        pos["entry_price"]
+                        - exit_p
+                    )
+                    / initial_risk
+                ) - (
+                    FEE_RATE * 2
+                )
+
+                price_return_pct = (
+                    pos["entry_price"]
+                    - exit_p
+                ) / pos["entry_price"]
+
+            outcome = (
+                "WIN"
+                if r_real > 0
+                else "LOSS"
+            )
+
+            position_notional = (
+                TRADE_MARGIN
+                * LEVERAGE
+            )
+
+            dollar_pnl = (
+                position_notional
+                * price_return_pct
+            ) - (
+                position_notional
+                * FEE_RATE
+                * 2
+            )
+
+            if outcome == "LOSS":
+                global_loss_streak += 1
+
+                symbol_side_losses[
+                    (
+                        symbol,
+                        pos["side"],
+                    )
+                ] += 1
+
+            else:
+                global_loss_streak = 0
+
+                symbol_side_losses[
+                    (
+                        symbol,
+                        pos["side"],
+                    )
+                ] = 0
+
+            all_trades.append(
+                {
+                    "Timestamp": ts,
+                    "Symbol": symbol,
+                    "Side": pos["side"],
+                    "Outcome": outcome,
+                    "Return": r_real,
+                    "Dollar_PnL": dollar_pnl,
+                    "ExitOrder": len(all_trades),
+                    "LSP_Active": 1,
+                    "LSP2_Global_Streak": global_loss_streak,
+                }
+            )
+
+            symbols_to_close.append(symbol)
+
+        for sym in symbols_to_close:
+            del active_positions[sym]
+
+        # EXACT V74 regime/breadth.
+        market_bull = True
+
+        if (
+            "BTC" in processed_data
+            and ts in processed_data["BTC"].index
+        ):
+            btc_c = processed_data["BTC"].loc[ts]
+            market_bull = (
+                btc_c["Close"]
+                > btc_c["EMA200"]
+            )
+
+        bullish_count = 0
+        total_active_syms = 0
+
+        for symbol, df in processed_data.items():
+            if ts not in df.index:
+                continue
+
+            total_active_syms += 1
+
+            if (
+                df.loc[ts, "Close"]
+                > df.loc[ts, "EMA200"]
+            ):
+                bullish_count += 1
+
+        market_breadth_ratio = (
+            bullish_count / total_active_syms
+            if total_active_syms > 0
+            else 0.5
+        )
+
+        allow_longs = (
+            market_breadth_ratio >= 0.35
+        )
+
+        allow_shorts = (
+            market_breadth_ratio <= 0.65
+        )
+
+        candidates = build_valid_candidates(
+            processed_data,
+            ts,
+            active_positions,
+            market_bull,
+            allow_longs,
+            allow_shorts,
+        )
+
+        diagnostics[
+            "valid_candidates"
+        ] += len(candidates)
+
+        if not candidates:
+            continue
+
+        slots = (
+            MAX_POSITIONS
+            - len(active_positions)
+        )
+
+        if slots <= 0:
+            diagnostics[
+                "portfolio_full"
+            ] += 1
+            continue
+
+        ranked = build_lsp2_priority(
+            candidates,
+            symbol_side_losses,
+            global_loss_streak,
+        )
+
+        selected = ranked[:slots]
+
+        diagnostics[
+            "selected_entries"
+        ] += len(selected)
+
+        if global_loss_streak >= 2:
+            diagnostics[
+                "lsp2_active_events"
+            ] += 1
+
+        for candidate in selected:
+            symbol = candidate["symbol"]
+            side = candidate["side"]
+
+            active_positions[symbol] = {
+                "side": side,
+                "entry_price": candidate[
+                    "entry_price"
+                ],
+                "stop_loss": candidate[
+                    "initial_sl"
+                ],
+                "highest_price": candidate[
+                    "entry_price"
+                ],
+                "lowest_price": candidate[
+                    "entry_price"
+                ],
+                "initial_risk": candidate[
+                    "initial_risk"
+                ],
+                "entry_index": candidate[
+                    "entry_index"
+                ],
+            }
+
+        closed_pnl = sum(
+            trade["Dollar_PnL"]
+            for trade in all_trades
+        )
+
+        unrealized = 0.0
+
+        for pos_symbol, pos in active_positions.items():
+            df = processed_data[pos_symbol]
+
+            if ts not in df.index:
+                continue
+
+            close_price = df.loc[
+                ts,
+                "Close",
+            ]
+
+            if pos["side"] == "LONG":
+                unrealized += (
+                    close_price
+                    - pos["entry_price"]
+                ) * (
+                    TRADE_MARGIN
+                    * LEVERAGE
+                    / pos["entry_price"]
+                )
+            else:
+                unrealized += (
+                    pos["entry_price"]
+                    - close_price
+                ) * (
+                    TRADE_MARGIN
+                    * LEVERAGE
+                    / pos["entry_price"]
+                )
+
+        equity_curve.append(
+            {
+                "Timestamp": ts,
+                "Equity": (
+                    INITIAL_CAPITAL
+                    + closed_pnl
+                    + unrealized
+                ),
+            }
+        )
+
+    return (
+        pd.DataFrame(all_trades),
+        pd.DataFrame(equity_curve),
+        diagnostics,
+    )
+
+
 # ============================================================
 # REPORTING
 # ============================================================
@@ -1655,6 +2360,41 @@ if __name__ == "__main__":
         lsp_summary,
     )
 
+    # --------------------------------------------------------
+    # FORENSICS:
+    # Find exactly where the 13-loss streak comes from.
+    # --------------------------------------------------------
+    loss_streak_forensics(
+        baseline_trades,
+        top_n=20,
+    )
+
+    # --------------------------------------------------------
+    # LSP2:
+    # Conservative adjacent-rank protection.
+    # --------------------------------------------------------
+    print(
+        "\nRunning V74-LSP2..."
+    )
+
+    lsp2_trades, lsp2_equity, lsp2_diag = (
+        run_lsp2(
+            processed_data
+        )
+    )
+
+    lsp2_summary = report(
+        "V74-LSP2 (CONSERVATIVE LOSS-CLUSTER SHIELD)",
+        lsp2_trades,
+        lsp2_equity,
+        lsp2_diag,
+    )
+
+    print_comparison(
+        baseline_summary,
+        lsp2_summary,
+    )
+
     save_csvs(
         baseline_trades,
         baseline_equity,
@@ -1662,6 +2402,29 @@ if __name__ == "__main__":
         lsp_equity,
     )
 
+    os.makedirs(
+        OUTPUT_DIR,
+        exist_ok=True,
+    )
+
+    if not lsp2_trades.empty:
+        lsp2_trades.to_csv(
+            os.path.join(
+                OUTPUT_DIR,
+                "v74_lsp2_trades.csv",
+            ),
+            index=False,
+        )
+
+    if not lsp2_equity.empty:
+        lsp2_equity.to_csv(
+            os.path.join(
+                OUTPUT_DIR,
+                "v74_lsp2_equity.csv",
+            ),
+            index=False,
+        )
+
     print(
-        "\nHUNTER-V74-LSP BACKTEST COMPLETE."
+        "\nHUNTER-V74-LSP2 BACKTEST COMPLETE."
     )
