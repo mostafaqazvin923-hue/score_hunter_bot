@@ -105,6 +105,14 @@ GLOBAL_STREAK_PENALTY = 0.35
 
 OUTPUT_DIR = "hunter_v74_lsp_output"
 
+# ============================================================
+# LSP3 — HARD LOSS-STREAK CIRCUIT BREAKER
+# ============================================================
+# The Golden Core signal logic is untouched. LSP3 only blocks NEW
+# entries in a direction after repeated losses in that same direction.
+LSP3_TRIGGER_STREAK = 2
+LSP3_COOLDOWN_CANDLES = 4   # 4 x 4h = 16 hours
+
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
@@ -649,6 +657,7 @@ def select_candidates_lsp(
 def run_backtest(
     processed_data,
     use_lsp=False,
+    use_lsp3=False,
 ):
     all_timestamps = get_all_timestamps(
         processed_data
@@ -663,11 +672,21 @@ def run_backtest(
     # Consecutive losses across portfolio exit order.
     global_loss_streak = 0
 
+    # LSP3 state: directional loss streak + temporary entry cooldown.
+    direction_loss_streak = {"LONG": 0, "SHORT": 0}
+    direction_cooldown = {"LONG": 0, "SHORT": 0}
+
     diagnostics = Counter()
 
     equity_curve = []
 
     for ts in all_timestamps:
+        # Count down only when LSP3 is active. This never affects V74 baseline/LSP.
+        if use_lsp3:
+            for _side in ("LONG", "SHORT"):
+                if direction_cooldown[_side] > 0:
+                    direction_cooldown[_side] -= 1
+
         symbols_to_close = []
 
         # --------------------------------------------------------
@@ -861,6 +880,13 @@ def run_backtest(
                     )
                 ] += 1
 
+                if use_lsp3:
+                    direction_loss_streak[pos["side"]] += 1
+                    if direction_loss_streak[pos["side"]] >= LSP3_TRIGGER_STREAK:
+                        direction_cooldown[pos["side"]] = LSP3_COOLDOWN_CANDLES
+                        diagnostics["lsp3_trigger_events"] += 1
+                        diagnostics["lsp3_blocked_candles_scheduled"] += LSP3_COOLDOWN_CANDLES
+
             else:
                 global_loss_streak = 0
 
@@ -870,6 +896,11 @@ def run_backtest(
                         pos["side"],
                     )
                 ] = 0
+
+                if use_lsp3:
+                    # A win in that direction releases its circuit breaker.
+                    direction_loss_streak[pos["side"]] = 0
+                    direction_cooldown[pos["side"]] = 0
 
             all_trades.append(
                 {
@@ -889,6 +920,9 @@ def run_backtest(
                     "ExitPrice": exit_p,
                     "LSP_Active": int(
                         use_lsp
+                    ),
+                    "LSP3_Active": int(
+                        use_lsp3
                     ),
                 }
             )
@@ -980,6 +1014,32 @@ def run_backtest(
 
         if not candidates:
             continue
+
+        # --------------------------------------------------------
+        # LSP3: HARD ENTRY CIRCUIT BREAKER ONLY
+        # --------------------------------------------------------
+        # V74 candidates are built exactly as before. We only suppress
+        # NEW entries in a direction whose own loss streak is active.
+        if use_lsp3:
+            original_candidate_count = len(candidates)
+            blocked_sides = {
+                side for side in ("LONG", "SHORT")
+                if direction_cooldown[side] > 0
+            }
+
+            if blocked_sides:
+                candidates = [
+                    c for c in candidates
+                    if c["side"] not in blocked_sides
+                ]
+                blocked_count = original_candidate_count - len(candidates)
+                diagnostics["lsp3_blocked_candidates"] += blocked_count
+                if blocked_count > 0:
+                    diagnostics["lsp3_active_events"] += 1
+
+            if not candidates:
+                diagnostics["lsp3_no_entry_events"] += 1
+                continue
 
         slots = (
             MAX_POSITIONS
@@ -2484,6 +2544,41 @@ if __name__ == "__main__":
         baseline_equity,
         baseline_diag,
     )
+
+    print("\nRunning V74-LSP3 — HARD DIRECTIONAL LOSS-STREAK CIRCUIT BREAKER...")
+    lsp3_trades, lsp3_equity, lsp3_diag = run_backtest(
+        processed_data,
+        use_lsp=False,
+        use_lsp3=True,
+    )
+
+    lsp3_summary = report(
+        "V74-LSP3 (DIRECTIONAL LOSS-STREAK CIRCUIT BREAKER)",
+        lsp3_trades,
+        lsp3_equity,
+        lsp3_diag,
+    )
+
+    print("\n" + "=" * 68)
+    print("V74 BASELINE vs V74-LSP3")
+    print("=" * 68)
+    if baseline_summary and lsp3_summary:
+        for metric in [
+            "trades", "wr", "pnl", "net_r", "max_dd",
+            "max_dd_pct", "max_loss_streak",
+        ]:
+            b = baseline_summary[metric]
+            v = lsp3_summary[metric]
+            print(f"{metric:20s} | V74={b:12.2f} | LSP3={v:12.2f} | Delta={v-b:12.2f}")
+
+    print("\nLSP3 DIAGNOSTICS")
+    print(f"Trigger streak       : {LSP3_TRIGGER_STREAK} same-direction losses")
+    print(f"Cooldown             : {LSP3_COOLDOWN_CANDLES} candles (16h)")
+    print(f"Trigger events       : {lsp3_diag.get('lsp3_trigger_events', 0)}")
+    print(f"Blocked candidates   : {lsp3_diag.get('lsp3_blocked_candidates', 0)}")
+    print(f"Blocked entry events : {lsp3_diag.get('lsp3_no_entry_events', 0)}")
+    print("IMPORTANT: V74 signal/filter/ranking/ATR/SL/trailing/timeout logic is unchanged.")
+    print("LSP3 only blocks NEW entries while the directional circuit breaker is active.")
 
     enhanced_loss_streak_forensics(baseline_trades)
 
