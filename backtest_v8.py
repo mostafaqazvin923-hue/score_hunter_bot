@@ -16,7 +16,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V74-DUAL-LOSS-REGIME-SHIELD
+# HUNTER-V74-LSP
 #
 # Golden Core = EXACT V74 signal / execution logic
 # ONLY ADDITION = Loss-Streak Protection in candidate priority
@@ -78,48 +78,6 @@ INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
-# ============================================================
-# SHOCK / ACCELERATION SHIELD
-# ============================================================
-# This layer is intentionally conservative and only filters NEW entries.
-# V74 signal, ranking, SL, trailing, timeout and PnL mechanics remain intact.
-# It detects an unusually fast move AGAINST the proposed trade direction
-# using only information available at the current 4h candle.
-SHOCK_LOOKBACK_CANDLES = 2
-SHOCK_1BAR_ATR_MULT = 1.25
-SHOCK_2BAR_ATR_MULT = 2.00
-SHOCK_RANGE_ATR_MULT = 1.75
-SHOCK_BODY_FRACTION = 0.55
-SHOCK_REQUIRE_SCORE = 2
-SHOCK_BTC_CONFIRM_ATR_MULT = 1.50
-
-# ============================================================
-# LOSS-STREAK REGIME SHIELD (NEW TEST)
-# ============================================================
-# Preventive, direction-aware protection. It activates only after
-# 2 same-direction loss events AND evidence that the market is
-# accelerating against that direction. It does NOT alter V74 signals,
-# ranking, SL, trailing, timeout, leverage, or sizing.
-LOSS_REGIME_TRIGGER = 2
-LOSS_REGIME_BTC_ADVERSE_ATR = 1.20
-LOSS_REGIME_SYMBOL_ADVERSE_ATR = 1.50
-LOSS_REGIME_BEAR_BREADTH = 0.35
-LOSS_REGIME_BULL_BREADTH = 0.65
-
-# Correlated-loss cluster control: only engages after repeated losses in
-# one direction AND when several fresh candidates want the same direction.
-# It keeps the best-ranked candidate(s) instead of deleting the V74 signal rules.
-CLUSTER_LOSS_TRIGGER = 2
-CLUSTER_MIN_SAME_SIDE = 3
-CLUSTER_KEEP_AFTER_TRIGGER = 1
-
-# PRE-ENTRY CROWD / ADVERSE-MARKET GATE
-# Causal only: uses current/prior bars; V74 signals and execution remain unchanged.
-PREVENTIVE_MIN_SAME_SIDE = 3
-PREVENTIVE_KEEP = 2
-PREVENTIVE_BTC_ATR_2BAR = 1.25
-PREVENTIVE_BREADTH_DELTA = 0.10
-
 INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
@@ -159,8 +117,8 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — PREVENTIVE CROWD GATE")
-print("Golden Core + Causal Pre-Entry Protection")
+print("HUNTER-V74-LSP")
+print("Golden Core + Soft Loss-Streak Protection")
 print("=" * 68)
 
 
@@ -692,230 +650,6 @@ def select_candidates_lsp(
     return selected
 
 
-def detect_shock_against_entry(processed_data, ts, candidate):
-    """
-    Conservative, causal shock detector.
-
-    Returns (blocked, reason, details). It never looks beyond `ts`.
-    A candidate is blocked only when at least SHOCK_REQUIRE_SCORE independent
-    signs indicate a fast move against the proposed direction.
-    """
-    symbol = candidate["symbol"]
-    side = candidate["side"]
-    df = processed_data[symbol]
-
-    if ts not in df.index:
-        return False, "", {}
-
-    i = df.index.get_loc(ts)
-    if i < 2:
-        return False, "", {}
-
-    c = df.iloc[i]
-    p1 = df.iloc[i - 1]
-    p2 = df.iloc[i - 2]
-
-    close = float(c["Close"])
-    if close <= 0 or not np.isfinite(close):
-        return False, "", {}
-
-    atr = float(c["ATR"])
-    atr_pct = atr / close if atr > 0 else 0.0
-    if atr_pct <= 0 or not np.isfinite(atr_pct):
-        return False, "", {}
-
-    r1 = float(c["Close"]) / float(p1["Close"]) - 1.0
-    r2 = float(c["Close"]) / float(p2["Close"]) - 1.0
-    candle_range = float(c["High"]) - float(c["Low"])
-    body = abs(float(c["Close"]) - float(c["Open"]))
-    body_fraction = body / candle_range if candle_range > 0 else 0.0
-
-    adverse = (
-        (side == "SHORT" and r1 > 0) or
-        (side == "LONG" and r1 < 0)
-    )
-    adverse2 = (
-        (side == "SHORT" and r2 > 0) or
-        (side == "LONG" and r2 < 0)
-    )
-
-    score = 0
-    reasons = []
-
-    if adverse and abs(r1) >= SHOCK_1BAR_ATR_MULT * atr_pct:
-        score += 1
-        reasons.append("1bar_impulse")
-
-    if adverse2 and abs(r2) >= SHOCK_2BAR_ATR_MULT * atr_pct:
-        score += 1
-        reasons.append("2bar_acceleration")
-
-    if (
-        adverse
-        and candle_range >= SHOCK_RANGE_ATR_MULT * atr
-        and body_fraction >= SHOCK_BODY_FRACTION
-    ):
-        score += 1
-        reasons.append("impulse_candle")
-
-    # BTC confirmation is deliberately normalized by BTC's own ATR so this
-    # remains scale-independent across market regimes.
-    btc_confirm = False
-    btc_r2 = np.nan
-    if "BTC" in processed_data and ts in processed_data["BTC"].index:
-        bdf = processed_data["BTC"]
-        bi = bdf.index.get_loc(ts)
-        if bi >= 2:
-            bc = bdf.iloc[bi]
-            bp2 = bdf.iloc[bi - 2]
-            btc_close = float(bc["Close"])
-            btc_atr = float(bc["ATR"])
-            btc_r2 = btc_close / float(bp2["Close"]) - 1.0
-            btc_atr_pct = btc_atr / btc_close if btc_atr > 0 else 0.0
-            if btc_atr_pct > 0:
-                btc_confirm = (
-                    (side == "SHORT" and btc_r2 >= SHOCK_BTC_CONFIRM_ATR_MULT * btc_atr_pct) or
-                    (side == "LONG" and btc_r2 <= -SHOCK_BTC_CONFIRM_ATR_MULT * btc_atr_pct)
-                )
-                if btc_confirm:
-                    score += 1
-                    reasons.append("btc_confirmation")
-
-    blocked = adverse and score >= SHOCK_REQUIRE_SCORE
-    details = {
-        "score": score,
-        "r1": r1,
-        "r2": r2,
-        "atr_pct": atr_pct,
-        "range_atr": candle_range / atr if atr > 0 else np.nan,
-        "body_fraction": body_fraction,
-        "btc_r2": btc_r2,
-        "reasons": reasons,
-    }
-    return blocked, "+".join(reasons), details
-
-
-# ============================================================
-# LOSS-STREAK REGIME SHIELD HELPER
-# ============================================================
-def detect_loss_regime_against_entry(processed_data, ts, candidate,
-                                     direction_loss_streak,
-                                     market_breadth_ratio):
-    """
-    Causal entry protection: only uses candles available at `ts`.
-    Returns (blocked, reason, details).
-
-    A candidate is blocked only when:
-      1) its direction has already suffered >= LOSS_REGIME_TRIGGER
-         consecutive loss EVENTS, and
-      2) there is fresh acceleration against that direction in BTC
-         or the candidate symbol, and
-      3) market breadth is simultaneously at the extreme boundary
-         that contradicts the proposed direction.
-
-    This is deliberately much narrower than a generic loss cooldown.
-    """
-    side = candidate["side"]
-    if direction_loss_streak.get(side, 0) < LOSS_REGIME_TRIGGER:
-        return False, "", {"streak": direction_loss_streak.get(side, 0)}
-
-    symbol = candidate["symbol"]
-    df = processed_data.get(symbol)
-    if df is None or ts not in df.index:
-        return False, "", {"streak": direction_loss_streak.get(side, 0)}
-
-    idx = df.index.get_loc(ts)
-    if idx < 2:
-        return False, "", {"streak": direction_loss_streak.get(side, 0)}
-
-    row = df.iloc[idx]
-    prev2 = df.iloc[idx-2]
-    atr = float(row.get("ATR", np.nan))
-    if not np.isfinite(atr) or atr <= 0:
-        return False, "", {"streak": direction_loss_streak.get(side, 0)}
-
-    sym_r2_abs_atr = abs(float(row["Close"]) - float(prev2["Close"])) / atr
-    sym_r2 = (float(row["Close"]) / float(prev2["Close"]) - 1.0) if float(prev2["Close"]) else 0.0
-
-    btc_r2_atr = 0.0
-    btc_r2 = 0.0
-    btc = processed_data.get("BTC")
-    if btc is not None and ts in btc.index:
-        bi = btc.index.get_loc(ts)
-        if bi >= 2:
-            br = btc.iloc[bi]
-            bp = btc.iloc[bi-2]
-            b_atr = float(br.get("ATR", np.nan))
-            if np.isfinite(b_atr) and b_atr > 0 and float(bp["Close"]) != 0:
-                btc_r2 = float(br["Close"]) / float(bp["Close"]) - 1.0
-                btc_r2_atr = abs(float(br["Close"]) - float(bp["Close"])) / b_atr
-
-    if side == "LONG":
-        breadth_contradiction = market_breadth_ratio <= LOSS_REGIME_BEAR_BREADTH
-        btc_adverse = btc_r2 <= 0 and btc_r2_atr >= LOSS_REGIME_BTC_ADVERSE_ATR
-        symbol_adverse = sym_r2 <= 0 and sym_r2_abs_atr >= LOSS_REGIME_SYMBOL_ADVERSE_ATR
-    else:
-        breadth_contradiction = market_breadth_ratio >= LOSS_REGIME_BULL_BREADTH
-        btc_adverse = btc_r2 >= 0 and btc_r2_atr >= LOSS_REGIME_BTC_ADVERSE_ATR
-        symbol_adverse = sym_r2 >= 0 and sym_r2_abs_atr >= LOSS_REGIME_SYMBOL_ADVERSE_ATR
-
-    # Require the broader regime evidence plus either BTC or symbol acceleration.
-    blocked = breadth_contradiction and (btc_adverse or symbol_adverse)
-    reasons = []
-    if breadth_contradiction:
-        reasons.append("breadth_contradiction")
-    if btc_adverse:
-        reasons.append("btc_adverse_acceleration")
-    if symbol_adverse:
-        reasons.append("symbol_adverse_acceleration")
-
-    return blocked, "+".join(reasons), {
-        "streak": direction_loss_streak.get(side, 0),
-        "breadth": market_breadth_ratio,
-        "symbol_r2": sym_r2,
-        "symbol_r2_atr": sym_r2_abs_atr,
-        "btc_r2": btc_r2,
-        "btc_r2_atr": btc_r2_atr,
-    }
-
-
-# ============================================================
-# PRE-ENTRY CROWD / ADVERSE-MARKET GATE
-# ============================================================
-def apply_preventive_crowd_gate(candidates, ts, processed_data, market_breadth_ratio, diagnostics):
-    if len(candidates) < PREVENTIVE_MIN_SAME_SIDE:
-        return candidates
-    out=[]
-    for side in ("LONG", "SHORT"):
-        group=[c for c in candidates if c.get("side") == side]
-        if len(group) < PREVENTIVE_MIN_SAME_SIDE:
-            out.extend(group); continue
-        adverse=False; reason=[]
-        btc=processed_data.get("BTC")
-        if btc is not None and ts in btc.index:
-            bi=btc.index.get_loc(ts)
-            if bi>=2:
-                r=btc.iloc[bi]; p=btc.iloc[bi-2]
-                atr=float(r.get("ATR", np.nan))
-                move=(float(r["Close"])/float(p["Close"])-1) if float(p["Close"]) else 0
-                move_atr=abs(float(r["Close"])-float(p["Close"])) / atr if np.isfinite(atr) and atr>0 else 0
-                if ((side=="SHORT" and move>0) or (side=="LONG" and move<0)) and move_atr>=PREVENTIVE_BTC_ATR_2BAR:
-                    adverse=True; reason.append("btc_adverse")
-        # Breadth contradiction is intentionally mild; only acts with a crowded side.
-        if (side=="SHORT" and market_breadth_ratio>0.60) or (side=="LONG" and market_breadth_ratio<0.40):
-            adverse=True; reason.append("breadth_contradiction")
-        if adverse:
-            kept=group[:PREVENTIVE_KEEP]
-            blocked=group[PREVENTIVE_KEEP:]
-            diagnostics.setdefault("preventive_gate_block_log", []).extend([{
-                "Timestamp":ts,"Side":side,"Symbol":c.get("symbol"),"Reason":"+".join(reason)
-            } for c in blocked])
-            out.extend(kept)
-        else:
-            out.extend(group)
-    return out
-
-
 # ============================================================
 # BACKTEST
 # ============================================================
@@ -924,11 +658,6 @@ def run_backtest(
     processed_data,
     use_lsp=False,
     use_lsp3=False,
-    use_shock_shield=False,
-    long_only=False,
-    use_loss_regime_shield=False,
-    use_cluster_control=False,
-    use_preventive_gate=False,
 ):
     all_timestamps = get_all_timestamps(
         processed_data
@@ -948,17 +677,9 @@ def run_backtest(
     # so simultaneous exits cannot artificially accelerate the breaker.
     direction_loss_streak = {"LONG": 0, "SHORT": 0}
     direction_cooldown = {"LONG": 0, "SHORT": 0}
-    # Separate event-based streak used by the new preventive shield.
-    loss_regime_streak = {"LONG": 0, "SHORT": 0}
-    loss_regime_block_log = []
     lsp3_trigger_log = []
-    shock_block_log = []
 
     diagnostics = Counter()
-    diagnostics["cluster_control_events"] = 0
-    diagnostics["cluster_control_blocked_long"] = 0
-    diagnostics["cluster_control_blocked_short"] = 0
-    diagnostics["cluster_control_block_log"] = []
 
     equity_curve = []
 
@@ -1206,22 +927,6 @@ def run_backtest(
             ]
 
         # --------------------------------------------------------
-        # NEW SHIELD STATE — DIRECTIONAL LOSS EVENTS
-        # --------------------------------------------------------
-        # Same timestamp = one event. Any WIN in a direction resets it.
-        for side in ("LONG", "SHORT"):
-            side_outcomes = [
-                t["Outcome"] for t in all_trades
-                if t["Timestamp"] == ts and t["Side"] == side
-            ]
-            if not side_outcomes:
-                continue
-            if "WIN" in side_outcomes:
-                loss_regime_streak[side] = 0
-            elif "LOSS" in side_outcomes:
-                loss_regime_streak[side] += 1
-
-        # --------------------------------------------------------
         # LSP3 — EVENT-BASED DIRECTIONAL CIRCUIT BREAKER
         # --------------------------------------------------------
         # All exits at the same 4h timestamp are one event per direction.
@@ -1342,15 +1047,6 @@ def run_backtest(
             "valid_candidates"
         ] += len(candidates)
 
-        # LONG-ONLY TEST: keep the V74 candidate generation completely
-        # unchanged, then remove SHORT candidates before ranking/entry.
-        # No EMA, Momentum, ATR, SL, trailing, timeout, sizing, or LONG
-        # signal rule is changed by this switch.
-        if long_only:
-            short_count = sum(1 for c in candidates if c["side"] == "SHORT")
-            diagnostics["long_only_removed_short_candidates"] += short_count
-            candidates = [c for c in candidates if c["side"] == "LONG"]
-
         if not candidates:
             if use_lsp3:
                 for _side in ("LONG", "SHORT"):
@@ -1399,90 +1095,6 @@ def run_backtest(
                         if direction_cooldown[_side] > 0:
                             direction_cooldown[_side] -= 1
                 continue
-
-        # --------------------------------------------------------
-        # SHOCK / ACCELERATION SHIELD — NEW ENTRIES ONLY
-        # --------------------------------------------------------
-        if use_shock_shield and candidates:
-            kept_candidates = []
-            for c in candidates:
-                blocked, reason, details = detect_shock_against_entry(
-                    processed_data, ts, c
-                )
-                if blocked:
-                    diagnostics["shock_blocked_candidates"] += 1
-                    diagnostics[f"shock_blocked_{c['side'].lower()}_candidates"] += 1
-                    diagnostics["shock_block_events"] += 1
-                    shock_block_log.append({
-                        "Timestamp": ts,
-                        "Symbol": c["symbol"],
-                        "Side": c["side"],
-                        "Score": details.get("score", 0),
-                        "Reason": reason,
-                        "R1": details.get("r1"),
-                        "R2": details.get("r2"),
-                        "ATR_Pct": details.get("atr_pct"),
-                        "Range_ATR": details.get("range_atr"),
-                        "BodyFraction": details.get("body_fraction"),
-                        "BTC_R2": details.get("btc_r2"),
-                    })
-                else:
-                    kept_candidates.append(c)
-            if len(kept_candidates) != len(candidates):
-                diagnostics["shock_active_events"] += 1
-            candidates = kept_candidates
-
-        # --------------------------------------------------------
-        # LOSS-STREAK REGIME SHIELD — NEW ENTRIES ONLY
-        # --------------------------------------------------------
-        # This is intentionally preventive and narrow: after repeated
-        # losses in one direction, suppress only candidates when current
-        # breadth + acceleration show that direction is being contradicted.
-        if use_loss_regime_shield and candidates:
-            kept_candidates = []
-            for c in candidates:
-                blocked, reason, details = detect_loss_regime_against_entry(
-                    processed_data, ts, c, loss_regime_streak, market_breadth_ratio
-                )
-                if blocked:
-                    diagnostics["loss_regime_blocked_candidates"] += 1
-                    diagnostics[f"loss_regime_blocked_{c['side'].lower()}_candidates"] += 1
-                    loss_regime_block_log.append({
-                        "Timestamp": ts,
-                        "Symbol": c["symbol"],
-                        "Side": c["side"],
-                        "LossEventStreak": details.get("streak", 0),
-                        "Reason": reason,
-                        "Breadth": details.get("breadth"),
-                        "Symbol_R2": details.get("symbol_r2"),
-                        "Symbol_R2_ATR": details.get("symbol_r2_atr"),
-                        "BTC_R2": details.get("btc_r2"),
-                        "BTC_R2_ATR": details.get("btc_r2_atr"),
-                    })
-                else:
-                    kept_candidates.append(c)
-            if len(kept_candidates) != len(candidates):
-                diagnostics["loss_regime_active_events"] += 1
-                diagnostics["loss_regime_blocked_entry_events"] += 1
-            candidates = kept_candidates
-
-        # --------------------------------------------------------
-        # PREVENTIVE CROWD / ADVERSE-MARKET GATE — NEW ENTRIES ONLY
-        # --------------------------------------------------------
-        if use_preventive_gate and candidates:
-            before = len(candidates)
-            candidates = apply_preventive_crowd_gate(
-                candidates, ts, processed_data, market_breadth_ratio, diagnostics
-            )
-            diagnostics["preventive_gate_blocked"] += before - len(candidates)
-
-        # --------------------------------------------------------
-        # CORRELATED LOSS CLUSTER CONTROL — NEW ENTRIES ONLY
-        # --------------------------------------------------------
-        if use_cluster_control and candidates:
-            candidates = apply_correlated_loss_cluster_control(
-                candidates, loss_regime_streak, active_positions, diagnostics, ts
-            )
 
         slots = (
             MAX_POSITIONS
@@ -1637,10 +1249,6 @@ def run_backtest(
 
     if use_lsp3:
         diagnostics["lsp3_trigger_log"] = lsp3_trigger_log
-    if use_shock_shield:
-        diagnostics["shock_block_log"] = shock_block_log
-    if use_loss_regime_shield:
-        diagnostics["loss_regime_block_log"] = loss_regime_block_log
 
     return (
         pd.DataFrame(all_trades),
@@ -2984,99 +2592,163 @@ def enhanced_loss_streak_forensics(trades_df):
 
 
 # ============================================================
-# CORRELATED LOSS CLUSTER CONTROL
+# MAIN — BASELINE ONLY + FORENSICS
 # ============================================================
-def apply_correlated_loss_cluster_control(candidates, direction_loss_streak,
-                                           active_positions, diagnostics, ts):
-    """
-    Prevent repeated directional clustering without changing V74 signals.
-
-    This is deliberately narrower than a direction cooldown:
-      * only activates after >= 2 completed loss events in that direction;
-      * only activates when >= 3 NEW candidates want that same direction;
-      * keeps the highest-ranked candidate for that direction;
-      * never touches existing positions or exit logic.
-
-    Ranking is already established by V74 before this function is called, so
-    keeping candidates[:N] preserves the original V74 preference ordering.
-    """
-    if not candidates:
-        return candidates
-
-    out = []
-    by_side = {"LONG": [], "SHORT": []}
-    for c in candidates:
-        by_side.get(c.get("side"), []).append(c)
-
-    blocked = []
-    for side in ("LONG", "SHORT"):
-        group = by_side[side]
-        streak = int(direction_loss_streak.get(side, 0))
-        if streak >= CLUSTER_LOSS_TRIGGER and len(group) >= CLUSTER_MIN_SAME_SIDE:
-            keep_n = min(CLUSTER_KEEP_AFTER_TRIGGER, len(group))
-            kept = group[:keep_n]
-            out.extend(kept)
-            blocked.extend(group[keep_n:])
-            diagnostics["cluster_control_events"] += 1
-            diagnostics[f"cluster_control_blocked_{side.lower()}"] += len(group) - keep_n
-            for c in group[keep_n:]:
-                diagnostics["cluster_control_block_log"].append({
-                    "Timestamp": ts,
-                    "Symbol": c.get("symbol"),
-                    "Side": side,
-                    "LossEventStreak": streak,
-                    "SameSideCandidates": len(group),
-                    "Action": "BLOCK_CORRELATED_CLUSTER",
-                })
-        else:
-            out.extend(group)
-
-    # Preserve V74 candidate ordering as much as possible.
-    rank = {id(c): i for i, c in enumerate(candidates)}
-    out.sort(key=lambda c: rank[id(c)])
-    return out
 
 
 # ============================================================
-# MAIN — EXACT V74 vs PREVENTIVE CROWD GATE
+# FORENSICS ONLY — GOLDEN V74 UNCHANGED
 # ============================================================
+FORENSIC_OUT = "hunter_v74_forensics"
+
+
+def entry_features(ts, symbol, side, trade_index, baseline_trades):
+    """Reconstruct only pre-entry information; never changes trading."""
+    d = processed_data[symbol]
+    i = d.index.get_loc(ts)
+    c = d.iloc[i]
+
+    # Reconstruct positions that were open immediately before this entry.
+    active = {}
+    for j, r in baseline_trades.iterrows():
+        et = pd.to_datetime(r["EntryTimestamp"])
+        xt = pd.to_datetime(r["Timestamp"])
+        if pd.isna(et) or pd.isna(xt):
+            continue
+        if et <= ts and xt > ts:
+            active[str(r["Symbol"])] = {"side": r["Side"]}
+
+    # Exact V74 market regime/breadth.
+    market_bull = True
+    if "BTC" in processed_data and ts in processed_data["BTC"].index:
+        b = processed_data["BTC"].loc[ts]
+        market_bull = bool(b["Close"] > b["EMA200"])
+
+    bullish = 0
+    total = 0
+    for s, df in processed_data.items():
+        if ts in df.index:
+            total += 1
+            bullish += int(df.loc[ts, "Close"] > df.loc[ts, "EMA200"])
+    breadth = bullish / total if total else 0.5
+    allow_longs = breadth >= 0.35
+    allow_shorts = breadth <= 0.65
+
+    cs = build_valid_candidates(
+        processed_data, ts, active, market_bull,
+        allow_longs, allow_shorts
+    )
+    same_side = [x for x in cs if x["side"] == side]
+    rank = next((n + 1 for n, x in enumerate(cs)
+                 if x["symbol"] == symbol and x["side"] == side), np.nan)
+
+    def ret(df, n):
+        if i < n:
+            return np.nan
+        return float(df.iloc[i]["Close"] / df.iloc[i-n]["Close"] - 1.0)
+
+    btc = processed_data.get("BTC")
+    if btc is not None and ts in btc.index:
+        bi = btc.index.get_loc(ts)
+        bc = btc.iloc[bi]
+        b1 = float(bc["Close"] / btc.iloc[bi-1]["Close"] - 1) if bi >= 1 else np.nan
+        b2 = float(bc["Close"] / btc.iloc[bi-2]["Close"] - 1) if bi >= 2 else np.nan
+        b3 = float(bc["Close"] / btc.iloc[bi-3]["Close"] - 1) if bi >= 3 else np.nan
+        b_atr_pct = float(bc["ATR"] / bc["Close"]) if bc["Close"] else np.nan
+        b1atr = b1 / b_atr_pct if b_atr_pct else np.nan
+        b2atr = b2 / b_atr_pct if b_atr_pct else np.nan
+        b3atr = b3 / b_atr_pct if b_atr_pct else np.nan
+        bd20 = float(bc["Close"] / bc["EMA20"] - 1)
+        bd50 = float(bc["Close"] / bc["EMA50"] - 1)
+        bd200 = float(bc["Close"] / bc["EMA200"] - 1)
+    else:
+        b1=b2=b3=b1atr=b2atr=b3atr=bd20=bd50=bd200=np.nan
+
+    atr_pct = float(c["ATR"] / c["Close"]) if c["Close"] else np.nan
+    prev_atr_pct = float(d.iloc[i-1]["ATR"] / d.iloc[i-1]["Close"]) if i >= 1 else np.nan
+    atr_change = atr_pct / prev_atr_pct - 1 if prev_atr_pct else np.nan
+
+    return {
+        "EntryTimestamp": ts,
+        "Symbol": symbol,
+        "Side": side,
+        "Rank": rank,
+        "CandidateCountSameSide": len(same_side),
+        "OpenPositionsTotal": len(active),
+        "OpenPositionsSameSide": sum(v["side"] == side for v in active.values()),
+        "BTC_Return_1Bar": b1, "BTC_Return_2Bar": b2, "BTC_Return_3Bar": b3,
+        "BTC_Return_1Bar_ATR": b1atr, "BTC_Return_2Bar_ATR": b2atr, "BTC_Return_3Bar_ATR": b3atr,
+        "BTC_Distance_EMA20": bd20, "BTC_Distance_EMA50": bd50, "BTC_Distance_EMA200": bd200,
+        "Breadth": breadth,
+        "Symbol_Return_1Bar": ret(d,1), "Symbol_Return_2Bar": ret(d,2), "Symbol_Return_3Bar": ret(d,3),
+        "Symbol_ATR_Percent": atr_pct, "Symbol_ATR_Change": atr_change,
+        "Symbol_Distance_EMA20_ATR": float((c["Close"]-c["EMA20"])/c["ATR"]),
+        "Symbol_Distance_EMA50_ATR": float((c["Close"]-c["EMA50"])/c["ATR"]),
+        "Symbol_Mom_Short": float(c["Mom_Short"]),
+        "Symbol_Mom_Long": float(c["Mom_Long"]),
+    }
+
+
+def run_forensics(trades):
+    os.makedirs(FORENSIC_OUT, exist_ok=True)
+    t = trades.copy()
+    t["EntryTimestamp"] = pd.to_datetime(t["EntryTimestamp"])
+    t["Timestamp"] = pd.to_datetime(t["Timestamp"])
+    t = t.sort_values(["Timestamp", "ExitOrder"], kind="stable").reset_index(drop=True)
+
+    rows=[]
+    for n, r in t.iterrows():
+        f=entry_features(r["EntryTimestamp"], r["Symbol"], r["Side"], n, t)
+        f.update({
+            "Outcome": r["Outcome"],
+            "Return_R": float(r["Return"]),
+            "Dollar_PnL": float(r["Dollar_PnL"]),
+            "ExitTimestamp": r["Timestamp"],
+        })
+        rows.append(f)
+    e=pd.DataFrame(rows)
+    e.to_csv(f"{FORENSIC_OUT}/v74_entry_diagnostics.csv", index=False)
+    t.to_csv(f"{FORENSIC_OUT}/v74_trades.csv", index=False)
+
+    # Exact raw longest losing sequence.
+    seq=[]; cur=[]
+    for _,r in t.iterrows():
+        if r["Outcome"] == "LOSS": cur.append(r)
+        elif cur: seq.append(cur); cur=[]
+    if cur: seq.append(cur)
+    longest=max(seq,key=len) if seq else []
+    target_keys={(str(r["EntryTimestamp"]),r["Symbol"],r["Side"]) for r in longest}
+    target=e[e.apply(lambda r:(str(r["EntryTimestamp"]),r["Symbol"],r["Side"]) in target_keys,axis=1)]
+    losses=e[e["Outcome"]=="LOSS"]
+    wins=e[e["Outcome"]=="WIN"]
+
+    features=[
+        "Rank","CandidateCountSameSide","OpenPositionsTotal","OpenPositionsSameSide",
+        "BTC_Return_1Bar","BTC_Return_2Bar","BTC_Return_3Bar",
+        "BTC_Return_1Bar_ATR","BTC_Return_2Bar_ATR","BTC_Return_3Bar_ATR",
+        "BTC_Distance_EMA20","BTC_Distance_EMA50","BTC_Distance_EMA200",
+        "Breadth","Symbol_Return_1Bar","Symbol_Return_2Bar","Symbol_Return_3Bar",
+        "Symbol_ATR_Percent","Symbol_ATR_Change","Symbol_Distance_EMA20_ATR",
+        "Symbol_Distance_EMA50_ATR","Symbol_Mom_Short","Symbol_Mom_Long"
+    ]
+    comp=[]
+    for f in features:
+        a=pd.to_numeric(target[f],errors="coerce")
+        b=pd.to_numeric(losses[f],errors="coerce")
+        c=pd.to_numeric(wins[f],errors="coerce")
+        comp.append({"Feature":f,"13_Loss_Avg":a.mean(),"All_Loss_Avg":b.mean(),"All_Win_Avg":c.mean()})
+    comp=pd.DataFrame(comp)
+    comp["AbsGap_13L_vs_Win"]=(comp["13_Loss_Avg"]-comp["All_Win_Avg"]).abs()
+    comp=comp.sort_values("AbsGap_13L_vs_Win",ascending=False)
+    comp.to_csv(f"{FORENSIC_OUT}/v74_feature_comparison.csv",index=False)
+
+    print(f"V74 | Trades={len(t)} | WR={(t.Outcome.eq('WIN').mean()*100):.2f}% | PnL=${t.Dollar_PnL.sum():,.2f} | MaxLS={len(longest)}")
+    print(f"FORENSIC | 13-loss={len(longest)} | CSV={FORENSIC_OUT}/")
+    print("TOP FEATURES")
+    for _,r in comp.head(10).iterrows():
+        print(f"{r['Feature']} | 13L={r['13_Loss_Avg']:.6f} | Loss={r['All_Loss_Avg']:.6f} | Win={r['All_Win_Avg']:.6f}")
+
 
 if __name__ == "__main__":
-    baseline_trades, baseline_equity, _ = run_backtest(
-        processed_data,
-        use_lsp=False,
-        use_lsp3=False,
-        use_shock_shield=False,
-        long_only=False,
-        use_loss_regime_shield=False,
-        use_cluster_control=False,
-        use_preventive_gate=False,
-    )
-
-    shield_trades, shield_equity, shield_diag = run_backtest(
-        processed_data,
-        use_lsp=False,
-        use_lsp3=False,
-        use_shock_shield=False,
-        long_only=False,
-        use_loss_regime_shield=False,
-        use_cluster_control=False,
-        use_preventive_gate=True,
-    )
-
-    def compact_result(trades, equity):
-        if trades.empty:
-            return 0, 0.0, 0.0, 0.0, 0
-        wins = int((trades["Outcome"] == "WIN").sum())
-        wr = wins / len(trades) * 100.0
-        pnl = float(trades["Dollar_PnL"].sum())
-        dd, _ = calculate_drawdown(equity)
-        ls, _ = calculate_loss_streaks(trades.sort_values(["Timestamp", "ExitOrder"], kind="stable"))
-        return len(trades), wr, pnl, dd, ls
-
-    b = compact_result(baseline_trades, baseline_equity)
-    t = compact_result(shield_trades, shield_equity)
-    blocked = len(shield_diag.get("preventive_gate_block_log", []))
-
-    print(f"V74      | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxDD=${b[3]:,.2f} | MaxLS={b[4]} | Blocked=0")
-    print(f"Preventive | Trades={t[0]} | WR={t[1]:.2f}% | PnL=${t[2]:,.2f} | MaxDD=${t[3]:,.2f} | MaxLS={t[4]} | Blocked={blocked}")
+    trades, equity, diag = run_backtest(processed_data, use_lsp=False, use_lsp3=False)
+    run_forensics(trades)
