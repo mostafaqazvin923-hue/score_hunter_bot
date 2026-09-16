@@ -777,6 +777,7 @@ def run_backtest(
     use_lsp=False,
     use_lsp3=False,
     use_shock_shield=False,
+    long_only=False,
 ):
     all_timestamps = get_all_timestamps(
         processed_data
@@ -1166,6 +1167,15 @@ def run_backtest(
         diagnostics[
             "valid_candidates"
         ] += len(candidates)
+
+        # LONG-ONLY TEST: keep the V74 candidate generation completely
+        # unchanged, then remove SHORT candidates before ranking/entry.
+        # No EMA, Momentum, ATR, SL, trailing, timeout, sizing, or LONG
+        # signal rule is changed by this switch.
+        if long_only:
+            short_count = sum(1 for c in candidates if c["side"] == "SHORT")
+            diagnostics["long_only_removed_short_candidates"] += short_count
+            candidates = [c for c in candidates if c["side"] == "LONG"]
 
         if not candidates:
             if use_lsp3:
@@ -2746,77 +2756,44 @@ def enhanced_loss_streak_forensics(trades_df):
 
 
 # ============================================================
-# MAIN — BASELINE ONLY + FORENSICS
+# MAIN — LONG-ONLY V74 TEST
 # ============================================================
 
 if __name__ == "__main__":
-    print("\nRunning EXACT V74 baseline for diagnostics only...")
+    print("\n" + "=" * 68)
+    print("HUNTER-V74 LONG-ONLY TEST")
+    print("=" * 68)
+    print("EXACT V74 CORE + SHORT DISABLED")
+    print("No V74 LONG signal / execution parameter was changed.")
+    print("All SHORT candidates are removed before ranking/entry.")
+    print("=" * 68)
 
-    baseline_trades, baseline_equity, baseline_diag = run_backtest(
-        processed_data,
-        use_lsp=False,
-    )
-
-    # Keep the normal V74 report so baseline numbers remain directly comparable.
-    baseline_summary = report(
-        "V74 BASELINE (UNCHANGED CORE)",
-        baseline_trades,
-        baseline_equity,
-        baseline_diag,
-    )
-
-    print("\nRunning V74 + SHOCK / ACCELERATION SHIELD...")
-    shock_trades, shock_equity, shock_diag = run_backtest(
+    long_trades, long_equity, long_diag = run_backtest(
         processed_data,
         use_lsp=False,
         use_lsp3=False,
-        use_shock_shield=True,
+        use_shock_shield=False,
+        long_only=True,
     )
 
-    shock_summary = report(
-        "V74 + SHOCK / ACCELERATION SHIELD",
-        shock_trades,
-        shock_equity,
-        shock_diag,
+    summary = report(
+        "V74 LONG-ONLY (SHORT REMOVED)",
+        long_trades,
+        long_equity,
+        long_diag,
     )
+
+    print("\nLONG-ONLY DIAGNOSTICS")
+    print(f"SHORT candidates removed : {long_diag.get('long_only_removed_short_candidates', 0)}")
+    print(f"LONG trades               : {sum(1 for t in long_trades if t.get('Side') == 'LONG')}")
+    print(f"SHORT trades              : {sum(1 for t in long_trades if t.get('Side') == 'SHORT')}")
+
+    # Keep the forensic analysis on the actual Long-only result so we can
+    # compare its loss-streak structure with the original V74 baseline.
+    enhanced_loss_streak_forensics(long_trades)
 
     print("\n" + "=" * 68)
-    print("V74 BASELINE vs SHOCK SHIELD")
+    print("LONG-ONLY TEST COMPLETE")
     print("=" * 68)
-    if baseline_summary and shock_summary:
-        for metric in [
-            "trades", "wr", "pnl", "net_r", "max_dd",
-            "max_dd_pct", "max_loss_streak",
-        ]:
-            b = baseline_summary[metric]
-            v = shock_summary[metric]
-            print(f"{metric:20s} | V74={b:12.2f} | SHIELD={v:12.2f} | Delta={v-b:12.2f}")
-
-    print("\nSHOCK SHIELD DIAGNOSTICS")
-    print(f"Required score      : {SHOCK_REQUIRE_SCORE}")
-    print(f"1-bar threshold     : {SHOCK_1BAR_ATR_MULT:.2f} ATR")
-    print(f"2-bar threshold     : {SHOCK_2BAR_ATR_MULT:.2f} ATR")
-    print(f"Impulse range       : {SHOCK_RANGE_ATR_MULT:.2f} ATR")
-    print(f"Body fraction       : {SHOCK_BODY_FRACTION:.2f}")
-    print(f"Blocked candidates  : {shock_diag.get('shock_blocked_candidates', 0)}")
-    print(f"  LONG              : {shock_diag.get('shock_blocked_long_candidates', 0)}")
-    print(f"  SHORT             : {shock_diag.get('shock_blocked_short_candidates', 0)}")
-    print(f"Block events        : {shock_diag.get('shock_block_events', 0)}")
-
-    if shock_diag.get("shock_block_log"):
-        print("\nSHOCK BLOCKS — FIRST 100")
-        for ev in shock_diag["shock_block_log"][:100]:
-            print(
-                f"{ev['Timestamp']} | {ev['Symbol']:7s} | {ev['Side']:5s} | "
-                f"score={ev['Score']} | {ev['Reason']} | "
-                f"R1={ev['R1']:.4f} R2={ev['R2']:.4f} "
-                f"ATR%={ev['ATR_Pct']:.4f} RangeATR={ev['Range_ATR']:.2f} "
-                f"BTC_R2={ev['BTC_R2']:.4f}"
-            )
-
-    print("IMPORTANT: V74 signal/filter/ranking/ATR/SL/trailing/timeout logic is unchanged.")
-    print("SHOCK SHIELD only blocks NEW entries when a causal adverse acceleration is detected.")
-
-    enhanced_loss_streak_forensics(baseline_trades)
-
-    print("\nHUNTER-V74 LOSS-STREAK FORENSICS COMPLETE.")
+    print("IMPORTANT: This test removes SHORT entries only.")
+    print("All LONG V74 signal, ranking, ATR/SL, trailing, timeout and PnL mechanics remain unchanged.")
