@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V94 - TIME-BASED COOLDOWN CIRCUIT BREAKER ENGINE
+# HUNTER-V95 - INSTITUTIONAL INVERSE-VOLATILITY RISK PARITY ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -68,13 +68,13 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-OUTPUT_DIR = "hunter_v94_output"
+OUTPUT_DIR = "hunter_v95_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V94 - TIME-BASED COOLDOWN CIRCUIT BREAKER ENGINE")
+print("HUNTER-V95 - INSTITUTIONAL INVERSE-VOLATILITY RISK PARITY ENGINE")
 print("=" * 68)
 
 
@@ -180,15 +180,9 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     equity_curve = []
-    
-    cooldown_counter = 0  # شمارشگر کندل‌های استراحت ربات پس از زنجیره باخت
 
     for ts in all_timestamps:
         symbols_to_close = []
-
-        # مدیریت کاهش تایمر خنک‌کننده در هر کندل جدید
-        if cooldown_counter > 0:
-            cooldown_counter -= 1
 
         for symbol, pos in list(active_positions.items()):
             df = processed_data[symbol]
@@ -263,21 +257,6 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # بررسی تعداد باخت‌های متوالی اخیر جهت فعال‌سازی تایمر خنک‌کننده موقت (به جای قفل دائم)
-        current_consecutive_losses = 0
-        if len(all_trades) > 0:
-            for t in reversed(all_trades):
-                if t["Outcome"] == "LOSS":
-                    current_consecutive_losses += 1
-                else:
-                    break
-
-        if current_consecutive_losses >= 3 and cooldown_counter == 0:
-            cooldown_counter = 8  # استراحت به مدت ۸ کندل (۳۲ ساعت) برای عبور از نوسان مخرب
-
-        if cooldown_counter > 0:
-            continue  # در حال استراحت، بدون باز کردن پوزیشن جدید
-
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
             btc_c = processed_data["BTC"].loc[ts]
@@ -316,18 +295,19 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
-            if c4h["ATR_Pct"] > 0.075 or c4h["ATR_Pct"] < 0.006:
+            # فیلتر حرفه‌ای رژیم نوسانی تمیز بدون محدودیت‌های مصنوعی
+            if c4h["ATR_Pct"] > 0.08 or c4h["ATR_Pct"] < 0.004:
                 continue
 
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"])
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
                 side = "LONG"
             else:
                 regime_ok = (c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"])
                 pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
                 side = "SHORT"
 
             if not valid_signal:
@@ -338,8 +318,15 @@ def run_backtest(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.012 <= sl_dist_pct <= 0.042):
+            if not (0.012 <= sl_dist_pct <= 0.045):
                 continue
+
+            # سیستم حرفه‌ای Risk Parity: تعیین سایز مارجین معکوس با میزان نوسان (ATR)
+            # ارزهای پرنوسان‌تر مارجین کمتری می‌گیرند تا ریسک پورتفو متعادل بماند
+            target_volatility_benchmark = 0.03  # 3% standard ATR baseline
+            volatility_scalar = target_volatility_benchmark / max(c4h["ATR_Pct"], 0.01)
+            volatility_scalar = np.clip(volatility_scalar, 0.5, 1.8) # محدود کردن ضریب بین 0.5 تا 1.8 برابر
+            dynamic_margin = BASE_TRADE_MARGIN * volatility_scalar
 
             candidates.append({
                 "symbol": symbol,
@@ -348,7 +335,7 @@ def run_backtest(processed_data):
                 "initial_sl": float(initial_sl),
                 "initial_risk": float(initial_risk),
                 "entry_index": int(i),
-                "margin": float(BASE_TRADE_MARGIN),
+                "margin": float(dynamic_margin),
             })
 
         slots = MAX_POSITIONS - len(active_positions)
@@ -468,7 +455,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V94 REPORT", trades_df, equity_df)
+    report("HUNTER-V95 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
