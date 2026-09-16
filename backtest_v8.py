@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V74-LSP - OPTIMIZED VERSION
+# HUNTER-V74-LSP - ULTRA OPTIMIZED LOSS-STREAK VERSION
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -54,7 +54,8 @@ SYMBOLS = {
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
-MAX_POSITIONS = 5
+# تغییرات حیاتی برای کنترل Loss Streak بدون افت شدید سود
+MAX_POSITIONS = 3            # کاهش پوزیشن‌های هم‌زمان برای افت ریسک سبد
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
@@ -79,16 +80,16 @@ GLOBAL_STREAK_PENALTY = 0.35
 OUTPUT_DIR = "hunter_v74_lsp_output"
 
 # ============================================================
-# LSP3 — OPTIMIZED LOSS-STREAK CIRCUIT BREAKER
+# LSP3 — ULTRA STRICT LOSS-STREAK CIRCUIT BREAKER
 # ============================================================
-LSP3_TRIGGER_STREAK = 2
-LSP3_COOLDOWN_CANDLES = 3   # تنظیم شده برای کنترل دقیق زنجیره ضرر بدون افت سود
+LSP3_TRIGGER_STREAK = 1      # فعال‌سازی به محض اولین ضرر جهت‌دار
+LSP3_COOLDOWN_CANDLES = 12   # استراحت طولانی‌تر برای پاکسازی روند نزولی کاذب
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74-LSP - OPTIMIZED LOSS-STREAK PROTECTION")
+print("HUNTER-V74-LSP - ULTRA LOSS-STREAK PROTECTION")
 print("=" * 68)
 
 
@@ -612,7 +613,7 @@ def run_backtest(
     firewall_loss_events = {"LONG": 0, "SHORT": 0}
     firewall_locked = {"LONG": False, "SHORT": False}
 
-    SINGLE_LOSS_CROWD_MIN_OPEN = 3
+    SINGLE_LOSS_CROWD_MIN_OPEN = 2
     diagnostics = Counter()
     equity_curve = []
 
@@ -885,7 +886,7 @@ def run_backtest(
                         firewall_locked[side] = False
                     elif "LOSS" in side_outcomes:
                         firewall_loss_events[side] += 1
-                        if firewall_loss_events[side] >= 2:
+                        if firewall_loss_events[side] >= 1:
                             firewall_locked[side] = True
 
                 if firewall_locked[side]:
@@ -969,13 +970,13 @@ def run_backtest(
         if gate_mode and candidates:
             btc = processed_data.get("BTC")
             if gate_mode == "A":
-                breadth_limit, ema50_limit, min_open = 0.10, -1.80, 3
+                breadth_limit, ema50_limit, min_open = 0.10, -1.80, 2
             elif gate_mode == "B":
-                breadth_limit, ema50_limit, min_open = 0.15, -1.80, 3
+                breadth_limit, ema50_limit, min_open = 0.15, -1.80, 2
             elif gate_mode == "C":
-                breadth_limit, ema50_limit, min_open = 0.20, -1.50, 3
+                breadth_limit, ema50_limit, min_open = 0.20, -1.50, 2
             else:
-                breadth_limit, ema50_limit, min_open = 0.15, -1.80, 3
+                breadth_limit, ema50_limit, min_open = 0.15, -1.80, 2
 
             kept = []
             for cand in candidates:
@@ -1303,11 +1304,10 @@ def report(
 
 
 # ============================================================
-# MAIN EXECUTION (OPTIMIZED FOR 34K PNL & LOW LOSS STREAK)
+# MAIN EXECUTION
 # ============================================================
 
 if __name__ == "__main__":
-    # اجرای بک‌تست بهینه‌شده با فایروال فعال و مدار فرمان جهت‌دار
     trades_df, equity_df, diagnostics = run_backtest(
         processed_data,
         use_lsp=True,
@@ -1317,8 +1317,7 @@ if __name__ == "__main__":
         use_single_loss_crowd=True
     )
 
-    # گزارش عملکرد نهایی
-    perf = report("HUNTER-V74 OPTIMIZED PERFORMANCE REPORT", trades_df, equity_df)
+    perf = report("HUNTER-V74 ULTRA OPTIMIZED REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
