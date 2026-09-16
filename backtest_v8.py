@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V79 - HARD CIRCUIT BREAKER QUANTITATIVE VERSION
+# HUNTER-V80 - COOLDOWN CIRCUIT BREAKER QUANTITATIVE VERSION
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -69,16 +69,18 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-# حد آستانه سخت برای قفل کردن ربات پس از ضررهای متوالی
+# تعداد ضرر پشت سر هم برای اعمال تنفس
 MAX_ALLOWED_CONSECUTIVE_LOSSES = 2
+# تعداد کندل تنفس (مثلاً ۶ کندل ۴ ساعته = ۲۴ ساعت استراحت ربات)
+COOLDOWN_CANDLES = 6
 
-OUTPUT_DIR = "hunter_v79_quant_output"
+OUTPUT_DIR = "hunter_v80_quant_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V79 - HARD CIRCUIT BREAKER QUANTITATIVE VERSION")
+print("HUNTER-V80 - COOLDOWN CIRCUIT BREAKER QUANTITATIVE VERSION")
 print("=" * 68)
 
 
@@ -188,10 +190,14 @@ def run_backtest(processed_data):
     all_trades = []
     equity_curve = []
 
-    # متغیرهای کلیدی برای رصد و کشتن زنجیره باخت
     consecutive_losses = 0
+    cooldown_counter = 0  # شمارشگر کندل‌های تنفس
 
     for ts in all_timestamps:
+        # مدیریت تنفس (اگر ربات در حالت استراحت باشد، از شمارشگر کم می‌شود)
+        if cooldown_counter > 0:
+            cooldown_counter -= 1
+
         symbols_to_close = []
 
         for symbol, pos in list(active_positions.items()):
@@ -237,11 +243,13 @@ def run_backtest(processed_data):
 
             outcome = "WIN" if r_real > 0 else "LOSS"
 
-            # بروزرسانی سیستم قطع اضطراری زنجیره باخت
             if outcome == "LOSS":
                 consecutive_losses += 1
+                if consecutive_losses >= MAX_ALLOWED_CONSECUTIVE_LOSSES:
+                    cooldown_counter = COOLDOWN_CANDLES  # فعال کردن تنفس موقت
             else:
                 consecutive_losses = 0
+                cooldown_counter = 0
 
             position_notional = margin * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
@@ -264,8 +272,8 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # اگر تعداد ضررهای پشت سر هم به حد نصاب رسید، اجازه ورودِ جدید داده نمی‌شود
-        if consecutive_losses >= MAX_ALLOWED_CONSECUTIVE_LOSSES:
+        # اگر ربات در دوره تنفس باشد، ورود جدید ممنوع است اما بعد از اتمام کندل‌ها دوباره باز می‌شود
+        if cooldown_counter > 0:
             continue
 
         market_bull = True
@@ -458,7 +466,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V79 HARD CB REPORT", trades_df, equity_df)
+    report("HUNTER-V80 COOLDOWN REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
