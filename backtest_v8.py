@@ -660,7 +660,7 @@ def run_backtest(
     use_lsp3=False,
     gate_mode=None,
     use_firewall=False,
-    use_cluster_research=False,
+    use_single_loss_crowd=False,
 ):
     all_timestamps = get_all_timestamps(
         processed_data
@@ -688,6 +688,13 @@ def run_backtest(
     # Existing positions are never touched. No signal/SL/trailing/sizing change.
     firewall_loss_events = {"LONG": 0, "SHORT": 0}
     firewall_locked = {"LONG": False, "SHORT": False}
+
+    # FW4: very narrow preventive portfolio-crowding control.
+    # It activates only AFTER one completed loss event in a direction,
+    # when >=3 positions of that same direction are already open.
+    # It blocks only NEW entries in that direction.
+    # Default is False, so the FW223 reference path is unchanged.
+    SINGLE_LOSS_CROWD_MIN_OPEN = 3
 
     diagnostics = Counter()
 
@@ -1181,6 +1188,32 @@ def run_backtest(
                 continue
 
         # --------------------------------------------------------
+        # FW4 — SINGLE-LOSS CROWD CONTROL (NEW ENTRIES ONLY)
+        # --------------------------------------------------------
+        # Narrow preventive layer:
+        #   1) at least one completed loss event in this direction
+        #   2) at least 3 positions already open in this direction
+        #   3) only NEW entries are blocked
+        # Existing positions and all V74 execution logic remain untouched.
+        if use_single_loss_crowd and candidates:
+            kept = []
+            for c in candidates:
+                side = c["side"]
+                open_same_side = sum(
+                    p["side"] == side for p in active_positions.values()
+                )
+                crowd_block = (
+                    firewall_loss_events.get(side, 0) >= 1
+                    and open_same_side >= SINGLE_LOSS_CROWD_MIN_OPEN
+                )
+                if crowd_block:
+                    diagnostics["single_loss_crowd_blocked"] += 1
+                    diagnostics[f"single_loss_crowd_blocked_{side.lower()}"] += 1
+                else:
+                    kept.append(c)
+            candidates = kept
+
+        # --------------------------------------------------------
         # LOSS FIREWALL — NEW ENTRIES ONLY
         # --------------------------------------------------------
         if use_firewall and candidates:
@@ -1192,68 +1225,6 @@ def run_backtest(
                 else:
                     kept.append(c)
             candidates = kept
-
-        # --------------------------------------------------------
-        # V3 RESEARCH — CAUSAL PORTFOLIO CLUSTER SATURATION GATE
-        # --------------------------------------------------------
-        # This is OFF for the exact V74 / Run-223 firewall.
-        # It never changes signal construction, ranking, SL, trailing,
-        # timeout, sizing, or existing positions. It only removes a
-        # small subset of NEW, directionally crowded + overextended
-        # candidates after that direction has already suffered one
-        # completed loss event.
-        if use_cluster_research and candidates:
-            for _side in ("LONG", "SHORT"):
-                if firewall_locked.get(_side, False):
-                    continue
-                if firewall_loss_events.get(_side, 0) < 1:
-                    continue
-
-                _open_same = sum(
-                    1 for p in active_positions.values()
-                    if p.get("side") == _side
-                )
-                _side_candidates = [
-                    c for c in candidates if c["side"] == _side
-                ]
-
-                # Require genuine portfolio crowding before touching anything.
-                if _open_same < 2 or len(_side_candidates) < 3:
-                    continue
-
-                # Only operate in an extreme breadth regime, where the
-                # forensic clusters showed the greatest directional crowding.
-                if _side == "SHORT" and market_breadth_ratio > 0.15:
-                    continue
-                if _side == "LONG" and market_breadth_ratio < 0.85:
-                    continue
-
-                _extended = []
-                for _c in _side_candidates:
-                    _d = processed_data[_c["symbol"]]
-                    _ci = _d.index.get_loc(ts)
-                    _cc = _d.iloc[_ci]
-                    _atr = float(_cc["ATR"])
-                    if not np.isfinite(_atr) or _atr <= 0:
-                        continue
-                    _dist50 = float((_cc["Close"] - _cc["EMA50"]) / _atr)
-                    if (_side == "SHORT" and _dist50 <= -1.50) or (_side == "LONG" and _dist50 >= 1.50):
-                        _extended.append(_c)
-
-                # Keep the best-ranked extended candidate; all other
-                # candidates remain untouched. This is intentionally narrow.
-                if len(_extended) >= 2:
-                    _keep = _extended[0]
-                    _drop_symbols = {id(c) for c in _extended[1:]}
-                    _new = []
-                    for _c in candidates:
-                        if id(_c) in _drop_symbols:
-                            diagnostics["cluster_research_blocked"] += 1
-                            diagnostics[f"cluster_research_blocked_{_side.lower()}"] += 1
-                        else:
-                            _new.append(_c)
-                    candidates = _new
-                    diagnostics["cluster_research_events"] += 1
 
         slots = (
             MAX_POSITIONS
@@ -2908,74 +2879,55 @@ def run_forensics(trades):
         print(f"{r['Feature']} | 13L={r['13_Loss_Avg']:.6f} | Loss={r['All_Loss_Avg']:.6f} | Win={r['All_Win_Avg']:.6f}")
 
 
-def _loss_sequences_report(trades, label):
-    if trades.empty:
-        print(f"\n{label}: no completed trades.")
-        return
-    t = trades.copy()
-    t["Timestamp"] = pd.to_datetime(t["Timestamp"])
-    t = t.sort_values(["Timestamp", "ExitOrder"], kind="stable").reset_index(drop=True)
-    sequences=[]; cur=[]
-    for _, r in t.iterrows():
-        if r["Outcome"] == "LOSS":
-            cur.append(r)
-        elif cur:
-            sequences.append(cur); cur=[]
-    if cur: sequences.append(cur)
-    sequences.sort(key=lambda x: (-len(x), x[0]["Timestamp"]))
-    print("\n" + "="*72)
-    print(f"ALL LOSS STREAKS — {label}")
-    print("="*72)
-    print(f"Total sequences: {len(sequences)} | Maximum: {len(sequences[0]) if sequences else 0}")
-    rows=[]
-    for n, seq in enumerate(sequences,1):
-        pnl=sum(float(x["Dollar_PnL"]) for x in seq)
-        syms=",".join(str(x["Symbol"]) for x in seq)
-        sides=",".join(str(x["Side"]) for x in seq)
-        rows.append({"Sequence_ID":n,"Length":len(seq),"Start":seq[0]["Timestamp"],"End":seq[-1]["Timestamp"],"PnL":pnl,"Symbols":syms,"Sides":sides})
-        print(f"#{n:03d} | LEN={len(seq):2d} | {seq[0]['Timestamp']} -> {seq[-1]['Timestamp']} | PnL=${pnl:,.2f} | {syms} | {sides}")
-    pd.DataFrame(rows).to_csv(f"{OUTPUT_DIR}/{label.lower().replace(' ','_')}_all_loss_streaks.csv", index=False)
-
-
-def _symbol_report(trades, label):
-    if trades.empty: return
-    t=trades.copy()
-    rows=[]
-    for sym,d in t.groupby("Symbol", sort=True):
-        n=len(d); w=int((d["Outcome"]=="WIN").sum()); l=int((d["Outcome"]=="LOSS").sum())
-        rows.append({"Symbol":sym,"Trades":n,"Wins":w,"Losses":l,"WR":100*w/n if n else 0.0,"PnL":float(d["Dollar_PnL"].sum())})
-    s=pd.DataFrame(rows).sort_values("PnL", ascending=True, kind="stable").reset_index(drop=True)
-    print("\n"+"="*72); print(f"SYMBOL PERFORMANCE — {label}"); print("="*72)
-    for _,r in s.iterrows():
-        print(f"{r['Symbol']:7s} | Trades={int(r['Trades']):3d} | W={int(r['Wins']):3d} | L={int(r['Losses']):3d} | WR={r['WR']:6.2f}% | PnL=${r['PnL']:10,.2f}")
-    s.to_csv(f"{OUTPUT_DIR}/{label.lower().replace(' ','_')}_symbol_table.csv", index=False)
-
-
-def _summary(df):
-    n=len(df); wr=100*df["Outcome"].eq("WIN").mean() if n else 0.0; pnl=float(df["Dollar_PnL"].sum()) if n else 0.0
-    cur=mx=0
-    for x in df["Outcome"]:
-        if x=="LOSS": cur+=1; mx=max(mx,cur)
-        else: cur=0
-    return n,wr,pnl,mx
-
-
 if __name__ == "__main__":
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    base, _, _ = run_backtest(processed_data, use_lsp=False, use_lsp3=False, gate_mode=None, use_firewall=False)
-    fw, _, fd = run_backtest(processed_data, use_lsp=False, use_lsp3=False, gate_mode=None, use_firewall=True)
-    fw3, _, fd3 = run_backtest(processed_data, use_lsp=False, use_lsp3=False, gate_mode=None, use_firewall=True, use_cluster_research=True)
+    base, _, _ = run_backtest(
+        processed_data,
+        use_lsp=False, use_lsp3=False, gate_mode=None,
+        use_firewall=False, use_single_loss_crowd=False
+    )
+    fw223, _, fd223 = run_backtest(
+        processed_data,
+        use_lsp=False, use_lsp3=False, gate_mode=None,
+        use_firewall=True, use_single_loss_crowd=False
+    )
+    fw4, _, fd4 = run_backtest(
+        processed_data,
+        use_lsp=False, use_lsp3=False, gate_mode=None,
+        use_firewall=True, use_single_loss_crowd=True
+    )
 
-    a=_summary(base); b=_summary(fw); c=_summary(fw3)
-    print("\n"+"="*72)
-    print("HUNTER-V74 — FIREWALL V3 RESEARCH")
-    print("="*72)
-    print(f"V74   | Trades={a[0]:3d} | WR={a[1]:6.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]:2d}")
-    print(f"FW223 | Trades={b[0]:3d} | WR={b[1]:6.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]:2d} | Blocked={int(fd.get('firewall_blocked',0))}")
-    print(f"FW3   | Trades={c[0]:3d} | WR={c[1]:6.2f}% | PnL=${c[2]:,.2f} | MaxLS={c[3]:2d} | FWBlocked={int(fd3.get('firewall_blocked',0))} | ClusterBlocked={int(fd3.get('cluster_research_blocked',0))}")
-    print("\nFW3 DELTA vs FW223")
-    print(f"Trades: {c[0]-b[0]:+d} | WR: {c[1]-b[1]:+.2f} pp | PnL: ${c[2]-b[2]:+,.2f} | MaxLS: {c[3]-b[3]:+d}")
-    _loss_sequences_report(fw, "FW223")
-    _symbol_report(fw, "FW223")
-    _loss_sequences_report(fw3, "FW3")
-    _symbol_report(fw3, "FW3")
+    def stats(df):
+        n = len(df)
+        wr = (df["Outcome"].eq("WIN").mean() * 100) if n else 0
+        pnl = float(df["Dollar_PnL"].sum()) if n else 0
+        cur = mx = 0
+        for x in df["Outcome"]:
+            if x == "LOSS":
+                cur += 1
+                mx = max(mx, cur)
+            else:
+                cur = 0
+        return n, wr, pnl, mx
+
+    a = stats(base)
+    b = stats(fw223)
+    c = stats(fw4)
+
+    print("=" * 72)
+    print("HUNTER-V74 — FIREWALL V4 SINGLE-LOSS CROWD TEST")
+    print("=" * 72)
+    print(f"V74   | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
+    print(f"FW223 | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]} | Blocked={int(fd223.get('firewall_blocked',0))}")
+    print(f"FW4   | Trades={c[0]} | WR={c[1]:.2f}% | PnL=${c[2]:,.2f} | MaxLS={c[3]} | FWBlocked={int(fd4.get('firewall_blocked',0))} | CrowdBlocked={int(fd4.get('single_loss_crowd_blocked',0))}")
+
+    print("\nFW4 DELTA vs FW223")
+    print(f"Trades: {c[0]-b[0]:+d}")
+    print(f"WR: {c[1]-b[1]:+.2f} pp")
+    print(f"PnL: ${c[2]-b[2]:+,.2f}")
+    print(f"MaxLS: {c[3]-b[3]:+d}")
+    print(f"Crowd blocked LONG : {int(fd4.get('single_loss_crowd_blocked_long',0))}")
+    print(f"Crowd blocked SHORT: {int(fd4.get('single_loss_crowd_blocked_short',0))}")
+
+    print("\nREFERENCE CHECK")
+    print("Expected FW223 reference: 491 trades | 63.34% WR | $34,733.29 PnL | MaxLS=8 | Blocked=113")
+    print("FW223 must remain the acceptance baseline; FW4 is rejected if it does not improve MaxLS without materially sacrificing PnL/trades.")
