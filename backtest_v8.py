@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V91 - VOLATILITY-REGIME ADAPTIVE ENGINE (MAX LOSS STREAK < 4)
+# HUNTER-V92 - INSTITUTIONAL KELLEY-ADAPTIVE & STREAK SUPPRESSOR
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -68,13 +68,13 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-OUTPUT_DIR = "hunter_v91_output"
+OUTPUT_DIR = "hunter_v92_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V91 - VOLATILITY-REGIME ADAPTIVE ENGINE")
+print("HUNTER-V92 - INSTITUTIONAL KELLEY-ADAPTIVE & STREAK SUPPRESSOR")
 print("=" * 68)
 
 
@@ -257,7 +257,7 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # تشخیص تعداد باخت‌های متوالی اخیر جهت تنظیم پویای گارد ریسک
+        # شمارش باخت‌های متوالی برای اعمال سایز پویای مارجین (جلوگیری از انباشت ریسک در استریک)
         current_consecutive_losses = 0
         if len(all_trades) > 0:
             for t in reversed(all_trades):
@@ -304,37 +304,35 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
-            # فیلتر رژیم نوسانی بازار: جلوگیری از ورود در بازارهای بیش از حد پرنوسان یا کاملاً فلت
-            if c4h["ATR_Pct"] > 0.08 or c4h["ATR_Pct"] < 0.005:
+            if c4h["ATR_Pct"] > 0.075 or c4h["ATR_Pct"] < 0.006:
                 continue
 
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"])
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
                 side = "LONG"
             else:
                 regime_ok = (c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"])
                 pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
                 side = "SHORT"
 
             if not valid_signal:
                 continue
 
             entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
-            
-            # تطبیق پویای ضریب استاپ‌لاس بر اساس زنجیره باخت قبلی برای محافظت در برابر استریک‌های بالا
-            dynamic_atr_mult = INITIAL_ATR_MULTIPLIER
-            if current_consecutive_losses >= 2:
-                dynamic_atr_mult = INITIAL_ATR_MULTIPLIER * 1.25
-
-            initial_sl = entry_price - dynamic_atr_mult * c4h["ATR"] if side == "LONG" else entry_price + dynamic_atr_mult * c4h["ATR"]
+            initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"] if side == "LONG" else entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"]
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.012 <= sl_dist_pct <= 0.045):
+            if not (0.012 <= sl_dist_pct <= 0.042):
                 continue
+
+            # مکانیزم مدرن مدیریت سرمایه پویا بر اساس زنجیره باخت
+            dynamic_margin = BASE_TRADE_MARGIN
+            if current_consecutive_losses >= 3:
+                dynamic_margin = BASE_TRADE_MARGIN * 0.5  # کاهش ریسک به نصف در زمان استریک بالا
 
             candidates.append({
                 "symbol": symbol,
@@ -343,7 +341,7 @@ def run_backtest(processed_data):
                 "initial_sl": float(initial_sl),
                 "initial_risk": float(initial_risk),
                 "entry_index": int(i),
-                "margin": float(BASE_TRADE_MARGIN),
+                "margin": float(dynamic_margin),
             })
 
         slots = MAX_POSITIONS - len(active_positions)
@@ -463,7 +461,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V91 REPORT", trades_df, equity_df)
+    report("HUNTER-V92 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
