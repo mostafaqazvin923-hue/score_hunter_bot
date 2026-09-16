@@ -16,7 +16,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V74-LSP
+# HUNTER-V74-DUAL-LOSS-REGIME-SHIELD
 #
 # Golden Core = EXACT V74 signal / execution logic
 # ONLY ADDITION = Loss-Streak Protection in candidate priority
@@ -92,6 +92,19 @@ SHOCK_RANGE_ATR_MULT = 1.75
 SHOCK_BODY_FRACTION = 0.55
 SHOCK_REQUIRE_SCORE = 2
 SHOCK_BTC_CONFIRM_ATR_MULT = 1.50
+
+# ============================================================
+# LOSS-STREAK REGIME SHIELD (NEW TEST)
+# ============================================================
+# Preventive, direction-aware protection. It activates only after
+# 2 same-direction loss events AND evidence that the market is
+# accelerating against that direction. It does NOT alter V74 signals,
+# ranking, SL, trailing, timeout, leverage, or sizing.
+LOSS_REGIME_TRIGGER = 2
+LOSS_REGIME_BTC_ADVERSE_ATR = 1.20
+LOSS_REGIME_SYMBOL_ADVERSE_ATR = 1.50
+LOSS_REGIME_BEAR_BREADTH = 0.35
+LOSS_REGIME_BULL_BREADTH = 0.65
 
 INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
@@ -769,6 +782,90 @@ def detect_shock_against_entry(processed_data, ts, candidate):
 
 
 # ============================================================
+# LOSS-STREAK REGIME SHIELD HELPER
+# ============================================================
+def detect_loss_regime_against_entry(processed_data, ts, candidate,
+                                     direction_loss_streak,
+                                     market_breadth_ratio):
+    """
+    Causal entry protection: only uses candles available at `ts`.
+    Returns (blocked, reason, details).
+
+    A candidate is blocked only when:
+      1) its direction has already suffered >= LOSS_REGIME_TRIGGER
+         consecutive loss EVENTS, and
+      2) there is fresh acceleration against that direction in BTC
+         or the candidate symbol, and
+      3) market breadth is simultaneously at the extreme boundary
+         that contradicts the proposed direction.
+
+    This is deliberately much narrower than a generic loss cooldown.
+    """
+    side = candidate["side"]
+    if direction_loss_streak.get(side, 0) < LOSS_REGIME_TRIGGER:
+        return False, "", {"streak": direction_loss_streak.get(side, 0)}
+
+    symbol = candidate["symbol"]
+    df = processed_data.get(symbol)
+    if df is None or ts not in df.index:
+        return False, "", {"streak": direction_loss_streak.get(side, 0)}
+
+    idx = df.index.get_loc(ts)
+    if idx < 2:
+        return False, "", {"streak": direction_loss_streak.get(side, 0)}
+
+    row = df.iloc[idx]
+    prev2 = df.iloc[idx-2]
+    atr = float(row.get("ATR", np.nan))
+    if not np.isfinite(atr) or atr <= 0:
+        return False, "", {"streak": direction_loss_streak.get(side, 0)}
+
+    sym_r2_abs_atr = abs(float(row["Close"]) - float(prev2["Close"])) / atr
+    sym_r2 = (float(row["Close"]) / float(prev2["Close"]) - 1.0) if float(prev2["Close"]) else 0.0
+
+    btc_r2_atr = 0.0
+    btc_r2 = 0.0
+    btc = processed_data.get("BTC")
+    if btc is not None and ts in btc.index:
+        bi = btc.index.get_loc(ts)
+        if bi >= 2:
+            br = btc.iloc[bi]
+            bp = btc.iloc[bi-2]
+            b_atr = float(br.get("ATR", np.nan))
+            if np.isfinite(b_atr) and b_atr > 0 and float(bp["Close"]) != 0:
+                btc_r2 = float(br["Close"]) / float(bp["Close"]) - 1.0
+                btc_r2_atr = abs(float(br["Close"]) - float(bp["Close"])) / b_atr
+
+    if side == "LONG":
+        breadth_contradiction = market_breadth_ratio <= LOSS_REGIME_BEAR_BREADTH
+        btc_adverse = btc_r2 <= 0 and btc_r2_atr >= LOSS_REGIME_BTC_ADVERSE_ATR
+        symbol_adverse = sym_r2 <= 0 and sym_r2_abs_atr >= LOSS_REGIME_SYMBOL_ADVERSE_ATR
+    else:
+        breadth_contradiction = market_breadth_ratio >= LOSS_REGIME_BULL_BREADTH
+        btc_adverse = btc_r2 >= 0 and btc_r2_atr >= LOSS_REGIME_BTC_ADVERSE_ATR
+        symbol_adverse = sym_r2 >= 0 and sym_r2_abs_atr >= LOSS_REGIME_SYMBOL_ADVERSE_ATR
+
+    # Require the broader regime evidence plus either BTC or symbol acceleration.
+    blocked = breadth_contradiction and (btc_adverse or symbol_adverse)
+    reasons = []
+    if breadth_contradiction:
+        reasons.append("breadth_contradiction")
+    if btc_adverse:
+        reasons.append("btc_adverse_acceleration")
+    if symbol_adverse:
+        reasons.append("symbol_adverse_acceleration")
+
+    return blocked, "+".join(reasons), {
+        "streak": direction_loss_streak.get(side, 0),
+        "breadth": market_breadth_ratio,
+        "symbol_r2": sym_r2,
+        "symbol_r2_atr": sym_r2_abs_atr,
+        "btc_r2": btc_r2,
+        "btc_r2_atr": btc_r2_atr,
+    }
+
+
+# ============================================================
 # BACKTEST
 # ============================================================
 
@@ -778,6 +875,7 @@ def run_backtest(
     use_lsp3=False,
     use_shock_shield=False,
     long_only=False,
+    use_loss_regime_shield=False,
 ):
     all_timestamps = get_all_timestamps(
         processed_data
@@ -797,6 +895,9 @@ def run_backtest(
     # so simultaneous exits cannot artificially accelerate the breaker.
     direction_loss_streak = {"LONG": 0, "SHORT": 0}
     direction_cooldown = {"LONG": 0, "SHORT": 0}
+    # Separate event-based streak used by the new preventive shield.
+    loss_regime_streak = {"LONG": 0, "SHORT": 0}
+    loss_regime_block_log = []
     lsp3_trigger_log = []
     shock_block_log = []
 
@@ -1048,6 +1149,22 @@ def run_backtest(
             ]
 
         # --------------------------------------------------------
+        # NEW SHIELD STATE — DIRECTIONAL LOSS EVENTS
+        # --------------------------------------------------------
+        # Same timestamp = one event. Any WIN in a direction resets it.
+        for side in ("LONG", "SHORT"):
+            side_outcomes = [
+                t["Outcome"] for t in all_trades
+                if t["Timestamp"] == ts and t["Side"] == side
+            ]
+            if not side_outcomes:
+                continue
+            if "WIN" in side_outcomes:
+                loss_regime_streak[side] = 0
+            elif "LOSS" in side_outcomes:
+                loss_regime_streak[side] += 1
+
+        # --------------------------------------------------------
         # LSP3 — EVENT-BASED DIRECTIONAL CIRCUIT BREAKER
         # --------------------------------------------------------
         # All exits at the same 4h timestamp are one event per direction.
@@ -1258,6 +1375,40 @@ def run_backtest(
                 diagnostics["shock_active_events"] += 1
             candidates = kept_candidates
 
+        # --------------------------------------------------------
+        # LOSS-STREAK REGIME SHIELD — NEW ENTRIES ONLY
+        # --------------------------------------------------------
+        # This is intentionally preventive and narrow: after repeated
+        # losses in one direction, suppress only candidates when current
+        # breadth + acceleration show that direction is being contradicted.
+        if use_loss_regime_shield and candidates:
+            kept_candidates = []
+            for c in candidates:
+                blocked, reason, details = detect_loss_regime_against_entry(
+                    processed_data, ts, c, loss_regime_streak, market_breadth_ratio
+                )
+                if blocked:
+                    diagnostics["loss_regime_blocked_candidates"] += 1
+                    diagnostics[f"loss_regime_blocked_{c['side'].lower()}_candidates"] += 1
+                    loss_regime_block_log.append({
+                        "Timestamp": ts,
+                        "Symbol": c["symbol"],
+                        "Side": c["side"],
+                        "LossEventStreak": details.get("streak", 0),
+                        "Reason": reason,
+                        "Breadth": details.get("breadth"),
+                        "Symbol_R2": details.get("symbol_r2"),
+                        "Symbol_R2_ATR": details.get("symbol_r2_atr"),
+                        "BTC_R2": details.get("btc_r2"),
+                        "BTC_R2_ATR": details.get("btc_r2_atr"),
+                    })
+                else:
+                    kept_candidates.append(c)
+            if len(kept_candidates) != len(candidates):
+                diagnostics["loss_regime_active_events"] += 1
+                diagnostics["loss_regime_blocked_entry_events"] += 1
+            candidates = kept_candidates
+
         slots = (
             MAX_POSITIONS
             - len(active_positions)
@@ -1413,6 +1564,8 @@ def run_backtest(
         diagnostics["lsp3_trigger_log"] = lsp3_trigger_log
     if use_shock_shield:
         diagnostics["shock_block_log"] = shock_block_log
+    if use_loss_regime_shield:
+        diagnostics["loss_regime_block_log"] = loss_regime_block_log
 
     return (
         pd.DataFrame(all_trades),
@@ -2756,60 +2909,130 @@ def enhanced_loss_streak_forensics(trades_df):
 
 
 # ============================================================
-# MAIN — LONG-ONLY V74 TEST
+# MAIN — TWO-SIDED V74 + LOSS-REGIME SHIELD TEST
 # ============================================================
 
 if __name__ == "__main__":
-    print("\n" + "=" * 68)
-    print("HUNTER-V74 LONG-ONLY TEST")
-    print("=" * 68)
-    print("EXACT V74 CORE + SHORT DISABLED")
-    print("No V74 LONG signal / execution parameter was changed.")
-    print("All SHORT candidates are removed before ranking/entry.")
-    print("=" * 68)
+    print("\n" + "=" * 76)
+    print("HUNTER-V74 — TWO-SIDED LOSS-REGIME SHIELD TEST")
+    print("=" * 76)
+    print("BASELINE = EXACT V74 LONG + SHORT CORE")
+    print("TEST     = EXACT V74 CORE + NARROW LOSS-REGIME SHIELD")
+    print("The shield only blocks NEW entries after repeated directional losses")
+    print("when fresh acceleration + breadth show that direction is being contradicted.")
+    print("No signal / ranking / ATR-SL / trailing / timeout / sizing parameter is changed.")
+    print("=" * 76)
 
-    long_trades, long_equity, long_diag = run_backtest(
+    baseline_trades, baseline_equity, baseline_diag = run_backtest(
         processed_data,
         use_lsp=False,
         use_lsp3=False,
         use_shock_shield=False,
-        long_only=True,
+        long_only=False,
+        use_loss_regime_shield=False,
     )
 
-    summary = report(
-        "V74 LONG-ONLY (SHORT REMOVED)",
-        long_trades,
-        long_equity,
-        long_diag,
+    shield_trades, shield_equity, shield_diag = run_backtest(
+        processed_data,
+        use_lsp=False,
+        use_lsp3=False,
+        use_shock_shield=False,
+        long_only=False,
+        use_loss_regime_shield=True,
     )
 
-    print("\nLONG-ONLY DIAGNOSTICS")
-    print(f"SHORT candidates removed : {long_diag.get('long_only_removed_short_candidates', 0)}")
-    print(f"LONG trades               : {int((long_trades['Side'] == 'LONG').sum())}")
-    print(f"SHORT trades              : {int((long_trades['Side'] == 'SHORT').sum())}")
+    baseline_summary = report(
+        "V74 BASELINE — TWO SIDED",
+        baseline_trades,
+        baseline_equity,
+        baseline_diag,
+    )
 
-    # Explicit per-symbol audit: total trades, wins, losses and win rate.
-    print("\nLONG-ONLY PER-SYMBOL DETAIL")
+    shield_summary = report(
+        "V74 + LOSS-REGIME SHIELD — TWO SIDED",
+        shield_trades,
+        shield_equity,
+        shield_diag,
+    )
+
+    print("\n" + "=" * 76)
+    print("DIRECT COMPARISON")
+    print("=" * 76)
+    print(f"{'Metric':28s} {'V74':>14s} {'SHIELD':>14s} {'Delta':>14s}")
+    print("-" * 74)
+    if baseline_summary and shield_summary:
+        comparison_rows = [
+            ("Trades", baseline_summary["trades"], shield_summary["trades"]),
+            ("Wins", baseline_summary["wins"], shield_summary["wins"]),
+            ("Losses", baseline_summary["losses"], shield_summary["losses"]),
+            ("Win Rate %", baseline_summary["wr"], shield_summary["wr"]),
+            ("Net PnL $", baseline_summary["pnl"], shield_summary["pnl"]),
+            ("Net R", baseline_summary["net_r"], shield_summary["net_r"]),
+            ("Max DD $", baseline_summary["max_dd"], shield_summary["max_dd"]),
+            ("Max DD %", baseline_summary["max_dd_pct"], shield_summary["max_dd_pct"]),
+            ("Max Loss Streak", baseline_summary["max_loss_streak"], shield_summary["max_loss_streak"]),
+        ]
+        for metric, b, v in comparison_rows:
+            d = v - b
+            if metric in ("Net PnL $", "Max DD $"):
+                print(f"{metric:28s} ${b:13,.2f} ${v:13,.2f} ${d:13,.2f}")
+            elif metric in ("Win Rate %", "Max DD %"):
+                print(f"{metric:28s} {b:13.2f} {v:13.2f} {d:13.2f}")
+            else:
+                print(f"{metric:28s} {b:14.2f} {v:14.2f} {d:14.2f}")
+
+    print("\nLOSS-REGIME SHIELD DIAGNOSTICS")
+    print(f"Blocked candidates : {shield_diag.get('loss_regime_blocked_candidates', 0)}")
+    print(f"Blocked LONG       : {shield_diag.get('loss_regime_blocked_long_candidates', 0)}")
+    print(f"Blocked SHORT      : {shield_diag.get('loss_regime_blocked_short_candidates', 0)}")
+    print(f"Active entry events: {shield_diag.get('loss_regime_blocked_entry_events', 0)}")
+
+    # Explicit per-symbol audit for the TEST result.
+    print("\nSHIELD PER-SYMBOL DETAIL")
     print("Symbol    | Trades | Wins | Losses | Win Rate | PnL")
     print("-" * 64)
     for symbol in SYMBOLS:
-        sdf = long_trades[long_trades['Symbol'] == symbol]
+        sdf = shield_trades[shield_trades["Symbol"] == symbol]
         if sdf.empty:
             print(f"{symbol:8s} |      0 |    0 |      0 |    0.00% | $       0.00")
             continue
         st = len(sdf)
-        sw = int((sdf['Outcome'] == 'WIN').sum())
+        sw = int((sdf["Outcome"] == "WIN").sum())
         sl = st - sw
         swr = sw / st * 100.0
-        sp = float(sdf['Dollar_PnL'].sum())
+        sp = float(sdf["Dollar_PnL"].sum())
         print(f"{symbol:8s} | {st:6d} | {sw:4d} | {sl:6d} | {swr:8.2f}% | ${sp:12,.2f}")
 
-    # Keep the forensic analysis on the actual Long-only result so we can
-    # compare its loss-streak structure with the original V74 baseline.
-    enhanced_loss_streak_forensics(long_trades)
+    # Forensics on both runs: this makes it obvious whether the shield
+    # actually changes the consecutive-loss structure instead of merely
+    # changing the final PnL.
+    print("\n" + "=" * 76)
+    print("BASELINE LOSS-STREAK FORENSICS")
+    print("=" * 76)
+    enhanced_loss_streak_forensics(baseline_trades)
 
-    print("\n" + "=" * 68)
-    print("LONG-ONLY TEST COMPLETE")
-    print("=" * 68)
-    print("IMPORTANT: This test removes SHORT entries only.")
-    print("All LONG V74 signal, ranking, ATR/SL, trailing, timeout and PnL mechanics remain unchanged.")
+    print("\n" + "=" * 76)
+    print("SHIELD LOSS-STREAK FORENSICS")
+    print("=" * 76)
+    enhanced_loss_streak_forensics(shield_trades)
+
+    # Save both trade/equity sets plus the shield block log.
+    save_csvs(
+        baseline_trades,
+        baseline_equity,
+        shield_trades,
+        shield_equity,
+    )
+    if shield_diag.get("loss_regime_block_log"):
+        pd.DataFrame(shield_diag["loss_regime_block_log"]).to_csv(
+            os.path.join(OUTPUT_DIR, "loss_regime_shield_blocks.csv"),
+            index=False,
+        )
+
+    print("\n" + "=" * 76)
+    print("TWO-SIDED LOSS-REGIME SHIELD TEST COMPLETE")
+    print("=" * 76)
+    print("Use the DIRECT COMPARISON + both forensics sections to judge whether")
+    print("the shield reduces consecutive losses without materially changing")
+    print("the original V74 trade count / win rate / PnL profile.")
+
