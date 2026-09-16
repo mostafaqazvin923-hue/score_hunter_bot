@@ -658,6 +658,7 @@ def run_backtest(
     processed_data,
     use_lsp=False,
     use_lsp3=False,
+    gate_mode=None,
 ):
     all_timestamps = get_all_timestamps(
         processed_data
@@ -1046,6 +1047,52 @@ def run_backtest(
         diagnostics[
             "valid_candidates"
         ] += len(candidates)
+
+        # --------------------------------------------------------
+        # CAUSAL LATE-SHORT / OVEREXTENSION TEST
+        # Only after the exact V74 candidate is valid.
+        # No signal/ranking/SL/trailing parameter is changed.
+        # --------------------------------------------------------
+        if gate_mode and candidates:
+            btc = processed_data.get("BTC")
+            btc_b2_atr = np.nan
+            if btc is not None and ts in btc.index:
+                bi = btc.index.get_loc(ts)
+                if bi >= 2:
+                    bc = btc.iloc[bi]
+                    b2 = float(bc["Close"] / btc.iloc[bi-2]["Close"] - 1.0)
+                    b_atr_pct = float(bc["ATR"] / bc["Close"])
+                    btc_b2_atr = b2 / b_atr_pct if b_atr_pct else np.nan
+
+            if gate_mode == "A":
+                breadth_limit, ema50_limit, min_open = 0.10, -1.80, 3
+            elif gate_mode == "B":
+                breadth_limit, ema50_limit, min_open = 0.15, -1.80, 3
+            elif gate_mode == "C":
+                breadth_limit, ema50_limit, min_open = 0.20, -1.50, 3
+            else:
+                breadth_limit, ema50_limit, min_open = 0.15, -1.80, 3
+
+            kept=[]
+            for cand in candidates:
+                block=False
+                if cand["side"] == "SHORT":
+                    d=processed_data[cand["symbol"]]
+                    ci=d.index.get_loc(ts)
+                    cc=d.iloc[ci]
+                    ema50_atr=float((cc["Close"]-cc["EMA50"])/cc["ATR"]) if cc["ATR"] else np.nan
+                    open_short=sum(v["side"]=="SHORT" for v in active_positions.values())
+                    # Evidence-driven: extreme bearish breadth + late/extended short + crowded existing shorts.
+                    if (market_breadth_ratio <= breadth_limit and
+                        ema50_atr <= ema50_limit and
+                        open_short >= min_open):
+                        block=True
+                if block:
+                    diagnostics["gate_blocked"] += 1
+                    diagnostics[f"gate_blocked_{gate_mode}"] += 1
+                else:
+                    kept.append(cand)
+            candidates=kept
 
         if not candidates:
             if use_lsp3:
@@ -2750,5 +2797,22 @@ def run_forensics(trades):
 
 
 if __name__ == "__main__":
-    trades, equity, diag = run_backtest(processed_data, use_lsp=False, use_lsp3=False)
-    run_forensics(trades)
+    results=[]
+    for mode in (None, "A", "B", "C"):
+        trades, equity, diag = run_backtest(
+            processed_data, use_lsp=False, use_lsp3=False, gate_mode=mode
+        )
+        t=trades.copy()
+        wins=int((t["Outcome"]=="WIN").sum())
+        wr=wins/len(t)*100 if len(t) else 0
+        pnl=float(t["Dollar_PnL"].sum()) if len(t) else 0
+        cur=mx=0
+        for x in t["Outcome"]:
+            if x=="LOSS": cur+=1; mx=max(mx,cur)
+            else: cur=0
+        name="V74" if mode is None else f"GATE-{mode}"
+        results.append((name,len(t),wr,pnl,mx,int(diag.get("gate_blocked",0))))
+
+    print("HUNTER-V74 — EVIDENCE TEST")
+    for r in results:
+        print(f"{r[0]:7s} | Trades={r[1]:3d} | WR={r[2]:.2f}% | PnL=${r[3]:,.2f} | MaxLS={r[4]:2d} | Blocked={r[5]}")
