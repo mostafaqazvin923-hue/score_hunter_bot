@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V82 - MAXIMUM PROFIT & BREAK-EVEN SHIELD VERSION
+# HUNTER-V83 - MAXIMUM PROFIT & CORRELATION SHIELD VERSION
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -69,13 +69,17 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-OUTPUT_DIR = "hunter_v82_output"
+# فیلتر حفاظتی برای متوقف کردن موقت زنجیره‌های باخت موازی
+MAX_CONSECUTIVE_LOSS_TRIGGER = 3
+COOLDOWN_CANDLES_AFTER_LOSS = 3
+
+OUTPUT_DIR = "hunter_v83_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V82 - MAXIMUM PROFIT & BREAK-EVEN SHIELD VERSION")
+print("HUNTER-V83 - MAXIMUM PROFIT & CORRELATION SHIELD VERSION")
 print("=" * 68)
 
 
@@ -156,6 +160,11 @@ def fetch_symbol_data(lbank_symbol):
     df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
     df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
 
+    # شاخص نوسان و حجم برای جلوگیری از ورود در بازارهای شلاقیِ فیک
+    rolling_std = df["Close"].rolling(20).std()
+    rolling_sma = df["Close"].rolling(20).mean()
+    df["Trend_Quality"] = np.abs(df["Close"] - rolling_sma) / (rolling_std + 1e-9)
+
     df.set_index("Date", inplace=True)
     return df
 
@@ -181,7 +190,13 @@ def run_backtest(processed_data):
     all_trades = []
     equity_curve = []
 
+    consecutive_loss_counter = 0
+    cooldown_timer = 0
+
     for ts in all_timestamps:
+        if cooldown_timer > 0:
+            cooldown_timer -= 1
+
         symbols_to_close = []
 
         for symbol, pos in list(active_positions.items()):
@@ -192,7 +207,6 @@ def run_backtest(processed_data):
             c4h = df.loc[ts]
 
             # سیستم محافظت و قفل سر‌به‌سر (Break-Even Shield)
-            # اگر قیمت به اندازه 1.5 برابر ریسک اولیه در سود رفت، استاپ لاس روی قیمت ورود قفل می‌شود تا جلوی باخت گرفته شود
             if pos["side"] == "LONG":
                 if not pos["be_triggered"] and c4h["High"] >= pos["entry_price"] + (pos["initial_risk"] * 1.5):
                     pos["stop_loss"] = max(pos["stop_loss"], pos["entry_price"])
@@ -236,6 +250,15 @@ def run_backtest(processed_data):
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
             outcome = "WIN" if r_real > 0 else "LOSS"
+
+            # رصد هوشمند زنجیره باخت برای اعمال تنفس بسیار کوتاه و ایمن
+            if outcome == "LOSS":
+                consecutive_loss_counter += 1
+                if consecutive_loss_counter >= MAX_CONSECUTIVE_LOSS_TRIGGER:
+                    cooldown_timer = COOLDOWN_CANDLES_AFTER_LOSS
+            else:
+                consecutive_loss_counter = 0
+
             position_notional = margin * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
@@ -256,6 +279,10 @@ def run_backtest(processed_data):
 
         for sym in symbols_to_close:
             del active_positions[sym]
+
+        # اگر در دوره تنفس کوتاه باشیم، از ورود جدید در این کندل جلوگیری می‌شود
+        if cooldown_timer > 0:
+            continue
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -294,6 +321,10 @@ def run_backtest(processed_data):
 
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
+
+            # فیلتر جراحی‌شده برای جلوگیری از ورود در روند فرسایشی
+            if c4h["Trend_Quality"] < 0.75:
+                continue
 
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"])
@@ -442,7 +473,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V82 MAXIMUM PROFIT REPORT", trades_df, equity_df)
+    report("HUNTER-V83 MAXIMUM PROFIT REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
