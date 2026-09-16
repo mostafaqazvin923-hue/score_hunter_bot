@@ -659,6 +659,7 @@ def run_backtest(
     use_lsp=False,
     use_lsp3=False,
     gate_mode=None,
+    use_firewall=False,
 ):
     all_timestamps = get_all_timestamps(
         processed_data
@@ -679,6 +680,13 @@ def run_backtest(
     direction_loss_streak = {"LONG": 0, "SHORT": 0}
     direction_cooldown = {"LONG": 0, "SHORT": 0}
     lsp3_trigger_log = []
+
+    # LOSS FIREWALL:
+    # After 2 consecutive loss EVENTS in one direction, stop NEW entries
+    # in that direction while any position in that direction remains open.
+    # Existing positions are never touched. No signal/SL/trailing/sizing change.
+    firewall_loss_events = {"LONG": 0, "SHORT": 0}
+    firewall_locked = {"LONG": False, "SHORT": False}
 
     diagnostics = Counter()
 
@@ -973,6 +981,34 @@ def run_backtest(
                         })
 
         # --------------------------------------------------------
+        # LOSS FIREWALL — UPDATE ONLY FROM COMPLETED EXIT EVENTS
+        # --------------------------------------------------------
+        if use_firewall:
+            for side in ("LONG", "SHORT"):
+                side_outcomes = [
+                    tr["Outcome"] for tr in all_trades
+                    if tr["Timestamp"] == ts and tr["Side"] == side
+                ]
+                if side_outcomes:
+                    # One timestamp = one loss event. A WIN resets the side.
+                    if "WIN" in side_outcomes:
+                        firewall_loss_events[side] = 0
+                        firewall_locked[side] = False
+                    elif "LOSS" in side_outcomes:
+                        firewall_loss_events[side] += 1
+                        if firewall_loss_events[side] >= 2:
+                            firewall_locked[side] = True
+
+                # Unlock only after the side has become flat.
+                if firewall_locked[side]:
+                    still_open = any(
+                        p["side"] == side for p in active_positions.values()
+                    )
+                    if not still_open:
+                        firewall_locked[side] = False
+                        firewall_loss_events[side] = 0
+
+        # --------------------------------------------------------
         # 2. EXACT V74 MARKET REGIME
         # --------------------------------------------------------
         market_bull = True
@@ -1142,6 +1178,19 @@ def run_backtest(
                         if direction_cooldown[_side] > 0:
                             direction_cooldown[_side] -= 1
                 continue
+
+        # --------------------------------------------------------
+        # LOSS FIREWALL — NEW ENTRIES ONLY
+        # --------------------------------------------------------
+        if use_firewall and candidates:
+            kept = []
+            for c in candidates:
+                if firewall_locked.get(c["side"], False):
+                    diagnostics["firewall_blocked"] += 1
+                    diagnostics[f"firewall_blocked_{c['side'].lower()}"] += 1
+                else:
+                    kept.append(c)
+            candidates = kept
 
         slots = (
             MAX_POSITIONS
@@ -2797,49 +2846,31 @@ def run_forensics(trades):
 
 
 if __name__ == "__main__":
-    results=[]
-    for mode in (None, "A", "B", "C"):
-        trades, equity, diag = run_backtest(
-            processed_data, use_lsp=False, use_lsp3=False, gate_mode=mode
-        )
-        t=trades.copy()
-        wins=int((t["Outcome"]=="WIN").sum())
-        wr=wins/len(t)*100 if len(t) else 0
-        pnl=float(t["Dollar_PnL"].sum()) if len(t) else 0
-        cur=mx=0
-        for x in t["Outcome"]:
-            if x=="LOSS": cur+=1; mx=max(mx,cur)
-            else: cur=0
-        name="V74" if mode is None else f"GATE-{mode}"
-        results.append((name,len(t),wr,pnl,mx,int(diag.get("gate_blocked",0))))
+    base, _, _ = run_backtest(
+        processed_data, use_lsp=False, use_lsp3=False, gate_mode=None, use_firewall=False
+    )
+    fw, _, fd = run_backtest(
+        processed_data, use_lsp=False, use_lsp3=False, gate_mode=None, use_firewall=True
+    )
 
-    print("HUNTER-V74 — EVIDENCE TEST")
-    for r in results:
-        print(f"{r[0]:7s} | Trades={r[1]:3d} | WR={r[2]:.2f}% | PnL=${r[3]:,.2f} | MaxLS={r[4]:2d} | Blocked={r[5]}")
+    def stats(df):
+        n = len(df)
+        wr = (df["Outcome"].eq("WIN").mean() * 100) if n else 0
+        pnl = float(df["Dollar_PnL"].sum()) if n else 0
+        cur = mx = 0
+        for x in df["Outcome"]:
+            if x == "LOSS":
+                cur += 1
+                mx = max(mx, cur)
+            else:
+                cur = 0
+        return n, wr, pnl, mx
 
+    a = stats(base)
+    b = stats(fw)
 
-# ============================================================
-# PORTFOLIO RISK GATE — NEW ENTRIES ONLY
-# Does NOT alter signals, ranking, exits, stops, trailing or sizing.
-# It only blocks NEW entries after a cluster of completed losses.
-# ============================================================
-PORTFOLIO_RISK_GATE = True
-PRG_MIN_LOSSES = 2
-PRG_COOLDOWN_CANDLES = 2
-PRG_MAX_NEW_POSITIONS = 1
-
-def portfolio_risk_gate_allow(side, ts, loss_events, open_positions,
-                              last_loss_ts_by_side, ts_to_idx):
-    """Causal portfolio-level entry throttle. Existing positions untouched."""
-    if not PORTFOLIO_RISK_GATE:
-        return True
-    recent = [x for x in loss_events if x[0] == side and x[1] <= ts]
-    if len(recent) < PRG_MIN_LOSSES:
-        return True
-    last_ts = recent[-1][1]
-    if last_ts not in ts_to_idx or ts not in ts_to_idx:
-        return True
-    if ts_to_idx[ts] - ts_to_idx[last_ts] > PRG_COOLDOWN_CANDLES:
-        return True
-    return sum(1 for p in open_positions if p.get("side") == side) < PRG_MAX_NEW_POSITIONS
-
+    print("=" * 68)
+    print("HUNTER-V74 — LOSS FIREWALL")
+    print("=" * 68)
+    print(f"V74 | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
+    print(f"FW  | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]} | Blocked={int(fd.get('firewall_blocked',0))}")
