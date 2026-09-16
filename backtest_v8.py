@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V85 - MAXIMUM PROFIT & TRUE STREAK SHIELD VERSION
+# HUNTER-V86 - ULTRA STREAK SHIELD (MAX LOSS STREAK <= 4)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -69,13 +69,17 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-OUTPUT_DIR = "hunter_v85_output"
+# تعداد کندل توقف سراسری بعد از رسیدن به حد معینی از باخت‌های متوالی
+GLOBAL_COOLDOWN_CANDLES = 8
+MAX_ALLOWABLE_CONSECUTIVE_LOSSES = 3
+
+OUTPUT_DIR = "hunter_v86_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V85 - MAXIMUM PROFIT & TRUE STREAK SHIELD VERSION")
+print("HUNTER-V86 - ULTRA STREAK SHIELD (MAX LOSS STREAK <= 4)")
 print("=" * 68)
 
 
@@ -181,7 +185,12 @@ def run_backtest(processed_data):
     all_trades = []
     equity_curve = []
 
+    global_cooldown_counter = 0
+
     for ts in all_timestamps:
+        if global_cooldown_counter > 0:
+            global_cooldown_counter -= 1
+
         symbols_to_close = []
 
         for symbol, pos in list(active_positions.items()):
@@ -191,7 +200,6 @@ def run_backtest(processed_data):
 
             c4h = df.loc[ts]
 
-            # سیستم محافظت و قفل سر‌به‌سر (Break-Even Shield)
             if pos["side"] == "LONG":
                 if not pos["be_triggered"] and c4h["High"] >= pos["entry_price"] + (pos["initial_risk"] * 1.5):
                     pos["stop_loss"] = max(pos["stop_loss"], pos["entry_price"])
@@ -234,9 +242,7 @@ def run_backtest(processed_data):
                 r_real = ((pos["entry_price"] - exit_p) / initial_risk) - (FEE_RATE * 2)
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
-            # تفکیک هوشمند نتیجه برای جلوگیری از ثبت خطای کاذب به عنوان باخت زنجیره‌ای
-            is_be_protected = pos["be_triggered"] and (abs(exit_p - pos["entry_price"]) / pos["entry_price"] < 0.002)
-            outcome = "WIN" if r_real > 0 else ("BE" if is_be_protected else "LOSS")
+            outcome = "WIN" if r_real > 0 else "LOSS"
 
             position_notional = margin * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
@@ -258,6 +264,15 @@ def run_backtest(processed_data):
 
         for sym in symbols_to_close:
             del active_positions[sym]
+
+        # بررسی و فعال‌سازی قفل سراسری در صورت ثبت باخت‌های متوالی
+        if len(all_trades) >= MAX_ALLOWABLE_CONSECUTIVE_LOSSES:
+            recent_outcomes = [t["Outcome"] for t in all_trades[-MAX_ALLOWABLE_CONSECUTIVE_LOSSES:]]
+            if all(o == "LOSS" for o in recent_outcomes):
+                global_cooldown_counter = GLOBAL_COOLDOWN_CANDLES
+
+        if global_cooldown_counter > 0:
+            continue
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -382,15 +397,13 @@ def calculate_loss_streaks(trades_df):
     maximum = 0
     sequences = []
     for outcome in ordered["Outcome"]:
-        # فقط باخت‌های واقعی به عنوان زنجیره باخت محاسبه می‌شوند؛ معاملات BE زنجیره را می‌شکنند
         if outcome == "LOSS":
             current += 1
             maximum = max(maximum, current)
-        elif outcome == "WIN":
+        else:
             if current > 0:
                 sequences.append(current)
             current = 0
-        # برای BE زنجیره افزایش پیدا نمی‌کند
     if current > 0:
         sequences.append(current)
     return maximum, sequences
@@ -421,7 +434,7 @@ def report(name, trades_df, equity_df):
     trades_df = trades_df.sort_values(["Timestamp", "ExitOrder"], kind="stable").reset_index(drop=True)
     total = len(trades_df)
     wins = int((trades_df["Outcome"] == "WIN").sum())
-    losses = int((trades_df["Outcome"] == "LOSS").sum())
+    losses = total - wins
     wr = (wins / total * 100.0) if total > 0 else 0.0
 
     net_r = float(trades_df["Return"].sum())
@@ -446,7 +459,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V85 TRUE STREAK REPORT", trades_df, equity_df)
+    report("HUNTER-V86 ULTRA STREAK REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
