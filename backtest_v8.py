@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V97 - DYNAMIC LEVERAGE & QUANTITATIVE MOMENTUM ENGINE
+# HUNTER-V98 - INSTITUTIONAL HEAT-CAPPED MOMENTUM ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -54,7 +54,7 @@ SYMBOLS = {
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
-MAX_POSITIONS = 5
+MAX_POSITIONS = 4  # کاهش تعداد پوزیشن‌های همزمان برای کنترل بهتر حرارت پورتفو
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
@@ -65,16 +65,16 @@ TIMEOUT_CANDLES = 40
 EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 1000.0
-BASE_TRADE_MARGIN = 100.0
-BASE_LEVERAGE = 50.0  # اهرم پایه بهینه‌شده برای جلوگیری از انحراف درودان
+BASE_TRADE_MARGIN = 90.0
+BASE_LEVERAGE = 40.0  # تنظیم اهرم پایه برای استانداردسازی نهایی درودان
 
-OUTPUT_DIR = "hunter_v97_output"
+OUTPUT_DIR = "hunter_v98_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V97 - DYNAMIC LEVERAGE & QUANTITATIVE MOMENTUM ENGINE")
+print("HUNTER-V98 - INSTITUTIONAL HEAT-CAPPED MOMENTUM ENGINE")
 print("=" * 68)
 
 
@@ -183,7 +183,6 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     equity_curve = []
-    current_capital = INITIAL_CAPITAL
 
     for ts in all_timestamps:
         symbols_to_close = []
@@ -328,15 +327,13 @@ def run_backtest(processed_data):
             if not (0.012 <= sl_dist_pct <= 0.045):
                 continue
 
-            # سیستم اهرم پویا بر اساس نوسان و شرایط پورتفو
             target_volatility_benchmark = 0.03
             volatility_scalar = target_volatility_benchmark / max(c4h["ATR_Pct"], 0.01)
-            volatility_scalar = np.clip(volatility_scalar, 0.5, 1.8)
+            volatility_scalar = np.clip(volatility_scalar, 0.5, 1.5)
             dynamic_margin = BASE_TRADE_MARGIN * volatility_scalar
             
-            # کاهش هوشمند اهرم در نوسانات شدید بازار برای تثبیت درصد Drawdown
             dynamic_leverage = BASE_LEVERAGE * (0.03 / max(c4h["ATR_Pct"], 0.02))
-            dynamic_leverage = float(np.clip(dynamic_leverage, 20.0, 60.0))
+            dynamic_leverage = float(np.clip(dynamic_leverage, 15.0, 45.0))
 
             candidates.append({
                 "symbol": symbol,
@@ -467,7 +464,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V97 REPORT", trades_df, equity_df)
+    report("HUNTER-V98 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
