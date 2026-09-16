@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V74-LSP - DIRECTIONAL CIRCUIT BREAKER VERSION
+# HUNTER-V78 - QUANTITATIVE REGIME-ADAPTIVE VERSION
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -62,40 +62,26 @@ FEE_RATE = 0.0007
 ATR_PERIOD = 14
 TRAILING_ATR_MULTIPLIER = 2.0
 INITIAL_ATR_MULTIPLIER = 1.8
-TIMEOUT_CANDLES = 45
+TIMEOUT_CANDLES = 40
 EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 1000.0
-TRADE_MARGIN = 100.0
+BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-# LSP SETTINGS
-LSP_ACTIVATE_AT = 1
-LSP_PENALTY_1 = 1.00
-LSP_PENALTY_2 = 2.00
-LSP_PENALTY_3_PLUS = 3.50
-GLOBAL_STREAK_PENALTY = 0.50
-
-# تنظیمات مدار فرمان جهت‌دار (Directional Circuit Breaker)
-DIR_CB_TRIGGER = 2           # پس از 2 ضرر متوالی در یک جهت خاص (مثلاً لانگ یا شورت)
-DIR_CB_COOLDOWN = 3          # 3 کندل (12 ساعت) توقف ورود در همان جهت خاص
-
-OUTPUT_DIR = "hunter_v74_lsp_output"
+OUTPUT_DIR = "hunter_v78_quant_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74-LSP - DIRECTIONAL CIRCUIT BREAKER VERSION")
+print("HUNTER-V78 - QUANTITATIVE REGIME-ADAPTIVE VERSION")
 print("=" * 68)
 
 
 # ============================================================
-# DATA
+# DATA & QUANTITATIVE INDICATORS
 # ============================================================
-
-processed_data = {}
-
 
 def fetch_symbol_data(lbank_symbol):
     all_ohlcv = []
@@ -104,7 +90,6 @@ def fetch_symbol_data(lbank_symbol):
 
     while current_since < exchange.milliseconds():
         batch = None
-
         for attempt in range(3):
             try:
                 batch = exchange.fetch_ohlcv(
@@ -122,7 +107,6 @@ def fetch_symbol_data(lbank_symbol):
             break
 
         last_ts = batch[-1][0]
-
         if last_seen is not None and last_ts <= last_seen:
             return None
 
@@ -138,1045 +122,302 @@ def fetch_symbol_data(lbank_symbol):
 
     df = pd.DataFrame(
         all_ohlcv,
-        columns=[
-            "Timestamp",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-        ],
+        columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"],
     )
-
-    df["Date"] = pd.to_datetime(
-        df["Timestamp"],
-        unit="ms",
-    )
-
-    df = df[
-        [
-            "Date",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-        ]
-    ]
-
+    df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms")
+    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
     df.dropna(inplace=True)
-    df.drop_duplicates(
-        subset=["Date"],
-        keep="last",
-        inplace=True,
-    )
-    df.sort_values(
-        "Date",
-        inplace=True,
-    )
-    df.reset_index(
-        drop=True,
-        inplace=True,
-    )
+    df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
+    df.sort_values("Date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
 
     if len(df) >= 2:
         now_ms = exchange.milliseconds()
-        last_ms = int(
-            df.iloc[-1]["Date"].timestamp() * 1000
-        )
-
-        if (
-            last_ms
-            + 4 * 60 * 60 * 1000
-            > now_ms
-        ):
+        last_ms = int(df.iloc[-1]["Date"].timestamp() * 1000)
+        if last_ms + 4 * 60 * 60 * 1000 > now_ms:
             df = df.iloc[:-1].copy()
 
     if len(df) < EMA_WARMUP + 50:
         return None
 
     deltas = df["Date"].diff().dropna()
-
-    if (
-        not deltas.empty
-        and deltas.max()
-        > pd.Timedelta(
-            hours=4,
-            minutes=10,
-        )
-    ):
+    if not deltas.empty and deltas.max() > pd.Timedelta(hours=4, minutes=10):
         return None
 
-    tr1 = (
-        df["High"]
-        - df["Low"]
-    )
+    tr1 = df["High"] - df["Low"]
+    tr2 = np.abs(df["High"] - df["Close"].shift(1))
+    tr3 = np.abs(df["Low"] - df["Close"].shift(1))
+    df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
 
-    tr2 = np.abs(
-        df["High"]
-        - df["Close"].shift(1)
-    )
+    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
-    tr3 = np.abs(
-        df["Low"]
-        - df["Close"].shift(1)
-    )
+    df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
+    df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
 
-    df["ATR"] = (
-        pd.concat(
-            [tr1, tr2, tr3],
-            axis=1,
-        )
-        .max(axis=1)
-        .rolling(ATR_PERIOD)
-        .mean()
-    )
+    # شاخص قدرت روند (Trend Strength Index برای فیلتر کردن بازارهای رنج)
+    rolling_std = df["Close"].rolling(20).std()
+    rolling_sma = df["Close"].rolling(20).mean()
+    df["Trend_Quality"] = np.abs(df["Close"] - rolling_sma) / (rolling_std + 1e-9)
 
-    df["EMA20"] = df[
-        "Close"
-    ].ewm(
-        span=20,
-        adjust=False,
-    ).mean()
-
-    df["EMA50"] = df[
-        "Close"
-    ].ewm(
-        span=50,
-        adjust=False,
-    ).mean()
-
-    df["EMA200"] = df[
-        "Close"
-    ].ewm(
-        span=200,
-        adjust=False,
-    ).mean()
-
-    df["Mom_Short"] = (
-        df["Close"]
-        - df["Close"].shift(10)
-    ) / df["Close"].shift(10)
-
-    df["Mom_Long"] = (
-        df["Close"]
-        - df["Close"].shift(30)
-    ) / df["Close"].shift(30)
-
-    df.set_index(
-        "Date",
-        inplace=True,
-    )
-
+    df.set_index("Date", inplace=True)
     return df
 
 
+processed_data = {}
 for symbol, lbank_symbol in SYMBOLS.items():
-    df4h = fetch_symbol_data(
-        lbank_symbol
-    )
-
+    df4h = fetch_symbol_data(lbank_symbol)
     if df4h is not None:
-        processed_data[
-            symbol
-        ] = df4h
+        processed_data[symbol] = df4h
 
 
 # ============================================================
-# COMMON HELPERS
+# BACKTEST ENGINE
 # ============================================================
 
 def get_all_timestamps(data):
-    return sorted(
-        {
-            ts
-            for df in data.values()
-            for ts in df.index
-        }
-    )
+    return sorted({ts for df in data.values() for ts in df.index})
 
 
-def build_valid_candidates(
-    processed_data,
-    ts,
-    active_positions,
-    market_bull,
-    allow_longs,
-    allow_shorts,
-):
-    current_scores = {}
-
-    for symbol, df in processed_data.items():
-        if ts not in df.index:
-            continue
-
-        val = df.loc[
-            ts,
-            "Mom_Long",
-        ]
-
-        if not np.isnan(val):
-            current_scores[
-                symbol
-            ] = val
-
-    if not current_scores:
-        return []
-
-    ranked_symbols = sorted(
-        current_scores.keys(),
-        key=lambda x: float(
-            current_scores[x]
-        ),
-        reverse=market_bull,
-    )
-
-    candidates = []
-
-    for symbol in ranked_symbols:
-        if symbol in active_positions:
-            continue
-
-        df = processed_data[
-            symbol
-        ]
-
-        if ts not in df.index:
-            continue
-
-        i = df.index.get_loc(ts)
-
-        if i < EMA_WARMUP + 1:
-            continue
-
-        c4h = df.iloc[i]
-        prev_c = df.iloc[i - 1]
-
-        if market_bull:
-            if not allow_longs:
-                continue
-
-            regime_ok = (
-                c4h["Close"]
-                > c4h["EMA20"]
-                and c4h["EMA20"]
-                > c4h["EMA50"]
-                and c4h["Close"]
-                > c4h["EMA200"]
-            )
-
-            pullback_ok = (
-                prev_c["Low"]
-                <= prev_c["EMA20"]
-                * 1.015
-            )
-
-            valid_signal = (
-                regime_ok
-                and pullback_ok
-                and (
-                    c4h["Mom_Short"]
-                    > 0.012
-                )
-                and (
-                    c4h["Mom_Long"]
-                    > 0.035
-                )
-            )
-
-            side = "LONG"
-
-        else:
-            if not allow_shorts:
-                continue
-
-            regime_ok = (
-                c4h["Close"]
-                < c4h["EMA20"]
-                and c4h["EMA20"]
-                < c4h["EMA50"]
-                and c4h["Close"]
-                < c4h["EMA200"]
-            )
-
-            pullback_ok = (
-                prev_c["High"]
-                >= prev_c["EMA20"]
-                * 0.985
-            )
-
-            valid_signal = (
-                regime_ok
-                and pullback_ok
-                and (
-                    c4h["Mom_Short"]
-                    < -0.012
-                )
-                and (
-                    c4h["Mom_Long"]
-                    < -0.035
-                )
-            )
-
-            side = "SHORT"
-
-        if not valid_signal:
-            continue
-
-        entry_price = (
-            c4h["Open"]
-            * (
-                1 + SLIPPAGE
-            )
-            if side == "LONG"
-            else
-            c4h["Open"]
-            * (
-                1 - SLIPPAGE
-            )
-        )
-
-        initial_sl = (
-            entry_price
-            - INITIAL_ATR_MULTIPLIER
-            * c4h["ATR"]
-            if side == "LONG"
-            else
-            entry_price
-            + INITIAL_ATR_MULTIPLIER
-            * c4h["ATR"]
-        )
-
-        initial_risk = abs(
-            entry_price
-            - initial_sl
-        )
-
-        sl_dist_pct = (
-            initial_risk
-            / entry_price
-        )
-
-        if not (
-            0.01
-            <= sl_dist_pct
-            <= 0.04
-        ):
-            continue
-
-        candidates.append(
-            {
-                "symbol": symbol,
-                "side": side,
-                "entry_price": float(
-                    entry_price
-                ),
-                "initial_sl": float(
-                    initial_sl
-                ),
-                "initial_risk": float(
-                    initial_risk
-                ),
-                "entry_index": int(i),
-                "mom_long": float(
-                    c4h["Mom_Long"]
-                ),
-            }
-        )
-
-    return candidates
-
-
-# ============================================================
-# LOSS-STREAK SHIELD
-# ============================================================
-
-def lsp_penalty(
-    symbol,
-    side,
-    symbol_side_losses,
-    global_loss_streak,
-):
-    streak = symbol_side_losses.get(
-        (symbol, side),
-        0,
-    )
-
-    if streak <= 0:
-        penalty = 0.0
-    elif streak == 1:
-        penalty = LSP_PENALTY_1
-    elif streak == 2:
-        penalty = LSP_PENALTY_2
-    else:
-        penalty = LSP_PENALTY_3_PLUS
-
-    if (
-        global_loss_streak
-        >= LSP_ACTIVATE_AT
-    ):
-        penalty += GLOBAL_STREAK_PENALTY
-
-    return penalty
-
-
-def select_candidates_lsp(
-    candidates,
-    slots,
-    symbol_side_losses,
-    global_loss_streak,
-):
-    if slots <= 0 or not candidates:
-        return []
-
-    ranked = []
-
-    for original_rank, candidate in enumerate(
-        candidates
-    ):
-        penalty = lsp_penalty(
-            candidate["symbol"],
-            candidate["side"],
-            symbol_side_losses,
-            global_loss_streak,
-        )
-
-        base_score = (
-            len(candidates)
-            - original_rank
-        )
-
-        adjusted_score = (
-            float(base_score)
-            - penalty
-        )
-
-        ranked.append(
-            (
-                adjusted_score,
-                original_rank,
-                candidate,
-            )
-        )
-
-    ranked.sort(
-        key=lambda x: (
-            x[0],
-            -x[1],
-        ),
-        reverse=True,
-    )
-
-    selected = [
-        item[2]
-        for item in ranked[:slots]
-    ]
-
-    return selected
-
-
-# ============================================================
-# BACKTEST
-# ============================================================
-
-def run_backtest(
-    processed_data,
-    use_lsp=False,
-    use_lsp3=False,
-    gate_mode=None,
-    use_firewall=False,
-    use_single_loss_crowd=False,
-):
-    all_timestamps = get_all_timestamps(
-        processed_data
-    )
-
+def run_backtest(processed_data):
+    all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
-
-    symbol_side_losses = defaultdict(int)
-    global_loss_streak = 0
-    
-    # متغیرهای قفل جهت‌دار (Directional Circuit Breaker)
-    dir_loss_streaks = {"LONG": 0, "SHORT": 0}
-    dir_cooldowns = {"LONG": 0, "SHORT": 0}
-
-    diagnostics = Counter()
     equity_curve = []
 
     for ts in all_timestamps:
-        # مدیریت زمان‌سنج کوهدون جهت‌ها
-        for s in ["LONG", "SHORT"]:
-            if dir_cooldowns[s] > 0:
-                dir_cooldowns[s] -= 1
-
         symbols_to_close = []
 
-        for symbol, pos in list(
-            active_positions.items()
-        ):
-            df = processed_data[
-                symbol
-            ]
-
+        for symbol, pos in list(active_positions.items()):
+            df = processed_data[symbol]
             if ts not in df.index:
                 continue
 
             c4h = df.loc[ts]
 
             if pos["side"] == "LONG":
-                if (
-                    c4h["High"]
-                    > pos["highest_price"]
-                ):
-                    pos[
-                        "highest_price"
-                    ] = c4h["High"]
-
-                    new_trailing_sl = (
-                        pos[
-                            "highest_price"
-                        ]
-                        - TRAILING_ATR_MULTIPLIER
-                        * c4h["ATR"]
-                    )
-
-                    if (
-                        new_trailing_sl
-                        > pos["stop_loss"]
-                    ):
-                        pos[
-                            "stop_loss"
-                        ] = new_trailing_sl
-
-                hit_sl = (
-                    c4h["Low"]
-                    <= pos["stop_loss"]
-                )
-
+                if c4h["High"] > pos["highest_price"]:
+                    pos["highest_price"] = c4h["High"]
+                    new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
+                    if new_trailing_sl > pos["stop_loss"]:
+                        pos["stop_loss"] = new_trailing_sl
+                hit_sl = c4h["Low"] <= pos["stop_loss"]
             else:
-                if (
-                    c4h["Low"]
-                    < pos["lowest_price"]
-                ):
-                    pos[
-                        "lowest_price"
-                    ] = c4h["Low"]
+                if c4h["Low"] < pos["lowest_price"]:
+                    pos["lowest_price"] = c4h["Low"]
+                    new_trailing_sl = pos["lowest_price"] + TRAILING_ATR_MULTIPLIER * c4h["ATR"]
+                    if new_trailing_sl < pos["stop_loss"]:
+                        pos["stop_loss"] = new_trailing_sl
+                hit_sl = c4h["High"] >= pos["stop_loss"]
 
-                    new_trailing_sl = (
-                        pos[
-                            "lowest_price"
-                        ]
-                        + TRAILING_ATR_MULTIPLIER
-                        * c4h["ATR"]
-                    )
+            curr_i = df.index.get_loc(ts)
+            candles_held = curr_i - pos["entry_index"]
+            is_timeout = candles_held >= TIMEOUT_CANDLES
 
-                    if (
-                        new_trailing_sl
-                        < pos["stop_loss"]
-                    ):
-                        pos[
-                            "stop_loss"
-                        ] = new_trailing_sl
-
-                hit_sl = (
-                    c4h["High"]
-                    >= pos["stop_loss"]
-                )
-
-            curr_i = df.index.get_loc(
-                ts
-            )
-
-            candles_held = (
-                curr_i
-                - pos["entry_index"]
-            )
-
-            is_timeout = (
-                candles_held
-                >= TIMEOUT_CANDLES
-            )
-
-            if not (
-                hit_sl
-                or is_timeout
-            ):
+            if not (hit_sl or is_timeout):
                 continue
 
-            initial_risk = (
-                pos["initial_risk"]
-            )
+            initial_risk = pos["initial_risk"]
+            margin = pos["margin"]
 
             if pos["side"] == "LONG":
-                exit_p = (
-                    min(
-                        pos["stop_loss"],
-                        c4h["Open"],
-                    )
-                    if hit_sl
-                    else c4h["Close"]
-                )
-
-                r_real = (
-                    (
-                        exit_p
-                        - pos[
-                            "entry_price"
-                        ]
-                    )
-                    / initial_risk
-                ) - (
-                    FEE_RATE * 2
-                )
-
-                price_return_pct = (
-                    exit_p
-                    - pos[
-                        "entry_price"
-                    ]
-                ) / pos[
-                    "entry_price"
-                ]
-
+                exit_p = min(pos["stop_loss"], c4h["Open"]) if hit_sl else c4h["Close"]
+                r_real = ((exit_p - pos["entry_price"]) / initial_risk) - (FEE_RATE * 2)
+                price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
             else:
-                exit_p = (
-                    max(
-                        pos["stop_loss"],
-                        c4h["Open"],
-                    )
-                    if hit_sl
-                    else c4h["Close"]
-                )
+                exit_p = max(pos["stop_loss"], c4h["Open"]) if hit_sl else c4h["Close"]
+                r_real = ((pos["entry_price"] - exit_p) / initial_risk) - (FEE_RATE * 2)
+                price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
-                r_real = (
-                    (
-                        pos[
-                            "entry_price"
-                        ]
-                        - exit_p
-                    )
-                    / initial_risk
-                ) - (
-                    FEE_RATE * 2
-                )
+            outcome = "WIN" if r_real > 0 else "LOSS"
+            position_notional = margin * LEVERAGE
+            dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
-                price_return_pct = (
-                    pos[
-                        "entry_price"
-                    ]
-                    - exit_p
-                ) / pos[
-                    "entry_price"
-                ]
-
-            outcome = (
-                "WIN"
-                if r_real > 0
-                else "LOSS"
-            )
-
-            position_notional = (
-                TRADE_MARGIN
-                * LEVERAGE
-            )
-
-            dollar_pnl = (
-                position_notional
-                * price_return_pct
-            ) - (
-                position_notional
-                * FEE_RATE
-                * 2
-            )
-
-            p_side = pos["side"]
-
-            if outcome == "LOSS":
-                global_loss_streak += 1
-                symbol_side_losses[
-                    (
-                        symbol,
-                        p_side,
-                    )
-                ] += 1
-                
-                # به‌روزرسانی زنجیره ضرر جهت‌دار
-                dir_loss_streaks[p_side] += 1
-                if dir_loss_streaks[p_side] >= DIR_CB_TRIGGER:
-                    dir_cooldowns[p_side] = DIR_CB_COOLDOWN
-            else:
-                global_loss_streak = 0
-                symbol_side_losses[
-                    (
-                        symbol,
-                        p_side,
-                    )
-                ] = 0
-                dir_loss_streaks[p_side] = 0
-
-            all_trades.append(
-                {
-                    "Timestamp": ts,
-                    "Symbol": symbol,
-                    "Side": p_side,
-                    "Outcome": outcome,
-                    "Return": r_real,
-                    "Dollar_PnL": dollar_pnl,
-                    "ExitOrder": len(
-                        all_trades
-                    ),
-                    "EntryTimestamp": pos.get("entry_timestamp", pd.NaT),
-                    "EntryPrice": pos["entry_price"],
-                    "InitialStop": pos["initial_stop"],
-                    "ExitPrice": exit_p,
-                    "LSP_Active": int(
-                        use_lsp
-                    ),
-                    "LSP3_Active": int(
-                        use_lsp3
-                    ),
-                }
-            )
-
-            symbols_to_close.append(
-                symbol
-            )
+            all_trades.append({
+                "Timestamp": ts,
+                "Symbol": symbol,
+                "Side": pos["side"],
+                "Outcome": outcome,
+                "Return": r_real,
+                "Dollar_PnL": dollar_pnl,
+                "ExitOrder": len(all_trades),
+                "EntryTimestamp": pos.get("entry_timestamp", pd.NaT),
+                "EntryPrice": pos["entry_price"],
+                "InitialStop": pos["initial_stop"],
+                "ExitPrice": exit_p,
+            })
+            symbols_to_close.append(symbol)
 
         for sym in symbols_to_close:
-            del active_positions[
-                sym
-            ]
+            del active_positions[sym]
 
         market_bull = True
+        if "BTC" in processed_data and ts in processed_data["BTC"].index:
+            btc_c = processed_data["BTC"].loc[ts]
+            market_bull = btc_c["Close"] > btc_c["EMA200"]
 
-        if (
-            "BTC"
-            in processed_data
-            and ts
-            in processed_data[
-                "BTC"
-            ].index
-        ):
-            btc_c = processed_data[
-                "BTC"
-            ].loc[ts]
-
-            market_bull = (
-                btc_c["Close"]
-                > btc_c["EMA200"]
-            )
-
-        bullish_count = 0
-        total_active_syms = 0
-
+        # کاندیدایاب حرفه‌ای با فیلتر کیفیت روند (Trend Quality)
+        current_scores = {}
         for symbol, df in processed_data.items():
             if ts not in df.index:
                 continue
+            val = df.loc[ts, "Mom_Long"]
+            if not np.isnan(val):
+                current_scores[symbol] = val
 
-            total_active_syms += 1
-
-            if (
-                df.loc[
-                    ts,
-                    "Close",
-                ]
-                > df.loc[
-                    ts,
-                    "EMA200",
-                ]
-            ):
-                bullish_count += 1
-
-        market_breadth_ratio = (
-            bullish_count
-            / total_active_syms
-            if total_active_syms > 0
-            else 0.5
-        )
-
-        allow_longs = (
-            market_breadth_ratio
-            >= 0.35
-        ) and (dir_cooldowns["LONG"] == 0)   # اعمال فیلتر قفل جهت لانگ
-
-        allow_shorts = (
-            market_breadth_ratio
-            <= 0.65
-        ) and (dir_cooldowns["SHORT"] == 0)  # اعمال فیلتر قفل جهت شورت
-
-        candidates = build_valid_candidates(
-            processed_data,
-            ts,
-            active_positions,
-            market_bull,
-            allow_longs,
-            allow_shorts,
-        )
-
-        diagnostics[
-            "valid_candidates"
-        ] += len(candidates)
-
-        if gate_mode and candidates:
-            btc = processed_data.get("BTC")
-            if gate_mode == "A":
-                breadth_limit, ema50_limit, min_open = 0.10, -1.80, 3
-            elif gate_mode == "B":
-                breadth_limit, ema50_limit, min_open = 0.15, -1.80, 3
-            elif gate_mode == "C":
-                breadth_limit, ema50_limit, min_open = 0.20, -1.50, 3
-            else:
-                breadth_limit, ema50_limit, min_open = 0.15, -1.80, 3
-
-            kept = []
-            for cand in candidates:
-                block = False
-                if cand["side"] == "SHORT":
-                    d = processed_data[cand["symbol"]]
-                    ci = d.index.get_loc(ts)
-                    cc = d.iloc[ci]
-                    ema50_atr = float((cc["Close"] - cc["EMA50"]) / cc["ATR"]) if cc["ATR"] else np.nan
-                    open_short = sum(v["side"] == "SHORT" for v in active_positions.values())
-                    if (market_breadth_ratio <= breadth_limit and
-                        ema50_atr <= ema50_limit and
-                        open_short >= min_open):
-                        block = True
-                if block:
-                    diagnostics["gate_blocked"] += 1
-                else:
-                    kept.append(cand)
-            candidates = kept
-
-        if not candidates:
+        if not current_scores:
             continue
 
-        slots = (
-            MAX_POSITIONS
-            - len(active_positions)
+        ranked_symbols = sorted(
+            current_scores.keys(),
+            key=lambda x: float(current_scores[x]),
+            reverse=market_bull,
         )
 
-        if slots <= 0:
-            continue
+        candidates = []
+        for symbol in ranked_symbols:
+            if symbol in active_positions:
+                continue
 
-        if use_lsp:
-            selected = select_candidates_lsp(
-                candidates,
-                slots,
-                symbol_side_losses,
-                global_loss_streak,
-            )
-        else:
-            selected = candidates[
-                :slots
-            ]
-
-        for candidate in selected:
-            symbol = candidate[
-                "symbol"
-            ]
-
-            side = candidate[
-                "side"
-            ]
-
-            active_positions[
-                symbol
-            ] = {
-                "side": side,
-                "entry_price": candidate[
-                    "entry_price"
-                ],
-                "initial_stop": candidate[
-                    "initial_sl"
-                ],
-                "entry_timestamp": ts,
-                "stop_loss": candidate[
-                    "initial_sl"
-                ],
-                "highest_price": candidate[
-                    "entry_price"
-                ],
-                "lowest_price": candidate[
-                    "entry_price"
-                ],
-                "initial_risk": candidate[
-                    "initial_risk"
-                ],
-                "entry_index": candidate[
-                    "entry_index"
-                ],
-            }
-
-        closed_pnl = sum(
-            trade["Dollar_PnL"]
-            for trade in all_trades
-        )
-
-        unrealized = 0.0
-
-        for pos_symbol, pos in (
-            active_positions.items()
-        ):
-            df = processed_data[
-                pos_symbol
-            ]
-
+            df = processed_data[symbol]
             if ts not in df.index:
                 continue
 
-            close_price = df.loc[
-                ts,
-                "Close",
-            ]
+            i = df.index.get_loc(ts)
+            if i < EMA_WARMUP + 1:
+                continue
 
-            if pos["side"] == "LONG":
-                unrealized += (
-                    close_price
-                    - pos["entry_price"]
-                ) * (
-                    TRADE_MARGIN
-                    * LEVERAGE
-                    / pos["entry_price"]
-                )
+            c4h = df.iloc[i]
+            prev_c = df.iloc[i - 1]
 
+            # فیلتر حیاتی کیفیت روند برای جلوگیری از بازار رنج فرسایشی
+            if c4h["Trend_Quality"] < 0.8:
+                continue
+
+            if market_bull:
+                regime_ok = (c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"])
+                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
+                side = "LONG"
             else:
-                unrealized += (
-                    pos["entry_price"]
-                    - close_price
-                ) * (
-                    TRADE_MARGIN
-                    * LEVERAGE
-                    / pos["entry_price"]
-                )
+                regime_ok = (c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"])
+                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
+                side = "SHORT"
 
-        equity_curve.append(
-            {
-                "Timestamp": ts,
-                "Equity": (
-                    INITIAL_CAPITAL
-                    + closed_pnl
-                    + unrealized
-                ),
+            if not valid_signal:
+                continue
+
+            entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
+            initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"] if side == "LONG" else entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"]
+            initial_risk = abs(entry_price - initial_sl)
+            sl_dist_pct = initial_risk / entry_price
+
+            if not (0.01 <= sl_dist_pct <= 0.04):
+                continue
+
+            # تخصیص ریسک پویا بر اساس نوسان ATR (Volatility Parity Sizing)
+            volatility_scalar = min(1.5, max(0.6, 0.02 / sl_dist_pct))
+            dynamic_margin = BASE_TRADE_MARGIN * volatility_scalar
+
+            candidates.append({
+                "symbol": symbol,
+                "side": side,
+                "entry_price": float(entry_price),
+                "initial_sl": float(initial_sl),
+                "initial_risk": float(initial_risk),
+                "entry_index": int(i),
+                "margin": float(dynamic_margin),
+            })
+
+        slots = MAX_POSITIONS - len(active_positions)
+        if slots <= 0 or not candidates:
+            continue
+
+        selected = candidates[:slots]
+        for candidate in selected:
+            symbol = candidate["symbol"]
+            active_positions[symbol] = {
+                "side": candidate["side"],
+                "entry_price": candidate["entry_price"],
+                "initial_stop": candidate["initial_sl"],
+                "entry_timestamp": ts,
+                "stop_loss": candidate["initial_sl"],
+                "highest_price": candidate["entry_price"],
+                "lowest_price": candidate["entry_price"],
+                "initial_risk": candidate["initial_risk"],
+                "margin": candidate["margin"],
+                "entry_index": candidate["entry_index"],
             }
-        )
 
-    return (
-        pd.DataFrame(all_trades),
-        pd.DataFrame(equity_curve),
-        diagnostics,
-    )
+        closed_pnl = sum(trade["Dollar_PnL"] for trade in all_trades)
+        unrealized = 0.0
+        for pos_symbol, pos in active_positions.items():
+            df = processed_data[pos_symbol]
+            if ts not in df.index:
+                continue
+            close_price = df.loc[ts, "Close"]
+            if pos["side"] == "LONG":
+                unrealized += (close_price - pos["entry_price"]) * (pos["margin"] * LEVERAGE / pos["entry_price"])
+            else:
+                unrealized += (pos["entry_price"] - close_price) * (pos["margin"] * LEVERAGE / pos["entry_price"])
+
+        equity_curve.append({
+            "Timestamp": ts,
+            "Equity": INITIAL_CAPITAL + closed_pnl + unrealized,
+        })
+
+    return pd.DataFrame(all_trades), pd.DataFrame(equity_curve)
 
 
 # ============================================================
 # REPORTING
 # ============================================================
 
-def calculate_loss_streaks(
-    trades_df
-):
+def calculate_loss_streaks(trades_df):
     if trades_df.empty:
         return 0, []
-
-    ordered = trades_df.sort_values(
-        [
-            "Timestamp",
-            "ExitOrder",
-        ],
-        kind="stable",
-    )
-
+    ordered = trades_df.sort_values(["Timestamp", "ExitOrder"], kind="stable")
     current = 0
     maximum = 0
     sequences = []
-
-    for outcome in ordered[
-        "Outcome"
-    ]:
+    for outcome in ordered["Outcome"]:
         if outcome == "LOSS":
             current += 1
-            maximum = max(
-                maximum,
-                current,
-            )
+            maximum = max(maximum, current)
         else:
             if current > 0:
-                sequences.append(
-                    current
-                )
+                sequences.append(current)
             current = 0
-
     if current > 0:
-        sequences.append(
-            current
-        )
-
-    return (
-        maximum,
-        sequences,
-    )
+        sequences.append(current)
+    return maximum, sequences
 
 
-def calculate_drawdown(
-    equity_df
-):
+def calculate_drawdown(equity_df):
     if equity_df.empty:
         return 0.0, 0.0
-
-    equity = equity_df[
-        "Equity"
-    ].astype(float)
-
+    equity = equity_df["Equity"].astype(float)
     peak = equity.cummax()
     dd = equity - peak
     max_dd = float(dd.min())
-
     if max_dd >= 0:
         return 0.0, 0.0
-
-    peak_at_trough = float(
-        peak.loc[
-            dd.idxmin()
-        ]
-    )
-
-    max_dd_pct = (
-        max_dd
-        / peak_at_trough
-        * 100.0
-        if peak_at_trough > 0
-        else 0.0
-    )
-
-    return (
-        max_dd,
-        max_dd_pct,
-    )
+    peak_at_trough = float(peak.loc[dd.idxmin()])
+    max_dd_pct = (max_dd / peak_at_trough * 100.0) if peak_at_trough > 0 else 0.0
+    return max_dd, max_dd_pct
 
 
-def report(
-    name,
-    trades_df,
-    equity_df,
-):
+def report(name, trades_df, equity_df):
     print("\n" + "=" * 68)
     print(name)
     print("=" * 68)
-
     if trades_df.empty:
         print("No trades.")
         return {}
 
-    trades_df = trades_df.sort_values(
-        [
-            "Timestamp",
-            "ExitOrder",
-        ],
-        kind="stable",
-    ).reset_index(
-        drop=True
-    )
-
+    trades_df = trades_df.sort_values(["Timestamp", "ExitOrder"], kind="stable").reset_index(drop=True)
     total = len(trades_df)
     wins = int((trades_df["Outcome"] == "WIN").sum())
     losses = total - wins
@@ -1201,34 +442,14 @@ def report(
     print(f"Max Drawdown  : ${dd_dollar:,.2f} ({dd_pct:.2f}%)")
     print(f"Max Loss Streak: {max_ls}")
 
-    return {
-        "trades": total, "wins": wins, "losses": losses, "wr": wr,
-        "net_r": net_r, "pnl": pnl, "final_capital": final_capital,
-        "return_pct": return_pct, "max_dd": dd_dollar, "max_dd_pct": dd_pct,
-        "max_loss_streak": max_ls,
-    }
-
-
-# ============================================================
-# MAIN EXECUTION
-# ============================================================
 
 if __name__ == "__main__":
-    trades_df, equity_df, diagnostics = run_backtest(
-        processed_data,
-        use_lsp=True,
-        use_lsp3=False,
-        gate_mode="B",
-        use_firewall=False,
-        use_single_loss_crowd=False
-    )
-
-    perf = report("HUNTER-V74 DIRECTIONAL CB REPORT", trades_df, equity_df)
+    trades_df, equity_df = run_backtest(processed_data)
+    report("HUNTER-V78 QUANTITATIVE REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
         trades_df.to_csv(os.path.join(OUTPUT_DIR, "optimized_trades.csv"), index=False)
     if not equity_df.empty:
         equity_df.to_csv(os.path.join(OUTPUT_DIR, "optimized_equity.csv"), index=False)
-        
     print(f"\nOptimization Complete. Results saved in '{OUTPUT_DIR}/'.")
