@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V78 - QUANTITATIVE REGIME-ADAPTIVE VERSION
+# HUNTER-V79 - HARD CIRCUIT BREAKER QUANTITATIVE VERSION
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -69,13 +69,16 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-OUTPUT_DIR = "hunter_v78_quant_output"
+# حد آستانه سخت برای قفل کردن ربات پس از ضررهای متوالی
+MAX_ALLOWED_CONSECUTIVE_LOSSES = 2
+
+OUTPUT_DIR = "hunter_v79_quant_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V78 - QUANTITATIVE REGIME-ADAPTIVE VERSION")
+print("HUNTER-V79 - HARD CIRCUIT BREAKER QUANTITATIVE VERSION")
 print("=" * 68)
 
 
@@ -156,7 +159,6 @@ def fetch_symbol_data(lbank_symbol):
     df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
     df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
 
-    # شاخص قدرت روند (Trend Strength Index برای فیلتر کردن بازارهای رنج)
     rolling_std = df["Close"].rolling(20).std()
     rolling_sma = df["Close"].rolling(20).mean()
     df["Trend_Quality"] = np.abs(df["Close"] - rolling_sma) / (rolling_std + 1e-9)
@@ -185,6 +187,9 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     equity_curve = []
+
+    # متغیرهای کلیدی برای رصد و کشتن زنجیره باخت
+    consecutive_losses = 0
 
     for ts in all_timestamps:
         symbols_to_close = []
@@ -231,6 +236,13 @@ def run_backtest(processed_data):
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
             outcome = "WIN" if r_real > 0 else "LOSS"
+
+            # بروزرسانی سیستم قطع اضطراری زنجیره باخت
+            if outcome == "LOSS":
+                consecutive_losses += 1
+            else:
+                consecutive_losses = 0
+
             position_notional = margin * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
@@ -252,12 +264,15 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
+        # اگر تعداد ضررهای پشت سر هم به حد نصاب رسید، اجازه ورودِ جدید داده نمی‌شود
+        if consecutive_losses >= MAX_ALLOWED_CONSECUTIVE_LOSSES:
+            continue
+
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
             btc_c = processed_data["BTC"].loc[ts]
             market_bull = btc_c["Close"] > btc_c["EMA200"]
 
-        # کاندیدایاب حرفه‌ای با فیلتر کیفیت روند (Trend Quality)
         current_scores = {}
         for symbol, df in processed_data.items():
             if ts not in df.index:
@@ -291,7 +306,6 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
-            # فیلتر حیاتی کیفیت روند برای جلوگیری از بازار رنج فرسایشی
             if c4h["Trend_Quality"] < 0.8:
                 continue
 
@@ -317,7 +331,6 @@ def run_backtest(processed_data):
             if not (0.01 <= sl_dist_pct <= 0.04):
                 continue
 
-            # تخصیص ریسک پویا بر اساس نوسان ATR (Volatility Parity Sizing)
             volatility_scalar = min(1.5, max(0.6, 0.02 / sl_dist_pct))
             dynamic_margin = BASE_TRADE_MARGIN * volatility_scalar
 
@@ -445,7 +458,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V78 QUANTITATIVE REPORT", trades_df, equity_df)
+    report("HUNTER-V79 HARD CB REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
