@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V81 - SURGICAL MOMENTUM OPTIMIZED VERSION
+# HUNTER-V82 - MAXIMUM PROFIT & BREAK-EVEN SHIELD VERSION
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -60,7 +60,7 @@ SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-TRAILING_ATR_MULTIPLIER = 2.0
+TRAILING_ATR_MULTIPLIER = 2.2
 INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 40
 EMA_WARMUP = 200
@@ -69,13 +69,13 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-OUTPUT_DIR = "hunter_v81_output"
+OUTPUT_DIR = "hunter_v82_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V81 - SURGICAL MOMENTUM OPTIMIZED VERSION")
+print("HUNTER-V82 - MAXIMUM PROFIT & BREAK-EVEN SHIELD VERSION")
 print("=" * 68)
 
 
@@ -156,14 +156,6 @@ def fetch_symbol_data(lbank_symbol):
     df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
     df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
 
-    # فیلتر کیفیت روند ارتقایافته برای حذف سیگنال‌های فیک
-    rolling_std = df["Close"].rolling(20).std()
-    rolling_sma = df["Close"].rolling(20).mean()
-    df["Trend_Quality"] = np.abs(df["Close"] - rolling_sma) / (rolling_std + 1e-9)
-
-    # میانگین حجم برای تایید قدرت نقدینگی
-    df["Volume_SMA"] = df["Volume"].rolling(20).mean()
-
     df.set_index("Date", inplace=True)
     return df
 
@@ -199,7 +191,13 @@ def run_backtest(processed_data):
 
             c4h = df.loc[ts]
 
+            # سیستم محافظت و قفل سر‌به‌سر (Break-Even Shield)
+            # اگر قیمت به اندازه 1.5 برابر ریسک اولیه در سود رفت، استاپ لاس روی قیمت ورود قفل می‌شود تا جلوی باخت گرفته شود
             if pos["side"] == "LONG":
+                if not pos["be_triggered"] and c4h["High"] >= pos["entry_price"] + (pos["initial_risk"] * 1.5):
+                    pos["stop_loss"] = max(pos["stop_loss"], pos["entry_price"])
+                    pos["be_triggered"] = True
+
                 if c4h["High"] > pos["highest_price"]:
                     pos["highest_price"] = c4h["High"]
                     new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
@@ -207,6 +205,10 @@ def run_backtest(processed_data):
                         pos["stop_loss"] = new_trailing_sl
                 hit_sl = c4h["Low"] <= pos["stop_loss"]
             else:
+                if not pos["be_triggered"] and c4h["Low"] <= pos["entry_price"] - (pos["initial_risk"] * 1.5):
+                    pos["stop_loss"] = min(pos["stop_loss"], pos["entry_price"])
+                    pos["be_triggered"] = True
+
                 if c4h["Low"] < pos["lowest_price"]:
                     pos["lowest_price"] = c4h["Low"]
                     new_trailing_sl = pos["lowest_price"] + TRAILING_ATR_MULTIPLIER * c4h["ATR"]
@@ -293,19 +295,15 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
-            # فیلتر جراحی‌شده: سخت‌گیری روی کیفیت روند برای جلوگیری از ورود در پولبک‌های فیک
-            if c4h["Trend_Quality"] < 1.0 or c4h["Volume"] < c4h["Volume_SMA"] * 0.7:
-                continue
-
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"])
-                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.01
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
+                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.01) and (c4h["Mom_Long"] > 0.03)
                 side = "LONG"
             else:
                 regime_ok = (c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"])
-                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.99
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
+                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.01) and (c4h["Mom_Long"] < -0.03)
                 side = "SHORT"
 
             if not valid_signal:
@@ -316,11 +314,8 @@ def run_backtest(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.01 <= sl_dist_pct <= 0.035):
+            if not (0.01 <= sl_dist_pct <= 0.04):
                 continue
-
-            volatility_scalar = min(1.5, max(0.6, 0.02 / sl_dist_pct))
-            dynamic_margin = BASE_TRADE_MARGIN * volatility_scalar
 
             candidates.append({
                 "symbol": symbol,
@@ -329,7 +324,7 @@ def run_backtest(processed_data):
                 "initial_sl": float(initial_sl),
                 "initial_risk": float(initial_risk),
                 "entry_index": int(i),
-                "margin": float(dynamic_margin),
+                "margin": float(BASE_TRADE_MARGIN),
             })
 
         slots = MAX_POSITIONS - len(active_positions)
@@ -350,6 +345,7 @@ def run_backtest(processed_data):
                 "initial_risk": candidate["initial_risk"],
                 "margin": candidate["margin"],
                 "entry_index": candidate["entry_index"],
+                "be_triggered": False,
             }
 
         closed_pnl = sum(trade["Dollar_PnL"] for trade in all_trades)
@@ -446,7 +442,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V81 SURGICAL REPORT", trades_df, equity_df)
+    report("HUNTER-V82 MAXIMUM PROFIT REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
