@@ -2816,3 +2816,30 @@ if __name__ == "__main__":
     print("HUNTER-V74 — EVIDENCE TEST")
     for r in results:
         print(f"{r[0]:7s} | Trades={r[1]:3d} | WR={r[2]:.2f}% | PnL=${r[3]:,.2f} | MaxLS={r[4]:2d} | Blocked={r[5]}")
+
+
+# ============================================================
+# PORTFOLIO RISK GATE — NEW ENTRIES ONLY
+# Does NOT alter signals, ranking, exits, stops, trailing or sizing.
+# It only blocks NEW entries after a cluster of completed losses.
+# ============================================================
+PORTFOLIO_RISK_GATE = True
+PRG_MIN_LOSSES = 2
+PRG_COOLDOWN_CANDLES = 2
+PRG_MAX_NEW_POSITIONS = 1
+
+def portfolio_risk_gate_allow(side, ts, loss_events, open_positions,
+                              last_loss_ts_by_side, ts_to_idx):
+    """Causal portfolio-level entry throttle. Existing positions untouched."""
+    if not PORTFOLIO_RISK_GATE:
+        return True
+    recent = [x for x in loss_events if x[0] == side and x[1] <= ts]
+    if len(recent) < PRG_MIN_LOSSES:
+        return True
+    last_ts = recent[-1][1]
+    if last_ts not in ts_to_idx or ts not in ts_to_idx:
+        return True
+    if ts_to_idx[ts] - ts_to_idx[last_ts] > PRG_COOLDOWN_CANDLES:
+        return True
+    return sum(1 for p in open_positions if p.get("side") == side) < PRG_MAX_NEW_POSITIONS
+
