@@ -1049,6 +1049,11 @@ def run_backtest(
                 "entry_price": candidate[
                     "entry_price"
                 ],
+                # Diagnostic-only fields; do not affect V74 execution.
+                "initial_stop": candidate[
+                    "initial_sl"
+                ],
+                "entry_timestamp": ts,
                 "stop_loss": candidate[
                     "initial_sl"
                 ],
