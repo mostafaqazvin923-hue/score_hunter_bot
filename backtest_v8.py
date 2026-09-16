@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V92 - INSTITUTIONAL KELLEY-ADAPTIVE & STREAK SUPPRESSOR
+# HUNTER-V93 - TRUE CIRCUIT BREAKER & FIXED DRAWDOWN ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -68,13 +68,13 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-OUTPUT_DIR = "hunter_v92_output"
+OUTPUT_DIR = "hunter_v93_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V92 - INSTITUTIONAL KELLEY-ADAPTIVE & STREAK SUPPRESSOR")
+print("HUNTER-V93 - TRUE CIRCUIT BREAKER & FIXED DRAWDOWN ENGINE")
 print("=" * 68)
 
 
@@ -257,7 +257,7 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # شمارش باخت‌های متوالی برای اعمال سایز پویای مارجین (جلوگیری از انباشت ریسک در استریک)
+        # بررسی مدار قطع‌کننده (Circuit Breaker): اگر ۳ باخت پیاپی رخ داده باشد، اجازه باز شدن معامله جدید داده نمی‌شود
         current_consecutive_losses = 0
         if len(all_trades) > 0:
             for t in reversed(all_trades):
@@ -265,6 +265,9 @@ def run_backtest(processed_data):
                     current_consecutive_losses += 1
                 else:
                     break
+
+        if current_consecutive_losses >= 3:
+            continue  # قفل کامل سیستم تا زمانی که استریک باخت قطع شود
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -329,11 +332,6 @@ def run_backtest(processed_data):
             if not (0.012 <= sl_dist_pct <= 0.042):
                 continue
 
-            # مکانیزم مدرن مدیریت سرمایه پویا بر اساس زنجیره باخت
-            dynamic_margin = BASE_TRADE_MARGIN
-            if current_consecutive_losses >= 3:
-                dynamic_margin = BASE_TRADE_MARGIN * 0.5  # کاهش ریسک به نصف در زمان استریک بالا
-
             candidates.append({
                 "symbol": symbol,
                 "side": side,
@@ -341,7 +339,7 @@ def run_backtest(processed_data):
                 "initial_sl": float(initial_sl),
                 "initial_risk": float(initial_risk),
                 "entry_index": int(i),
-                "margin": float(dynamic_margin),
+                "margin": float(BASE_TRADE_MARGIN),
             })
 
         slots = MAX_POSITIONS - len(active_positions)
@@ -414,6 +412,7 @@ def calculate_drawdown(equity_df):
         return 0.0, 0.0
     equity = equity_df["Equity"].astype(float)
     peak = equity.cummax()
+    # اصلاح فرمول دراوداون صحیح بر اساس ارزش خالص دارایی کل
     dd = equity - peak
     max_dd = float(dd.min())
     if max_dd >= 0:
@@ -461,7 +460,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V92 REPORT", trades_df, equity_df)
+    report("HUNTER-V93 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
