@@ -113,6 +113,13 @@ CLUSTER_LOSS_TRIGGER = 2
 CLUSTER_MIN_SAME_SIDE = 3
 CLUSTER_KEEP_AFTER_TRIGGER = 1
 
+# PRE-ENTRY CROWD / ADVERSE-MARKET GATE
+# Causal only: uses current/prior bars; V74 signals and execution remain unchanged.
+PREVENTIVE_MIN_SAME_SIDE = 3
+PREVENTIVE_KEEP = 2
+PREVENTIVE_BTC_ATR_2BAR = 1.25
+PREVENTIVE_BREADTH_DELTA = 0.10
+
 INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
@@ -873,6 +880,43 @@ def detect_loss_regime_against_entry(processed_data, ts, candidate,
 
 
 # ============================================================
+# PRE-ENTRY CROWD / ADVERSE-MARKET GATE
+# ============================================================
+def apply_preventive_crowd_gate(candidates, ts, processed_data, market_breadth_ratio, diagnostics):
+    if len(candidates) < PREVENTIVE_MIN_SAME_SIDE:
+        return candidates
+    out=[]
+    for side in ("LONG", "SHORT"):
+        group=[c for c in candidates if c.get("side") == side]
+        if len(group) < PREVENTIVE_MIN_SAME_SIDE:
+            out.extend(group); continue
+        adverse=False; reason=[]
+        btc=processed_data.get("BTC")
+        if btc is not None and ts in btc.index:
+            bi=btc.index.get_loc(ts)
+            if bi>=2:
+                r=btc.iloc[bi]; p=btc.iloc[bi-2]
+                atr=float(r.get("ATR", np.nan))
+                move=(float(r["Close"])/float(p["Close"])-1) if float(p["Close"]) else 0
+                move_atr=abs(float(r["Close"])-float(p["Close"])) / atr if np.isfinite(atr) and atr>0 else 0
+                if ((side=="SHORT" and move>0) or (side=="LONG" and move<0)) and move_atr>=PREVENTIVE_BTC_ATR_2BAR:
+                    adverse=True; reason.append("btc_adverse")
+        # Breadth contradiction is intentionally mild; only acts with a crowded side.
+        if (side=="SHORT" and market_breadth_ratio>0.60) or (side=="LONG" and market_breadth_ratio<0.40):
+            adverse=True; reason.append("breadth_contradiction")
+        if adverse:
+            kept=group[:PREVENTIVE_KEEP]
+            blocked=group[PREVENTIVE_KEEP:]
+            diagnostics.setdefault("preventive_gate_block_log", []).extend([{
+                "Timestamp":ts,"Side":side,"Symbol":c.get("symbol"),"Reason":"+".join(reason)
+            } for c in blocked])
+            out.extend(kept)
+        else:
+            out.extend(group)
+    return out
+
+
+# ============================================================
 # BACKTEST
 # ============================================================
 
@@ -884,6 +928,7 @@ def run_backtest(
     long_only=False,
     use_loss_regime_shield=False,
     use_cluster_control=False,
+    use_preventive_gate=False,
 ):
     all_timestamps = get_all_timestamps(
         processed_data
@@ -3005,6 +3050,7 @@ if __name__ == "__main__":
         long_only=False,
         use_loss_regime_shield=False,
         use_cluster_control=False,
+        use_preventive_gate=False,
     )
 
     shield_trades, shield_equity, shield_diag = run_backtest(
@@ -3014,7 +3060,8 @@ if __name__ == "__main__":
         use_shock_shield=False,
         long_only=False,
         use_loss_regime_shield=False,
-        use_cluster_control=True,
+        use_cluster_control=False,
+        use_preventive_gate=True,
     )
 
     baseline_summary = report(
@@ -3111,4 +3158,3 @@ if __name__ == "__main__":
     print("Use the DIRECT COMPARISON + both forensics sections to judge whether")
     print("the shield reduces consecutive losses without materially changing")
     print("the original V74 trade count / win rate / PnL profile.")
-
