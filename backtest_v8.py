@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V74-LSP - GOLDEN RECOVERY VERSION (34K TARGET)
+# HUNTER-V74-LSP - GLOBAL CIRCUIT BREAKER VERSION
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -54,8 +54,7 @@ SYMBOLS = {
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
-# بازگشت به تنظیمات اصلیِ سازنده سود ۳۴ هزار دلاری
-MAX_POSITIONS = 5            
+MAX_POSITIONS = 5            # حفظ پوزیشن‌های اصلی برای نگهداری سود بالا
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
@@ -70,23 +69,24 @@ INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-# LSP SETTINGS (اصلاح ضرایب جریمه برای سرکوب ضررهای متوالی بدون افت سود)
+# LSP SETTINGS
 LSP_ACTIVATE_AT = 1
 LSP_PENALTY_1 = 1.00
 LSP_PENALTY_2 = 2.00
 LSP_PENALTY_3_PLUS = 3.50
 GLOBAL_STREAK_PENALTY = 0.50
 
-OUTPUT_DIR = "hunter_v74_lsp_output"
+# تنظیمات مدار فرمان کلان (Global Circuit Breaker)
+GLOBAL_CB_TRIGGER = 2        # پس از 2 ضرر متوالی در کل سبد
+GLOBAL_CB_COOLDOWN = 4       # 4 کندل (16 ساعت) توقف کامل ورود جدید
 
-LSP3_TRIGGER_STREAK = 2
-LSP3_COOLDOWN_CANDLES = 4
+OUTPUT_DIR = "hunter_v74_lsp_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74-LSP - GOLDEN RECOVERY 34K VERSION")
+print("HUNTER-V74-LSP - GLOBAL CIRCUIT BREAKER VERSION")
 print("=" * 68)
 
 
@@ -596,6 +596,7 @@ def run_backtest(
 
     symbol_side_losses = defaultdict(int)
     global_loss_streak = 0
+    global_cb_cooldown = 0  # شمارشگر توقف کلان
 
     direction_loss_streak = {"LONG": 0, "SHORT": 0}
     direction_cooldown = {"LONG": 0, "SHORT": 0}
@@ -608,6 +609,10 @@ def run_backtest(
     equity_curve = []
 
     for ts in all_timestamps:
+        # مدیریت زمان‌سنج قفل کلان
+        if global_cb_cooldown > 0:
+            global_cb_cooldown -= 1
+
         symbols_to_close = []
 
         for symbol, pos in list(
@@ -796,6 +801,10 @@ def run_backtest(
                         pos["side"],
                     )
                 ] += 1
+                
+                # اعمال قفل اضطراری کلان در صورت رسیدن به آستانه ضرر متوالی
+                if global_loss_streak >= GLOBAL_CB_TRIGGER:
+                    global_cb_cooldown = GLOBAL_CB_COOLDOWN
             else:
                 global_loss_streak = 0
                 symbol_side_losses[
@@ -838,48 +847,9 @@ def run_backtest(
                 sym
             ]
 
-        if use_lsp3:
-            for side in ("LONG", "SHORT"):
-                side_outcomes = [
-                    t["Outcome"]
-                    for t in all_trades
-                    if t["Timestamp"] == ts and t["Side"] == side
-                ]
-
-                if not side_outcomes:
-                    continue
-
-                if "WIN" in side_outcomes:
-                    direction_loss_streak[side] = 0
-                    direction_cooldown[side] = 0
-                elif "LOSS" in side_outcomes:
-                    direction_loss_streak[side] += 1
-
-                    if direction_loss_streak[side] >= LSP3_TRIGGER_STREAK:
-                        direction_cooldown[side] = LSP3_COOLDOWN_CANDLES
-
-        if use_firewall:
-            for side in ("LONG", "SHORT"):
-                side_outcomes = [
-                    tr["Outcome"] for tr in all_trades
-                    if tr["Timestamp"] == ts and tr["Side"] == side
-                ]
-                if side_outcomes:
-                    if "WIN" in side_outcomes:
-                        firewall_loss_events[side] = 0
-                        firewall_locked[side] = False
-                    elif "LOSS" in side_outcomes:
-                        firewall_loss_events[side] += 1
-                        if firewall_loss_events[side] >= 2:
-                            firewall_locked[side] = True
-
-                if firewall_locked[side]:
-                    still_open = any(
-                        p["side"] == side for p in active_positions.values()
-                    )
-                    if not still_open:
-                        firewall_locked[side] = False
-                        firewall_loss_events[side] = 0
+        # اگر سیستم در حالت قفل کلان باشد، هیچ کاندید جدیدی بررسی نمی‌شود
+        if global_cb_cooldown > 0:
+            continue
 
         market_bull = True
 
@@ -982,48 +952,7 @@ def run_backtest(
             candidates = kept
 
         if not candidates:
-            if use_lsp3:
-                for _side in ("LONG", "SHORT"):
-                    if direction_cooldown[_side] > 0:
-                        direction_cooldown[_side] -= 1
             continue
-
-        if use_lsp3:
-            blocked_sides = {
-                side for side in ("LONG", "SHORT")
-                if direction_cooldown[side] > 0
-            }
-
-            if blocked_sides:
-                candidates = [c for c in candidates if c["side"] not in blocked_sides]
-
-            if not candidates:
-                for _side in ("LONG", "SHORT"):
-                    if direction_cooldown[_side] > 0:
-                        direction_cooldown[_side] -= 1
-                continue
-
-        if use_single_loss_crowd and candidates:
-            kept = []
-            for c in candidates:
-                side = c["side"]
-                open_same_side = sum(
-                    p["side"] == side for p in active_positions.values()
-                )
-                crowd_block = (
-                    firewall_loss_events.get(side, 0) >= 1
-                    and open_same_side >= SINGLE_LOSS_CROWD_MIN_OPEN
-                )
-                if not crowd_block:
-                    kept.append(c)
-            candidates = kept
-
-        if use_firewall and candidates:
-            kept = []
-            for c in candidates:
-                if not firewall_locked.get(c["side"], False):
-                    kept.append(c)
-            candidates = kept
 
         slots = (
             MAX_POSITIONS
@@ -1031,10 +960,6 @@ def run_backtest(
         )
 
         if slots <= 0:
-            if use_lsp3:
-                for _side in ("LONG", "SHORT"):
-                    if direction_cooldown[_side] > 0:
-                        direction_cooldown[_side] -= 1
             continue
 
         if use_lsp:
@@ -1295,13 +1220,13 @@ if __name__ == "__main__":
     trades_df, equity_df, diagnostics = run_backtest(
         processed_data,
         use_lsp=True,
-        use_lsp3=True,
+        use_lsp3=False,
         gate_mode="B",
-        use_firewall=True,
-        use_single_loss_crowd=True
+        use_firewall=False,
+        use_single_loss_crowd=False
     )
 
-    perf = report("HUNTER-V74 GOLDEN RECOVERY REPORT", trades_df, equity_df)
+    perf = report("HUNTER-V74 GLOBAL CB REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
