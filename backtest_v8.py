@@ -1247,6 +1247,9 @@ def run_backtest(
             }
         )
 
+    if use_lsp3:
+        diagnostics["lsp3_trigger_log"] = lsp3_trigger_log
+
     return (
         pd.DataFrame(all_trades),
         pd.DataFrame(equity_curve),
@@ -2649,7 +2652,7 @@ if __name__ == "__main__":
     print(f"WIN reset events    : {lsp3_diag.get('lsp3_win_reset_events', 0)}")
     if lsp3_diag.get("lsp3_trigger_events", 0):
         print("\nLSP3 TRIGGERS")
-        for ev in lsp3_trigger_log:
+        for ev in lsp3_diag.get("lsp3_trigger_log", []):
             print(
                 f"{ev['Timestamp']} | {ev['Side']:5s} | "
                 f"event_streak={ev['LossEventStreak']} | "
