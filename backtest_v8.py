@@ -159,8 +159,8 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74-LSP")
-print("Golden Core + Soft Loss-Streak Protection")
+print("HUNTER-V74 — PREVENTIVE CROWD GATE")
+print("Golden Core + Causal Pre-Entry Protection")
 print("=" * 68)
 
 
@@ -1465,6 +1465,16 @@ def run_backtest(
                 diagnostics["loss_regime_active_events"] += 1
                 diagnostics["loss_regime_blocked_entry_events"] += 1
             candidates = kept_candidates
+
+        # --------------------------------------------------------
+        # PREVENTIVE CROWD / ADVERSE-MARKET GATE — NEW ENTRIES ONLY
+        # --------------------------------------------------------
+        if use_preventive_gate and candidates:
+            before = len(candidates)
+            candidates = apply_preventive_crowd_gate(
+                candidates, ts, processed_data, market_breadth_ratio, diagnostics
+            )
+            diagnostics["preventive_gate_blocked"] += before - len(candidates)
 
         # --------------------------------------------------------
         # CORRELATED LOSS CLUSTER CONTROL — NEW ENTRIES ONLY
