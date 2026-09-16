@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V87 - CLEAN PURE VERSION (MAX PROFIT & MAX LOSS STREAK < 4)
+# HUNTER-V88 - MICRO-COOLDOWN STREAK BREAKER (MAX LOSS STREAK <= 4)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -69,13 +69,17 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-OUTPUT_DIR = "hunter_v87_output"
+# تنظیم میکرو-کول‌دان برای شکستن زنجیره باخت بدون از دست رفتن معاملات
+GLOBAL_COOLDOWN_CANDLES = 1
+MAX_ALLOWABLE_CONSECUTIVE_LOSSES = 3
+
+OUTPUT_DIR = "hunter_v88_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V87 - CLEAN PURE VERSION (MAX PROFIT & LOSS STREAK < 4)")
+print("HUNTER-V88 - MICRO-COOLDOWN STREAK BREAKER (MAX LOSS STREAK <= 4)")
 print("=" * 68)
 
 
@@ -181,7 +185,12 @@ def run_backtest(processed_data):
     all_trades = []
     equity_curve = []
 
+    global_cooldown_counter = 0
+
     for ts in all_timestamps:
+        if global_cooldown_counter > 0:
+            global_cooldown_counter -= 1
+
         symbols_to_close = []
 
         for symbol, pos in list(active_positions.items()):
@@ -256,6 +265,15 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
+        # بررسی و فعال‌سازی میکرو-کول‌دان برای جلوگیری از زنجیره باخت بالای ۴
+        if len(all_trades) >= MAX_ALLOWABLE_CONSECUTIVE_LOSSES:
+            recent_outcomes = [t["Outcome"] for t in all_trades[-MAX_ALLOWABLE_CONSECUTIVE_LOSSES:]]
+            if all(o == "LOSS" for o in recent_outcomes):
+                global_cooldown_counter = GLOBAL_COOLDOWN_CANDLES
+
+        if global_cooldown_counter > 0:
+            continue
+
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
             btc_c = processed_data["BTC"].loc[ts]
@@ -294,7 +312,6 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
-            # فیلتر دقیق‌تر و پاکسازی نویزها برای کنترل زنجیره باخت زیر ۴
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"])
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.01
@@ -442,7 +459,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V87 REPORT", trades_df, equity_df)
+    report("HUNTER-V88 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
