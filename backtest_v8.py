@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V74-LSP - GLOBAL CIRCUIT BREAKER VERSION
+# HUNTER-V74-LSP - DIRECTIONAL CIRCUIT BREAKER VERSION
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -54,7 +54,7 @@ SYMBOLS = {
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
-MAX_POSITIONS = 5            # حفظ پوزیشن‌های اصلی برای نگهداری سود بالا
+MAX_POSITIONS = 5
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
@@ -76,9 +76,9 @@ LSP_PENALTY_2 = 2.00
 LSP_PENALTY_3_PLUS = 3.50
 GLOBAL_STREAK_PENALTY = 0.50
 
-# تنظیمات مدار فرمان کلان (Global Circuit Breaker)
-GLOBAL_CB_TRIGGER = 2        # پس از 2 ضرر متوالی در کل سبد
-GLOBAL_CB_COOLDOWN = 4       # 4 کندل (16 ساعت) توقف کامل ورود جدید
+# تنظیمات مدار فرمان جهت‌دار (Directional Circuit Breaker)
+DIR_CB_TRIGGER = 2           # پس از 2 ضرر متوالی در یک جهت خاص (مثلاً لانگ یا شورت)
+DIR_CB_COOLDOWN = 3          # 3 کندل (12 ساعت) توقف ورود در همان جهت خاص
 
 OUTPUT_DIR = "hunter_v74_lsp_output"
 
@@ -86,7 +86,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74-LSP - GLOBAL CIRCUIT BREAKER VERSION")
+print("HUNTER-V74-LSP - DIRECTIONAL CIRCUIT BREAKER VERSION")
 print("=" * 68)
 
 
@@ -596,22 +596,19 @@ def run_backtest(
 
     symbol_side_losses = defaultdict(int)
     global_loss_streak = 0
-    global_cb_cooldown = 0  # شمارشگر توقف کلان
+    
+    # متغیرهای قفل جهت‌دار (Directional Circuit Breaker)
+    dir_loss_streaks = {"LONG": 0, "SHORT": 0}
+    dir_cooldowns = {"LONG": 0, "SHORT": 0}
 
-    direction_loss_streak = {"LONG": 0, "SHORT": 0}
-    direction_cooldown = {"LONG": 0, "SHORT": 0}
-
-    firewall_loss_events = {"LONG": 0, "SHORT": 0}
-    firewall_locked = {"LONG": False, "SHORT": False}
-
-    SINGLE_LOSS_CROWD_MIN_OPEN = 3
     diagnostics = Counter()
     equity_curve = []
 
     for ts in all_timestamps:
-        # مدیریت زمان‌سنج قفل کلان
-        if global_cb_cooldown > 0:
-            global_cb_cooldown -= 1
+        # مدیریت زمان‌سنج کوهدون جهت‌ها
+        for s in ["LONG", "SHORT"]:
+            if dir_cooldowns[s] > 0:
+                dir_cooldowns[s] -= 1
 
         symbols_to_close = []
 
@@ -793,32 +790,36 @@ def run_backtest(
                 * 2
             )
 
+            p_side = pos["side"]
+
             if outcome == "LOSS":
                 global_loss_streak += 1
                 symbol_side_losses[
                     (
                         symbol,
-                        pos["side"],
+                        p_side,
                     )
                 ] += 1
                 
-                # اعمال قفل اضطراری کلان در صورت رسیدن به آستانه ضرر متوالی
-                if global_loss_streak >= GLOBAL_CB_TRIGGER:
-                    global_cb_cooldown = GLOBAL_CB_COOLDOWN
+                # به‌روزرسانی زنجیره ضرر جهت‌دار
+                dir_loss_streaks[p_side] += 1
+                if dir_loss_streaks[p_side] >= DIR_CB_TRIGGER:
+                    dir_cooldowns[p_side] = DIR_CB_COOLDOWN
             else:
                 global_loss_streak = 0
                 symbol_side_losses[
                     (
                         symbol,
-                        pos["side"],
+                        p_side,
                     )
                 ] = 0
+                dir_loss_streaks[p_side] = 0
 
             all_trades.append(
                 {
                     "Timestamp": ts,
                     "Symbol": symbol,
-                    "Side": pos["side"],
+                    "Side": p_side,
                     "Outcome": outcome,
                     "Return": r_real,
                     "Dollar_PnL": dollar_pnl,
@@ -846,10 +847,6 @@ def run_backtest(
             del active_positions[
                 sym
             ]
-
-        # اگر سیستم در حالت قفل کلان باشد، هیچ کاندید جدیدی بررسی نمی‌شود
-        if global_cb_cooldown > 0:
-            continue
 
         market_bull = True
 
@@ -901,12 +898,12 @@ def run_backtest(
         allow_longs = (
             market_breadth_ratio
             >= 0.35
-        )
+        ) and (dir_cooldowns["LONG"] == 0)   # اعمال فیلتر قفل جهت لانگ
 
         allow_shorts = (
             market_breadth_ratio
             <= 0.65
-        )
+        ) and (dir_cooldowns["SHORT"] == 0)  # اعمال فیلتر قفل جهت شورت
 
         candidates = build_valid_candidates(
             processed_data,
@@ -1226,7 +1223,7 @@ if __name__ == "__main__":
         use_single_loss_crowd=False
     )
 
-    perf = report("HUNTER-V74 GLOBAL CB REPORT", trades_df, equity_df)
+    perf = report("HUNTER-V74 DIRECTIONAL CB REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
