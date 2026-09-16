@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V90 - DYNAMIC EXPOSURE CONTROL (MAX LOSS STREAK < 4)
+# HUNTER-V91 - VOLATILITY-REGIME ADAPTIVE ENGINE (MAX LOSS STREAK < 4)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -54,15 +54,13 @@ SYMBOLS = {
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
-BASE_MAX_POSITIONS = 5
-MAX_ALLOWABLE_CONSECUTIVE_LOSSES = 3
-
+MAX_POSITIONS = 5
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-TRAILING_ATR_MULTIPLIER = 2.2
-INITIAL_ATR_MULTIPLIER = 1.8
+TRAILING_ATR_MULTIPLIER = 2.4
+INITIAL_ATR_MULTIPLIER = 2.0
 TIMEOUT_CANDLES = 40
 EMA_WARMUP = 200
 
@@ -70,13 +68,13 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-OUTPUT_DIR = "hunter_v90_output"
+OUTPUT_DIR = "hunter_v91_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V90 - DYNAMIC EXPOSURE CONTROL (MAX LOSS STREAK < 4)")
+print("HUNTER-V91 - VOLATILITY-REGIME ADAPTIVE ENGINE")
 print("=" * 68)
 
 
@@ -149,6 +147,7 @@ def fetch_symbol_data(lbank_symbol):
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
+    df["ATR_Pct"] = df["ATR"] / df["Close"]
 
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
@@ -258,12 +257,14 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # محاسبه هوشمند حداکثر پوزیشن‌های مجاز بر اساس زنجیره باخت فعلی
-        current_max_positions = BASE_MAX_POSITIONS
-        if len(all_trades) >= MAX_ALLOWABLE_CONSECUTIVE_LOSSES:
-            recent_outcomes = [t["Outcome"] for t in all_trades[-MAX_ALLOWABLE_CONSECUTIVE_LOSSES:]]
-            if all(o == "LOSS" for o in recent_outcomes):
-                current_max_positions = 1  # محدود کردن به ۱ پوزیشن تا زمان بازگشت به روند سودده
+        # تشخیص تعداد باخت‌های متوالی اخیر جهت تنظیم پویای گارد ریسک
+        current_consecutive_losses = 0
+        if len(all_trades) > 0:
+            for t in reversed(all_trades):
+                if t["Outcome"] == "LOSS":
+                    current_consecutive_losses += 1
+                else:
+                    break
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -303,26 +304,36 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
+            # فیلتر رژیم نوسانی بازار: جلوگیری از ورود در بازارهای بیش از حد پرنوسان یا کاملاً فلت
+            if c4h["ATR_Pct"] > 0.08 or c4h["ATR_Pct"] < 0.005:
+                continue
+
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"])
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.01) and (c4h["Mom_Long"] > 0.03)
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
                 side = "LONG"
             else:
                 regime_ok = (c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"])
                 pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.01) and (c4h["Mom_Long"] < -0.03)
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
                 side = "SHORT"
 
             if not valid_signal:
                 continue
 
             entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
-            initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"] if side == "LONG" else entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"]
+            
+            # تطبیق پویای ضریب استاپ‌لاس بر اساس زنجیره باخت قبلی برای محافظت در برابر استریک‌های بالا
+            dynamic_atr_mult = INITIAL_ATR_MULTIPLIER
+            if current_consecutive_losses >= 2:
+                dynamic_atr_mult = INITIAL_ATR_MULTIPLIER * 1.25
+
+            initial_sl = entry_price - dynamic_atr_mult * c4h["ATR"] if side == "LONG" else entry_price + dynamic_atr_mult * c4h["ATR"]
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.01 <= sl_dist_pct <= 0.04):
+            if not (0.012 <= sl_dist_pct <= 0.045):
                 continue
 
             candidates.append({
@@ -335,7 +346,7 @@ def run_backtest(processed_data):
                 "margin": float(BASE_TRADE_MARGIN),
             })
 
-        slots = current_max_positions - len(active_positions)
+        slots = MAX_POSITIONS - len(active_positions)
         if slots <= 0 or not candidates:
             continue
 
@@ -452,7 +463,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V90 REPORT", trades_df, equity_df)
+    report("HUNTER-V91 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
