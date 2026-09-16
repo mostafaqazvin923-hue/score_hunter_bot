@@ -882,6 +882,11 @@ def run_backtest(
                     "ExitOrder": len(
                         all_trades
                     ),
+                    # Diagnostic fields only; they do NOT affect execution.
+                    "EntryTimestamp": pos.get("entry_timestamp", pd.NaT),
+                    "EntryPrice": pos["entry_price"],
+                    "InitialStop": pos["initial_stop"],
+                    "ExitPrice": exit_p,
                     "LSP_Active": int(
                         use_lsp
                     ),
@@ -1758,6 +1763,10 @@ def run_lsp2(
                 "entry_price": candidate[
                     "entry_price"
                 ],
+                "initial_stop": candidate[
+                    "initial_sl"
+                ],
+                "entry_timestamp": ts,
                 "stop_loss": candidate[
                     "initial_sl"
                 ],
@@ -2315,116 +2324,162 @@ def print_comparison(
 
 
 # ============================================================
-# MAIN
+# ENHANCED LOSS-STREAK FORENSICS (DIAGNOSTIC ONLY)
+# ============================================================
+
+def enhanced_loss_streak_forensics(trades_df):
+    """
+    Diagnostic only. The V74 trading logic is NOT modified.
+
+    Produces two different streak measurements:
+      1) RAW: every losing trade in ExitOrder counts separately.
+      2) EVENT: all losses sharing the exact same exit timestamp count as
+         one loss event. This detects artificial streak inflation caused by
+         several positions closing on the same 4h candle.
+
+    Also prints the exact longest RAW streak trade-by-trade and the timestamp
+    clusters around it.
+    """
+    if trades_df.empty:
+        print("\nNo trades available for forensics.")
+        return
+
+    df = trades_df.copy()
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    if "EntryTimestamp" in df.columns:
+        df["EntryTimestamp"] = pd.to_datetime(df["EntryTimestamp"])
+    df = df.sort_values(["Timestamp", "ExitOrder"], kind="stable").reset_index(drop=True)
+
+    # ---------------- RAW streaks ----------------
+    sequences = []
+    cur = []
+    for _, row in df.iterrows():
+        if row["Outcome"] == "LOSS":
+            cur.append(row)
+        elif cur:
+            sequences.append(cur); cur = []
+    if cur:
+        sequences.append(cur)
+
+    max_raw = max((len(x) for x in sequences), default=0)
+    longest = next((x for x in sequences if len(x) == max_raw), [])
+
+    # ---------------- SAME-TIMESTAMP clusters ----------------
+    loss_df = df[df["Outcome"] == "LOSS"].copy()
+    clusters = (
+        loss_df.groupby("Timestamp", sort=True)
+        .agg(
+            Losses=("Outcome", "size"),
+            PnL=("Dollar_PnL", "sum"),
+            Symbols=("Symbol", lambda x: ",".join(map(str, x))),
+            Sides=("Side", lambda x: ",".join(map(str, x))),
+        )
+        .reset_index()
+    )
+
+    # ---------------- EVENT streaks ----------------
+    event_loss_flags = []
+    for _, g in df.groupby("Timestamp", sort=True):
+        event_loss_flags.append((g["Timestamp"].iloc[0], bool((g["Outcome"] == "LOSS").all())))
+
+    # Important: a timestamp is considered a LOSS EVENT only when ALL trades
+    # exiting at that timestamp are losses. A mixed timestamp breaks the raw
+    # sequence but is not itself a pure-loss event.
+    event_streaks = []
+    cur_events = []
+    for ts, all_loss in event_loss_flags:
+        if all_loss:
+            cur_events.append(ts)
+        else:
+            if cur_events:
+                event_streaks.append(cur_events); cur_events = []
+    if cur_events:
+        event_streaks.append(cur_events)
+    max_event = max((len(x) for x in event_streaks), default=0)
+
+    print("\n" + "=" * 76)
+    print("HUNTER-V74 — LOSS-STREAK FORENSICS (V74 CORE UNCHANGED)")
+    print("=" * 76)
+    print(f"Total trades                 : {len(df)}")
+    print(f"Raw maximum loss streak     : {max_raw}")
+    print(f"Pure-loss event max streak  : {max_event}")
+    print(f"Max losses on one 4h candle : {int(clusters['Losses'].max()) if not clusters.empty else 0}")
+
+    if not clusters.empty:
+        print("\nLOSS TIMESTAMP CLUSTERS — TOP 20")
+        top = clusters.sort_values(["Losses", "Timestamp"], ascending=[False, True]).head(20)
+        for _, r in top.iterrows():
+            print(f"{r['Timestamp']} | losses={int(r['Losses']):2d} | PnL=${float(r['PnL']):9,.2f} | {r['Symbols']} | {r['Sides']}")
+
+    print("\nLONGEST RAW STREAK — TRADE BY TRADE")
+    if not longest:
+        print("No losing streak found.")
+    else:
+        start_ts = longest[0]["Timestamp"]
+        end_ts = longest[-1]["Timestamp"]
+        print(f"Length={len(longest)} | {start_ts} -> {end_ts}")
+        for n, row in enumerate(longest, 1):
+            entry = row.get("EntryTimestamp", pd.NaT)
+            held = "?"
+            if pd.notna(entry):
+                held = str(row["Timestamp"] - entry)
+            print(
+                f"{n:2d}. EXIT={row['Timestamp']} | ENTRY={entry} | "
+                f"{str(row['Symbol']):8s} | {str(row['Side']):5s} | "
+                f"R={float(row['Return']):7.3f} | PnL=${float(row['Dollar_PnL']):9,.2f} | Held={held}"
+            )
+
+        streak_ts = pd.to_datetime([x["Timestamp"] for x in longest])
+        print("\nLONGEST STREAK — SAME-CANDLE ANALYSIS")
+        for ts in sorted(set(streak_ts)):
+            g = df[(df["Timestamp"] == ts) & (df["Outcome"] == "LOSS")]
+            print(f"{ts} | {len(g)} simultaneous loss(es) | {', '.join(g['Symbol'].astype(str))}")
+
+        print("\nLONGEST STREAK COMPOSITION")
+        print("Symbols:", ", ".join(f"{k}={v}" for k, v in Counter(x["Symbol"] for x in longest).most_common()))
+        print("Sides  :", ", ".join(f"{k}={v}" for k, v in Counter(x["Side"] for x in longest).most_common()))
+
+        if "EntryTimestamp" in df.columns:
+            entries = pd.to_datetime([x.get("EntryTimestamp") for x in longest])
+            valid_entries = [x for x in entries if pd.notna(x)]
+            if valid_entries:
+                print(f"Entry window: {min(valid_entries)} -> {max(valid_entries)}")
+
+    # Save machine-readable outputs for GitHub Actions artifacts.
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    df.to_csv(os.path.join(OUTPUT_DIR, "v74_baseline_trades_forensics.csv"), index=False)
+    clusters.to_csv(os.path.join(OUTPUT_DIR, "v74_loss_timestamp_clusters.csv"), index=False)
+    pd.DataFrame([{
+        "raw_max_loss_streak": max_raw,
+        "pure_loss_event_max_streak": max_event,
+        "max_losses_same_timestamp": int(clusters["Losses"].max()) if not clusters.empty else 0,
+        "total_trades": len(df),
+    }]).to_csv(os.path.join(OUTPUT_DIR, "v74_loss_streak_diagnostic_summary.csv"), index=False)
+
+    print("\nSaved forensic CSVs under:", OUTPUT_DIR)
+    print("IMPORTANT: No V74 entry/exit/filter/ranking parameter was changed by this diagnostic.")
+
+
+# ============================================================
+# MAIN — BASELINE ONLY + FORENSICS
 # ============================================================
 
 if __name__ == "__main__":
-    print(
-        "\nRunning EXACT V74 baseline..."
+    print("\nRunning EXACT V74 baseline for diagnostics only...")
+
+    baseline_trades, baseline_equity, baseline_diag = run_backtest(
+        processed_data,
+        use_lsp=False,
     )
 
-    baseline_trades, baseline_equity, baseline_diag = (
-        run_backtest(
-            processed_data,
-            use_lsp=False,
-        )
-    )
-
-    baseline_summary = report(
+    # Keep the normal V74 report so baseline numbers remain directly comparable.
+    report(
         "V74 BASELINE (UNCHANGED CORE)",
         baseline_trades,
         baseline_equity,
         baseline_diag,
     )
 
-    print(
-        "\nRunning V74-LSP..."
-    )
+    enhanced_loss_streak_forensics(baseline_trades)
 
-    lsp_trades, lsp_equity, lsp_diag = (
-        run_backtest(
-            processed_data,
-            use_lsp=True,
-        )
-    )
-
-    lsp_summary = report(
-        "V74-LSP (ONLY LOSS-STREAK PRIORITY SHIELD)",
-        lsp_trades,
-        lsp_equity,
-        lsp_diag,
-    )
-
-    print_comparison(
-        baseline_summary,
-        lsp_summary,
-    )
-
-    # --------------------------------------------------------
-    # FORENSICS:
-    # Find exactly where the 13-loss streak comes from.
-    # --------------------------------------------------------
-    loss_streak_forensics(
-        baseline_trades,
-        top_n=20,
-    )
-
-    # --------------------------------------------------------
-    # LSP2:
-    # Conservative adjacent-rank protection.
-    # --------------------------------------------------------
-    print(
-        "\nRunning V74-LSP2..."
-    )
-
-    lsp2_trades, lsp2_equity, lsp2_diag = (
-        run_lsp2(
-            processed_data
-        )
-    )
-
-    lsp2_summary = report(
-        "V74-LSP2 (CONSERVATIVE LOSS-CLUSTER SHIELD)",
-        lsp2_trades,
-        lsp2_equity,
-        lsp2_diag,
-    )
-
-    print_comparison(
-        baseline_summary,
-        lsp2_summary,
-    )
-
-    save_csvs(
-        baseline_trades,
-        baseline_equity,
-        lsp_trades,
-        lsp_equity,
-    )
-
-    os.makedirs(
-        OUTPUT_DIR,
-        exist_ok=True,
-    )
-
-    if not lsp2_trades.empty:
-        lsp2_trades.to_csv(
-            os.path.join(
-                OUTPUT_DIR,
-                "v74_lsp2_trades.csv",
-            ),
-            index=False,
-        )
-
-    if not lsp2_equity.empty:
-        lsp2_equity.to_csv(
-            os.path.join(
-                OUTPUT_DIR,
-                "v74_lsp2_equity.csv",
-            ),
-            index=False,
-        )
-
-    print(
-        "\nHUNTER-V74-LSP2 BACKTEST COMPLETE."
-    )
+    print("\nHUNTER-V74 LOSS-STREAK FORENSICS COMPLETE.")
