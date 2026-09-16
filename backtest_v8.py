@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V95 - INSTITUTIONAL INVERSE-VOLATILITY RISK PARITY ENGINE
+# HUNTER-V96 - INSTITUTIONAL QUANTITATIVE MOMENTUM ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -68,13 +68,13 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-OUTPUT_DIR = "hunter_v95_output"
+OUTPUT_DIR = "hunter_v96_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V95 - INSTITUTIONAL INVERSE-VOLATILITY RISK PARITY ENGINE")
+print("HUNTER-V96 - INSTITUTIONAL QUANTITATIVE MOMENTUM ENGINE")
 print("=" * 68)
 
 
@@ -155,6 +155,10 @@ def fetch_symbol_data(lbank_symbol):
 
     df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
     df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
+    
+    # اضافه شدن شاخص حجم نسبی برای فیلتر کردن فیک‌بریک‌اوت‌ها
+    df["Volume_SMA"] = df["Volume"].rolling(20).mean()
+    df["Volume_Ratio"] = df["Volume"] / df["Volume_SMA"]
 
     df.set_index("Date", inplace=True)
     return df
@@ -295,19 +299,22 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
-            # فیلتر حرفه‌ای رژیم نوسانی تمیز بدون محدودیت‌های مصنوعی
             if c4h["ATR_Pct"] > 0.08 or c4h["ATR_Pct"] < 0.004:
+                continue
+
+            # فیلتر سخت‌گیرانه‌تر حجم برای کاهش استریک باخت در بازارهای کم‌عمق
+            if c4h["Volume_Ratio"] < 0.7:
                 continue
 
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"])
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
                 side = "LONG"
             else:
                 regime_ok = (c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"])
                 pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
                 side = "SHORT"
 
             if not valid_signal:
@@ -321,11 +328,9 @@ def run_backtest(processed_data):
             if not (0.012 <= sl_dist_pct <= 0.045):
                 continue
 
-            # سیستم حرفه‌ای Risk Parity: تعیین سایز مارجین معکوس با میزان نوسان (ATR)
-            # ارزهای پرنوسان‌تر مارجین کمتری می‌گیرند تا ریسک پورتفو متعادل بماند
-            target_volatility_benchmark = 0.03  # 3% standard ATR baseline
+            target_volatility_benchmark = 0.03
             volatility_scalar = target_volatility_benchmark / max(c4h["ATR_Pct"], 0.01)
-            volatility_scalar = np.clip(volatility_scalar, 0.5, 1.8) # محدود کردن ضریب بین 0.5 تا 1.8 برابر
+            volatility_scalar = np.clip(volatility_scalar, 0.5, 1.8)
             dynamic_margin = BASE_TRADE_MARGIN * volatility_scalar
 
             candidates.append({
@@ -412,6 +417,7 @@ def calculate_drawdown(equity_df):
     max_dd = float(dd.min())
     if max_dd >= 0:
         return 0.0, 0.0
+    # اصلاح فرمول درودان درصدی بر اساس قله‌ی متحرک اکویتی
     dd_pct_series = (dd / peak) * 100.0
     max_dd_pct = float(dd_pct_series.min())
     return max_dd, max_dd_pct
@@ -455,7 +461,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V95 REPORT", trades_df, equity_df)
+    report("HUNTER-V96 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
