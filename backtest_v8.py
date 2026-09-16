@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V80 - COOLDOWN CIRCUIT BREAKER QUANTITATIVE VERSION
+# HUNTER-V81 - SURGICAL MOMENTUM OPTIMIZED VERSION
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -69,18 +69,13 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-# تعداد ضرر پشت سر هم برای اعمال تنفس
-MAX_ALLOWED_CONSECUTIVE_LOSSES = 2
-# تعداد کندل تنفس (مثلاً ۶ کندل ۴ ساعته = ۲۴ ساعت استراحت ربات)
-COOLDOWN_CANDLES = 6
-
-OUTPUT_DIR = "hunter_v80_quant_output"
+OUTPUT_DIR = "hunter_v81_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V80 - COOLDOWN CIRCUIT BREAKER QUANTITATIVE VERSION")
+print("HUNTER-V81 - SURGICAL MOMENTUM OPTIMIZED VERSION")
 print("=" * 68)
 
 
@@ -161,9 +156,13 @@ def fetch_symbol_data(lbank_symbol):
     df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
     df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
 
+    # فیلتر کیفیت روند ارتقایافته برای حذف سیگنال‌های فیک
     rolling_std = df["Close"].rolling(20).std()
     rolling_sma = df["Close"].rolling(20).mean()
     df["Trend_Quality"] = np.abs(df["Close"] - rolling_sma) / (rolling_std + 1e-9)
+
+    # میانگین حجم برای تایید قدرت نقدینگی
+    df["Volume_SMA"] = df["Volume"].rolling(20).mean()
 
     df.set_index("Date", inplace=True)
     return df
@@ -190,14 +189,7 @@ def run_backtest(processed_data):
     all_trades = []
     equity_curve = []
 
-    consecutive_losses = 0
-    cooldown_counter = 0  # شمارشگر کندل‌های تنفس
-
     for ts in all_timestamps:
-        # مدیریت تنفس (اگر ربات در حالت استراحت باشد، از شمارشگر کم می‌شود)
-        if cooldown_counter > 0:
-            cooldown_counter -= 1
-
         symbols_to_close = []
 
         for symbol, pos in list(active_positions.items()):
@@ -242,15 +234,6 @@ def run_backtest(processed_data):
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
             outcome = "WIN" if r_real > 0 else "LOSS"
-
-            if outcome == "LOSS":
-                consecutive_losses += 1
-                if consecutive_losses >= MAX_ALLOWED_CONSECUTIVE_LOSSES:
-                    cooldown_counter = COOLDOWN_CANDLES  # فعال کردن تنفس موقت
-            else:
-                consecutive_losses = 0
-                cooldown_counter = 0
-
             position_notional = margin * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
@@ -271,10 +254,6 @@ def run_backtest(processed_data):
 
         for sym in symbols_to_close:
             del active_positions[sym]
-
-        # اگر ربات در دوره تنفس باشد، ورود جدید ممنوع است اما بعد از اتمام کندل‌ها دوباره باز می‌شود
-        if cooldown_counter > 0:
-            continue
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -314,18 +293,19 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
-            if c4h["Trend_Quality"] < 0.8:
+            # فیلتر جراحی‌شده: سخت‌گیری روی کیفیت روند برای جلوگیری از ورود در پولبک‌های فیک
+            if c4h["Trend_Quality"] < 1.0 or c4h["Volume"] < c4h["Volume_SMA"] * 0.7:
                 continue
 
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"])
-                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
+                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.01
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
                 side = "LONG"
             else:
                 regime_ok = (c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"])
-                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
+                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.99
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
                 side = "SHORT"
 
             if not valid_signal:
@@ -336,7 +316,7 @@ def run_backtest(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.01 <= sl_dist_pct <= 0.04):
+            if not (0.01 <= sl_dist_pct <= 0.035):
                 continue
 
             volatility_scalar = min(1.5, max(0.6, 0.02 / sl_dist_pct))
@@ -466,7 +446,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V80 COOLDOWN REPORT", trades_df, equity_df)
+    report("HUNTER-V81 SURGICAL REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
