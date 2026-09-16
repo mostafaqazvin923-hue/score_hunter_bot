@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V98 - INSTITUTIONAL HEAT-CAPPED MOMENTUM ENGINE
+# HUNTER-V99 - HIGH-YIELD OPTIMIZED MOMENTUM ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -54,7 +54,7 @@ SYMBOLS = {
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
-MAX_POSITIONS = 4  # کاهش تعداد پوزیشن‌های همزمان برای کنترل بهتر حرارت پورتفو
+MAX_POSITIONS = 5  # بازگشت به ۵ پوزیشن همزمان برای پویایی بیشتر
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
@@ -65,16 +65,16 @@ TIMEOUT_CANDLES = 40
 EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 1000.0
-BASE_TRADE_MARGIN = 90.0
-BASE_LEVERAGE = 40.0  # تنظیم اهرم پایه برای استانداردسازی نهایی درودان
+BASE_TRADE_MARGIN = 110.0  # افزایش مارجین پایه برای بازگشت سود دلاری بالا
+BASE_LEVERAGE = 65.0      # اهرم بهینه‌شده برای ایجاد تعادل بین سود و کنترل درودان
 
-OUTPUT_DIR = "hunter_v98_output"
+OUTPUT_DIR = "hunter_v99_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V98 - INSTITUTIONAL HEAT-CAPPED MOMENTUM ENGINE")
+print("HUNTER-V99 - HIGH-YIELD OPTIMIZED MOMENTUM ENGINE")
 print("=" * 68)
 
 
@@ -329,11 +329,11 @@ def run_backtest(processed_data):
 
             target_volatility_benchmark = 0.03
             volatility_scalar = target_volatility_benchmark / max(c4h["ATR_Pct"], 0.01)
-            volatility_scalar = np.clip(volatility_scalar, 0.5, 1.5)
+            volatility_scalar = np.clip(volatility_scalar, 0.5, 1.8)
             dynamic_margin = BASE_TRADE_MARGIN * volatility_scalar
             
             dynamic_leverage = BASE_LEVERAGE * (0.03 / max(c4h["ATR_Pct"], 0.02))
-            dynamic_leverage = float(np.clip(dynamic_leverage, 15.0, 45.0))
+            dynamic_leverage = float(np.clip(dynamic_leverage, 20.0, 75.0))
 
             candidates.append({
                 "symbol": symbol,
@@ -464,7 +464,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V98 REPORT", trades_df, equity_df)
+    report("HUNTER-V99 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
