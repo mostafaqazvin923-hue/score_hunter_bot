@@ -2785,8 +2785,24 @@ if __name__ == "__main__":
 
     print("\nLONG-ONLY DIAGNOSTICS")
     print(f"SHORT candidates removed : {long_diag.get('long_only_removed_short_candidates', 0)}")
-    print(f"LONG trades               : {sum(1 for t in long_trades if t.get('Side') == 'LONG')}")
-    print(f"SHORT trades              : {sum(1 for t in long_trades if t.get('Side') == 'SHORT')}")
+    print(f"LONG trades               : {int((long_trades['Side'] == 'LONG').sum())}")
+    print(f"SHORT trades              : {int((long_trades['Side'] == 'SHORT').sum())}")
+
+    # Explicit per-symbol audit: total trades, wins, losses and win rate.
+    print("\nLONG-ONLY PER-SYMBOL DETAIL")
+    print("Symbol    | Trades | Wins | Losses | Win Rate | PnL")
+    print("-" * 64)
+    for symbol in SYMBOLS:
+        sdf = long_trades[long_trades['Symbol'] == symbol]
+        if sdf.empty:
+            print(f"{symbol:8s} |      0 |    0 |      0 |    0.00% | $       0.00")
+            continue
+        st = len(sdf)
+        sw = int((sdf['Outcome'] == 'WIN').sum())
+        sl = st - sw
+        swr = sw / st * 100.0
+        sp = float(sdf['Dollar_PnL'].sum())
+        print(f"{symbol:8s} | {st:6d} | {sw:4d} | {sl:6d} | {swr:8.2f}% | ${sp:12,.2f}")
 
     # Keep the forensic analysis on the actual Long-only result so we can
     # compare its loss-streak structure with the original V74 baseline.
