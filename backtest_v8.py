@@ -78,6 +78,21 @@ INITIAL_ATR_MULTIPLIER = 1.8
 TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
+# ============================================================
+# SHOCK / ACCELERATION SHIELD
+# ============================================================
+# This layer is intentionally conservative and only filters NEW entries.
+# V74 signal, ranking, SL, trailing, timeout and PnL mechanics remain intact.
+# It detects an unusually fast move AGAINST the proposed trade direction
+# using only information available at the current 4h candle.
+SHOCK_LOOKBACK_CANDLES = 2
+SHOCK_1BAR_ATR_MULT = 1.25
+SHOCK_2BAR_ATR_MULT = 2.00
+SHOCK_RANGE_ATR_MULT = 1.75
+SHOCK_BODY_FRACTION = 0.55
+SHOCK_REQUIRE_SCORE = 2
+SHOCK_BTC_CONFIRM_ATR_MULT = 1.50
+
 INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
@@ -650,6 +665,109 @@ def select_candidates_lsp(
     return selected
 
 
+def detect_shock_against_entry(processed_data, ts, candidate):
+    """
+    Conservative, causal shock detector.
+
+    Returns (blocked, reason, details). It never looks beyond `ts`.
+    A candidate is blocked only when at least SHOCK_REQUIRE_SCORE independent
+    signs indicate a fast move against the proposed direction.
+    """
+    symbol = candidate["symbol"]
+    side = candidate["side"]
+    df = processed_data[symbol]
+
+    if ts not in df.index:
+        return False, "", {}
+
+    i = df.index.get_loc(ts)
+    if i < 2:
+        return False, "", {}
+
+    c = df.iloc[i]
+    p1 = df.iloc[i - 1]
+    p2 = df.iloc[i - 2]
+
+    close = float(c["Close"])
+    if close <= 0 or not np.isfinite(close):
+        return False, "", {}
+
+    atr = float(c["ATR"])
+    atr_pct = atr / close if atr > 0 else 0.0
+    if atr_pct <= 0 or not np.isfinite(atr_pct):
+        return False, "", {}
+
+    r1 = float(c["Close"]) / float(p1["Close"]) - 1.0
+    r2 = float(c["Close"]) / float(p2["Close"]) - 1.0
+    candle_range = float(c["High"]) - float(c["Low"])
+    body = abs(float(c["Close"]) - float(c["Open"]))
+    body_fraction = body / candle_range if candle_range > 0 else 0.0
+
+    adverse = (
+        (side == "SHORT" and r1 > 0) or
+        (side == "LONG" and r1 < 0)
+    )
+    adverse2 = (
+        (side == "SHORT" and r2 > 0) or
+        (side == "LONG" and r2 < 0)
+    )
+
+    score = 0
+    reasons = []
+
+    if adverse and abs(r1) >= SHOCK_1BAR_ATR_MULT * atr_pct:
+        score += 1
+        reasons.append("1bar_impulse")
+
+    if adverse2 and abs(r2) >= SHOCK_2BAR_ATR_MULT * atr_pct:
+        score += 1
+        reasons.append("2bar_acceleration")
+
+    if (
+        adverse
+        and candle_range >= SHOCK_RANGE_ATR_MULT * atr
+        and body_fraction >= SHOCK_BODY_FRACTION
+    ):
+        score += 1
+        reasons.append("impulse_candle")
+
+    # BTC confirmation is deliberately normalized by BTC's own ATR so this
+    # remains scale-independent across market regimes.
+    btc_confirm = False
+    btc_r2 = np.nan
+    if "BTC" in processed_data and ts in processed_data["BTC"].index:
+        bdf = processed_data["BTC"]
+        bi = bdf.index.get_loc(ts)
+        if bi >= 2:
+            bc = bdf.iloc[bi]
+            bp2 = bdf.iloc[bi - 2]
+            btc_close = float(bc["Close"])
+            btc_atr = float(bc["ATR"])
+            btc_r2 = btc_close / float(bp2["Close"]) - 1.0
+            btc_atr_pct = btc_atr / btc_close if btc_atr > 0 else 0.0
+            if btc_atr_pct > 0:
+                btc_confirm = (
+                    (side == "SHORT" and btc_r2 >= SHOCK_BTC_CONFIRM_ATR_MULT * btc_atr_pct) or
+                    (side == "LONG" and btc_r2 <= -SHOCK_BTC_CONFIRM_ATR_MULT * btc_atr_pct)
+                )
+                if btc_confirm:
+                    score += 1
+                    reasons.append("btc_confirmation")
+
+    blocked = adverse and score >= SHOCK_REQUIRE_SCORE
+    details = {
+        "score": score,
+        "r1": r1,
+        "r2": r2,
+        "atr_pct": atr_pct,
+        "range_atr": candle_range / atr if atr > 0 else np.nan,
+        "body_fraction": body_fraction,
+        "btc_r2": btc_r2,
+        "reasons": reasons,
+    }
+    return blocked, "+".join(reasons), details
+
+
 # ============================================================
 # BACKTEST
 # ============================================================
@@ -658,6 +776,7 @@ def run_backtest(
     processed_data,
     use_lsp=False,
     use_lsp3=False,
+    use_shock_shield=False,
 ):
     all_timestamps = get_all_timestamps(
         processed_data
@@ -678,6 +797,7 @@ def run_backtest(
     direction_loss_streak = {"LONG": 0, "SHORT": 0}
     direction_cooldown = {"LONG": 0, "SHORT": 0}
     lsp3_trigger_log = []
+    shock_block_log = []
 
     diagnostics = Counter()
 
@@ -1096,6 +1216,38 @@ def run_backtest(
                             direction_cooldown[_side] -= 1
                 continue
 
+        # --------------------------------------------------------
+        # SHOCK / ACCELERATION SHIELD — NEW ENTRIES ONLY
+        # --------------------------------------------------------
+        if use_shock_shield and candidates:
+            kept_candidates = []
+            for c in candidates:
+                blocked, reason, details = detect_shock_against_entry(
+                    processed_data, ts, c
+                )
+                if blocked:
+                    diagnostics["shock_blocked_candidates"] += 1
+                    diagnostics[f"shock_blocked_{c['side'].lower()}_candidates"] += 1
+                    diagnostics["shock_block_events"] += 1
+                    shock_block_log.append({
+                        "Timestamp": ts,
+                        "Symbol": c["symbol"],
+                        "Side": c["side"],
+                        "Score": details.get("score", 0),
+                        "Reason": reason,
+                        "R1": details.get("r1"),
+                        "R2": details.get("r2"),
+                        "ATR_Pct": details.get("atr_pct"),
+                        "Range_ATR": details.get("range_atr"),
+                        "BodyFraction": details.get("body_fraction"),
+                        "BTC_R2": details.get("btc_r2"),
+                    })
+                else:
+                    kept_candidates.append(c)
+            if len(kept_candidates) != len(candidates):
+                diagnostics["shock_active_events"] += 1
+            candidates = kept_candidates
+
         slots = (
             MAX_POSITIONS
             - len(active_positions)
@@ -1249,6 +1401,8 @@ def run_backtest(
 
     if use_lsp3:
         diagnostics["lsp3_trigger_log"] = lsp3_trigger_log
+    if use_shock_shield:
+        diagnostics["shock_block_log"] = shock_block_log
 
     return (
         pd.DataFrame(all_trades),
@@ -2611,56 +2765,57 @@ if __name__ == "__main__":
         baseline_diag,
     )
 
-    print("\nRunning V74-LSP3 — HARD DIRECTIONAL LOSS-STREAK CIRCUIT BREAKER...")
-    lsp3_trades, lsp3_equity, lsp3_diag = run_backtest(
+    print("\nRunning V74 + SHOCK / ACCELERATION SHIELD...")
+    shock_trades, shock_equity, shock_diag = run_backtest(
         processed_data,
         use_lsp=False,
-        use_lsp3=True,
+        use_lsp3=False,
+        use_shock_shield=True,
     )
 
-    lsp3_summary = report(
-        "V74-LSP3 (DIRECTIONAL LOSS-STREAK CIRCUIT BREAKER)",
-        lsp3_trades,
-        lsp3_equity,
-        lsp3_diag,
+    shock_summary = report(
+        "V74 + SHOCK / ACCELERATION SHIELD",
+        shock_trades,
+        shock_equity,
+        shock_diag,
     )
 
     print("\n" + "=" * 68)
-    print("V74 BASELINE vs V74-LSP3")
+    print("V74 BASELINE vs SHOCK SHIELD")
     print("=" * 68)
-    if baseline_summary and lsp3_summary:
+    if baseline_summary and shock_summary:
         for metric in [
             "trades", "wr", "pnl", "net_r", "max_dd",
             "max_dd_pct", "max_loss_streak",
         ]:
             b = baseline_summary[metric]
-            v = lsp3_summary[metric]
-            print(f"{metric:20s} | V74={b:12.2f} | LSP3={v:12.2f} | Delta={v-b:12.2f}")
+            v = shock_summary[metric]
+            print(f"{metric:20s} | V74={b:12.2f} | SHIELD={v:12.2f} | Delta={v-b:12.2f}")
 
-    print("\nLSP3 DIAGNOSTICS")
-    print(f"Trigger streak       : {LSP3_TRIGGER_STREAK} same-direction losses")
-    print(f"Cooldown             : {LSP3_COOLDOWN_CANDLES} candles (16h)")
-    print(f"Trigger events       : {lsp3_diag.get('lsp3_trigger_events', 0)}")
-    print(f"  LONG triggers      : {lsp3_diag.get('lsp3_long_trigger_events', 0)}")
-    print(f"  SHORT triggers     : {lsp3_diag.get('lsp3_short_trigger_events', 0)}")
-    print(f"Blocked candidates   : {lsp3_diag.get('lsp3_blocked_candidates', 0)}")
-    print(f"  LONG candidates    : {lsp3_diag.get('lsp3_blocked_long_candidates', 0)}")
-    print(f"  SHORT candidates   : {lsp3_diag.get('lsp3_blocked_short_candidates', 0)}")
-    print(f"Blocked entry events : {lsp3_diag.get('lsp3_blocked_entry_events', 0)}")
-    print(f"  LONG entry events  : {lsp3_diag.get('lsp3_blocked_long_entry_events', 0)}")
-    print(f"  SHORT entry events : {lsp3_diag.get('lsp3_blocked_short_entry_events', 0)}")
-    print(f"WIN reset events    : {lsp3_diag.get('lsp3_win_reset_events', 0)}")
-    if lsp3_diag.get("lsp3_trigger_events", 0):
-        print("\nLSP3 TRIGGERS")
-        for ev in lsp3_diag.get("lsp3_trigger_log", []):
+    print("\nSHOCK SHIELD DIAGNOSTICS")
+    print(f"Required score      : {SHOCK_REQUIRE_SCORE}")
+    print(f"1-bar threshold     : {SHOCK_1BAR_ATR_MULT:.2f} ATR")
+    print(f"2-bar threshold     : {SHOCK_2BAR_ATR_MULT:.2f} ATR")
+    print(f"Impulse range       : {SHOCK_RANGE_ATR_MULT:.2f} ATR")
+    print(f"Body fraction       : {SHOCK_BODY_FRACTION:.2f}")
+    print(f"Blocked candidates  : {shock_diag.get('shock_blocked_candidates', 0)}")
+    print(f"  LONG              : {shock_diag.get('shock_blocked_long_candidates', 0)}")
+    print(f"  SHORT             : {shock_diag.get('shock_blocked_short_candidates', 0)}")
+    print(f"Block events        : {shock_diag.get('shock_block_events', 0)}")
+
+    if shock_diag.get("shock_block_log"):
+        print("\nSHOCK BLOCKS — FIRST 100")
+        for ev in shock_diag["shock_block_log"][:100]:
             print(
-                f"{ev['Timestamp']} | {ev['Side']:5s} | "
-                f"event_streak={ev['LossEventStreak']} | "
-                f"cooldown={ev['CooldownCandles']} candles"
+                f"{ev['Timestamp']} | {ev['Symbol']:7s} | {ev['Side']:5s} | "
+                f"score={ev['Score']} | {ev['Reason']} | "
+                f"R1={ev['R1']:.4f} R2={ev['R2']:.4f} "
+                f"ATR%={ev['ATR_Pct']:.4f} RangeATR={ev['Range_ATR']:.2f} "
+                f"BTC_R2={ev['BTC_R2']:.4f}"
             )
 
     print("IMPORTANT: V74 signal/filter/ranking/ATR/SL/trailing/timeout logic is unchanged.")
-    print("LSP3 only blocks NEW entries while the directional circuit breaker is active.")
+    print("SHOCK SHIELD only blocks NEW entries when a causal adverse acceleration is detected.")
 
     enhanced_loss_streak_forensics(baseline_trades)
 
