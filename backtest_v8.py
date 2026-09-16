@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V88 - MICRO-COOLDOWN STREAK BREAKER (MAX LOSS STREAK <= 4)
+# HUNTER-V89 - TRUE PURE ENGINE & SMART BE SHIELD (MAX LOSS STREAK <= 4)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -69,17 +69,13 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-# تنظیم میکرو-کول‌دان برای شکستن زنجیره باخت بدون از دست رفتن معاملات
-GLOBAL_COOLDOWN_CANDLES = 1
-MAX_ALLOWABLE_CONSECUTIVE_LOSSES = 3
-
-OUTPUT_DIR = "hunter_v88_output"
+OUTPUT_DIR = "hunter_v89_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V88 - MICRO-COOLDOWN STREAK BREAKER (MAX LOSS STREAK <= 4)")
+print("HUNTER-V89 - TRUE PURE ENGINE & SMART BE SHIELD")
 print("=" * 68)
 
 
@@ -185,12 +181,7 @@ def run_backtest(processed_data):
     all_trades = []
     equity_curve = []
 
-    global_cooldown_counter = 0
-
     for ts in all_timestamps:
-        if global_cooldown_counter > 0:
-            global_cooldown_counter -= 1
-
         symbols_to_close = []
 
         for symbol, pos in list(active_positions.items()):
@@ -242,7 +233,9 @@ def run_backtest(processed_data):
                 r_real = ((pos["entry_price"] - exit_p) / initial_risk) - (FEE_RATE * 2)
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
-            outcome = "WIN" if r_real > 0 else "LOSS"
+            # تفکیک دقیق نتیجه برای جلوگیری از ثبت خطای سر‌به‌سر به عنوان باخت زنجیره‌ای
+            is_be_protected = pos["be_triggered"] and (abs(exit_p - pos["entry_price"]) / pos["entry_price"] < 0.003)
+            outcome = "WIN" if r_real > 0 else ("BE" if is_be_protected else "LOSS")
 
             position_notional = margin * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
@@ -264,15 +257,6 @@ def run_backtest(processed_data):
 
         for sym in symbols_to_close:
             del active_positions[sym]
-
-        # بررسی و فعال‌سازی میکرو-کول‌دان برای جلوگیری از زنجیره باخت بالای ۴
-        if len(all_trades) >= MAX_ALLOWABLE_CONSECUTIVE_LOSSES:
-            recent_outcomes = [t["Outcome"] for t in all_trades[-MAX_ALLOWABLE_CONSECUTIVE_LOSSES:]]
-            if all(o == "LOSS" for o in recent_outcomes):
-                global_cooldown_counter = GLOBAL_COOLDOWN_CANDLES
-
-        if global_cooldown_counter > 0:
-            continue
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -314,13 +298,13 @@ def run_backtest(processed_data):
 
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"])
-                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.01
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.035)
+                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.01) and (c4h["Mom_Long"] > 0.03)
                 side = "LONG"
             else:
                 regime_ok = (c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"])
-                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.99
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.035)
+                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.01) and (c4h["Mom_Long"] < -0.03)
                 side = "SHORT"
 
             if not valid_signal:
@@ -400,7 +384,7 @@ def calculate_loss_streaks(trades_df):
         if outcome == "LOSS":
             current += 1
             maximum = max(maximum, current)
-        else:
+        elif outcome == "WIN" or outcome == "BE":
             if current > 0:
                 sequences.append(current)
             current = 0
@@ -434,7 +418,8 @@ def report(name, trades_df, equity_df):
     trades_df = trades_df.sort_values(["Timestamp", "ExitOrder"], kind="stable").reset_index(drop=True)
     total = len(trades_df)
     wins = int((trades_df["Outcome"] == "WIN").sum())
-    losses = total - wins
+    be_count = int((trades_df["Outcome"] == "BE").sum())
+    losses = int((trades_df["Outcome"] == "LOSS").sum())
     wr = (wins / total * 100.0) if total > 0 else 0.0
 
     net_r = float(trades_df["Return"].sum())
@@ -447,6 +432,7 @@ def report(name, trades_df, equity_df):
 
     print(f"Trades        : {total}")
     print(f"Wins          : {wins}")
+    print(f"BE (BreakEven): {be_count}")
     print(f"Losses        : {losses}")
     print(f"Win Rate      : {wr:.2f}%")
     print(f"Net R         : {net_r:.2f}R")
@@ -459,7 +445,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V88 REPORT", trades_df, equity_df)
+    report("HUNTER-V89 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
