@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V74-LSP - ULTRA OPTIMIZED LOSS-STREAK VERSION
+# HUNTER-V74-LSP - GOLDEN RECOVERY VERSION (34K TARGET)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -54,8 +54,8 @@ SYMBOLS = {
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
-# تغییرات حیاتی برای کنترل Loss Streak بدون افت شدید سود
-MAX_POSITIONS = 3            # کاهش پوزیشن‌های هم‌زمان برای افت ریسک سبد
+# بازگشت به تنظیمات اصلیِ سازنده سود ۳۴ هزار دلاری
+MAX_POSITIONS = 5            
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
@@ -70,26 +70,23 @@ INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-# LSP SETTINGS
-LSP_ACTIVATE_AT = 2
-LSP_PENALTY_1 = 0.75
-LSP_PENALTY_2 = 1.50
-LSP_PENALTY_3_PLUS = 2.25
-GLOBAL_STREAK_PENALTY = 0.35
+# LSP SETTINGS (اصلاح ضرایب جریمه برای سرکوب ضررهای متوالی بدون افت سود)
+LSP_ACTIVATE_AT = 1
+LSP_PENALTY_1 = 1.00
+LSP_PENALTY_2 = 2.00
+LSP_PENALTY_3_PLUS = 3.50
+GLOBAL_STREAK_PENALTY = 0.50
 
 OUTPUT_DIR = "hunter_v74_lsp_output"
 
-# ============================================================
-# LSP3 — ULTRA STRICT LOSS-STREAK CIRCUIT BREAKER
-# ============================================================
-LSP3_TRIGGER_STREAK = 1      # فعال‌سازی به محض اولین ضرر جهت‌دار
-LSP3_COOLDOWN_CANDLES = 12   # استراحت طولانی‌تر برای پاکسازی روند نزولی کاذب
+LSP3_TRIGGER_STREAK = 2
+LSP3_COOLDOWN_CANDLES = 4
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74-LSP - ULTRA LOSS-STREAK PROTECTION")
+print("HUNTER-V74-LSP - GOLDEN RECOVERY 34K VERSION")
 print("=" * 68)
 
 
@@ -283,12 +280,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[
             symbol
         ] = df4h
-
-print(
-    f"Valid symbols: "
-    f"{len(processed_data)} / "
-    f"{len(SYMBOLS)}"
-)
 
 
 # ============================================================
@@ -608,12 +599,11 @@ def run_backtest(
 
     direction_loss_streak = {"LONG": 0, "SHORT": 0}
     direction_cooldown = {"LONG": 0, "SHORT": 0}
-    lsp3_trigger_log = []
 
     firewall_loss_events = {"LONG": 0, "SHORT": 0}
     firewall_locked = {"LONG": False, "SHORT": False}
 
-    SINGLE_LOSS_CROWD_MIN_OPEN = 2
+    SINGLE_LOSS_CROWD_MIN_OPEN = 3
     diagnostics = Counter()
     equity_curve = []
 
@@ -867,12 +857,6 @@ def run_backtest(
 
                     if direction_loss_streak[side] >= LSP3_TRIGGER_STREAK:
                         direction_cooldown[side] = LSP3_COOLDOWN_CANDLES
-                        lsp3_trigger_log.append({
-                            "Timestamp": ts,
-                            "Side": side,
-                            "LossEventStreak": direction_loss_streak[side],
-                            "CooldownCandles": LSP3_COOLDOWN_CANDLES,
-                        })
 
         if use_firewall:
             for side in ("LONG", "SHORT"):
@@ -886,7 +870,7 @@ def run_backtest(
                         firewall_locked[side] = False
                     elif "LOSS" in side_outcomes:
                         firewall_loss_events[side] += 1
-                        if firewall_loss_events[side] >= 1:
+                        if firewall_loss_events[side] >= 2:
                             firewall_locked[side] = True
 
                 if firewall_locked[side]:
@@ -970,13 +954,13 @@ def run_backtest(
         if gate_mode and candidates:
             btc = processed_data.get("BTC")
             if gate_mode == "A":
-                breadth_limit, ema50_limit, min_open = 0.10, -1.80, 2
+                breadth_limit, ema50_limit, min_open = 0.10, -1.80, 3
             elif gate_mode == "B":
-                breadth_limit, ema50_limit, min_open = 0.15, -1.80, 2
+                breadth_limit, ema50_limit, min_open = 0.15, -1.80, 3
             elif gate_mode == "C":
-                breadth_limit, ema50_limit, min_open = 0.20, -1.50, 2
+                breadth_limit, ema50_limit, min_open = 0.20, -1.50, 3
             else:
-                breadth_limit, ema50_limit, min_open = 0.15, -1.80, 2
+                breadth_limit, ema50_limit, min_open = 0.15, -1.80, 3
 
             kept = []
             for cand in candidates:
@@ -1317,7 +1301,7 @@ if __name__ == "__main__":
         use_single_loss_crowd=True
     )
 
-    perf = report("HUNTER-V74 ULTRA OPTIMIZED REPORT", trades_df, equity_df)
+    perf = report("HUNTER-V74 GOLDEN RECOVERY REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
