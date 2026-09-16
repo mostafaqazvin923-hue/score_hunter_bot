@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V96 - INSTITUTIONAL QUANTITATIVE MOMENTUM ENGINE
+# HUNTER-V97 - DYNAMIC LEVERAGE & QUANTITATIVE MOMENTUM ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -66,15 +66,15 @@ EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
-LEVERAGE = 80.0
+BASE_LEVERAGE = 50.0  # اهرم پایه بهینه‌شده برای جلوگیری از انحراف درودان
 
-OUTPUT_DIR = "hunter_v96_output"
+OUTPUT_DIR = "hunter_v97_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V96 - INSTITUTIONAL QUANTITATIVE MOMENTUM ENGINE")
+print("HUNTER-V97 - DYNAMIC LEVERAGE & QUANTITATIVE MOMENTUM ENGINE")
 print("=" * 68)
 
 
@@ -156,7 +156,6 @@ def fetch_symbol_data(lbank_symbol):
     df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
     df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
     
-    # اضافه شدن شاخص حجم نسبی برای فیلتر کردن فیک‌بریک‌اوت‌ها
     df["Volume_SMA"] = df["Volume"].rolling(20).mean()
     df["Volume_Ratio"] = df["Volume"] / df["Volume_SMA"]
 
@@ -184,6 +183,7 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     equity_curve = []
+    current_capital = INITIAL_CAPITAL
 
     for ts in all_timestamps:
         symbols_to_close = []
@@ -227,6 +227,7 @@ def run_backtest(processed_data):
 
             initial_risk = pos["initial_risk"]
             margin = pos["margin"]
+            leverage = pos["leverage"]
 
             if pos["side"] == "LONG":
                 exit_p = min(pos["stop_loss"], c4h["Open"]) if hit_sl else c4h["Close"]
@@ -240,7 +241,7 @@ def run_backtest(processed_data):
             is_be_protected = pos["be_triggered"] and (abs(exit_p - pos["entry_price"]) / pos["entry_price"] < 0.003)
             outcome = "WIN" if r_real > 0 else ("BE" if is_be_protected else "LOSS")
 
-            position_notional = margin * LEVERAGE
+            position_notional = margin * leverage
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
             all_trades.append({
@@ -302,7 +303,6 @@ def run_backtest(processed_data):
             if c4h["ATR_Pct"] > 0.08 or c4h["ATR_Pct"] < 0.004:
                 continue
 
-            # فیلتر سخت‌گیرانه‌تر حجم برای کاهش استریک باخت در بازارهای کم‌عمق
             if c4h["Volume_Ratio"] < 0.7:
                 continue
 
@@ -328,10 +328,15 @@ def run_backtest(processed_data):
             if not (0.012 <= sl_dist_pct <= 0.045):
                 continue
 
+            # سیستم اهرم پویا بر اساس نوسان و شرایط پورتفو
             target_volatility_benchmark = 0.03
             volatility_scalar = target_volatility_benchmark / max(c4h["ATR_Pct"], 0.01)
             volatility_scalar = np.clip(volatility_scalar, 0.5, 1.8)
             dynamic_margin = BASE_TRADE_MARGIN * volatility_scalar
+            
+            # کاهش هوشمند اهرم در نوسانات شدید بازار برای تثبیت درصد Drawdown
+            dynamic_leverage = BASE_LEVERAGE * (0.03 / max(c4h["ATR_Pct"], 0.02))
+            dynamic_leverage = float(np.clip(dynamic_leverage, 20.0, 60.0))
 
             candidates.append({
                 "symbol": symbol,
@@ -341,6 +346,7 @@ def run_backtest(processed_data):
                 "initial_risk": float(initial_risk),
                 "entry_index": int(i),
                 "margin": float(dynamic_margin),
+                "leverage": float(dynamic_leverage),
             })
 
         slots = MAX_POSITIONS - len(active_positions)
@@ -360,6 +366,7 @@ def run_backtest(processed_data):
                 "lowest_price": candidate["entry_price"],
                 "initial_risk": candidate["initial_risk"],
                 "margin": candidate["margin"],
+                "leverage": candidate["leverage"],
                 "entry_index": candidate["entry_index"],
                 "be_triggered": False,
             }
@@ -372,9 +379,9 @@ def run_backtest(processed_data):
                 continue
             close_price = df.loc[ts, "Close"]
             if pos["side"] == "LONG":
-                unrealized += (close_price - pos["entry_price"]) * (pos["margin"] * LEVERAGE / pos["entry_price"])
+                unrealized += (close_price - pos["entry_price"]) * (pos["margin"] * pos["leverage"] / pos["entry_price"])
             else:
-                unrealized += (pos["entry_price"] - close_price) * (pos["margin"] * LEVERAGE / pos["entry_price"])
+                unrealized += (pos["entry_price"] - close_price) * (pos["margin"] * pos["leverage"] / pos["entry_price"])
 
         equity_curve.append({
             "Timestamp": ts,
@@ -417,7 +424,6 @@ def calculate_drawdown(equity_df):
     max_dd = float(dd.min())
     if max_dd >= 0:
         return 0.0, 0.0
-    # اصلاح فرمول درودان درصدی بر اساس قله‌ی متحرک اکویتی
     dd_pct_series = (dd / peak) * 100.0
     max_dd_pct = float(dd_pct_series.min())
     return max_dd, max_dd_pct
@@ -461,7 +467,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V96 REPORT", trades_df, equity_df)
+    report("HUNTER-V97 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
