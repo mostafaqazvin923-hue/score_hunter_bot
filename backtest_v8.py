@@ -106,6 +106,13 @@ LOSS_REGIME_SYMBOL_ADVERSE_ATR = 1.50
 LOSS_REGIME_BEAR_BREADTH = 0.35
 LOSS_REGIME_BULL_BREADTH = 0.65
 
+# Correlated-loss cluster control: only engages after repeated losses in
+# one direction AND when several fresh candidates want the same direction.
+# It keeps the best-ranked candidate(s) instead of deleting the V74 signal rules.
+CLUSTER_LOSS_TRIGGER = 2
+CLUSTER_MIN_SAME_SIDE = 3
+CLUSTER_KEEP_AFTER_TRIGGER = 1
+
 INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
@@ -876,6 +883,7 @@ def run_backtest(
     use_shock_shield=False,
     long_only=False,
     use_loss_regime_shield=False,
+    use_cluster_control=False,
 ):
     all_timestamps = get_all_timestamps(
         processed_data
@@ -902,6 +910,10 @@ def run_backtest(
     shock_block_log = []
 
     diagnostics = Counter()
+    diagnostics["cluster_control_events"] = 0
+    diagnostics["cluster_control_blocked_long"] = 0
+    diagnostics["cluster_control_blocked_short"] = 0
+    diagnostics["cluster_control_block_log"] = []
 
     equity_curve = []
 
@@ -1408,6 +1420,14 @@ def run_backtest(
                 diagnostics["loss_regime_active_events"] += 1
                 diagnostics["loss_regime_blocked_entry_events"] += 1
             candidates = kept_candidates
+
+        # --------------------------------------------------------
+        # CORRELATED LOSS CLUSTER CONTROL — NEW ENTRIES ONLY
+        # --------------------------------------------------------
+        if use_cluster_control and candidates:
+            candidates = apply_correlated_loss_cluster_control(
+                candidates, loss_regime_streak, active_positions, diagnostics, ts
+            )
 
         slots = (
             MAX_POSITIONS
@@ -2909,17 +2929,71 @@ def enhanced_loss_streak_forensics(trades_df):
 
 
 # ============================================================
+# CORRELATED LOSS CLUSTER CONTROL
+# ============================================================
+def apply_correlated_loss_cluster_control(candidates, direction_loss_streak,
+                                           active_positions, diagnostics, ts):
+    """
+    Prevent repeated directional clustering without changing V74 signals.
+
+    This is deliberately narrower than a direction cooldown:
+      * only activates after >= 2 completed loss events in that direction;
+      * only activates when >= 3 NEW candidates want that same direction;
+      * keeps the highest-ranked candidate for that direction;
+      * never touches existing positions or exit logic.
+
+    Ranking is already established by V74 before this function is called, so
+    keeping candidates[:N] preserves the original V74 preference ordering.
+    """
+    if not candidates:
+        return candidates
+
+    out = []
+    by_side = {"LONG": [], "SHORT": []}
+    for c in candidates:
+        by_side.get(c.get("side"), []).append(c)
+
+    blocked = []
+    for side in ("LONG", "SHORT"):
+        group = by_side[side]
+        streak = int(direction_loss_streak.get(side, 0))
+        if streak >= CLUSTER_LOSS_TRIGGER and len(group) >= CLUSTER_MIN_SAME_SIDE:
+            keep_n = min(CLUSTER_KEEP_AFTER_TRIGGER, len(group))
+            kept = group[:keep_n]
+            out.extend(kept)
+            blocked.extend(group[keep_n:])
+            diagnostics["cluster_control_events"] += 1
+            diagnostics[f"cluster_control_blocked_{side.lower()}"] += len(group) - keep_n
+            for c in group[keep_n:]:
+                diagnostics["cluster_control_block_log"].append({
+                    "Timestamp": ts,
+                    "Symbol": c.get("symbol"),
+                    "Side": side,
+                    "LossEventStreak": streak,
+                    "SameSideCandidates": len(group),
+                    "Action": "BLOCK_CORRELATED_CLUSTER",
+                })
+        else:
+            out.extend(group)
+
+    # Preserve V74 candidate ordering as much as possible.
+    rank = {id(c): i for i, c in enumerate(candidates)}
+    out.sort(key=lambda c: rank[id(c)])
+    return out
+
+
+# ============================================================
 # MAIN — TWO-SIDED V74 + LOSS-REGIME SHIELD TEST
 # ============================================================
 
 if __name__ == "__main__":
     print("\n" + "=" * 76)
-    print("HUNTER-V74 — TWO-SIDED LOSS-REGIME SHIELD TEST")
+    print("HUNTER-V74 — TWO-SIDED CORRELATED LOSS CLUSTER CONTROL TEST")
     print("=" * 76)
     print("BASELINE = EXACT V74 LONG + SHORT CORE")
-    print("TEST     = EXACT V74 CORE + NARROW LOSS-REGIME SHIELD")
-    print("The shield only blocks NEW entries after repeated directional losses")
-    print("when fresh acceleration + breadth show that direction is being contradicted.")
+    print("TEST     = EXACT V74 CORE + CORRELATED LOSS CLUSTER CONTROL")
+    print("The control only limits NEW same-direction clusters after repeated losses.")
+    print("It keeps the best-ranked V74 candidate and leaves exits/positions untouched.")
     print("No signal / ranking / ATR-SL / trailing / timeout / sizing parameter is changed.")
     print("=" * 76)
 
@@ -2930,6 +3004,7 @@ if __name__ == "__main__":
         use_shock_shield=False,
         long_only=False,
         use_loss_regime_shield=False,
+        use_cluster_control=False,
     )
 
     shield_trades, shield_equity, shield_diag = run_backtest(
@@ -2938,7 +3013,8 @@ if __name__ == "__main__":
         use_lsp3=False,
         use_shock_shield=False,
         long_only=False,
-        use_loss_regime_shield=True,
+        use_loss_regime_shield=False,
+        use_cluster_control=True,
     )
 
     baseline_summary = report(
@@ -2949,7 +3025,7 @@ if __name__ == "__main__":
     )
 
     shield_summary = report(
-        "V74 + LOSS-REGIME SHIELD — TWO SIDED",
+        "V74 + CORRELATED CLUSTER CONTROL — TWO SIDED",
         shield_trades,
         shield_equity,
         shield_diag,
@@ -2981,11 +3057,11 @@ if __name__ == "__main__":
             else:
                 print(f"{metric:28s} {b:14.2f} {v:14.2f} {d:14.2f}")
 
-    print("\nLOSS-REGIME SHIELD DIAGNOSTICS")
-    print(f"Blocked candidates : {shield_diag.get('loss_regime_blocked_candidates', 0)}")
-    print(f"Blocked LONG       : {shield_diag.get('loss_regime_blocked_long_candidates', 0)}")
-    print(f"Blocked SHORT      : {shield_diag.get('loss_regime_blocked_short_candidates', 0)}")
-    print(f"Active entry events: {shield_diag.get('loss_regime_blocked_entry_events', 0)}")
+    print("\nCORRELATED CLUSTER CONTROL DIAGNOSTICS")
+    print(f"Blocked LONG       : {shield_diag.get('cluster_control_blocked_long', 0)}")
+    print(f"Blocked SHORT      : {shield_diag.get('cluster_control_blocked_short', 0)}")
+    print(f"Blocked TOTAL      : {shield_diag.get('cluster_control_blocked_long', 0) + shield_diag.get('cluster_control_blocked_short', 0)}")
+    print(f"Control events     : {shield_diag.get('cluster_control_events', 0)}")
 
     # Explicit per-symbol audit for the TEST result.
     print("\nSHIELD PER-SYMBOL DETAIL")
@@ -3023,14 +3099,14 @@ if __name__ == "__main__":
         shield_trades,
         shield_equity,
     )
-    if shield_diag.get("loss_regime_block_log"):
-        pd.DataFrame(shield_diag["loss_regime_block_log"]).to_csv(
-            os.path.join(OUTPUT_DIR, "loss_regime_shield_blocks.csv"),
+    if shield_diag.get("cluster_control_block_log"):
+        pd.DataFrame(shield_diag["cluster_control_block_log"]).to_csv(
+            os.path.join(OUTPUT_DIR, "correlated_cluster_control_blocks.csv"),
             index=False,
         )
 
     print("\n" + "=" * 76)
-    print("TWO-SIDED LOSS-REGIME SHIELD TEST COMPLETE")
+    print("TWO-SIDED CORRELATED LOSS CLUSTER CONTROL TEST COMPLETE")
     print("=" * 76)
     print("Use the DIRECT COMPARISON + both forensics sections to judge whether")
     print("the shield reduces consecutive losses without materially changing")
