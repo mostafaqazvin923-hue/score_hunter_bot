@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V89 - TRUE PURE ENGINE & SMART BE SHIELD (MAX LOSS STREAK <= 4)
+# HUNTER-V90 - DYNAMIC EXPOSURE CONTROL (MAX LOSS STREAK < 4)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -54,7 +54,8 @@ SYMBOLS = {
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
-MAX_POSITIONS = 5
+BASE_MAX_POSITIONS = 5
+MAX_ALLOWABLE_CONSECUTIVE_LOSSES = 3
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
@@ -69,13 +70,13 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-OUTPUT_DIR = "hunter_v89_output"
+OUTPUT_DIR = "hunter_v90_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V89 - TRUE PURE ENGINE & SMART BE SHIELD")
+print("HUNTER-V90 - DYNAMIC EXPOSURE CONTROL (MAX LOSS STREAK < 4)")
 print("=" * 68)
 
 
@@ -233,7 +234,6 @@ def run_backtest(processed_data):
                 r_real = ((pos["entry_price"] - exit_p) / initial_risk) - (FEE_RATE * 2)
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
-            # تفکیک دقیق نتیجه برای جلوگیری از ثبت خطای سر‌به‌سر به عنوان باخت زنجیره‌ای
             is_be_protected = pos["be_triggered"] and (abs(exit_p - pos["entry_price"]) / pos["entry_price"] < 0.003)
             outcome = "WIN" if r_real > 0 else ("BE" if is_be_protected else "LOSS")
 
@@ -257,6 +257,13 @@ def run_backtest(processed_data):
 
         for sym in symbols_to_close:
             del active_positions[sym]
+
+        # محاسبه هوشمند حداکثر پوزیشن‌های مجاز بر اساس زنجیره باخت فعلی
+        current_max_positions = BASE_MAX_POSITIONS
+        if len(all_trades) >= MAX_ALLOWABLE_CONSECUTIVE_LOSSES:
+            recent_outcomes = [t["Outcome"] for t in all_trades[-MAX_ALLOWABLE_CONSECUTIVE_LOSSES:]]
+            if all(o == "LOSS" for o in recent_outcomes):
+                current_max_positions = 1  # محدود کردن به ۱ پوزیشن تا زمان بازگشت به روند سودده
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -328,7 +335,7 @@ def run_backtest(processed_data):
                 "margin": float(BASE_TRADE_MARGIN),
             })
 
-        slots = MAX_POSITIONS - len(active_positions)
+        slots = current_max_positions - len(active_positions)
         if slots <= 0 or not candidates:
             continue
 
@@ -384,7 +391,7 @@ def calculate_loss_streaks(trades_df):
         if outcome == "LOSS":
             current += 1
             maximum = max(maximum, current)
-        elif outcome == "WIN" or outcome == "BE":
+        else:
             if current > 0:
                 sequences.append(current)
             current = 0
@@ -402,8 +409,8 @@ def calculate_drawdown(equity_df):
     max_dd = float(dd.min())
     if max_dd >= 0:
         return 0.0, 0.0
-    peak_at_trough = float(peak.loc[dd.idxmin()])
-    max_dd_pct = (max_dd / peak_at_trough * 100.0) if peak_at_trough > 0 else 0.0
+    dd_pct_series = (dd / peak) * 100.0
+    max_dd_pct = float(dd_pct_series.min())
     return max_dd, max_dd_pct
 
 
@@ -445,7 +452,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V89 REPORT", trades_df, equity_df)
+    report("HUNTER-V90 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
