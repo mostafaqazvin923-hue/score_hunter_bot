@@ -1152,10 +1152,6 @@ def run_backtest(
             diagnostics[
                 "portfolio_full"
             ] += 1
-            if use_lsp3:
-                for _side in ("LONG", "SHORT"):
-                    if direction_cooldown[_side] > 0:
-                        direction_cooldown[_side] -= 1
             continue
 
         # --------------------------------------------------------
@@ -1911,10 +1907,6 @@ def run_firewall(
             diagnostics[
                 "portfolio_full"
             ] += 1
-            if use_lsp3:
-                for _side in ("LONG", "SHORT"):
-                    if direction_cooldown[_side] > 0:
-                        direction_cooldown[_side] -= 1
             continue
 
         ranked = build_lsp2_priority(
@@ -2038,35 +2030,130 @@ def run_firewall(
 # FIREWALL REPORTING: ALL LOSS STREAKS + SYMBOL TABLE
 # ============================================================
 def print_firewall_reports(trades_df, label="FW"):
+    """
+    Diagnostic only:
+    - Prints ALL consecutive-loss sequences.
+    - Saves ALL sequences to CSV.
+    - Prints and saves per-symbol performance table.
+    """
     if trades_df.empty:
         print("NO TRADES")
         return
-    t = trades_df.sort_values(["Timestamp", "ExitOrder"], kind="stable").copy()
-    t["Dollar_PnL"] = pd.to_numeric(t["Dollar_PnL"], errors="coerce")
 
-    print("\\nLOSS STREAKS — ALL SEQUENCES")
-    seq=[]; cur=[]
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    t = trades_df.sort_values(
+        ["Timestamp", "ExitOrder"],
+        kind="stable"
+    ).reset_index(drop=True).copy()
+
+    t["Dollar_PnL"] = pd.to_numeric(
+        t["Dollar_PnL"], errors="coerce"
+    )
+
+    sequences = []
+    current = []
+
     for _, r in t.iterrows():
         if r["Outcome"] == "LOSS":
-            cur.append(r)
-        elif cur:
-            seq.append(cur); cur=[]
-    if cur: seq.append(cur)
-    for i, rows in enumerate(sorted(seq, key=lambda x: (len(x), x[0]["Timestamp"]), reverse=True), 1):
+            current.append(r)
+        elif current:
+            sequences.append(current)
+            current = []
+
+    if current:
+        sequences.append(current)
+
+    sequence_rows = []
+
+    for seq_id, rows in enumerate(sequences, start=1):
         a, b = rows[0], rows[-1]
         pnl = sum(float(x["Dollar_PnL"]) for x in rows)
-        syms = ",".join(str(x["Symbol"]) for x in rows)
-        print(f"#{i:02d} LEN={len(rows):2d} | {a['Timestamp']} -> {b['Timestamp']} | PnL=${pnl:,.2f} | {syms}")
+        sequence_rows.append({
+            "Sequence_ID": seq_id,
+            "Length": len(rows),
+            "Start": a["Timestamp"],
+            "End": b["Timestamp"],
+            "PnL": pnl,
+            "Symbols": ",".join(str(x["Symbol"]) for x in rows),
+            "Sides": ",".join(str(x["Side"]) for x in rows),
+        })
 
-    print("\\nSYMBOL TABLE")
-    g=t.groupby("Symbol", sort=False)
-    rows=[]
-    for sym,d in g:
-        wins=int((d["Outcome"]=="WIN").sum()); losses=int((d["Outcome"]=="LOSS").sum())
-        rows.append((sym,len(d),wins,losses,float(d["Dollar_PnL"].sum()),wins/len(d)*100 if len(d) else 0))
-    for sym,n,w,l,pnl,wr in sorted(rows, key=lambda x:x[4]):
-        print(f"{sym:7s} | Trades={n:3d} | W={w:3d} | L={l:3d} | WR={wr:6.2f}% | PnL=${pnl:10,.2f}")
-    pd.DataFrame(rows, columns=["Symbol","Trades","Wins","Losses","PnL","WR"]).sort_values("PnL").to_csv("firewall_symbol_table.csv", index=False)
+    seq_df = pd.DataFrame(sequence_rows)
+
+    if not seq_df.empty:
+        seq_df = seq_df.sort_values(
+            ["Length", "Start"],
+            ascending=[False, True],
+            kind="stable"
+        ).reset_index(drop=True)
+
+    print("\n" + "=" * 68)
+    print(f"LOSS STREAKS — {label} — ALL SEQUENCES")
+    print("=" * 68)
+    print(f"Total loss sequences: {len(seq_df)}")
+
+    if not seq_df.empty:
+        print(f"Maximum loss streak: {int(seq_df.iloc[0]['Length'])}")
+        for _, r in seq_df.iterrows():
+            print(
+                f"#{int(r['Sequence_ID']):03d} | "
+                f"LEN={int(r['Length']):2d} | "
+                f"{r['Start']} -> {r['End']} | "
+                f"PnL=${float(r['PnL']):,.2f} | "
+                f"{r['Symbols']} | {r['Sides']}"
+            )
+
+    streak_path = os.path.join(
+        OUTPUT_DIR,
+        f"{label.lower()}_all_loss_streaks.csv"
+    )
+    seq_df.to_csv(streak_path, index=False)
+
+    print(f"\nSaved: {streak_path}")
+
+    print("\n" + "=" * 68)
+    print(f"SYMBOL PERFORMANCE — {label}")
+    print("=" * 68)
+
+    rows = []
+    for sym, d in t.groupby("Symbol", sort=True):
+        trades = len(d)
+        wins = int((d["Outcome"] == "WIN").sum())
+        losses = int((d["Outcome"] == "LOSS").sum())
+        pnl = float(d["Dollar_PnL"].sum())
+        wr = wins / trades * 100 if trades else 0.0
+        rows.append({
+            "Symbol": sym,
+            "Trades": trades,
+            "Wins": wins,
+            "Losses": losses,
+            "WR": wr,
+            "PnL": pnl,
+        })
+
+    symbol_df = pd.DataFrame(rows).sort_values(
+        "PnL", ascending=True, kind="stable"
+    ).reset_index(drop=True)
+
+    for _, r in symbol_df.iterrows():
+        print(
+            f"{str(r['Symbol']):7s} | "
+            f"Trades={int(r['Trades']):3d} | "
+            f"W={int(r['Wins']):3d} | "
+            f"L={int(r['Losses']):3d} | "
+            f"WR={float(r['WR']):6.2f}% | "
+            f"PnL=${float(r['PnL']):10,.2f}"
+        )
+
+    symbol_path = os.path.join(
+        OUTPUT_DIR,
+        f"{label.lower()}_symbol_table.csv"
+    )
+    symbol_df.to_csv(symbol_path, index=False)
+
+    print(f"\nSaved: {symbol_path}")
+
 
 if __name__ == "__main__":
     print("HUNTER-V74 — LOSS FIREWALL V2")
