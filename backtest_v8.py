@@ -3028,21 +3028,11 @@ def apply_correlated_loss_cluster_control(candidates, direction_loss_streak,
 
 
 # ============================================================
-# MAIN — TWO-SIDED V74 + LOSS-REGIME SHIELD TEST
+# MAIN — EXACT V74 vs PREVENTIVE CROWD GATE
 # ============================================================
 
 if __name__ == "__main__":
-    print("\n" + "=" * 76)
-    print("HUNTER-V74 — TWO-SIDED CORRELATED LOSS CLUSTER CONTROL TEST")
-    print("=" * 76)
-    print("BASELINE = EXACT V74 LONG + SHORT CORE")
-    print("TEST     = EXACT V74 CORE + CORRELATED LOSS CLUSTER CONTROL")
-    print("The control only limits NEW same-direction clusters after repeated losses.")
-    print("It keeps the best-ranked V74 candidate and leaves exits/positions untouched.")
-    print("No signal / ranking / ATR-SL / trailing / timeout / sizing parameter is changed.")
-    print("=" * 76)
-
-    baseline_trades, baseline_equity, baseline_diag = run_backtest(
+    baseline_trades, baseline_equity, _ = run_backtest(
         processed_data,
         use_lsp=False,
         use_lsp3=False,
@@ -3064,97 +3054,19 @@ if __name__ == "__main__":
         use_preventive_gate=True,
     )
 
-    baseline_summary = report(
-        "V74 BASELINE — TWO SIDED",
-        baseline_trades,
-        baseline_equity,
-        baseline_diag,
-    )
+    def compact_result(trades, equity):
+        if trades.empty:
+            return 0, 0.0, 0.0, 0.0, 0
+        wins = int((trades["Outcome"] == "WIN").sum())
+        wr = wins / len(trades) * 100.0
+        pnl = float(trades["Dollar_PnL"].sum())
+        dd, _ = calculate_drawdown(equity)
+        ls, _ = calculate_loss_streaks(trades.sort_values(["Timestamp", "ExitOrder"], kind="stable"))
+        return len(trades), wr, pnl, dd, ls
 
-    shield_summary = report(
-        "V74 + CORRELATED CLUSTER CONTROL — TWO SIDED",
-        shield_trades,
-        shield_equity,
-        shield_diag,
-    )
+    b = compact_result(baseline_trades, baseline_equity)
+    t = compact_result(shield_trades, shield_equity)
+    blocked = len(shield_diag.get("preventive_gate_block_log", []))
 
-    print("\n" + "=" * 76)
-    print("DIRECT COMPARISON")
-    print("=" * 76)
-    print(f"{'Metric':28s} {'V74':>14s} {'SHIELD':>14s} {'Delta':>14s}")
-    print("-" * 74)
-    if baseline_summary and shield_summary:
-        comparison_rows = [
-            ("Trades", baseline_summary["trades"], shield_summary["trades"]),
-            ("Wins", baseline_summary["wins"], shield_summary["wins"]),
-            ("Losses", baseline_summary["losses"], shield_summary["losses"]),
-            ("Win Rate %", baseline_summary["wr"], shield_summary["wr"]),
-            ("Net PnL $", baseline_summary["pnl"], shield_summary["pnl"]),
-            ("Net R", baseline_summary["net_r"], shield_summary["net_r"]),
-            ("Max DD $", baseline_summary["max_dd"], shield_summary["max_dd"]),
-            ("Max DD %", baseline_summary["max_dd_pct"], shield_summary["max_dd_pct"]),
-            ("Max Loss Streak", baseline_summary["max_loss_streak"], shield_summary["max_loss_streak"]),
-        ]
-        for metric, b, v in comparison_rows:
-            d = v - b
-            if metric in ("Net PnL $", "Max DD $"):
-                print(f"{metric:28s} ${b:13,.2f} ${v:13,.2f} ${d:13,.2f}")
-            elif metric in ("Win Rate %", "Max DD %"):
-                print(f"{metric:28s} {b:13.2f} {v:13.2f} {d:13.2f}")
-            else:
-                print(f"{metric:28s} {b:14.2f} {v:14.2f} {d:14.2f}")
-
-    print("\nCORRELATED CLUSTER CONTROL DIAGNOSTICS")
-    print(f"Blocked LONG       : {shield_diag.get('cluster_control_blocked_long', 0)}")
-    print(f"Blocked SHORT      : {shield_diag.get('cluster_control_blocked_short', 0)}")
-    print(f"Blocked TOTAL      : {shield_diag.get('cluster_control_blocked_long', 0) + shield_diag.get('cluster_control_blocked_short', 0)}")
-    print(f"Control events     : {shield_diag.get('cluster_control_events', 0)}")
-
-    # Explicit per-symbol audit for the TEST result.
-    print("\nSHIELD PER-SYMBOL DETAIL")
-    print("Symbol    | Trades | Wins | Losses | Win Rate | PnL")
-    print("-" * 64)
-    for symbol in SYMBOLS:
-        sdf = shield_trades[shield_trades["Symbol"] == symbol]
-        if sdf.empty:
-            print(f"{symbol:8s} |      0 |    0 |      0 |    0.00% | $       0.00")
-            continue
-        st = len(sdf)
-        sw = int((sdf["Outcome"] == "WIN").sum())
-        sl = st - sw
-        swr = sw / st * 100.0
-        sp = float(sdf["Dollar_PnL"].sum())
-        print(f"{symbol:8s} | {st:6d} | {sw:4d} | {sl:6d} | {swr:8.2f}% | ${sp:12,.2f}")
-
-    # Forensics on both runs: this makes it obvious whether the shield
-    # actually changes the consecutive-loss structure instead of merely
-    # changing the final PnL.
-    print("\n" + "=" * 76)
-    print("BASELINE LOSS-STREAK FORENSICS")
-    print("=" * 76)
-    enhanced_loss_streak_forensics(baseline_trades)
-
-    print("\n" + "=" * 76)
-    print("SHIELD LOSS-STREAK FORENSICS")
-    print("=" * 76)
-    enhanced_loss_streak_forensics(shield_trades)
-
-    # Save both trade/equity sets plus the shield block log.
-    save_csvs(
-        baseline_trades,
-        baseline_equity,
-        shield_trades,
-        shield_equity,
-    )
-    if shield_diag.get("cluster_control_block_log"):
-        pd.DataFrame(shield_diag["cluster_control_block_log"]).to_csv(
-            os.path.join(OUTPUT_DIR, "correlated_cluster_control_blocks.csv"),
-            index=False,
-        )
-
-    print("\n" + "=" * 76)
-    print("TWO-SIDED CORRELATED LOSS CLUSTER CONTROL TEST COMPLETE")
-    print("=" * 76)
-    print("Use the DIRECT COMPARISON + both forensics sections to judge whether")
-    print("the shield reduces consecutive losses without materially changing")
-    print("the original V74 trade count / win rate / PnL profile.")
+    print(f"V74      | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxDD=${b[3]:,.2f} | MaxLS={b[4]} | Blocked=0")
+    print(f"Preventive | Trades={t[0]} | WR={t[1]:.2f}% | PnL=${t[2]:,.2f} | MaxDD=${t[3]:,.2f} | MaxLS={t[4]} | Blocked={blocked}")
