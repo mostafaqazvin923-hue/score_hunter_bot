@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V93 - TRUE CIRCUIT BREAKER & FIXED DRAWDOWN ENGINE
+# HUNTER-V94 - TIME-BASED COOLDOWN CIRCUIT BREAKER ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -68,13 +68,13 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-OUTPUT_DIR = "hunter_v93_output"
+OUTPUT_DIR = "hunter_v94_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V93 - TRUE CIRCUIT BREAKER & FIXED DRAWDOWN ENGINE")
+print("HUNTER-V94 - TIME-BASED COOLDOWN CIRCUIT BREAKER ENGINE")
 print("=" * 68)
 
 
@@ -180,9 +180,15 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     equity_curve = []
+    
+    cooldown_counter = 0  # شمارشگر کندل‌های استراحت ربات پس از زنجیره باخت
 
     for ts in all_timestamps:
         symbols_to_close = []
+
+        # مدیریت کاهش تایمر خنک‌کننده در هر کندل جدید
+        if cooldown_counter > 0:
+            cooldown_counter -= 1
 
         for symbol, pos in list(active_positions.items()):
             df = processed_data[symbol]
@@ -257,7 +263,7 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # بررسی مدار قطع‌کننده (Circuit Breaker): اگر ۳ باخت پیاپی رخ داده باشد، اجازه باز شدن معامله جدید داده نمی‌شود
+        # بررسی تعداد باخت‌های متوالی اخیر جهت فعال‌سازی تایمر خنک‌کننده موقت (به جای قفل دائم)
         current_consecutive_losses = 0
         if len(all_trades) > 0:
             for t in reversed(all_trades):
@@ -266,8 +272,11 @@ def run_backtest(processed_data):
                 else:
                     break
 
-        if current_consecutive_losses >= 3:
-            continue  # قفل کامل سیستم تا زمانی که استریک باخت قطع شود
+        if current_consecutive_losses >= 3 and cooldown_counter == 0:
+            cooldown_counter = 8  # استراحت به مدت ۸ کندل (۳۲ ساعت) برای عبور از نوسان مخرب
+
+        if cooldown_counter > 0:
+            continue  # در حال استراحت، بدون باز کردن پوزیشن جدید
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -412,7 +421,6 @@ def calculate_drawdown(equity_df):
         return 0.0, 0.0
     equity = equity_df["Equity"].astype(float)
     peak = equity.cummax()
-    # اصلاح فرمول دراوداون صحیح بر اساس ارزش خالص دارایی کل
     dd = equity - peak
     max_dd = float(dd.min())
     if max_dd >= 0:
@@ -460,7 +468,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V93 REPORT", trades_df, equity_df)
+    report("HUNTER-V94 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
