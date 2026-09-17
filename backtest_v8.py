@@ -2,7 +2,6 @@ import os
 import subprocess
 import sys
 from datetime import datetime, timedelta
-from collections import defaultdict, Counter
 
 try:
     import ccxt
@@ -15,7 +14,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V100 - INSTITUTIONAL ANTI-TRAP & CHOP-FREE ENGINE
+# HUNTER-V101 - BALANCED INSTITUTIONAL FILTER ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -68,22 +67,21 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0  # مارجین ثابت ۱۰۰ دلار
 BASE_LEVERAGE = 80.0       # لورج ثابت ۸۰
 
-OUTPUT_DIR = "hunter_v100_output"
+OUTPUT_DIR = "hunter_v101_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V100 - INSTITUTIONAL ANTI-TRAP & CHOP-FREE ENGINE")
+print("HUNTER-V101 - BALANCED INSTITUTIONAL FILTER ENGINE")
 print("=" * 68)
 
 
 # ============================================================
-# INSTITUTIONAL FILTERS & INDICATORS
+# BALANCED FILTERS & INDICATORS
 # ============================================================
 
 def calculate_adx_and_chop(df, period=14):
-    # ADX Calculation
     alpha = 1 / period
     tr1 = np.abs(df['High'] - df['Low'])
     tr2 = np.abs(df['High'] - df['Close'].shift(1))
@@ -103,13 +101,11 @@ def calculate_adx_and_chop(df, period=14):
     dx = 100 * np.abs(p_di - m_di) / (p_di + m_di + 1e-9)
     df['ADX'] = dx.ewm(alpha=alpha, adjust=False).mean()
 
-    # Choppiness Index Calculation
     sum_tr = tr.rolling(period).sum()
     high_max = df['High'].rolling(period).max()
     low_min = df['Low'].rolling(period).min()
     df['CHOP'] = 100 * np.log10(sum_tr / (high_max - low_min + 1e-9)) / np.log10(period)
     
-    # ATR & Technicals
     df['ATR'] = tr.rolling(ATR_PERIOD).mean()
     df['ATR_Pct'] = df['ATR'] / df['Close']
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -325,35 +321,27 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
-            # 1. فیلتر نوسان شدید ATR
             if c4h["ATR_Pct"] > 0.08 or c4h["ATR_Pct"] < 0.004:
                 continue
 
-            # 2. فیلتر حجم معاملات
-            if c4h["Volume_Ratio"] < 0.7:
+            if c4h["Volume_Ratio"] < 0.65:
                 continue
 
-            # 3. فیلترهای ضد رنج و ضد تله نهنگی (ADX & Choppiness)
+            # فیلترهای بالانسرِ ضد رنج (اصلاح‌شده برای جلوگیری از No trades)
             if pd.isna(c4h["ADX"]) or pd.isna(c4h["CHOP"]):
                 continue
-            if c4h["ADX"] < 23 or c4h["CHOP"] > 55:  # بازار رنج یا بی‌روند -> ممنوعیت ورود
-                continue
-
-            # 4. فیلتر پین‌بار و کندل‌های دستکاری‌شده (جلوگیری از کندل‌های شارپی فیک)
-            body_size = abs(c4h["Close"] - c4h["Open"])
-            total_candle_size = c4h["High"] - c4h["Low"]
-            if total_candle_size > 0 and (body_size / total_candle_size) < 0.28:
+            if c4h["ADX"] < 18 or c4h["CHOP"] > 62:  
                 continue
 
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"])
-                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
+                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.02
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
                 side = "LONG"
             else:
                 regime_ok = (c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"])
-                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
+                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.98
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
                 side = "SHORT"
 
             if not valid_signal:
@@ -496,7 +484,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V100 REPORT", trades_df, equity_df)
+    report("HUNTER-V101 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
