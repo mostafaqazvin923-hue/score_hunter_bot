@@ -14,7 +14,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V101 - BALANCED INSTITUTIONAL FILTER ENGINE
+# HUNTER-V102 - SMART INSTITUTIONAL REGIME & TRAP FILTER
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -67,50 +67,35 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0  # مارجین ثابت ۱۰۰ دلار
 BASE_LEVERAGE = 80.0       # لورج ثابت ۸۰
 
-OUTPUT_DIR = "hunter_v101_output"
+OUTPUT_DIR = "hunter_v102_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V101 - BALANCED INSTITUTIONAL FILTER ENGINE")
+print("HUNTER-V102 - SMART INSTITUTIONAL REGIME & TRAP FILTER")
 print("=" * 68)
 
 
 # ============================================================
-# BALANCED FILTERS & INDICATORS
+# TECHNICAL INDICATORS & CLEAN FILTERS
 # ============================================================
 
-def calculate_adx_and_chop(df, period=14):
-    alpha = 1 / period
+def calculate_indicators(df):
     tr1 = np.abs(df['High'] - df['Low'])
     tr2 = np.abs(df['High'] - df['Close'].shift(1))
     tr3 = np.abs(df['Low'] - df['Close'].shift(1))
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    
-    up_move = df['High'] - df['High'].shift(1)
-    down_move = df['Low'].shift(1) - df['Low']
-    
-    p_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    m_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    
-    tr_smooth = pd.Series(tr).ewm(alpha=alpha, adjust=False).mean()
-    p_di = 100 * (pd.Series(p_dm).ewm(alpha=alpha, adjust=False).mean() / tr_smooth)
-    m_di = 100 * (pd.Series(m_dm).ewm(alpha=alpha, adjust=False).mean() / tr_smooth)
-    
-    dx = 100 * np.abs(p_di - m_di) / (p_di + m_di + 1e-9)
-    df['ADX'] = dx.ewm(alpha=alpha, adjust=False).mean()
-
-    sum_tr = tr.rolling(period).sum()
-    high_max = df['High'].rolling(period).max()
-    low_min = df['Low'].rolling(period).min()
-    df['CHOP'] = 100 * np.log10(sum_tr / (high_max - low_min + 1e-9)) / np.log10(period)
     
     df['ATR'] = tr.rolling(ATR_PERIOD).mean()
     df['ATR_Pct'] = df['ATR'] / df['Close']
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+    
+    # فیلتر تشخیص رنج (فاصله کم میانگین‌های متحرک نشانه‌ی بازار فرسایشی و رنج است)
+    df['EMA_Spread'] = np.abs(df['EMA20'] - df['EMA50']) / df['Close']
+    
     df['Mom_Short'] = (df['Close'] - df['Close'].shift(10)) / df['Close'].shift(10)
     df['Mom_Long'] = (df['Close'] - df['Close'].shift(30)) / df['Close'].shift(30)
     df['Volume_SMA'] = df['Volume'].rolling(20).mean()
@@ -181,7 +166,7 @@ def fetch_symbol_data(lbank_symbol):
         return None
 
     df.set_index("Date", inplace=True)
-    df = calculate_adx_and_chop(df)
+    df = calculate_indicators(df)
     return df
 
 
@@ -321,16 +306,22 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
+            # 1. فیلتر نوسان ATR
             if c4h["ATR_Pct"] > 0.08 or c4h["ATR_Pct"] < 0.004:
                 continue
 
-            if c4h["Volume_Ratio"] < 0.65:
+            # 2. فیلتر حجم معاملات
+            if c4h["Volume_Ratio"] < 0.6:
                 continue
 
-            # فیلترهای بالانسرِ ضد رنج (اصلاح‌شده برای جلوگیری از No trades)
-            if pd.isna(c4h["ADX"]) or pd.isna(c4h["CHOP"]):
+            # 3. فیلتر ضد بازار رنج و فرسایشی (اگر فاصله EMA20 و EMA50 خیلی کم باشد یعنی بازار گره خورده و رنج است)
+            if c4h["EMA_Spread"] < 0.002:
                 continue
-            if c4h["ADX"] < 18 or c4h["CHOP"] > 62:  
+
+            # 4. فیلتر ضد حرکات شارپی فیک (نهنگی): جلوگیری از ورود روی کندل‌های با سایه خیلی بزرگ (پین‌بار‌های فیک)
+            body_size = abs(c4h["Close"] - c4h["Open"])
+            total_range = c4h["High"] - c4h["Low"]
+            if total_range > 0 and (body_size / total_range) < 0.3:
                 continue
 
             if market_bull:
@@ -484,7 +475,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V101 REPORT", trades_df, equity_df)
+    report("HUNTER-V102 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
