@@ -122,6 +122,55 @@ GLOBAL_BREAKER_TRIGGER = 3      # raw consecutive portfolio-wide losses
 GLOBAL_BREAKER_COOLDOWN = 6     # candles (6 x 4h = 24h) fallback cap
 MAX_PER_SIDE_DEFAULT = 3        # of the 5 MAX_POSITIONS slots, cap per direction
 
+# ============================================================
+# NEW (this session, round 2) — POSITION-SIZE THROTTLING
+# (Anti-Martingale + Trading-the-Equity-Curve, research-backed)
+# ============================================================
+# Both mechanisms below change ONLY position size (dollar exposure),
+# never entries/exits/signal/SL/trailing. Because Return (R) is
+# computed from price movement relative to initial_risk — independent
+# of dollar size — Win Rate and Net R are mathematically UNCHANGED by
+# either of these. Only Dollar_PnL and the equity curve's smoothness
+# change. This directly targets "smaller damage from a loss streak"
+# without touching trade count or win rate, unlike the (failed)
+# entry-blocking mechanisms tried earlier.
+#
+# (A) Anti-Martingale: size steps down after each consecutive raw
+#     loss (portfolio-wide), resets to full size on any win.
+ANTI_MARTINGALE_SCHEDULE = {0: 1.00, 1: 0.75, 2: 0.50, 3: 0.25}  # floor at streak>=3
+
+# (B) Trading-the-equity-curve: size depends on where the REALIZED
+#     equity curve sits relative to its own short/long moving average
+#     (Bandy/Alvarez-style regime detection on the strategy's own P&L,
+#     not on price). Needs enough closed trades to warm up; before
+#     that, runs at full size.
+EQUITY_CURVE_SHORT_WIN = 10
+EQUITY_CURVE_LONG_WIN = 30
+EQUITY_CURVE_MULT_HEALTHY = 1.00   # equity >= short MA
+EQUITY_CURVE_MULT_CHOPPY = 0.50    # short MA <= equity < long MA region is mixed; see helper
+EQUITY_CURVE_MULT_BROKEN = 0.25    # equity below long MA (deeper slump)
+
+
+def equity_curve_size_mult(realized_equity_history):
+    """
+    Causal only: uses realized (closed-trade) equity up to now — never
+    a future value. Mirrors the common 'trading the equity curve'
+    overlay (Bandy/Alvarez/KJTradingSystems): full size while the
+    curve is healthy, half size in a choppy/below-short-MA patch,
+    quarter size once it's also below the longer MA (deeper slump).
+    """
+    n = len(realized_equity_history)
+    if n < EQUITY_CURVE_LONG_WIN:
+        return EQUITY_CURVE_MULT_HEALTHY  # not enough history yet — run full size
+    short_ma = sum(realized_equity_history[-EQUITY_CURVE_SHORT_WIN:]) / EQUITY_CURVE_SHORT_WIN
+    long_ma = sum(realized_equity_history[-EQUITY_CURVE_LONG_WIN:]) / EQUITY_CURVE_LONG_WIN
+    current = realized_equity_history[-1]
+    if current >= short_ma:
+        return EQUITY_CURVE_MULT_HEALTHY
+    if current >= long_ma:
+        return EQUITY_CURVE_MULT_CHOPPY
+    return EQUITY_CURVE_MULT_BROKEN
+
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
@@ -674,6 +723,9 @@ def run_backtest(
     global_breaker_trigger=GLOBAL_BREAKER_TRIGGER,
     global_breaker_cooldown=GLOBAL_BREAKER_COOLDOWN,
     max_per_side=None,
+    use_risk_throttle=False,
+    throttle_schedule=None,
+    use_equity_curve_filter=False,
 ):
     all_timestamps = get_all_timestamps(
         processed_data
@@ -691,6 +743,13 @@ def run_backtest(
     # NEW: cooldown counter for the global raw-streak breaker.
     # Blocks ALL new entries (both directions) while > 0.
     global_breaker_cooldown_left = 0
+
+    # NEW: realized (closed-trade) equity history for the equity-curve
+    # filter. Starts at INITIAL_CAPITAL; each closed trade appends the
+    # new running total. Only ever uses PAST entries — no lookahead.
+    realized_equity_history = [INITIAL_CAPITAL]
+    _schedule = throttle_schedule or ANTI_MARTINGALE_SCHEDULE
+    _schedule_max_key = max(_schedule.keys())
 
     # LSP3 state: directional loss-event streak + temporary entry cooldown.
     # IMPORTANT: losses on the same 4h timestamp count as ONE directional event,
@@ -890,6 +949,7 @@ def run_backtest(
             position_notional = (
                 TRADE_MARGIN
                 * LEVERAGE
+                * pos.get("size_mult", 1.0)
             )
 
             dollar_pnl = (
@@ -899,6 +959,12 @@ def run_backtest(
                 position_notional
                 * FEE_RATE
                 * 2
+            )
+
+            # NEW: update the realized equity history the instant this
+            # trade closes (causal — only past/closed trades feed it).
+            realized_equity_history.append(
+                realized_equity_history[-1] + dollar_pnl
             )
 
             if outcome == "LOSS":
@@ -965,6 +1031,7 @@ def run_backtest(
                     "LSP3_Active": int(
                         use_lsp3
                     ),
+                    "SizeMult": pos.get("size_mult", 1.0),
                 }
             )
 
@@ -1382,6 +1449,17 @@ def run_backtest(
                 "side"
             ]
 
+            # NEW: decide the size multiplier NOW, at entry, from state
+            # available at this instant only (causal, no lookahead).
+            # Anti-Martingale and equity-curve throttles combine by
+            # taking the stricter (smaller) of the two when both are on.
+            size_mult = 1.0
+            if use_risk_throttle:
+                key = min(global_loss_streak, _schedule_max_key)
+                size_mult = min(size_mult, _schedule[key])
+            if use_equity_curve_filter:
+                size_mult = min(size_mult, equity_curve_size_mult(realized_equity_history))
+
             active_positions[
                 symbol
             ] = {
@@ -1409,6 +1487,7 @@ def run_backtest(
                 "entry_index": candidate[
                     "entry_index"
                 ],
+                "size_mult": size_mult,
             }
 
         # --------------------------------------------------------
@@ -1444,6 +1523,7 @@ def run_backtest(
                 ) * (
                     TRADE_MARGIN
                     * LEVERAGE
+                    * pos.get("size_mult", 1.0)
                     / pos["entry_price"]
                 )
 
@@ -1454,6 +1534,7 @@ def run_backtest(
                 ) * (
                     TRADE_MARGIN
                     * LEVERAGE
+                    * pos.get("size_mult", 1.0)
                     / pos["entry_price"]
                 )
 
@@ -1581,13 +1662,18 @@ def stats(df):
     pnl = float(df["Dollar_PnL"].sum()) if n else 0
     net_r = float(df["Return"].sum()) if n else 0
     cur = mx = 0
-    for x in df["Outcome"]:
-        if x == "LOSS":
-            cur += 1
-            mx = max(mx, cur)
-        else:
-            cur = 0
-    return n, wr, pnl, mx, net_r
+    cur_dollar = worst_streak_dollar = 0.0
+    if n:
+        for _, row in df.sort_values(["Timestamp", "ExitOrder"], kind="stable").iterrows():
+            if row["Outcome"] == "LOSS":
+                cur += 1
+                cur_dollar += row["Dollar_PnL"]
+                mx = max(mx, cur)
+                worst_streak_dollar = min(worst_streak_dollar, cur_dollar)
+            else:
+                cur = 0
+                cur_dollar = 0.0
+    return n, wr, pnl, mx, net_r, worst_streak_dollar
 
 
 if __name__ == "__main__":
@@ -1601,55 +1687,72 @@ if __name__ == "__main__":
         use_lsp=False, use_lsp3=False, gate_mode=None,
         use_firewall=True, use_single_loss_crowd=False,
     )
-    # NEW: FW223 + side cap only (no global breaker yet)
+    # Round-1 attempts (entry-blocking) — kept only for reference, not
+    # expected to win: prior real-data run showed SideCap costs ~27% of
+    # PnL for -1 MaxLS, and GlobalBreaker made WR/PnL/MaxLS all worse.
     fw223_cap, fw223_cap_eq, fd223_cap = run_backtest(
         processed_data,
         use_lsp=False, use_lsp3=False, gate_mode=None,
         use_firewall=True, use_single_loss_crowd=False,
         max_per_side=MAX_PER_SIDE_DEFAULT,
     )
-    # NEW: FW223 + global breaker only (no side cap)
-    fw223_gb, fw223_gb_eq, fd223_gb = run_backtest(
+
+    # Round-2 (this session): position-SIZE throttling instead of entry
+    # blocking. Research-backed (Anti-Martingale, Trading-the-Equity-
+    # Curve). These change ONLY Dollar_PnL/equity, never Return/R or
+    # Outcome — so Trades and Win Rate are mathematically identical to
+    # FW223 by construction. Only PnL, drawdown, and the DOLLAR cost of
+    # the loss streak should change.
+    fw223_am, fw223_am_eq, fd223_am = run_backtest(
         processed_data,
         use_lsp=False, use_lsp3=False, gate_mode=None,
         use_firewall=True, use_single_loss_crowd=False,
-        use_global_breaker=True,
+        use_risk_throttle=True,
     )
-    # NEW: FW223 + side cap + global breaker together
-    fw223_full, fw223_full_eq, fd223_full = run_backtest(
+    fw223_ec, fw223_ec_eq, fd223_ec = run_backtest(
         processed_data,
         use_lsp=False, use_lsp3=False, gate_mode=None,
         use_firewall=True, use_single_loss_crowd=False,
-        max_per_side=MAX_PER_SIDE_DEFAULT,
-        use_global_breaker=True,
+        use_equity_curve_filter=True,
+    )
+    fw223_am_ec, fw223_am_ec_eq, fd223_am_ec = run_backtest(
+        processed_data,
+        use_lsp=False, use_lsp3=False, gate_mode=None,
+        use_firewall=True, use_single_loss_crowd=False,
+        use_risk_throttle=True, use_equity_curve_filter=True,
     )
 
     a = stats(base)
     b = stats(fw223)
     c = stats(fw223_cap)
-    d = stats(fw223_gb)
-    e = stats(fw223_full)
+    f = stats(fw223_am)
+    g = stats(fw223_ec)
+    h = stats(fw223_am_ec)
 
-    print("=" * 84)
-    print("HUNTER-V74 — GLOBAL BREAKER + SIDE-CAP TEST (on top of FW223)")
-    print("=" * 84)
-    print(f"{'Variant':22s}{'Trades':>8s}{'WR%':>8s}{'PnL$':>14s}{'NetR':>10s}{'MaxLS':>8s}")
-    print("-" * 84)
+    print("=" * 96)
+    print("HUNTER-V74 — POSITION-SIZE THROTTLING TEST (Anti-Martingale / Equity-Curve, on top of FW223)")
+    print("=" * 96)
+    print(f"{'Variant':24s}{'Trades':>8s}{'WR%':>8s}{'PnL$':>14s}{'NetR':>10s}{'MaxLS':>7s}{'WorstStreak$':>16s}")
+    print("-" * 96)
     for name, s in [
-        ("V74 (baseline)", a), ("FW223", b), ("FW223+SideCap", c),
-        ("FW223+GlobalBreak", d), ("FW223+Both", e),
+        ("V74 (baseline)", a), ("FW223 (reference)", b), ("FW223+SideCap (round1)", c),
+        ("FW223+AntiMartingale", f), ("FW223+EquityCurve", g), ("FW223+Both(size)", h),
     ]:
-        n, wr, pnl, mx, net_r = s
-        print(f"{name:22s}{n:8d}{wr:8.2f}{pnl:14,.2f}{net_r:10.2f}{mx:8d}")
+        n, wr, pnl, mx, net_r, worst_dollar = s
+        print(f"{name:24s}{n:8d}{wr:8.2f}{pnl:14,.2f}{net_r:10.2f}{mx:7d}{worst_dollar:16,.2f}")
 
-    print("\nBLOCK COUNTS")
-    print(f"FW223+SideCap  | side_cap_blocked_long={fd223_cap.get('side_cap_blocked_long',0)} "
-          f"side_cap_blocked_short={fd223_cap.get('side_cap_blocked_short',0)}")
-    print(f"FW223+GlobalBreak | global_breaker_active_events={fd223_gb.get('global_breaker_active_events',0)} "
-          f"global_breaker_blocked_candidates={fd223_gb.get('global_breaker_blocked_candidates',0)}")
-    print(f"FW223+Both | side_cap_blocked={fd223_full.get('side_cap_blocked',0)} "
-          f"global_breaker_active_events={fd223_full.get('global_breaker_active_events',0)}")
+    print("\nSANITY CHECK (must hold by construction if code is correct):")
+    print(f"  Trades:  FW223={b[0]}  AntiMartingale={f[0]}  EquityCurve={g[0]}  Both={h[0]}  (should all equal FW223)")
+    print(f"  WinRate: FW223={b[1]:.2f}%  AntiMartingale={f[1]:.2f}%  EquityCurve={g[1]:.2f}%  Both={h[1]:.2f}%  (should all equal FW223)")
+    print(f"  NetR:    FW223={b[4]:.2f}  AntiMartingale={f[4]:.2f}  EquityCurve={g[4]:.2f}  Both={h[4]:.2f}  (should all equal FW223)")
+    print("  If any of these differ, something besides position size changed — flag it, that would be a bug.")
+
+    print("\nWHAT TO LOOK AT:")
+    print("  'WorstStreak$' = total dollar damage of the single worst consecutive-loss run.")
+    print("  Goal: WorstStreak$ should be clearly LESS NEGATIVE (smaller damage) than FW223's,")
+    print("  while PnL$ stays close to (or above) FW223's — since Trades/WR/NetR are identical,")
+    print("  any PnL$ change comes purely from smaller losers in the bad patch vs full-size winners elsewhere.")
 
     print("\nREFERENCE CHECK")
     print("Expected FW223 reference: 491 trades | 63.34% WR | $34,733.29 PnL | MaxLS=8")
-    print("Goal: MaxLS(FW223+Both) should be clearly lower than 8 while Trades/WR/PnL stay close to FW223.")
+
