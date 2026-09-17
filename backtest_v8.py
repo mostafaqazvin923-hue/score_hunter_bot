@@ -14,7 +14,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V103 - ANTI-STREAK INSTITUTIONAL ENGINE
+# HUNTER-V104 - TARGETED STREAK-KILLER ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -53,7 +53,7 @@ SYMBOLS = {
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
-MAX_POSITIONS = 5
+MAX_POSITIONS = 4          # کاهش تعداد پوزیشن‌های همزمان برای کنترل ریسک سبد
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
@@ -67,18 +67,18 @@ INITIAL_CAPITAL = 1000.0
 BASE_TRADE_MARGIN = 100.0  # مارجین ثابت ۱۰۰ دلار
 BASE_LEVERAGE = 80.0       # لورج ثابت ۸۰
 
-OUTPUT_DIR = "hunter_v103_output"
+OUTPUT_DIR = "hunter_v104_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V103 - ANTI-STREAK INSTITUTIONAL ENGINE")
+print("HUNTER-V104 - TARGETED STREAK-KILLER ENGINE")
 print("=" * 68)
 
 
 # ============================================================
-# TECHNICAL INDICATORS & ANTI-STREAK FILTERS
+# TECHNICAL INDICATORS & ADVANCED FILTERS
 # ============================================================
 
 def calculate_indicators(df):
@@ -93,7 +93,6 @@ def calculate_indicators(df):
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
     
-    # فیلتر سخت‌گیرانه‌تر برای دوری از بازارهای رنج و فرسایشی
     df['EMA_Spread'] = np.abs(df['EMA20'] - df['EMA50']) / df['Close']
     
     df['Mom_Short'] = (df['Close'] - df['Close'].shift(10)) / df['Close'].shift(10)
@@ -178,7 +177,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
 
 # ============================================================
-# BACKTEST ENGINE WITH ANTI-STREAK CIRCUIT BREAKER
+# BACKTEST ENGINE WITH SYMBOL-LEVEL & GLOBAL COOLDOWN
 # ============================================================
 
 def get_all_timestamps(data):
@@ -191,8 +190,9 @@ def run_backtest(processed_data):
     all_trades = []
     equity_curve = []
     
-    # ردیاب ضررهای متوالی برای جلوگیری از استریک منفی
-    recent_losses_count = 0
+    # ثبت زمان آخرین ضرر برای هر نماد به صورت مجزا (کوول‌دان اختصاصی)
+    symbol_last_loss_time = {sym: pd.NaT for sym in processed_data.keys()}
+    global_recent_losses = 0
 
     for ts in all_timestamps:
         symbols_to_close = []
@@ -250,11 +250,11 @@ def run_backtest(processed_data):
             is_be_protected = pos["be_triggered"] and (abs(exit_p - pos["entry_price"]) / pos["entry_price"] < 0.003)
             outcome = "WIN" if r_real > 0 else ("BE" if is_be_protected else "LOSS")
 
-            # به‌روزرسانی وضعیت استریک ضرر
             if outcome == "LOSS":
-                recent_losses_count += 1
+                global_recent_losses += 1
+                symbol_last_loss_time[symbol] = ts
             else:
-                recent_losses_count = 0
+                global_recent_losses = max(0, global_recent_losses - 1)
 
             position_notional = margin * leverage
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
@@ -304,6 +304,15 @@ def run_backtest(processed_data):
             if symbol in active_positions:
                 continue
 
+            # کوول‌دان نماد: اگر این ارز تازه روی این نماد ضرر داده‌ایم، تا ۱۲ کندل (۴۸ ساعت) اجازه ورود مجدد نداریم
+            last_loss = symbol_last_loss_time.get(symbol, pd.NaT)
+            if not pd.isna(last_loss):
+                df_sym = processed_data[symbol]
+                if ts in df_sym.index and last_loss in df_sym.index:
+                    bars_since_loss = df_sym.index.get_loc(ts) - df_sym.index.get_loc(last_loss)
+                    if bars_since_loss < 12:
+                        continue
+
             df = processed_data[symbol]
             if ts not in df.index:
                 continue
@@ -315,37 +324,33 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
-            # 1. فیلتر نوسان ATR
             if c4h["ATR_Pct"] > 0.08 or c4h["ATR_Pct"] < 0.004:
                 continue
 
-            # 2. فیلتر حجم معاملات
-            if c4h["Volume_Ratio"] < 0.7:
+            if c4h["Volume_Ratio"] < 0.75:
                 continue
 
-            # 3. فیلتر ضد بازار رنج (ارتقا یافته برای فیلتر دقیق‌تر گره‌ها)
-            if c4h["EMA_Spread"] < 0.0025:
+            if c4h["EMA_Spread"] < 0.003:  # فیلتر قوی‌تر برای تشخیص رنج
                 continue
 
-            # 4. فیلتر ضد حرکات فیک (بدنه‌ی کندل حداقل باید ۴۰٪ کل رنج باشد تا تله نباشد)
             body_size = abs(c4h["Close"] - c4h["Open"])
             total_range = c4h["High"] - c4h["Low"]
-            if total_range > 0 and (body_size / total_range) < 0.4:
+            if total_range > 0 and (body_size / total_range) < 0.42:
                 continue
 
-            # 5. مدار محافظتی ضد ضرر زنجیره‌ای: اگر اخیراً ضرر پشت سر هم داده‌ایم، آستانه‌ی مومنتوم ورود سخت‌تر می‌شود
-            mom_short_threshold = 0.015 if recent_losses_count >= 2 else 0.012
-            mom_long_threshold = 0.040 if recent_losses_count >= 2 else 0.035
+            # اگر استریک کلی بالا رفت، فیلتر مومنتوم را بسیار سخت‌گیرانه‌تر می‌کنیم
+            mom_short_thresh = 0.018 if global_recent_losses >= 2 else 0.012
+            mom_long_thresh = 0.045 if global_recent_losses >= 2 else 0.035
 
             if market_bull:
                 regime_ok = (c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"])
-                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > mom_short_threshold) and (c4h["Mom_Long"] > mom_long_threshold)
+                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.01
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > mom_short_thresh) and (c4h["Mom_Long"] > mom_long_thresh)
                 side = "LONG"
             else:
                 regime_ok = (c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"])
-                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -mom_short_threshold) and (c4h["Mom_Long"] < -mom_long_threshold)
+                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.99
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -mom_short_thresh) and (c4h["Mom_Long"] < -mom_long_thresh)
                 side = "SHORT"
 
             if not valid_signal:
@@ -366,8 +371,8 @@ def run_backtest(processed_data):
                 "initial_sl": float(initial_sl),
                 "initial_risk": float(initial_risk),
                 "entry_index": int(i),
-                "margin": float(BASE_TRADE_MARGIN),  # ۱۰۰ دلار ثابت
-                "leverage": float(BASE_LEVERAGE),    # لورج ۸۰ ثابت
+                "margin": float(BASE_TRADE_MARGIN),
+                "leverage": float(BASE_LEVERAGE),
             })
 
         slots = MAX_POSITIONS - len(active_positions)
@@ -488,7 +493,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V103 REPORT", trades_df, equity_df)
+    report("HUNTER-V104 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
