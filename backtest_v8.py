@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V99 - HIGH-YIELD OPTIMIZED MOMENTUM ENGINE
+# HUNTER-V100 - INSTITUTIONAL ANTI-TRAP & CHOP-FREE ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -54,7 +54,7 @@ SYMBOLS = {
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
-MAX_POSITIONS = 5  # بازگشت به ۵ پوزیشن همزمان برای پویایی بیشتر
+MAX_POSITIONS = 5
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
@@ -65,22 +65,63 @@ TIMEOUT_CANDLES = 40
 EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 1000.0
-BASE_TRADE_MARGIN = 110.0  # افزایش مارجین پایه برای بازگشت سود دلاری بالا
-BASE_LEVERAGE = 65.0      # اهرم بهینه‌شده برای ایجاد تعادل بین سود و کنترل درودان
+BASE_TRADE_MARGIN = 100.0  # مارجین ثابت ۱۰۰ دلار
+BASE_LEVERAGE = 80.0       # لورج ثابت ۸۰
 
-OUTPUT_DIR = "hunter_v99_output"
+OUTPUT_DIR = "hunter_v100_output"
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V99 - HIGH-YIELD OPTIMIZED MOMENTUM ENGINE")
+print("HUNTER-V100 - INSTITUTIONAL ANTI-TRAP & CHOP-FREE ENGINE")
 print("=" * 68)
 
 
 # ============================================================
-# DATA & QUANTITATIVE INDICATORS
+# INSTITUTIONAL FILTERS & INDICATORS
 # ============================================================
+
+def calculate_adx_and_chop(df, period=14):
+    # ADX Calculation
+    alpha = 1 / period
+    tr1 = np.abs(df['High'] - df['Low'])
+    tr2 = np.abs(df['High'] - df['Close'].shift(1))
+    tr3 = np.abs(df['Low'] - df['Close'].shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    up_move = df['High'] - df['High'].shift(1)
+    down_move = df['Low'].shift(1) - df['Low']
+    
+    p_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    m_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    
+    tr_smooth = pd.Series(tr).ewm(alpha=alpha, adjust=False).mean()
+    p_di = 100 * (pd.Series(p_dm).ewm(alpha=alpha, adjust=False).mean() / tr_smooth)
+    m_di = 100 * (pd.Series(m_dm).ewm(alpha=alpha, adjust=False).mean() / tr_smooth)
+    
+    dx = 100 * np.abs(p_di - m_di) / (p_di + m_di + 1e-9)
+    df['ADX'] = dx.ewm(alpha=alpha, adjust=False).mean()
+
+    # Choppiness Index Calculation
+    sum_tr = tr.rolling(period).sum()
+    high_max = df['High'].rolling(period).max()
+    low_min = df['Low'].rolling(period).min()
+    df['CHOP'] = 100 * np.log10(sum_tr / (high_max - low_min + 1e-9)) / np.log10(period)
+    
+    # ATR & Technicals
+    df['ATR'] = tr.rolling(ATR_PERIOD).mean()
+    df['ATR_Pct'] = df['ATR'] / df['Close']
+    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+    df['Mom_Short'] = (df['Close'] - df['Close'].shift(10)) / df['Close'].shift(10)
+    df['Mom_Long'] = (df['Close'] - df['Close'].shift(30)) / df['Close'].shift(30)
+    df['Volume_SMA'] = df['Volume'].rolling(20).mean()
+    df['Volume_Ratio'] = df['Volume'] / df['Volume_SMA']
+    
+    return df
+
 
 def fetch_symbol_data(lbank_symbol):
     all_ohlcv = []
@@ -143,23 +184,8 @@ def fetch_symbol_data(lbank_symbol):
     if not deltas.empty and deltas.max() > pd.Timedelta(hours=4, minutes=10):
         return None
 
-    tr1 = df["High"] - df["Low"]
-    tr2 = np.abs(df["High"] - df["Close"].shift(1))
-    tr3 = np.abs(df["Low"] - df["Close"].shift(1))
-    df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
-    df["ATR_Pct"] = df["ATR"] / df["Close"]
-
-    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
-    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
-    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
-
-    df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
-    df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
-    
-    df["Volume_SMA"] = df["Volume"].rolling(20).mean()
-    df["Volume_Ratio"] = df["Volume"] / df["Volume_SMA"]
-
     df.set_index("Date", inplace=True)
+    df = calculate_adx_and_chop(df)
     return df
 
 
@@ -299,10 +325,24 @@ def run_backtest(processed_data):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
+            # 1. فیلتر نوسان شدید ATR
             if c4h["ATR_Pct"] > 0.08 or c4h["ATR_Pct"] < 0.004:
                 continue
 
+            # 2. فیلتر حجم معاملات
             if c4h["Volume_Ratio"] < 0.7:
+                continue
+
+            # 3. فیلترهای ضد رنج و ضد تله نهنگی (ADX & Choppiness)
+            if pd.isna(c4h["ADX"]) or pd.isna(c4h["CHOP"]):
+                continue
+            if c4h["ADX"] < 23 or c4h["CHOP"] > 55:  # بازار رنج یا بی‌روند -> ممنوعیت ورود
+                continue
+
+            # 4. فیلتر پین‌بار و کندل‌های دستکاری‌شده (جلوگیری از کندل‌های شارپی فیک)
+            body_size = abs(c4h["Close"] - c4h["Open"])
+            total_candle_size = c4h["High"] - c4h["Low"]
+            if total_candle_size > 0 and (body_size / total_candle_size) < 0.28:
                 continue
 
             if market_bull:
@@ -327,14 +367,6 @@ def run_backtest(processed_data):
             if not (0.012 <= sl_dist_pct <= 0.045):
                 continue
 
-            target_volatility_benchmark = 0.03
-            volatility_scalar = target_volatility_benchmark / max(c4h["ATR_Pct"], 0.01)
-            volatility_scalar = np.clip(volatility_scalar, 0.5, 1.8)
-            dynamic_margin = BASE_TRADE_MARGIN * volatility_scalar
-            
-            dynamic_leverage = BASE_LEVERAGE * (0.03 / max(c4h["ATR_Pct"], 0.02))
-            dynamic_leverage = float(np.clip(dynamic_leverage, 20.0, 75.0))
-
             candidates.append({
                 "symbol": symbol,
                 "side": side,
@@ -342,8 +374,8 @@ def run_backtest(processed_data):
                 "initial_sl": float(initial_sl),
                 "initial_risk": float(initial_risk),
                 "entry_index": int(i),
-                "margin": float(dynamic_margin),
-                "leverage": float(dynamic_leverage),
+                "margin": float(BASE_TRADE_MARGIN),  # ۱۰۰ دلار ثابت
+                "leverage": float(BASE_LEVERAGE),    # لورج ۸۰ ثابت
             })
 
         slots = MAX_POSITIONS - len(active_positions)
@@ -464,7 +496,7 @@ def report(name, trades_df, equity_df):
 
 if __name__ == "__main__":
     trades_df, equity_df = run_backtest(processed_data)
-    report("HUNTER-V99 REPORT", trades_df, equity_df)
+    report("HUNTER-V100 REPORT", trades_df, equity_df)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not trades_df.empty:
