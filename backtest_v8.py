@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — SHORT SHARP COOLDOWN & OPTIMIZED EXPOSURE (V14.8)
+# HUNTER-V74 — ANTI-CLUSTER SHOCK BREAKER (V14.9)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -52,7 +52,7 @@ SYMBOLS = {
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
-MAX_POSITIONS = 4  # بهینه‌سازی شده برای کنترل همبستگی ضررها
+MAX_POSITIONS = 3  # کاهش پوزیشن‌های هم‌زمان برای جلوگیری از انباشت ضرر در یک کندل
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — SHORT SHARP COOLDOWN (V14.8)")
+print("HUNTER-V74 — ANTI-CLUSTER SHOCK BREAKER (V14.9)")
 print("=" * 68)
 
 processed_data = {}
@@ -188,13 +188,14 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
     trades = []
     
     recent_consecutive_losses = 0
-    short_cooldown_remaining = 0
+    cooldown_candles_remaining = 0
 
     for ts in all_timestamps:
-        if short_cooldown_remaining > 0:
-            short_cooldown_remaining -= 1
+        if cooldown_candles_remaining > 0:
+            cooldown_candles_remaining -= 1
 
         symbols_to_close = []
+        timestamp_losses_count = 0
 
         for symbol, pos in list(active_positions.items()):
             df = processed_data[symbol]
@@ -238,10 +239,7 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
             
             if outcome == "LOSS":
                 recent_consecutive_losses += 1
-                if recent_consecutive_losses >= 3:
-                    # بعد از ۳ باخت متوالی، فقط ۵ کندل (۲۰ ساعت) استراحت کن و دوباره برگرد
-                    short_cooldown_remaining = 5
-                    recent_consecutive_losses = 0
+                timestamp_losses_count += 1
             else:
                 recent_consecutive_losses = 0
 
@@ -261,7 +259,13 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        if short_cooldown_remaining > 0:
+        # اگر در این کندل بیش از ۱ پوزیشن با ضرر بسته شد یا باخت‌های متوالی به ۳ رسید، استراحت کن
+        if timestamp_losses_count >= 2 or recent_consecutive_losses >= 3:
+            cooldown_candles_remaining = 8  # ۳۲ ساعت استراحت ضد شوک
+            if timestamp_losses_count >= 2:
+                recent_consecutive_losses = 0  # ریست برای جلوگیری از انباشتگی کاذب
+
+        if cooldown_candles_remaining > 0:
             continue
 
         market_bull = True
@@ -388,6 +392,6 @@ if __name__ == "__main__":
             cur = 0
 
     print("=" * 72)
-    print("HUNTER-V14.8 — SHORT SHARP COOLDOWN RESULTS")
+    print("HUNTER-V14.9 — ANTI-CLUSTER SHOCK BREAKER RESULTS")
     print("=" * 72)
     print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
