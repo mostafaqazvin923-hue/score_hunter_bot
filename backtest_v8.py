@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — TIGHT RISK & MAXLS TARGET 4 (V14.3)
+# HUNTER-V74 — GOLDEN BASE & SMART CIRCUIT BREAKER (V14.4)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — TIGHT RISK & MAXLS TARGET 4 (V14.3)")
+print("HUNTER-V74 — GOLDEN BASE & SMART CIRCUIT BREAKER (V14.4)")
 print("=" * 68)
 
 processed_data = {}
@@ -186,6 +186,9 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     trades = []
+    
+    # متغیر برای ردیابی تعداد باخت‌های پشت‌سرهمِ اخیر به منظور اعمال مدارشکن ملایم
+    recent_consecutive_losses = 0
 
     for ts in all_timestamps:
         symbols_to_close = []
@@ -229,6 +232,13 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
             outcome = "WIN" if r_real > 0 else "LOSS"
+            
+            # به‌روزرسانی شمارنده باخت‌های متوالی برای مدارشکن
+            if outcome == "LOSS":
+                recent_consecutive_losses += 1
+            else:
+                recent_consecutive_losses = 0
+
             position_notional = TRADE_MARGIN * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
@@ -244,6 +254,10 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
 
         for sym in symbols_to_close:
             del active_positions[sym]
+
+        # مدارشکن هوشمند: اگر ۴ باخت متوالی ثبت شد، به مدت این کندل اجازه باز کردن پوزیشن جدید را نمی‌دهیم تا روند اصلاحی تمام شود
+        if recent_consecutive_losses >= 4:
+            continue
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -319,8 +333,8 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            # سخت‌گیری روی ریسک اولیه: فشرده کردن حد ضرر به جای باز گذاشتن تا ۴٪
-            if not (0.01 <= sl_dist_pct <= 0.03):
+            # برگشت به دامنه اصلی و بی‌نقصِ قبلی (بین ۱٪ تا ۴٪)
+            if not (0.01 <= sl_dist_pct <= 0.04):
                 continue
 
             candidates.append({
@@ -370,6 +384,6 @@ if __name__ == "__main__":
             cur = 0
 
     print("=" * 72)
-    print("HUNTER-V14.3 — TIGHT RISK RESULTS")
+    print("HUNTER-V14.4 — GOLDEN BASE WITH CIRCUIT BREAKER RESULTS")
     print("=" * 72)
     print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
