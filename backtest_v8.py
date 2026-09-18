@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — ULTIMATE TREND-QUALITY & STREAK-KILLER (V11)
+# HUNTER-V74 — DYNAMIC BREAKEVEN & STREAK KILLER (V12)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -58,9 +58,9 @@ SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-TRAILING_ATR_MULTIPLIER = 2.0
-INITIAL_ATR_MULTIPLIER = 1.8
-TIMEOUT_CANDLES = 45
+TRAILING_ATR_MULTIPLIER = 1.6
+INITIAL_ATR_MULTIPLIER = 1.5
+TIMEOUT_CANDLES = 40
 EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 1000.0
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — ULTIMATE TREND-QUALITY & STREAK-KILLER (V11)")
+print("HUNTER-V74 — DYNAMIC BREAKEVEN & STREAK KILLER (V12)")
 print("=" * 68)
 
 processed_data = {}
@@ -138,10 +138,6 @@ def fetch_symbol_data(lbank_symbol):
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
-    
-    # فیلتر کیفیت روند برای جلوگیری از رِنج‌های فیک
-    df["Trend_Spread"] = np.abs(df["EMA20"] - df["EMA50"]) / df["Close"]
-    
     df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
     df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
     df.set_index("Date", inplace=True)
@@ -157,7 +153,7 @@ print(f"Valid symbols: {len(processed_data)} / {len(SYMBOLS)}")
 def get_all_timestamps(data):
     return sorted({ts for df in data.values() for ts in df.index})
 
-def build_valid_candidates(processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts, strict_chop_filter=False):
+def build_valid_candidates(processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts):
     current_scores = {}
     for symbol, df in processed_data.items():
         if ts not in df.index:
@@ -173,8 +169,6 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
     ranked_symbols = sorted(current_scores.keys(), key=lambda x: current_scores[x], reverse=rev_bool)
     candidates = []
 
-    min_spread = 0.008 if strict_chop_filter else 0.004
-
     for symbol in ranked_symbols:
         if symbol in active_positions:
             continue
@@ -188,10 +182,6 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
 
         c4h = df.iloc[i]
         prev_c = df.iloc[i - 1]
-
-        # فیلتر فاصله میانگین‌ها برای جلوگیری از معامله در بازار رِنج فشرده
-        if c4h["Trend_Spread"] < min_spread:
-            continue
 
         if market_bull:
             if not allow_longs:
@@ -233,12 +223,11 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
 
 def run_backtest(
     processed_data,
-    use_trend_quality=False,
+    use_breakeven_shield=False,
 ):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
-    consecutive_losses = 0
     diagnostics = Counter()
     equity_curve = []
 
@@ -254,6 +243,13 @@ def run_backtest(
             if pos["side"] == "LONG":
                 if c4h["High"] > pos["highest_price"]:
                     pos["highest_price"] = c4h["High"]
+                    # مکانیزم برک‌ایو پیشرفته: اگر سود به اندازه ۱.۲ برابر ریسک اولیه رسید، حد ضرر را روی نقطه ورود قفل کن
+                    if use_breakeven_shield and not pos["breakeven_triggered"]:
+                        if (pos["highest_price"] - pos["entry_price"]) >= (1.2 * pos["initial_risk"]):
+                            pos["stop_loss"] = pos["entry_price"]
+                            pos["breakeven_triggered"] = True
+                            diagnostics["breakeven_locks"] += 1
+
                     new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
                     if new_trailing_sl > pos["stop_loss"]:
                         pos["stop_loss"] = new_trailing_sl
@@ -261,6 +257,12 @@ def run_backtest(
             else:
                 if c4h["Low"] < pos["lowest_price"]:
                     pos["lowest_price"] = c4h["Low"]
+                    if use_breakeven_shield and not pos["breakeven_triggered"]:
+                        if (pos["entry_price"] - pos["lowest_price"]) >= (1.2 * pos["initial_risk"]):
+                            pos["stop_loss"] = pos["entry_price"]
+                            pos["breakeven_triggered"] = True
+                            diagnostics["breakeven_locks"] += 1
+
                     new_trailing_sl = pos["lowest_price"] + TRAILING_ATR_MULTIPLIER * c4h["ATR"]
                     if new_trailing_sl < pos["stop_loss"]:
                         pos["stop_loss"] = new_trailing_sl
@@ -286,11 +288,6 @@ def run_backtest(
             outcome = "WIN" if r_real > 0 else "LOSS"
             position_notional = TRADE_MARGIN * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
-
-            if outcome == "LOSS":
-                consecutive_losses += 1
-            else:
-                consecutive_losses = 0
 
             all_trades.append({
                 "Timestamp": ts,
@@ -325,12 +322,8 @@ def run_backtest(
         allow_longs = market_breadth_ratio >= 0.35
         allow_shorts = market_breadth_ratio <= 0.65
 
-        strict_chop_filter = use_trend_quality and (consecutive_losses >= 2)
-        if strict_chop_filter:
-            diagnostics["strict_chop_blocks"] += 1
-
         candidates = build_valid_candidates(
-            processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts, strict_chop_filter=strict_chop_filter
+            processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts
         )
 
         if not candidates:
@@ -353,6 +346,7 @@ def run_backtest(
                 "lowest_price": candidate["entry_price"],
                 "initial_risk": candidate["initial_risk"],
                 "entry_index": candidate["entry_index"],
+                "breakeven_triggered": False,
             }
 
         closed_pnl = sum(trade["Dollar_PnL"] for trade in all_trades)
@@ -376,10 +370,10 @@ def run_backtest(
 
 if __name__ == "__main__":
     base, _, _ = run_backtest(
-        processed_data, use_trend_quality=False
+        processed_data, use_breakeven_shield=False
     )
-    v11_optimized, _, fd_v11 = run_backtest(
-        processed_data, use_trend_quality=True
+    v12_optimized, _, fd_v12 = run_backtest(
+        processed_data, use_breakeven_shield=True
     )
 
     def stats(df):
@@ -396,10 +390,10 @@ if __name__ == "__main__":
         return n, wr, pnl, mx
 
     a = stats(base)
-    b = stats(v11_optimized)
+    b = stats(v12_optimized)
 
     print("=" * 72)
-    print("HUNTER-V74 — ULTIMATE TREND-QUALITY & STREAK-KILLER RESULTS (V11)")
+    print("HUNTER-V74 — DYNAMIC BREAKEVEN & STREAK KILLER RESULTS (V12)")
     print("=" * 72)
     print(f"V74 اصلی      | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
-    print(f"V11 هوشمند    | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]} | StrictBlocks={int(fd_v11.get('strict_chop_blocks',0))}")
+    print(f"V12 برک‌ایو    | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]} | BE_Locks={int(fd_v12.get('breakeven_locks',0))}")
