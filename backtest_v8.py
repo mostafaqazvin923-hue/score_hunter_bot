@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — PRECISION ATR FILTER & MAXLS CONTROL (V14.1)
+# HUNTER-V74 — SYMBOL COOLDOWN & MAXLS TARGET 4 (V14.2)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — PRECISION ATR FILTER & MAXLS CONTROL (V14.1)")
+print("HUNTER-V74 — SYMBOL COOLDOWN & MAXLS TARGET 4 (V14.2)")
 print("=" * 68)
 
 processed_data = {}
@@ -135,9 +135,6 @@ def fetch_symbol_data(lbank_symbol):
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
 
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
-    # محاسبه میانگین ATR برای جلوگیری از ورود در کندل‌های با نوسان غیرعادی و فیک
-    df["ATR_SMA20"] = df["ATR"].rolling(20).mean()
-    
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
@@ -189,6 +186,9 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
+    
+    # دیکشنری برای ثبت زمان استراحتِ هر ارز به صورت اختصاصی پس از ضرر
+    symbol_cooldown = {}
 
     for ts in all_timestamps:
         symbols_to_close = []
@@ -232,6 +232,11 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
             outcome = "WIN" if r_real > 0 else "LOSS"
+            
+            # اگر این ارز ضرر داد، به مدت ۳ کندل (۱۲ ساعت) وارد لیست خنک‌سازی اختصاصی می‌شود
+            if outcome == "LOSS":
+                symbol_cooldown[symbol] = curr_i + 3
+
             position_notional = TRADE_MARGIN * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
@@ -285,36 +290,38 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
             if symbol in active_positions:
                 continue
             
-            if use_correlation_gate and not is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=corr_threshold):
-                continue
-
             df = processed_data[symbol]
             if ts not in df.index:
                 continue
 
             i = df.index.get_loc(ts)
+
+            # چک کردن اینکه آیا این ارز در دوره خنک‌سازی پس از ضرر قرار دارد یا خیر
+            if symbol in symbol_cooldown and i < symbol_cooldown[symbol]:
+                continue
+
+            if use_correlation_gate and not is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=corr_threshold):
+                continue
+
             if i < EMA_WARMUP + 1:
                 continue
 
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
-            # فیلتر دقت ATR: جلوگیری از ورود در کندل‌هایی که نوسان آن‌ها بیش از حد غیرعادی (پامپ و دامپ ناگهانی) است
-            atr_normal = c4h["ATR"] <= (c4h["ATR_SMA20"] * 2.2) if not np.isnan(c4h["ATR_SMA20"]) else True
-
             if market_bull:
                 if not allow_longs:
                     continue
                 regime_ok = c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"]
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                valid_signal = regime_ok and pullback_ok and atr_normal and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
                 side = "LONG"
             else:
                 if not allow_shorts:
                     continue
                 regime_ok = c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"]
                 pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and atr_normal and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
                 side = "SHORT"
 
             if not valid_signal:
@@ -375,6 +382,6 @@ if __name__ == "__main__":
             cur = 0
 
     print("=" * 72)
-    print("HUNTER-V74 — PRECISION ATR FILTER RESULTS (V14.1)")
+    print("HUNTER-V14.2 — SYMBOL COOLDOWN RESULTS")
     print("=" * 72)
     print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
