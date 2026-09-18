@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — GOLDEN BASE & SMART CIRCUIT BREAKER (V14.4)
+# HUNTER-V74 — GOLDEN BASE & FIXED TIMED CIRCUIT BREAKER (V14.5)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — GOLDEN BASE & SMART CIRCUIT BREAKER (V14.4)")
+print("HUNTER-V74 — FIXED TIMED CIRCUIT BREAKER (V14.5)")
 print("=" * 68)
 
 processed_data = {}
@@ -187,10 +187,14 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
     active_positions = {}
     trades = []
     
-    # متغیر برای ردیابی تعداد باخت‌های پشت‌سرهمِ اخیر به منظور اعمال مدارشکن ملایم
     recent_consecutive_losses = 0
+    cooldown_candles_remaining = 0
 
     for ts in all_timestamps:
+        # مدیریت تایمر استراحت مدارشکن
+        if cooldown_candles_remaining > 0:
+            cooldown_candles_remaining -= 1
+
         symbols_to_close = []
 
         for symbol, pos in list(active_positions.items()):
@@ -233,9 +237,12 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
 
             outcome = "WIN" if r_real > 0 else "LOSS"
             
-            # به‌روزرسانی شمارنده باخت‌های متوالی برای مدارشکن
             if outcome == "LOSS":
                 recent_consecutive_losses += 1
+                if recent_consecutive_losses >= 4:
+                    # به جای قفل همیشگی، ۱۵ کندل (۶۰ ساعت) استراحت بده و شمارنده را ریست کن
+                    cooldown_candles_remaining = 15
+                    recent_consecutive_losses = 0
             else:
                 recent_consecutive_losses = 0
 
@@ -255,8 +262,8 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # مدارشکن هوشمند: اگر ۴ باخت متوالی ثبت شد، به مدت این کندل اجازه باز کردن پوزیشن جدید را نمی‌دهیم تا روند اصلاحی تمام شود
-        if recent_consecutive_losses >= 4:
+        # اگر در دوره استراحت مدارشکن هستیم، اجازه باز کردن پوزیشن جدید را نده
+        if cooldown_candles_remaining > 0:
             continue
 
         market_bull = True
@@ -333,7 +340,6 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            # برگشت به دامنه اصلی و بی‌نقصِ قبلی (بین ۱٪ تا ۴٪)
             if not (0.01 <= sl_dist_pct <= 0.04):
                 continue
 
@@ -384,6 +390,6 @@ if __name__ == "__main__":
             cur = 0
 
     print("=" * 72)
-    print("HUNTER-V14.4 — GOLDEN BASE WITH CIRCUIT BREAKER RESULTS")
+    print("HUNTER-V14.5 — TIMED CIRCUIT BREAKER RESULTS")
     print("=" * 72)
     print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
