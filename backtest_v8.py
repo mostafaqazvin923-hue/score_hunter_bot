@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — CIRCUIT BREAKER & CORRELATION ENGINE (V14)
+# HUNTER-V74 — OPTIMIZED CORRELATION & QUALITY GATE (V13.1)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — CIRCUIT BREAKER & CORRELATION ENGINE (V14)")
+print("HUNTER-V74 — OPTIMIZED CORRELATION & QUALITY GATE (V13.1)")
 print("=" * 68)
 
 processed_data = {}
@@ -153,7 +153,7 @@ print(f"Valid symbols: {len(processed_data)} / {len(SYMBOLS)}")
 def get_all_timestamps(data):
     return sorted({ts for df in data.values() for ts in df.index})
 
-def is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=0.75):
+def is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=0.60):
     if not active_positions:
         return True
     df_cand = processed_data[symbol]
@@ -182,18 +182,12 @@ def is_correlation_allowed(symbol, active_positions, processed_data, ts, thresho
             return False
     return True
 
-def run_backtest_v14(processed_data, max_consecutive_losses_limit=2, cooldown_candles=6):
+def run_backtest(processed_data, use_correlation_gate=False, corr_threshold=0.60):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
-    consecutive_losses = 0
-    cooldown_counter = 0
 
     for ts in all_timestamps:
-        # کاهش تایمر انجماد در هر کندل جدید
-        if cooldown_counter > 0:
-            cooldown_counter -= 1
-
         symbols_to_close = []
 
         for symbol, pos in list(active_positions.items()):
@@ -238,14 +232,6 @@ def run_backtest_v14(processed_data, max_consecutive_losses_limit=2, cooldown_ca
             position_notional = TRADE_MARGIN * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
-            # آپدیت مدارشکن پس از بسته شدن معامله
-            if outcome == "LOSS":
-                consecutive_losses += 1
-                if consecutive_losses >= max_consecutive_losses_limit:
-                    cooldown_counter = cooldown_candles # ربات برای چند کندل آینده منجمد می‌شود
-            else:
-                consecutive_losses = 0
-
             all_trades.append({
                 "Timestamp": ts,
                 "Symbol": symbol,
@@ -258,10 +244,6 @@ def run_backtest_v14(processed_data, max_consecutive_losses_limit=2, cooldown_ca
 
         for sym in symbols_to_close:
             del active_positions[sym]
-
-        # اگر مدارشکن فعال باشد، اجازه ثبت سیگنال جدید داده نمی‌شود
-        if cooldown_counter > 0:
-            continue
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -281,7 +263,6 @@ def run_backtest_v14(processed_data, max_consecutive_losses_limit=2, cooldown_ca
         allow_longs = market_breadth_ratio >= 0.35
         allow_shorts = market_breadth_ratio <= 0.65
 
-        # استخراج نامزدهای ورود با فیلتر همبستگی
         current_scores = {}
         for symbol, df in processed_data.items():
             if ts not in df.index:
@@ -300,7 +281,8 @@ def run_backtest_v14(processed_data, max_consecutive_losses_limit=2, cooldown_ca
         for symbol in ranked_symbols:
             if symbol in active_positions:
                 continue
-            if not is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=0.75):
+            
+            if use_correlation_gate and not is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=corr_threshold):
                 continue
 
             df = processed_data[symbol]
@@ -319,14 +301,15 @@ def run_backtest_v14(processed_data, max_consecutive_losses_limit=2, cooldown_ca
                     continue
                 regime_ok = c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"]
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
+                # سخت‌گیری بیشتر روی مومنتوم برای کاهش خطاهای متوالی
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
                 side = "LONG"
             else:
                 if not allow_shorts:
                     continue
                 regime_ok = c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"]
                 pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
                 side = "SHORT"
 
             if not valid_signal:
@@ -373,8 +356,8 @@ def run_backtest_v14(processed_data, max_consecutive_losses_limit=2, cooldown_ca
     return pd.DataFrame(all_trades)
 
 if __name__ == "__main__":
-    base_trades = run_backtest_v14(processed_data, max_consecutive_losses_limit=99, cooldown_candles=0)
-    v14_trades = run_backtest_v14(processed_data, max_consecutive_losses_limit=2, cooldown_candles=6)
+    v13_trades = run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
+    v13_1_trades = run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.60)
 
     def stats(df):
         n = len(df)
@@ -389,11 +372,11 @@ if __name__ == "__main__":
                 cur = 0
         return n, wr, pnl, mx
 
-    a = stats(base_trades)
-    b = stats(v14_trades)
+    a = stats(v13_trades)
+    b = stats(v13_1_trades)
 
     print("=" * 72)
-    print("HUNTER-V74 — CIRCUIT BREAKER ENGINE RESULTS (V14)")
+    print("HUNTER-V74 — OPTIMIZED CORRELATION & QUALITY RESULTS (V13.1)")
     print("=" * 72)
-    print(f"V74 اصلی         | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
-    print(f"V14 مدارشکن هوشمند | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]}")
+    print(f"V13 قبلی (ت آستانه 0.75) | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
+    print(f"V13.1 بهینه (آستانه 0.60) | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]}")
