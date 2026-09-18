@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — PORTFOLIO CORRELATION & DIAGNOSTIC LAB (V13-DIAG)
+# HUNTER-V74 — DYNAMIC CORRELATION-GATE ENGINE (V13)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — PORTFOLIO CORRELATION & DIAGNOSTIC LAB (V13-DIAG)")
+print("HUNTER-V74 — DYNAMIC CORRELATION-GATE ENGINE (V13)")
 print("=" * 68)
 
 processed_data = {}
@@ -153,7 +153,36 @@ print(f"Valid symbols: {len(processed_data)} / {len(SYMBOLS)}")
 def get_all_timestamps(data):
     return sorted({ts for df in data.values() for ts in df.index})
 
-def build_valid_candidates(processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts):
+def is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=0.75):
+    if not active_positions:
+        return True
+    df_cand = processed_data[symbol]
+    if ts not in df_cand.index:
+        return False
+    idx_cand = df_cand.index.get_loc(ts)
+    if idx_cand < 30:
+        return True
+    
+    cand_returns = df_cand['Close'].iloc[idx_cand-30:idx_cand+1].pct_change().dropna()
+
+    for active_sym in active_positions:
+        df_act = processed_data[active_sym]
+        if ts not in df_act.index:
+            continue
+        idx_act = df_act.index.get_loc(ts)
+        if idx_act < 30:
+            continue
+        act_returns = df_act['Close'].iloc[idx_act-30:idx_act+1].pct_change().dropna()
+
+        aligned = pd.concat([cand_returns, act_returns], axis=1).dropna()
+        if len(aligned) < 15:
+            continue
+        corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
+        if not np.isnan(corr) and corr > threshold:
+            return False
+    return True
+
+def build_valid_candidates(processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts, use_correlation_gate=False):
     current_scores = {}
     for symbol, df in processed_data.items():
         if ts not in df.index:
@@ -172,6 +201,11 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
     for symbol in ranked_symbols:
         if symbol in active_positions:
             continue
+        
+        # اعمال فیلتر همبستگی پویا
+        if use_correlation_gate and not is_correlation_allowed(symbol, active_positions, processed_data, ts):
+            continue
+
         df = processed_data[symbol]
         if ts not in df.index:
             continue
@@ -221,10 +255,11 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
 
     return candidates
 
-def run_diagnostic_backtest(processed_data, max_allowed_positions=5):
+def run_backtest(processed_data, use_correlation_gate=False):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
+    diagnostics = Counter()
 
     for ts in all_timestamps:
         symbols_to_close = []
@@ -278,7 +313,6 @@ def run_diagnostic_backtest(processed_data, max_allowed_positions=5):
                 "Outcome": outcome,
                 "Return": r_real,
                 "Dollar_PnL": dollar_pnl,
-                "ActiveCountAtClose": len(active_positions),
             })
             symbols_to_close.append(symbol)
 
@@ -304,13 +338,13 @@ def run_diagnostic_backtest(processed_data, max_allowed_positions=5):
         allow_shorts = market_breadth_ratio <= 0.65
 
         candidates = build_valid_candidates(
-            processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts
+            processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts, use_correlation_gate=use_correlation_gate
         )
 
         if not candidates:
             continue
 
-        slots = max_allowed_positions - len(active_positions)
+        slots = MAX_POSITIONS - len(active_positions)
         if slots <= 0:
             continue
 
@@ -332,8 +366,8 @@ def run_diagnostic_backtest(processed_data, max_allowed_positions=5):
     return pd.DataFrame(all_trades)
 
 if __name__ == "__main__":
-    trades_5 = run_diagnostic_backtest(processed_data, max_allowed_positions=5)
-    trades_2 = run_diagnostic_backtest(processed_data, max_allowed_positions=2)
+    base_trades = run_backtest(processed_data, use_correlation_gate=False)
+    v13_trades = run_backtest(processed_data, use_correlation_gate=True)
 
     def stats(df):
         n = len(df)
@@ -348,11 +382,11 @@ if __name__ == "__main__":
                 cur = 0
         return n, wr, pnl, mx
 
-    a = stats(trades_5)
-    b = stats(trades_2)
+    a = stats(base_trades)
+    b = stats(v13_trades)
 
     print("=" * 72)
-    print("HUNTER-V74 — CORRELATION & MAX_POSITIONS STRESS TEST")
+    print("HUNTER-V74 — DYNAMIC CORRELATION-GATE RESULTS (V13)")
     print("=" * 72)
-    print(f"Max Positions = 5 | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
-    print(f"Max Positions = 2 | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]}")
+    print(f"V74 اصلی      | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
+    print(f"V13 همبستگی پویا | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]}")
