@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — DYNAMIC BREAKEVEN SHIELD (V14.11)
+# HUNTER-V74 — GOLDEN BASE WITH ENTRY SHOCK FILTER (V14.12)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — DYNAMIC BREAKEVEN SHIELD (V14.11)")
+print("HUNTER-V74 — GOLDEN BASE WITH ENTRY SHOCK FILTER (V14.12)")
 print("=" * 68)
 
 processed_data = {}
@@ -203,11 +203,6 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
             c4h = df.loc[ts]
 
             if pos["side"] == "LONG":
-                # بررسی انتقال استاپ به نقطه سر به سر (Breakeven) اگر قیمت ۱ برابر ATR رشد کرده باشد
-                if not pos["breakeven_triggered"] and c4h["High"] >= pos["entry_price"] + 1.0 * c4h["ATR"]:
-                    pos["stop_loss"] = max(pos["stop_loss"], pos["entry_price"])
-                    pos["breakeven_triggered"] = True
-
                 if c4h["High"] > pos["highest_price"]:
                     pos["highest_price"] = c4h["High"]
                     new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
@@ -215,10 +210,6 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
                         pos["stop_loss"] = new_trailing_sl
                 hit_sl = c4h["Low"] <= pos["stop_loss"]
             else:
-                if not pos["breakeven_triggered"] and c4h["Low"] <= pos["entry_price"] - 1.0 * c4h["ATR"]:
-                    pos["stop_loss"] = min(pos["stop_loss"], pos["entry_price"])
-                    pos["breakeven_triggered"] = True
-
                 if c4h["Low"] < pos["lowest_price"]:
                     pos["lowest_price"] = c4h["Low"]
                     new_trailing_sl = pos["lowest_price"] + TRAILING_ATR_MULTIPLIER * c4h["ATR"]
@@ -243,14 +234,15 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
                 r_real = ((pos["entry_price"] - exit_p) / initial_risk) - (FEE_RATE * 2)
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
-            outcome = "WIN" if r_real > 0 else ("LOSS" if r_real < 0 else "EVEN")
+            outcome = "WIN" if r_real > 0 else "LOSS"
             
             if outcome == "LOSS":
                 recent_consecutive_losses += 1
-                if recent_consecutive_losses >= 4:
-                    cooldown_candles_remaining = 10
+                if recent_consecutive_losses >= 5:
+                    # فقط وقتی باخت‌های متوالی به ۵ رسید، ۴ کندل (۱۶ ساعت) ورودهای جدید رو متوقف کن تا طوفان رد بشه
+                    cooldown_candles_remaining = 4
                     recent_consecutive_losses = 0
-            elif outcome == "WIN":
+            else:
                 recent_consecutive_losses = 0
 
             position_notional = TRADE_MARGIN * LEVERAGE
@@ -276,6 +268,13 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
             btc_c = processed_data["BTC"].loc[ts]
             market_bull = btc_c["Close"] > btc_c["EMA200"]
+            
+            # فیلتر هوشمند ورود: اگر بیت کوین در این کندل افت بیشتر از ۳٪ داشت، موقتاً ورود جدید نزنیم
+            btc_prev_close = processed_data["BTC"]["Close"].shift(1).loc[ts] if ts in processed_data["BTC"].index else btc_c["Close"]
+            if not np.isnan(btc_prev_close) and btc_prev_close > 0:
+                btc_pct_change = (btc_c["Close"] - btc_prev_close) / btc_prev_close
+                if btc_pct_change < -0.03:
+                    continue
 
         bullish_count = 0
         total_active_syms = 0
@@ -377,13 +376,12 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
                 "lowest_price": candidate["entry_price"],
                 "initial_risk": candidate["initial_risk"],
                 "entry_index": candidate["entry_index"],
-                "breakeven_triggered": False,
             }
 
     return pd.DataFrame(trades)
 
 if __name__ == "__main__":
-    trades_df = run_blocktest_df = run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
+    trades_df = run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
 
     n = len(trades_df)
     wr = (trades_df["Outcome"].eq("WIN").mean() * 100) if n else 0
@@ -397,6 +395,6 @@ if __name__ == "__main__":
             cur = 0
 
     print("=" * 72)
-    print("HUNTER-V14.11 — DYNAMIC BREAKEVEN SHIELD RESULTS")
+    print("HUNTER-V14.12 — GOLDEN BASE WITH ENTRY SHOCK FILTER RESULTS")
     print("=" * 72)
     print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
