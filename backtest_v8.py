@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — GOLDEN BASE & FIXED TIMED CIRCUIT BREAKER (V14.5)
+# HUNTER-V74 — SENSITIVE CIRCUIT BREAKER & TARGET MAXLS 4 (V14.6)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — FIXED TIMED CIRCUIT BREAKER (V14.5)")
+print("HUNTER-V74 — SENSITIVE CIRCUIT BREAKER (V14.6)")
 print("=" * 68)
 
 processed_data = {}
@@ -191,7 +191,6 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
     cooldown_candles_remaining = 0
 
     for ts in all_timestamps:
-        # مدیریت تایمر استراحت مدارشکن
         if cooldown_candles_remaining > 0:
             cooldown_candles_remaining -= 1
 
@@ -239,9 +238,9 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
             
             if outcome == "LOSS":
                 recent_consecutive_losses += 1
-                if recent_consecutive_losses >= 4:
-                    # به جای قفل همیشگی، ۱۵ کندل (۶۰ ساعت) استراحت بده و شمارنده را ریست کن
-                    cooldown_candles_remaining = 15
+                if recent_consecutive_losses >= 3:
+                    # حساسیت بیشتر: بعد از ۳ باخت متوالی، ۲۰ کندل (۸۰ ساعت) استراحت کن
+                    cooldown_candles_remaining = 20
                     recent_consecutive_losses = 0
             else:
                 recent_consecutive_losses = 0
@@ -262,7 +261,6 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # اگر در دوره استراحت مدارشکن هستیم، اجازه باز کردن پوزیشن جدید را نده
         if cooldown_candles_remaining > 0:
             continue
 
@@ -390,6 +388,6 @@ if __name__ == "__main__":
             cur = 0
 
     print("=" * 72)
-    print("HUNTER-V14.5 — TIMED CIRCUIT BREAKER RESULTS")
+    print("HUNTER-V14.6 — SENSITIVE CIRCUIT BREAKER RESULTS")
     print("=" * 72)
     print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
