@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — SYMBOL COOLDOWN & MAXLS TARGET 4 (V14.2)
+# HUNTER-V74 — TIGHT RISK & MAXLS TARGET 4 (V14.3)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — SYMBOL COOLDOWN & MAXLS TARGET 4 (V14.2)")
+print("HUNTER-V74 — TIGHT RISK & MAXLS TARGET 4 (V14.3)")
 print("=" * 68)
 
 processed_data = {}
@@ -185,10 +185,7 @@ def is_correlation_allowed(symbol, active_positions, processed_data, ts, thresho
 def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
-    all_trades = []
-    
-    # دیکشنری برای ثبت زمان استراحتِ هر ارز به صورت اختصاصی پس از ضرر
-    symbol_cooldown = {}
+    trades = []
 
     for ts in all_timestamps:
         symbols_to_close = []
@@ -232,15 +229,10 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
             outcome = "WIN" if r_real > 0 else "LOSS"
-            
-            # اگر این ارز ضرر داد، به مدت ۳ کندل (۱۲ ساعت) وارد لیست خنک‌سازی اختصاصی می‌شود
-            if outcome == "LOSS":
-                symbol_cooldown[symbol] = curr_i + 3
-
             position_notional = TRADE_MARGIN * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
-            all_trades.append({
+            trades.append({
                 "Timestamp": ts,
                 "Symbol": symbol,
                 "Side": pos["side"],
@@ -290,19 +282,14 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
             if symbol in active_positions:
                 continue
             
+            if use_correlation_gate and not is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=corr_threshold):
+                continue
+
             df = processed_data[symbol]
             if ts not in df.index:
                 continue
 
             i = df.index.get_loc(ts)
-
-            # چک کردن اینکه آیا این ارز در دوره خنک‌سازی پس از ضرر قرار دارد یا خیر
-            if symbol in symbol_cooldown and i < symbol_cooldown[symbol]:
-                continue
-
-            if use_correlation_gate and not is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=corr_threshold):
-                continue
-
             if i < EMA_WARMUP + 1:
                 continue
 
@@ -332,7 +319,8 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.01 <= sl_dist_pct <= 0.04):
+            # سخت‌گیری روی ریسک اولیه: فشرده کردن حد ضرر به جای باز گذاشتن تا ۴٪
+            if not (0.01 <= sl_dist_pct <= 0.03):
                 continue
 
             candidates.append({
@@ -365,7 +353,7 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
                 "entry_index": candidate["entry_index"],
             }
 
-    return pd.DataFrame(all_trades)
+    return pd.DataFrame(trades)
 
 if __name__ == "__main__":
     trades_df = run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
@@ -382,6 +370,6 @@ if __name__ == "__main__":
             cur = 0
 
     print("=" * 72)
-    print("HUNTER-V14.2 — SYMBOL COOLDOWN RESULTS")
+    print("HUNTER-V14.3 — TIGHT RISK RESULTS")
     print("=" * 72)
     print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
