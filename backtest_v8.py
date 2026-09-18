@@ -171,6 +171,35 @@ def equity_curve_size_mult(realized_equity_history):
         return EQUITY_CURVE_MULT_CHOPPY
     return EQUITY_CURVE_MULT_BROKEN
 
+
+# (C) NEW — Live Drawdown-Adaptive throttle: sizes down based on how far
+#     the CURRENT mark-to-market equity (realized + open positions) sits
+#     below its own running peak — the direct CTA-style "vol/DD scaling"
+#     approach. This targets Max Drawdown $ specifically, independent of
+#     how many consecutive trades happened to lose.
+DD_THROTTLE_LEVEL_1_PCT = 5.0    # drawdown beyond this -> reduce size
+DD_THROTTLE_LEVEL_2_PCT = 10.0   # drawdown beyond this -> reduce further
+DD_THROTTLE_MULT_LEVEL_0 = 1.00  # dd <= 5%
+DD_THROTTLE_MULT_LEVEL_1 = 0.70  # 5% < dd <= 10%
+DD_THROTTLE_MULT_LEVEL_2 = 0.40  # dd > 10%
+
+
+def drawdown_size_mult(current_equity, running_peak):
+    """
+    Causal only: running_peak is the peak of mark-to-market equity up to
+    (and including) this instant — never a future value. current_equity
+    is today's mark-to-market (realized + open positions), computed
+    BEFORE any new position this timestamp is opened.
+    """
+    if running_peak <= 0:
+        return DD_THROTTLE_MULT_LEVEL_0
+    dd_pct = (running_peak - current_equity) / running_peak * 100.0
+    if dd_pct > DD_THROTTLE_LEVEL_2_PCT:
+        return DD_THROTTLE_MULT_LEVEL_2
+    if dd_pct > DD_THROTTLE_LEVEL_1_PCT:
+        return DD_THROTTLE_MULT_LEVEL_1
+    return DD_THROTTLE_MULT_LEVEL_0
+
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
@@ -726,6 +755,7 @@ def run_backtest(
     use_risk_throttle=False,
     throttle_schedule=None,
     use_equity_curve_filter=False,
+    use_drawdown_throttle=False,
 ):
     all_timestamps = get_all_timestamps(
         processed_data
@@ -750,6 +780,10 @@ def run_backtest(
     realized_equity_history = [INITIAL_CAPITAL]
     _schedule = throttle_schedule or ANTI_MARTINGALE_SCHEDULE
     _schedule_max_key = max(_schedule.keys())
+
+    # NEW: running peak of mark-to-market equity (realized + open),
+    # updated causally once per timestamp, used by the drawdown throttle.
+    running_equity_peak = INITIAL_CAPITAL
 
     # LSP3 state: directional loss-event streak + temporary entry cooldown.
     # IMPORTANT: losses on the same 4h timestamp count as ONE directional event,
@@ -1043,6 +1077,27 @@ def run_backtest(
             del active_positions[
                 sym
             ]
+
+        # --------------------------------------------------------
+        # NEW: pre-entry mark-to-market equity + running peak.
+        # Computed from realized PnL so far plus CURRENTLY open
+        # positions (post-exit, pre-new-entry) — fully causal, since
+        # no position opened at this timestamp is included yet.
+        # --------------------------------------------------------
+        pre_entry_unrealized = 0.0
+        for pos_symbol, pos in active_positions.items():
+            df_p = processed_data[pos_symbol]
+            if ts not in df_p.index:
+                continue
+            close_price = df_p.loc[ts, "Close"]
+            side_sign = 1 if pos["side"] == "LONG" else -1
+            pre_entry_unrealized += side_sign * (
+                close_price - pos["entry_price"]
+            ) * (
+                TRADE_MARGIN * LEVERAGE * pos.get("size_mult", 1.0) / pos["entry_price"]
+            )
+        current_mtm_equity = realized_equity_history[-1] + pre_entry_unrealized
+        running_equity_peak = max(running_equity_peak, current_mtm_equity)
 
         # --------------------------------------------------------
         # LSP3 — EVENT-BASED DIRECTIONAL CIRCUIT BREAKER
@@ -1451,14 +1506,16 @@ def run_backtest(
 
             # NEW: decide the size multiplier NOW, at entry, from state
             # available at this instant only (causal, no lookahead).
-            # Anti-Martingale and equity-curve throttles combine by
-            # taking the stricter (smaller) of the two when both are on.
+            # All active throttles combine by taking the stricter
+            # (smaller) multiplier when more than one is on.
             size_mult = 1.0
             if use_risk_throttle:
                 key = min(global_loss_streak, _schedule_max_key)
                 size_mult = min(size_mult, _schedule[key])
             if use_equity_curve_filter:
                 size_mult = min(size_mult, equity_curve_size_mult(realized_equity_history))
+            if use_drawdown_throttle:
+                size_mult = min(size_mult, drawdown_size_mult(current_mtm_equity, running_equity_peak))
 
             active_positions[
                 symbol
@@ -1656,7 +1713,7 @@ def calculate_drawdown(
     )
 
 
-def stats(df):
+def stats(df, equity_df=None):
     n = len(df)
     wr = (df["Outcome"].eq("WIN").mean() * 100) if n else 0
     pnl = float(df["Dollar_PnL"].sum()) if n else 0
@@ -1673,7 +1730,16 @@ def stats(df):
             else:
                 cur = 0
                 cur_dollar = 0.0
-    return n, wr, pnl, mx, net_r, worst_streak_dollar
+
+    max_dd_dollar, max_dd_pct = (0.0, 0.0)
+    if equity_df is not None and not equity_df.empty:
+        max_dd_dollar, max_dd_pct = calculate_drawdown(equity_df)
+
+    # Calmar-like ratio: annual-ish return per unit of max drawdown.
+    # Higher is better (more return for the same drawdown risk).
+    calmar = (pnl / abs(max_dd_dollar)) if max_dd_dollar < 0 else float("nan")
+
+    return n, wr, pnl, mx, net_r, worst_streak_dollar, max_dd_dollar, max_dd_pct, calmar
 
 
 if __name__ == "__main__":
@@ -1687,22 +1753,10 @@ if __name__ == "__main__":
         use_lsp=False, use_lsp3=False, gate_mode=None,
         use_firewall=True, use_single_loss_crowd=False,
     )
-    # Round-1 attempts (entry-blocking) — kept only for reference, not
-    # expected to win: prior real-data run showed SideCap costs ~27% of
-    # PnL for -1 MaxLS, and GlobalBreaker made WR/PnL/MaxLS all worse.
-    fw223_cap, fw223_cap_eq, fd223_cap = run_backtest(
-        processed_data,
-        use_lsp=False, use_lsp3=False, gate_mode=None,
-        use_firewall=True, use_single_loss_crowd=False,
-        max_per_side=MAX_PER_SIDE_DEFAULT,
-    )
 
-    # Round-2 (this session): position-SIZE throttling instead of entry
-    # blocking. Research-backed (Anti-Martingale, Trading-the-Equity-
-    # Curve). These change ONLY Dollar_PnL/equity, never Return/R or
-    # Outcome — so Trades and Win Rate are mathematically identical to
-    # FW223 by construction. Only PnL, drawdown, and the DOLLAR cost of
-    # the loss streak should change.
+    # Position-SIZE throttling (never touches signal/entries/exits — so
+    # Trades/WR/NetR are mathematically identical to FW223 by
+    # construction; only Dollar_PnL and the equity curve shape change).
     fw223_am, fw223_am_eq, fd223_am = run_backtest(
         processed_data,
         use_lsp=False, use_lsp3=False, gate_mode=None,
@@ -1715,44 +1769,54 @@ if __name__ == "__main__":
         use_firewall=True, use_single_loss_crowd=False,
         use_equity_curve_filter=True,
     )
-    fw223_am_ec, fw223_am_ec_eq, fd223_am_ec = run_backtest(
+    # NEW: live-Drawdown-adaptive throttle — targets Max Drawdown $
+    # directly (CTA-style vol/DD scaling), independent of streak length.
+    fw223_dd, fw223_dd_eq, fd223_dd = run_backtest(
         processed_data,
         use_lsp=False, use_lsp3=False, gate_mode=None,
         use_firewall=True, use_single_loss_crowd=False,
-        use_risk_throttle=True, use_equity_curve_filter=True,
+        use_drawdown_throttle=True,
+    )
+    # All three throttles combined (strictest of the three each time).
+    fw223_all, fw223_all_eq, fd223_all = run_backtest(
+        processed_data,
+        use_lsp=False, use_lsp3=False, gate_mode=None,
+        use_firewall=True, use_single_loss_crowd=False,
+        use_risk_throttle=True, use_equity_curve_filter=True, use_drawdown_throttle=True,
     )
 
-    a = stats(base)
-    b = stats(fw223)
-    c = stats(fw223_cap)
-    f = stats(fw223_am)
-    g = stats(fw223_ec)
-    h = stats(fw223_am_ec)
+    a = stats(base, base_eq)
+    b = stats(fw223, fw223_eq)
+    f = stats(fw223_am, fw223_am_eq)
+    g = stats(fw223_ec, fw223_ec_eq)
+    dd = stats(fw223_dd, fw223_dd_eq)
+    allv = stats(fw223_all, fw223_all_eq)
 
-    print("=" * 96)
-    print("HUNTER-V74 — POSITION-SIZE THROTTLING TEST (Anti-Martingale / Equity-Curve, on top of FW223)")
-    print("=" * 96)
-    print(f"{'Variant':24s}{'Trades':>8s}{'WR%':>8s}{'PnL$':>14s}{'NetR':>10s}{'MaxLS':>7s}{'WorstStreak$':>16s}")
-    print("-" * 96)
+    print("=" * 108)
+    print("HUNTER-V74 — MAX DRAWDOWN $ FOCUS (position-size throttles on top of FW223)")
+    print("=" * 108)
+    print(f"{'Variant':22s}{'Trades':>7s}{'WR%':>7s}{'PnL$':>13s}{'NetR':>8s}{'MaxLS':>6s}{'MaxDD$':>13s}{'MaxDD%':>8s}{'Calmar':>8s}")
+    print("-" * 108)
     for name, s in [
-        ("V74 (baseline)", a), ("FW223 (reference)", b), ("FW223+SideCap (round1)", c),
-        ("FW223+AntiMartingale", f), ("FW223+EquityCurve", g), ("FW223+Both(size)", h),
+        ("V74 (baseline)", a), ("FW223 (reference)", b),
+        ("FW223+AntiMartingale", f), ("FW223+EquityCurve", g),
+        ("FW223+DrawdownThrottle", dd), ("FW223+AllThree", allv),
     ]:
-        n, wr, pnl, mx, net_r, worst_dollar = s
-        print(f"{name:24s}{n:8d}{wr:8.2f}{pnl:14,.2f}{net_r:10.2f}{mx:7d}{worst_dollar:16,.2f}")
+        n, wr, pnl, mx, net_r, worst_dollar, max_dd_dollar, max_dd_pct, calmar = s
+        print(f"{name:22s}{n:7d}{wr:7.2f}{pnl:13,.2f}{net_r:8.2f}{mx:6d}{max_dd_dollar:13,.2f}{max_dd_pct:8.2f}{calmar:8.2f}")
 
-    print("\nSANITY CHECK (must hold by construction if code is correct):")
-    print(f"  Trades:  FW223={b[0]}  AntiMartingale={f[0]}  EquityCurve={g[0]}  Both={h[0]}  (should all equal FW223)")
-    print(f"  WinRate: FW223={b[1]:.2f}%  AntiMartingale={f[1]:.2f}%  EquityCurve={g[1]:.2f}%  Both={h[1]:.2f}%  (should all equal FW223)")
-    print(f"  NetR:    FW223={b[4]:.2f}  AntiMartingale={f[4]:.2f}  EquityCurve={g[4]:.2f}  Both={h[4]:.2f}  (should all equal FW223)")
-    print("  If any of these differ, something besides position size changed — flag it, that would be a bug.")
+    print("\nSANITY CHECK (must hold by construction — size throttles never touch signal/outcome):")
+    print(f"  Trades:  FW223={b[0]}  AntiMartingale={f[0]}  EquityCurve={g[0]}  DDThrottle={dd[0]}  AllThree={allv[0]}")
+    print(f"  WinRate: FW223={b[1]:.2f}%  AntiMartingale={f[1]:.2f}%  EquityCurve={g[1]:.2f}%  DDThrottle={dd[1]:.2f}%  AllThree={allv[1]:.2f}%")
+    print("  All of these should exactly equal FW223's — if not, something besides size changed (a bug).")
 
     print("\nWHAT TO LOOK AT:")
-    print("  'WorstStreak$' = total dollar damage of the single worst consecutive-loss run.")
-    print("  Goal: WorstStreak$ should be clearly LESS NEGATIVE (smaller damage) than FW223's,")
-    print("  while PnL$ stays close to (or above) FW223's — since Trades/WR/NetR are identical,")
-    print("  any PnL$ change comes purely from smaller losers in the bad patch vs full-size winners elsewhere.")
+    print("  MaxDD$ / MaxDD% = worst peak-to-trough drop in mark-to-market equity over the whole year")
+    print("  (the metric you asked to prioritize) — not just one streak's damage.")
+    print("  Calmar = PnL$ / |MaxDD$| — a simple return-per-unit-of-drawdown-risk score; higher is better,")
+    print("  and it's the number to compare variants on even when PnL$ itself differs.")
 
     print("\nREFERENCE CHECK")
     print("Expected FW223 reference: 491 trades | 63.34% WR | $34,733.29 PnL | MaxLS=8")
+
 
