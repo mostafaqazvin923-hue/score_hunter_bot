@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V74 PRO - PROFESSIONAL STREAK CONTROLLED
+# HUNTER-V74 ULTRA STRICT STREAK KILLER
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -54,7 +54,8 @@ SYMBOLS = {
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
-MAX_POSITIONS = 5
+MAX_POSITIONS = 4
+MAX_SAME_SIDE_POSITIONS = 2   # حداکثر پوزیشن هم‌جهت برای جلوگیری از تجمع ریسک
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
@@ -69,20 +70,19 @@ INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 80.0
 
-# حرفه‌ای‌ترین تنظیمات سرکوب استریک منفی
-MAX_ALLOWED_STREAK = 2          # حداکثر ضرر متوالی مجاز قبل از قفل کامل جهت
-COOLDOWN_PERIOD_CANDLES = 6     # تعداد کندل استراحت اجباری برای جهت زیان‌ده
+# فریز سخت‌گیرانه جهت پس از اولین ضرر
+STREAK_COOLDOWN_CANDLES = 8   # ۸ کندل (۳۲ ساعت) قفل کامل جهت پس از ثبت حتی ۱ ضرر!
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 PRO — ADVANCED STREAK SUPPRESSION")
+print("HUNTER-V74 ULTRA — STRICT STREAK KILLER")
 print("=" * 68)
 
 
 # ============================================================
-# DATA FETCHING & PREPARATION
+# DATA FETCHING
 # ============================================================
 
 processed_data = {}
@@ -182,7 +182,7 @@ print(f"Valid symbols: {len(processed_data)} / {len(SYMBOLS)}")
 
 
 # ============================================================
-# BACKTEST ENGINE WITH STRICT STREAK SUPPRESSION
+# BACKTEST ENGINE
 # ============================================================
 
 def get_all_timestamps(data):
@@ -196,19 +196,17 @@ def run_backtest(processed_data):
     all_trades = []
     equity_curve = []
 
-    # ردیاب‌های استریک جهت‌دار
-    direction_streak = {"LONG": 0, "SHORT": 0}
-    direction_cooldown_counter = {"LONG": 0, "SHORT": 0}
+    side_lock_timer = {"LONG": 0, "SHORT": 0}
 
     for ts in all_timestamps:
-        # کاهش تایمر کول‌دان در هر کندل جدید
+        # کاهش تایمرهای قفل جهت
         for side in ("LONG", "SHORT"):
-            if direction_cooldown_counter[side] > 0:
-                direction_cooldown_counter[side] -= 1
+            if side_lock_timer[side] > 0:
+                side_lock_timer[side] -= 1
 
         symbols_to_close = []
 
-        # بررسی و بستن پوزیشن‌های فعال
+        # ۱. مدیریت و بستن پوزیشن‌های فعال
         for symbol, pos in list(active_positions.items()):
             df = processed_data[symbol]
             if ts not in df.index:
@@ -257,15 +255,10 @@ def run_backtest(processed_data):
             position_notional = TRADE_MARGIN * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
-            # آپدیت استریک جهت‌دار بر اساس خروجی معامله
             side = pos["side"]
             if outcome == "LOSS":
-                direction_streak[side] += 1
-                if direction_streak[side] >= MAX_ALLOWED_STREAK:
-                    direction_cooldown_counter[side] = COOLDOWN_PERIOD_CANDLES
-            else:
-                direction_streak[side] = 0
-                direction_cooldown_counter[side] = 0
+                # به محض ثبت حتی یک ضرر، آن سمت بازار برای مدت طولانی قفل می‌شود
+                side_lock_timer[side] = STREAK_COOLDOWN_CANDLES
 
             all_trades.append(
                 {
@@ -285,13 +278,13 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # تشخیص روند کلی بازار (BTC)
+        # ۲. بررسی روند کلی بازار
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
             btc_c = processed_data["BTC"].loc[ts]
             market_bull = btc_c["Close"] > btc_c["EMA200"]
 
-        # جمع‌آوری نامزدهای معاملاتی جدید
+        # ۳. جمع‌آوری نامزدهای معاملاتی جدید
         current_scores = {}
         for symbol, df in processed_data.items():
             if ts not in df.index:
@@ -327,8 +320,7 @@ def run_backtest(processed_data):
 
             if market_bull:
                 side = "LONG"
-                # بررسی قفل استریک
-                if direction_cooldown_counter["LONG"] > 0:
+                if side_lock_timer["LONG"] > 0:
                     continue
                 regime_ok = (
                     c4h["Close"] > c4h["EMA20"]
@@ -344,8 +336,7 @@ def run_backtest(processed_data):
                 )
             else:
                 side = "SHORT"
-                # بررسی قفل استریک
-                if direction_cooldown_counter["SHORT"] > 0:
+                if side_lock_timer["SHORT"] > 0:
                     continue
                 regime_ok = (
                     c4h["Close"] < c4h["EMA20"]
@@ -396,7 +387,13 @@ def run_backtest(processed_data):
         if slots <= 0 or not candidates:
             continue
 
-        selected = candidates[:slots]
+        # فیلتر کردن نامزدها برای اینکه تعداد پوزیشن‌های هم‌جهت از حد مجاز تجاوز نکند
+        selected = []
+        for candidate in candidates:
+            side = candidate["side"]
+            current_same_side = sum(1 for p in active_positions.values() if p["side"] == side)
+            if current_same_side < MAX_SAME_SIDE_POSITIONS and len(selected) < slots:
+                selected.append(candidate)
 
         for candidate in selected:
             symbol = candidate["symbol"]
@@ -473,7 +470,7 @@ def calculate_drawdown(equity_df):
 
 def report(trades_df, equity_df):
     print("\n" + "=" * 68)
-    print("HUNTER-V74 PRO — FINAL RESULTS")
+    print("HUNTER-V74 ULTRA — FINAL RESULTS")
     print("=" * 68)
 
     if trades_df.empty:
