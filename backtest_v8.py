@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — DYNAMIC BREAKEVEN & STREAK KILLER (V12)
+# HUNTER-V74 — PORTFOLIO CORRELATION & DIAGNOSTIC LAB (V13-DIAG)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -58,9 +58,9 @@ SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-TRAILING_ATR_MULTIPLIER = 1.6
-INITIAL_ATR_MULTIPLIER = 1.5
-TIMEOUT_CANDLES = 40
+TRAILING_ATR_MULTIPLIER = 2.0
+INITIAL_ATR_MULTIPLIER = 1.8
+TIMEOUT_CANDLES = 45
 EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 1000.0
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — DYNAMIC BREAKEVEN & STREAK KILLER (V12)")
+print("HUNTER-V74 — PORTFOLIO CORRELATION & DIAGNOSTIC LAB (V13-DIAG)")
 print("=" * 68)
 
 processed_data = {}
@@ -221,15 +221,10 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
 
     return candidates
 
-def run_backtest(
-    processed_data,
-    use_breakeven_shield=False,
-):
+def run_diagnostic_backtest(processed_data, max_allowed_positions=5):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
-    diagnostics = Counter()
-    equity_curve = []
 
     for ts in all_timestamps:
         symbols_to_close = []
@@ -243,13 +238,6 @@ def run_backtest(
             if pos["side"] == "LONG":
                 if c4h["High"] > pos["highest_price"]:
                     pos["highest_price"] = c4h["High"]
-                    # مکانیزم برک‌ایو پیشرفته: اگر سود به اندازه ۱.۲ برابر ریسک اولیه رسید، حد ضرر را روی نقطه ورود قفل کن
-                    if use_breakeven_shield and not pos["breakeven_triggered"]:
-                        if (pos["highest_price"] - pos["entry_price"]) >= (1.2 * pos["initial_risk"]):
-                            pos["stop_loss"] = pos["entry_price"]
-                            pos["breakeven_triggered"] = True
-                            diagnostics["breakeven_locks"] += 1
-
                     new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
                     if new_trailing_sl > pos["stop_loss"]:
                         pos["stop_loss"] = new_trailing_sl
@@ -257,12 +245,6 @@ def run_backtest(
             else:
                 if c4h["Low"] < pos["lowest_price"]:
                     pos["lowest_price"] = c4h["Low"]
-                    if use_breakeven_shield and not pos["breakeven_triggered"]:
-                        if (pos["entry_price"] - pos["lowest_price"]) >= (1.2 * pos["initial_risk"]):
-                            pos["stop_loss"] = pos["entry_price"]
-                            pos["breakeven_triggered"] = True
-                            diagnostics["breakeven_locks"] += 1
-
                     new_trailing_sl = pos["lowest_price"] + TRAILING_ATR_MULTIPLIER * c4h["ATR"]
                     if new_trailing_sl < pos["stop_loss"]:
                         pos["stop_loss"] = new_trailing_sl
@@ -296,8 +278,7 @@ def run_backtest(
                 "Outcome": outcome,
                 "Return": r_real,
                 "Dollar_PnL": dollar_pnl,
-                "ExitOrder": len(all_trades),
-                "EntryTimestamp": pos.get("entry_timestamp", pd.NaT),
+                "ActiveCountAtClose": len(active_positions),
             })
             symbols_to_close.append(symbol)
 
@@ -329,7 +310,7 @@ def run_backtest(
         if not candidates:
             continue
 
-        slots = MAX_POSITIONS - len(active_positions)
+        slots = max_allowed_positions - len(active_positions)
         if slots <= 0:
             continue
 
@@ -346,35 +327,13 @@ def run_backtest(
                 "lowest_price": candidate["entry_price"],
                 "initial_risk": candidate["initial_risk"],
                 "entry_index": candidate["entry_index"],
-                "breakeven_triggered": False,
             }
 
-        closed_pnl = sum(trade["Dollar_PnL"] for trade in all_trades)
-        unrealized = 0.0
-        for pos_symbol, pos in active_positions.items():
-            df = processed_data[pos_symbol]
-            if ts not in df.index:
-                continue
-            close_price = df.loc[ts, "Close"]
-            if pos["side"] == "LONG":
-                unrealized += (close_price - pos["entry_price"]) * (TRADE_MARGIN * LEVERAGE / pos["entry_price"])
-            else:
-                unrealized += (pos["entry_price"] - close_price) * (TRADE_MARGIN * LEVERAGE / pos["entry_price"])
-
-        equity_curve.append({
-            "Timestamp": ts,
-            "Equity": INITIAL_CAPITAL + closed_pnl + unrealized,
-        })
-
-    return pd.DataFrame(all_trades), pd.DataFrame(equity_curve), diagnostics
+    return pd.DataFrame(all_trades)
 
 if __name__ == "__main__":
-    base, _, _ = run_backtest(
-        processed_data, use_breakeven_shield=False
-    )
-    v12_optimized, _, fd_v12 = run_backtest(
-        processed_data, use_breakeven_shield=True
-    )
+    trades_5 = run_diagnostic_backtest(processed_data, max_allowed_positions=5)
+    trades_2 = run_diagnostic_backtest(processed_data, max_allowed_positions=2)
 
     def stats(df):
         n = len(df)
@@ -389,11 +348,11 @@ if __name__ == "__main__":
                 cur = 0
         return n, wr, pnl, mx
 
-    a = stats(base)
-    b = stats(v12_optimized)
+    a = stats(trades_5)
+    b = stats(trades_2)
 
     print("=" * 72)
-    print("HUNTER-V74 — DYNAMIC BREAKEVEN & STREAK KILLER RESULTS (V12)")
+    print("HUNTER-V74 — CORRELATION & MAX_POSITIONS STRESS TEST")
     print("=" * 72)
-    print(f"V74 اصلی      | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
-    print(f"V12 برک‌ایو    | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]} | BE_Locks={int(fd_v12.get('breakeven_locks',0))}")
+    print(f"Max Positions = 5 | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
+    print(f"Max Positions = 2 | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]}")
