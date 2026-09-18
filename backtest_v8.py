@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — DYNAMIC CORRELATION-GATE ENGINE (V13)
+# HUNTER-V74 — CIRCUIT BREAKER & CORRELATION ENGINE (V14)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — DYNAMIC CORRELATION-GATE ENGINE (V13)")
+print("HUNTER-V74 — CIRCUIT BREAKER & CORRELATION ENGINE (V14)")
 print("=" * 68)
 
 processed_data = {}
@@ -182,86 +182,18 @@ def is_correlation_allowed(symbol, active_positions, processed_data, ts, thresho
             return False
     return True
 
-def build_valid_candidates(processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts, use_correlation_gate=False):
-    current_scores = {}
-    for symbol, df in processed_data.items():
-        if ts not in df.index:
-            continue
-        val = df.loc[ts, "Mom_Long"]
-        if not np.isnan(val):
-            current_scores[symbol] = float(val)
-
-    if not current_scores:
-        return []
-
-    rev_bool = bool(market_bull)
-    ranked_symbols = sorted(current_scores.keys(), key=lambda x: current_scores[x], reverse=rev_bool)
-    candidates = []
-
-    for symbol in ranked_symbols:
-        if symbol in active_positions:
-            continue
-        
-        # اعمال فیلتر همبستگی پویا
-        if use_correlation_gate and not is_correlation_allowed(symbol, active_positions, processed_data, ts):
-            continue
-
-        df = processed_data[symbol]
-        if ts not in df.index:
-            continue
-
-        i = df.index.get_loc(ts)
-        if i < EMA_WARMUP + 1:
-            continue
-
-        c4h = df.iloc[i]
-        prev_c = df.iloc[i - 1]
-
-        if market_bull:
-            if not allow_longs:
-                continue
-            regime_ok = c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"]
-            pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
-            side = "LONG"
-        else:
-            if not allow_shorts:
-                continue
-            regime_ok = c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"]
-            pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
-            side = "SHORT"
-
-        if not valid_signal:
-            continue
-
-        entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
-        initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"] if side == "LONG" else entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"]
-        initial_risk = abs(entry_price - initial_sl)
-        sl_dist_pct = initial_risk / entry_price
-
-        if not (0.01 <= sl_dist_pct <= 0.04):
-            continue
-
-        candidates.append({
-            "symbol": symbol,
-            "side": side,
-            "entry_price": float(entry_price),
-            "initial_sl": float(initial_sl),
-            "initial_risk": float(initial_risk),
-            "entry_index": int(i),
-            "mom_long": float(c4h["Mom_Long"]),
-        })
-
-    return candidates
-
-def run_backtest(processed_data, use_correlation_gate=False):
+def run_backtest_v14(processed_data, max_consecutive_losses_limit=2, cooldown_candles=6):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
-    diagnostics = Counter()
+    consecutive_losses = 0
+    cooldown_counter = 0
 
     for ts in all_timestamps:
+        # کاهش تایمر انجماد در هر کندل جدید
+        if cooldown_counter > 0:
+            cooldown_counter -= 1
+
         symbols_to_close = []
 
         for symbol, pos in list(active_positions.items()):
@@ -306,6 +238,14 @@ def run_backtest(processed_data, use_correlation_gate=False):
             position_notional = TRADE_MARGIN * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
+            # آپدیت مدارشکن پس از بسته شدن معامله
+            if outcome == "LOSS":
+                consecutive_losses += 1
+                if consecutive_losses >= max_consecutive_losses_limit:
+                    cooldown_counter = cooldown_candles # ربات برای چند کندل آینده منجمد می‌شود
+            else:
+                consecutive_losses = 0
+
             all_trades.append({
                 "Timestamp": ts,
                 "Symbol": symbol,
@@ -318,6 +258,10 @@ def run_backtest(processed_data, use_correlation_gate=False):
 
         for sym in symbols_to_close:
             del active_positions[sym]
+
+        # اگر مدارشکن فعال باشد، اجازه ثبت سیگنال جدید داده نمی‌شود
+        if cooldown_counter > 0:
+            continue
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -337,9 +281,73 @@ def run_backtest(processed_data, use_correlation_gate=False):
         allow_longs = market_breadth_ratio >= 0.35
         allow_shorts = market_breadth_ratio <= 0.65
 
-        candidates = build_valid_candidates(
-            processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts, use_correlation_gate=use_correlation_gate
-        )
+        # استخراج نامزدهای ورود با فیلتر همبستگی
+        current_scores = {}
+        for symbol, df in processed_data.items():
+            if ts not in df.index:
+                continue
+            val = df.loc[ts, "Mom_Long"]
+            if not np.isnan(val):
+                current_scores[symbol] = float(val)
+
+        if not current_scores:
+            continue
+
+        rev_bool = bool(market_bull)
+        ranked_symbols = sorted(current_scores.keys(), key=lambda x: current_scores[x], reverse=rev_bool)
+        candidates = []
+
+        for symbol in ranked_symbols:
+            if symbol in active_positions:
+                continue
+            if not is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=0.75):
+                continue
+
+            df = processed_data[symbol]
+            if ts not in df.index:
+                continue
+
+            i = df.index.get_loc(ts)
+            if i < EMA_WARMUP + 1:
+                continue
+
+            c4h = df.iloc[i]
+            prev_c = df.iloc[i - 1]
+
+            if market_bull:
+                if not allow_longs:
+                    continue
+                regime_ok = c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"]
+                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
+                side = "LONG"
+            else:
+                if not allow_shorts:
+                    continue
+                regime_ok = c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"]
+                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
+                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
+                side = "SHORT"
+
+            if not valid_signal:
+                continue
+
+            entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
+            initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"] if side == "LONG" else entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"]
+            initial_risk = abs(entry_price - initial_sl)
+            sl_dist_pct = initial_risk / entry_price
+
+            if not (0.01 <= sl_dist_pct <= 0.04):
+                continue
+
+            candidates.append({
+                "symbol": symbol,
+                "side": side,
+                "entry_price": float(entry_price),
+                "initial_sl": float(initial_sl),
+                "initial_risk": float(initial_risk),
+                "entry_index": int(i),
+            })
 
         if not candidates:
             continue
@@ -349,7 +357,6 @@ def run_backtest(processed_data, use_correlation_gate=False):
             continue
 
         selected = candidates[:slots]
-
         for candidate in selected:
             active_positions[candidate["symbol"]] = {
                 "side": candidate["side"],
@@ -366,8 +373,8 @@ def run_backtest(processed_data, use_correlation_gate=False):
     return pd.DataFrame(all_trades)
 
 if __name__ == "__main__":
-    base_trades = run_backtest(processed_data, use_correlation_gate=False)
-    v13_trades = run_backtest(processed_data, use_correlation_gate=True)
+    base_trades = run_backtest_v14(processed_data, max_consecutive_losses_limit=99, cooldown_candles=0)
+    v14_trades = run_backtest_v14(processed_data, max_consecutive_losses_limit=2, cooldown_candles=6)
 
     def stats(df):
         n = len(df)
@@ -383,10 +390,10 @@ if __name__ == "__main__":
         return n, wr, pnl, mx
 
     a = stats(base_trades)
-    b = stats(v13_trades)
+    b = stats(v14_trades)
 
     print("=" * 72)
-    print("HUNTER-V74 — DYNAMIC CORRELATION-GATE RESULTS (V13)")
+    print("HUNTER-V74 — CIRCUIT BREAKER ENGINE RESULTS (V14)")
     print("=" * 72)
-    print(f"V74 اصلی      | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
-    print(f"V13 همبستگی پویا | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]}")
+    print(f"V74 اصلی         | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
+    print(f"V14 مدارشکن هوشمند | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]}")
