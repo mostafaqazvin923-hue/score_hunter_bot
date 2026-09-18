@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — SENSITIVE CIRCUIT BREAKER & TARGET MAXLS 4 (V14.6)
+# HUNTER-V74 — GOLDEN BASE & BTC PANIC SHOCK FILTER (V14.7)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — SENSITIVE CIRCUIT BREAKER (V14.6)")
+print("HUNTER-V74 — BTC PANIC SHOCK FILTER (V14.7)")
 print("=" * 68)
 
 processed_data = {}
@@ -187,12 +187,22 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
     active_positions = {}
     trades = []
     
-    recent_consecutive_losses = 0
-    cooldown_candles_remaining = 0
+    btc_panic_cooldown = 0
 
     for ts in all_timestamps:
-        if cooldown_candles_remaining > 0:
-            cooldown_candles_remaining -= 1
+        if btc_panic_cooldown > 0:
+            btc_panic_cooldown -= 1
+
+        # بررسی شوک ناگهانی بیت‌کوین در این کندل
+        if "BTC" in processed_data and ts in processed_data["BTC"].index:
+            btc_df = processed_data["BTC"]
+            btc_curr = btc_df.loc[ts]
+            btc_prev_close = btc_df["Close"].shift(1).loc[ts] if ts in btc_df.index and btc_df.index.get_loc(ts) > 0 else btc_curr["Close"]
+            btc_change = (btc_curr["Close"] - btc_prev_close) / btc_prev_close
+            
+            # اگر بیت‌کوین در یک کندل ۴ ساعته بیش از ۳.۵٪ ریخت، یعنی پانیک بازار شروع شده
+            if btc_change < -0.035:
+                btc_panic_cooldown = 10  # ۱۰ کندل (۴۰ ساعت) هیچ پوزیشن جدیدی باز نکن
 
         symbols_to_close = []
 
@@ -235,16 +245,6 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
             outcome = "WIN" if r_real > 0 else "LOSS"
-            
-            if outcome == "LOSS":
-                recent_consecutive_losses += 1
-                if recent_consecutive_losses >= 3:
-                    # حساسیت بیشتر: بعد از ۳ باخت متوالی، ۲۰ کندل (۸۰ ساعت) استراحت کن
-                    cooldown_candles_remaining = 20
-                    recent_consecutive_losses = 0
-            else:
-                recent_consecutive_losses = 0
-
             position_notional = TRADE_MARGIN * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
@@ -261,7 +261,8 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        if cooldown_candles_remaining > 0:
+        # اگر بیت‌کوین در شرایط پانیک است، ورود جدید ممنوع
+        if btc_panic_cooldown > 0:
             continue
 
         market_bull = True
@@ -388,6 +389,6 @@ if __name__ == "__main__":
             cur = 0
 
     print("=" * 72)
-    print("HUNTER-V14.6 — SENSITIVE CIRCUIT BREAKER RESULTS")
+    print("HUNTER-V14.7 — BTC PANIC SHOCK FILTER RESULTS")
     print("=" * 72)
     print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
