@@ -15,7 +15,7 @@ import pandas as pd
 
 
 # ============================================================
-# HUNTER-V74 ULTRA STRICT STREAK KILLER
+# HUNTER-V75 GLOBAL CIRCUIT BREAKER & STREAK KILLER
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -54,8 +54,8 @@ SYMBOLS = {
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
 
-MAX_POSITIONS = 4
-MAX_SAME_SIDE_POSITIONS = 2   # حداکثر پوزیشن هم‌جهت برای جلوگیری از تجمع ریسک
+MAX_POSITIONS = 3             # کاهش تعداد پوزیشن‌های هم‌زمان برای کنترل ریسک
+MAX_SAME_SIDE_POSITIONS = 1   # فقط ۱ پوزیشن در هر سمت برای جلوگیری از همبستگی منفی
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
@@ -63,21 +63,21 @@ FEE_RATE = 0.0007
 ATR_PERIOD = 14
 TRAILING_ATR_MULTIPLIER = 2.0
 INITIAL_ATR_MULTIPLIER = 1.8
-TIMEOUT_CANDLES = 45
+TIMEOUT_CANDLES = 40
 EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 1000.0
-TRADE_MARGIN = 100.0
-LEVERAGE = 80.0
+TRADE_MARGIN = 50.0           # کاهش مارجین هر معامله
+LEVERAGE = 20.0               # کاهش اهرم از 80 به 20 برای مهار درووداون فاجعه‌بار
 
-# فریز سخت‌گیرانه جهت پس از اولین ضرر
-STREAK_COOLDOWN_CANDLES = 8   # ۸ کندل (۳۲ ساعت) قفل کامل جهت پس از ثبت حتی ۱ ضرر!
+# فریز سراسری کل سیستم پس از هر ضرر
+GLOBAL_COOLDOWN_CANDLES = 12   # ۱۲ کندل (۴۸ ساعت) قفل کامل کل پورتفو پس از هر ضرر!
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 ULTRA — STRICT STREAK KILLER")
+print("HUNTER-V75 — GLOBAL CIRCUIT BREAKER")
 print("=" * 68)
 
 
@@ -196,17 +196,15 @@ def run_backtest(processed_data):
     all_trades = []
     equity_curve = []
 
-    side_lock_timer = {"LONG": 0, "SHORT": 0}
+    global_cooldown_timer = 0
 
     for ts in all_timestamps:
-        # کاهش تایمرهای قفل جهت
-        for side in ("LONG", "SHORT"):
-            if side_lock_timer[side] > 0:
-                side_lock_timer[side] -= 1
+        if global_cooldown_timer > 0:
+            global_cooldown_timer -= 1
 
         symbols_to_close = []
 
-        # ۱. مدیریت و بستن پوزیشن‌های فعال
+        # ۱. مدیریت پوزیشن‌های فعال
         for symbol, pos in list(active_positions.items()):
             df = processed_data[symbol]
             if ts not in df.index:
@@ -255,16 +253,15 @@ def run_backtest(processed_data):
             position_notional = TRADE_MARGIN * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
-            side = pos["side"]
             if outcome == "LOSS":
-                # به محض ثبت حتی یک ضرر، آن سمت بازار برای مدت طولانی قفل می‌شود
-                side_lock_timer[side] = STREAK_COOLDOWN_CANDLES
+                # اعمال فریز سراسری روی تمام نمادها به مدت طولانی
+                global_cooldown_timer = GLOBAL_COOLDOWN_CANDLES
 
             all_trades.append(
                 {
                     "Timestamp": ts,
                     "Symbol": symbol,
-                    "Side": side,
+                    "Side": pos["side"],
                     "Outcome": outcome,
                     "Return": r_real,
                     "Dollar_PnL": dollar_pnl,
@@ -278,13 +275,17 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
+        # اگر سیستم در فریز سراسری است، اجازه ورود جدید دادهچ نمی‌شود
+        if global_cooldown_timer > 0:
+            continue
+
         # ۲. بررسی روند کلی بازار
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
             btc_c = processed_data["BTC"].loc[ts]
             market_bull = btc_c["Close"] > btc_c["EMA200"]
 
-        # ۳. جمع‌آوری نامزدهای معاملاتی جدید
+        # ۳. اسکن بازار برای پوزیشن‌های جدید
         current_scores = {}
         for symbol, df in processed_data.items():
             if ts not in df.index:
@@ -320,8 +321,6 @@ def run_backtest(processed_data):
 
             if market_bull:
                 side = "LONG"
-                if side_lock_timer["LONG"] > 0:
-                    continue
                 regime_ok = (
                     c4h["Close"] > c4h["EMA20"]
                     and c4h["EMA20"] > c4h["EMA50"]
@@ -331,13 +330,11 @@ def run_backtest(processed_data):
                 valid_signal = (
                     regime_ok
                     and pullback_ok
-                    and (c4h["Mom_Short"] > 0.012)
-                    and (c4h["Mom_Long"] > 0.035)
+                    and (c4h["Mom_Short"] > 0.015)
+                    and (c4h["Mom_Long"] > 0.04)
                 )
             else:
                 side = "SHORT"
-                if side_lock_timer["SHORT"] > 0:
-                    continue
                 regime_ok = (
                     c4h["Close"] < c4h["EMA20"]
                     and c4h["EMA20"] < c4h["EMA50"]
@@ -347,8 +344,8 @@ def run_backtest(processed_data):
                 valid_signal = (
                     regime_ok
                     and pullback_ok
-                    and (c4h["Mom_Short"] < -0.012)
-                    and (c4h["Mom_Long"] < -0.035)
+                    and (c4h["Mom_Short"] < -0.015)
+                    and (c4h["Mom_Long"] < -0.04)
                 )
 
             if not valid_signal:
@@ -369,7 +366,7 @@ def run_backtest(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.01 <= sl_dist_pct <= 0.04):
+            if not (0.01 <= sl_dist_pct <= 0.035):
                 continue
 
             candidates.append(
@@ -387,7 +384,6 @@ def run_backtest(processed_data):
         if slots <= 0 or not candidates:
             continue
 
-        # فیلتر کردن نامزدها برای اینکه تعداد پوزیشن‌های هم‌جهت از حد مجاز تجاوز نکند
         selected = []
         for candidate in candidates:
             side = candidate["side"]
@@ -470,7 +466,7 @@ def calculate_drawdown(equity_df):
 
 def report(trades_df, equity_df):
     print("\n" + "=" * 68)
-    print("HUNTER-V74 ULTRA — FINAL RESULTS")
+    print("HUNTER-V75 — FINAL RESULTS")
     print("=" * 68)
 
     if trades_df.empty:
