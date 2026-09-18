@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — DYNAMIC STREAK SUPPRESSOR ENGINE (V9)
+# HUNTER-V74 — ULTIMATE CLUSTER-SHIELD ENGINE (V10)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — DYNAMIC STREAK SUPPRESSOR ENGINE (V9)")
+print("HUNTER-V74 — ULTIMATE CLUSTER-SHIELD ENGINE (V10)")
 print("=" * 68)
 
 processed_data = {}
@@ -153,7 +153,7 @@ print(f"Valid symbols: {len(processed_data)} / {len(SYMBOLS)}")
 def get_all_timestamps(data):
     return sorted({ts for df in data.values() for ts in df.index})
 
-def build_valid_candidates(processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts, strict_filter=False):
+def build_valid_candidates(processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts):
     current_scores = {}
     for symbol, df in processed_data.items():
         if ts not in df.index:
@@ -168,9 +168,6 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
     rev_bool = bool(market_bull)
     ranked_symbols = sorted(current_scores.keys(), key=lambda x: current_scores[x], reverse=rev_bool)
     candidates = []
-
-    mom_short_thresh = 0.015 if strict_filter else 0.012
-    mom_long_thresh = 0.042 if strict_filter else 0.035
 
     for symbol in ranked_symbols:
         if symbol in active_positions:
@@ -191,14 +188,14 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
                 continue
             regime_ok = c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"]
             pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > mom_short_thresh) and (c4h["Mom_Long"] > mom_long_thresh)
+            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
             side = "LONG"
         else:
             if not allow_shorts:
                 continue
             regime_ok = c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"]
             pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -mom_short_thresh) and (c4h["Mom_Long"] < -mom_long_thresh)
+            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
             side = "SHORT"
 
         if not valid_signal:
@@ -226,20 +223,21 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
 
 def run_backtest(
     processed_data,
-    use_firewall=False,
-    use_streak_suppressor=False,
+    use_cluster_shield=False,
 ):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
-    firewall_loss_events = {"LONG": 0, "SHORT": 0}
-    firewall_locked = {"LONG": False, "SHORT": False}
-    consecutive_losses_global = 0
+    cluster_cooldown_counter = 0
     diagnostics = Counter()
     equity_curve = []
 
     for ts in all_timestamps:
+        if cluster_cooldown_counter > 0:
+            cluster_cooldown_counter -= 1
+
         symbols_to_close = []
+        timestamp_losses_count = 0
 
         for symbol, pos in list(active_positions.items()):
             df = processed_data[symbol]
@@ -284,12 +282,7 @@ def run_backtest(
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
             if outcome == "LOSS":
-                firewall_loss_events[pos["side"]] += 1
-                consecutive_losses_global += 1
-            else:
-                firewall_loss_events[pos["side"]] = 0
-                firewall_locked[pos["side"]] = False
-                consecutive_losses_global = 0
+                timestamp_losses_count += 1
 
             all_trades.append({
                 "Timestamp": ts,
@@ -306,23 +299,10 @@ def run_backtest(
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        if use_firewall:
-            for side in ("LONG", "SHORT"):
-                side_outcomes = [tr["Outcome"] for tr in all_trades if tr["Timestamp"] == ts and tr["Side"] == side]
-                if side_outcomes:
-                    if "WIN" in side_outcomes:
-                        firewall_loss_events[side] = 0
-                        firewall_locked[side] = False
-                    elif "LOSS" in side_outcomes:
-                        firewall_loss_events[side] += 1
-                        if firewall_loss_events[side] >= 2:
-                            firewall_locked[side] = True
-
-                if firewall_locked[side]:
-                    still_open = any(p["side"] == side for p in active_positions.values())
-                    if not still_open:
-                        firewall_locked[side] = False
-                        firewall_loss_events[side] = 0
+        # اگر در این کندل ۲ یا چند پوزیشن با ضرر بسته شدند، یعنی آبشار فیک‌آوت رخ داده است -> فعال‌سازی وقفه
+        if use_cluster_shield and timestamp_losses_count >= 2:
+            cluster_cooldown_counter = 3  # ۳ کندل استراحت کامل ربات برای جلوگیری از زنجیره ضرر
+            diagnostics["cluster_shield_triggers"] += 1
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -342,26 +322,16 @@ def run_backtest(
         allow_longs = market_breadth_ratio >= 0.35
         allow_shorts = market_breadth_ratio <= 0.65
 
-        # اگر استریک منفی به ۳ یا بیشتر رسید، فیلتر ورود را سخت‌تر کن تا جلوی ادامه ضررها گرفته شود
-        strict_filter = use_streak_suppressor and (consecutive_losses_global >= 3)
-        if strict_filter:
-            diagnostics["streak_strict_filters_applied"] += 1
+        if use_cluster_shield and cluster_cooldown_counter > 0:
+            diagnostics["cooldown_blocked"] += 1
+            continue
 
         candidates = build_valid_candidates(
-            processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts, strict_filter=strict_filter
+            processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts
         )
 
         if not candidates:
             continue
-
-        if use_firewall and candidates:
-            kept = []
-            for c in candidates:
-                if firewall_locked.get(c["side"], False):
-                    diagnostics["firewall_blocked"] += 1
-                else:
-                    kept.append(c)
-            candidates = kept
 
         slots = MAX_POSITIONS - len(active_positions)
         if slots <= 0:
@@ -370,12 +340,6 @@ def run_backtest(
         selected = candidates[:slots]
 
         for candidate in selected:
-            # اگر استریک منفی بالا بود، مارجین یا ریسک پوزیشن جدید را نصف کن تا ضرر احتمالی کنترل شود
-            effective_margin = TRADE_MARGIN
-            if use_streak_suppressor and consecutive_losses_global >= 4:
-                effective_margin = TRADE_MARGIN * 0.5
-                diagnostics["reduced_size_trades"] += 1
-
             active_positions[candidate["symbol"]] = {
                 "side": candidate["side"],
                 "entry_price": candidate["entry_price"],
@@ -386,7 +350,6 @@ def run_backtest(
                 "lowest_price": candidate["entry_price"],
                 "initial_risk": candidate["initial_risk"],
                 "entry_index": candidate["entry_index"],
-                "effective_margin": effective_margin,
             }
 
         closed_pnl = sum(trade["Dollar_PnL"] for trade in all_trades)
@@ -396,11 +359,10 @@ def run_backtest(
             if ts not in df.index:
                 continue
             close_price = df.loc[ts, "Close"]
-            pos_margin = pos.get("effective_margin", TRADE_MARGIN)
             if pos["side"] == "LONG":
-                unrealized += (close_price - pos["entry_price"]) * (pos_margin * LEVERAGE / pos["entry_price"])
+                unrealized += (close_price - pos["entry_price"]) * (TRADE_MARGIN * LEVERAGE / pos["entry_price"])
             else:
-                unrealized += (pos["entry_price"] - close_price) * (pos_margin * LEVERAGE / pos["entry_price"])
+                unrealized += (pos["entry_price"] - close_price) * (TRADE_MARGIN * LEVERAGE / pos["entry_price"])
 
         equity_curve.append({
             "Timestamp": ts,
@@ -411,10 +373,10 @@ def run_backtest(
 
 if __name__ == "__main__":
     base, _, _ = run_backtest(
-        processed_data, use_firewall=False, use_streak_suppressor=False
+        processed_data, use_cluster_shield=False
     )
-    v9_optimized, _, fd_v9 = run_backtest(
-        processed_data, use_firewall=True, use_streak_suppressor=True
+    v10_optimized, _, fd_v10 = run_backtest(
+        processed_data, use_cluster_shield=True
     )
 
     def stats(df):
@@ -431,10 +393,10 @@ if __name__ == "__main__":
         return n, wr, pnl, mx
 
     a = stats(base)
-    b = stats(v9_optimized)
+    b = stats(v10_optimized)
 
     print("=" * 72)
-    print("HUNTER-V74 — DYNAMIC STREAK SUPPRESSOR RESULTS (V9)")
+    print("HUNTER-V74 — ULTIMATE CLUSTER-SHIELD RESULTS (V10)")
     print("=" * 72)
     print(f"V74 اصلی      | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
-    print(f"V9 ضدستریک   | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]} | StrictFilters={int(fd_v9.get('streak_strict_filters_applied',0))} | ReducedSize={int(fd_v9.get('reduced_size_trades',0))}")
+    print(f"V10 کلسترشیلد | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]} | Shields={int(fd_v10.get('cluster_shield_triggers',0))} | CD_Blocked={int(fd_v10.get('cooldown_blocked',0))}")
