@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — PROVEN FW4 STABLE ENGINE (V8)
+# HUNTER-V74 — DYNAMIC STREAK SUPPRESSOR ENGINE (V9)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — PROVEN FW4 STABLE ENGINE (V8)")
+print("HUNTER-V74 — DYNAMIC STREAK SUPPRESSOR ENGINE (V9)")
 print("=" * 68)
 
 processed_data = {}
@@ -153,7 +153,7 @@ print(f"Valid symbols: {len(processed_data)} / {len(SYMBOLS)}")
 def get_all_timestamps(data):
     return sorted({ts for df in data.values() for ts in df.index})
 
-def build_valid_candidates(processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts):
+def build_valid_candidates(processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts, strict_filter=False):
     current_scores = {}
     for symbol, df in processed_data.items():
         if ts not in df.index:
@@ -168,6 +168,9 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
     rev_bool = bool(market_bull)
     ranked_symbols = sorted(current_scores.keys(), key=lambda x: current_scores[x], reverse=rev_bool)
     candidates = []
+
+    mom_short_thresh = 0.015 if strict_filter else 0.012
+    mom_long_thresh = 0.042 if strict_filter else 0.035
 
     for symbol in ranked_symbols:
         if symbol in active_positions:
@@ -188,14 +191,14 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
                 continue
             regime_ok = c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"]
             pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
+            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > mom_short_thresh) and (c4h["Mom_Long"] > mom_long_thresh)
             side = "LONG"
         else:
             if not allow_shorts:
                 continue
             regime_ok = c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"]
             pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
+            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -mom_short_thresh) and (c4h["Mom_Long"] < -mom_long_thresh)
             side = "SHORT"
 
         if not valid_signal:
@@ -224,14 +227,14 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
 def run_backtest(
     processed_data,
     use_firewall=False,
-    use_single_loss_crowd=False,
+    use_streak_suppressor=False,
 ):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
     firewall_loss_events = {"LONG": 0, "SHORT": 0}
     firewall_locked = {"LONG": False, "SHORT": False}
-    SINGLE_LOSS_CROWD_MIN_OPEN = 3
+    consecutive_losses_global = 0
     diagnostics = Counter()
     equity_curve = []
 
@@ -282,9 +285,11 @@ def run_backtest(
 
             if outcome == "LOSS":
                 firewall_loss_events[pos["side"]] += 1
+                consecutive_losses_global += 1
             else:
                 firewall_loss_events[pos["side"]] = 0
                 firewall_locked[pos["side"]] = False
+                consecutive_losses_global = 0
 
             all_trades.append({
                 "Timestamp": ts,
@@ -337,24 +342,17 @@ def run_backtest(
         allow_longs = market_breadth_ratio >= 0.35
         allow_shorts = market_breadth_ratio <= 0.65
 
+        # اگر استریک منفی به ۳ یا بیشتر رسید، فیلتر ورود را سخت‌تر کن تا جلوی ادامه ضررها گرفته شود
+        strict_filter = use_streak_suppressor and (consecutive_losses_global >= 3)
+        if strict_filter:
+            diagnostics["streak_strict_filters_applied"] += 1
+
         candidates = build_valid_candidates(
-            processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts
+            processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts, strict_filter=strict_filter
         )
 
         if not candidates:
             continue
-
-        if use_single_loss_crowd and candidates:
-            kept = []
-            for c in candidates:
-                side = c["side"]
-                open_same_side = sum(p["side"] == side for p in active_positions.values())
-                crowd_block = (firewall_loss_events.get(side, 0) >= 1 and open_same_side >= SINGLE_LOSS_CROWD_MIN_OPEN)
-                if crowd_block:
-                    diagnostics["single_loss_crowd_blocked"] += 1
-                else:
-                    kept.append(c)
-            candidates = kept
 
         if use_firewall and candidates:
             kept = []
@@ -372,6 +370,12 @@ def run_backtest(
         selected = candidates[:slots]
 
         for candidate in selected:
+            # اگر استریک منفی بالا بود، مارجین یا ریسک پوزیشن جدید را نصف کن تا ضرر احتمالی کنترل شود
+            effective_margin = TRADE_MARGIN
+            if use_streak_suppressor and consecutive_losses_global >= 4:
+                effective_margin = TRADE_MARGIN * 0.5
+                diagnostics["reduced_size_trades"] += 1
+
             active_positions[candidate["symbol"]] = {
                 "side": candidate["side"],
                 "entry_price": candidate["entry_price"],
@@ -382,6 +386,7 @@ def run_backtest(
                 "lowest_price": candidate["entry_price"],
                 "initial_risk": candidate["initial_risk"],
                 "entry_index": candidate["entry_index"],
+                "effective_margin": effective_margin,
             }
 
         closed_pnl = sum(trade["Dollar_PnL"] for trade in all_trades)
@@ -391,10 +396,11 @@ def run_backtest(
             if ts not in df.index:
                 continue
             close_price = df.loc[ts, "Close"]
+            pos_margin = pos.get("effective_margin", TRADE_MARGIN)
             if pos["side"] == "LONG":
-                unrealized += (close_price - pos["entry_price"]) * (TRADE_MARGIN * LEVERAGE / pos["entry_price"])
+                unrealized += (close_price - pos["entry_price"]) * (pos_margin * LEVERAGE / pos["entry_price"])
             else:
-                unrealized += (pos["entry_price"] - close_price) * (TRADE_MARGIN * LEVERAGE / pos["entry_price"])
+                unrealized += (pos["entry_price"] - close_price) * (pos_margin * LEVERAGE / pos["entry_price"])
 
         equity_curve.append({
             "Timestamp": ts,
@@ -405,10 +411,10 @@ def run_backtest(
 
 if __name__ == "__main__":
     base, _, _ = run_backtest(
-        processed_data, use_firewall=False, use_single_loss_crowd=False
+        processed_data, use_firewall=False, use_streak_suppressor=False
     )
-    v8_optimized, _, fd_v8 = run_backtest(
-        processed_data, use_firewall=True, use_single_loss_crowd=True
+    v9_optimized, _, fd_v9 = run_backtest(
+        processed_data, use_firewall=True, use_streak_suppressor=True
     )
 
     def stats(df):
@@ -425,10 +431,10 @@ if __name__ == "__main__":
         return n, wr, pnl, mx
 
     a = stats(base)
-    b = stats(v8_optimized)
+    b = stats(v9_optimized)
 
     print("=" * 72)
-    print("HUNTER-V74 — PROVEN FW4 STABLE RESULTS (V8)")
+    print("HUNTER-V74 — DYNAMIC STREAK SUPPRESSOR RESULTS (V9)")
     print("=" * 72)
     print(f"V74 اصلی      | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
-    print(f"V8 پایدار     | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]} | FWBlock={int(fd_v8.get('firewall_blocked',0))} | CrowdBlock={int(fd_v8.get('single_loss_crowd_blocked',0))}")
+    print(f"V9 ضدستریک   | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]} | StrictFilters={int(fd_v9.get('streak_strict_filters_applied',0))} | ReducedSize={int(fd_v9.get('reduced_size_trades',0))}")
