@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — ADVANCED FIREWALL & STREAK NEUTRALIZATION (V5)
+# HUNTER-V74 — PROFESSIONAL ROOT-OPTIMIZED ENGINE (V6)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — ADVANCED FIREWALL & CLEAN ENGINE (V5)")
+print("HUNTER-V74 — PROFESSIONAL ROOT-OPTIMIZED ENGINE (V6)")
 print("=" * 68)
 
 processed_data = {}
@@ -138,6 +138,7 @@ def fetch_symbol_data(lbank_symbol):
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
+    df["Vol_MA20"] = df["Volume"].rolling(20).mean()
     df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
     df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
     df.set_index("Date", inplace=True)
@@ -165,7 +166,6 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
     if not current_scores:
         return []
 
-    # رفع هشدار np.bool با تبدیل صریح reverse به استاندارد پایتون bool
     rev_bool = bool(market_bull)
     ranked_symbols = sorted(current_scores.keys(), key=lambda x: current_scores[x], reverse=rev_bool)
     candidates = []
@@ -184,19 +184,24 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
         c4h = df.iloc[i]
         prev_c = df.iloc[i - 1]
 
+        # فیلتر حجم برای جلوگیری از ورود در بازارهای کم‌حجم و فیک
+        volume_ok = c4h["Volume"] > (c4h["Vol_MA20"] * 0.9)
+        if not volume_ok:
+            continue
+
         if market_bull:
             if not allow_longs:
                 continue
             regime_ok = c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"]
             pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
+            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.014) and (c4h["Mom_Long"] > 0.040)
             side = "LONG"
         else:
             if not allow_shorts:
                 continue
             regime_ok = c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"]
             pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
+            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.014) and (c4h["Mom_Long"] < -0.040)
             side = "SHORT"
 
         if not valid_signal:
@@ -226,25 +231,17 @@ def run_backtest(
     processed_data,
     use_firewall=False,
     use_single_loss_crowd=False,
-    use_advanced_streak_breaker=False,
 ):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
     firewall_loss_events = {"LONG": 0, "SHORT": 0}
     firewall_locked = {"LONG": False, "SHORT": False}
-    streak_cooldown_candles = {"LONG": 0, "SHORT": 0}
-    
-    SINGLE_LOSS_CROWD_MIN_OPEN = 2  # سخت‌گیرانه‌تر کردن کنترل ازدحام برای کاهش MaxLS
+    SINGLE_LOSS_CROWD_MIN_OPEN = 2
     diagnostics = Counter()
     equity_curve = []
 
     for ts in all_timestamps:
-        # مدیریت کاهش تایمر کلددان جهت‌ها
-        for side in ("LONG", "SHORT"):
-            if streak_cooldown_candles[side] > 0:
-                streak_cooldown_candles[side] -= 1
-
         symbols_to_close = []
 
         for symbol, pos in list(active_positions.items()):
@@ -291,12 +288,9 @@ def run_backtest(
 
             if outcome == "LOSS":
                 firewall_loss_events[pos["side"]] += 1
-                if use_advanced_streak_breaker and firewall_loss_events[pos["side"]] >= 2:
-                    streak_cooldown_candles[pos["side"]] = 3 # 3 کندل استراحت برای جلوگیری از زنجیره ضرر
             else:
                 firewall_loss_events[pos["side"]] = 0
                 firewall_locked[pos["side"]] = False
-                streak_cooldown_candles[pos["side"]] = 0
 
             all_trades.append({
                 "Timestamp": ts,
@@ -355,15 +349,6 @@ def run_backtest(
 
         if not candidates:
             continue
-
-        if use_advanced_streak_breaker and candidates:
-            kept = []
-            for c in candidates:
-                if streak_cooldown_candles.get(c["side"], 0) > 0:
-                    diagnostics["streak_cooldown_blocked"] += 1
-                else:
-                    kept.append(c)
-            candidates = kept
 
         if use_single_loss_crowd and candidates:
             kept = []
@@ -424,18 +409,12 @@ def run_backtest(
 
     return pd.DataFrame(all_trades), pd.DataFrame(equity_curve), diagnostics
 
-# ============================================================
-# MAIN EXECUTION & COMPARISON (V5)
-# ============================================================
 if __name__ == "__main__":
     base, _, _ = run_backtest(
-        processed_data, use_firewall=False, use_single_loss_crowd=False, use_advanced_streak_breaker=False
+        processed_data, use_firewall=False, use_single_loss_crowd=False
     )
-    fw4, _, fd4 = run_backtest(
-        processed_data, use_firewall=True, use_single_loss_crowd=True, use_advanced_streak_breaker=False
-    )
-    fw_advanced, _, fd_adv = run_backtest(
-        processed_data, use_firewall=True, use_single_loss_crowd=True, use_advanced_streak_breaker=True
+    v6_optimized, _, fd_v6 = run_backtest(
+        processed_data, use_firewall=True, use_single_loss_crowd=True
     )
 
     def stats(df):
@@ -452,12 +431,10 @@ if __name__ == "__main__":
         return n, wr, pnl, mx
 
     a = stats(base)
-    b = stats(fw4)
-    c = stats(fw_advanced)
+    b = stats(v6_optimized)
 
     print("=" * 72)
-    print("HUNTER-V74 — STREAK NEUTRALIZATION & ERROR FIX RESULTS")
+    print("HUNTER-V74 — ROOT OPTIMIZED RESULTS (V6)")
     print("=" * 72)
     print(f"V74 اصلی      | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
-    print(f"FW4 (قبلی)   | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]} | FWBlock={int(fd4.get('firewall_blocked',0))}")
-    print(f"FW-Advanced  | Trades={c[0]} | WR={c[1]:.2f}% | PnL=${c[2]:,.2f} | MaxLS={c[3]} | CooldownBlock={int(fd_adv.get('streak_cooldown_blocked',0))}")
+    print(f"V6 بهینه‌شده  | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]} | Blocked={int(fd_v6.get('firewall_blocked',0))}")
