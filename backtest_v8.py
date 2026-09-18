@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — ULTIMATE DYNAMIC STREAK KILLER (V7)
+# HUNTER-V74 — PROVEN FW4 STABLE ENGINE (V8)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — ULTIMATE DYNAMIC STREAK KILLER (V7)")
+print("HUNTER-V74 — PROVEN FW4 STABLE ENGINE (V8)")
 print("=" * 68)
 
 processed_data = {}
@@ -138,7 +138,6 @@ def fetch_symbol_data(lbank_symbol):
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
-    df["Vol_MA20"] = df["Volume"].rolling(20).mean()
     df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
     df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
     df.set_index("Date", inplace=True)
@@ -184,23 +183,19 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
         c4h = df.iloc[i]
         prev_c = df.iloc[i - 1]
 
-        volume_ok = c4h["Volume"] > (c4h["Vol_MA20"] * 0.85)
-        if not volume_ok:
-            continue
-
         if market_bull:
             if not allow_longs:
                 continue
             regime_ok = c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"]
             pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.013) and (c4h["Mom_Long"] > 0.038)
+            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.012) and (c4h["Mom_Long"] > 0.035)
             side = "LONG"
         else:
             if not allow_shorts:
                 continue
             regime_ok = c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"]
             pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.013) and (c4h["Mom_Long"] < -0.038)
+            valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.012) and (c4h["Mom_Long"] < -0.035)
             side = "SHORT"
 
         if not valid_signal:
@@ -229,22 +224,18 @@ def build_valid_candidates(processed_data, ts, active_positions, market_bull, al
 def run_backtest(
     processed_data,
     use_firewall=False,
-    use_dynamic_circuit_breaker=False,
+    use_single_loss_crowd=False,
 ):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
     firewall_loss_events = {"LONG": 0, "SHORT": 0}
     firewall_locked = {"LONG": False, "SHORT": False}
-    consecutive_losses = 0
-    circuit_breaker_cooldown = 0
+    SINGLE_LOSS_CROWD_MIN_OPEN = 3
     diagnostics = Counter()
     equity_curve = []
 
     for ts in all_timestamps:
-        if circuit_breaker_cooldown > 0:
-            circuit_breaker_cooldown -= 1
-
         symbols_to_close = []
 
         for symbol, pos in list(active_positions.items()):
@@ -291,14 +282,9 @@ def run_backtest(
 
             if outcome == "LOSS":
                 firewall_loss_events[pos["side"]] += 1
-                consecutive_losses += 1
-                if use_dynamic_circuit_breaker and consecutive_losses >= 3:
-                    circuit_breaker_cooldown = 2  # استراحت هوشمند سیستم به مدت ۲ کندل بعد از ۳ ضرر متوالی
             else:
                 firewall_loss_events[pos["side"]] = 0
                 firewall_locked[pos["side"]] = False
-                consecutive_losses = 0
-                circuit_breaker_cooldown = 0
 
             all_trades.append({
                 "Timestamp": ts,
@@ -351,16 +337,24 @@ def run_backtest(
         allow_longs = market_breadth_ratio >= 0.35
         allow_shorts = market_breadth_ratio <= 0.65
 
-        if use_dynamic_circuit_breaker and circuit_breaker_cooldown > 0:
-            diagnostics["circuit_breaker_blocked"] += 1
-            continue
-
         candidates = build_valid_candidates(
             processed_data, ts, active_positions, market_bull, allow_longs, allow_shorts
         )
 
         if not candidates:
             continue
+
+        if use_single_loss_crowd and candidates:
+            kept = []
+            for c in candidates:
+                side = c["side"]
+                open_same_side = sum(p["side"] == side for p in active_positions.values())
+                crowd_block = (firewall_loss_events.get(side, 0) >= 1 and open_same_side >= SINGLE_LOSS_CROWD_MIN_OPEN)
+                if crowd_block:
+                    diagnostics["single_loss_crowd_blocked"] += 1
+                else:
+                    kept.append(c)
+            candidates = kept
 
         if use_firewall and candidates:
             kept = []
@@ -411,10 +405,10 @@ def run_backtest(
 
 if __name__ == "__main__":
     base, _, _ = run_backtest(
-        processed_data, use_firewall=False, use_dynamic_circuit_breaker=False
+        processed_data, use_firewall=False, use_single_loss_crowd=False
     )
-    v7_optimized, _, fd_v7 = run_backtest(
-        processed_data, use_firewall=True, use_dynamic_circuit_breaker=True
+    v8_optimized, _, fd_v8 = run_backtest(
+        processed_data, use_firewall=True, use_single_loss_crowd=True
     )
 
     def stats(df):
@@ -431,10 +425,10 @@ if __name__ == "__main__":
         return n, wr, pnl, mx
 
     a = stats(base)
-    b = stats(v7_optimized)
+    b = stats(v8_optimized)
 
     print("=" * 72)
-    print("HUNTER-V74 — ULTIMATE DYNAMIC RESULTS (V7)")
+    print("HUNTER-V74 — PROVEN FW4 STABLE RESULTS (V8)")
     print("=" * 72)
-    print(f"V74 اصلی         | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
-    print(f"V7 داینامیک‌سرکت | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]} | CB_Blocked={int(fd_v7.get('circuit_breaker_blocked',0))}")
+    print(f"V74 اصلی      | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
+    print(f"V8 پایدار     | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]} | FWBlock={int(fd_v8.get('firewall_blocked',0))} | CrowdBlock={int(fd_v8.get('single_loss_crowd_blocked',0))}")
