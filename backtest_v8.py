@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — MAX LOSS REDUCTION & CIRCUIT BREAKER (V14.0)
+# HUNTER-V74 — PRECISION ATR FILTER & MAXLS CONTROL (V14.1)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — MAX LOSS REDUCTION & CIRCUIT BREAKER (V14.0)")
+print("HUNTER-V74 — PRECISION ATR FILTER & MAXLS CONTROL (V14.1)")
 print("=" * 68)
 
 processed_data = {}
@@ -135,13 +135,14 @@ def fetch_symbol_data(lbank_symbol):
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
 
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
+    # محاسبه میانگین ATR برای جلوگیری از ورود در کندل‌های با نوسان غیرعادی و فیک
+    df["ATR_SMA20"] = df["ATR"].rolling(20).mean()
+    
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
     df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
     df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
-    df["Vol_EMA20"] = df["Volume"].ewm(span=20, adjust=False).mean()
-    
     df.set_index("Date", inplace=True)
     return df
 
@@ -184,18 +185,12 @@ def is_correlation_allowed(symbol, active_positions, processed_data, ts, thresho
             return False
     return True
 
-def run_backtest(processed_data, use_circuit_breaker=True):
+def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
-    
-    consecutive_losses = 0
-    cooldown_counter = 0
 
     for ts in all_timestamps:
-        if cooldown_counter > 0:
-            cooldown_counter -= 1
-
         symbols_to_close = []
 
         for symbol, pos in list(active_positions.items()):
@@ -237,14 +232,6 @@ def run_backtest(processed_data, use_circuit_breaker=True):
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
             outcome = "WIN" if r_real > 0 else "LOSS"
-            
-            if outcome == "LOSS":
-                consecutive_losses += 1
-                if use_circuit_breaker and consecutive_losses >= 3:
-                    cooldown_counter = 6  # ۶ کندل استراحت پس از ۳ ضرر متوالی
-            else:
-                consecutive_losses = 0
-
             position_notional = TRADE_MARGIN * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
@@ -260,9 +247,6 @@ def run_backtest(processed_data, use_circuit_breaker=True):
 
         for sym in symbols_to_close:
             del active_positions[sym]
-
-        if cooldown_counter > 0:
-            continue
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -301,7 +285,7 @@ def run_backtest(processed_data, use_circuit_breaker=True):
             if symbol in active_positions:
                 continue
             
-            if not is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=0.75):
+            if use_correlation_gate and not is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=corr_threshold):
                 continue
 
             df = processed_data[symbol]
@@ -315,21 +299,22 @@ def run_backtest(processed_data, use_circuit_breaker=True):
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
-            volume_ok = c4h["Volume"] >= c4h["Vol_EMA20"] * 0.85
+            # فیلتر دقت ATR: جلوگیری از ورود در کندل‌هایی که نوسان آن‌ها بیش از حد غیرعادی (پامپ و دامپ ناگهانی) است
+            atr_normal = c4h["ATR"] <= (c4h["ATR_SMA20"] * 2.2) if not np.isnan(c4h["ATR_SMA20"]) else True
 
             if market_bull:
                 if not allow_longs:
                     continue
                 regime_ok = c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"]
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                valid_signal = regime_ok and pullback_ok and volume_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
+                valid_signal = regime_ok and pullback_ok and atr_normal and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
                 side = "LONG"
             else:
                 if not allow_shorts:
                     continue
                 regime_ok = c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"]
                 pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and volume_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
+                valid_signal = regime_ok and pullback_ok and atr_normal and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
                 side = "SHORT"
 
             if not valid_signal:
@@ -376,7 +361,7 @@ def run_backtest(processed_data, use_circuit_breaker=True):
     return pd.DataFrame(all_trades)
 
 if __name__ == "__main__":
-    trades_df = run_backtest(processed_data, use_circuit_breaker=True)
+    trades_df = run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
 
     n = len(trades_df)
     wr = (trades_df["Outcome"].eq("WIN").mean() * 100) if n else 0
@@ -390,6 +375,6 @@ if __name__ == "__main__":
             cur = 0
 
     print("=" * 72)
-    print("HUNTER-V14.0 — CIRCUIT BREAKER & VOLUME FILTER RESULTS")
+    print("HUNTER-V74 — PRECISION ATR FILTER RESULTS (V14.1)")
     print("=" * 72)
     print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
