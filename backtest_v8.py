@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — OPTIMIZED CORRELATION & QUALITY GATE (V13.1)
+# HUNTER-V74 — MAX LOSS REDUCTION & CIRCUIT BREAKER (V14.0)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — OPTIMIZED CORRELATION & QUALITY GATE (V13.1)")
+print("HUNTER-V74 — MAX LOSS REDUCTION & CIRCUIT BREAKER (V14.0)")
 print("=" * 68)
 
 processed_data = {}
@@ -140,6 +140,8 @@ def fetch_symbol_data(lbank_symbol):
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
     df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
     df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
+    df["Vol_EMA20"] = df["Volume"].ewm(span=20, adjust=False).mean()
+    
     df.set_index("Date", inplace=True)
     return df
 
@@ -153,7 +155,7 @@ print(f"Valid symbols: {len(processed_data)} / {len(SYMBOLS)}")
 def get_all_timestamps(data):
     return sorted({ts for df in data.values() for ts in df.index})
 
-def is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=0.60):
+def is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=0.75):
     if not active_positions:
         return True
     df_cand = processed_data[symbol]
@@ -182,12 +184,18 @@ def is_correlation_allowed(symbol, active_positions, processed_data, ts, thresho
             return False
     return True
 
-def run_backtest(processed_data, use_correlation_gate=False, corr_threshold=0.60):
+def run_backtest(processed_data, use_circuit_breaker=True):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
+    
+    consecutive_losses = 0
+    cooldown_counter = 0
 
     for ts in all_timestamps:
+        if cooldown_counter > 0:
+            cooldown_counter -= 1
+
         symbols_to_close = []
 
         for symbol, pos in list(active_positions.items()):
@@ -229,6 +237,14 @@ def run_backtest(processed_data, use_correlation_gate=False, corr_threshold=0.60
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
             outcome = "WIN" if r_real > 0 else "LOSS"
+            
+            if outcome == "LOSS":
+                consecutive_losses += 1
+                if use_circuit_breaker and consecutive_losses >= 3:
+                    cooldown_counter = 6  # ۶ کندل استراحت پس از ۳ ضرر متوالی
+            else:
+                consecutive_losses = 0
+
             position_notional = TRADE_MARGIN * LEVERAGE
             dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
@@ -244,6 +260,9 @@ def run_backtest(processed_data, use_correlation_gate=False, corr_threshold=0.60
 
         for sym in symbols_to_close:
             del active_positions[sym]
+
+        if cooldown_counter > 0:
+            continue
 
         market_bull = True
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
@@ -282,7 +301,7 @@ def run_backtest(processed_data, use_correlation_gate=False, corr_threshold=0.60
             if symbol in active_positions:
                 continue
             
-            if use_correlation_gate and not is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=corr_threshold):
+            if not is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=0.75):
                 continue
 
             df = processed_data[symbol]
@@ -296,20 +315,21 @@ def run_backtest(processed_data, use_correlation_gate=False, corr_threshold=0.60
             c4h = df.iloc[i]
             prev_c = df.iloc[i - 1]
 
+            volume_ok = c4h["Volume"] >= c4h["Vol_EMA20"] * 0.85
+
             if market_bull:
                 if not allow_longs:
                     continue
                 regime_ok = c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"]
                 pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                # سخت‌گیری بیشتر روی مومنتوم برای کاهش خطاهای متوالی
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
+                valid_signal = regime_ok and pullback_ok and volume_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
                 side = "LONG"
             else:
                 if not allow_shorts:
                     continue
                 regime_ok = c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"]
                 pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
+                valid_signal = regime_ok and pullback_ok and volume_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
                 side = "SHORT"
 
             if not valid_signal:
@@ -356,27 +376,20 @@ def run_backtest(processed_data, use_correlation_gate=False, corr_threshold=0.60
     return pd.DataFrame(all_trades)
 
 if __name__ == "__main__":
-    v13_trades = run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
-    v13_1_trades = run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.60)
+    trades_df = run_backtest(processed_data, use_circuit_breaker=True)
 
-    def stats(df):
-        n = len(df)
-        wr = (df["Outcome"].eq("WIN").mean() * 100) if n else 0
-        pnl = float(df["Dollar_PnL"].sum()) if n else 0
-        cur = mx = 0
-        for x in df["Outcome"]:
-            if x == "LOSS":
-                cur += 1
-                mx = max(mx, cur)
-            else:
-                cur = 0
-        return n, wr, pnl, mx
-
-    a = stats(v13_trades)
-    b = stats(v13_1_trades)
+    n = len(trades_df)
+    wr = (trades_df["Outcome"].eq("WIN").mean() * 100) if n else 0
+    pnl = float(trades_df["Dollar_PnL"].sum()) if n else 0
+    cur = mx = 0
+    for x in trades_df["Outcome"]:
+        if x == "LOSS":
+            cur += 1
+            mx = max(mx, cur)
+        else:
+            cur = 0
 
     print("=" * 72)
-    print("HUNTER-V74 — OPTIMIZED CORRELATION & QUALITY RESULTS (V13.1)")
+    print("HUNTER-V14.0 — CIRCUIT BREAKER & VOLUME FILTER RESULTS")
     print("=" * 72)
-    print(f"V13 قبلی (ت آستانه 0.75) | Trades={a[0]} | WR={a[1]:.2f}% | PnL=${a[2]:,.2f} | MaxLS={a[3]}")
-    print(f"V13.1 بهینه (آستانه 0.60) | Trades={b[0]} | WR={b[1]:.2f}% | PnL=${b[2]:,.2f} | MaxLS={b[3]}")
+    print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
