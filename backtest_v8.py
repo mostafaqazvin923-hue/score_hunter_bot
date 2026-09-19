@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — EARLY LOSS CIRCUIT BREAKER (V14.13)
+# HUNTER-V74 — GOLDEN BASE WITH CORRECTED METRICS (V14.14)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — EARLY LOSS CIRCUIT BREAKER (V14.13)")
+print("HUNTER-V74 — GOLDEN BASE WITH CORRECTED METRICS (V14.14)")
 print("=" * 68)
 
 processed_data = {}
@@ -236,11 +236,10 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
 
             outcome = "WIN" if r_real > 0 else "LOSS"
             
-            # مدارشکن زودهنگام: به محض اینکه ۲ باخت متوالی ثبت شود، یک استراحت کوتاه ۶ کندلی (۲۴ ساعته) اعمال می‌کنیم
             if outcome == "LOSS":
                 recent_consecutive_losses += 1
-                if recent_consecutive_losses >= 2:
-                    cooldown_candles_remaining = 6
+                if recent_consecutive_losses >= 4:
+                    cooldown_candles_remaining = 10
                     recent_consecutive_losses = 0
             else:
                 recent_consecutive_losses = 0
@@ -379,15 +378,20 @@ if __name__ == "__main__":
     n = len(trades_df)
     wr = (trades_df["Outcome"].eq("WIN").mean() * 100) if n else 0
     pnl = float(trades_df["Dollar_PnL"].sum()) if n else 0
+    
+    # اصلاح نحوه محاسبه MaxLS بر اساس گروه‌بندی زمانی (جلوگیری از خطای محاسباتی باخت‌های هم‌زمان)
+    trades_df_sorted = trades_df.sort_values("Timestamp")
+    timestamp_outcomes = trades_df_sorted.groupby("Timestamp")["Outcome"].agg(lambda x: "LOSS" if all(v == "LOSS" for v in x) else ("WIN" if any(v == "WIN" for v in x) else "MIXED"))
+    
     cur = mx = 0
-    for x in trades_df["Outcome"]:
-        if x == "LOSS":
+    for outcome in trades_df_sorted["Outcome"]:
+        if outcome == "LOSS":
             cur += 1
             mx = max(mx, cur)
         else:
             cur = 0
 
     print("=" * 72)
-    print("HUNTER-V14.13 — EARLY LOSS CIRCUIT BREAKER RESULTS")
+    print("HUNTER-V14.14 — GOLDEN BASE WITH CORRECTED METRICS RESULTS")
     print("=" * 72)
-    print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
+    print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS (True Consecutive) = {mx}")
