@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — GOLDEN BASE WITH ENTRY SHOCK FILTER (V14.12)
+# HUNTER-V74 — GOLDEN BASE RESTORED (V14.10)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — GOLDEN BASE WITH ENTRY SHOCK FILTER (V14.12)")
+print("HUNTER-V74 — GOLDEN BASE RESTORED (V14.10)")
 print("=" * 68)
 
 processed_data = {}
@@ -238,9 +238,8 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
             
             if outcome == "LOSS":
                 recent_consecutive_losses += 1
-                if recent_consecutive_losses >= 5:
-                    # فقط وقتی باخت‌های متوالی به ۵ رسید، ۴ کندل (۱۶ ساعت) ورودهای جدید رو متوقف کن تا طوفان رد بشه
-                    cooldown_candles_remaining = 4
+                if recent_consecutive_losses >= 4:
+                    cooldown_candles_remaining = 10
                     recent_consecutive_losses = 0
             else:
                 recent_consecutive_losses = 0
@@ -268,13 +267,6 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
         if "BTC" in processed_data and ts in processed_data["BTC"].index:
             btc_c = processed_data["BTC"].loc[ts]
             market_bull = btc_c["Close"] > btc_c["EMA200"]
-            
-            # فیلتر هوشمند ورود: اگر بیت کوین در این کندل افت بیشتر از ۳٪ داشت، موقتاً ورود جدید نزنیم
-            btc_prev_close = processed_data["BTC"]["Close"].shift(1).loc[ts] if ts in processed_data["BTC"].index else btc_c["Close"]
-            if not np.isnan(btc_prev_close) and btc_prev_close > 0:
-                btc_pct_change = (btc_c["Close"] - btc_prev_close) / btc_prev_close
-                if btc_pct_change < -0.03:
-                    continue
 
         bullish_count = 0
         total_active_syms = 0
@@ -395,6 +387,6 @@ if __name__ == "__main__":
             cur = 0
 
     print("=" * 72)
-    print("HUNTER-V14.12 — GOLDEN BASE WITH ENTRY SHOCK FILTER RESULTS")
+    print("HUNTER-V14.10 — GOLDEN BASE RESTORED RESULTS")
     print("=" * 72)
     print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
