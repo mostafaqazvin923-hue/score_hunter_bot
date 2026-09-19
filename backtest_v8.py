@@ -14,7 +14,19 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — GOLDEN BASE WITH CORRECTED METRICS (V14.14)
+# HUNTER-V74 — GOLDEN BASE RESTORED (V14.10) + CORRELATION TUNING
+# ============================================================
+# Golden Core (signal/SL/trailing/timeout) is UNTOUCHED.
+# This session only tunes two ROOT-CAUSE knobs that were already
+# part of your own V14.10 file — not new blocking layers:
+#   1) corr_threshold: how correlated a candidate must be with an
+#      already-open position before its entry is skipped.
+#   2) corr_lookback: how many 4H candles the correlation is computed
+#      over (30 candles = 5 days is short/noisy; a longer window gives
+#      a more stable correlation estimate).
+#   3) the existing hard breaker's trigger (currently: 4 consecutive
+#      losses -> 10-candle cooldown) — tested both at 4 (baseline) and
+#      3, since you asked specifically about consecutive losses.
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,10 +83,11 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — GOLDEN BASE WITH CORRECTED METRICS (V14.14)")
+print("HUNTER-V74 — GOLDEN BASE RESTORED (V14.10) + CORRELATION TUNING")
 print("=" * 68)
 
 processed_data = {}
+
 
 def fetch_symbol_data(lbank_symbol):
     all_ohlcv = []
@@ -143,6 +156,7 @@ def fetch_symbol_data(lbank_symbol):
     df.set_index("Date", inplace=True)
     return df
 
+
 for symbol, lbank_symbol in SYMBOLS.items():
     df4h = fetch_symbol_data(lbank_symbol)
     if df4h is not None:
@@ -150,43 +164,53 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
 print(f"Valid symbols: {len(processed_data)} / {len(SYMBOLS)}")
 
+
 def get_all_timestamps(data):
     return sorted({ts for df in data.values() for ts in df.index})
 
-def is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=0.75):
+
+def is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold, lookback):
     if not active_positions:
         return True
     df_cand = processed_data[symbol]
     if ts not in df_cand.index:
         return False
     idx_cand = df_cand.index.get_loc(ts)
-    if idx_cand < 30:
+    if idx_cand < lookback:
         return True
-    
-    cand_returns = df_cand['Close'].iloc[idx_cand-30:idx_cand+1].pct_change().dropna()
+
+    cand_returns = df_cand['Close'].iloc[idx_cand - lookback:idx_cand + 1].pct_change().dropna()
 
     for active_sym in active_positions:
         df_act = processed_data[active_sym]
         if ts not in df_act.index:
             continue
         idx_act = df_act.index.get_loc(ts)
-        if idx_act < 30:
+        if idx_act < lookback:
             continue
-        act_returns = df_act['Close'].iloc[idx_act-30:idx_act+1].pct_change().dropna()
+        act_returns = df_act['Close'].iloc[idx_act - lookback:idx_act + 1].pct_change().dropna()
 
         aligned = pd.concat([cand_returns, act_returns], axis=1).dropna()
-        if len(aligned) < 15:
+        if len(aligned) < max(15, lookback // 2):
             continue
         corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
         if not np.isnan(corr) and corr > threshold:
             return False
     return True
 
-def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75):
+
+def run_backtest(
+    processed_data,
+    use_correlation_gate=True,
+    corr_threshold=0.75,
+    corr_lookback=30,
+    breaker_trigger=4,
+    breaker_cooldown=10,
+):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     trades = []
-    
+
     recent_consecutive_losses = 0
     cooldown_candles_remaining = 0
 
@@ -235,11 +259,11 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
             outcome = "WIN" if r_real > 0 else "LOSS"
-            
+
             if outcome == "LOSS":
                 recent_consecutive_losses += 1
-                if recent_consecutive_losses >= 4:
-                    cooldown_candles_remaining = 10
+                if recent_consecutive_losses >= breaker_trigger:
+                    cooldown_candles_remaining = breaker_cooldown
                     recent_consecutive_losses = 0
             else:
                 recent_consecutive_losses = 0
@@ -299,8 +323,11 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
         for symbol in ranked_symbols:
             if symbol in active_positions:
                 continue
-            
-            if use_correlation_gate and not is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=corr_threshold):
+
+            if use_correlation_gate and not is_correlation_allowed(
+                symbol, active_positions, processed_data, ts,
+                threshold=corr_threshold, lookback=corr_lookback,
+            ):
                 continue
 
             df = processed_data[symbol]
@@ -372,26 +399,57 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
 
     return pd.DataFrame(trades)
 
-if __name__ == "__main__":
-    trades_df = run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
 
-    n = len(trades_df)
-    wr = (trades_df["Outcome"].eq("WIN").mean() * 100) if n else 0
-    pnl = float(trades_df["Dollar_PnL"].sum()) if n else 0
-    
-    # اصلاح نحوه محاسبه MaxLS بر اساس گروه‌بندی زمانی (جلوگیری از خطای محاسباتی باخت‌های هم‌زمان)
-    trades_df_sorted = trades_df.sort_values("Timestamp")
-    timestamp_outcomes = trades_df_sorted.groupby("Timestamp")["Outcome"].agg(lambda x: "LOSS" if all(v == "LOSS" for v in x) else ("WIN" if any(v == "WIN" for v in x) else "MIXED"))
-    
+def stats(df):
+    n = len(df)
+    if n == 0:
+        return 0, 0.0, 0.0, 0
+    wr = df["Outcome"].eq("WIN").mean() * 100
+    pnl = float(df["Dollar_PnL"].sum())
     cur = mx = 0
-    for outcome in trades_df_sorted["Outcome"]:
-        if outcome == "LOSS":
+    for x in df.sort_values("Timestamp")["Outcome"]:
+        if x == "LOSS":
             cur += 1
             mx = max(mx, cur)
         else:
             cur = 0
+    return n, wr, pnl, mx
 
-    print("=" * 72)
-    print("HUNTER-V14.14 — GOLDEN BASE WITH CORRECTED METRICS RESULTS")
-    print("=" * 72)
-    print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS (True Consecutive) = {mx}")
+
+if __name__ == "__main__":
+    # (name, kwargs) — baseline is exactly your reported 70%WR/$33k/MaxLS=6 config.
+    variants = [
+        ("Baseline (corr=0.75, lb=30, brk=4)",
+         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10)),
+        ("TighterCorr (corr=0.60)",
+         dict(corr_threshold=0.60, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10)),
+        ("LongerLookback (lb=60)",
+         dict(corr_threshold=0.75, corr_lookback=60, breaker_trigger=4, breaker_cooldown=10)),
+        ("TighterCorr+LongerLookback",
+         dict(corr_threshold=0.60, corr_lookback=60, breaker_trigger=4, breaker_cooldown=10)),
+        ("EarlierBreaker (trigger=3)",
+         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=3, breaker_cooldown=10)),
+        ("TighterCorr+EarlierBreaker",
+         dict(corr_threshold=0.60, corr_lookback=60, breaker_trigger=3, breaker_cooldown=10)),
+    ]
+
+    results = []
+    for name, kwargs in variants:
+        df = run_backtest(processed_data, use_correlation_gate=True, **kwargs)
+        results.append((name, stats(df)))
+
+    print("=" * 90)
+    print("HUNTER-V14.10 — CORRELATION-GATE TUNING (root-cause, not size-based)")
+    print("=" * 90)
+    print(f"{'Variant':32s}{'Trades':>8s}{'WR%':>8s}{'PnL$':>14s}{'MaxLS':>8s}")
+    print("-" * 90)
+    for name, (n, wr, pnl, mx) in results:
+        print(f"{name:32s}{n:8d}{wr:8.2f}{pnl:14,.2f}{mx:8d}")
+
+    print("\nREFERENCE CHECK (your reported baseline)")
+    print("Expected baseline: ~similar trade count | 70% WR | ~$33,000 PnL | MaxLS=6")
+    print("\nGOAL")
+    print("Find the variant with MaxLS closest to 3 while WR stays >= baseline's 70% and PnL$ stays >= baseline's.")
+    print("If NONE of these six get MaxLS to 3 without WR/PnL dropping, that's a real answer too —")
+    print("it would mean 3 is past what this signal's natural correlation structure can support for free,")
+    print("and we'd need to say so rather than force it with something that quietly costs WR/PnL.")
