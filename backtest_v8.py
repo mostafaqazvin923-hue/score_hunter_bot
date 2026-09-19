@@ -199,6 +199,32 @@ def is_correlation_allowed(symbol, active_positions, processed_data, ts, thresho
     return True
 
 
+def compute_dominance_spread(processed_data, ts):
+    """
+    Self-contained BTC-Dominance PROXY — no external API needed, built
+    only from data you already fetch. Positive value = BTC outperforming
+    the alt basket over the last 10 4H candles (~ dominance rising, risk
+    for long-alt momentum trades). Negative = alts outperforming BTC
+    (~ dominance falling, risk for short-alt momentum trades).
+    Uses the already-computed, fully causal Mom_Short column.
+    """
+    if "BTC" not in processed_data or ts not in processed_data["BTC"].index:
+        return None
+    btc_mom = processed_data["BTC"].loc[ts, "Mom_Short"]
+    if np.isnan(btc_mom):
+        return None
+    alt_moms = []
+    for sym, df in processed_data.items():
+        if sym == "BTC" or ts not in df.index:
+            continue
+        v = df.loc[ts, "Mom_Short"]
+        if not np.isnan(v):
+            alt_moms.append(v)
+    if not alt_moms:
+        return None
+    return float(btc_mom - np.median(alt_moms))
+
+
 def run_backtest(
     processed_data,
     use_correlation_gate=True,
@@ -206,6 +232,8 @@ def run_backtest(
     corr_lookback=30,
     breaker_trigger=4,
     breaker_cooldown=10,
+    use_dominance_gate=False,
+    dom_threshold=0.03,
 ):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
@@ -305,6 +333,22 @@ def run_backtest(
         allow_longs = market_breadth_ratio >= 0.35
         allow_shorts = market_breadth_ratio <= 0.65
 
+        # NEW: BTC-Dominance proxy, computed once per timestamp (all
+        # candidates this timestamp share the same intended side, since
+        # `side` is decided by the single `market_bull` flag above).
+        dom_block_alts = False
+        if use_dominance_gate:
+            spread = compute_dominance_spread(processed_data, ts)
+            if spread is not None:
+                if market_bull and spread > dom_threshold:
+                    # BTC strongly outperforming alts -> risky to open
+                    # NEW long-alt momentum trades right now.
+                    dom_block_alts = True
+                elif (not market_bull) and spread < -dom_threshold:
+                    # Alts strongly outperforming BTC -> risky to open
+                    # NEW short-alt momentum trades right now.
+                    dom_block_alts = True
+
         current_scores = {}
         for symbol, df in processed_data.items():
             if ts not in df.index:
@@ -322,6 +366,9 @@ def run_backtest(
 
         for symbol in ranked_symbols:
             if symbol in active_positions:
+                continue
+
+            if dom_block_alts and symbol != "BTC":
                 continue
 
             if use_correlation_gate and not is_correlation_allowed(
@@ -417,20 +464,26 @@ def stats(df):
 
 
 if __name__ == "__main__":
-    # (name, kwargs) — baseline is exactly your reported 70%WR/$33k/MaxLS=6 config.
+    # Baseline = your confirmed-best config (corr=0.75/lb=30/brk=4 ->
+    # 70.92% WR, $33,533 PnL, MaxLS=6). Correlation/breaker tightening
+    # already PROVEN to backfire — kept fixed at baseline here, only the
+    # NEW BTC-Dominance-proxy gate is varied on top of it.
     variants = [
-        ("Baseline (corr=0.75, lb=30, brk=4)",
-         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10)),
-        ("TighterCorr (corr=0.60)",
-         dict(corr_threshold=0.60, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10)),
-        ("LongerLookback (lb=60)",
-         dict(corr_threshold=0.75, corr_lookback=60, breaker_trigger=4, breaker_cooldown=10)),
-        ("TighterCorr+LongerLookback",
-         dict(corr_threshold=0.60, corr_lookback=60, breaker_trigger=4, breaker_cooldown=10)),
-        ("EarlierBreaker (trigger=3)",
-         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=3, breaker_cooldown=10)),
-        ("TighterCorr+EarlierBreaker",
-         dict(corr_threshold=0.60, corr_lookback=60, breaker_trigger=3, breaker_cooldown=10)),
+        ("Baseline (corr gate only)",
+         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
+              use_dominance_gate=False)),
+        ("+DomGate (thr=0.02)",
+         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
+              use_dominance_gate=True, dom_threshold=0.02)),
+        ("+DomGate (thr=0.03)",
+         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
+              use_dominance_gate=True, dom_threshold=0.03)),
+        ("+DomGate (thr=0.05)",
+         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
+              use_dominance_gate=True, dom_threshold=0.05)),
+        ("+DomGate (thr=0.08)",
+         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
+              use_dominance_gate=True, dom_threshold=0.08)),
     ]
 
     results = []
@@ -439,17 +492,24 @@ if __name__ == "__main__":
         results.append((name, stats(df)))
 
     print("=" * 90)
-    print("HUNTER-V14.10 — CORRELATION-GATE TUNING (root-cause, not size-based)")
+    print("HUNTER-V14.10 — BTC-DOMINANCE-PROXY GATE (new mechanism, on top of your best-known base)")
     print("=" * 90)
     print(f"{'Variant':32s}{'Trades':>8s}{'WR%':>8s}{'PnL$':>14s}{'MaxLS':>8s}")
     print("-" * 90)
     for name, (n, wr, pnl, mx) in results:
         print(f"{name:32s}{n:8d}{wr:8.2f}{pnl:14,.2f}{mx:8d}")
 
-    print("\nREFERENCE CHECK (your reported baseline)")
-    print("Expected baseline: ~similar trade count | 70% WR | ~$33,000 PnL | MaxLS=6")
+    print("\nREFERENCE CHECK (your confirmed-best baseline)")
+    print("Expected baseline: 337 trades | 70.92% WR | $33,533.16 PnL | MaxLS=6")
+    print("\nWHAT THIS GATE DOES DIFFERENTLY FROM EVERYTHING TRIED SO FAR")
+    print("Correlation gate = blocks a candidate correlated with an OPEN position (pairwise, reactive).")
+    print("Dominance gate  = blocks ALL new alt entries in the risky direction when the WHOLE alt basket")
+    print("is losing/gaining strength vs BTC — a market-wide macro condition, not a pairwise one. It can")
+    print("catch a scenario correlation-gate misses: many DIFFERENT (not mutually correlated) alts each")
+    print("independently getting hit because BTC itself is dominating capital flows.")
     print("\nGOAL")
-    print("Find the variant with MaxLS closest to 3 while WR stays >= baseline's 70% and PnL$ stays >= baseline's.")
-    print("If NONE of these six get MaxLS to 3 without WR/PnL dropping, that's a real answer too —")
-    print("it would mean 3 is past what this signal's natural correlation structure can support for free,")
-    print("and we'd need to say so rather than force it with something that quietly costs WR/PnL.")
+    print("Look for a dom_threshold where MaxLS drops below 6 while WR/PnL stay >= baseline's.")
+    print("If none clear that bar either, we'll have tested 3 fundamentally different root-cause")
+    print("mechanisms (side-cap, correlation-tightening, dominance) and can say with real confidence")
+    print("that MaxLS=6 is this system's structural floor, not a gap in our search.")
+
