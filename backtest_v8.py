@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — GOLDEN BASE RESTORED (V14.10)
+# HUNTER-V74 — EARLY LOSS CIRCUIT BREAKER (V14.13)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — GOLDEN BASE RESTORED (V14.10)")
+print("HUNTER-V74 — EARLY LOSS CIRCUIT BREAKER (V14.13)")
 print("=" * 68)
 
 processed_data = {}
@@ -236,10 +236,11 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
 
             outcome = "WIN" if r_real > 0 else "LOSS"
             
+            # مدارشکن زودهنگام: به محض اینکه ۲ باخت متوالی ثبت شود، یک استراحت کوتاه ۶ کندلی (۲۴ ساعته) اعمال می‌کنیم
             if outcome == "LOSS":
                 recent_consecutive_losses += 1
-                if recent_consecutive_losses >= 4:
-                    cooldown_candles_remaining = 10
+                if recent_consecutive_losses >= 2:
+                    cooldown_candles_remaining = 6
                     recent_consecutive_losses = 0
             else:
                 recent_consecutive_losses = 0
@@ -387,6 +388,6 @@ if __name__ == "__main__":
             cur = 0
 
     print("=" * 72)
-    print("HUNTER-V14.10 — GOLDEN BASE RESTORED RESULTS")
+    print("HUNTER-V14.13 — EARLY LOSS CIRCUIT BREAKER RESULTS")
     print("=" * 72)
     print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
