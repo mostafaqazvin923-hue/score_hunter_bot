@@ -466,24 +466,23 @@ def stats(df):
 if __name__ == "__main__":
     # Baseline = your confirmed-best config (corr=0.75/lb=30/brk=4 ->
     # 70.92% WR, $33,533 PnL, MaxLS=6). Correlation/breaker tightening
-    # already PROVEN to backfire — kept fixed at baseline here, only the
-    # NEW BTC-Dominance-proxy gate is varied on top of it.
+    # already PROVEN to backfire — kept fixed at baseline here.
+    #
+    # Real-data round 1 found the active band is BELOW 0.03 (0.03+ was a
+    # no-op; 0.02 gave MaxLS 6->5 with WR flat/+0.04pp and PnL only -2.2%
+    # — by far the best trade-off found this whole session). This round
+    # scans finer around and below 0.02 to find how far it goes before
+    # it starts costing WR/PnL the way tighter correlation did.
+    dom_thresholds = [0.005, 0.010, 0.015, 0.020, 0.025]
     variants = [
         ("Baseline (corr gate only)",
          dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
               use_dominance_gate=False)),
-        ("+DomGate (thr=0.02)",
+    ] + [
+        (f"+DomGate (thr={t:.3f})",
          dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
-              use_dominance_gate=True, dom_threshold=0.02)),
-        ("+DomGate (thr=0.03)",
-         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
-              use_dominance_gate=True, dom_threshold=0.03)),
-        ("+DomGate (thr=0.05)",
-         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
-              use_dominance_gate=True, dom_threshold=0.05)),
-        ("+DomGate (thr=0.08)",
-         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
-              use_dominance_gate=True, dom_threshold=0.08)),
+              use_dominance_gate=True, dom_threshold=t))
+        for t in dom_thresholds
     ]
 
     results = []
@@ -508,7 +507,9 @@ if __name__ == "__main__":
     print("catch a scenario correlation-gate misses: many DIFFERENT (not mutually correlated) alts each")
     print("independently getting hit because BTC itself is dominating capital flows.")
     print("\nGOAL")
-    print("Look for a dom_threshold where MaxLS drops below 6 while WR/PnL stay >= baseline's.")
+    print("Look for the SMALLEST dom_threshold where WR stays >= baseline's 70.92% and PnL$ stays")
+    print("within ~2-3% of baseline's $33,533 — that's the practical floor for this lever before it")
+    print("starts costing performance the way tighter correlation did.")
     print("If none clear that bar either, we'll have tested 3 fundamentally different root-cause")
     print("mechanisms (side-cap, correlation-tightening, dominance) and can say with real confidence")
     print("that MaxLS=6 is this system's structural floor, not a gap in our search.")
