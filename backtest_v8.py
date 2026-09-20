@@ -1,8 +1,25 @@
+""" 
+HUNTER V15 — PRECISION REGIME PULLBACK
+Causal LBank USDT-M Futures backtester.
+
+Core idea:
+4H regime -> 1H impulse -> controlled pullback -> rejection/continuation.
+The system uses a FIXED 1:2 risk/reward target. There is no trailing stop,
+no timeout exit, no same-candle entry, and no future-looking information.
+
+IMPORTANT:
+- This program does NOT promise 60% win rate or <=4 consecutive losses.
+- Those are acceptance targets. The market decides the result.
+- Do not tune parameters after seeing the test result and call that validation.
+"""
+from __future__ import annotations
+
 import os
-import subprocess
 import sys
-from datetime import datetime, timedelta
-from collections import defaultdict, Counter
+import time
+import subprocess
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 try:
     import ccxt
@@ -13,530 +30,1038 @@ except ImportError:
 import numpy as np
 import pandas as pd
 
-# ============================================================
-# HUNTER-V74 — GOLDEN BASE (V14.10) — FINAL TUNED VERSION
-# ============================================================
-# Golden Core (signal/SL/trailing/timeout) is UNTOUCHED from your
-# original V14.10. Final locked-in root-cause tuning from this session:
-#   corr_threshold  = 0.70   (was 0.75)
-#   dom_threshold   = 0.020  (new BTC-Dominance-proxy gate, was off)
-#   breaker_trigger = 4      (unchanged — tightening it always backfired)
-# Confirmed twice on real LBank data: 320 trades | 70.94% WR |
-# $32,932.00 PnL | MaxLS=4 (down from the original ~340 trades |
-# ~70.6-70.9% WR | ~$33,500 PnL | MaxLS=6).
-# ============================================================
 
-exchange = ccxt.lbank({"enableRateLimit": True})
-
-SYMBOLS = {
-    "BTC": "BTC/USDT",
-    "ETH": "ETH/USDT",
-    "SOL": "SOL/USDT",
-    "XRP": "XRP/USDT",
-    "LINK": "LINK/USDT",
-    "UNI": "UNI/USDT",
-    "ICP": "ICP/USDT",
-    "INJ": "INJ/USDT",
-    "ATOM": "ATOM/USDT",
-    "RENDER": "RENDER/USDT",
-    "XLM": "XLM/USDT",
-    "AAVE": "AAVE/USDT",
-    "WIF": "WIF/USDT",
-    "ONDO": "ONDO/USDT",
-    "DOGE": "DOGE/USDT",
-    "BNB": "BNB/USDT",
-    "ADA": "ADA/USDT",
-}
-
-REMOVED_COINS = {
-    "NEAR", "OP", "HYPE", "HBAR", "AVAX", "SUI", "PENDLE", "TIA",
-    "FET", "SEI", "ARB", "DOT", "ETC", "SHIB", "STX", "RUNE",
-    "MKR", "APT", "LTC", "AR", "IMX", "PEPE", "BONK",
-}
-
-SYMBOLS = {
-    k: v for k, v in SYMBOLS.items()
-    if k not in REMOVED_COINS
-}
-
+# =========================
+# CONFIGURATION
+# =========================
 LOOKBACK_DAYS = 365
-TIMEFRAME = "4h"
-MAX_POSITIONS = 5
+WARMUP_DAYS = 70
 
-SLIPPAGE = 0.0003
-FEE_RATE = 0.0007
+SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT",
+    "ADA/USDT", "LINK/USDT", "AVAX/USDT", "DOT/USDT", "NEAR/USDT",
+]
 
-ATR_PERIOD = 14
-TRAILING_ATR_MULTIPLIER = 2.0
-INITIAL_ATR_MULTIPLIER = 1.8
-TIMEOUT_CANDLES = 45
-EMA_WARMUP = 200
+TIMEFRAME = "1h"
+HTF_TIMEFRAME = "4h"
 
 INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
-LEVERAGE = 80.0
+LEVERAGE = 1.0
+FEE_RATE = 0.0006
+SLIPPAGE = 0.0002
 
-start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
-since_timestamp = int(start_date.timestamp() * 1000)
+# Fixed design target: 1R stop, 2R target.
+TP_R = 2.0
+MAX_RISK_PCT_OF_ENTRY = 0.025
 
-print("=" * 68)
-print("HUNTER-V74 — GOLDEN BASE (V14.10) — FINAL TUNED VERSION")
-print("=" * 68)
+# 4H regime
+EMA_FAST_4H = 50
+EMA_SLOW_4H = 200
+ATR_LEN_4H = 14
+ADX_LEN_4H = 14
+ADX_MIN_4H = 18.0
 
-processed_data = {}
+# 1H setup
+EMA_FAST_1H = 20
+EMA_MID_1H = 50
+ATR_LEN_1H = 14
+RSI_LEN = 14
+ADX_LEN_1H = 14
+RVOL_LEN = 20
+
+# Impulse / pullback geometry
+DONCHIAN_LEN = 20
+IMPULSE_ATR_MIN = 1.00
+PULLBACK_MAX_ATR = 1.60
+PULLBACK_MIN_BARS = 1
+PULLBACK_MAX_BARS = 5
+EMA_TOUCH_ATR = 0.35
+REJECTION_MIN_BODY_ATR = 0.15
+REJECTION_CLOSE_LOCATION = 0.65
+STOP_BUFFER_ATR = 0.15
+
+# Portfolio
+MAX_OPEN_POSITIONS = 3
+
+# If both SL and TP are touched inside one candle, assume SL first.
+CONSERVATIVE_INTRABAR = True
 
 
-def fetch_symbol_data(lbank_symbol):
-    all_ohlcv = []
-    current_since = since_timestamp
-    last_seen = None
+# =========================
+# INDICATORS — CAUSAL
+# =========================
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False, min_periods=n).mean()
 
-    while current_since < exchange.milliseconds():
-        batch = None
-        for attempt in range(3):
-            try:
-                batch = exchange.fetch_ohlcv(
-                    lbank_symbol, timeframe=TIMEFRAME, since=current_since, limit=1000
-                )
-                break
-            except Exception:
-                if attempt == 2:
-                    return None
+
+def atr(df: pd.DataFrame, n: int) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+
+
+def rsi(s: pd.Series, n: int = 14) -> pd.Series:
+    delta = s.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    avg_up = up.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+    avg_down = down.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+    rs = avg_up / avg_down.replace(0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=df.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=df.index,
+    )
+
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    atr_w = tr.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+    plus = 100.0 * plus_dm.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean() / atr_w
+    minus = 100.0 * minus_dm.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean() / atr_w
+
+    dx = 100.0 * (plus - minus).abs() / (plus + minus).replace(0, np.nan)
+    return dx.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+
+
+def add_indicators(df: pd.DataFrame, htf: bool = False) -> pd.DataFrame:
+    x = df.copy()
+
+    if htf:
+        x["ema_fast"] = ema(x["close"], EMA_FAST_4H)
+        x["ema_slow"] = ema(x["close"], EMA_SLOW_4H)
+        x["atr"] = atr(x, ATR_LEN_4H)
+        x["adx"] = adx(x, ADX_LEN_4H)
+        x["ema_fast_slope"] = x["ema_fast"] - x["ema_fast"].shift(3)
+    else:
+        x["ema20"] = ema(x["close"], EMA_FAST_1H)
+        x["ema50"] = ema(x["close"], EMA_MID_1H)
+        x["atr"] = atr(x, ATR_LEN_1H)
+        x["rsi"] = rsi(x["close"], RSI_LEN)
+        x["adx"] = adx(x, ADX_LEN_1H)
+        x["vol_ma"] = x["volume"].rolling(RVOL_LEN, min_periods=RVOL_LEN).mean()
+        x["rvol"] = x["volume"] / x["vol_ma"].replace(0, np.nan)
+
+        # CRITICAL: current candle is excluded from Donchian.
+        x["donchian_high"] = x["high"].shift(1).rolling(
+            DONCHIAN_LEN, min_periods=DONCHIAN_LEN
+        ).max()
+        x["donchian_low"] = x["low"].shift(1).rolling(
+            DONCHIAN_LEN, min_periods=DONCHIAN_LEN
+        ).min()
+
+    return x
+
+
+# =========================
+# LBank DATA
+# =========================
+def make_exchange():
+    return ccxt.lbank({
+        "enableRateLimit": True,
+        "options": {"defaultType": "swap"},
+    })
+
+
+def fetch_ohlcv(
+    exchange,
+    symbol: str,
+    timeframe: str,
+    since_ms: int,
+    until_ms: int,
+) -> pd.DataFrame:
+    rows = []
+    tf_ms = exchange.parse_timeframe(timeframe) * 1000
+    cursor = since_ms
+
+    while cursor < until_ms:
+        batch = exchange.fetch_ohlcv(symbol, timeframe, cursor, limit=1000)
         if not batch:
             break
 
-        last_ts = batch[-1][0]
-        if last_seen is not None and last_ts <= last_seen:
-            return None
+        rows.extend(batch)
+        last_open = batch[-1][0]
+        next_cursor = last_open + tf_ms
 
-        all_ohlcv.extend(batch)
-        last_seen = last_ts
-        current_since = last_ts + 1
+        if next_cursor <= cursor:
+            break
+
+        cursor = next_cursor
 
         if len(batch) < 1000:
             break
 
-    if not all_ohlcv:
-        return None
+        time.sleep(exchange.rateLimit / 1000.0)
 
-    df = pd.DataFrame(all_ohlcv, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
-    df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms")
-    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-    df.dropna(inplace=True)
-    df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
-    df.sort_values("Date", inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    if not rows:
+        return pd.DataFrame(
+            columns=["open", "high", "low", "close", "volume"]
+        )
 
-    if len(df) >= 2:
-        now_ms = exchange.milliseconds()
-        last_ms = int(df.iloc[-1]["Date"].timestamp() * 1000)
-        if last_ms + 4 * 60 * 60 * 1000 > now_ms:
-            df = df.iloc[:-1].copy()
+    df = pd.DataFrame(
+        rows,
+        columns=["ts", "open", "high", "low", "close", "volume"],
+    )
+    df = df.drop_duplicates("ts").sort_values("ts")
+    df["Date"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
 
-    if len(df) < EMA_WARMUP + 50:
-        return None
+    df = df[
+        (df["ts"] >= since_ms)
+        & (df["ts"] < until_ms)
+    ]
 
-    deltas = df["Date"].diff().dropna()
-    if not deltas.empty and deltas.max() > pd.Timedelta(hours=4, minutes=10):
-        return None
+    df = df.set_index("Date")[
+        ["open", "high", "low", "close", "volume"]
+    ].astype(float)
 
-    tr1 = df["High"] - df["Low"]
-    tr2 = np.abs(df["High"] - df["Close"].shift(1))
-    tr3 = np.abs(df["Low"] - df["Close"].shift(1))
+    valid = (
+        (df["high"] >= df[["open", "close"]].max(axis=1))
+        & (df["low"] <= df[["open", "close"]].min(axis=1))
+        & (df["high"] >= df["low"])
+        & (df["volume"] >= 0)
+    )
+    df = df[valid]
 
-    df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
-    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
-    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
-    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
-    df["Mom_Short"] = (df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10)
-    df["Mom_Long"] = (df["Close"] - df["Close"].shift(30)) / df["Close"].shift(30)
-    df.set_index("Date", inplace=True)
+    # Remove the currently open candle.
+    now_ms = exchange.milliseconds()
+    last_complete_open_ms = (now_ms // tf_ms) * tf_ms - tf_ms
+    last_complete = pd.to_datetime(
+        last_complete_open_ms,
+        unit="ms",
+        utc=True,
+    )
+    df = df[df.index <= last_complete]
+
     return df
 
 
-for symbol, lbank_symbol in SYMBOLS.items():
-    df4h = fetch_symbol_data(lbank_symbol)
-    if df4h is not None:
-        processed_data[symbol] = df4h
+def prepare_symbol(
+    exchange,
+    symbol: str,
+    test_start: pd.Timestamp,
+    test_end: pd.Timestamp,
+) -> pd.DataFrame:
+    warm_start = test_start - pd.Timedelta(days=WARMUP_DAYS)
 
-print(f"Valid symbols: {len(processed_data)} / {len(SYMBOLS)}")
+    since_ms = int(warm_start.timestamp() * 1000)
+    until_ms = int(test_end.timestamp() * 1000)
+
+    one = fetch_ohlcv(
+        exchange, symbol, TIMEFRAME, since_ms, until_ms
+    )
+    four = fetch_ohlcv(
+        exchange, symbol, HTF_TIMEFRAME, since_ms, until_ms
+    )
+
+    one = add_indicators(one, htf=False)
+    four = add_indicators(four, htf=True)
+
+    if one.empty or four.empty:
+        return pd.DataFrame()
+
+    # A 4H candle opened at t becomes usable only after t+4h.
+    h = four.copy()
+    h["regime_available_at"] = h.index + pd.Timedelta(hours=4)
+
+    bull = (
+        (h["ema_fast"] > h["ema_slow"])
+        & (h["close"] > h["ema_fast"])
+        & (h["ema_fast_slope"] > 0)
+        & (h["adx"] >= ADX_MIN_4H)
+    )
+    bear = (
+        (h["ema_fast"] < h["ema_slow"])
+        & (h["close"] < h["ema_fast"])
+        & (h["ema_fast_slope"] < 0)
+        & (h["adx"] >= ADX_MIN_4H)
+    )
+
+    h["regime"] = np.where(
+        bull,
+        "BULL",
+        np.where(bear, "BEAR", "NEUTRAL"),
+    )
+
+    h = h[[
+        "regime_available_at",
+        "regime",
+    ]].sort_values("regime_available_at")
+
+    one = one.reset_index()
+    one = pd.merge_asof(
+        one.sort_values("Date"),
+        h,
+        left_on="Date",
+        right_on="regime_available_at",
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    one = one.set_index("Date").sort_index()
+
+    return one
 
 
-def get_all_timestamps(data):
-    return sorted({ts for df in data.values() for ts in df.index})
+# =========================
+# SETUP STATE
+# =========================
+@dataclass
+class PendingEntry:
+    symbol: str
+    direction: str
+    signal_time: pd.Timestamp
+    entry_time: pd.Timestamp
+    stop_ref: float
+    setup_type: str
+    regime: str
 
 
-def is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold, lookback):
-    if not active_positions:
-        return True
-    df_cand = processed_data[symbol]
-    if ts not in df_cand.index:
-        return False
-    idx_cand = df_cand.index.get_loc(ts)
-    if idx_cand < lookback:
-        return True
-
-    cand_returns = df_cand['Close'].iloc[idx_cand - lookback:idx_cand + 1].pct_change().dropna()
-
-    for active_sym in active_positions:
-        df_act = processed_data[active_sym]
-        if ts not in df_act.index:
-            continue
-        idx_act = df_act.index.get_loc(ts)
-        if idx_act < lookback:
-            continue
-        act_returns = df_act['Close'].iloc[idx_act - lookback:idx_act + 1].pct_change().dropna()
-
-        aligned = pd.concat([cand_returns, act_returns], axis=1).dropna()
-        if len(aligned) < max(15, lookback // 2):
-            continue
-        corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
-        if not np.isnan(corr) and corr > threshold:
-            return False
-    return True
+@dataclass
+class Position:
+    symbol: str
+    direction: str
+    entry_time: pd.Timestamp
+    entry_price: float
+    stop: float
+    target: float
+    notional: float
+    risk_price: float
+    signal_time: pd.Timestamp
+    setup_type: str
+    regime: str
 
 
-def compute_dominance_spread(processed_data, ts):
+def candle_body(row) -> float:
+    return abs(float(row["close"]) - float(row["open"]))
+
+
+def close_location(row) -> float:
+    rng = float(row["high"]) - float(row["low"])
+    if rng <= 0:
+        return 0.5
+    return (float(row["close"]) - float(row["low"])) / rng
+
+
+def finite(row, names) -> bool:
+    return all(np.isfinite(row.get(k, np.nan)) for k in names)
+
+
+# =========================
+# SIGNALS
+# =========================
+def long_signal(
+    df: pd.DataFrame,
+    i: int,
+) -> Optional[Tuple[float, str]]:
     """
-    Self-contained BTC-Dominance PROXY — no external API needed, built
-    only from data you already fetch. Positive value = BTC outperforming
-    the alt basket over the last 10 4H candles (~ dominance rising, risk
-    for long-alt momentum trades). Negative = alts outperforming BTC
-    (~ dominance falling, risk for short-alt momentum trades).
-    Uses the already-computed, fully causal Mom_Short column.
+    Signal is evaluated only on the fully closed candle i.
+    Entry is scheduled for i+1 open.
     """
-    if "BTC" not in processed_data or ts not in processed_data["BTC"].index:
+    if i < max(DONCHIAN_LEN + 5, 60):
         return None
-    btc_mom = processed_data["BTC"].loc[ts, "Mom_Short"]
-    if np.isnan(btc_mom):
+
+    r = df.iloc[i]
+    p = df.iloc[i - 1]
+
+    if r["regime"] != "BULL":
         return None
-    alt_moms = []
-    for sym, df in processed_data.items():
-        if sym == "BTC" or ts not in df.index:
+
+    needed = [
+        "close", "open", "high", "low", "atr",
+        "ema20", "ema50", "rsi", "adx", "rvol",
+        "donchian_high",
+    ]
+    if not finite(r, needed):
+        return None
+
+    # 1H trend alignment.
+    if not (r["close"] > r["ema20"] > r["ema50"]):
+        return None
+    if r["adx"] < ADX_MIN_1H:
+        return None
+
+    # Find a recent completed impulse. No future bars are examined.
+    found = None
+    start = max(1, i - PULLBACK_MAX_BARS - 2)
+
+    for j in range(start, i):
+        x = df.iloc[j]
+        if not finite(
+            x,
+            ["close", "open", "high", "low", "atr", "donchian_high"],
+        ):
             continue
-        v = df.loc[ts, "Mom_Short"]
-        if not np.isnan(v):
-            alt_moms.append(v)
-    if not alt_moms:
+
+        impulse = x["close"] > x["donchian_high"]
+        impulse_size = (
+            (x["high"] - x["low"]) / x["atr"]
+            if x["atr"] > 0 else 0
+        )
+
+        if (
+            impulse
+            and impulse_size >= IMPULSE_ATR_MIN
+            and x["close"] > x["open"]
+        ):
+            found = j
+            break
+
+    if found is None:
         return None
-    return float(btc_mom - np.median(alt_moms))
+
+    bars_since = i - found
+    if bars_since < PULLBACK_MIN_BARS:
+        return None
+    if bars_since > PULLBACK_MAX_BARS:
+        return None
+
+    imp = df.iloc[found]
+    pull = df.iloc[found + 1:i]
+
+    if len(pull) < PULLBACK_MIN_BARS:
+        return None
+
+    pull_low = float(pull["low"].min())
+
+    # Pullback may not erase the impulse structure.
+    if pull_low < imp["low"] - 0.20 * imp["atr"]:
+        return None
+
+    # Pullback must interact with the fast trend area OR remain close to
+    # the impulse high. This prevents chasing extended candles.
+    ema_distance = abs(float(r["low"]) - float(r["ema20"])) / float(r["atr"])
+    if ema_distance > EMA_TOUCH_ATR and r["low"] > imp["high"]:
+        return None
+
+    pullback_depth = (float(imp["high"]) - pull_low) / float(imp["atr"])
+    if pullback_depth > PULLBACK_MAX_ATR:
+        return None
+
+    # Rejection / continuation candle.
+    if r["close"] <= r["open"]:
+        return None
+    if candle_body(r) < REJECTION_MIN_BODY_ATR * r["atr"]:
+        return None
+    if close_location(r) < REJECTION_CLOSE_LOCATION:
+        return None
+    if r["rsi"] < 52:
+        return None
+    if r["rvol"] < 1.0:
+        return None
+    if r["close"] <= p["high"]:
+        return None
+
+    # Structural stop below the pullback.
+    stop_ref = pull_low - STOP_BUFFER_ATR * r["atr"]
+
+    if stop_ref >= r["close"]:
+        return None
+
+    if (r["close"] - stop_ref) / r["close"] > MAX_RISK_PCT_OF_ENTRY:
+        return None
+
+    return stop_ref, "BULL_IMPULSE_PULLBACK_RECLAIM"
 
 
+def short_signal(
+    df: pd.DataFrame,
+    i: int,
+) -> Optional[Tuple[float, str]]:
+    if i < max(DONCHIAN_LEN + 5, 60):
+        return None
+
+    r = df.iloc[i]
+    p = df.iloc[i - 1]
+
+    if r["regime"] != "BEAR":
+        return None
+
+    needed = [
+        "close", "open", "high", "low", "atr",
+        "ema20", "ema50", "rsi", "adx", "rvol",
+        "donchian_low",
+    ]
+    if not finite(r, needed):
+        return None
+
+    if not (r["close"] < r["ema20"] < r["ema50"]):
+        return None
+    if r["adx"] < ADX_MIN_1H:
+        return None
+
+    found = None
+    start = max(1, i - PULLBACK_MAX_BARS - 2)
+
+    for j in range(start, i):
+        x = df.iloc[j]
+        if not finite(
+            x,
+            ["close", "open", "high", "low", "atr", "donchian_low"],
+        ):
+            continue
+
+        impulse = x["close"] < x["donchian_low"]
+        impulse_size = (
+            (x["high"] - x["low"]) / x["atr"]
+            if x["atr"] > 0 else 0
+        )
+
+        if (
+            impulse
+            and impulse_size >= IMPULSE_ATR_MIN
+            and x["close"] < x["open"]
+        ):
+            found = j
+            break
+
+    if found is None:
+        return None
+
+    bars_since = i - found
+    if bars_since < PULLBACK_MIN_BARS:
+        return None
+    if bars_since > PULLBACK_MAX_BARS:
+        return None
+
+    imp = df.iloc[found]
+    pull = df.iloc[found + 1:i]
+
+    if len(pull) < PULLBACK_MIN_BARS:
+        return None
+
+    pull_high = float(pull["high"].max())
+
+    if pull_high > imp["high"] + 0.20 * imp["atr"]:
+        return None
+
+    ema_distance = abs(float(r["high"]) - float(r["ema20"])) / float(r["atr"])
+    if ema_distance > EMA_TOUCH_ATR and r["high"] < imp["low"]:
+        return None
+
+    pullback_depth = (pull_high - float(imp["low"])) / float(imp["atr"])
+    if pullback_depth > PULLBACK_MAX_ATR:
+        return None
+
+    # Rejection / continuation candle.
+    if r["close"] >= r["open"]:
+        return None
+    if candle_body(r) < REJECTION_MIN_BODY_ATR * r["atr"]:
+        return None
+    if close_location(r) > (1.0 - REJECTION_CLOSE_LOCATION):
+        return None
+    if r["rsi"] > 48:
+        return None
+    if r["rvol"] < 1.0:
+        return None
+    if r["close"] >= p["low"]:
+        return None
+
+    stop_ref = pull_high + STOP_BUFFER_ATR * r["atr"]
+
+    if stop_ref <= r["close"]:
+        return None
+
+    if (stop_ref - r["close"]) / r["close"] > MAX_RISK_PCT_OF_ENTRY:
+        return None
+
+    return stop_ref, "BEAR_IMPULSE_PULLBACK_RECLAIM"
+
+
+# =========================
+# BACKTEST ENGINE
+# =========================
 def run_backtest(
-    processed_data,
-    use_correlation_gate=True,
-    corr_threshold=0.70,
-    corr_lookback=30,
-    breaker_trigger=4,
-    breaker_cooldown=10,
-    use_dominance_gate=True,
-    dom_threshold=0.020,
+    data: Dict[str, pd.DataFrame],
+    test_start: pd.Timestamp,
+    test_end: pd.Timestamp,
 ):
-    all_timestamps = get_all_timestamps(processed_data)
-    active_positions = {}
-    trades = []
+    cash = INITIAL_CAPITAL
+    positions: Dict[str, Position] = {}
+    pending: Dict[str, PendingEntry] = {}
+    trades: List[dict] = []
+    last_exit_time: Dict[str, pd.Timestamp] = {}
+    equity_curve: List[dict] = []
 
-    recent_consecutive_losses = 0
-    cooldown_candles_remaining = 0
+    timestamps = sorted(set(
+        ts
+        for df in data.values()
+        for ts in df.index
+        if test_start <= ts < test_end
+    ))
 
-    for ts_idx, ts in enumerate(all_timestamps):
-        if cooldown_candles_remaining > 0:
-            cooldown_candles_remaining -= 1
+    for ts in timestamps:
 
-        # FIX (lookahead bug): every NEW-ENTRY decision below must be
-        # based on the LAST FULLY CLOSED candle, never on `ts` itself —
-        # `ts` is the candle that has just OPENED (its Open is the only
-        # thing we can legitimately act on right now; its Close/High/Low/
-        # indicators are not known yet). `ts_sig` is that last-closed
-        # reference point. Position MANAGEMENT (below) legitimately still
-        # watches `ts`'s own High/Low in real time, since that's how a
-        # live stop actually gets hit intraperiod.
-        ts_sig = all_timestamps[ts_idx - 1] if ts_idx >= 1 else None
+        # --------------------------------
+        # 1. FILL SIGNALS FROM PREVIOUS BAR
+        # --------------------------------
+        for symbol in list(pending.keys()):
+            pe = pending[symbol]
 
-        symbols_to_close = []
-
-        for symbol, pos in list(active_positions.items()):
-            df = processed_data[symbol]
-            if ts not in df.index:
-                continue
-            c4h = df.loc[ts]
-
-            if pos["side"] == "LONG":
-                if c4h["High"] > pos["highest_price"]:
-                    pos["highest_price"] = c4h["High"]
-                    new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
-                    if new_trailing_sl > pos["stop_loss"]:
-                        pos["stop_loss"] = new_trailing_sl
-                hit_sl = c4h["Low"] <= pos["stop_loss"]
-            else:
-                if c4h["Low"] < pos["lowest_price"]:
-                    pos["lowest_price"] = c4h["Low"]
-                    new_trailing_sl = pos["lowest_price"] + TRAILING_ATR_MULTIPLIER * c4h["ATR"]
-                    if new_trailing_sl < pos["stop_loss"]:
-                        pos["stop_loss"] = new_trailing_sl
-                hit_sl = c4h["High"] >= pos["stop_loss"]
-
-            curr_i = df.index.get_loc(ts)
-            candles_held = curr_i - pos["entry_index"]
-            is_timeout = candles_held >= TIMEOUT_CANDLES
-
-            if not (hit_sl or is_timeout):
+            if pe.entry_time != ts:
                 continue
 
-            initial_risk = pos["initial_risk"]
-            if pos["side"] == "LONG":
-                exit_p = min(pos["stop_loss"], c4h["Open"]) if hit_sl else c4h["Close"]
-                r_real = ((exit_p - pos["entry_price"]) / initial_risk) - (FEE_RATE * 2)
-                price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
+            if symbol in positions:
+                del pending[symbol]
+                continue
+
+            if last_exit_time.get(symbol) == ts:
+                del pending[symbol]
+                continue
+
+            if len(positions) >= MAX_OPEN_POSITIONS:
+                # The signal is not shifted forward. It expires.
+                del pending[symbol]
+                continue
+
+            row = data[symbol].loc[ts]
+            raw_open = float(row["open"])
+
+            if pe.direction == "LONG":
+                entry = raw_open * (1.0 + SLIPPAGE)
+                stop = pe.stop_ref
+                risk = entry - stop
+                if risk <= 0:
+                    del pending[symbol]
+                    continue
+                target = entry + TP_R * risk
             else:
-                exit_p = max(pos["stop_loss"], c4h["Open"]) if hit_sl else c4h["Close"]
-                r_real = ((pos["entry_price"] - exit_p) / initial_risk) - (FEE_RATE * 2)
-                price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
+                entry = raw_open * (1.0 - SLIPPAGE)
+                stop = pe.stop_ref
+                risk = stop - entry
+                if risk <= 0:
+                    del pending[symbol]
+                    continue
+                target = entry - TP_R * risk
 
-            outcome = "WIN" if r_real > 0 else "LOSS"
+            if risk / entry > MAX_RISK_PCT_OF_ENTRY:
+                del pending[symbol]
+                continue
 
-            if outcome == "LOSS":
-                recent_consecutive_losses += 1
-                if recent_consecutive_losses >= breaker_trigger:
-                    cooldown_candles_remaining = breaker_cooldown
-                    recent_consecutive_losses = 0
+            positions[symbol] = Position(
+                symbol=symbol,
+                direction=pe.direction,
+                entry_time=ts,
+                entry_price=entry,
+                stop=stop,
+                target=target,
+                notional=TRADE_MARGIN * LEVERAGE,
+                risk_price=risk,
+                signal_time=pe.signal_time,
+                setup_type=pe.setup_type,
+                regime=pe.regime,
+            )
+
+            del pending[symbol]
+
+        # --------------------------------
+        # 2. MANAGE OPEN POSITIONS
+        # --------------------------------
+        for symbol in list(positions.keys()):
+            pos = positions[symbol]
+            row = data[symbol].loc[ts]
+
+            if pos.direction == "LONG":
+                stop_hit = row["low"] <= pos.stop
+                target_hit = row["high"] >= pos.target
             else:
-                recent_consecutive_losses = 0
+                stop_hit = row["high"] >= pos.stop
+                target_hit = row["low"] <= pos.target
 
-            position_notional = TRADE_MARGIN * LEVERAGE
-            dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
+            exit_reason = None
+
+            if stop_hit and target_hit:
+                exit_reason = "SL" if CONSERVATIVE_INTRABAR else "TP"
+            elif stop_hit:
+                exit_reason = "SL"
+            elif target_hit:
+                exit_reason = "TP"
+
+            if exit_reason is None:
+                continue
+
+            raw_exit = pos.stop if exit_reason == "SL" else pos.target
+
+            if pos.direction == "LONG":
+                exit_price = raw_exit * (1.0 - SLIPPAGE)
+                gross = (
+                    (exit_price - pos.entry_price)
+                    * pos.notional
+                    / pos.entry_price
+                )
+                r_mult = (
+                    (exit_price - pos.entry_price)
+                    / pos.risk_price
+                )
+            else:
+                exit_price = raw_exit * (1.0 + SLIPPAGE)
+                gross = (
+                    (pos.entry_price - exit_price)
+                    * pos.notional
+                    / pos.entry_price
+                )
+                r_mult = (
+                    (pos.entry_price - exit_price)
+                    / pos.risk_price
+                )
+
+            entry_fee = pos.notional * FEE_RATE
+            exit_notional = pos.notional * (exit_price / pos.entry_price)
+            exit_fee = exit_notional * FEE_RATE
+            fees = entry_fee + exit_fee
+            net = gross - fees
 
             trades.append({
-                "Timestamp": ts,
-                "Symbol": symbol,
-                "Side": pos["side"],
-                "Outcome": outcome,
-                "Return": r_real,
-                "Dollar_PnL": dollar_pnl,
-            })
-            symbols_to_close.append(symbol)
-
-        for sym in symbols_to_close:
-            del active_positions[sym]
-
-        if cooldown_candles_remaining > 0:
-            continue
-
-        if ts_sig is None:
-            continue  # no fully-closed reference candle yet — can't signal
-
-        market_bull = True
-        if "BTC" in processed_data and ts_sig in processed_data["BTC"].index:
-            btc_c = processed_data["BTC"].loc[ts_sig]
-            market_bull = btc_c["Close"] > btc_c["EMA200"]
-
-        bullish_count = 0
-        total_active_syms = 0
-        for symbol, df in processed_data.items():
-            if ts_sig not in df.index:
-                continue
-            total_active_syms += 1
-            if df.loc[ts_sig, "Close"] > df.loc[ts_sig, "EMA200"]:
-                bullish_count += 1
-
-        market_breadth_ratio = bullish_count / total_active_syms if total_active_syms > 0 else 0.5
-        allow_longs = market_breadth_ratio >= 0.35
-        allow_shorts = market_breadth_ratio <= 0.65
-
-        # BTC-Dominance proxy — computed from the last CLOSED candle
-        # (ts_sig), never from `ts` (still-forming candle).
-        dom_block_alts = False
-        if use_dominance_gate:
-            spread = compute_dominance_spread(processed_data, ts_sig)
-            if spread is not None:
-                if market_bull and spread > dom_threshold:
-                    dom_block_alts = True
-                elif (not market_bull) and spread < -dom_threshold:
-                    dom_block_alts = True
-
-        current_scores = {}
-        for symbol, df in processed_data.items():
-            if ts_sig not in df.index:
-                continue
-            val = df.loc[ts_sig, "Mom_Long"]
-            if not np.isnan(val):
-                current_scores[symbol] = float(val)
-
-        if not current_scores:
-            continue
-
-        rev_bool = bool(market_bull)
-        ranked_symbols = sorted(current_scores.keys(), key=lambda x: current_scores[x], reverse=rev_bool)
-        candidates = []
-
-        for symbol in ranked_symbols:
-            if symbol in active_positions:
-                continue
-
-            if dom_block_alts and symbol != "BTC":
-                continue
-
-            if use_correlation_gate and not is_correlation_allowed(
-                symbol, active_positions, processed_data, ts_sig,
-                threshold=corr_threshold, lookback=corr_lookback,
-            ):
-                continue
-
-            df = processed_data[symbol]
-            if ts not in df.index or ts_sig not in df.index:
-                continue
-
-            i_sig = df.index.get_loc(ts_sig)
-            if i_sig < EMA_WARMUP + 1:
-                continue
-
-            # Signal comes ENTIRELY from the last two CLOSED candles —
-            # never from `ts` (the candle we're about to enter on).
-            c4h = df.iloc[i_sig]
-            prev_c = df.iloc[i_sig - 1]
-
-            if market_bull:
-                if not allow_longs:
-                    continue
-                regime_ok = c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"]
-                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
-                side = "LONG"
-            else:
-                if not allow_shorts:
-                    continue
-                regime_ok = c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"]
-                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
-                side = "SHORT"
-
-            if not valid_signal:
-                continue
-
-            # Execution: enter at the OPEN of `ts` — the candle that has
-            # just started, right after the signal candle (ts_sig) closed.
-            # This is the only price a real order could actually get.
-            entry_row = df.loc[ts]
-            i = df.index.get_loc(ts)
-            entry_price = entry_row["Open"] * (1 + SLIPPAGE) if side == "LONG" else entry_row["Open"] * (1 - SLIPPAGE)
-            # Stop distance uses the signal candle's ATR (c4h) — the most
-            # recent value that was actually known when the decision was
-            # made, not `ts`'s own (still-forming) ATR.
-            initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"] if side == "LONG" else entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"]
-            initial_risk = abs(entry_price - initial_sl)
-            sl_dist_pct = initial_risk / entry_price
-
-            if not (0.01 <= sl_dist_pct <= 0.04):
-                continue
-
-            candidates.append({
                 "symbol": symbol,
-                "side": side,
-                "entry_price": float(entry_price),
-                "initial_sl": float(initial_sl),
-                "initial_risk": float(initial_risk),
-                "entry_index": int(i),
+                "direction": pos.direction,
+                "signal_time": pos.signal_time,
+                "entry_time": pos.entry_time,
+                "exit_time": ts,
+                "entry_price": pos.entry_price,
+                "stop": pos.stop,
+                "target": pos.target,
+                "exit_price": exit_price,
+                "risk_price": pos.risk_price,
+                "notional": pos.notional,
+                "gross_pnl": gross,
+                "fees": fees,
+                "net_pnl": net,
+                "r_multiple": r_mult,
+                "result": exit_reason,
+                "setup_type": pos.setup_type,
+                "regime": pos.regime,
+                "holding_hours": (
+                    ts - pos.entry_time
+                ).total_seconds() / 3600.0,
             })
 
-        if not candidates:
-            continue
+            cash += net
+            last_exit_time[symbol] = ts
+            del positions[symbol]
 
-        slots = MAX_POSITIONS - len(active_positions)
-        if slots <= 0:
-            continue
+        # --------------------------------
+        # 3. GENERATE SIGNALS
+        # --------------------------------
+        # Signals use the just-closed candle only.
+        # Entry happens at the NEXT candle open.
+        for symbol, df in data.items():
 
-        selected = candidates[:slots]
-        for candidate in selected:
-            active_positions[candidate["symbol"]] = {
-                "side": candidate["side"],
-                "entry_price": candidate["entry_price"],
-                "initial_stop": candidate["initial_sl"],
-                "entry_timestamp": ts,
-                "stop_loss": candidate["initial_sl"],
-                "highest_price": candidate["entry_price"],
-                "lowest_price": candidate["entry_price"],
-                "initial_risk": candidate["initial_risk"],
-                "entry_index": candidate["entry_index"],
-            }
+            if ts not in df.index:
+                continue
 
-    return pd.DataFrame(trades)
+            if symbol in positions or symbol in pending:
+                continue
+
+            # No same-candle re-entry after an exit.
+            if last_exit_time.get(symbol) == ts:
+                continue
+
+            idx = df.index.get_loc(ts)
+
+            if idx + 1 >= len(df.index):
+                continue
+
+            next_ts = df.index[idx + 1]
+
+            if next_ts >= test_end:
+                continue
+
+            sig = long_signal(df, idx)
+
+            if sig:
+                stop_ref, setup = sig
+                pending[symbol] = PendingEntry(
+                    symbol=symbol,
+                    direction="LONG",
+                    signal_time=ts,
+                    entry_time=next_ts,
+                    stop_ref=stop_ref,
+                    setup_type=setup,
+                    regime=str(df.iloc[idx]["regime"]),
+                )
+                continue
+
+            sig = short_signal(df, idx)
+
+            if sig:
+                stop_ref, setup = sig
+                pending[symbol] = PendingEntry(
+                    symbol=symbol,
+                    direction="SHORT",
+                    signal_time=ts,
+                    entry_time=next_ts,
+                    stop_ref=stop_ref,
+                    setup_type=setup,
+                    regime=str(df.iloc[idx]["regime"]),
+                )
+
+        equity_curve.append({
+            "Date": ts,
+            "equity_closed": cash,
+        })
+
+    return (
+        pd.DataFrame(trades),
+        pd.DataFrame(equity_curve),
+        cash,
+    )
 
 
-def stats(df):
-    n = len(df)
-    if n == 0:
-        return 0, 0.0, 0.0, 0, 0.0, 0.0, float("nan")
-    wr = df["Outcome"].eq("WIN").mean() * 100
-    pnl = float(df["Dollar_PnL"].sum())
-    cur = mx = 0
-    for x in df.sort_values("Timestamp")["Outcome"]:
-        if x == "LOSS":
-            cur += 1
-            mx = max(mx, cur)
+# =========================
+# REPORTING
+# =========================
+def consecutive_loss_streaks(trades: pd.DataFrame) -> List[int]:
+    if trades.empty:
+        return []
+
+    x = trades.sort_values("exit_time")
+    streaks = []
+    n = 0
+
+    for result in x["result"]:
+        if result == "SL":
+            n += 1
         else:
-            cur = 0
+            if n:
+                streaks.append(n)
+                n = 0
 
-    # Empirical Risk:Reward — this system uses an ATR trailing stop with
-    # NO fixed take-profit, so R:R is not a constant like 1:2 by design;
-    # it has to be measured from what actually happened. "Return" is
-    # already the R-multiple per trade: (price move) / (initial ATR-based
-    # risk), fees included.
-    win_r = df.loc[df["Outcome"] == "WIN", "Return"]
-    loss_r = df.loc[df["Outcome"] == "LOSS", "Return"]
-    avg_win_r = float(win_r.mean()) if len(win_r) else float("nan")
-    avg_loss_r = float(loss_r.mean()) if len(loss_r) else float("nan")  # negative
-    rr_ratio = (avg_win_r / abs(avg_loss_r)) if avg_loss_r not in (0, None) and not np.isnan(avg_loss_r) else float("nan")
+    if n:
+        streaks.append(n)
 
-    return n, wr, pnl, mx, avg_win_r, avg_loss_r, rr_ratio
+    return streaks
+
+
+def print_report(
+    trades: pd.DataFrame,
+    equity: pd.DataFrame,
+    final_cash: float,
+):
+    print("=" * 78)
+    print("HUNTER V15 — PRECISION REGIME PULLBACK")
+    print("=" * 78)
+
+    n = len(trades)
+
+    if n:
+        wins = int((trades["result"] == "TP").sum())
+        losses = int((trades["result"] == "SL").sum())
+        wr = 100.0 * wins / n
+        pnl = final_cash - INITIAL_CAPITAL
+
+        gross_win = trades.loc[
+            trades["net_pnl"] > 0,
+            "net_pnl",
+        ].sum()
+
+        gross_loss = -trades.loc[
+            trades["net_pnl"] < 0,
+            "net_pnl",
+        ].sum()
+
+        pf = (
+            gross_win / gross_loss
+            if gross_loss > 0
+            else float("inf")
+        )
+
+        avg_win_r = trades.loc[
+            trades["result"] == "TP",
+            "r_multiple",
+        ].mean()
+
+        avg_loss_r = trades.loc[
+            trades["result"] == "SL",
+            "r_multiple",
+        ].mean()
+
+        avg_hold = trades["holding_hours"].mean()
+
+    else:
+        wins = losses = 0
+        wr = 0.0
+        pnl = final_cash - INITIAL_CAPITAL
+        pf = 0.0
+        avg_win_r = avg_loss_r = avg_hold = 0.0
+
+    streaks = consecutive_loss_streaks(trades)
+    max_streak = max(streaks) if streaks else 0
+
+    if not equity.empty:
+        eq = equity["equity_closed"].astype(float)
+        peak = eq.cummax()
+        dd = eq - peak
+        max_dd = float(dd.min())
+
+        max_dd_pct = float(
+            (dd / peak.replace(0, np.nan)).min()
+            * 100.0
+        )
+    else:
+        max_dd = max_dd_pct = 0.0
+
+    print(f"Trades             = {n}")
+    print(f"Wins               = {wins}")
+    print(f"Losses             = {losses}")
+    print(f"Win Rate           = {wr:.2f}%")
+    print(f"Net PnL            = ${pnl:+.2f}")
+    print(f"Final Balance      = ${final_cash:.2f}")
+    print(f"Profit Factor      = {pf:.3f}")
+    print(f"Max Drawdown       = ${max_dd:.2f} ({max_dd_pct:.2f}%)")
+    print(f"Max Loss Streak    = {max_streak}")
+    print(f"Loss Streaks       = {streaks}")
+    print(f"Avg Win R          = {avg_win_r:+.3f}")
+    print(f"Avg Loss R         = {avg_loss_r:+.3f}")
+    print(f"Avg Holding Hours  = {avg_hold:.2f}")
+    print("Designed RR        = 1:2 FIXED")
+    print("Timeout            = DISABLED")
+    print("Lookahead          = NONE BY DESIGN")
+
+    if n:
+        print("\nPER SYMBOL")
+        rows = []
+
+        for sym, z in trades.groupby("symbol"):
+            rows.append({
+                "symbol": sym,
+                "trades": len(z),
+                "wins": int((z["result"] == "TP").sum()),
+                "losses": int((z["result"] == "SL").sum()),
+                "win_rate": 100.0 * (z["result"] == "TP").mean(),
+                "net_pnl": z["net_pnl"].sum(),
+            })
+
+        print(
+            pd.DataFrame(rows)
+            .sort_values("net_pnl")
+            .to_string(index=False)
+        )
+
+        print("\nDIRECTION")
+        d = trades.groupby("direction").agg(
+            trades=("result", "size"),
+            win_rate=(
+                "result",
+                lambda x: 100.0 * (x == "TP").mean(),
+            ),
+            net_pnl=("net_pnl", "sum"),
+        )
+        print(d.to_string())
+
+        print("\nRESULT BY MONTH")
+        m = trades.copy()
+        m["month"] = m["exit_time"].dt.strftime("%Y-%m")
+
+        print(
+            m.groupby("month").agg(
+                trades=("result", "size"),
+                win_rate=(
+                    "result",
+                    lambda x: 100.0 * (x == "TP").mean(),
+                ),
+                net_pnl=("net_pnl", "sum"),
+            ).to_string()
+        )
+
+    print("\nACCEPTANCE TARGETS")
+    print("Target Win Rate    >= 60%")
+    print("Target Max Streak  <= 4 (NOT guaranteed)")
+    print("Target RR          = 1:2")
+    print("=" * 78)
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    exchange = make_exchange()
+
+    # Test window = last 365 completed days.
+    end = pd.Timestamp.now(tz="UTC").floor("h")
+    start = end - pd.Timedelta(days=LOOKBACK_DAYS)
+
+    print("=" * 78)
+    print("HUNTER V15 — CAUSAL LBank DATASET")
+    print(f"Test window: {start} -> {end}")
+    print("=" * 78)
+
+    data: Dict[str, pd.DataFrame] = {}
+
+    for symbol in SYMBOLS:
+        try:
+            print(f"Downloading {symbol}...")
+
+            df = prepare_symbol(
+                exchange,
+                symbol,
+                start,
+                end,
+            )
+
+            if len(df) < 300:
+                print(
+                    f"  SKIP: insufficient 1H candles ({len(df)})"
+                )
+                continue
+
+            data[symbol] = df
+            print(f"  OK: {len(df)} x 1H candles")
+
+        except Exception as exc:
+            print(
+                f"  ERROR {symbol}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    if not data:
+        raise RuntimeError(
+            "No symbol data was downloaded from LBank."
+        )
+
+    trades, equity, final_cash = run_backtest(
+        data,
+        start,
+        end,
+    )
+
+    os.makedirs("backtest_results", exist_ok=True)
+
+    trades_path = (
+        "backtest_results/hunter_v15_trades.csv"
+    )
+    equity_path = (
+        "backtest_results/hunter_v15_equity.csv"
+    )
+
+    trades.to_csv(trades_path, index=False)
+    equity.to_csv(equity_path, index=False)
+
+    print_report(
+        trades,
+        equity,
+        final_cash,
+    )
+
+    print(f"\nSaved: {trades_path}")
+    print(f"Saved: {equity_path}")
 
 
 if __name__ == "__main__":
-    # ============================================================
-    # FINAL CONFIGURATION — locked in after this session's search:
-    #   corr_threshold  = 0.70   (nudged from Golden Base's 0.75)
-    #   corr_lookback   = 30     (unchanged)
-    #   breaker_trigger = 4      (unchanged — every attempt to tighten
-    #                             this to 3 made WR/PnL/MaxLS all worse,
-    #                             across three separate files/sessions)
-    #   breaker_cooldown= 10     (unchanged)
-    #   dom_threshold   = 0.020  (new BTC-Dominance-proxy gate)
-    #
-    # Confirmed on real LBank data, reproduced identically across two
-    # independent runs: 320 trades | 70.94% WR | $32,932.00 PnL | MaxLS=4
-    # vs the original Golden Base's ~340 trades | ~70.6-70.9% WR |
-    # ~$33,500 PnL | MaxLS=6. Win Rate improved, PnL cost ~1.6%, and the
-    # worst consecutive-loss run dropped from 6 to 4.
-    #
-    # Values between 0.60-0.68 for corr_threshold were tested and were
-    # clearly worse on every metric — 0.70 is a genuine, reproduced
-    # optimum on this year of data, not an untested guess. Going further
-    # (0.69/0.71) to chase exactly MaxLS=3 was deliberately NOT done:
-    # the neighborhood around 0.70 was uneven enough (0.72 was worse)
-    # that finer tuning on this same one-year window risks fitting noise
-    # rather than a real edge (see the earlier warning about EMA
-    # curve-fitting in the original strategy design — the same principle
-    # applies here). If you want to push further, the right next step is
-    # testing this exact config on a DIFFERENT time window (walk-forward
-    # / out-of-sample), not re-tuning on this same year.
-    # ============================================================
-    trades_df = run_backtest(
-        processed_data,
-        use_correlation_gate=True,
-        corr_threshold=0.70,
-        corr_lookback=30,
-        breaker_trigger=4,
-        breaker_cooldown=10,
-        use_dominance_gate=True,
-        dom_threshold=0.020,
-    )
-
-    n, wr, pnl, mx, avg_win_r, avg_loss_r, rr_ratio = stats(trades_df)
-
-    print("=" * 72)
-    print("HUNTER-V14.10 — FINAL (corr=0.70, dom=0.020, breaker=4/10)")
-    print("=" * 72)
-    print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
-    print(f"Avg Win = {avg_win_r:+.2f}R | Avg Loss = {avg_loss_r:+.2f}R | "
-          f"Empirical R:R = 1:{rr_ratio:.2f}")
-    print("(this system uses an ATR trailing stop with NO fixed take-profit, so R:R is")
-    print(" measured from realized trades, not set by design like a fixed 1:2 target)")
+    main()
