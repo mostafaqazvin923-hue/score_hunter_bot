@@ -2,13 +2,9 @@ import pandas as pd
 import numpy as np
 
 def run_score_hunter_backtest(df):
-    """
-    بک‌تست استاندارد و Causal (بدون نگاه به آینده) برای score_hunter_bot
-    """
-    initial_capital = 100000.0
+    initial_capital = 1000.0
     capital = initial_capital
-    peak_capital = initial_capital
-    max_drawdown = 0.0
+    fixed_margin = 100.0  # مارجین ثابت برای هر معامله
     
     position = None 
     entry_price = 0.0
@@ -29,95 +25,101 @@ def run_score_hunter_backtest(df):
         prev_close = df['Close'].iloc[i-1]
         prev_high = df['High'].iloc[i-1]
         prev_low = df['Low'].iloc[i-1]
-        signal = df['Signal'].iloc[i-1] # استفاده از سیگنال کندل قبلی (بدون تقلب)
+        signal = df['Signal'].iloc[i-1]
         
         # ۱. مدیریت پوزیشن‌های باز
         if position == 'LONG':
             if current_low <= stop_loss:
-                pnl = (stop_loss - entry_price) * position_size
+                # محاسبه ضرر بر اساس مارجین ثابت و فاصله تا استاپ‌لاس
+                loss_pct = (entry_price - stop_loss) / entry_price
+                pnl = - (fixed_margin * loss_pct * 5) # فرض اهرم یا مقیاس مشخص
                 capital += pnl
-                trades.append({'type': 'LONG', 'result': 'LOSS', 'pnl': pnl})
+                trades.append({'result': 'LOSS', 'pnl': pnl})
                 position = None
             elif current_high >= take_profit:
-                pnl = (take_profit - entry_price) * position_size
+                win_pct = (take_profit - entry_price) / entry_price
+                pnl = fixed_margin * win_pct * 5
                 capital += pnl
-                trades.append({'type': 'LONG', 'result': 'WIN', 'pnl': pnl})
+                trades.append({'result': 'WIN', 'pnl': pnl})
                 position = None
                 
         elif position == 'SHORT':
             if current_high >= stop_loss:
-                pnl = (entry_price - stop_loss) * position_size
+                loss_pct = (stop_loss - entry_price) / entry_price
+                pnl = - (fixed_margin * loss_pct * 5)
                 capital += pnl
-                trades.append({'type': 'SHORT', 'result': 'LOSS', 'pnl': pnl})
+                trades.append({'result': 'LOSS', 'pnl': pnl})
                 position = None
             elif current_low <= take_profit:
-                pnl = (entry_price - take_profit) * position_size
+                win_pct = (entry_price - take_profit) / entry_price
+                pnl = fixed_margin * win_pct * 5
                 capital += pnl
-                trades.append({'type': 'SHORT', 'result': 'WIN', 'pnl': pnl})
+                trades.append({'result': 'WIN', 'pnl': pnl})
                 position = None
 
-        # ۲. ورود جدید
-        if position is None and signal != 0:
-            risk_amount = capital * 0.02 
-            
-            if signal == 1:  # خرید
-                if prev_close > prev_open:
-                    position = 'LONG'
-                    entry_price = current_open
-                    stop_loss = prev_low
-                    risk_per_unit = entry_price - stop_loss
-                    if risk_per_unit > 0:
-                        position_size = risk_amount / risk_per_unit
-                        take_profit = entry_price + (risk_per_unit * 2.0)
+        # ۲. ورود جدید با مارجین ثابت ۱۰۰ دلاری
+        if position is None and signal != 0 and capital >= fixed_margin:
+            if signal == 1 and prev_close > prev_open:  # خرید
+                position = 'LONG'
+                entry_price = current_open
+                stop_loss = prev_low
+                if entry_price > stop_loss:
+                    take_profit = entry_price + (entry_price - stop_loss) * 2.0 # ریسک به ریوارد 1 به 2
+                else:
+                    position = None
                     
-            elif signal == -1:  # فروش
-                if prev_close < prev_open:
-                    position = 'SHORT'
-                    entry_price = current_open
-                    stop_loss = prev_high
-                    risk_per_unit = stop_loss - entry_price
-                    if risk_per_unit > 0:
-                        position_size = risk_amount / risk_per_unit
-                        take_profit = entry_price - (risk_per_unit * 2.0)
+            elif signal == -1 and prev_close < prev_open:  # فروش
+                position = 'SHORT'
+                entry_price = current_open
+                stop_loss = prev_high
+                if stop_loss > entry_price:
+                    take_profit = entry_price - (stop_loss - entry_price) * 2.0 # ریسک به ریوارد 1 به 2
+                else:
+                    position = None
 
         equity_curve.append(capital)
-        if capital > peak_capital:
-            peak_capital = capital
-        
-        current_drawdown = (peak_capital - capital) / peak_capital * 100
-        if current_drawdown > max_drawdown:
-            max_drawdown = current_drawdown
+
+    # محاسبه ضررهای متوالی (Loss Streaks)
+    loss_streaks = []
+    current_streak = 0
+    for t in trades:
+        if t['result'] == 'LOSS':
+            current_streak += 1
+        else:
+            if current_streak > 0:
+                loss_streaks.append(current_streak)
+                current_streak = 0
+    if current_streak > 0:
+        loss_streaks.append(current_streak)
 
     total_trades = len(trades)
     winning_trades = [t for t in trades if t['result'] == 'WIN']
     win_rate = (len(winning_trades) / total_trades * 100) if total_trades > 0 else 0
     total_pnl = capital - initial_capital
-    return_pct = (total_pnl / initial_capital) * 100
 
     print("=" * 50)
-    print("گزارش نهایی بک‌تست (Score Hunter Bot - V8)")
+    print("گزارش نهایی بک‌تست (استراتژی جدید - مارجین ثابت ۱۰۰$ و R:R = 1:2)")
     print("=" * 50)
-    print(f"کل معاملات: {total_trades}")
-    print(f"وین ریت (Win Rate): {win_rate:.2f}%")
-    print(f"سود خالص کل: ${total_pnl:,.2f} ({return_pct:.2f}%)")
-    print(f"حداکثر افت سرمایه (Max Drawdown): {max_drawdown:.2f}%")
+    print(f"تعداد کل معامله ها: {total_trades}")
+    print(f"وین ریت کلی (Win Rate): {win_rate:.2f}%")
+    print(f"سود خالص کل: ${total_pnl:,.2f}")
+    print(f"لیست ضررهای متوالی (Loss Streaks): {loss_streaks}")
     print("=" * 50)
 
     return trades, equity_curve
 
 if __name__ == "__main__":
-    # تولید دیتای استاندارد برای اجرای موفق در گیت‌هاب اکشن
     np.random.seed(42)
-    dates = pd.date_range(start='2026-01-01', periods=500, freq='4h')
-    prices = 50000 + np.cumsum(np.random.randn(500) * 100)
+    dates = pd.date_range(start='2026-01-01', periods=300, freq='4h')
+    prices = 50000 + np.cumsum(np.random.randn(300) * 80)
     
     df_test = pd.DataFrame({
-        'Open': prices + np.random.randn(500) * 10,
-        'High': prices + abs(np.random.randn(500) * 20),
-        'Low': prices - abs(np.random.randn(500) * 20),
-        'Close': prices + np.random.randn(500) * 10
+        'Open': prices + np.random.randn(300) * 10,
+        'High': prices + abs(np.random.randn(300) * 15),
+        'Low': prices - abs(np.random.randn(300) * 15),
+        'Close': prices + np.random.randn(300) * 10
     }, index=dates)
     
-    df_test['Signal'] = np.random.choice([0, 1, -1], size=len(df_test), p=[0.7, 0.15, 0.15])
+    df_test['Signal'] = np.random.choice([0, 1, -1], size=len(df_test), p=[0.65, 0.175, 0.175])
     
     run_score_hunter_backtest(df_test)
