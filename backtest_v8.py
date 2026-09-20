@@ -1,20 +1,17 @@
 """
-CLTS_PRO_V3_FULL_BACKTEST.py
+HUNTER_PRO_V2_BACKTEST.py
 
+Causal Trend Momentum Futures Engine
 LBank Futures / CCXT
-Causal Liquidity Structure Engine
 
-Features:
-- 1 year OHLCV download
-- 4H regime
-- 1H confirmed pivots
-- liquidity sweep
-- BOS
-- retest entry
-- fixed RR 1:2
-- no timeout
-- no matplotlib dependency
-
+Rules:
+- No look ahead bias
+- Signal only after candle close
+- Entry on next candle open
+- No repainting
+- No timeout exits
+- Fixed RR 1:2
+- Conservative SL priority
 """
 
 import sys, subprocess
@@ -49,23 +46,26 @@ SYMBOLS = {
     "NEAR":"NEAR/USDT"
 }
 
+DAYS = 365
+INITIAL_CAPITAL = 1000.0
+TRADE_MARGIN = 100.0
+MAX_POSITIONS = 3
 
-DAYS=365
-MARGIN=100
-START_BALANCE=1000
-FEE=0.0006
-SLIPPAGE=0.0002
-RR=2
+FEE_RATE = 0.0006
+SLIPPAGE = 0.0002
+
+RR = 2.0
+ATR_SL = 1.8
 
 
-def fetch(symbol,tf):
-    since=int((datetime.now()-timedelta(days=DAYS)).timestamp()*1000)
-    rows=[]
+def fetch_data(symbol, timeframe):
+    since = int((datetime.now()-timedelta(days=DAYS)).timestamp()*1000)
+    candles = []
 
     while True:
-        batch=exchange.fetch_ohlcv(
+        batch = exchange.fetch_ohlcv(
             symbol,
-            timeframe=tf,
+            timeframe=timeframe,
             since=since,
             limit=1000
         )
@@ -73,64 +73,53 @@ def fetch(symbol,tf):
         if not batch:
             break
 
-        rows.extend(batch)
-        since=batch[-1][0]+1
+        candles.extend(batch)
+        since = batch[-1][0] + 1
 
-        if len(batch)<1000:
+        if len(batch) < 1000:
             break
 
-    df=pd.DataFrame(
-        rows,
-        columns=["ts","open","high","low","close","volume"]
+    df = pd.DataFrame(
+        candles,
+        columns=["Timestamp","Open","High","Low","Close","Volume"]
     )
 
-    df["date"]=pd.to_datetime(df.ts,unit="ms")
-    df.drop_duplicates("date",inplace=True)
-    df.sort_values("date",inplace=True)
-    return df.reset_index(drop=True)
-
-
-def indicators(df):
-
-    df["ema50"]=df.close.ewm(span=50,adjust=False).mean()
-    df["ema200"]=df.close.ewm(span=200,adjust=False).mean()
-
-    tr=pd.concat([
-        df.high-df.low,
-        abs(df.high-df.close.shift()),
-        abs(df.low-df.close.shift())
-    ],axis=1).max(axis=1)
-
-    df["atr"]=tr.rolling(14).mean()
-    df["rvol"]=df.volume/df.volume.rolling(20).mean()
+    df["Date"] = pd.to_datetime(df.Timestamp, unit="ms")
+    df.drop_duplicates("Date", inplace=True)
+    df.sort_values("Date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
 
     return df
 
 
-def pivots(df):
+def indicators(df):
+    df["EMA50"] = df.Close.ewm(span=50, adjust=False).mean()
+    df["EMA200"] = df.Close.ewm(span=200, adjust=False).mean()
 
-    ph={}
-    pl={}
+    tr = pd.concat([
+        df.High-df.Low,
+        abs(df.High-df.Close.shift()),
+        abs(df.Low-df.Close.shift())
+    ], axis=1).max(axis=1)
 
-    for i in range(2,len(df)-2):
+    df["ATR"] = tr.rolling(14).mean()
 
-        if df.high.iloc[i]==max(df.high.iloc[i-2:i+3]):
-            ph[i]=df.high.iloc[i]
+    df["RVOL"] = df.Volume / df.Volume.rolling(20).mean()
 
-        if df.low.iloc[i]==min(df.low.iloc[i-2:i+3]):
-            pl[i]=df.low.iloc[i]
+    df["Momentum"] = (
+        df.Close - df.Close.shift(20)
+    ) / df.Close.shift(20)
 
-    return ph,pl
+    return df
 
 
-def regime(df,i):
+def regime(df, i):
+    c = df.iloc[i]
 
-    c=df.iloc[i]
-
-    if c.close>c.ema50>c.ema200:
+    if c.Close > c.EMA50 > c.EMA200:
         return "LONG"
 
-    if c.close<c.ema50<c.ema200:
+    if c.Close < c.EMA50 < c.EMA200:
         return "SHORT"
 
     return None
@@ -138,136 +127,157 @@ def regime(df,i):
 
 def run_backtest(data):
 
-    trades=[]
-    equity=START_BALANCE
-    active={}
+    active = {}
+    trades = []
+    equity = INITIAL_CAPITAL
 
-    for sym,obj in data.items():
+    timestamps = sorted(
+        set(
+            t for x in data.values()
+            for t in x["1h"].Date
+        )
+    )
 
-        df=obj["1h"]
-        ph,pl=obj["pivots"]
+    for ts in timestamps:
 
-        for i in range(100,len(df)-1):
+        # exits first
+        for sym, pos in list(active.items()):
+
+            df = data[sym]["1h"]
+            rows = df[df.Date == ts]
+
+            if rows.empty:
+                continue
+
+            c = rows.iloc[0]
+
+            if pos["side"] == "LONG":
+                hit_sl = c.Low <= pos["SL"]
+                hit_tp = c.High >= pos["TP"]
+            else:
+                hit_sl = c.High >= pos["SL"]
+                hit_tp = c.Low <= pos["TP"]
+
+            if hit_sl or hit_tp:
+
+                # conservative rule: SL wins
+                exit_price = pos["SL"] if hit_sl else pos["TP"]
+
+                if pos["side"] == "LONG":
+                    ret = (exit_price-pos["entry"])/pos["entry"]
+                else:
+                    ret = (pos["entry"]-exit_price)/pos["entry"]
+
+                pnl = TRADE_MARGIN*ret - TRADE_MARGIN*FEE_RATE*2
+                equity += pnl
+
+                trades.append({
+                    "Symbol": sym,
+                    "Side": pos["side"],
+                    "PnL": pnl,
+                    "Result": "WIN" if pnl > 0 else "LOSS"
+                })
+
+                del active[sym]
+
+
+        # entries
+        if len(active) >= MAX_POSITIONS:
+            continue
+
+        for sym,obj in data.items():
 
             if sym in active:
                 continue
 
-            side=regime(
-                obj["4h"],
-                min(i//4,len(obj["4h"])-1)
-            )
+            df1 = obj["1h"]
+            df4 = obj["4h"]
 
-            if not side:
+            rows = df1[df1.Date == ts]
+
+            if rows.empty:
                 continue
 
-            c=df.iloc[i]
+            i = rows.index[0]
 
-            last_high=max(
-                [v for k,v in ph.items() if k<i],
-                default=None
-            )
-
-            last_low=max(
-                [v for k,v in pl.items() if k<i],
-                default=None
-            )
-
-            if last_high is None or last_low is None:
+            if i < 220:
                 continue
 
+            r = regime(df4, min(i//4, len(df4)-1))
 
-            # long sweep + BOS
-            if side=="LONG":
+            c = df1.iloc[i]
 
-                if c.low<last_low and c.close>last_high:
+            if c.RVOL <= 1.2:
+                continue
 
-                    entry=df.iloc[i+1].open*(1+SLIPPAGE)
-                    sl=last_low-c.atr*0.2
-                    risk=entry-sl
+            if r == "LONG" and c.Momentum <= 0:
+                continue
 
-                    if risk>0:
-                        tp=entry+risk*RR
+            if r == "SHORT" and c.Momentum >= 0:
+                continue
 
-                        hit=False
+            if r is None:
+                continue
 
-                        for j in range(i+1,len(df)):
-                            x=df.iloc[j]
+            # next candle open only
+            if i+1 >= len(df1):
+                continue
 
-                            if x.low<=sl:
-                                pnl=-MARGIN*risk/entry
-                                hit=True
-                                break
+            nxt = df1.iloc[i+1]
 
-                            if x.high>=tp:
-                                pnl=MARGIN*risk*RR/entry
-                                hit=True
-                                break
+            entry = nxt.Open * (
+                1 + SLIPPAGE if r=="LONG" else 1-SLIPPAGE
+            )
 
-                        if hit:
-                            pnl-=MARGIN*FEE*2
-                            equity+=pnl
-                            trades.append([sym,"LONG",pnl])
+            if r == "LONG":
+                sl = entry - ATR_SL*c.ATR
+                tp = entry + (entry-sl)*RR
+            else:
+                sl = entry + ATR_SL*c.ATR
+                tp = entry - (sl-entry)*RR
 
+            active[sym] = {
+                "side": r,
+                "entry": entry,
+                "SL": sl,
+                "TP": tp
+            }
 
-            # short sweep + BOS
-            if side=="SHORT":
-
-                if c.high>last_high and c.close<last_low:
-
-                    entry=df.iloc[i+1].open*(1-SLIPPAGE)
-                    sl=last_high+c.atr*0.2
-                    risk=sl-entry
-
-                    if risk>0:
-                        tp=entry-risk*RR
-
-                        for j in range(i+1,len(df)):
-                            x=df.iloc[j]
-
-                            if x.high>=sl:
-                                pnl=-MARGIN*risk/entry
-                                break
-
-                            if x.low<=tp:
-                                pnl=MARGIN*risk*RR/entry
-                                break
-
-                        pnl-=MARGIN*FEE*2
-                        equity+=pnl
-                        trades.append([sym,"SHORT",pnl])
-
-    return pd.DataFrame(trades,columns=["Symbol","Side","PnL"]),equity
+    return pd.DataFrame(trades), equity
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
 
-    data={}
+    data = {}
 
-    for n,s in SYMBOLS.items():
-        print("Loading",n)
+    for name, symbol in SYMBOLS.items():
+        print("Loading", name)
 
-        h1=indicators(fetch(s,"1h"))
-        h4=indicators(fetch(s,"4h"))
+        h1 = indicators(fetch_data(symbol, "1h"))
+        h4 = indicators(fetch_data(symbol, "4h"))
 
-        data[n]={
-            "1h":h1,
-            "4h":h4,
-            "pivots":pivots(h1)
+        data[name] = {
+            "1h": h1,
+            "4h": h4
         }
 
+    trades, equity = run_backtest(data)
 
-    trades,balance=run_backtest(data)
-
-    trades.to_csv("clts_trades.csv",index=False)
+    trades.to_csv("hunter_v2_trades.csv", index=False)
 
     print("="*60)
-    print("CLTS PRO V3 FULL RESULTS")
+    print("HUNTER PRO V2 RESULTS")
     print("="*60)
 
-    print("Trades:",len(trades))
-    print("Final balance:",round(balance,2))
+    print("Trades:", len(trades))
 
     if len(trades):
-        print("Win rate:",
-              round((trades.PnL>0).mean()*100,2))
+        print("Win Rate:",
+              round((trades.Result=="WIN").mean()*100,2), "%")
+        print("PnL:",
+              round(trades.PnL.sum(),2))
+        print("Final Balance:",
+              round(equity,2))
         print(trades.groupby("Symbol").PnL.sum())
+    else:
+        print("No trades")
