@@ -14,12 +14,28 @@ def run_score_hunter_backtest(df):
     trades = []
     equity_curve = [initial_capital]
 
-    # محاسبه اندیکاتورهای روند و حجم
-    df['EMA_Trend'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA_Fast'] = df['Close'].ewm(span=9, adjust=False).mean()
+    # متغیرهای کنترل ضرر متوالی (Circuit Breaker)
+    consecutive_losses = 0
+    cooldown_counter = 0  # وقفه برای جلوگیری از ضرر بیشتر از ۳ تا
+
+    # اندیکاتورهای فیلتر روند و مومنتوم
+    df['EMA_Trend'] = df['Close'].ewm(span=30, adjust=False).mean()
+    df['EMA_Fast'] = df['Close'].ewm(span=7, adjust=False).mean()
     df['Volume_SMA'] = df['Volume'].rolling(window=20).mean()
+    
+    # محاسبه RSI
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
 
     for i in range(50, len(df)):
+        # اگر در حالت وقفه هستیم، معامله‌ای انجام نشود
+        if cooldown_counter > 0:
+            cooldown_counter -= 1
+            continue
+
         current_open = df['Open'].iloc[i]
         current_high = df['High'].iloc[i]
         current_low = df['Low'].iloc[i]
@@ -30,6 +46,7 @@ def run_score_hunter_backtest(df):
         prev_low = df['Low'].iloc[i-1]
         prev_trend = df['EMA_Trend'].iloc[i-1]
         prev_fast = df['EMA_Fast'].iloc[i-1]
+        prev_rsi = df['RSI'].iloc[i-1]
         prev_vol = df['Volume'].iloc[i-1]
         prev_vol_sma = df['Volume_SMA'].iloc[i-1]
         
@@ -37,38 +54,45 @@ def run_score_hunter_backtest(df):
         if position == 'LONG':
             if current_low <= stop_loss:
                 loss_pct = (entry_price - stop_loss) / entry_price
-                pnl = - (fixed_margin * loss_pct * 3)
+                pnl = - (fixed_margin * loss_pct * 2.5)
                 capital += pnl
                 trades.append({'result': 'LOSS', 'pnl': pnl})
+                consecutive_losses += 1
+                if consecutive_losses >= 3:
+                    cooldown_counter = 18  # وقفه برای جلوگیری از عبور ضرر متوالی از ۳
                 position = None
             elif current_high >= take_profit:
                 win_pct = (take_profit - entry_price) / entry_price
-                pnl = fixed_margin * win_pct * 3
+                pnl = fixed_margin * win_pct * 2.5
                 capital += pnl
                 trades.append({'result': 'WIN', 'pnl': pnl})
+                consecutive_losses = 0  # ریست شدن شمارنده با برد
                 position = None
                 
         elif position == 'SHORT':
             if current_high >= stop_loss:
                 loss_pct = (stop_loss - entry_price) / entry_price
-                pnl = - (fixed_margin * loss_pct * 3)
+                pnl = - (fixed_margin * loss_pct * 2.5)
                 capital += pnl
                 trades.append({'result': 'LOSS', 'pnl': pnl})
+                consecutive_losses += 1
+                if consecutive_losses >= 3:
+                    cooldown_counter = 18
                 position = None
             elif current_low <= take_profit:
                 win_pct = (entry_price - take_profit) / entry_price
-                pnl = fixed_margin * win_pct * 3
+                pnl = fixed_margin * win_pct * 2.5
                 capital += pnl
                 trades.append({'result': 'WIN', 'pnl': pnl})
+                consecutive_losses = 0
                 position = None
 
-        # ۲. ورود جدید با فیلتر حجم بالا و تاییدیه مومنتوم جهت‌دار
-        if position is None and capital >= fixed_margin:
-            # تاییدیه حجم: حجم کندل قبل بالاتر از میانگین باشد (ورود پول واقعی)
+        # ۲. ورود جدید با فیلتر دقیق و R:R = 1:2
+        if position is None and capital >= fixed_margin and cooldown_counter == 0:
             is_high_volume = prev_vol > prev_vol_sma
             
-            # سیگنال خرید (Long)
-            if prev_close > prev_trend and prev_fast > prev_trend and prev_close > prev_open and is_high_volume:
+            # سیگنال خرید
+            if prev_close > prev_trend and prev_fast > prev_trend and 50 < prev_rsi < 70 and is_high_volume and prev_close > prev_open:
                 position = 'LONG'
                 entry_price = current_open
                 stop_loss = prev_low
@@ -77,8 +101,8 @@ def run_score_hunter_backtest(df):
                 else:
                     position = None
                     
-            # سیگنال فروش (Short)
-            elif prev_close < prev_trend and prev_fast < prev_trend and prev_close < prev_open and is_high_volume:
+            # سیگنال فروش
+            elif prev_close < prev_trend and prev_fast < prev_trend and 30 < prev_rsi < 50 and is_high_volume and prev_close < prev_open:
                 position = 'SHORT'
                 entry_price = current_open
                 stop_loss = prev_high
@@ -108,7 +132,7 @@ def run_score_hunter_backtest(df):
     total_pnl = capital - initial_capital
 
     print("=" * 60)
-    print("گزارش نهایی بک‌تست (ستاپ مومنتوم + فیلتر حجم با R:R = 1:2)")
+    print("گزارش نهایی بک‌تست (سیستم ضد ضرر متوالی > 3 با R:R = 1:2)")
     print("=" * 60)
     print(f"تعداد کل معامله ها: {total_trades}")
     print(f"وین ریت کلی (Win Rate): {win_rate:.2f}%")
