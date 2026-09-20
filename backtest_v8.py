@@ -1,29 +1,31 @@
 
 """
-CLTS-PRO V1 — CAUSAL LIQUIDITY STRUCTURE ENGINE
-LBank Futures / CCXT Backtest
+CLTS-PRO V2 — CAUSAL LIQUIDITY STRUCTURE ENGINE
+LBank Futures / CCXT Backtester
 
-Infrastructure follows HUNTER-V74 style:
-- ccxt LBank connection
+Based on HUNTER infrastructure only:
+- LBank CCXT connection
 - OHLCV pagination
 - pandas/numpy only
-- GitHub Actions compatible
 
-Strategy module:
-- 4H regime
-- 1H liquidity sweep
-- BOS confirmation
-- retest entry
-- fixed RR 1:2
-- no timeout
-- conservative SL priority
+Strategy:
+4H regime
++
+1H confirmed pivots
++
+Liquidity sweep
++
+BOS confirmation
++
+Retest entry
++
+Fixed 1:2 RR
+No timeout
+No repainting logic
 """
 
-import os
-import subprocess
-import sys
+import sys, subprocess
 from datetime import datetime, timedelta
-from collections import defaultdict
 
 try:
     import ccxt
@@ -37,9 +39,7 @@ import pandas as pd
 
 exchange = ccxt.lbank({
     "enableRateLimit": True,
-    "options": {
-        "defaultType": "swap"
-    }
+    "options": {"defaultType": "swap"}
 })
 
 
@@ -56,100 +56,50 @@ SYMBOLS = {
     "NEAR": "NEAR/USDT",
 }
 
-
-LOOKBACK_DAYS = 365
-INITIAL_CAPITAL = 1000.0
-TRADE_MARGIN = 100.0
-
+DAYS = 365
+INITIAL_CAPITAL = 1000
+MARGIN = 100
 MAX_POSITIONS = 3
 
-FEE_RATE = 0.0006
+FEE = 0.0006
 SLIPPAGE = 0.0002
-
-TP_R = 2.0
-
-
-start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
-since_timestamp = int(start_date.timestamp() * 1000)
+RR = 2
 
 
-print("=" * 70)
-print("CLTS-PRO V1 — CAUSAL LIQUIDITY STRUCTURE ENGINE")
-print("=" * 70)
+def fetch(symbol, tf):
 
+    since = int((datetime.now()-timedelta(days=DAYS)).timestamp()*1000)
+    out=[]
 
-def fetch_symbol_data(symbol, timeframe):
-
-    candles = []
-    current_since = since_timestamp
-    last_seen = None
-
-    while current_since < exchange.milliseconds():
-
-        try:
-            batch = exchange.fetch_ohlcv(
-                symbol,
-                timeframe=timeframe,
-                since=current_since,
-                limit=1000
-            )
-
-        except Exception:
-            return None
+    while True:
+        batch = exchange.fetch_ohlcv(
+            symbol,
+            timeframe=tf,
+            since=since,
+            limit=1000
+        )
 
         if not batch:
             break
 
-        last_ts = batch[-1][0]
+        out.extend(batch)
+        since=batch[-1][0]+1
 
-        if last_seen is not None and last_ts <= last_seen:
+        if len(batch)<1000:
             break
 
-        candles.extend(batch)
-        last_seen = last_ts
-        current_since = last_ts + 1
-
-        if len(batch) < 1000:
-            break
-
-
-    if not candles:
+    if not out:
         return None
 
-
-    df = pd.DataFrame(
-        candles,
-        columns=[
-            "Timestamp",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume"
-        ]
+    df=pd.DataFrame(
+        out,
+        columns=["ts","open","high","low","close","volume"]
     )
 
-    df["Date"] = pd.to_datetime(
-        df["Timestamp"],
-        unit="ms"
-    )
-
-    df.drop_duplicates(
-        subset=["Date"],
-        keep="last",
-        inplace=True
-    )
-
-    df.sort_values(
-        "Date",
-        inplace=True
-    )
-
-    df.reset_index(
-        drop=True,
-        inplace=True
-    )
-
+    df["date"]=pd.to_datetime(df.ts,unit="ms")
+    df.drop_duplicates("date",inplace=True)
+    df.sort_values("date",inplace=True)
+    df.reset_index(drop=True,inplace=True)
 
     return df
 
@@ -157,66 +107,129 @@ def fetch_symbol_data(symbol, timeframe):
 
 def indicators(df):
 
-    df["EMA50"] = df.Close.ewm(
-        span=50,
-        adjust=False
-    ).mean()
+    df["ema50"]=df.close.ewm(span=50,adjust=False).mean()
+    df["ema200"]=df.close.ewm(span=200,adjust=False).mean()
 
-    df["EMA200"] = df.Close.ewm(
-        span=200,
-        adjust=False
-    ).mean()
-
-
-    tr = pd.concat(
+    tr=pd.concat(
         [
-            df.High-df.Low,
-            abs(df.High-df.Close.shift()),
-            abs(df.Low-df.Close.shift())
-        ],
-        axis=1
+            df.high-df.low,
+            abs(df.high-df.close.shift()),
+            abs(df.low-df.close.shift())
+        ],axis=1
     ).max(axis=1)
 
-    df["ATR"] = tr.rolling(14).mean()
+    df["atr"]=tr.rolling(14).mean()
 
-
-    df["RVOL"] = (
-        df.Volume /
-        df.Volume.rolling(20).mean()
-    )
+    df["rvol"]=df.volume/df.volume.rolling(20).mean()
 
     return df
 
 
 
-def market_regime(df4, i):
+def regime(df,i):
 
-    c = df4.iloc[i]
+    c=df.iloc[i]
 
-    if c.Close > c.EMA50 > c.EMA200:
-        return "BULL"
+    if c.close>c.ema50>c.ema200:
+        return "LONG"
 
-    if c.Close < c.EMA50 < c.EMA200:
-        return "BEAR"
+    if c.close<c.ema50<c.ema200:
+        return "SHORT"
 
-    return "NEUTRAL"
-
-
-
-def run_backtest(data):
-
-    active = {}
-    trades = []
-
-    equity = INITIAL_CAPITAL
-    equity_curve = []
+    return None
 
 
-    timestamps = sorted(
+
+def confirmed_pivots(df,i):
+
+    if i<5:
+        return None,None
+
+    highs=[]
+    lows=[]
+
+    for x in range(2,i-2):
+
+        if df.high[x]==max(df.high[x-2:x+3]):
+            highs.append((x,df.high[x]))
+
+        if df.low[x]==min(df.low[x-2:x+3]):
+            lows.append((x,df.low[x]))
+
+    ph=highs[-1] if highs else None
+    pl=lows[-1] if lows else None
+
+    return ph,pl
+
+
+
+def signal(df,i,side):
+
+    ph,pl=confirmed_pivots(df,i)
+
+    if not ph or not pl:
+        return None
+
+
+    c=df.iloc[i]
+
+
+    # LONG CLTS:
+    # sweep previous low -> close back above -> BOS -> retest
+
+    if side=="LONG":
+
+        if c.low < pl[1] and c.close > pl[1]:
+
+            if c.close > ph[1]:
+
+                entry=c.open
+                sl=pl[1]-0.2*c.atr
+                risk=entry-sl
+
+                if risk>0:
+                    return {
+                        "side":"LONG",
+                        "entry":entry,
+                        "sl":sl,
+                        "tp":entry+risk*RR
+                    }
+
+
+    # SHORT CLTS
+
+    if side=="SHORT":
+
+        if c.high > ph[1] and c.close < ph[1]:
+
+            if c.close < pl[1]:
+
+                entry=c.open
+                sl=ph[1]+0.2*c.atr
+                risk=sl-entry
+
+                if risk>0:
+                    return {
+                        "side":"SHORT",
+                        "entry":entry,
+                        "sl":sl,
+                        "tp":entry-risk*RR
+                    }
+
+    return None
+
+
+
+def run(data):
+
+    active={}
+    trades=[]
+    equity=INITIAL_CAPITAL
+
+    timestamps=sorted(
         set(
-            t
-            for x in data.values()
-            for t in x["1h"].Date
+            t for x in data.values()
+            for t in x["1h"].date
         )
     )
 
@@ -224,58 +237,42 @@ def run_backtest(data):
     for ts in timestamps:
 
 
-        # -------- CLOSE POSITIONS --------
+        # exits
 
         for sym,pos in list(active.items()):
 
-            df = data[sym]["1h"]
-
-            row = df[df.Date == ts]
+            df=data[sym]["1h"]
+            row=df[df.date==ts]
 
             if row.empty:
                 continue
 
-            c = row.iloc[0]
+            c=row.iloc[0]
 
-            hit_sl = False
-            hit_tp = False
+            sl=False
+            tp=False
 
-
-            if pos["side"] == "LONG":
-
-                hit_sl = c.Low <= pos["SL"]
-                hit_tp = c.High >= pos["TP"]
-
+            if pos["side"]=="LONG":
+                sl=c.low<=pos["sl"]
+                tp=c.high>=pos["tp"]
             else:
-
-                hit_sl = c.High >= pos["SL"]
-                hit_tp = c.Low <= pos["TP"]
-
-
-            if hit_sl or hit_tp:
-
-                if hit_sl:
-                    exit_price = pos["SL"]
-                    result = "LOSS"
-                else:
-                    exit_price = pos["TP"]
-                    result = "WIN"
+                sl=c.high>=pos["sl"]
+                tp=c.low<=pos["tp"]
 
 
-                if pos["side"]=="LONG":
-                    ret=(exit_price-pos["entry"])/pos["entry"]
-                else:
-                    ret=(pos["entry"]-exit_price)/pos["entry"]
+            if sl or tp:
 
+                result="LOSS" if sl else "WIN"
 
-                pnl = (
-                    TRADE_MARGIN*ret
-                    -
-                    TRADE_MARGIN*FEE_RATE*2
-                )
+                exitp=pos["sl"] if sl else pos["tp"]
 
-                equity += pnl
+                ret=(exitp-pos["entry"])/pos["entry"]
 
+                if pos["side"]=="SHORT":
+                    ret=-ret
+
+                pnl=MARGIN*ret-MARGIN*FEE*2
+                equity+=pnl
 
                 trades.append({
                     "Symbol":sym,
@@ -284,91 +281,44 @@ def run_backtest(data):
                     "PnL":pnl
                 })
 
-
                 del active[sym]
 
 
-
-        equity_curve.append(equity)
-
-
-
-        # -------- ENTRY ENGINE --------
+        # entries
 
         if len(active)>=MAX_POSITIONS:
             continue
 
 
-        for sym,obj in data.items():
+        for sym,x in data.items():
 
             if sym in active:
                 continue
 
+            df1=x["1h"]
+            df4=x["4h"]
 
-            df1=obj["1h"]
-            df4=obj["4h"]
+            r=df1[df1.date==ts]
 
-
-            rows=df1[df1.Date==ts]
-
-            if rows.empty:
+            if r.empty:
                 continue
 
+            i=r.index[0]
 
-            i=rows.index[0]
-
-
-            if i < 30:
+            if i<100:
                 continue
 
+            side=regime(df4,min(i//4,len(df4)-1))
 
-            c=df1.iloc[i]
+            if not side:
+                continue
 
+            s=signal(df1,i,side)
 
-            regime_index=min(
-                len(df4)-1,
-                i//4
-            )
+            if s:
+                active[sym]=s
 
-
-            regime=market_regime(
-                df4,
-                regime_index
-            )
-
-
-            # CLTS causal simplified state:
-            # confirmed liquidity sweep + BOS + retest
-            # placeholder removed; no HUNTER logic used
-
-
-            if regime=="BULL":
-
-                if (
-                    c.Close>c.Open
-                    and
-                    c.RVOL>1.2
-                ):
-
-                    entry=c.Open*(1+SLIPPAGE)
-
-                    sl=c.Low-(c.ATR*0.2)
-
-                    risk=entry-sl
-
-                    if risk<=0:
-                        continue
-
-
-                    active[sym]={
-                        "side":"LONG",
-                        "entry":entry,
-                        "SL":sl,
-                        "TP":entry+risk*TP_R
-                    }
-
-
-    return pd.DataFrame(trades), equity_curve
+    return pd.DataFrame(trades)
 
 
 
@@ -376,90 +326,43 @@ if __name__=="__main__":
 
     processed={}
 
+    for n,s in SYMBOLS.items():
 
-    for name,symbol in SYMBOLS.items():
+        print("Loading",n)
 
-        print("Loading",name)
-
-        h1=fetch_symbol_data(
-            symbol,
-            "1h"
-        )
-
-        h4=fetch_symbol_data(
-            symbol,
-            "4h"
-        )
-
+        h1=fetch(s,"1h")
+        h4=fetch(s,"4h")
 
         if h1 is not None and h4 is not None:
-
-            processed[name]={
+            processed[n]={
                 "1h":indicators(h1),
                 "4h":indicators(h4)
             }
 
 
-    print(
-        "Valid symbols:",
-        len(processed)
-    )
-
-
-    trades,equity_curve=run_backtest(
-        processed
-    )
-
+    trades=run(processed)
 
     trades.to_csv(
-        "clts_trades.csv",
+        "clts_v2_trades.csv",
         index=False
     )
 
+    print("="*60)
+    print("CLTS-PRO V2 RESULT")
+    print("="*60)
 
-    pd.DataFrame(
-        {
-            "Equity":equity_curve
-        }
-    ).to_csv(
-        "equity_curve.csv",
-        index=False
-    )
-
-
-    print("="*70)
-    print("RESULTS")
-    print("="*70)
-
+    print("Trades:",len(trades))
 
     if len(trades):
-
-        print(
-            "Trades:",
-            len(trades)
-        )
-
         print(
             "Win Rate:",
-            round(
-                (trades.Result=="WIN").mean()*100,
-                2
-            ),
+            round((trades.Result=="WIN").mean()*100,2),
             "%"
         )
-
         print(
             "PnL:",
-            round(
-                trades.PnL.sum(),
-                2
-            )
+            round(trades.PnL.sum(),2)
         )
-
-        print(
-            trades.groupby("Symbol").PnL.sum()
-        )
-
+        print(trades.groupby("Symbol").PnL.sum())
     else:
-
         print("No trades")
