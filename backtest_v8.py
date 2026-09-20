@@ -14,16 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — GOLDEN BASE (V14.10) — FINAL TUNED VERSION
-# ============================================================
-# Golden Core (signal/SL/trailing/timeout) is UNTOUCHED from your
-# original V14.10. Final locked-in root-cause tuning from this session:
-#   corr_threshold  = 0.70   (was 0.75)
-#   dom_threshold   = 0.020  (new BTC-Dominance-proxy gate, was off)
-#   breaker_trigger = 4      (unchanged — tightening it always backfired)
-# Confirmed twice on real LBank data: 320 trades | 70.94% WR |
-# $32,932.00 PnL | MaxLS=4 (down from the original ~340 trades |
-# ~70.6-70.9% WR | ~$33,500 PnL | MaxLS=6).
+# HUNTER-V74 — CAUSAL VERSION (NO LOOKAHEAD BIAS)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -80,7 +71,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — GOLDEN BASE (V14.10) — FINAL TUNED VERSION")
+print("HUNTER-V74 — CAUSAL VERSION (NO LOOKAHEAD BIAS)")
 print("=" * 68)
 
 processed_data = {}
@@ -173,19 +164,20 @@ def is_correlation_allowed(symbol, active_positions, processed_data, ts, thresho
     if ts not in df_cand.index:
         return False
     idx_cand = df_cand.index.get_loc(ts)
-    if idx_cand < lookback:
+    if idx_cand < lookback + 1:
         return True
 
-    cand_returns = df_cand['Close'].iloc[idx_cand - lookback:idx_cand + 1].pct_change().dropna()
+    # Causal correlation using completed candles up to i-1
+    cand_returns = df_cand['Close'].iloc[idx_cand - lookback - 1:idx_cand].pct_change().dropna()
 
     for active_sym in active_positions:
         df_act = processed_data[active_sym]
         if ts not in df_act.index:
             continue
         idx_act = df_act.index.get_loc(ts)
-        if idx_act < lookback:
+        if idx_act < lookback + 1:
             continue
-        act_returns = df_act['Close'].iloc[idx_act - lookback:idx_act + 1].pct_change().dropna()
+        act_returns = df_act['Close'].iloc[idx_act - lookback - 1:idx_act].pct_change().dropna()
 
         aligned = pd.concat([cand_returns, act_returns], axis=1).dropna()
         if len(aligned) < max(15, lookback // 2):
@@ -196,25 +188,26 @@ def is_correlation_allowed(symbol, active_positions, processed_data, ts, thresho
     return True
 
 
-def compute_dominance_spread(processed_data, ts):
-    """
-    Self-contained BTC-Dominance PROXY — no external API needed, built
-    only from data you already fetch. Positive value = BTC outperforming
-    the alt basket over the last 10 4H candles (~ dominance rising, risk
-    for long-alt momentum trades). Negative = alts outperforming BTC
-    (~ dominance falling, risk for short-alt momentum trades).
-    Uses the already-computed, fully causal Mom_Short column.
-    """
-    if "BTC" not in processed_data or ts not in processed_data["BTC"].index:
+def compute_dominance_spread_causal(processed_data, ts):
+    if "BTC" not in processed_data:
         return None
-    btc_mom = processed_data["BTC"].loc[ts, "Mom_Short"]
+    btc_df = processed_data["BTC"]
+    if ts not in btc_df.index:
+        return None
+    btc_i = btc_df.index.get_loc(ts)
+    if btc_i < 1:
+        return None
+    btc_mom = btc_df.iloc[btc_i - 1]["Mom_Short"]
     if np.isnan(btc_mom):
         return None
     alt_moms = []
     for sym, df in processed_data.items():
         if sym == "BTC" or ts not in df.index:
             continue
-        v = df.loc[ts, "Mom_Short"]
+        sym_i = df.index.get_loc(ts)
+        if sym_i < 1:
+            continue
+        v = df.iloc[sym_i - 1]["Mom_Short"]
         if not np.isnan(v):
             alt_moms.append(v)
     if not alt_moms:
@@ -245,6 +238,7 @@ def run_backtest(
 
         symbols_to_close = []
 
+        # 1. Management of active positions (using current candle i high/low)
         for symbol, pos in list(active_positions.items()):
             df = processed_data[symbol]
             if ts not in df.index:
@@ -312,45 +306,49 @@ def run_backtest(
         if cooldown_candles_remaining > 0:
             continue
 
+        # 2. Causal Market State (based on completed candle i-1)
         market_bull = True
-        if "BTC" in processed_data and ts in processed_data["BTC"].index:
-            btc_c = processed_data["BTC"].loc[ts]
-            market_bull = btc_c["Close"] > btc_c["EMA200"]
+        if "BTC" in processed_data:
+            btc_df = processed_data["BTC"]
+            if ts in btc_df.index:
+                btc_i = btc_df.index.get_loc(ts)
+                if btc_i >= 1:
+                    btc_prev = btc_df.iloc[btc_i - 1]
+                    market_bull = btc_prev["Close"] > btc_prev["EMA200"]
 
         bullish_count = 0
         total_active_syms = 0
         for symbol, df in processed_data.items():
             if ts not in df.index:
                 continue
+            sym_i = df.index.get_loc(ts)
+            if sym_i < 1:
+                continue
             total_active_syms += 1
-            if df.loc[ts, "Close"] > df.loc[ts, "EMA200"]:
+            if df.iloc[sym_i - 1]["Close"] > df.iloc[sym_i - 1]["EMA200"]:
                 bullish_count += 1
 
         market_breadth_ratio = bullish_count / total_active_syms if total_active_syms > 0 else 0.5
         allow_longs = market_breadth_ratio >= 0.35
         allow_shorts = market_breadth_ratio <= 0.65
 
-        # NEW: BTC-Dominance proxy, computed once per timestamp (all
-        # candidates this timestamp share the same intended side, since
-        # `side` is decided by the single `market_bull` flag above).
         dom_block_alts = False
         if use_dominance_gate:
-            spread = compute_dominance_spread(processed_data, ts)
+            spread = compute_dominance_spread_causal(processed_data, ts)
             if spread is not None:
                 if market_bull and spread > dom_threshold:
-                    # BTC strongly outperforming alts -> risky to open
-                    # NEW long-alt momentum trades right now.
                     dom_block_alts = True
                 elif (not market_bull) and spread < -dom_threshold:
-                    # Alts strongly outperforming BTC -> risky to open
-                    # NEW short-alt momentum trades right now.
                     dom_block_alts = True
 
         current_scores = {}
         for symbol, df in processed_data.items():
             if ts not in df.index:
                 continue
-            val = df.loc[ts, "Mom_Long"]
+            sym_i = df.index.get_loc(ts)
+            if sym_i < 1:
+                continue
+            val = df.iloc[sym_i - 1]["Mom_Long"]
             if not np.isnan(val):
                 current_scores[symbol] = float(val)
 
@@ -379,32 +377,35 @@ def run_backtest(
                 continue
 
             i = df.index.get_loc(ts)
-            if i < EMA_WARMUP + 1:
+            if i < EMA_WARMUP + 2:
                 continue
 
-            c4h = df.iloc[i]
-            prev_c = df.iloc[i - 1]
+            # --- STRICT CAUSAL SEPARATION ---
+            c4h = df.iloc[i]         # Current candle (for Open execution & current high/low limits)
+            prev_c = df.iloc[i - 1]  # Decision candle (COMPLETED - indicators & momentum checked here)
+            prev_prev_c = df.iloc[i - 2] # Previous to decision (for pullback check)
 
             if market_bull:
                 if not allow_longs:
                     continue
-                regime_ok = c4h["Close"] > c4h["EMA20"] and c4h["EMA20"] > c4h["EMA50"] and c4h["Close"] > c4h["EMA200"]
-                pullback_ok = prev_c["Low"] <= prev_c["EMA20"] * 1.015
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] > 0.015) and (c4h["Mom_Long"] > 0.04)
+                regime_ok = prev_c["Close"] > prev_c["EMA20"] and prev_c["EMA20"] > prev_c["EMA50"] and prev_c["Close"] > prev_c["EMA200"]
+                pullback_ok = prev_prev_c["Low"] <= prev_prev_c["EMA20"] * 1.015
+                valid_signal = regime_ok and pullback_ok and (prev_c["Mom_Short"] > 0.015) and (prev_c["Mom_Long"] > 0.04)
                 side = "LONG"
             else:
                 if not allow_shorts:
                     continue
-                regime_ok = c4h["Close"] < c4h["EMA20"] and c4h["EMA20"] < c4h["EMA50"] and c4h["Close"] < c4h["EMA200"]
-                pullback_ok = prev_c["High"] >= prev_c["EMA20"] * 0.985
-                valid_signal = regime_ok and pullback_ok and (c4h["Mom_Short"] < -0.015) and (c4h["Mom_Long"] < -0.04)
+                regime_ok = prev_c["Close"] < prev_c["EMA20"] and prev_c["EMA20"] < prev_c["EMA50"] and prev_c["Close"] < prev_c["EMA200"]
+                pullback_ok = prev_prev_c["High"] >= prev_prev_c["EMA20"] * 0.985
+                valid_signal = regime_ok and pullback_ok and (prev_c["Mom_Short"] < -0.015) and (prev_c["Mom_Long"] < -0.04)
                 side = "SHORT"
 
             if not valid_signal:
                 continue
 
+            # Execution happens strictly at current candle Open, using previous completed ATR for initial stop
             entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
-            initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"] if side == "LONG" else entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"]
+            initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * prev_c["ATR"] if side == "LONG" else entry_price + INITIAL_ATR_MULTIPLIER * prev_c["ATR"]
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
@@ -461,34 +462,6 @@ def stats(df):
 
 
 if __name__ == "__main__":
-    # ============================================================
-    # FINAL CONFIGURATION — locked in after this session's search:
-    #   corr_threshold  = 0.70   (nudged from Golden Base's 0.75)
-    #   corr_lookback   = 30     (unchanged)
-    #   breaker_trigger = 4      (unchanged — every attempt to tighten
-    #                             this to 3 made WR/PnL/MaxLS all worse,
-    #                             across three separate files/sessions)
-    #   breaker_cooldown= 10     (unchanged)
-    #   dom_threshold   = 0.020  (new BTC-Dominance-proxy gate)
-    #
-    # Confirmed on real LBank data, reproduced identically across two
-    # independent runs: 320 trades | 70.94% WR | $32,932.00 PnL | MaxLS=4
-    # vs the original Golden Base's ~340 trades | ~70.6-70.9% WR |
-    # ~$33,500 PnL | MaxLS=6. Win Rate improved, PnL cost ~1.6%, and the
-    # worst consecutive-loss run dropped from 6 to 4.
-    #
-    # Values between 0.60-0.68 for corr_threshold were tested and were
-    # clearly worse on every metric — 0.70 is a genuine, reproduced
-    # optimum on this year of data, not an untested guess. Going further
-    # (0.69/0.71) to chase exactly MaxLS=3 was deliberately NOT done:
-    # the neighborhood around 0.70 was uneven enough (0.72 was worse)
-    # that finer tuning on this same one-year window risks fitting noise
-    # rather than a real edge (see the earlier warning about EMA
-    # curve-fitting in the original strategy design — the same principle
-    # applies here). If you want to push further, the right next step is
-    # testing this exact config on a DIFFERENT time window (walk-forward
-    # / out-of-sample), not re-tuning on this same year.
-    # ============================================================
     trades_df = run_backtest(
         processed_data,
         use_correlation_gate=True,
@@ -503,6 +476,6 @@ if __name__ == "__main__":
     n, wr, pnl, mx = stats(trades_df)
 
     print("=" * 72)
-    print("HUNTER-V14.10 — FINAL (corr=0.70, dom=0.020, breaker=4/10)")
+    print("HUNTER-V14.10 — CAUSAL FINAL (NO LOOKAHEAD)")
     print("=" * 72)
     print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
