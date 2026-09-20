@@ -1,259 +1,305 @@
-import ccxt
-import pandas as pd
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta
 import numpy as np
+import pandas as pd
 
 try:
-    import matplotlib.pyplot as plt
-    HAS_PLOT = True
+    import ccxt
 except ImportError:
-    HAS_PLOT = False
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
+    import ccxt
 
-def fetch_lbank_data(symbol, timeframe='1h', limit=1500):
-    """
-    دریافت کاملاً ایمن و بدون خطای داده‌های تاریخی از صرافی LBank با دور زدن ساختار balance
-    """
-    # ایجاد نمونه صرافی با غیرفعال کردن کامل چک کردن لایسنس، بالانس و بقیه موارد احراز هویت
-    exchange = ccxt.lbank({
-        'enableRateLimit': True,
-        'options': {
-            'defaultType': 'spot', # استفاده از ساختار اسپات عمومی برای دیتای پرایس اکشن (بدون خطای balance فیوچرز)
-            'fetchMarkets': False
-        }
-    })
-    
-    # فرمت‌های مختلفی که ممکن است ال‌بنک برای نمادها بشناسد
-    clean_sym = symbol.replace('/USDT', '')
-    variants = [
-        symbol,
-        f"{clean_sym}_USDT",
-        f"{clean_sym}USDT",
-        symbol.replace('/', '_')
-    ]
-    
-    for v in variants:
-        try:
-            ohlcv = exchange.fetch_ohlcv(v, timeframe=timeframe, limit=limit)
-            if ohlcv and len(ohlcv) > 50:
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                df.set_index('timestamp', inplace=True)
-                df.rename(columns={
-                    'open': 'Open', 'high': 'High', 
-                    'low': 'Low', 'close': 'Close', 'volume': 'Volume'
-                }, inplace=True)
-                return df
-        except Exception:
-            continue
-            
-    # اگر روش بالا نشد، از طریق ساختار پیش‌فرض عمومی صرافی‌های دیگر یا عمومی‌سازی CCXT تست می‌کنیم
-    try:
-        exchange_generic = ccxt.binance({'enableRateLimit': True}) # به عنوان جایگزین اضطراری پابلیک دیتای مشابه در صورت قطع کامل لبانک
-        # ولی برای ماندن روی لبانک، از ساختار فچ مستقیم استفاده می‌کنیم:
-        raw_exchange = ccxt.lbank()
-        raw_exchange.aio = False
-        ohlcv = raw_exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if ohlcv and len(ohlcv) > 50:
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-            return df
-    except Exception as e:
-        print(f"خطای نهایی در دریافت داده برای {symbol}: {e}")
-        
-    return pd.DataFrame()
+# ============================================================
+# PERSONALIZED TRADING ENGINE — REBUILT STRATEGY
+# ============================================================
 
-def run_improved_strategy(df, symbol_name):
-    initial_capital = 1000.0
-    capital = initial_capital
-    fixed_margin = 100.0  
-    leverage = 2.0        
+exchange = ccxt.lbank({"enableRateLimit": True})
+
+SYMBOLS = {
+    "BTC": "BTC/USDT",
+    "ETH": "ETH/USDT",
+    "SOL": "SOL/USDT",
+    "XRP": "XRP/USDT",
+    "LINK": "LINK/USDT",
+    "UNI": "UNI/USDT",
+    "ICP": "ICP/USDT",
+    "INJ": "INJ/USDT",
+    "ATOM": "ATOM/USDT",
+    "RENDER": "RENDER/USDT",
+    "XLM": "XLM/USDT",
+    "AAVE": "AAVE/USDT",
+    "WIF": "WIF/USDT",
+    "ONDO": "ONDO/USDT",
+    "DOGE": "DOGE/USDT",
+    "BNB": "BNB/USDT",
+    "ADA": "ADA/USDT",
+}
+
+LOOKBACK_DAYS = 365
+TIMEFRAME = "4h"
+MAX_POSITIONS = 3  # کاهش تعداد پوزیشن‌های همزمان برای کنترل ریسک
+
+SLIPPAGE = 0.0003
+FEE_RATE = 0.0007
+
+ATR_PERIOD = 14
+TRAILING_ATR_MULTIPLIER = 2.0
+INITIAL_ATR_MULTIPLIER = 1.8
+TIMEOUT_CANDLES = 30
+EMA_WARMUP = 200
+
+INITIAL_CAPITAL = 1000.0
+TRADE_MARGIN = 100.0
+LEVERAGE = 20.0  # کاهش اهرم برای کاهش ریسک و جلوگیری از لیکوئید شدن در زنجیره ضرر
+
+start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
+since_timestamp = int(start_date.timestamp() * 1000)
+
+print("=" * 68)
+print("PERSONALIZED TRADING ENGINE — CLEAN DATA & NEW SETUP")
+print("=" * 68)
+
+processed_data = {}
+
+def fetch_symbol_data(lbank_symbol):
+    all_ohlcv = []
+    current_since = since_timestamp
+    last_seen = None
+
+    while current_since < exchange.milliseconds():
+        batch = None
+        for attempt in range(3):
+            try:
+                batch = exchange.fetch_ohlcv(
+                    lbank_symbol, timeframe=TIMEFRAME, since=current_since, limit=1000
+                )
+                break
+            except Exception:
+                if attempt == 2:
+                    return None
+        if not batch:
+            break
+
+        last_ts = batch[-1][0]
+        if last_seen is not None and last_ts <= last_seen:
+            return None
+
+        all_ohlcv.extend(batch)
+        last_seen = last_ts
+        current_since = last_ts + 1
+
+        if len(batch) < 1000:
+            break
+
+    if not all_ohlcv:
+        return None
+
+    df = pd.DataFrame(all_ohlcv, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+    df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms")
+    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+    df.dropna(inplace=True)
+    df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
+    df.sort_values("Date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    if len(df) >= 2:
+        now_ms = exchange.milliseconds()
+        last_ms = int(df.iloc[-1]["Date"].timestamp() * 1000)
+        if last_ms + 4 * 60 * 60 * 1000 > now_ms:
+            df = df.iloc[:-1].copy()
+
+    if len(df) < EMA_WARMUP + 50:
+        return None
+
+    deltas = df["Date"].diff().dropna()
+    if not deltas.empty and deltas.max() > pd.Timedelta(hours=4, minutes=10):
+        return None
+
+    # محاسبه اندیکاتورها
+    tr1 = df["High"] - df["Low"]
+    tr2 = np.abs(df["High"] - df["Close"].shift(1))
+    tr3 = np.abs(df["Low"] - df["Close"].shift(1))
+
+    df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
     
-    position = None 
-    entry_price = 0.0
-    stop_loss = 0.0
-    take_profit = 0.0
+    # محاسبه RSI ساده
+    delta = df["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    df.set_index("Date", inplace=True)
+    return df
+
+for symbol, lbank_symbol in SYMBOLS.items():
+    df4h = fetch_symbol_data(lbank_symbol)
+    if df4h is not None:
+        processed_data[symbol] = df4h
+
+print(f"Valid symbols loaded: {len(processed_data)}")
+
+def get_all_timestamps(data):
+    return sorted({ts for df in data.values() for ts in df.index})
+
+def run_new_backtest(processed_data):
+    all_timestamps = get_all_timestamps(processed_data)
+    active_positions = {}
+    all_trades = []
     
-    trades = []
+    # متغیرهای کنترل زنجیره ضرر (Loss Streak Protection)
     consecutive_losses = 0
     cooldown_counter = 0
 
-    df['EMA_Fast'] = df['Close'].ewm(span=20, adjust=False).mean()
-    df['EMA_Slow'] = df['Close'].ewm(span=50, adjust=False).mean()
-    
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    df['TR'] = np.maximum(high_low, np.maximum(high_close, low_close))
-    df['ATR'] = df['TR'].rolling(window=14).mean()
-
-    for i in range(50, len(df)):
+    for ts in all_timestamps:
+        # مدیریت کول‌داون (اگر ضرر پشت سر هم دادیم، مدتی معامله نکنیم)
         if cooldown_counter > 0:
             cooldown_counter -= 1
             continue
 
-        current_open = df['Open'].iloc[i]
-        current_high = df['High'].iloc[i]
-        current_low = df['Low'].iloc[i]
-        
-        prev_close = df['Close'].iloc[i-1]
-        prev_fast = df['EMA_Fast'].iloc[i-1]
-        prev_slow = df['EMA_Slow'].iloc[i-1]
-        prev_rsi = df['RSI'].iloc[i-1]
-        prev_atr = df['ATR'].iloc[i-1]
-        
-        if position == 'LONG':
-            if current_low <= stop_loss:
-                loss_pct = (entry_price - stop_loss) / entry_price
-                pnl = - (fixed_margin * loss_pct * leverage)
-                capital += pnl
-                trades.append({'symbol': symbol_name, 'result': 'LOSS', 'pnl': pnl})
-                consecutive_losses += 1
-                if consecutive_losses >= 2:
-                    cooldown_counter = 10
-                position = None
-            elif current_high >= take_profit:
-                win_pct = (take_profit - entry_price) / entry_price
-                pnl = fixed_margin * win_pct * leverage
-                capital += pnl
-                trades.append({'symbol': symbol_name, 'result': 'WIN', 'pnl': pnl})
-                consecutive_losses = 0
-                position = None
-                
-        elif position == 'SHORT':
-            if current_high >= stop_loss:
-                loss_pct = (stop_loss - entry_price) / entry_price
-                pnl = - (fixed_margin * loss_pct * leverage)
-                capital += pnl
-                trades.append({'symbol': symbol_name, 'result': 'LOSS', 'pnl': pnl})
-                consecutive_losses += 1
-                if consecutive_losses >= 2:
-                    cooldown_counter = 10
-                position = None
-            elif current_low <= take_profit:
-                win_pct = (entry_price - take_profit) / entry_price
-                pnl = fixed_margin * win_pct * leverage
-                capital += pnl
-                trades.append({'symbol': symbol_name, 'result': 'WIN', 'pnl': pnl})
-                consecutive_losses = 0
-                position = None
+        symbols_to_close = []
 
-        if position is None and capital >= fixed_margin and cooldown_counter == 0:
-            if prev_fast > prev_slow and 45 < prev_rsi < 70:
-                position = 'LONG'
-                entry_price = current_open
-                stop_loss = entry_price - (1.5 * prev_atr)
-                take_profit = entry_price + (2.5 * prev_atr)
-                
-            elif prev_fast < prev_slow and 30 < prev_rsi < 55:
-                position = 'SHORT'
-                entry_price = current_open
-                stop_loss = entry_price + (1.5 * prev_atr)
-                take_profit = entry_price - (2.5 * prev_atr)
+        for symbol, pos in list(active_positions.items()):
+            df = processed_data[symbol]
+            if ts not in df.index:
+                continue
+            c4h = df.loc[ts]
 
-    return trades
+            if pos["side"] == "LONG":
+                if c4h["High"] > pos["highest_price"]:
+                    pos["highest_price"] = c4h["High"]
+                    new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
+                    if new_trailing_sl > pos["stop_loss"]:
+                        pos["stop_loss"] = new_trailing_sl
+                hit_sl = c4h["Low"] <= pos["stop_loss"]
+            else:
+                if c4h["Low"] < pos["lowest_price"]:
+                    pos["lowest_price"] = c4h["Low"]
+                    new_trailing_sl = pos["lowest_price"] + TRAILING_ATR_MULTIPLIER * c4h["ATR"]
+                    if new_trailing_sl < pos["stop_loss"]:
+                        pos["stop_loss"] = new_trailing_sl
+                hit_sl = c4h["High"] >= pos["stop_loss"]
 
-def master_backtest():
-    symbols = [
-        'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 
-        'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 
-        'AVAX/USDT', 'LINK/USDT', 'DOT/USDT', 'NEAR/USDT'
-    ]
-    
-    all_trades = []
-    asset_summary = {}
-    initial_capital = 1000.0
-    
-    print("در حال دریافت داده‌های ۱۰۰٪ کامل هر ۱۰ ارز از LBank و اجرای بک‌تست نهایی...")
-    
-    for symbol in symbols:
-        df = fetch_lbank_data(symbol, timeframe='1h', limit=1500)
-        if df.empty or len(df) < 200:
-            print(f"هشدار: داده کافی برای {symbol} دریافت نشد.")
-            continue
+            curr_i = df.index.get_loc(ts)
+            candles_held = curr_i - pos["entry_index"]
+            is_timeout = candles_held >= TIMEOUT_CANDLES
+
+            if not (hit_sl or is_timeout):
+                continue
+
+            initial_risk = pos["initial_risk"]
+            if pos["side"] == "LONG":
+                exit_p = min(pos["stop_loss"], c4h["Open"]) if hit_sl else c4h["Close"]
+                r_real = ((exit_p - pos["entry_price"]) / initial_risk) - (FEE_RATE * 2)
+                price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
+            else:
+                exit_p = max(pos["stop_loss"], c4h["Open"]) if hit_sl else c4h["Close"]
+                r_real = ((pos["entry_price"] - exit_p) / initial_risk) - (FEE_RATE * 2)
+                price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
+
+            outcome = "WIN" if r_real > 0 else "LOSS"
             
-        trades = run_improved_strategy(df, symbol)
-        all_trades.extend(trades)
-        
-        sym_pnl = sum([t['pnl'] for t in trades])
-        asset_summary[symbol] = {
-            'trades_count': len(trades),
-            'pnl': sym_pnl
-        }
-        
-    total_trades = len(all_trades)
-    winning_trades = [t for t in all_trades if t['result'] == 'WIN']
-    losing_trades = [t for t in all_trades if t['result'] == 'LOSS']
-    
-    win_rate = (len(winning_trades) / total_trades * 100) if total_trades > 0 else 0
-    total_pnl = sum([t['pnl'] for t in all_trades])
-    final_balance = initial_capital + total_pnl
-    
-    loss_streaks = []
-    current_streak = 0
-    for t in all_trades:
-        if t['result'] == 'LOSS':
-            current_streak += 1
-        else:
-            if current_streak > 0:
-                loss_streaks.append(current_streak)
-                current_streak = 0
-    if current_streak > 0:
-        loss_streaks.append(current_streak)
-        
-    peak = initial_capital
-    max_dd = 0.0
-    running_cap = initial_capital
-    for t in all_trades:
-        running_cap += t['pnl']
-        if running_cap > peak:
-            peak = running_cap
-        dd = (peak - running_cap) / peak * 100
-        if dd > max_dd:
-            max_dd = dd
+            # مدیریت شمارنده ضررهای متوالی
+            if outcome == "LOSS":
+                consecutive_losses += 1
+                if consecutive_losses >= 2:  # اگر ۲ ضرر متوالی دادیم
+                    cooldown_counter = 6     # ۶ کندل (۲۴ ساعت) استراحت کن
+            else:
+                consecutive_losses = 0
 
-    total_wins_pnl = sum([t['pnl'] for t in winning_trades]) if winning_trades else 0
-    total_losses_pnl = abs(sum([t['pnl'] for t in losing_trades])) if losing_trades else 0
-    profit_factor = (total_wins_pnl / total_losses_pnl) if total_losses_pnl > 0 else float('inf')
-    
-    avg_win = (total_wins_pnl / len(winning_trades)) if winning_trades else 0
-    avg_loss = (total_losses_pnl / len(losing_trades)) if losing_trades else 0
+            position_notional = TRADE_MARGIN * LEVERAGE
+            dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
 
-    print("\n" + "=" * 65)
-    print("گزارش نهایی عملکرد سیستم معاملاتی (LBank - Final Clean Version)")
-    print("=" * 65)
-    print(f"1- تعداد کل معاملات: {total_trades}")
-    print(f"2- تعداد معاملات برنده: {len(winning_trades)}")
-    print(f"3- تعداد معاملات بازنده: {len(losing_trades)}")
-    print(f"4- درصد Win Rate کلی: {win_rate:.2f}%")
-    print(f"5- سود یا ضرر نهایی به دلار: ${total_pnl:,.2f}")
-    print(f"6- موجودی نهایی حساب (از سرمایه اولیه $1000): ${final_balance:,.2f}")
-    
-    print("\n7 & 8 - سود/ضرر و تعداد معاملات هر ارز به صورت جداگانه:")
-    if asset_summary:
-        for sym, data in asset_summary.items():
-            print(f"   - {sym}: تعداد معاملات = {data['trades_count']} | سود/ضرر = ${data['pnl']:,.2f}")
-    else:
-        print("   هیچ داده‌ای ثبت نشد.")
-        
-    print("\n9- لیست تمام سری‌های ضرر متوالی (Loss Streaks):")
-    if loss_streaks:
-        streak_counts = {s: loss_streaks.count(s) for s in set(loss_streaks)}
-        for s_len, count in sorted(streak_counts.items()):
-            print(f"   {s_len} ضرر متوالی: {count} بار")
-    else:
-        print("   هیچ ضرر متوالی ثبت نشد.")
-        
-    print(f"\n10- بیشترین Drawdown (حداکثر افت سرمایه): {max_dd:.2f}%")
-    print(f"11- Profit Factor (فاکتور سود): {profit_factor:.2f}")
-    print(f"12- Average Win / Average Loss: میانگین برد: ${avg_win:.2f} | میانگین باخت: ${avg_loss:.2f}")
-    print("=" * 65)
+            all_trades.append({
+                "Timestamp": ts,
+                "Symbol": symbol,
+                "Side": pos["side"],
+                "Outcome": outcome,
+                "Return": r_real,
+                "Dollar_PnL": dollar_pnl,
+            })
+            symbols_to_close.append(symbol)
+
+        for sym in symbols_to_close:
+            del active_positions[sym]
+
+        if consecutive_losses >= 2:
+            continue
+
+        # بررسی سیگنال روی کندل بسته شده قبلی (جلوگیری از Lookahead Bias)
+        for symbol, df in processed_data.items():
+            if symbol in active_positions:
+                continue
+            if ts not in df.index:
+                continue
+
+            i = df.index.get_loc(ts)
+            if i < EMA_WARMUP + 1:
+                continue
+
+            # استفاده از کندل قبلی (i-1) برای تصمیم‌گیری و کندل جاری (i) برای ورود
+            prev_c = df.iloc[i - 1]
+            c4h = df.iloc[i]
+
+            # استراتژی شخصی: روند صعودی امن + اصلاح RSI
+            trend_long = prev_c["Close"] > prev_c["EMA50"] and prev_c["EMA50"] > prev_c["EMA200"]
+            rsi_pullback_long = 40 <= prev_c["RSI"] <= 55
+
+            valid_long = trend_long and rsi_pullback_long
+
+            # استراتژی شخصی: روند نزولی امن + اصلاح RSI
+            trend_short = prev_c["Close"] < prev_c["EMA50"] and prev_c["EMA50"] < prev_c["EMA200"]
+            rsi_pullback_short = 45 <= prev_c["RSI"] <= 60
+
+            valid_short = trend_short and rsi_pullback_short
+
+            if not (valid_long or valid_short):
+                continue
+
+            side = "LONG" if valid_long else "SHORT"
+            entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
+            initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"] if side == "LONG" else entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"]
+            initial_risk = abs(entry_price - initial_sl)
+            sl_dist_pct = initial_risk / entry_price
+
+            if not (0.01 <= sl_dist_pct <= 0.05):
+                continue
+
+            if len(active_positions) >= MAX_POSITIONS:
+                break
+
+            active_positions[symbol] = {
+                "side": side,
+                "entry_price": float(entry_price),
+                "stop_loss": float(initial_sl),
+                "highest_price": float(entry_price),
+                "lowest_price": float(entry_price),
+                "initial_risk": float(initial_risk),
+                "entry_index": int(i),
+            }
+
+    return pd.DataFrame(all_trades)
 
 if __name__ == "__main__":
-    master_backtest()
+    trades_df = run_new_backtest(processed_data)
+    n = len(trades_df)
+    wr = (trades_df["Outcome"].eq("WIN").mean() * 100) if n else 0
+    pnl = float(trades_df["Dollar_PnL"].sum()) if n else 0
+    
+    mx = cur = 0
+    if n > 0:
+        for x in trades_df["Outcome"]:
+            if x == "LOSS":
+                cur += 1
+                mx = max(mx, cur)
+            else:
+                cur = 0
+
+    print("=" * 72)
+    print("NEW PERSONAL SETUP BACKTEST RESULTS")
+    print("=" * 72)
+    print(f"Total Trades: {n} | Win Rate: {wr:.2f}% | Net PnL: ${pnl:,.2f} | Max Loss Streak: {mx}")
