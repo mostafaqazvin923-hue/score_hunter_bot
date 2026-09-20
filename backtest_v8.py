@@ -11,17 +11,33 @@ except ImportError:
 
 def fetch_lbank_data(symbol, timeframe='1h', limit=1500):
     """
-    دریافت داده‌های تاریخی فیوچرز از صرافی LBank با استفاده از CCXT
-    و تنظیم دقیق نام ستون‌ها (Open, High, Low, Close, Volume) مطابقت‌یافته با پروژه شما
+    دریافت داده‌های تاریخی از صرافی LBank با استفاده از CCXT و مدیریت خودکار نمادها
     """
     exchange = ccxt.lbank({'enableRateLimit': True})
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        exchange.load_markets()
+        
+        # اصلاح فرمت نماد بر اساس ساختار صرافی در CCXT
+        target_symbol = symbol
+        if target_symbol not in exchange.symbols:
+            # تلاش برای پیدا کردن فرمت جایگزین
+            base = symbol.split('/')[0]
+            possible_syms = [s for s in exchange.symbols if s.startswith(base + '/USDT')]
+            if possible_syms:
+                target_symbol = possible_syms[0]
+            else:
+                print(f"هشدار: نماد {symbol} در صرافی یافت نشد.")
+                return pd.DataFrame()
+
+        ohlcv = exchange.fetch_ohlcv(target_symbol, timeframe=timeframe, limit=limit)
+        if not ohlcv:
+            return pd.DataFrame()
+            
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         
-        # استانداردسازی نام ستون‌ها با حروف بزرگ مطابق ساختار پروژه
+        # استانداردسازی نام ستون‌ها با حروف بزرگ مطابق ساختار پروژه شما
         df.rename(columns={
             'open': 'Open',
             'high': 'High',
@@ -32,7 +48,7 @@ def fetch_lbank_data(symbol, timeframe='1h', limit=1500):
         
         return df
     except Exception as e:
-        print(f"Error fetching data for {symbol}: {e}")
+        print(f"خطا در دریافت داده برای {symbol}: {e}")
         return pd.DataFrame()
 
 def run_advanced_strategy(df, symbol_name):
@@ -52,20 +68,19 @@ def run_advanced_strategy(df, symbol_name):
     consecutive_losses = 0
     cooldown_counter = 0  # وقفه برای کنترل ضررهای متوالی
 
-    # مفاهیم نهادی و ساختار بازار (Market Structure & Institutional Logic)
-    # فیلتر روند 4 ساعته ترکیب شده با 1 ساعته و نوسان (ATR / Swing Structure)
+    # محاسبات اندیکاتورها و ساختار بازار
     df['EMA_Trend'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_Fast'] = df['Close'].ewm(span=10, adjust=False).mean()
     df['Volume_SMA'] = df['Volume'].rolling(window=20).mean()
     
-    # محاسبه نوسان با ATR برای تعیین داینامیک حد ضرر و جلوگیری از تله‌های اسلیپیج
+    # محاسبه ATR
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     df['TR'] = np.maximum(high_low, np.maximum(high_close, low_close))
     df['ATR'] = df['TR'].rolling(window=14).mean()
     
-    # سویینگ‌های بازار برای شناسایی لیکوئیدیتی سویپ (Liquidity Sweep)
+    # سویینگ‌های بازار برای شناسایی لیکوئیدیتی سویپ
     df['Swing_High'] = df['High'].rolling(window=20).max()
     df['Swing_Low'] = df['Low'].rolling(window=20).min()
 
@@ -90,13 +105,12 @@ def run_advanced_strategy(df, symbol_name):
         prev_swing_high = df['Swing_High'].iloc[i-1]
         prev_swing_low = df['Swing_Low'].iloc[i-1]
         
-        # ۱. مدیریت پوزیشن‌های باز و اعمال قانون محافظه‌کارانه برخورد همزمان TP و SL
+        # ۱. مدیریت پوزیشن‌های باز
         if position == 'LONG':
             hit_tp = current_high >= take_profit
             hit_sl = current_low <= stop_loss
             
             if hit_sl and hit_tp:
-                # قانون محافظه‌کارانه: اولویت با فعال شدن ضرر (SL)
                 loss_pct = (entry_price - stop_loss) / entry_price
                 pnl = - (fixed_margin * loss_pct * leverage)
                 capital += pnl
@@ -152,11 +166,10 @@ def run_advanced_strategy(df, symbol_name):
                 consecutive_losses = 0
                 position = None
 
-        # ۲. ورود جدید بر اساس ساختار بازار (Liquidity Sweep + Trend Regime + R:R 1:2)
+        # ۲. ورود جدید
         if position is None and capital >= fixed_margin and cooldown_counter == 0:
             is_high_volume = prev_vol > prev_vol_sma
             
-            # سیگنال خرید (Long Setup): جارو شدن نقدینگی کف قبلی و بازگشت به روند صعودی با تایید حجم
             swept_low = current_low < prev_swing_low
             bullish_structure = prev_close > prev_trend and prev_fast > prev_trend
             
@@ -165,11 +178,10 @@ def run_advanced_strategy(df, symbol_name):
                 entry_price = current_open
                 stop_loss = prev_swing_low - (0.2 * prev_atr)
                 if entry_price > stop_loss:
-                    take_profit = entry_price + (entry_price - stop_loss) * 2.0  # R:R = 1:2
+                    take_profit = entry_price + (entry_price - stop_loss) * 2.0
                 else:
                     position = None
                     
-            # سیگنال فروش (Short Setup): جارو شدن نقدینگی سقف قبلی و بازگشت به روند نزولی با تایید حجم
             swept_high = current_high > prev_swing_high
             bearish_structure = prev_close < prev_trend and prev_fast < prev_trend
             
@@ -178,7 +190,7 @@ def run_advanced_strategy(df, symbol_name):
                 entry_price = current_open
                 stop_loss = prev_swing_high + (0.2 * prev_atr)
                 if stop_loss > entry_price:
-                    take_profit = entry_price - (stop_loss - entry_price) * 2.0  # R:R = 1:2
+                    take_profit = entry_price - (stop_loss - entry_price) * 2.0
                 else:
                     position = None
 
@@ -187,20 +199,17 @@ def run_advanced_strategy(df, symbol_name):
     return trades, equity_curve
 
 def master_backtest():
-    # ۱۰ ارز برتر بازار کریپتو در فیوچرز صرافی LBank
     symbols = [
-        'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 
-        'XRP/USDT:USDT', 'DOGE/USDT:USDT', 'ADA/USDT:USDT', 
-        'AVAX/USDT:USDT', 'LINK/USDT:USDT', 'DOT/USDT:USDT', 'NEAR/USDT:USDT'
+        'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 
+        'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 
+        'AVAX/USDT', 'LINK/USDT', 'DOT/USDT', 'NEAR/USDT'
     ]
     
     all_trades = []
     asset_summary = {}
-    master_equity = [1000.0]
     initial_capital = 1000.0
-    current_capital = initial_capital
     
-    print("در حال دریافت داده‌های واقعی از LBank Futures و اجرای بک‌تست استراتژی ساختار بازار...")
+    print("در حال دریافت داده‌های واقعی از صرافی و اجرای بک‌تست...")
     
     for symbol in symbols:
         df = fetch_lbank_data(symbol, timeframe='1h', limit=1500)
@@ -217,7 +226,6 @@ def master_backtest():
             'pnl': sym_pnl
         }
         
-    # محاسبات آماری جامع خروجی‌ها
     total_trades = len(all_trades)
     winning_trades = [t for t in all_trades if t['result'] == 'WIN']
     losing_trades = [t for t in all_trades if t['result'] == 'LOSS']
@@ -226,7 +234,6 @@ def master_backtest():
     total_pnl = sum([t['pnl'] for t in all_trades])
     final_balance = initial_capital + total_pnl
     
-    # لیست ضررهای متوالی (Loss Streaks)
     loss_streaks = []
     current_streak = 0
     for t in all_trades:
@@ -239,7 +246,6 @@ def master_backtest():
     if current_streak > 0:
         loss_streaks.append(current_streak)
         
-    # محاسبه Maximum Drawdown
     peak = initial_capital
     max_dd = 0.0
     running_cap = initial_capital
@@ -251,7 +257,6 @@ def master_backtest():
         if dd > max_dd:
             max_dd = dd
 
-    # Profit Factor و میانگین برد/باخت
     total_wins_pnl = sum([t['pnl'] for t in winning_trades]) if winning_trades else 0
     total_losses_pnl = abs(sum([t['pnl'] for t in losing_trades])) if losing_trades else 0
     profit_factor = (total_wins_pnl / total_losses_pnl) if total_losses_pnl > 0 else float('inf')
@@ -259,9 +264,8 @@ def master_backtest():
     avg_win = (total_wins_pnl / len(winning_trades)) if winning_trades else 0
     avg_loss = (total_losses_pnl / len(losing_trades)) if losing_trades else 0
 
-    # گزارش نهایی دقیق مطابق خواسته شما
     print("\n" + "=" * 65)
-    print("گزارش نهایی عملکرد سیستم معاملاتی فیوچرز (LBank Futures - Institutional Strategy)")
+    print("گزارش نهایی عملکرد سیستم معاملاتی (LBank - Institutional Strategy)")
     print("=" * 65)
     print(f"1- تعداد کل معاملات: {total_trades}")
     print(f"2- تعداد معاملات برنده: {len(winning_trades)}")
@@ -271,12 +275,14 @@ def master_backtest():
     print(f"6- موجودی نهایی حساب (از سرمایه اولیه $1000): ${final_balance:,.2f}")
     
     print("\n7 & 8 - سود/ضرر و تعداد معاملات هر ارز به صورت جداگانه:")
-    for sym, data in asset_summary.items():
-        print(f"   - {sym}: تعداد معاملات = {data['trades_count']} | سود/ضرر = ${data['pnl']:,.2f}")
+    if asset_summary:
+        for sym, data in asset_summary.items():
+            print(f"   - {sym}: تعداد معاملات = {data['trades_count']} | سود/ضرر = ${data['pnl']:,.2f}")
+    else:
+        print("   هیچ داده‌ای ثبت نشد.")
         
     print("\n9- لیست تمام سری‌های ضرر متوالی (Loss Streaks):")
     if loss_streaks:
-        # شمارش تعداد دفعات رخ دادن هر طول از ضرر متوالی
         streak_counts = {s: loss_streaks.count(s) for s in set(loss_streaks)}
         for s_len, count in sorted(streak_counts.items()):
             print(f"   {s_len} ضرر متوالی: {count} بار")
@@ -288,7 +294,6 @@ def master_backtest():
     print(f"12- Average Win / Average Loss: میانگین برد: ${avg_win:.2f} | میانگین باخت: ${avg_loss:.2f}")
     print("=" * 65)
 
-    # ترسیم نمودار Equity Curve در صورت وجود کتابخانه گرافیکی
     if HAS_PLOT and len(all_trades) > 0:
         try:
             plt.figure(figsize=(10, 5))
@@ -298,13 +303,13 @@ def master_backtest():
                 curr += t['pnl']
                 eq_series.append(curr)
             plt.plot(eq_series, label='Equity Curve', color='teal', linewidth=2)
-            plt.title('Score Hunter Bot - Equity Curve (LBank Futures)')
+            plt.title('Score Hunter Bot - Equity Curve')
             plt.xlabel('Trade Index')
             plt.ylabel('Capital ($)')
             plt.grid(True)
             plt.legend()
             plt.savefig('equity_curve.png')
-            print("\n نمودار منحنی سرمایه (Equity Curve) با موفقیت در فایل equity_curve.png ذخیره شد.")
+            print("\nنمودار منحنی سرمایه (Equity Curve) با موفقیت در فایل equity_curve.png ذخیره شد.")
         except Exception as ex:
             print(f"خطا در ذخیره نمودار: {ex}")
 
