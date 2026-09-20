@@ -14,19 +14,16 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — GOLDEN BASE RESTORED (V14.10) + CORRELATION TUNING
+# HUNTER-V74 — GOLDEN BASE (V14.10) — FINAL TUNED VERSION
 # ============================================================
-# Golden Core (signal/SL/trailing/timeout) is UNTOUCHED.
-# This session only tunes two ROOT-CAUSE knobs that were already
-# part of your own V14.10 file — not new blocking layers:
-#   1) corr_threshold: how correlated a candidate must be with an
-#      already-open position before its entry is skipped.
-#   2) corr_lookback: how many 4H candles the correlation is computed
-#      over (30 candles = 5 days is short/noisy; a longer window gives
-#      a more stable correlation estimate).
-#   3) the existing hard breaker's trigger (currently: 4 consecutive
-#      losses -> 10-candle cooldown) — tested both at 4 (baseline) and
-#      3, since you asked specifically about consecutive losses.
+# Golden Core (signal/SL/trailing/timeout) is UNTOUCHED from your
+# original V14.10. Final locked-in root-cause tuning from this session:
+#   corr_threshold  = 0.70   (was 0.75)
+#   dom_threshold   = 0.020  (new BTC-Dominance-proxy gate, was off)
+#   breaker_trigger = 4      (unchanged — tightening it always backfired)
+# Confirmed twice on real LBank data: 320 trades | 70.94% WR |
+# $32,932.00 PnL | MaxLS=4 (down from the original ~340 trades |
+# ~70.6-70.9% WR | ~$33,500 PnL | MaxLS=6).
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -83,7 +80,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — GOLDEN BASE RESTORED (V14.10) + CORRELATION TUNING")
+print("HUNTER-V74 — GOLDEN BASE (V14.10) — FINAL TUNED VERSION")
 print("=" * 68)
 
 processed_data = {}
@@ -228,12 +225,12 @@ def compute_dominance_spread(processed_data, ts):
 def run_backtest(
     processed_data,
     use_correlation_gate=True,
-    corr_threshold=0.75,
+    corr_threshold=0.70,
     corr_lookback=30,
     breaker_trigger=4,
     breaker_cooldown=10,
-    use_dominance_gate=False,
-    dom_threshold=0.03,
+    use_dominance_gate=True,
+    dom_threshold=0.020,
 ):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
@@ -464,43 +461,52 @@ def stats(df):
 
 
 if __name__ == "__main__":
-    # CONFIRMED WINNER so far: dom=0.020 + corr=0.70 (breaker stays at 4,
-    # since trigger=3 has now failed in every test across three files) ->
-    # MaxLS 6->4, WR actually improved (70.59->70.94), PnL only -1.6%.
-    # Breaker_trigger is fixed at 4 from here on — repeatedly proven not
-    # to help. This round scans corr_threshold finely between 0.60 (which
-    # failed badly alone, before Dominance gate existed) and 0.75, with
-    # dom=0.020 held constant, to find the real edge of the useful range
-    # and see whether 4 -> 3 is reachable.
-    corr_values = [0.60, 0.63, 0.65, 0.68, 0.70, 0.72, 0.75]
-    variants = [
-        (f"corr={c:.2f} + dom=0.020", dict(
-            corr_threshold=c, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
-            use_dominance_gate=True, dom_threshold=0.020,
-        ))
-        for c in corr_values
-    ]
+    # ============================================================
+    # FINAL CONFIGURATION — locked in after this session's search:
+    #   corr_threshold  = 0.70   (nudged from Golden Base's 0.75)
+    #   corr_lookback   = 30     (unchanged)
+    #   breaker_trigger = 4      (unchanged — every attempt to tighten
+    #                             this to 3 made WR/PnL/MaxLS all worse,
+    #                             across three separate files/sessions)
+    #   breaker_cooldown= 10     (unchanged)
+    #   dom_threshold   = 0.020  (new BTC-Dominance-proxy gate)
+    #
+    # Confirmed on real LBank data, reproduced identically across two
+    # independent runs: 320 trades | 70.94% WR | $32,932.00 PnL | MaxLS=4
+    # vs the original Golden Base's ~340 trades | ~70.6-70.9% WR |
+    # ~$33,500 PnL | MaxLS=6. Win Rate improved, PnL cost ~1.6%, and the
+    # worst consecutive-loss run dropped from 6 to 4.
+    #
+    # Values between 0.60-0.68 for corr_threshold were tested and were
+    # clearly worse on every metric — 0.70 is a genuine, reproduced
+    # optimum on this year of data, not an untested guess. Going further
+    # (0.69/0.71) to chase exactly MaxLS=3 was deliberately NOT done:
+    # the neighborhood around 0.70 was uneven enough (0.72 was worse)
+    # that finer tuning on this same one-year window risks fitting noise
+    # rather than a real edge (see the earlier warning about EMA
+    # curve-fitting in the original strategy design — the same principle
+    # applies here). If you want to push further, the right next step is
+    # testing this exact config on a DIFFERENT time window (walk-forward
+    # / out-of-sample), not re-tuning on this same year.
+    # ============================================================
+    trades_df = run_backtest(
+        processed_data,
+        use_correlation_gate=True,
+        corr_threshold=0.70,
+        corr_lookback=30,
+        breaker_trigger=4,
+        breaker_cooldown=10,
+        use_dominance_gate=True,
+        dom_threshold=0.020,
+    )
 
-    results = []
-    for name, kwargs in variants:
-        df = run_backtest(processed_data, use_correlation_gate=True, **kwargs)
-        results.append((name, stats(df)))
+    n, wr, pnl, mx = stats(trades_df)
 
-    print("=" * 90)
-    print("HUNTER-V14.10 — FINE CORRELATION SWEEP (dom=0.020 fixed, breaker=4 fixed)")
-    print("=" * 90)
-    print(f"{'Variant':32s}{'Trades':>8s}{'WR%':>8s}{'PnL$':>14s}{'MaxLS':>8s}")
-    print("-" * 90)
-    for name, (n, wr, pnl, mx) in results:
-        print(f"{name:32s}{n:8d}{wr:8.2f}{pnl:14,.2f}{mx:8d}")
-
-    print("\nREFERENCE POINTS")
-    print("Baseline (corr=0.75, no dom gate): ~340 trades | ~70.6-70.9% WR | ~$33,500 PnL | MaxLS=6")
-    print("Best so far (corr=0.70 + dom=0.020): 320 trades | 70.94% WR | $32,932 PnL | MaxLS=4")
-    print("\nGOAL")
-    print("Find the tightest corr_threshold where WR stays >= ~70.5% and PnL$ stays within ~2% of")
-    print("the corr=0.70 result ($32,932) — looking for whether MaxLS can drop to 3, or whether 0.70")
-    print("is already the edge before it breaks down the way 0.60 did without the dominance gate.")
-    print("breaker_trigger stays fixed at 4 — trigger=3 has now failed in every test across three")
-    print("separate files, so it is excluded from further search.")
-
+    print("=" * 72)
+    print("HUNTER-V14.10 — FINAL (corr=0.70, dom=0.020, breaker=4/10)")
+    print("=" * 72)
+    print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
+    print("\nReference (previous confirmed run on real data):")
+    print("Trades = 320 | Win Rate = 70.94% | Total PnL = $32,932.00 | MaxLS = 4")
+    print("\nGolden Base (before this session's tuning), for comparison:")
+    print("Trades ≈ 340 | Win Rate ≈ 70.6-70.9% | Total PnL ≈ $33,500 | MaxLS = 6")
