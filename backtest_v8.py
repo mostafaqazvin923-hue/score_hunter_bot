@@ -506,7 +506,3 @@ if __name__ == "__main__":
     print("HUNTER-V14.10 — FINAL (corr=0.70, dom=0.020, breaker=4/10)")
     print("=" * 72)
     print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | MaxLS = {mx}")
-    print("\nReference (previous confirmed run on real data):")
-    print("Trades = 320 | Win Rate = 70.94% | Total PnL = $32,932.00 | MaxLS = 4")
-    print("\nGolden Base (before this session's tuning), for comparison:")
-    print("Trades ≈ 340 | Win Rate ≈ 70.6-70.9% | Total PnL ≈ $33,500 | MaxLS = 6")
