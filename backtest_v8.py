@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V104 — 50X LEVERAGE PRECISION INSTITUTIONAL ENGINE
+# HUNTER-V105 — OPTIMIZED FEE-AWARE INSTITUTIONAL ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -39,26 +39,26 @@ SYMBOLS = {
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "1h"
-MAX_POSITIONS = 4  # کنترل تعداد پوزیشن‌های همزمان برای مدیریت ریسک اهرم ۵۰
+MAX_POSITIONS = 5
 
 SLIPPAGE = 0.0002
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-INITIAL_ATR_MULTIPLIER = 2.0
-TP_ATR_MULTIPLIER = 4.5  # ریسک به ریوارد قوی برای پوشش کارمزد لوریج بالا
-TIMEOUT_CANDLES = 22
+INITIAL_ATR_MULTIPLIER = 1.6
+TP_ATR_MULTIPLIER = 4.0  # ریسک به ریوارد عالی 1 به 2.5 برای پوشش کامل کارمزد
+TIMEOUT_CANDLES = 24
 EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 2000.0
 TRADE_MARGIN = 100.0
-LEVERAGE = 50.0  # اعمال لوریج ۵۰ بر اساس دستور شما
+LEVERAGE = 20.0  # اهرم بهینه ۲۰x برای جلوگیری از بلعیده شدن سود توسط کارمزد صرافی
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V104 — 50X LEVERAGE PRECISION ENGINE INITIALIZED")
+print("HUNTER-V105 — OPTIMIZED FEE-AWARE ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -109,10 +109,6 @@ def fetch_and_prepare_data(lbank_symbol):
 
     df.set_index("Date", inplace=True)
 
-    df_4h = df.resample('4h').agg({
-        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-    }).dropna()
-
     df_daily = df.resample('1D').agg({
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).dropna()
@@ -128,7 +124,6 @@ def fetch_and_prepare_data(lbank_symbol):
     df_daily["EMA200_Daily"] = df_daily["Close"].ewm(span=200, adjust=False).mean()
     df["Daily_EMA200"] = df_daily["EMA200_Daily"].reindex(df.index, method='ffill')
 
-    # پنجره سویینگ متعادل و دقیق (۱۴) برای فیلتر نویز
     df["Swing_High"] = df["High"].rolling(14).max().shift(1)
     df["Swing_Low"] = df["Low"].rolling(14).min().shift(1)
 
@@ -212,7 +207,7 @@ def run_backtest(processed_data):
                 consecutive_losses += 1
                 current_loss_streak += 1
                 if consecutive_losses >= 3:
-                    global_cooldown = 24  # محافظت از حساب در برابر ضررهای متوالی با لوریج ۵۰
+                    global_cooldown = 20
             else:
                 if current_loss_streak > 0:
                     loss_streaks_list.append(current_loss_streak)
@@ -259,9 +254,8 @@ def run_backtest(processed_data):
             trend_bullish = prev_c["Close"] > prev_c["Daily_EMA200"] and prev_c["EMA50"] > prev_c["EMA200"]
             trend_bearish = prev_c["Close"] < prev_c["Daily_EMA200"] and prev_c["EMA50"] < prev_c["EMA200"]
 
-            # ضریب جابجایی دقیق 1.35 برای فیلتر کردن نویزهای کشنده لوریج ۵۰
             candle_body = abs(prev_c["Close"] - prev_c["Open"])
-            is_displacement = candle_body >= (prev_c["ATR"] * 1.35)
+            is_displacement = candle_body >= (prev_c["ATR"] * 1.3)
 
             valid_long = trend_bullish and is_displacement and (prev_c["Close"] > prev_c["Open"]) and (prev_c["Low"] <= prev_c["Swing_Low"])
             valid_short = trend_bearish and is_displacement and (prev_c["Close"] < prev_c["Open"]) and (prev_c["High"] >= prev_c["Swing_High"])
@@ -283,7 +277,7 @@ def run_backtest(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.015 <= sl_dist_pct <= 0.05):
+            if not (0.012 <= sl_dist_pct <= 0.05):
                 continue
 
             if len(active_positions) >= MAX_POSITIONS:
@@ -311,7 +305,7 @@ if __name__ == "__main__":
     max_streak = max(loss_streaks) if loss_streaks else 0
 
     print("=" * 72)
-    print("HUNTER-V104 BACKTEST RESULTS (1-YEAR)")
+    print("HUNTER-V105 BACKTEST RESULTS (1-YEAR)")
     print("=" * 72)
     print(f"Total Trades: {n}")
     print(f"Overall Win Rate: {win_rate:.2f}%")
