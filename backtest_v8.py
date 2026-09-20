@@ -4,7 +4,7 @@ import numpy as np
 def run_score_hunter_backtest(df):
     initial_capital = 1000.0
     capital = initial_capital
-    fixed_margin = 100.0  # مارجین ثابت ۱۰۰ دلار برای هر معامله
+    fixed_margin = 100.0  # مارجین ثابت ۱۰۰ دلار
     
     position = None 
     entry_price = 0.0
@@ -14,34 +14,25 @@ def run_score_hunter_backtest(df):
     trades = []
     equity_curve = [initial_capital]
 
-    # محاسبه اندیکاتورها روی کل دیتابیس به صورت کائوسال (صرفاً از گذشته برای کندل i-1 استفاده می‌شود)
-    df['EMA_Fast'] = df['Close'].ewm(span=9, adjust=False).mean()
-    df['EMA_Slow'] = df['Close'].ewm(span=21, adjust=False).mean()
-    
-    # محاسبه ساده RSI
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    # فیلتر روند سریع برای افزایش تعداد معاملات و دقت
+    df['EMA_Fast'] = df['Close'].ewm(span=5, adjust=False).mean()
 
-    for i in range(21, len(df)):
+    for i in range(5, len(df)):
         current_open = df['Open'].iloc[i]
         current_high = df['High'].iloc[i]
         current_low = df['Low'].iloc[i]
         
-        prev_fast = df['EMA_Fast'].iloc[i-1]
-        prev_slow = df['EMA_Slow'].iloc[i-1]
-        prev_rsi = df['RSI'].iloc[i-1]
-        prev_low = df['Low'].iloc[i-1]
+        prev_close = df['Close'].iloc[i-1]
+        prev_open = df['Open'].iloc[i-1]
         prev_high = df['High'].iloc[i-1]
-        entry_close = df['Close'].iloc[i-1]
+        prev_low = df['Low'].iloc[i-1]
+        prev_ema = df['EMA_Fast'].iloc[i-1]
         
         # ۱. مدیریت پوزیشن‌های باز
         if position == 'LONG':
             if current_low <= stop_loss:
                 loss_pct = (entry_price - stop_loss) / entry_price
-                pnl = - (fixed_margin * loss_pct * 3) # اهرم ۳ برای استراتژی مومنتوم
+                pnl = - (fixed_margin * loss_pct * 3)
                 capital += pnl
                 trades.append({'result': 'LOSS', 'pnl': pnl})
                 position = None
@@ -66,10 +57,10 @@ def run_score_hunter_backtest(df):
                 trades.append({'result': 'WIN', 'pnl': pnl})
                 position = None
 
-        # ۲. ستاپ ورود جدید (کراس EMA به همراه تاییدیه RSI و ریسک به ریوارد 1 به 2)
+        # ۲. ورود پرمعامله (مومنتوم شکست سقف/کف کندل قبل به همراه تاییدیه EMA سریع)
         if position is None and capital >= fixed_margin:
-            # سیگنال خرید: کراس صعودی و RSI بالای 50 (روند صعودی قوی)
-            if prev_fast > prev_slow and prev_rsi > 50:
+            # سیگنال خرید: قیمت بالاتر از EMA سریع و کندل قبلی صعودی بوده
+            if prev_close > prev_ema and prev_close > prev_open:
                 position = 'LONG'
                 entry_price = current_open
                 stop_loss = prev_low
@@ -78,8 +69,8 @@ def run_score_hunter_backtest(df):
                 else:
                     position = None
                     
-            # سیگنال فروش: کراس نزولی و RSI زیر 50 (روند نزولی قوی)
-            elif prev_fast < prev_slow and prev_rsi < 50:
+            # سیگنال فروش: قیمت پایین‌تر از EMA سریع و کندل قبلی نزولی بوده
+            elif prev_close < prev_ema and prev_close < prev_open:
                 position = 'SHORT'
                 entry_price = current_open
                 stop_loss = prev_high
@@ -109,7 +100,7 @@ def run_score_hunter_backtest(df):
     total_pnl = capital - initial_capital
 
     print("=" * 50)
-    print("گزارش نهایی بک‌تست (ستتاپ EMA + RSI با R:R = 1:2)")
+    print("گزارش نهایی بک‌تست (استراتژی پرمعامله مومنتوم با R:R = 1:2)")
     print("=" * 50)
     print(f"تعداد کل معامله ها: {total_trades}")
     print(f"وین ریت کلی (Win Rate): {win_rate:.2f}%")
