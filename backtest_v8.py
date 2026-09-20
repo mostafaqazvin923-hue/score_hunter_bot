@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V102 — BREAK-EVEN PROTECTED INSTITUTIONAL ENGINE
+# HUNTER-V103 — HIGH-FREQUENCY SCALABLE INSTITUTIONAL ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -39,15 +39,15 @@ SYMBOLS = {
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "1h"
-MAX_POSITIONS = 4
+MAX_POSITIONS = 6  # افزایش همزمان پوزیشن‌ها برای بالا بردن فرکانس معاملاتی
 
 SLIPPAGE = 0.0002
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-INITIAL_ATR_MULTIPLIER = 1.8
-TP_ATR_MULTIPLIER = 4.0
-TIMEOUT_CANDLES = 24
+INITIAL_ATR_MULTIPLIER = 1.6
+TP_ATR_MULTIPLIER = 3.8  # ریسک به ریوارد مطلوب و منطقی
+TIMEOUT_CANDLES = 20
 EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 2000.0
@@ -58,7 +58,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V102 — BREAK-EVEN PROTECTED ENGINE INITIALIZED")
+print("HUNTER-V103 — HIGH-FREQUENCY SCALABLE ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -128,8 +128,9 @@ def fetch_and_prepare_data(lbank_symbol):
     df_daily["EMA200_Daily"] = df_daily["Close"].ewm(span=200, adjust=False).mean()
     df["Daily_EMA200"] = df_daily["EMA200_Daily"].reindex(df.index, method='ffill')
 
-    df["Swing_High"] = df["High"].rolling(16).max().shift(1)
-    df["Swing_Low"] = df["Low"].rolling(16).min().shift(1)
+    # پنجره سویینگ کوتاه‌تر برای شناسایی فرصت‌های بیشتر
+    df["Swing_High"] = df["High"].rolling(10).max().shift(1)
+    df["Swing_Low"] = df["Low"].rolling(10).min().shift(1)
 
     df.dropna(inplace=True)
     if len(df) < EMA_WARMUP:
@@ -165,26 +166,17 @@ def run_backtest(processed_data):
 
         symbols_to_close = []
 
+        # ۱. مدیریت پوزیشن‌ها (بدون بریگ‌اون مخرب، اجرای خالص R:R)
         for symbol, pos in list(active_positions.items()):
             df = processed_data[symbol]
             if ts not in df.index:
                 continue
             c1h = df.loc[ts]
 
-            # بررسی انتقال حد ضرر به نقطه سر‌به‌سر (Break-Even)
-            initial_atr = pos["initial_atr"]
             if pos["side"] == "LONG":
-                if not pos["breakeven_triggered"] and c1h["High"] >= (pos["entry_price"] + initial_atr):
-                    pos["stop_loss"] = pos["entry_price"] + (initial_atr * 0.1) # کمی بالاتر از قیمت ورود برای پوشش کارمزد
-                    pos["breakeven_triggered"] = True
-                
                 hit_sl = c1h["Low"] <= pos["stop_loss"]
                 hit_tp = c1h["High"] >= pos["take_profit"]
             else:
-                if not pos["breakeven_triggered"] and c1h["Low"] <= (pos["entry_price"] - initial_atr):
-                    pos["stop_loss"] = pos["entry_price"] - (initial_atr * 0.1)
-                    pos["breakeven_triggered"] = True
-
                 hit_sl = c1h["High"] >= pos["stop_loss"]
                 hit_tp = c1h["Low"] <= pos["take_profit"]
 
@@ -220,8 +212,8 @@ def run_backtest(processed_data):
             if outcome == "LOSS":
                 consecutive_losses += 1
                 current_loss_streak += 1
-                if consecutive_losses >= 3:
-                    global_cooldown = 30
+                if consecutive_losses >= 4:
+                    global_cooldown = 20  # استراحت کوتاه به سیستم در صورت ضررهای متوالی
             else:
                 if current_loss_streak > 0:
                     loss_streaks_list.append(current_loss_streak)
@@ -240,7 +232,7 @@ def run_backtest(processed_data):
                 "Dollar_PnL": dollar_pnl,
             })
             
-            cooldown_counters[symbol] = 4
+            cooldown_counters[symbol] = 2
             symbols_to_close.append(symbol)
 
         for sym in symbols_to_close:
@@ -249,6 +241,7 @@ def run_backtest(processed_data):
         if global_cooldown > 0:
             continue
 
+        # ۲. جستجوی سیگنال‌های جدید با فرکانس بالاتر
         for symbol, df in processed_data.items():
             if symbol in active_positions:
                 continue
@@ -268,9 +261,9 @@ def run_backtest(processed_data):
             trend_bullish = prev_c["Close"] > prev_c["Daily_EMA200"] and prev_c["EMA50"] > prev_c["EMA200"]
             trend_bearish = prev_c["Close"] < prev_c["Daily_EMA200"] and prev_c["EMA50"] < prev_c["EMA200"]
 
-            # بازگشت به ضریب کیفی 1.4 برای جلوگیری از ورود فیک‌ها
+            # ضریب جابجایی متعادل برای گرفتن حجم مناسبی از معاملات
             candle_body = abs(prev_c["Close"] - prev_c["Open"])
-            is_displacement = candle_body >= (prev_c["ATR"] * 1.4)
+            is_displacement = candle_body >= (prev_c["ATR"] * 1.25)
 
             valid_long = trend_bullish and is_displacement and (prev_c["Close"] > prev_c["Open"]) and (prev_c["Low"] <= prev_c["Swing_Low"])
             valid_short = trend_bearish and is_displacement and (prev_c["Close"] < prev_c["Open"]) and (prev_c["High"] >= prev_c["Swing_High"])
@@ -292,7 +285,7 @@ def run_backtest(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.015 <= sl_dist_pct <= 0.05):
+            if not (0.01 <= sl_dist_pct <= 0.05):
                 continue
 
             if len(active_positions) >= MAX_POSITIONS:
@@ -304,8 +297,6 @@ def run_backtest(processed_data):
                 "stop_loss": float(initial_sl),
                 "take_profit": float(take_profit),
                 "initial_risk": float(initial_risk),
-                "initial_atr": float(initial_atr),
-                "breakeven_triggered": False,
                 "entry_index": int(i),
             }
 
@@ -322,7 +313,7 @@ if __name__ == "__main__":
     max_streak = max(loss_streaks) if loss_streaks else 0
 
     print("=" * 72)
-    print("HUNTER-V102 BACKTEST RESULTS (1-YEAR)")
+    print("HUNTER-V103 BACKTEST RESULTS (1-YEAR)")
     print("=" * 72)
     print(f"Total Trades: {n}")
     print(f"Overall Win Rate: {win_rate:.2f}%")
