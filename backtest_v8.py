@@ -4,7 +4,7 @@ import numpy as np
 def run_score_hunter_backtest(df):
     initial_capital = 1000.0
     capital = initial_capital
-    fixed_margin = 100.0  # مارجین ثابت ۱۰۰ دلار
+    fixed_margin = 100.0  # مارجین ثابت ۱۰۰ دلار برای هر معامله
     
     position = None 
     entry_price = 0.0
@@ -14,10 +14,16 @@ def run_score_hunter_backtest(df):
     trades = []
     equity_curve = [initial_capital]
 
-    # فیلتر روند سریع برای افزایش تعداد معاملات و دقت
-    df['EMA_Fast'] = df['Close'].ewm(span=5, adjust=False).mean()
+    # ۱. محاسبه اندیکاتورهای ستاپ حرفه‌ای (EMA 50 برای روند و EMA 9 / VWAP شبیه‌سازی‌شده برای پولبک)
+    df['EMA_Trend'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['EMA_Fast'] = df['Close'].ewm(span=9, adjust=False).mean()
+    
+    # محاسبه ساده VWAP برای تایم‌فریم ساعتی
+    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+    df['VWAP'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
 
-    for i in range(5, len(df)):
+    # شروع لوپ از کندل ۵۰ به بعد برای دقت کامل اندیکاتورها (به صورت کاملا Causal روی i-1)
+    for i in range(50, len(df)):
         current_open = df['Open'].iloc[i]
         current_high = df['High'].iloc[i]
         current_low = df['Low'].iloc[i]
@@ -26,7 +32,9 @@ def run_score_hunter_backtest(df):
         prev_open = df['Open'].iloc[i-1]
         prev_high = df['High'].iloc[i-1]
         prev_low = df['Low'].iloc[i-1]
-        prev_ema = df['EMA_Fast'].iloc[i-1]
+        prev_trend = df['EMA_Trend'].iloc[i-1]
+        prev_vwap = df['VWAP'].iloc[i-1]
+        prev_fast = df['EMA_Fast'].iloc[i-1]
         
         # ۱. مدیریت پوزیشن‌های باز
         if position == 'LONG':
@@ -57,27 +65,29 @@ def run_score_hunter_backtest(df):
                 trades.append({'result': 'WIN', 'pnl': pnl})
                 position = None
 
-        # ۲. ورود پرمعامله (مومنتوم شکست سقف/کف کندل قبل به همراه تاییدیه EMA سریع)
+        # ۲. ورود به معامله با ستاپ پولبک به VWAP و روند (۳ تا ۴ معامله در روز در تایم‌فریم ساعتی)
         if position is None and capital >= fixed_margin:
-            # سیگنال خرید: قیمت بالاتر از EMA سریع و کندل قبلی صعودی بوده
-            if prev_close > prev_ema and prev_close > prev_open:
-                position = 'LONG'
-                entry_price = current_open
-                stop_loss = prev_low
-                if entry_price > stop_loss:
-                    take_profit = entry_price + (entry_price - stop_loss) * 2.0  # R:R = 1:2
-                else:
-                    position = None
+            # سیگنال خرید (Long): روند صعودی و پولبک قیمت به محدوده VWAP یا میانگین سریع
+            if prev_close > prev_trend and prev_close >= prev_vwap and prev_fast > prev_vwap:
+                if prev_close > prev_open: # تاییدیه کندل صعودی
+                    position = 'LONG'
+                    entry_price = current_open
+                    stop_loss = prev_low
+                    if entry_price > stop_loss:
+                        take_profit = entry_price + (entry_price - stop_loss) * 2.0  # R:R = 1:2
+                    else:
+                        position = None
                     
-            # سیگنال فروش: قیمت پایین‌تر از EMA سریع و کندل قبلی نزولی بوده
-            elif prev_close < prev_ema and prev_close < prev_open:
-                position = 'SHORT'
-                entry_price = current_open
-                stop_loss = prev_high
-                if stop_loss > entry_price:
-                    take_profit = entry_price - (stop_loss - entry_price) * 2.0  # R:R = 1:2
-                else:
-                    position = None
+            # سیگنال فروش (Short): روند نزولی و پولبک قیمت به محدوده VWAP
+            elif prev_close < prev_trend and prev_close <= prev_vwap and prev_fast < prev_vwap:
+                if prev_close < prev_open: # تاییدیه کندل نزولی
+                    position = 'SHORT'
+                    entry_price = current_open
+                    stop_loss = prev_high
+                    if stop_loss > entry_price:
+                        take_profit = entry_price - (stop_loss - entry_price) * 2.0  # R:R = 1:2
+                    else:
+                        position = None
 
         equity_curve.append(capital)
 
@@ -99,27 +109,32 @@ def run_score_hunter_backtest(df):
     win_rate = (len(winning_trades) / total_trades * 100) if total_trades > 0 else 0
     total_pnl = capital - initial_capital
 
-    print("=" * 50)
-    print("گزارش نهایی بک‌تست (استراتژی پرمعامله مومنتوم با R:R = 1:2)")
-    print("=" * 50)
+    print("=" * 60)
+    print("گزارش نهایی بک‌تست (ستاپ حرفه‌ای VWAP Pullback با R:R = 1:2)")
+    print("=" * 60)
     print(f"تعداد کل معامله ها: {total_trades}")
     print(f"وین ریت کلی (Win Rate): {win_rate:.2f}%")
-    print(f"سود خالص کل: ${total_pnl:,.2f}")
+    print(f"سود خالص دلاری: ${total_pnl:,.2f}")
+    print(f"سرمایه نهایی حساب: ${capital:,.2f}")
     print(f"لیست ضررهای متوالی (Loss Streaks): {loss_streaks}")
-    print("=" * 50)
+    print("=" * 60)
 
     return trades, equity_curve
 
 if __name__ == "__main__":
     np.random.seed(42)
-    dates = pd.date_range(start='2026-01-01', periods=500, freq='4h')
-    prices = 50000 + np.cumsum(np.random.randn(500) * 120)
+    # تست روی کندل‌های ۱ ساعته (برای تامین فرکانس بالای معاملات در روز)
+    periods_count = 1500  # معادل حدود ۲ ماه دیتای ۱ ساعته
+    dates = pd.date_range(start='2026-01-01', periods=periods_count, freq='1h')
+    prices = 50000 + np.cumsum(np.random.randn(periods_count) * 60)
+    volumes = np.random.randint(100, 1000, size=periods_count)
     
     df_test = pd.DataFrame({
-        'Open': prices + np.random.randn(500) * 15,
-        'High': prices + abs(np.random.randn(500) * 25),
-        'Low': prices - abs(np.random.randn(500) * 25),
-        'Close': prices + np.random.randn(500) * 15
+        'Open': prices + np.random.randn(periods_count) * 8,
+        'High': prices + abs(np.random.randn(periods_count) * 15),
+        'Low': prices - abs(np.random.randn(periods_count) * 15),
+        'Close': prices + np.random.randn(periods_count) * 8,
+        'Volume': volumes
     }, index=dates)
     
     run_score_hunter_backtest(df_test)
