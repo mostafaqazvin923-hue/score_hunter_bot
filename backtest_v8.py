@@ -464,31 +464,21 @@ def stats(df):
 
 
 if __name__ == "__main__":
-    # CONFIRMED WINNER from this session: dom_threshold=0.020 on top of
-    # the corr=0.75/lb=30/brk=4 base -> MaxLS 6->5, WR flat (+0.04pp),
-    # PnL only -2.2%. Going tighter than 0.02 only adds cost with no
-    # further MaxLS gain (data-confirmed, not a guess).
-    #
-    # This round: hold dom=0.020 fixed (the winning lever) and add GENTLE
-    # (not extreme) nudges to the other two levers, since we've only ever
-    # tested those in isolation or at extreme settings so far — a mild
-    # combined nudge is a genuinely untested combination.
+    # CONFIRMED WINNER so far: dom=0.020 + corr=0.70 (breaker stays at 4,
+    # since trigger=3 has now failed in every test across three files) ->
+    # MaxLS 6->4, WR actually improved (70.59->70.94), PnL only -1.6%.
+    # Breaker_trigger is fixed at 4 from here on — repeatedly proven not
+    # to help. This round scans corr_threshold finely between 0.60 (which
+    # failed badly alone, before Dominance gate existed) and 0.75, with
+    # dom=0.020 held constant, to find the real edge of the useful range
+    # and see whether 4 -> 3 is reachable.
+    corr_values = [0.60, 0.63, 0.65, 0.68, 0.70, 0.72, 0.75]
     variants = [
-        ("Baseline (corr gate only)",
-         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
-              use_dominance_gate=False)),
-        ("DomGate=0.020 (this session's best)",
-         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
-              use_dominance_gate=True, dom_threshold=0.020)),
-        ("+ gentle corr (0.70)",
-         dict(corr_threshold=0.70, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
-              use_dominance_gate=True, dom_threshold=0.020)),
-        ("+ gentle breaker (trigger=3)",
-         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=3, breaker_cooldown=10,
-              use_dominance_gate=True, dom_threshold=0.020)),
-        ("+ both gentle nudges",
-         dict(corr_threshold=0.70, corr_lookback=30, breaker_trigger=3, breaker_cooldown=10,
-              use_dominance_gate=True, dom_threshold=0.020)),
+        (f"corr={c:.2f} + dom=0.020", dict(
+            corr_threshold=c, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
+            use_dominance_gate=True, dom_threshold=0.020,
+        ))
+        for c in corr_values
     ]
 
     results = []
@@ -497,26 +487,20 @@ if __name__ == "__main__":
         results.append((name, stats(df)))
 
     print("=" * 90)
-    print("HUNTER-V14.10 — GENTLE COMBINED NUDGES ON TOP OF THE WINNING DomGate=0.020")
+    print("HUNTER-V14.10 — FINE CORRELATION SWEEP (dom=0.020 fixed, breaker=4 fixed)")
     print("=" * 90)
     print(f"{'Variant':32s}{'Trades':>8s}{'WR%':>8s}{'PnL$':>14s}{'MaxLS':>8s}")
     print("-" * 90)
     for name, (n, wr, pnl, mx) in results:
         print(f"{name:32s}{n:8d}{wr:8.2f}{pnl:14,.2f}{mx:8d}")
 
-    print("\nREFERENCE CHECK (your confirmed-best baseline)")
-    print("Expected baseline: 337 trades | 70.92% WR | $33,533.16 PnL | MaxLS=6")
-    print("\nWHAT THIS GATE DOES DIFFERENTLY FROM EVERYTHING TRIED SO FAR")
-    print("Correlation gate = blocks a candidate correlated with an OPEN position (pairwise, reactive).")
-    print("Dominance gate  = blocks ALL new alt entries in the risky direction when the WHOLE alt basket")
-    print("is losing/gaining strength vs BTC — a market-wide macro condition, not a pairwise one. It can")
-    print("catch a scenario correlation-gate misses: many DIFFERENT (not mutually correlated) alts each")
-    print("independently getting hit because BTC itself is dominating capital flows.")
+    print("\nREFERENCE POINTS")
+    print("Baseline (corr=0.75, no dom gate): ~340 trades | ~70.6-70.9% WR | ~$33,500 PnL | MaxLS=6")
+    print("Best so far (corr=0.70 + dom=0.020): 320 trades | 70.94% WR | $32,932 PnL | MaxLS=4")
     print("\nGOAL")
-    print("Look for the SMALLEST dom_threshold where WR stays >= baseline's 70.92% and PnL$ stays")
-    print("within ~2-3% of baseline's $33,533 — that's the practical floor for this lever before it")
-    print("starts costing performance the way tighter correlation did.")
-    print("If none clear that bar either, we'll have tested 3 fundamentally different root-cause")
-    print("mechanisms (side-cap, correlation-tightening, dominance) and can say with real confidence")
-    print("that MaxLS=6 is this system's structural floor, not a gap in our search.")
+    print("Find the tightest corr_threshold where WR stays >= ~70.5% and PnL$ stays within ~2% of")
+    print("the corr=0.70 result ($32,932) — looking for whether MaxLS can drop to 3, or whether 0.70")
+    print("is already the edge before it breaks down the way 0.60 did without the dominance gate.")
+    print("breaker_trigger stays fixed at 4 — trigger=3 has now failed in every test across three")
+    print("separate files, so it is excluded from further search.")
 
