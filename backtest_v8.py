@@ -4,7 +4,7 @@ import numpy as np
 def run_score_hunter_backtest(df):
     initial_capital = 1000.0
     capital = initial_capital
-    fixed_margin = 100.0  # مارجین ثابت ۱۰۰ دلار برای هر معامله
+    fixed_margin = 100.0  # مارجین ثابت ۱۰۰ دلار
     
     position = None 
     entry_price = 0.0
@@ -14,15 +14,11 @@ def run_score_hunter_backtest(df):
     trades = []
     equity_curve = [initial_capital]
 
-    # ۱. محاسبه اندیکاتورهای ستاپ حرفه‌ای (EMA 50 برای روند و EMA 9 / VWAP شبیه‌سازی‌شده برای پولبک)
+    # محاسبه اندیکاتورهای روند و حجم
     df['EMA_Trend'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA_Fast'] = df['Close'].ewm(span=9, adjust=False).mean()
-    
-    # محاسبه ساده VWAP برای تایم‌فریم ساعتی
-    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
-    df['VWAP'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
+    df['Volume_SMA'] = df['Volume'].rolling(window=20).mean()
 
-    # شروع لوپ از کندل ۵۰ به بعد برای دقت کامل اندیکاتورها (به صورت کاملا Causal روی i-1)
     for i in range(50, len(df)):
         current_open = df['Open'].iloc[i]
         current_high = df['High'].iloc[i]
@@ -33,8 +29,9 @@ def run_score_hunter_backtest(df):
         prev_high = df['High'].iloc[i-1]
         prev_low = df['Low'].iloc[i-1]
         prev_trend = df['EMA_Trend'].iloc[i-1]
-        prev_vwap = df['VWAP'].iloc[i-1]
         prev_fast = df['EMA_Fast'].iloc[i-1]
+        prev_vol = df['Volume'].iloc[i-1]
+        prev_vol_sma = df['Volume_SMA'].iloc[i-1]
         
         # ۱. مدیریت پوزیشن‌های باز
         if position == 'LONG':
@@ -65,29 +62,30 @@ def run_score_hunter_backtest(df):
                 trades.append({'result': 'WIN', 'pnl': pnl})
                 position = None
 
-        # ۲. ورود به معامله با ستاپ پولبک به VWAP و روند (۳ تا ۴ معامله در روز در تایم‌فریم ساعتی)
+        # ۲. ورود جدید با فیلتر حجم بالا و تاییدیه مومنتوم جهت‌دار
         if position is None and capital >= fixed_margin:
-            # سیگنال خرید (Long): روند صعودی و پولبک قیمت به محدوده VWAP یا میانگین سریع
-            if prev_close > prev_trend and prev_close >= prev_vwap and prev_fast > prev_vwap:
-                if prev_close > prev_open: # تاییدیه کندل صعودی
-                    position = 'LONG'
-                    entry_price = current_open
-                    stop_loss = prev_low
-                    if entry_price > stop_loss:
-                        take_profit = entry_price + (entry_price - stop_loss) * 2.0  # R:R = 1:2
-                    else:
-                        position = None
+            # تاییدیه حجم: حجم کندل قبل بالاتر از میانگین باشد (ورود پول واقعی)
+            is_high_volume = prev_vol > prev_vol_sma
+            
+            # سیگنال خرید (Long)
+            if prev_close > prev_trend and prev_fast > prev_trend and prev_close > prev_open and is_high_volume:
+                position = 'LONG'
+                entry_price = current_open
+                stop_loss = prev_low
+                if entry_price > stop_loss:
+                    take_profit = entry_price + (entry_price - stop_loss) * 2.0  # R:R = 1:2
+                else:
+                    position = None
                     
-            # سیگنال فروش (Short): روند نزولی و پولبک قیمت به محدوده VWAP
-            elif prev_close < prev_trend and prev_close <= prev_vwap and prev_fast < prev_vwap:
-                if prev_close < prev_open: # تاییدیه کندل نزولی
-                    position = 'SHORT'
-                    entry_price = current_open
-                    stop_loss = prev_high
-                    if stop_loss > entry_price:
-                        take_profit = entry_price - (stop_loss - entry_price) * 2.0  # R:R = 1:2
-                    else:
-                        position = None
+            # سیگنال فروش (Short)
+            elif prev_close < prev_trend and prev_fast < prev_trend and prev_close < prev_open and is_high_volume:
+                position = 'SHORT'
+                entry_price = current_open
+                stop_loss = prev_high
+                if stop_loss > entry_price:
+                    take_profit = entry_price - (stop_loss - entry_price) * 2.0  # R:R = 1:2
+                else:
+                    position = None
 
         equity_curve.append(capital)
 
@@ -110,7 +108,7 @@ def run_score_hunter_backtest(df):
     total_pnl = capital - initial_capital
 
     print("=" * 60)
-    print("گزارش نهایی بک‌تست (ستاپ حرفه‌ای VWAP Pullback با R:R = 1:2)")
+    print("گزارش نهایی بک‌تست (ستاپ مومنتوم + فیلتر حجم با R:R = 1:2)")
     print("=" * 60)
     print(f"تعداد کل معامله ها: {total_trades}")
     print(f"وین ریت کلی (Win Rate): {win_rate:.2f}%")
@@ -123,8 +121,7 @@ def run_score_hunter_backtest(df):
 
 if __name__ == "__main__":
     np.random.seed(42)
-    # تست روی کندل‌های ۱ ساعته (برای تامین فرکانس بالای معاملات در روز)
-    periods_count = 1500  # معادل حدود ۲ ماه دیتای ۱ ساعته
+    periods_count = 1500
     dates = pd.date_range(start='2026-01-01', periods=periods_count, freq='1h')
     prices = 50000 + np.cumsum(np.random.randn(periods_count) * 60)
     volumes = np.random.randint(100, 1000, size=periods_count)
