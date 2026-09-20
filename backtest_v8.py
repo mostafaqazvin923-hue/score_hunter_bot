@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# PERSONALIZED TRADING ENGINE — REBUILT STRATEGY
+# HUNTER-V74 — BALANCED LONG & SHORT ENGINE (NO LOOKAHEAD)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -39,7 +39,7 @@ SYMBOLS = {
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
-MAX_POSITIONS = 3  # کاهش تعداد پوزیشن‌های همزمان برای کنترل ریسک
+MAX_POSITIONS = 4  # ظرفیت مناسب برای مدیریت همزمان لانگ و شورت
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
@@ -47,18 +47,17 @@ FEE_RATE = 0.0007
 ATR_PERIOD = 14
 TRAILING_ATR_MULTIPLIER = 2.0
 INITIAL_ATR_MULTIPLIER = 1.8
-TIMEOUT_CANDLES = 30
+TIMEOUT_CANDLES = 35
 EMA_WARMUP = 200
 
-INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
-LEVERAGE = 20.0  # کاهش اهرم برای کاهش ریسک و جلوگیری از لیکوئید شدن در زنجیره ضرر
+LEVERAGE = 20.0
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("PERSONALIZED TRADING ENGINE — CLEAN DATA & NEW SETUP")
+print("HUNTER-V74 — BALANCED LONG & SHORT TRADING ENGINE")
 print("=" * 68)
 
 processed_data = {}
@@ -117,21 +116,17 @@ def fetch_symbol_data(lbank_symbol):
     if not deltas.empty and deltas.max() > pd.Timedelta(hours=4, minutes=10):
         return None
 
-    # محاسبه اندیکاتورها
     tr1 = df["High"] - df["Low"]
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
 
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
+    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
     
-    # محاسبه RSI ساده
-    delta = df["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df["RSI"] = 100 - (100 / (1 + rs))
+    # مومنتوم چند کندلی برای تایید جهت
+    df["Mom"] = (df["Close"] - df["Close"].shift(5)) / df["Close"].shift(5)
 
     df.set_index("Date", inplace=True)
     return df
@@ -146,17 +141,15 @@ print(f"Valid symbols loaded: {len(processed_data)}")
 def get_all_timestamps(data):
     return sorted({ts for df in data.values() for ts in df.index})
 
-def run_new_backtest(processed_data):
+def run_backtest_balanced(processed_data):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
     
-    # متغیرهای کنترل زنجیره ضرر (Loss Streak Protection)
     consecutive_losses = 0
     cooldown_counter = 0
 
     for ts in all_timestamps:
-        # مدیریت کول‌داون (اگر ضرر پشت سر هم دادیم، مدتی معامله نکنیم)
         if cooldown_counter > 0:
             cooldown_counter -= 1
             continue
@@ -203,11 +196,10 @@ def run_new_backtest(processed_data):
 
             outcome = "WIN" if r_real > 0 else "LOSS"
             
-            # مدیریت شمارنده ضررهای متوالی
             if outcome == "LOSS":
                 consecutive_losses += 1
-                if consecutive_losses >= 2:  # اگر ۲ ضرر متوالی دادیم
-                    cooldown_counter = 6     # ۶ کندل (۲۴ ساعت) استراحت کن
+                if consecutive_losses >= 3:  # بعد از ۳ ضرر متوالی، کمی استراحت
+                    cooldown_counter = 4
             else:
                 consecutive_losses = 0
 
@@ -227,10 +219,10 @@ def run_new_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        if consecutive_losses >= 2:
+        if consecutive_losses >= 3:
             continue
 
-        # بررسی سیگنال روی کندل بسته شده قبلی (جلوگیری از Lookahead Bias)
+        # بررسی سیگنال برای لانگ و شورت روی کندل بسته شده قبلی (بدون نگاه به آینده)
         for symbol, df in processed_data.items():
             if symbol in active_positions:
                 continue
@@ -241,32 +233,34 @@ def run_new_backtest(processed_data):
             if i < EMA_WARMUP + 1:
                 continue
 
-            # استفاده از کندل قبلی (i-1) برای تصمیم‌گیری و کندل جاری (i) برای ورود
             prev_c = df.iloc[i - 1]
             c4h = df.iloc[i]
 
-            # استراتژی شخصی: روند صعودی امن + اصلاح RSI
-            trend_long = prev_c["Close"] > prev_c["EMA50"] and prev_c["EMA50"] > prev_c["EMA200"]
-            rsi_pullback_long = 40 <= prev_c["RSI"] <= 55
+            # شرایط لانگ: روند صعودی و مومنتوم مثبت
+            valid_long = (
+                prev_c["Close"] > prev_c["EMA20"] and 
+                prev_c["EMA20"] > prev_c["EMA50"] and 
+                prev_c["Mom"] > 0.005
+            )
 
-            valid_long = trend_long and rsi_pullback_long
-
-            # استراتژی شخصی: روند نزولی امن + اصلاح RSI
-            trend_short = prev_c["Close"] < prev_c["EMA50"] and prev_c["EMA50"] < prev_c["EMA200"]
-            rsi_pullback_short = 45 <= prev_c["RSI"] <= 60
-
-            valid_short = trend_short and rsi_pullback_short
+            # شرایط شورت: روند نزولی و مومنتوم منفی
+            valid_short = (
+                prev_c["Close"] < prev_c["EMA20"] and 
+                prev_c["EMA20"] < prev_c["EMA50"] and 
+                prev_c["Mom"] < -0.005
+            )
 
             if not (valid_long or valid_short):
                 continue
 
             side = "LONG" if valid_long else "SHORT"
+            
             entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
             initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"] if side == "LONG" else entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"]
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.01 <= sl_dist_pct <= 0.05):
+            if not (0.01 <= sl_dist_pct <= 0.06):
                 continue
 
             if len(active_positions) >= MAX_POSITIONS:
@@ -285,11 +279,14 @@ def run_new_backtest(processed_data):
     return pd.DataFrame(all_trades)
 
 if __name__ == "__main__":
-    trades_df = run_new_backtest(processed_data)
+    trades_df = run_backtest_balanced(processed_data)
     n = len(trades_df)
     wr = (trades_df["Outcome"].eq("WIN").mean() * 100) if n else 0
     pnl = float(trades_df["Dollar_PnL"].sum()) if n else 0
     
+    longs_count = len(trades_df[trades_df["Side"] == "LONG"]) if n else 0
+    shorts_count = len(trades_df[trades_df["Side"] == "SHORT"]) if n else 0
+
     mx = cur = 0
     if n > 0:
         for x in trades_df["Outcome"]:
@@ -300,6 +297,7 @@ if __name__ == "__main__":
                 cur = 0
 
     print("=" * 72)
-    print("NEW PERSONAL SETUP BACKTEST RESULTS")
+    print("BALANCED LONG & SHORT BACKTEST RESULTS")
     print("=" * 72)
-    print(f"Total Trades: {n} | Win Rate: {wr:.2f}% | Net PnL: ${pnl:,.2f} | Max Loss Streak: {mx}")
+    print(f"Total Trades: {n} (Longs: {longs_count} | Shorts: {shorts_count})")
+    print(f"Win Rate: {wr:.2f}% | Net PnL: ${pnl:,.2f} | Max Loss Streak: {mx}")
