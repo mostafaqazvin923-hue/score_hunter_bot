@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V74 — BALANCED LONG & SHORT ENGINE (NO LOOKAHEAD)
+# HUNTER-V80 — INSTITUTIONAL QUANT ENGINE (LONG & SHORT)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -39,25 +39,25 @@ SYMBOLS = {
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
-MAX_POSITIONS = 4  # ظرفیت مناسب برای مدیریت همزمان لانگ و شورت
+MAX_POSITIONS = 6  # ظرفیت مناسب برای توزیع ریسک بین لانگ و شورت
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-TRAILING_ATR_MULTIPLIER = 2.0
+TRAILING_ATR_MULTIPLIER = 2.2
 INITIAL_ATR_MULTIPLIER = 1.8
-TIMEOUT_CANDLES = 35
+TIMEOUT_CANDLES = 40
 EMA_WARMUP = 200
 
 TRADE_MARGIN = 100.0
-LEVERAGE = 20.0
+LEVERAGE = 10.0  # اهرم امن منطبق با استانداردهای مدیریت ریسک نهنگی
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — BALANCED LONG & SHORT TRADING ENGINE")
+print("HUNTER-V80 — INSTITUTIONAL QUANT ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -116,17 +116,23 @@ def fetch_symbol_data(lbank_symbol):
     if not deltas.empty and deltas.max() > pd.Timedelta(hours=4, minutes=10):
         return None
 
+    # فاکتورهای کوانت و محاسبات آماری مؤسسات
     tr1 = df["High"] - df["Low"]
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
 
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
-    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
-    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
-    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
+    df["SMA50"] = df["Close"].rolling(50).mean()
+    df["SMA200"] = df["Close"].rolling(200).mean()
     
-    # مومنتوم چند کندلی برای تایید جهت
-    df["Mom"] = (df["Close"] - df["Close"].shift(5)) / df["Close"].shift(5)
+    # محاسبه Z-Score برای انحراف آماری قیمت از میانگین (مبنای استراتژی‌های میان‌ویو نهنگ‌ها)
+    rolling_std = df["Close"].rolling(20).std()
+    rolling_mean = df["Close"].rolling(20).mean()
+    df["Z_Score"] = (df["Close"] - rolling_mean) / rolling_std
+
+    # فاکتور آلفای مومنتوم و حجم ترکیبی
+    df["Volume_Factor"] = df["Volume"] / df["Volume"].rolling(20).mean()
+    df["Alpha_Momentum"] = (df["Close"] - df["Close"].shift(3)) / df["Close"].shift(3)
 
     df.set_index("Date", inplace=True)
     return df
@@ -136,12 +142,12 @@ for symbol, lbank_symbol in SYMBOLS.items():
     if df4h is not None:
         processed_data[symbol] = df4h
 
-print(f"Valid symbols loaded: {len(processed_data)}")
+print(f"Valid institutional symbols loaded: {len(processed_data)}")
 
 def get_all_timestamps(data):
     return sorted({ts for df in data.values() for ts in df.index})
 
-def run_backtest_balanced(processed_data):
+def run_institutional_backtest(processed_data):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
@@ -198,8 +204,8 @@ def run_backtest_balanced(processed_data):
             
             if outcome == "LOSS":
                 consecutive_losses += 1
-                if consecutive_losses >= 3:  # بعد از ۳ ضرر متوالی، کمی استراحت
-                    cooldown_counter = 4
+                if consecutive_losses >= 3:
+                    cooldown_counter = 5
             else:
                 consecutive_losses = 0
 
@@ -222,7 +228,7 @@ def run_backtest_balanced(processed_data):
         if consecutive_losses >= 3:
             continue
 
-        # بررسی سیگنال برای لانگ و شورت روی کندل بسته شده قبلی (بدون نگاه به آینده)
+        # منطق سیگنال‌دهی کوانت مؤسسات (بدون نگاه به آینده - روی کندل i-1)
         for symbol, df in processed_data.items():
             if symbol in active_positions:
                 continue
@@ -236,18 +242,20 @@ def run_backtest_balanced(processed_data):
             prev_c = df.iloc[i - 1]
             c4h = df.iloc[i]
 
-            # شرایط لانگ: روند صعودی و مومنتوم مثبت
+            # فاکتور ترکیبی لانگ: بازگشت از اشباع فروش یا تاییدیه مومنتوم بالا رونده
             valid_long = (
-                prev_c["Close"] > prev_c["EMA20"] and 
-                prev_c["EMA20"] > prev_c["EMA50"] and 
-                prev_c["Mom"] > 0.005
+                prev_c["Close"] > prev_c["SMA50"] and
+                prev_c["Z_Score"] > -1.5 and prev_c["Z_Score"] < 1.0 and
+                prev_c["Alpha_Momentum"] > 0.003 and
+                prev_c["Volume_Factor"] > 0.8
             )
 
-            # شرایط شورت: روند نزولی و مومنتوم منفی
+            # فاکتور ترکیبی شورت: متقارن لانگ در روندهای نزولی یا اشباع خرید
             valid_short = (
-                prev_c["Close"] < prev_c["EMA20"] and 
-                prev_c["EMA20"] < prev_c["EMA50"] and 
-                prev_c["Mom"] < -0.005
+                prev_c["Close"] < prev_c["SMA50"] and
+                prev_c["Z_Score"] < 1.5 and prev_c["Z_Score"] > -1.0 and
+                prev_c["Alpha_Momentum"] < -0.003 and
+                prev_c["Volume_Factor"] > 0.8
             )
 
             if not (valid_long or valid_short):
@@ -260,7 +268,7 @@ def run_backtest_balanced(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.01 <= sl_dist_pct <= 0.06):
+            if not (0.012 <= sl_dist_pct <= 0.055):
                 continue
 
             if len(active_positions) >= MAX_POSITIONS:
@@ -279,7 +287,7 @@ def run_backtest_balanced(processed_data):
     return pd.DataFrame(all_trades)
 
 if __name__ == "__main__":
-    trades_df = run_backtest_balanced(processed_data)
+    trades_df = run_institutional_backtest(processed_data)
     n = len(trades_df)
     wr = (trades_df["Outcome"].eq("WIN").mean() * 100) if n else 0
     pnl = float(trades_df["Dollar_PnL"].sum()) if n else 0
@@ -297,7 +305,7 @@ if __name__ == "__main__":
                 cur = 0
 
     print("=" * 72)
-    print("BALANCED LONG & SHORT BACKTEST RESULTS")
+    print("INSTITUTIONAL QUANT ENGINE BACKTEST RESULTS")
     print("=" * 72)
     print(f"Total Trades: {n} (Longs: {longs_count} | Shorts: {shorts_count})")
     print(f"Win Rate: {wr:.2f}% | Net PnL: ${pnl:,.2f} | Max Loss Streak: {mx}")
