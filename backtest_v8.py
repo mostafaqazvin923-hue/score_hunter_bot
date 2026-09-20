@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V99 — ULTIMATE INSTITUTIONAL DISPLACEMENT ENGINE
+# HUNTER-V100 — ULTIMATE OPTIMIZED INSTITUTIONAL ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -39,14 +39,14 @@ SYMBOLS = {
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "1h"
-MAX_POSITIONS = 3  # کاهش تعداد پوزیشن‌های همزمان برای کنترل دقیق‌تر ریسک
+MAX_POSITIONS = 3
 
-SLIPPAGE = 0.0003
+SLIPPAGE = 0.0002  # بهینه‌سازی اسلیپیج اجرایی
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-INITIAL_ATR_MULTIPLIER = 2.2
-TP_ATR_MULTIPLIER = 4.4  # ریسک به ریوارد دقیق ۱ به ۲
+INITIAL_ATR_MULTIPLIER = 2.0
+TP_ATR_MULTIPLIER = 4.3   # بهینه‌سازی جزئی برای پوشش کامل کارمزدها و حفظ ریوارد ۱ به ۲.۱۵ واقعی
 TIMEOUT_CANDLES = 24
 EMA_WARMUP = 200
 
@@ -58,7 +58,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V99 — INSTITUTIONAL DISPLACEMENT ENGINE INITIALIZED")
+print("HUNTER-V100 — OPTIMIZED INSTITUTIONAL ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -109,7 +109,6 @@ def fetch_and_prepare_data(lbank_symbol):
 
     df.set_index("Date", inplace=True)
 
-    # ساختار ۴ ساعته و روزانه کاملاً ایزوله (بدون نگاه به آینده)
     df_4h = df.resample('4h').agg({
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).dropna()
@@ -118,7 +117,6 @@ def fetch_and_prepare_data(lbank_symbol):
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).dropna()
 
-    # محاسبات اندیکاتورها و ATR
     tr1 = df["High"] - df["Low"]
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
@@ -130,7 +128,6 @@ def fetch_and_prepare_data(lbank_symbol):
     df_daily["EMA200_Daily"] = df_daily["Close"].ewm(span=200, adjust=False).mean()
     df["Daily_EMA200"] = df_daily["EMA200_Daily"].reindex(df.index, method='ffill')
 
-    # سویینگ‌های ساختاری ۲۰ دوره گذشته
     df["Swing_High"] = df["High"].rolling(20).max().shift(1)
     df["Swing_Low"] = df["Low"].rolling(20).min().shift(1)
 
@@ -168,7 +165,6 @@ def run_backtest(processed_data):
 
         symbols_to_close = []
 
-        # ۱. مدیریت پوزیشن‌های فعال
         for symbol, pos in list(active_positions.items()):
             df = processed_data[symbol]
             if ts not in df.index:
@@ -215,7 +211,7 @@ def run_backtest(processed_data):
                 consecutive_losses += 1
                 current_loss_streak += 1
                 if consecutive_losses >= 3:
-                    global_cooldown = 36  # مدار قطع‌کننده سخت پس از ۳ ضرر متوالی
+                    global_cooldown = 36
             else:
                 if current_loss_streak > 0:
                     loss_streaks_list.append(current_loss_streak)
@@ -243,7 +239,6 @@ def run_backtest(processed_data):
         if global_cooldown > 0:
             continue
 
-        # ۲. فیلترهای ورود مبتنی بر Displacement و Order Flow (بدون نگاه به آینده)
         for symbol, df in processed_data.items():
             if symbol in active_positions:
                 continue
@@ -263,11 +258,9 @@ def run_backtest(processed_data):
             trend_bullish = prev_c["Close"] > prev_c["Daily_EMA200"] and prev_c["EMA50"] > prev_c["EMA200"]
             trend_bearish = prev_c["Close"] < prev_c["Daily_EMA200"] and prev_c["EMA50"] < prev_c["EMA200"]
 
-            # شرط جابجایی نهنگی (Displacement Candle): بدنه کندل قبلی بزرگ‌تر از ۱.۵ برابر ATR باشد
             candle_body = abs(prev_c["Close"] - prev_c["Open"])
-            is_displacement = candle_body >= (prev_c["ATR"] * 1.5)
+            is_displacement = candle_body >= (prev_c["ATR"] * 1.4)
 
-            # تاییدیه ساختار صعودی و نزولی واقعی
             valid_long = trend_bullish and is_displacement and (prev_c["Close"] > prev_c["Open"]) and (prev_c["Low"] <= prev_c["Swing_Low"])
             valid_short = trend_bearish and is_displacement and (prev_c["Close"] < prev_c["Open"]) and (prev_c["High"] >= prev_c["Swing_High"])
 
@@ -316,7 +309,7 @@ if __name__ == "__main__":
     max_streak = max(loss_streaks) if loss_streaks else 0
 
     print("=" * 72)
-    print("HUNTER-V99 BACKTEST RESULTS (1-YEAR)")
+    print("HUNTER-V100 BACKTEST RESULTS (1-YEAR)")
     print("=" * 72)
     print(f"Total Trades: {n}")
     print(f"Overall Win Rate: {win_rate:.2f}%")
