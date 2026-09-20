@@ -10,57 +10,63 @@ except ImportError:
 
 def fetch_lbank_data(symbol, timeframe='1h', limit=1500):
     """
-    دریافت داده‌های تاریخی از صرافی LBank بدون درگیر کردن متدهای احراز هویت یا Balance
+    دریافت ایمن داده‌های تاریخی از LBank برای تمامی نمادها با مدیریت خطاهای ساختاری نماد
     """
-    # تنظیم صرافی در حالت کاملاً عمومی (Public-only) برای جلوگیری از خطای parseBalance
     exchange = ccxt.lbank({
         'enableRateLimit': True,
-        'options': {
-            'defaultType': 'swap', # یا 'spot' بر اساس نوع بازار
-        }
+        'options': {'defaultType': 'swap'}
     })
     
-    try:
-        # استفاده مستقیم از fetch_ohlcv بدون load_markets عمومی که باعث درخواست بالانس می‌شود
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not ohlcv:
-            return pd.DataFrame()
-            
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        
-        # استانداردسازی نام ستون‌ها با حروف بزرگ مطابق ساختار پروژه شما
-        df.rename(columns={
-            'open': 'Open',
-            'high': 'High',
-            'low': 'Low',
-            'close': 'Close',
-            'volume': 'Volume'
-        }, inplace=True)
-        
-        return df
-    except Exception as e:
-        # اگر فرمت نماد سوآپ نیاز به پیشوند یا پسوند خاصی داشت، اینجا هندل می‌شود
+    # لیست احتمالی فرمت‌های نماد در لبانک
+    possible_symbols = [
+        symbol,
+        symbol.replace('/USDT', '_USDT'),
+        symbol.replace('/', '_'),
+        symbol.replace('/USDT', 'USDT')
+    ]
+    
+    for s in possible_symbols:
         try:
-            alt_symbol = symbol.replace('/USDT', '_USDT')
-            ohlcv = exchange.fetch_ohlcv(alt_symbol, timeframe=timeframe, limit=limit)
-            if ohlcv:
+            ohlcv = exchange.fetch_ohlcv(s, timeframe=timeframe, limit=limit)
+            if ohlcv and len(ohlcv) > 50:
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                 df.set_index('timestamp', inplace=True)
-                df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+                df.rename(columns={
+                    'open': 'Open', 'high': 'High', 
+                    'low': 'Low', 'close': 'Close', 'volume': 'Volume'
+                }, inplace=True)
                 return df
-        except Exception as inner_e:
-            print(f"خطا در دریافت داده برای {symbol}: {inner_e}")
+        except Exception:
+            continue
             
-        return pd.DataFrame()
+    # اگر با سویپ خطا داد، حالت اسپات تست می‌شود
+    try:
+        exchange_spot = ccxt.lbank({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+        ohlcv = exchange_spot.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        if ohlcv and len(ohlcv) > 50:
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            df.rename(columns={
+                'open': 'Open', 'high': 'High', 
+                'low': 'Low', 'close': 'Close', 'volume': 'Volume'
+            }, inplace=True)
+            return df
+    except Exception as e:
+        print(f"خطای نهایی در دریافت داده برای {symbol}: {e}")
+        
+    return pd.DataFrame()
 
-def run_advanced_strategy(df, symbol_name):
+def run_improved_strategy(df, symbol_name):
+    """
+    استراتژی اصلاح‌شده مومنتوم و تاییدیه روند (Trend-Following & Momentum)
+    جهت جلوگیری از باخت‌های سریالی سنگین
+    """
     initial_capital = 1000.0
     capital = initial_capital
-    fixed_margin = 100.0  # مارجین ثابت ۱۰۰ دلار
-    leverage = 2.5        # اهرم پیش‌فرض
+    fixed_margin = 100.0  
+    leverage = 2.0        # کاهش اهرم برای کنترل ریسک و Drawdown
     
     position = None 
     entry_price = 0.0
@@ -68,31 +74,30 @@ def run_advanced_strategy(df, symbol_name):
     take_profit = 0.0
     
     trades = []
-    equity_curve = [initial_capital]
-
     consecutive_losses = 0
-    cooldown_counter = 0  # وقفه برای کنترل ضررهای متوالی
+    cooldown_counter = 0
 
-    # محاسبات اندیکاتورها و ساختار بازار
-    df['EMA_Trend'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA_Fast'] = df['Close'].ewm(span=10, adjust=False).mean()
-    df['Volume_SMA'] = df['Volume'].rolling(window=20).mean()
+    # محاسبه اندیکاتورهای دقیق‌تر
+    df['EMA_Fast'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA_Slow'] = df['Close'].ewm(span=50, adjust=False).mean()
     
-    # محاسبه ATR
+    # RSI
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # ATR برای تعیین استاپ لاس داینامیک
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     df['TR'] = np.maximum(high_low, np.maximum(high_close, low_close))
     df['ATR'] = df['TR'].rolling(window=14).mean()
-    
-    # سویینگ‌های بازار برای شناسایی لیکوئیدیتی سویپ
-    df['Swing_High'] = df['High'].rolling(window=20).max()
-    df['Swing_Low'] = df['Low'].rolling(window=20).min()
 
     for i in range(50, len(df)):
         if cooldown_counter > 0:
             cooldown_counter -= 1
-            equity_curve.append(capital)
             continue
 
         current_open = df['Open'].iloc[i]
@@ -100,40 +105,23 @@ def run_advanced_strategy(df, symbol_name):
         current_low = df['Low'].iloc[i]
         
         prev_close = df['Close'].iloc[i-1]
-        prev_high = df['High'].iloc[i-1]
-        prev_low = df['Low'].iloc[i-1]
-        prev_trend = df['EMA_Trend'].iloc[i-1]
         prev_fast = df['EMA_Fast'].iloc[i-1]
-        prev_vol = df['Volume'].iloc[i-1]
-        prev_vol_sma = df['Volume_SMA'].iloc[i-1]
+        prev_slow = df['EMA_Slow'].iloc[i-1]
+        prev_rsi = df['RSI'].iloc[i-1]
         prev_atr = df['ATR'].iloc[i-1]
-        prev_swing_high = df['Swing_High'].iloc[i-1]
-        prev_swing_low = df['Swing_Low'].iloc[i-1]
         
-        # ۱. مدیریت پوزیشن‌های باز
+        # ۱. مدیریت پوزیشن‌های فعال
         if position == 'LONG':
-            hit_tp = current_high >= take_profit
-            hit_sl = current_low <= stop_loss
-            
-            if hit_sl and hit_tp:
+            if current_low <= stop_loss:
                 loss_pct = (entry_price - stop_loss) / entry_price
                 pnl = - (fixed_margin * loss_pct * leverage)
                 capital += pnl
                 trades.append({'symbol': symbol_name, 'result': 'LOSS', 'pnl': pnl})
                 consecutive_losses += 1
-                if consecutive_losses >= 3:
-                    cooldown_counter = 18
+                if consecutive_losses >= 2:
+                    cooldown_counter = 10 # وقفه سریع‌تر برای جلوگیری از ضرر زنجیره‌ای
                 position = None
-            elif hit_sl:
-                loss_pct = (entry_price - stop_loss) / entry_price
-                pnl = - (fixed_margin * loss_pct * leverage)
-                capital += pnl
-                trades.append({'symbol': symbol_name, 'result': 'LOSS', 'pnl': pnl})
-                consecutive_losses += 1
-                if consecutive_losses >= 3:
-                    cooldown_counter = 18
-                position = None
-            elif hit_tp:
+            elif current_high >= take_profit:
                 win_pct = (take_profit - entry_price) / entry_price
                 pnl = fixed_margin * win_pct * leverage
                 capital += pnl
@@ -142,28 +130,16 @@ def run_advanced_strategy(df, symbol_name):
                 position = None
                 
         elif position == 'SHORT':
-            hit_tp = current_low <= take_profit
-            hit_sl = current_high >= stop_loss
-            
-            if hit_sl and hit_tp:
+            if current_high >= stop_loss:
                 loss_pct = (stop_loss - entry_price) / entry_price
                 pnl = - (fixed_margin * loss_pct * leverage)
                 capital += pnl
                 trades.append({'symbol': symbol_name, 'result': 'LOSS', 'pnl': pnl})
                 consecutive_losses += 1
-                if consecutive_losses >= 3:
-                    cooldown_counter = 18
+                if consecutive_losses >= 2:
+                    cooldown_counter = 10
                 position = None
-            elif hit_sl:
-                loss_pct = (stop_loss - entry_price) / entry_price
-                pnl = - (fixed_margin * loss_pct * leverage)
-                capital += pnl
-                trades.append({'symbol': symbol_name, 'result': 'LOSS', 'pnl': pnl})
-                consecutive_losses += 1
-                if consecutive_losses >= 3:
-                    cooldown_counter = 18
-                position = None
-            elif hit_tp:
+            elif current_low <= take_profit:
                 win_pct = (entry_price - take_profit) / entry_price
                 pnl = fixed_margin * win_pct * leverage
                 capital += pnl
@@ -171,37 +147,23 @@ def run_advanced_strategy(df, symbol_name):
                 consecutive_losses = 0
                 position = None
 
-        # ۲. ورود جدید
+        # ۲. سیگنال‌های ورود جدید (مبتنی بر کراس امین و RSI کنترل شده)
         if position is None and capital >= fixed_margin and cooldown_counter == 0:
-            is_high_volume = prev_vol > prev_vol_sma
-            
-            swept_low = current_low < prev_swing_low
-            bullish_structure = prev_close > prev_trend and prev_fast > prev_trend
-            
-            if bullish_structure and swept_low and is_high_volume:
+            # لانگ: کراس صعودی EMA سریع به بالا و RSI در محدوده مناسب (بین ۴5 و ۷۰)
+            if prev_fast > prev_slow and 45 < prev_rsi < 70:
                 position = 'LONG'
                 entry_price = current_open
-                stop_loss = prev_swing_low - (0.2 * prev_atr)
-                if entry_price > stop_loss:
-                    take_profit = entry_price + (entry_price - stop_loss) * 2.0
-                else:
-                    position = None
-                    
-            swept_high = current_high > prev_swing_high
-            bearish_structure = prev_close < prev_trend and prev_fast < prev_trend
-            
-            if bearish_structure and swept_high and is_high_volume:
+                stop_loss = entry_price - (1.5 * prev_atr)
+                take_profit = entry_price + (2.5 * prev_atr) # ریسک به ریوارد ۱ به ۱.۶۶
+                
+            # شورت: کراس نزولی EMA سریع به پایین و RSI در محدوده مناسب (بین ۳۰ و ۵۵)
+            elif prev_fast < prev_slow and 30 < prev_rsi < 55:
                 position = 'SHORT'
                 entry_price = current_open
-                stop_loss = prev_swing_high + (0.2 * prev_atr)
-                if stop_loss > entry_price:
-                    take_profit = entry_price - (stop_loss - entry_price) * 2.0
-                else:
-                    position = None
+                stop_loss = entry_price + (1.5 * prev_atr)
+                take_profit = entry_price - (2.5 * prev_atr)
 
-        equity_curve.append(capital)
-
-    return trades, equity_curve
+    return trades
 
 def master_backtest():
     symbols = [
@@ -214,15 +176,15 @@ def master_backtest():
     asset_summary = {}
     initial_capital = 1000.0
     
-    print("در حال دریافت داده‌های واقعی از صرافی و اجرای بک‌تست بر روی ۱۰ ارز برتر...")
+    print("در حال دریافت داده‌های تمام ۱۰ ارز از LBank و اجرای بک‌تست اصلاح‌شده (V9)...")
     
     for symbol in symbols:
         df = fetch_lbank_data(symbol, timeframe='1h', limit=1500)
         if df.empty or len(df) < 200:
-            print(f"هشدار: داده کافی برای {symbol} دریافت نشد یا خالی است.")
+            print(f"هشدار: داده کافی برای {symbol} دریافت نشد.")
             continue
             
-        trades, equity = run_advanced_strategy(df, symbol)
+        trades = run_improved_strategy(df, symbol)
         all_trades.extend(trades)
         
         sym_pnl = sum([t['pnl'] for t in trades])
@@ -270,7 +232,7 @@ def master_backtest():
     avg_loss = (total_losses_pnl / len(losing_trades)) if losing_trades else 0
 
     print("\n" + "=" * 65)
-    print("گزارش نهایی عملکرد سیستم معاملاتی (LBank - Institutional Strategy)")
+    print("گزارش نهایی عملکرد سیستم معاملاتی (LBank - Optimized V9 Strategy)")
     print("=" * 65)
     print(f"1- تعداد کل معاملات: {total_trades}")
     print(f"2- تعداد معاملات برنده: {len(winning_trades)}")
@@ -298,25 +260,6 @@ def master_backtest():
     print(f"11- Profit Factor (فاکتور سود): {profit_factor:.2f}")
     print(f"12- Average Win / Average Loss: میانگین برد: ${avg_win:.2f} | میانگین باخت: ${avg_loss:.2f}")
     print("=" * 65)
-
-    if HAS_PLOT and len(all_trades) > 0:
-        try:
-            plt.figure(figsize=(10, 5))
-            eq_series = [initial_capital]
-            curr = initial_capital
-            for t in all_trades:
-                curr += t['pnl']
-                eq_series.append(curr)
-            plt.plot(eq_series, label='Equity Curve', color='teal', linewidth=2)
-            plt.title('Score Hunter Bot - Equity Curve')
-            plt.xlabel('Trade Index')
-            plt.ylabel('Capital ($)')
-            plt.grid(True)
-            plt.legend()
-            plt.savefig('equity_curve.png')
-            print("\nنمودار منحنی سرمایه (Equity Curve) با موفقیت در فایل equity_curve.png ذخیره شد.")
-        except Exception as ex:
-            print(f"خطا در ذخیره نمودار: {ex}")
 
 if __name__ == "__main__":
     master_backtest()
