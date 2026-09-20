@@ -14,7 +14,19 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V74 — TRUE CLUSTERED METRICS (V14.15)
+# HUNTER-V74 — GOLDEN BASE RESTORED (V14.10) + CORRELATION TUNING
+# ============================================================
+# Golden Core (signal/SL/trailing/timeout) is UNTOUCHED.
+# This session only tunes two ROOT-CAUSE knobs that were already
+# part of your own V14.10 file — not new blocking layers:
+#   1) corr_threshold: how correlated a candidate must be with an
+#      already-open position before its entry is skipped.
+#   2) corr_lookback: how many 4H candles the correlation is computed
+#      over (30 candles = 5 days is short/noisy; a longer window gives
+#      a more stable correlation estimate).
+#   3) the existing hard breaker's trigger (currently: 4 consecutive
+#      losses -> 10-candle cooldown) — tested both at 4 (baseline) and
+#      3, since you asked specifically about consecutive losses.
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,10 +83,11 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V74 — TRUE CLUSTERED METRICS (V14.15)")
+print("HUNTER-V74 — GOLDEN BASE RESTORED (V14.10) + CORRELATION TUNING")
 print("=" * 68)
 
 processed_data = {}
+
 
 def fetch_symbol_data(lbank_symbol):
     all_ohlcv = []
@@ -143,6 +156,7 @@ def fetch_symbol_data(lbank_symbol):
     df.set_index("Date", inplace=True)
     return df
 
+
 for symbol, lbank_symbol in SYMBOLS.items():
     df4h = fetch_symbol_data(lbank_symbol)
     if df4h is not None:
@@ -150,43 +164,81 @@ for symbol, lbank_symbol in SYMBOLS.items():
 
 print(f"Valid symbols: {len(processed_data)} / {len(SYMBOLS)}")
 
+
 def get_all_timestamps(data):
     return sorted({ts for df in data.values() for ts in df.index})
 
-def is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=0.75):
+
+def is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold, lookback):
     if not active_positions:
         return True
     df_cand = processed_data[symbol]
     if ts not in df_cand.index:
         return False
     idx_cand = df_cand.index.get_loc(ts)
-    if idx_cand < 30:
+    if idx_cand < lookback:
         return True
-    
-    cand_returns = df_cand['Close'].iloc[idx_cand-30:idx_cand+1].pct_change().dropna()
+
+    cand_returns = df_cand['Close'].iloc[idx_cand - lookback:idx_cand + 1].pct_change().dropna()
 
     for active_sym in active_positions:
         df_act = processed_data[active_sym]
         if ts not in df_act.index:
             continue
         idx_act = df_act.index.get_loc(ts)
-        if idx_act < 30:
+        if idx_act < lookback:
             continue
-        act_returns = df_act['Close'].iloc[idx_act-30:idx_act+1].pct_change().dropna()
+        act_returns = df_act['Close'].iloc[idx_act - lookback:idx_act + 1].pct_change().dropna()
 
         aligned = pd.concat([cand_returns, act_returns], axis=1).dropna()
-        if len(aligned) < 15:
+        if len(aligned) < max(15, lookback // 2):
             continue
         corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
         if not np.isnan(corr) and corr > threshold:
             return False
     return True
 
-def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75):
+
+def compute_dominance_spread(processed_data, ts):
+    """
+    Self-contained BTC-Dominance PROXY — no external API needed, built
+    only from data you already fetch. Positive value = BTC outperforming
+    the alt basket over the last 10 4H candles (~ dominance rising, risk
+    for long-alt momentum trades). Negative = alts outperforming BTC
+    (~ dominance falling, risk for short-alt momentum trades).
+    Uses the already-computed, fully causal Mom_Short column.
+    """
+    if "BTC" not in processed_data or ts not in processed_data["BTC"].index:
+        return None
+    btc_mom = processed_data["BTC"].loc[ts, "Mom_Short"]
+    if np.isnan(btc_mom):
+        return None
+    alt_moms = []
+    for sym, df in processed_data.items():
+        if sym == "BTC" or ts not in df.index:
+            continue
+        v = df.loc[ts, "Mom_Short"]
+        if not np.isnan(v):
+            alt_moms.append(v)
+    if not alt_moms:
+        return None
+    return float(btc_mom - np.median(alt_moms))
+
+
+def run_backtest(
+    processed_data,
+    use_correlation_gate=True,
+    corr_threshold=0.75,
+    corr_lookback=30,
+    breaker_trigger=4,
+    breaker_cooldown=10,
+    use_dominance_gate=False,
+    dom_threshold=0.03,
+):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     trades = []
-    
+
     recent_consecutive_losses = 0
     cooldown_candles_remaining = 0
 
@@ -235,11 +287,11 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
             outcome = "WIN" if r_real > 0 else "LOSS"
-            
+
             if outcome == "LOSS":
                 recent_consecutive_losses += 1
-                if recent_consecutive_losses >= 4:
-                    cooldown_candles_remaining = 10
+                if recent_consecutive_losses >= breaker_trigger:
+                    cooldown_candles_remaining = breaker_cooldown
                     recent_consecutive_losses = 0
             else:
                 recent_consecutive_losses = 0
@@ -281,6 +333,22 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
         allow_longs = market_breadth_ratio >= 0.35
         allow_shorts = market_breadth_ratio <= 0.65
 
+        # NEW: BTC-Dominance proxy, computed once per timestamp (all
+        # candidates this timestamp share the same intended side, since
+        # `side` is decided by the single `market_bull` flag above).
+        dom_block_alts = False
+        if use_dominance_gate:
+            spread = compute_dominance_spread(processed_data, ts)
+            if spread is not None:
+                if market_bull and spread > dom_threshold:
+                    # BTC strongly outperforming alts -> risky to open
+                    # NEW long-alt momentum trades right now.
+                    dom_block_alts = True
+                elif (not market_bull) and spread < -dom_threshold:
+                    # Alts strongly outperforming BTC -> risky to open
+                    # NEW short-alt momentum trades right now.
+                    dom_block_alts = True
+
         current_scores = {}
         for symbol, df in processed_data.items():
             if ts not in df.index:
@@ -299,8 +367,14 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
         for symbol in ranked_symbols:
             if symbol in active_positions:
                 continue
-            
-            if use_correlation_gate and not is_correlation_allowed(symbol, active_positions, processed_data, ts, threshold=corr_threshold):
+
+            if dom_block_alts and symbol != "BTC":
+                continue
+
+            if use_correlation_gate and not is_correlation_allowed(
+                symbol, active_positions, processed_data, ts,
+                threshold=corr_threshold, lookback=corr_lookback,
+            ):
                 continue
 
             df = processed_data[symbol]
@@ -372,27 +446,77 @@ def run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
 
     return pd.DataFrame(trades)
 
+
+def stats(df):
+    n = len(df)
+    if n == 0:
+        return 0, 0.0, 0.0, 0
+    wr = df["Outcome"].eq("WIN").mean() * 100
+    pnl = float(df["Dollar_PnL"].sum())
+    cur = mx = 0
+    for x in df.sort_values("Timestamp")["Outcome"]:
+        if x == "LOSS":
+            cur += 1
+            mx = max(mx, cur)
+        else:
+            cur = 0
+    return n, wr, pnl, mx
+
+
 if __name__ == "__main__":
-    trades_df = run_backtest(processed_data, use_correlation_gate=True, corr_threshold=0.75)
+    # CONFIRMED WINNER from this session: dom_threshold=0.020 on top of
+    # the corr=0.75/lb=30/brk=4 base -> MaxLS 6->5, WR flat (+0.04pp),
+    # PnL only -2.2%. Going tighter than 0.02 only adds cost with no
+    # further MaxLS gain (data-confirmed, not a guess).
+    #
+    # This round: hold dom=0.020 fixed (the winning lever) and add GENTLE
+    # (not extreme) nudges to the other two levers, since we've only ever
+    # tested those in isolation or at extreme settings so far — a mild
+    # combined nudge is a genuinely untested combination.
+    variants = [
+        ("Baseline (corr gate only)",
+         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
+              use_dominance_gate=False)),
+        ("DomGate=0.020 (this session's best)",
+         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
+              use_dominance_gate=True, dom_threshold=0.020)),
+        ("+ gentle corr (0.70)",
+         dict(corr_threshold=0.70, corr_lookback=30, breaker_trigger=4, breaker_cooldown=10,
+              use_dominance_gate=True, dom_threshold=0.020)),
+        ("+ gentle breaker (trigger=3)",
+         dict(corr_threshold=0.75, corr_lookback=30, breaker_trigger=3, breaker_cooldown=10,
+              use_dominance_gate=True, dom_threshold=0.020)),
+        ("+ both gentle nudges",
+         dict(corr_threshold=0.70, corr_lookback=30, breaker_trigger=3, breaker_cooldown=10,
+              use_dominance_gate=True, dom_threshold=0.020)),
+    ]
 
-    n = len(trades_df)
-    wr = (trades_df["Outcome"].eq("WIN").mean() * 100) if n else 0
-    pnl = float(trades_df["Dollar_PnL"].sum()) if n else 0
-    
-    # اصلاح واقعی نحوه محاسبه MaxLS بر اساس خوشه‌های زمانی (جلوگیری از شمارش مکرر استاپ‌های هم‌زمان در یک کندل)
-    trades_df_sorted = trades_df.sort_values("Timestamp")
-    timestamp_groups = trades_df_sorted.groupby("Timestamp")["Outcome"].apply(list).reset_index()
-    
-    cur_streak = 0
-    max_streak = 0
-    for outcomes in timestamp_groups["Outcome"]:
-        if all(o == "LOSS" for o in outcomes):
-            cur_streak += 1
-            max_streak = max(max_streak, cur_streak)
-        elif any(o == "WIN" for o in outcomes):
-            cur_streak = 0
+    results = []
+    for name, kwargs in variants:
+        df = run_backtest(processed_data, use_correlation_gate=True, **kwargs)
+        results.append((name, stats(df)))
 
-    print("=" * 72)
-    print("HUNTER-V14.15 — TRUE CLUSTERED METRICS RESULTS")
-    print("=" * 72)
-    print(f"Trades = {n} | Win Rate = {wr:.2f}% | Total PnL = ${pnl:,.2f} | Max Event Loss Streak = {max_streak}")
+    print("=" * 90)
+    print("HUNTER-V14.10 — GENTLE COMBINED NUDGES ON TOP OF THE WINNING DomGate=0.020")
+    print("=" * 90)
+    print(f"{'Variant':32s}{'Trades':>8s}{'WR%':>8s}{'PnL$':>14s}{'MaxLS':>8s}")
+    print("-" * 90)
+    for name, (n, wr, pnl, mx) in results:
+        print(f"{name:32s}{n:8d}{wr:8.2f}{pnl:14,.2f}{mx:8d}")
+
+    print("\nREFERENCE CHECK (your confirmed-best baseline)")
+    print("Expected baseline: 337 trades | 70.92% WR | $33,533.16 PnL | MaxLS=6")
+    print("\nWHAT THIS GATE DOES DIFFERENTLY FROM EVERYTHING TRIED SO FAR")
+    print("Correlation gate = blocks a candidate correlated with an OPEN position (pairwise, reactive).")
+    print("Dominance gate  = blocks ALL new alt entries in the risky direction when the WHOLE alt basket")
+    print("is losing/gaining strength vs BTC — a market-wide macro condition, not a pairwise one. It can")
+    print("catch a scenario correlation-gate misses: many DIFFERENT (not mutually correlated) alts each")
+    print("independently getting hit because BTC itself is dominating capital flows.")
+    print("\nGOAL")
+    print("Look for the SMALLEST dom_threshold where WR stays >= baseline's 70.92% and PnL$ stays")
+    print("within ~2-3% of baseline's $33,533 — that's the practical floor for this lever before it")
+    print("starts costing performance the way tighter correlation did.")
+    print("If none clear that bar either, we'll have tested 3 fundamentally different root-cause")
+    print("mechanisms (side-cap, correlation-tightening, dominance) and can say with real confidence")
+    print("that MaxLS=6 is this system's structural floor, not a gap in our search.")
+
