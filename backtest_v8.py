@@ -690,9 +690,8 @@ def run_backtest(frames_1h, variant_name, variant_cfg, start=None, end=None):
 
             # Group lock + portfolio cap.
             active_groups = {
-                positions[s]["group"]
+                positions[s].group
                 for s in positions
-                if s in positions
             }
 
             if len(positions) >= MAX_OPEN_POSITIONS:
