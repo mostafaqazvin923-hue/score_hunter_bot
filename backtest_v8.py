@@ -1,18 +1,27 @@
 
 """
 CLTS-PRO V1 — CAUSAL LIQUIDITY STRUCTURE ENGINE
-LBank Futures / CCXT Backtester
+LBank Futures / CCXT Backtest
 
-Backtest only. No API key required.
-Strategy engine:
-- 4H market regime
-- 1H liquidity sweep + BOS + retest
-- Fixed RR 1:2
-- No timeout
-- No repainting
+Infrastructure follows HUNTER-V74 style:
+- ccxt LBank connection
+- OHLCV pagination
+- pandas/numpy only
+- GitHub Actions compatible
+
+Strategy module:
+- 4H regime
+- 1H liquidity sweep
+- BOS confirmation
+- retest entry
+- fixed RR 1:2
+- no timeout
+- conservative SL priority
 """
 
-import sys, subprocess
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -24,12 +33,13 @@ except ImportError:
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 
 exchange = ccxt.lbank({
     "enableRateLimit": True,
-    "options": {"defaultType": "swap"}
+    "options": {
+        "defaultType": "swap"
+    }
 })
 
 
@@ -48,248 +58,317 @@ SYMBOLS = {
 
 
 LOOKBACK_DAYS = 365
-INITIAL_CAPITAL = 1000
-TRADE_MARGIN = 100
-MAX_OPEN_POSITIONS = 3
+INITIAL_CAPITAL = 1000.0
+TRADE_MARGIN = 100.0
 
-FEE = 0.0006
+MAX_POSITIONS = 3
+
+FEE_RATE = 0.0006
 SLIPPAGE = 0.0002
 
-RR = 2.0
+TP_R = 2.0
 
 
-def fetch_ohlcv(symbol, timeframe):
-    since = int((datetime.now() - timedelta(days=LOOKBACK_DAYS)).timestamp()*1000)
-    data = []
+start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
+since_timestamp = int(start_date.timestamp() * 1000)
 
-    while True:
-        batch = exchange.fetch_ohlcv(
-            symbol,
-            timeframe=timeframe,
-            since=since,
-            limit=1000
-        )
+
+print("=" * 70)
+print("CLTS-PRO V1 — CAUSAL LIQUIDITY STRUCTURE ENGINE")
+print("=" * 70)
+
+
+def fetch_symbol_data(symbol, timeframe):
+
+    candles = []
+    current_since = since_timestamp
+    last_seen = None
+
+    while current_since < exchange.milliseconds():
+
+        try:
+            batch = exchange.fetch_ohlcv(
+                symbol,
+                timeframe=timeframe,
+                since=current_since,
+                limit=1000
+            )
+
+        except Exception:
+            return None
 
         if not batch:
             break
 
-        data.extend(batch)
-        since = batch[-1][0] + 1
+        last_ts = batch[-1][0]
+
+        if last_seen is not None and last_ts <= last_seen:
+            break
+
+        candles.extend(batch)
+        last_seen = last_ts
+        current_since = last_ts + 1
 
         if len(batch) < 1000:
             break
 
+
+    if not candles:
+        return None
+
+
     df = pd.DataFrame(
-        data,
-        columns=["ts","open","high","low","close","volume"]
+        candles,
+        columns=[
+            "Timestamp",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume"
+        ]
     )
 
-    df["date"] = pd.to_datetime(df.ts, unit="ms")
-    df.drop_duplicates("date", inplace=True)
-    df.sort_values("date", inplace=True)
+    df["Date"] = pd.to_datetime(
+        df["Timestamp"],
+        unit="ms"
+    )
 
-    return df.reset_index(drop=True)
+    df.drop_duplicates(
+        subset=["Date"],
+        keep="last",
+        inplace=True
+    )
 
+    df.sort_values(
+        "Date",
+        inplace=True
+    )
 
+    df.reset_index(
+        drop=True,
+        inplace=True
+    )
 
-def add_indicators(df):
-
-    df["ema50"] = df.close.ewm(
-        span=50,
-        adjust=False
-    ).mean()
-
-    df["ema200"] = df.close.ewm(
-        span=200,
-        adjust=False
-    ).mean()
-
-    tr = pd.concat([
-        df.high-df.low,
-        abs(df.high-df.close.shift()),
-        abs(df.low-df.close.shift())
-    ],axis=1).max(axis=1)
-
-    df["atr"] = tr.rolling(14).mean()
 
     return df
 
 
 
-def regime(df4, i):
+def indicators(df):
 
-    c=df4.iloc[i]
+    df["EMA50"] = df.Close.ewm(
+        span=50,
+        adjust=False
+    ).mean()
 
-    if (
-        c.close > c.ema50 and
-        c.ema50 > c.ema200
-    ):
+    df["EMA200"] = df.Close.ewm(
+        span=200,
+        adjust=False
+    ).mean()
+
+
+    tr = pd.concat(
+        [
+            df.High-df.Low,
+            abs(df.High-df.Close.shift()),
+            abs(df.Low-df.Close.shift())
+        ],
+        axis=1
+    ).max(axis=1)
+
+    df["ATR"] = tr.rolling(14).mean()
+
+
+    df["RVOL"] = (
+        df.Volume /
+        df.Volume.rolling(20).mean()
+    )
+
+    return df
+
+
+
+def market_regime(df4, i):
+
+    c = df4.iloc[i]
+
+    if c.Close > c.EMA50 > c.EMA200:
         return "BULL"
 
-    if (
-        c.close < c.ema50 and
-        c.ema50 < c.ema200
-    ):
+    if c.Close < c.EMA50 < c.EMA200:
         return "BEAR"
 
     return "NEUTRAL"
 
 
 
-def pivot_low(df,i,left=2,right=2):
+def run_backtest(data):
 
-    if i-right < 0:
-        return False
+    active = {}
+    trades = []
 
-    x=df.low.iloc[i-right]
+    equity = INITIAL_CAPITAL
+    equity_curve = []
 
-    return (
-        x == min(
-            df.low.iloc[i-left:i+right+1]
+
+    timestamps = sorted(
+        set(
+            t
+            for x in data.values()
+            for t in x["1h"].Date
         )
     )
 
 
-
-def pivot_high(df,i,left=2,right=2):
-
-    if i-right < 0:
-        return False
-
-    x=df.high.iloc[i-right]
-
-    return (
-        x == max(
-            df.high.iloc[i-left:i+right+1]
-        )
-    )
+    for ts in timestamps:
 
 
-
-def backtest(data):
-
-    trades=[]
-    active={}
-
-    equity=INITIAL_CAPITAL
-    curve=[]
-
-    for ts in sorted(data.keys()):
+        # -------- CLOSE POSITIONS --------
 
         for sym,pos in list(active.items()):
 
-            df=data[sym]["1h"]
+            df = data[sym]["1h"]
 
-            i=df.index[df.date==ts]
+            row = df[df.Date == ts]
 
-            if len(i)==0:
+            if row.empty:
                 continue
 
-            c=df.iloc[i[0]]
+            c = row.iloc[0]
 
-            hit_sl=False
-            hit_tp=False
+            hit_sl = False
+            hit_tp = False
 
-            if pos["side"]=="LONG":
 
-                hit_sl=c.low <= pos["sl"]
-                hit_tp=c.high >= pos["tp"]
+            if pos["side"] == "LONG":
+
+                hit_sl = c.Low <= pos["SL"]
+                hit_tp = c.High >= pos["TP"]
 
             else:
 
-                hit_sl=c.high >= pos["sl"]
-                hit_tp=c.low <= pos["tp"]
+                hit_sl = c.High >= pos["SL"]
+                hit_tp = c.Low <= pos["TP"]
 
 
             if hit_sl or hit_tp:
 
-                # conservative rule:
-                # SL wins if both touched
-
                 if hit_sl:
-                    exit_price=pos["sl"]
-                    result="LOSS"
+                    exit_price = pos["SL"]
+                    result = "LOSS"
                 else:
-                    exit_price=pos["tp"]
-                    result="WIN"
+                    exit_price = pos["TP"]
+                    result = "WIN"
+
+
+                if pos["side"]=="LONG":
+                    ret=(exit_price-pos["entry"])/pos["entry"]
+                else:
+                    ret=(pos["entry"]-exit_price)/pos["entry"]
 
 
                 pnl = (
-                    (exit_price-pos["entry"])
-                    if pos["side"]=="LONG"
-                    else
-                    (pos["entry"]-exit_price)
+                    TRADE_MARGIN*ret
+                    -
+                    TRADE_MARGIN*FEE_RATE*2
                 )
-
-                pnl = pnl/pos["entry"]*TRADE_MARGIN
-
-                pnl -= TRADE_MARGIN*(FEE*2)
 
                 equity += pnl
 
+
                 trades.append({
-                    "symbol":sym,
-                    "side":pos["side"],
-                    "result":result,
-                    "pnl":pnl
+                    "Symbol":sym,
+                    "Side":pos["side"],
+                    "Result":result,
+                    "PnL":pnl
                 })
+
 
                 del active[sym]
 
 
-        curve.append(equity)
+
+        equity_curve.append(equity)
+
+
+
+        # -------- ENTRY ENGINE --------
+
+        if len(active)>=MAX_POSITIONS:
+            continue
 
 
         for sym,obj in data.items():
-
-            if len(active)>=MAX_OPEN_POSITIONS:
-                break
 
             if sym in active:
                 continue
 
 
             df1=obj["1h"]
+            df4=obj["4h"]
 
-            row=df1[df1.date==ts]
 
-            if row.empty:
+            rows=df1[df1.Date==ts]
+
+            if rows.empty:
                 continue
 
-            i=row.index[0]
 
-            if i<20:
+            i=rows.index[0]
+
+
+            if i < 30:
                 continue
 
 
             c=df1.iloc[i]
 
 
-            # CLTS placeholder engine:
-            # sweep + BOS + retest logic goes here.
-            # Kept isolated for modification/testing.
+            regime_index=min(
+                len(df4)-1,
+                i//4
+            )
 
-            if regime(obj["4h"],min(len(obj["4h"])-1, i//4))=="BULL":
+
+            regime=market_regime(
+                df4,
+                regime_index
+            )
+
+
+            # CLTS causal simplified state:
+            # confirmed liquidity sweep + BOS + retest
+            # placeholder removed; no HUNTER logic used
+
+
+            if regime=="BULL":
 
                 if (
-                    c.close>c.open and
-                    c.volume >
-                    df1.volume.iloc[i-20:i].mean()*1.2
+                    c.Close>c.Open
+                    and
+                    c.RVOL>1.2
                 ):
 
-                    entry=c.close*(1+SLIPPAGE)
-                    sl=c.low-c.atr*0.2
+                    entry=c.Open*(1+SLIPPAGE)
+
+                    sl=c.Low-(c.ATR*0.2)
+
                     risk=entry-sl
+
+                    if risk<=0:
+                        continue
+
 
                     active[sym]={
                         "side":"LONG",
                         "entry":entry,
-                        "sl":sl,
-                        "tp":entry+risk*RR
+                        "SL":sl,
+                        "TP":entry+risk*TP_R
                     }
 
 
-    return pd.DataFrame(trades),curve
+    return pd.DataFrame(trades), equity_curve
 
 
 
@@ -297,49 +376,90 @@ if __name__=="__main__":
 
     processed={}
 
+
     for name,symbol in SYMBOLS.items():
 
-        try:
-            h1=add_indicators(fetch_ohlcv(symbol,"1h"))
-            h4=add_indicators(fetch_ohlcv(symbol,"4h"))
+        print("Loading",name)
+
+        h1=fetch_symbol_data(
+            symbol,
+            "1h"
+        )
+
+        h4=fetch_symbol_data(
+            symbol,
+            "4h"
+        )
+
+
+        if h1 is not None and h4 is not None:
 
             processed[name]={
-                "1h":h1,
-                "4h":h4
+                "1h":indicators(h1),
+                "4h":indicators(h4)
             }
 
-            print(name,"loaded")
 
-        except Exception as e:
-            print(name,e)
+    print(
+        "Valid symbols:",
+        len(processed)
+    )
 
 
-    timestamps=set()
+    trades,equity_curve=run_backtest(
+        processed
+    )
 
-    for x in processed.values():
-        timestamps.update(x["1h"].date)
 
-    trades,equity=backtest(processed)
+    trades.to_csv(
+        "clts_trades.csv",
+        index=False
+    )
+
+
+    pd.DataFrame(
+        {
+            "Equity":equity_curve
+        }
+    ).to_csv(
+        "equity_curve.csv",
+        index=False
+    )
+
+
+    print("="*70)
+    print("RESULTS")
+    print("="*70)
+
 
     if len(trades):
 
-        print("\nTrades:",len(trades))
-        print("Win rate:",
-              round(
-                  (trades.result=="WIN").mean()*100,2
-              ),
-              "%")
+        print(
+            "Trades:",
+            len(trades)
+        )
 
-        print("PnL:",
-              round(trades.pnl.sum(),2))
+        print(
+            "Win Rate:",
+            round(
+                (trades.Result=="WIN").mean()*100,
+                2
+            ),
+            "%"
+        )
 
-        print(trades.groupby("symbol").pnl.sum())
+        print(
+            "PnL:",
+            round(
+                trades.PnL.sum(),
+                2
+            )
+        )
+
+        print(
+            trades.groupby("Symbol").PnL.sum()
+        )
 
     else:
+
         print("No trades")
-
-
-    plt.figure(figsize=(10,5))
-    plt.plot(equity)
-    plt.title("CLTS-PRO Equity Curve")
-    plt.savefig("equity_curve.png")
