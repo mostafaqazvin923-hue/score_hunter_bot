@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V80 — INSTITUTIONAL QUANT ENGINE (LONG & SHORT)
+# HUNTER-V85 — INSTITUTIONAL MARKET STRUCTURE & ORDER FLOW
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -39,25 +39,25 @@ SYMBOLS = {
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
-MAX_POSITIONS = 6  # ظرفیت مناسب برای توزیع ریسک بین لانگ و شورت
+MAX_POSITIONS = 5
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-TRAILING_ATR_MULTIPLIER = 2.2
-INITIAL_ATR_MULTIPLIER = 1.8
-TIMEOUT_CANDLES = 40
+INITIAL_ATR_MULTIPLIER = 1.5
+TP_ATR_MULTIPLIER = 3.0  # ریوارد ۳ به ۱ برای جبران وین‌ریت
+TIMEOUT_CANDLES = 30
 EMA_WARMUP = 200
 
 TRADE_MARGIN = 100.0
-LEVERAGE = 10.0  # اهرم امن منطبق با استانداردهای مدیریت ریسک نهنگی
+LEVERAGE = 10.0
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V80 — INSTITUTIONAL QUANT ENGINE INITIALIZED")
+print("HUNTER-V85 — MARKET STRUCTURE & VOLUME FLOW ENGINE")
 print("=" * 68)
 
 processed_data = {}
@@ -116,23 +116,21 @@ def fetch_symbol_data(lbank_symbol):
     if not deltas.empty and deltas.max() > pd.Timedelta(hours=4, minutes=10):
         return None
 
-    # فاکتورهای کوانت و محاسبات آماری مؤسسات
     tr1 = df["High"] - df["Low"]
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
 
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
-    df["SMA50"] = df["Close"].rolling(50).mean()
-    df["SMA200"] = df["Close"].rolling(200).mean()
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
     
-    # محاسبه Z-Score برای انحراف آماری قیمت از میانگین (مبنای استراتژی‌های میان‌ویو نهنگ‌ها)
-    rolling_std = df["Close"].rolling(20).std()
-    rolling_mean = df["Close"].rolling(20).mean()
-    df["Z_Score"] = (df["Close"] - rolling_mean) / rolling_std
-
-    # فاکتور آلفای مومنتوم و حجم ترکیبی
-    df["Volume_Factor"] = df["Volume"] / df["Volume"].rolling(20).mean()
-    df["Alpha_Momentum"] = (df["Close"] - df["Close"].shift(3)) / df["Close"].shift(3)
+    # شناسایی سقف و کف‌های محلی برای ساختار بازار
+    df["Highest_20"] = df["High"].rolling(20).max()
+    df["Lowest_20"] = df["Low"].rolling(20).min()
+    
+    # فیلتر حجم نوسانی نهنگ‌ها
+    df["Volume_MA"] = df["Volume"].rolling(20).mean()
+    df["Volume_Spike"] = df["Volume"] > (df["Volume_MA"] * 1.3)
 
     df.set_index("Date", inplace=True)
     return df
@@ -147,7 +145,7 @@ print(f"Valid institutional symbols loaded: {len(processed_data)}")
 def get_all_timestamps(data):
     return sorted({ts for df in data.values() for ts in df.index})
 
-def run_institutional_backtest(processed_data):
+def run_market_structure_backtest(processed_data):
     all_timestamps = get_all_timestamps(processed_data)
     active_positions = {}
     all_trades = []
@@ -168,35 +166,38 @@ def run_institutional_backtest(processed_data):
                 continue
             c4h = df.loc[ts]
 
+            # بررسی برخورد با حد ضرر یا حد سود (TP/SL)
             if pos["side"] == "LONG":
-                if c4h["High"] > pos["highest_price"]:
-                    pos["highest_price"] = c4h["High"]
-                    new_trailing_sl = pos["highest_price"] - TRAILING_ATR_MULTIPLIER * c4h["ATR"]
-                    if new_trailing_sl > pos["stop_loss"]:
-                        pos["stop_loss"] = new_trailing_sl
                 hit_sl = c4h["Low"] <= pos["stop_loss"]
+                hit_tp = c4h["High"] >= pos["take_profit"]
             else:
-                if c4h["Low"] < pos["lowest_price"]:
-                    pos["lowest_price"] = c4h["Low"]
-                    new_trailing_sl = pos["lowest_price"] + TRAILING_ATR_MULTIPLIER * c4h["ATR"]
-                    if new_trailing_sl < pos["stop_loss"]:
-                        pos["stop_loss"] = new_trailing_sl
                 hit_sl = c4h["High"] >= pos["stop_loss"]
+                hit_tp = c4h["Low"] <= pos["take_profit"]
 
             curr_i = df.index.get_loc(ts)
             candles_held = curr_i - pos["entry_index"]
             is_timeout = candles_held >= TIMEOUT_CANDLES
 
-            if not (hit_sl or is_timeout):
+            if not (hit_sl or hit_tp or is_timeout):
                 continue
 
             initial_risk = pos["initial_risk"]
             if pos["side"] == "LONG":
-                exit_p = min(pos["stop_loss"], c4h["Open"]) if hit_sl else c4h["Close"]
+                if hit_tp:
+                    exit_p = pos["take_profit"]
+                elif hit_sl:
+                    exit_p = min(pos["stop_loss"], c4h["Open"])
+                else:
+                    exit_p = c4h["Close"]
                 r_real = ((exit_p - pos["entry_price"]) / initial_risk) - (FEE_RATE * 2)
                 price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
             else:
-                exit_p = max(pos["stop_loss"], c4h["Open"]) if hit_sl else c4h["Close"]
+                if hit_tp:
+                    exit_p = pos["take_profit"]
+                elif hit_sl:
+                    exit_p = max(pos["stop_loss"], c4h["Open"])
+                else:
+                    exit_p = c4h["Close"]
                 r_real = ((pos["entry_price"] - exit_p) / initial_risk) - (FEE_RATE * 2)
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
@@ -205,7 +206,7 @@ def run_institutional_backtest(processed_data):
             if outcome == "LOSS":
                 consecutive_losses += 1
                 if consecutive_losses >= 3:
-                    cooldown_counter = 5
+                    cooldown_counter = 6
             else:
                 consecutive_losses = 0
 
@@ -228,7 +229,7 @@ def run_institutional_backtest(processed_data):
         if consecutive_losses >= 3:
             continue
 
-        # منطق سیگنال‌دهی کوانت مؤسسات (بدون نگاه به آینده - روی کندل i-1)
+        # سیگنال ساختار بازار و جریان سفارشات (بدون نگاه به آینده - روی کندل i-1)
         for symbol, df in processed_data.items():
             if symbol in active_positions:
                 continue
@@ -242,20 +243,20 @@ def run_institutional_backtest(processed_data):
             prev_c = df.iloc[i - 1]
             c4h = df.iloc[i]
 
-            # فاکتور ترکیبی لانگ: بازگشت از اشباع فروش یا تاییدیه مومنتوم بالا رونده
+            # شرایط ساختار لانگ: روند صعودی میان‌مدت + حجم بالا + شکست مقاومت محلی
             valid_long = (
-                prev_c["Close"] > prev_c["SMA50"] and
-                prev_c["Z_Score"] > -1.5 and prev_c["Z_Score"] < 1.0 and
-                prev_c["Alpha_Momentum"] > 0.003 and
-                prev_c["Volume_Factor"] > 0.8
+                prev_c["Close"] > prev_c["EMA50"] and
+                prev_c["EMA50"] > prev_c["EMA200"] and
+                prev_c["Volume_Spike"] and
+                prev_c["Close"] >= prev_c["Highest_20"] * 0.99
             )
 
-            # فاکتور ترکیبی شورت: متقارن لانگ در روندهای نزولی یا اشباع خرید
+            # شرایط ساختار شورت: روند نزولی میان‌مدت + حجم بالا + شکست حمایت محلی
             valid_short = (
-                prev_c["Close"] < prev_c["SMA50"] and
-                prev_c["Z_Score"] < 1.5 and prev_c["Z_Score"] > -1.0 and
-                prev_c["Alpha_Momentum"] < -0.003 and
-                prev_c["Volume_Factor"] > 0.8
+                prev_c["Close"] < prev_c["EMA50"] and
+                prev_c["EMA50"] < prev_c["EMA200"] and
+                prev_c["Volume_Spike"] and
+                prev_c["Close"] <= prev_c["Lowest_20"] * 1.01
             )
 
             if not (valid_long or valid_short):
@@ -264,7 +265,14 @@ def run_institutional_backtest(processed_data):
             side = "LONG" if valid_long else "SHORT"
             
             entry_price = c4h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c4h["Open"] * (1 - SLIPPAGE)
-            initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"] if side == "LONG" else entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"]
+            
+            if side == "LONG":
+                initial_sl = entry_price - INITIAL_ATR_MULTIPLIER * c4h["ATR"]
+                take_profit = entry_price + (INITIAL_ATR_MULTIPLIER * TP_ATR_MULTIPLIER) * c4h["ATR"]
+            else:
+                initial_sl = entry_price + INITIAL_ATR_MULTIPLIER * c4h["ATR"]
+                take_profit = entry_price - (INITIAL_ATR_MULTIPLIER * TP_ATR_MULTIPLIER) * c4h["ATR"]
+
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
@@ -278,8 +286,7 @@ def run_institutional_backtest(processed_data):
                 "side": side,
                 "entry_price": float(entry_price),
                 "stop_loss": float(initial_sl),
-                "highest_price": float(entry_price),
-                "lowest_price": float(entry_price),
+                "take_profit": float(take_profit),
                 "initial_risk": float(initial_risk),
                 "entry_index": int(i),
             }
@@ -287,7 +294,7 @@ def run_institutional_backtest(processed_data):
     return pd.DataFrame(all_trades)
 
 if __name__ == "__main__":
-    trades_df = run_institutional_backtest(processed_data)
+    trades_df = run_market_structure_backtest(processed_data)
     n = len(trades_df)
     wr = (trades_df["Outcome"].eq("WIN").mean() * 100) if n else 0
     pnl = float(trades_df["Dollar_PnL"].sum()) if n else 0
@@ -305,7 +312,7 @@ if __name__ == "__main__":
                 cur = 0
 
     print("=" * 72)
-    print("INSTITUTIONAL QUANT ENGINE BACKTEST RESULTS")
+    print("MARKET STRUCTURE ENGINE BACKTEST RESULTS")
     print("=" * 72)
     print(f"Total Trades: {n} (Longs: {longs_count} | Shorts: {shorts_count})")
     print(f"Win Rate: {wr:.2f}% | Net PnL: ${pnl:,.2f} | Max Loss Streak: {mx}")
