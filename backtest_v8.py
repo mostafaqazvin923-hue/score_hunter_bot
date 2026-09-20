@@ -4,41 +4,50 @@ import numpy as np
 def run_score_hunter_backtest(df):
     initial_capital = 1000.0
     capital = initial_capital
-    fixed_margin = 100.0  # مارجین ثابت برای هر معامله
+    fixed_margin = 100.0  # مارجین ثابت ۱۰۰ دلار برای هر معامله
     
     position = None 
     entry_price = 0.0
     stop_loss = 0.0
     take_profit = 0.0
-    position_size = 0.0
     
     trades = []
     equity_curve = [initial_capital]
 
-    for i in range(1, len(df)):
+    # محاسبه اندیکاتورها روی کل دیتابیس به صورت کائوسال (صرفاً از گذشته برای کندل i-1 استفاده می‌شود)
+    df['EMA_Fast'] = df['Close'].ewm(span=9, adjust=False).mean()
+    df['EMA_Slow'] = df['Close'].ewm(span=21, adjust=False).mean()
+    
+    # محاسبه ساده RSI
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    for i in range(21, len(df)):
         current_open = df['Open'].iloc[i]
         current_high = df['High'].iloc[i]
         current_low = df['Low'].iloc[i]
-        current_close = df['Close'].iloc[i]
         
-        prev_open = df['Open'].iloc[i-1]
-        prev_close = df['Close'].iloc[i-1]
-        prev_high = df['High'].iloc[i-1]
+        prev_fast = df['EMA_Fast'].iloc[i-1]
+        prev_slow = df['EMA_Slow'].iloc[i-1]
+        prev_rsi = df['RSI'].iloc[i-1]
         prev_low = df['Low'].iloc[i-1]
-        signal = df['Signal'].iloc[i-1]
+        prev_high = df['High'].iloc[i-1]
+        entry_close = df['Close'].iloc[i-1]
         
         # ۱. مدیریت پوزیشن‌های باز
         if position == 'LONG':
             if current_low <= stop_loss:
-                # محاسبه ضرر بر اساس مارجین ثابت و فاصله تا استاپ‌لاس
                 loss_pct = (entry_price - stop_loss) / entry_price
-                pnl = - (fixed_margin * loss_pct * 5) # فرض اهرم یا مقیاس مشخص
+                pnl = - (fixed_margin * loss_pct * 3) # اهرم ۳ برای استراتژی مومنتوم
                 capital += pnl
                 trades.append({'result': 'LOSS', 'pnl': pnl})
                 position = None
             elif current_high >= take_profit:
                 win_pct = (take_profit - entry_price) / entry_price
-                pnl = fixed_margin * win_pct * 5
+                pnl = fixed_margin * win_pct * 3
                 capital += pnl
                 trades.append({'result': 'WIN', 'pnl': pnl})
                 position = None
@@ -46,34 +55,36 @@ def run_score_hunter_backtest(df):
         elif position == 'SHORT':
             if current_high >= stop_loss:
                 loss_pct = (stop_loss - entry_price) / entry_price
-                pnl = - (fixed_margin * loss_pct * 5)
+                pnl = - (fixed_margin * loss_pct * 3)
                 capital += pnl
                 trades.append({'result': 'LOSS', 'pnl': pnl})
                 position = None
             elif current_low <= take_profit:
                 win_pct = (entry_price - take_profit) / entry_price
-                pnl = fixed_margin * win_pct * 5
+                pnl = fixed_margin * win_pct * 3
                 capital += pnl
                 trades.append({'result': 'WIN', 'pnl': pnl})
                 position = None
 
-        # ۲. ورود جدید با مارجین ثابت ۱۰۰ دلاری
-        if position is None and signal != 0 and capital >= fixed_margin:
-            if signal == 1 and prev_close > prev_open:  # خرید
+        # ۲. ستاپ ورود جدید (کراس EMA به همراه تاییدیه RSI و ریسک به ریوارد 1 به 2)
+        if position is None and capital >= fixed_margin:
+            # سیگنال خرید: کراس صعودی و RSI بالای 50 (روند صعودی قوی)
+            if prev_fast > prev_slow and prev_rsi > 50:
                 position = 'LONG'
                 entry_price = current_open
                 stop_loss = prev_low
                 if entry_price > stop_loss:
-                    take_profit = entry_price + (entry_price - stop_loss) * 2.0 # ریسک به ریوارد 1 به 2
+                    take_profit = entry_price + (entry_price - stop_loss) * 2.0  # R:R = 1:2
                 else:
                     position = None
                     
-            elif signal == -1 and prev_close < prev_open:  # فروش
+            # سیگنال فروش: کراس نزولی و RSI زیر 50 (روند نزولی قوی)
+            elif prev_fast < prev_slow and prev_rsi < 50:
                 position = 'SHORT'
                 entry_price = current_open
                 stop_loss = prev_high
                 if stop_loss > entry_price:
-                    take_profit = entry_price - (stop_loss - entry_price) * 2.0 # ریسک به ریوارد 1 به 2
+                    take_profit = entry_price - (stop_loss - entry_price) * 2.0  # R:R = 1:2
                 else:
                     position = None
 
@@ -98,7 +109,7 @@ def run_score_hunter_backtest(df):
     total_pnl = capital - initial_capital
 
     print("=" * 50)
-    print("گزارش نهایی بک‌تست (استراتژی جدید - مارجین ثابت ۱۰۰$ و R:R = 1:2)")
+    print("گزارش نهایی بک‌تست (ستتاپ EMA + RSI با R:R = 1:2)")
     print("=" * 50)
     print(f"تعداد کل معامله ها: {total_trades}")
     print(f"وین ریت کلی (Win Rate): {win_rate:.2f}%")
@@ -110,16 +121,14 @@ def run_score_hunter_backtest(df):
 
 if __name__ == "__main__":
     np.random.seed(42)
-    dates = pd.date_range(start='2026-01-01', periods=300, freq='4h')
-    prices = 50000 + np.cumsum(np.random.randn(300) * 80)
+    dates = pd.date_range(start='2026-01-01', periods=500, freq='4h')
+    prices = 50000 + np.cumsum(np.random.randn(500) * 120)
     
     df_test = pd.DataFrame({
-        'Open': prices + np.random.randn(300) * 10,
-        'High': prices + abs(np.random.randn(300) * 15),
-        'Low': prices - abs(np.random.randn(300) * 15),
-        'Close': prices + np.random.randn(300) * 10
+        'Open': prices + np.random.randn(500) * 15,
+        'High': prices + abs(np.random.randn(500) * 25),
+        'Low': prices - abs(np.random.randn(500) * 25),
+        'Close': prices + np.random.randn(500) * 15
     }, index=dates)
-    
-    df_test['Signal'] = np.random.choice([0, 1, -1], size=len(df_test), p=[0.65, 0.175, 0.175])
     
     run_score_hunter_backtest(df_test)
