@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V105 — OPTIMIZED FEE-AWARE INSTITUTIONAL ENGINE
+# HUNTER-V106 — MOMENTUM BOLLINGER & RSI BREAKOUT ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -39,26 +39,26 @@ SYMBOLS = {
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "1h"
-MAX_POSITIONS = 5
+MAX_POSITIONS = 4
 
 SLIPPAGE = 0.0002
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-INITIAL_ATR_MULTIPLIER = 1.6
-TP_ATR_MULTIPLIER = 4.0  # ریسک به ریوارد عالی 1 به 2.5 برای پوشش کامل کارمزد
-TIMEOUT_CANDLES = 24
+INITIAL_ATR_MULTIPLIER = 1.8
+TP_ATR_MULTIPLIER = 3.6  # ریسک به ریوارد مطمئن 1 به 2
+TIMEOUT_CANDLES = 18
 EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 2000.0
 TRADE_MARGIN = 100.0
-LEVERAGE = 20.0  # اهرم بهینه ۲۰x برای جلوگیری از بلعیده شدن سود توسط کارمزد صرافی
+LEVERAGE = 20.0
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V105 — OPTIMIZED FEE-AWARE ENGINE INITIALIZED")
+print("HUNTER-V106 — MOMENTUM BOLLINGER ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -109,10 +109,7 @@ def fetch_and_prepare_data(lbank_symbol):
 
     df.set_index("Date", inplace=True)
 
-    df_daily = df.resample('1D').agg({
-        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-    }).dropna()
-
+    # محاسبه اندیکاتورها (باند بولینگر و RSI به همراه میانگین‌ها)
     tr1 = df["High"] - df["Low"]
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
@@ -121,11 +118,19 @@ def fetch_and_prepare_data(lbank_symbol):
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
-    df_daily["EMA200_Daily"] = df_daily["Close"].ewm(span=200, adjust=False).mean()
-    df["Daily_EMA200"] = df_daily["EMA200_Daily"].reindex(df.index, method='ffill')
+    # بولینگر بندز (20 دوره، انحراف معیار 2)
+    bb_period = 20
+    df["BB_Middle"] = df["Close"].rolling(bb_period).mean()
+    bb_std = df["Close"].rolling(bb_period).std()
+    df["BB_Upper"] = df["BB_Middle"] + (bb_std * 2.0)
+    df["BB_Lower"] = df["BB_Middle"] - (bb_std * 2.0)
 
-    df["Swing_High"] = df["High"].rolling(14).max().shift(1)
-    df["Swing_Low"] = df["Low"].rolling(14).min().shift(1)
+    # شاخص قدرت نسبی (RSI 14)
+    delta = df["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df["RSI"] = 100 - (100 / (1 + rs))
 
     df.dropna(inplace=True)
     if len(df) < EMA_WARMUP:
@@ -207,7 +212,7 @@ def run_backtest(processed_data):
                 consecutive_losses += 1
                 current_loss_streak += 1
                 if consecutive_losses >= 3:
-                    global_cooldown = 20
+                    global_cooldown = 15  # توقف سریع تر برای جلوگیری از ضررهای زنجیره‌ای
             else:
                 if current_loss_streak > 0:
                     loss_streaks_list.append(current_loss_streak)
@@ -226,7 +231,7 @@ def run_backtest(processed_data):
                 "Dollar_PnL": dollar_pnl,
             })
             
-            cooldown_counters[symbol] = 3
+            cooldown_counters[symbol] = 2
             symbols_to_close.append(symbol)
 
         for sym in symbols_to_close:
@@ -251,14 +256,13 @@ def run_backtest(processed_data):
             prev_c = df.iloc[i - 1]
             c1h = df.iloc[i]
 
-            trend_bullish = prev_c["Close"] > prev_c["Daily_EMA200"] and prev_c["EMA50"] > prev_c["EMA200"]
-            trend_bearish = prev_c["Close"] < prev_c["Daily_EMA200"] and prev_c["EMA50"] < prev_c["EMA200"]
+            # ستاپ جدید: روند صعودی با بولینگر و RSI
+            trend_long = prev_c["Close"] > prev_c["EMA200"] and prev_c["EMA50"] > prev_c["EMA200"]
+            trend_short = prev_c["Close"] < prev_c["EMA200"] and prev_c["EMA50"] < prev_c["EMA200"]
 
-            candle_body = abs(prev_c["Close"] - prev_c["Open"])
-            is_displacement = candle_body >= (prev_c["ATR"] * 1.3)
-
-            valid_long = trend_bullish and is_displacement and (prev_c["Close"] > prev_c["Open"]) and (prev_c["Low"] <= prev_c["Swing_Low"])
-            valid_short = trend_bearish and is_displacement and (prev_c["Close"] < prev_c["Open"]) and (prev_c["High"] >= prev_c["Swing_High"])
+            # شرایط ورود بر اساس برخورد/شکست بند بالایی و پایینی بولینگر به همراه مومنتوم RSI
+            valid_long = trend_long and (prev_c["Close"] <= prev_c["BB_Lower"]) and (prev_c["RSI"] < 40)
+            valid_short = trend_short and (prev_c["Close"] >= prev_c["BB_Upper"]) and (prev_c["RSI"] > 60)
 
             if not (valid_long or valid_short):
                 continue
@@ -277,7 +281,7 @@ def run_backtest(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.012 <= sl_dist_pct <= 0.05):
+            if not (0.01 <= sl_dist_pct <= 0.05):
                 continue
 
             if len(active_positions) >= MAX_POSITIONS:
@@ -305,7 +309,7 @@ if __name__ == "__main__":
     max_streak = max(loss_streaks) if loss_streaks else 0
 
     print("=" * 72)
-    print("HUNTER-V105 BACKTEST RESULTS (1-YEAR)")
+    print("HUNTER-V106 BACKTEST RESULTS (1-YEAR)")
     print("=" * 72)
     print(f"Total Trades: {n}")
     print(f"Overall Win Rate: {win_rate:.2f}%")
