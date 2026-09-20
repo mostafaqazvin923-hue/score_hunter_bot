@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-INSTITUTIONAL QUANT ENGINE (1H / 4H / DAILY)
+# HUNTER-V90 — ULTIMATE INSTITUTIONAL QUANT ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -39,15 +39,15 @@ SYMBOLS = {
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "1h"
-MAX_POSITIONS = 5
+MAX_POSITIONS = 4
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-INITIAL_ATR_MULTIPLIER = 1.8
-TP_ATR_MULTIPLIER = 3.6  # ریسک به ریوارد ۱ به ۲ (1.8 * 2)
-TIMEOUT_CANDLES = 48     # معادل ۴۸ ساعت در تایم‌فریم ۱ ساعته
+INITIAL_ATR_MULTIPLIER = 2.0
+TP_ATR_MULTIPLIER = 4.0  # ریسک به ریوارد دقیق ۱ به ۲ (2.0 * 2)
+TIMEOUT_CANDLES = 36
 EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 2000.0
@@ -58,7 +58,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER INSTITUTIONAL BACKTEST ENGINE INITIALIZED")
+print("HUNTER-V90 — ULTIMATE INSTITUTIONAL ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -109,7 +109,7 @@ def fetch_and_prepare_data(lbank_symbol):
 
     df.set_index("Date", inplace=True)
 
-    # ساخت تایم‌فریم‌های ۴ ساعته و روزانه به صورت کاملاً ایزوله برای جلوگیری از نگاه به آینده
+    # ایجاد تایم‌فریم‌های بالاتر بدون نگاه به آینده (Forward Fill)
     df_4h = df.resample('4h').agg({
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).dropna()
@@ -118,23 +118,22 @@ def fetch_and_prepare_data(lbank_symbol):
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).dropna()
 
-    # محاسبه اندیکاتورها در سطح ۱ ساعته
+    # محاسبات اندیکاتورها و ساختار بازار
     tr1 = df["High"] - df["Low"]
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
     
-    df["Volume_MA"] = df["Volume"].rolling(24).mean()
-    df["Volume_Spike"] = df["Volume"] > (df["Volume_MA"] * 1.3)
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
-    # افزودن اطلاعات رژیم روزانه و ساختار ۴ ساعته به دیتای ۱ ساعته بدون نگاه به آینده (Forward Fill)
     df_daily["EMA200_Daily"] = df_daily["Close"].ewm(span=200, adjust=False).mean()
     df["Daily_EMA200"] = df_daily["EMA200_Daily"].reindex(df.index, method='ffill')
 
-    df_4h["High_20_4H"] = df_4h["High"].rolling(20).max()
-    df_4h["Low_20_4H"] = df_4h["Low"].rolling(20).min()
-    df["H4_High20"] = df_4h["High_20_4H"].reindex(df.index, method='ffill')
-    df["H4_Low20"] = df_4h["Low_20_4H"].reindex(df.index, method='ffill')
+    df_4h["Structure_High"] = df_4h["High"].rolling(15).max()
+    df_4h["Structure_Low"] = df_4h["Low"].rolling(15).min()
+    df["H4_High"] = df_4h["Structure_High"].reindex(df.index, method='ffill')
+    df["H4_Low"] = df_4h["Structure_Low"].reindex(df.index, method='ffill')
 
     df.dropna(inplace=True)
     if len(df) < EMA_WARMUP:
@@ -170,7 +169,7 @@ def run_backtest(processed_data):
 
         symbols_to_close = []
 
-        # ۱. مدیریت پوزیشن‌های باز و بررسی TP / SL / Timeout
+        # مدیریت پوزیشن‌های فعال
         for symbol, pos in list(active_positions.items()):
             df = processed_data[symbol]
             if ts not in df.index:
@@ -213,12 +212,11 @@ def run_backtest(processed_data):
 
             outcome = "WIN" if r_real > 0 else "LOSS"
             
-            # ثبت ضررها و کنترل مدار قطع‌کننده (حداکثر ۴ ضرر متوالی)
             if outcome == "LOSS":
                 consecutive_losses += 1
                 current_loss_streak += 1
-                if consecutive_losses >= 4:
-                    global_cooldown = 24  # ۲۴ ساعت استراحت کل سیستم
+                if consecutive_losses >= 3:
+                    global_cooldown = 36  # مدار قطع‌کننده سخت پس از ۳ ضرر متوالی
             else:
                 if current_loss_streak > 0:
                     loss_streaks_list.append(current_loss_streak)
@@ -237,8 +235,7 @@ def run_backtest(processed_data):
                 "Dollar_PnL": dollar_pnl,
             })
             
-            # اعمال قانون خروج (Exit-Candle Cooldown) روی نماد
-            cooldown_counters[symbol] = 2
+            cooldown_counters[symbol] = 3
             symbols_to_close.append(symbol)
 
         for sym in symbols_to_close:
@@ -247,7 +244,7 @@ def run_backtest(processed_data):
         if global_cooldown > 0:
             continue
 
-        # ۲. بررسی سیگنال ورود روی کندل بسته شده‌ی قبلی (i-1) بدون نگاه به آینده
+        # فیلترهای ورود دقیق مبتنی بر ساختار بازار و بدون نگاه به آینده (روی کندل i-1)
         for symbol, df in processed_data.items():
             if symbol in active_positions:
                 continue
@@ -264,22 +261,20 @@ def run_backtest(processed_data):
             prev_c = df.iloc[i - 1]
             c1h = df.iloc[i]
 
-            # رژیم روزانه و تاییدیه ساختار ۴ ساعته
-            daily_bullish = prev_c["Close"] > prev_c["Daily_EMA200"]
-            daily_bearish = prev_c["Close"] < prev_c["Daily_EMA200"]
+            trend_bullish = prev_c["Close"] > prev_c["Daily_EMA200"] and prev_c["EMA50"] > prev_c["EMA200"]
+            trend_bearish = prev_c["Close"] < prev_c["Daily_EMA200"] and prev_c["EMA50"] < prev_c["EMA200"]
 
-            # شرایط لانگ (بر اساس نشت نقدینگی، حجم بالا و روند روزانه)
+            # شرایط سخت‌گیرانه ساختار بازار برای لانگ و شورت
             valid_long = (
-                daily_bullish and
-                prev_c["Volume_Spike"] and
-                prev_c["Close"] >= prev_c["H4_High20"] * 0.995
+                trend_bullish and
+                prev_c["Close"] >= prev_c["H4_High"] * 0.998 and
+                prev_c["Close"] > prev_c["EMA50"]
             )
 
-            # شرایط شورت (متقارن با لانگ)
             valid_short = (
-                daily_bearish and
-                prev_c["Volume_Spike"] and
-                prev_c["Close"] <= prev_c["H4_Low20"] * 1.005
+                trend_bearish and
+                prev_c["Close"] <= prev_c["H4_Low"] * 1.002 and
+                prev_c["Close"] < prev_c["EMA50"]
             )
 
             if not (valid_long or valid_short):
@@ -299,13 +294,8 @@ def run_backtest(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.01 <= sl_dist_pct <= 0.055):
+            if not (0.012 <= sl_dist_pct <= 0.045):
                 continue
-
-            # اعتبارسنجی فضای خالی و Clearance (چک کردن موانع ۴ ساعته پیش رو)
-            if side == "LONG" and take_profit >= prev_c["H4_High20"] * 1.02:
-                # اگر هدف فراتر از مقاومت ماژور بعدی باشد و فضای کافی نباشد، فیلتر می‌شود
-                pass
 
             if len(active_positions) >= MAX_POSITIONS:
                 break
@@ -332,7 +322,7 @@ if __name__ == "__main__":
     max_streak = max(loss_streaks) if loss_streaks else 0
 
     print("=" * 72)
-    print("HUNTER INSTITUTIONAL BACKTEST RESULTS (1-YEAR)")
+    print("HUNTER-V90 INSTITUTIONAL BACKTEST RESULTS (1-YEAR)")
     print("=" * 72)
     print(f"Total Trades: {n}")
     print(f"Overall Win Rate: {win_rate:.2f}%")
