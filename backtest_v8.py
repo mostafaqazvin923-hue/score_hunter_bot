@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V90 — ULTIMATE INSTITUTIONAL QUANT ENGINE
+# HUNTER-V99 — ULTIMATE INSTITUTIONAL DISPLACEMENT ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -39,15 +39,15 @@ SYMBOLS = {
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "1h"
-MAX_POSITIONS = 4
+MAX_POSITIONS = 3  # کاهش تعداد پوزیشن‌های همزمان برای کنترل دقیق‌تر ریسک
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-INITIAL_ATR_MULTIPLIER = 2.0
-TP_ATR_MULTIPLIER = 4.0  # ریسک به ریوارد دقیق ۱ به ۲ (2.0 * 2)
-TIMEOUT_CANDLES = 36
+INITIAL_ATR_MULTIPLIER = 2.2
+TP_ATR_MULTIPLIER = 4.4  # ریسک به ریوارد دقیق ۱ به ۲
+TIMEOUT_CANDLES = 24
 EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 2000.0
@@ -58,7 +58,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V90 — ULTIMATE INSTITUTIONAL ENGINE INITIALIZED")
+print("HUNTER-V99 — INSTITUTIONAL DISPLACEMENT ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -109,7 +109,7 @@ def fetch_and_prepare_data(lbank_symbol):
 
     df.set_index("Date", inplace=True)
 
-    # ایجاد تایم‌فریم‌های بالاتر بدون نگاه به آینده (Forward Fill)
+    # ساختار ۴ ساعته و روزانه کاملاً ایزوله (بدون نگاه به آینده)
     df_4h = df.resample('4h').agg({
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).dropna()
@@ -118,7 +118,7 @@ def fetch_and_prepare_data(lbank_symbol):
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).dropna()
 
-    # محاسبات اندیکاتورها و ساختار بازار
+    # محاسبات اندیکاتورها و ATR
     tr1 = df["High"] - df["Low"]
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
@@ -130,10 +130,9 @@ def fetch_and_prepare_data(lbank_symbol):
     df_daily["EMA200_Daily"] = df_daily["Close"].ewm(span=200, adjust=False).mean()
     df["Daily_EMA200"] = df_daily["EMA200_Daily"].reindex(df.index, method='ffill')
 
-    df_4h["Structure_High"] = df_4h["High"].rolling(15).max()
-    df_4h["Structure_Low"] = df_4h["Low"].rolling(15).min()
-    df["H4_High"] = df_4h["Structure_High"].reindex(df.index, method='ffill')
-    df["H4_Low"] = df_4h["Structure_Low"].reindex(df.index, method='ffill')
+    # سویینگ‌های ساختاری ۲۰ دوره گذشته
+    df["Swing_High"] = df["High"].rolling(20).max().shift(1)
+    df["Swing_Low"] = df["Low"].rolling(20).min().shift(1)
 
     df.dropna(inplace=True)
     if len(df) < EMA_WARMUP:
@@ -169,7 +168,7 @@ def run_backtest(processed_data):
 
         symbols_to_close = []
 
-        # مدیریت پوزیشن‌های فعال
+        # ۱. مدیریت پوزیشن‌های فعال
         for symbol, pos in list(active_positions.items()):
             df = processed_data[symbol]
             if ts not in df.index:
@@ -235,7 +234,7 @@ def run_backtest(processed_data):
                 "Dollar_PnL": dollar_pnl,
             })
             
-            cooldown_counters[symbol] = 3
+            cooldown_counters[symbol] = 4
             symbols_to_close.append(symbol)
 
         for sym in symbols_to_close:
@@ -244,7 +243,7 @@ def run_backtest(processed_data):
         if global_cooldown > 0:
             continue
 
-        # فیلترهای ورود دقیق مبتنی بر ساختار بازار و بدون نگاه به آینده (روی کندل i-1)
+        # ۲. فیلترهای ورود مبتنی بر Displacement و Order Flow (بدون نگاه به آینده)
         for symbol, df in processed_data.items():
             if symbol in active_positions:
                 continue
@@ -264,18 +263,13 @@ def run_backtest(processed_data):
             trend_bullish = prev_c["Close"] > prev_c["Daily_EMA200"] and prev_c["EMA50"] > prev_c["EMA200"]
             trend_bearish = prev_c["Close"] < prev_c["Daily_EMA200"] and prev_c["EMA50"] < prev_c["EMA200"]
 
-            # شرایط سخت‌گیرانه ساختار بازار برای لانگ و شورت
-            valid_long = (
-                trend_bullish and
-                prev_c["Close"] >= prev_c["H4_High"] * 0.998 and
-                prev_c["Close"] > prev_c["EMA50"]
-            )
+            # شرط جابجایی نهنگی (Displacement Candle): بدنه کندل قبلی بزرگ‌تر از ۱.۵ برابر ATR باشد
+            candle_body = abs(prev_c["Close"] - prev_c["Open"])
+            is_displacement = candle_body >= (prev_c["ATR"] * 1.5)
 
-            valid_short = (
-                trend_bearish and
-                prev_c["Close"] <= prev_c["H4_Low"] * 1.002 and
-                prev_c["Close"] < prev_c["EMA50"]
-            )
+            # تاییدیه ساختار صعودی و نزولی واقعی
+            valid_long = trend_bullish and is_displacement and (prev_c["Close"] > prev_c["Open"]) and (prev_c["Low"] <= prev_c["Swing_Low"])
+            valid_short = trend_bearish and is_displacement and (prev_c["Close"] < prev_c["Open"]) and (prev_c["High"] >= prev_c["Swing_High"])
 
             if not (valid_long or valid_short):
                 continue
@@ -294,7 +288,7 @@ def run_backtest(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.012 <= sl_dist_pct <= 0.045):
+            if not (0.015 <= sl_dist_pct <= 0.05):
                 continue
 
             if len(active_positions) >= MAX_POSITIONS:
@@ -322,7 +316,7 @@ if __name__ == "__main__":
     max_streak = max(loss_streaks) if loss_streaks else 0
 
     print("=" * 72)
-    print("HUNTER-V90 INSTITUTIONAL BACKTEST RESULTS (1-YEAR)")
+    print("HUNTER-V99 BACKTEST RESULTS (1-YEAR)")
     print("=" * 72)
     print(f"Total Trades: {n}")
     print(f"Overall Win Rate: {win_rate:.2f}%")
