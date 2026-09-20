@@ -1,7 +1,30 @@
+import os
+import glob
 import pandas as pd
 import numpy as np
 
+def load_repository_data():
+    """جستجوی خودکار فایل دیتا در مخزن برای جلوگیری از خطای مسیر"""
+    possible_paths = [
+        "data.csv",
+        "dataset.csv",
+        "historical_data.csv",
+        "data/*.csv",
+        "*.csv"
+    ]
+    
+    for pattern in possible_paths:
+        files = glob.glob(pattern)
+        if files:
+            print(f"-> فایل دیتا پیدا شد: {files[0]}")
+            return pd.read_csv(files[0])
+            
+    raise FileNotFoundError("هیچ فایل دیتایی (CSV) در مخزن پیدا نشد! لطفاً مسیر دیتا را بررسی کنید.")
+
 def run_score_hunter_backtest(df):
+    """
+    بک‌تست استاندارد و Causal (بدون نگاه به آینده) برای score_hunter_bot
+    """
     initial_capital = 100000.0
     capital = initial_capital
     peak_capital = initial_capital
@@ -16,6 +39,12 @@ def run_score_hunter_backtest(df):
     trades = []
     equity_curve = [initial_capital]
     
+    # اطمینان از وجود ستون‌های اصلی
+    required_columns = ['Open', 'High', 'Low', 'Close', 'Signal']
+    for col in required_columns:
+        if col not in df.columns:
+            raise ValueError(f"ستون ضروری '{col}' در دیتافریم موجود نیست!")
+
     for i in range(1, len(df)):
         current_open = df['Open'].iloc[i]
         current_high = df['High'].iloc[i]
@@ -26,7 +55,7 @@ def run_score_hunter_backtest(df):
         prev_close = df['Close'].iloc[i-1]
         prev_high = df['High'].iloc[i-1]
         prev_low = df['Low'].iloc[i-1]
-        signal = df['Signal'].iloc[i-1] 
+        signal = df['Signal'].iloc[i-1] # استفاده از سیگنال کندل قبلی (بدون تقلب)
         
         # ۱. مدیریت پوزیشن‌های باز
         if position == 'LONG':
@@ -53,27 +82,25 @@ def run_score_hunter_backtest(df):
                 trades.append({'type': 'SHORT', 'result': 'WIN', 'pnl': pnl})
                 position = None
 
-        # ۲. ورود جدید با فیلتر بدنه‌ی کندل قبلی (جلوگیری از فیک‌بریک‌اوت)
+        # ۲. ورود جدید
         if position is None and signal != 0:
             risk_amount = capital * 0.02 
             
-            if signal == 1:  # سیگنال خرید
-                # فیلتر تاییدیه: کندل قبلی باید صعودی یا پرقدرت بوده باشد
+            if signal == 1:  # خرید
                 if prev_close > prev_open:
                     position = 'LONG'
-                    entry_price = current_open  # ورود در Open کندل جدید (استاندارد لایو)
-                    stop_loss = prev_low        # کف کندل قبل به عنوان حد ضرر معتبر
+                    entry_price = current_open
+                    stop_loss = prev_low
                     risk_per_unit = entry_price - stop_loss
                     if risk_per_unit > 0:
                         position_size = risk_amount / risk_per_unit
                         take_profit = entry_price + (risk_per_unit * 2.0)
                     
-            elif signal == -1:  # سیگنال فروش
-                # فیلتر تاییدیه: کندل قبلی باید نزولی بوده باشد
+            elif signal == -1:  # فروش
                 if prev_close < prev_open:
                     position = 'SHORT'
                     entry_price = current_open
-                    stop_loss = prev_high       # سقف کندل قبل به عنوان حد ضرر
+                    stop_loss = prev_high
                     risk_per_unit = stop_loss - entry_price
                     if risk_per_unit > 0:
                         position_size = risk_amount / risk_per_unit
@@ -94,7 +121,7 @@ def run_score_hunter_backtest(df):
     return_pct = (total_pnl / initial_capital) * 100
 
     print("=" * 50)
-    print("گزارش نهایی اصلاح‌شده (Score Hunter Bot - V8.1)")
+    print("گزارش نهایی بک‌تست (Score Hunter Bot - V8)")
     print("=" * 50)
     print(f"کل معاملات: {total_trades}")
     print(f"وین ریت (Win Rate): {win_rate:.2f}%")
@@ -103,3 +130,7 @@ def run_score_hunter_backtest(df):
     print("=" * 50)
 
     return trades, equity_curve
+
+if __name__ == "__main__":
+    df_data = load_repository_data()
+    run_score_hunter_backtest(df_data)
