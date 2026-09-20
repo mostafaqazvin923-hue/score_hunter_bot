@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V100 — ULTIMATE OPTIMIZED INSTITUTIONAL ENGINE
+# HUNTER-V101 — OPTIMIZED HIGH-FREQUENCY INSTITUTIONAL ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -39,14 +39,14 @@ SYMBOLS = {
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "1h"
-MAX_POSITIONS = 3
+MAX_POSITIONS = 5  # افزایش ظرفیت پوزیشن‌های همزمان برای بالا بردن تعداد معاملات
 
-SLIPPAGE = 0.0002  # بهینه‌سازی اسلیپیج اجرایی
+SLIPPAGE = 0.0002
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-INITIAL_ATR_MULTIPLIER = 2.0
-TP_ATR_MULTIPLIER = 4.3   # بهینه‌سازی جزئی برای پوشش کامل کارمزدها و حفظ ریوارد ۱ به ۲.۱۵ واقعی
+INITIAL_ATR_MULTIPLIER = 1.8
+TP_ATR_MULTIPLIER = 3.8   # ریسک به ریوارد متناسب با ضریب جدید
 TIMEOUT_CANDLES = 24
 EMA_WARMUP = 200
 
@@ -58,7 +58,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V100 — OPTIMIZED INSTITUTIONAL ENGINE INITIALIZED")
+print("HUNTER-V101 — HIGH-FREQUENCY INSTITUTIONAL ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -128,8 +128,9 @@ def fetch_and_prepare_data(lbank_symbol):
     df_daily["EMA200_Daily"] = df_daily["Close"].ewm(span=200, adjust=False).mean()
     df["Daily_EMA200"] = df_daily["EMA200_Daily"].reindex(df.index, method='ffill')
 
-    df["Swing_High"] = df["High"].rolling(20).max().shift(1)
-    df["Swing_Low"] = df["Low"].rolling(20).min().shift(1)
+    # کاهش پنجره سویینگ از ۲۰ به ۱۴ برای ثبت فرکانس معاملات بیشتر
+    df["Swing_High"] = df["High"].rolling(14).max().shift(1)
+    df["Swing_Low"] = df["Low"].rolling(14).min().shift(1)
 
     df.dropna(inplace=True)
     if len(df) < EMA_WARMUP:
@@ -211,7 +212,7 @@ def run_backtest(processed_data):
                 consecutive_losses += 1
                 current_loss_streak += 1
                 if consecutive_losses >= 3:
-                    global_cooldown = 36
+                    global_cooldown = 24
             else:
                 if current_loss_streak > 0:
                     loss_streaks_list.append(current_loss_streak)
@@ -230,7 +231,7 @@ def run_backtest(processed_data):
                 "Dollar_PnL": dollar_pnl,
             })
             
-            cooldown_counters[symbol] = 4
+            cooldown_counters[symbol] = 3
             symbols_to_close.append(symbol)
 
         for sym in symbols_to_close:
@@ -258,8 +259,9 @@ def run_backtest(processed_data):
             trend_bullish = prev_c["Close"] > prev_c["Daily_EMA200"] and prev_c["EMA50"] > prev_c["EMA200"]
             trend_bearish = prev_c["Close"] < prev_c["Daily_EMA200"] and prev_c["EMA50"] < prev_c["EMA200"]
 
+            # تنظیم ضریب جابجایی به 1.2 برای پوشش فرصت‌های بیشتر
             candle_body = abs(prev_c["Close"] - prev_c["Open"])
-            is_displacement = candle_body >= (prev_c["ATR"] * 1.4)
+            is_displacement = candle_body >= (prev_c["ATR"] * 1.2)
 
             valid_long = trend_bullish and is_displacement and (prev_c["Close"] > prev_c["Open"]) and (prev_c["Low"] <= prev_c["Swing_Low"])
             valid_short = trend_bearish and is_displacement and (prev_c["Close"] < prev_c["Open"]) and (prev_c["High"] >= prev_c["Swing_High"])
@@ -281,7 +283,7 @@ def run_backtest(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.015 <= sl_dist_pct <= 0.05):
+            if not (0.012 <= sl_dist_pct <= 0.05):
                 continue
 
             if len(active_positions) >= MAX_POSITIONS:
@@ -309,7 +311,7 @@ if __name__ == "__main__":
     max_streak = max(loss_streaks) if loss_streaks else 0
 
     print("=" * 72)
-    print("HUNTER-V100 BACKTEST RESULTS (1-YEAR)")
+    print("HUNTER-V101 BACKTEST RESULTS (1-YEAR)")
     print("=" * 72)
     print(f"Total Trades: {n}")
     print(f"Overall Win Rate: {win_rate:.2f}%")
