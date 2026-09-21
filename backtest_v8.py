@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V107 — 15M 90-DAY WALK-FORWARD SCALPING ENGINE
+# HUNTER-V108 — PROFESSIONAL MULTI-TIMEFRAME QUANT ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -37,33 +37,33 @@ SYMBOLS = {
     "ADA": "ADA/USDT",
 }
 
-LOOKBACK_DAYS = 90  # تست دقیق ۹۰ روزه
-TIMEFRAME = "15m"
-MAX_POSITIONS = 4
+LOOKBACK_DAYS = 90
+EXEC_TIMEFRAME = "15m"
+MACRO_TIMEFRAME = "4h"
+MAX_POSITIONS = 3
 
 SLIPPAGE = 0.0002
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-INITIAL_ATR_MULTIPLIER = 1.6
-TP_ATR_MULTIPLIER = 3.2  # ریسک به ریوارد دقیق 1 به 2
-TIMEOUT_CANDLES = 24  # در تایم فریم 15 دقیقه یعنی 6 ساعت حداکثر زمان ماندن در معامله
-EMA_WARMUP = 200
+INITIAL_ATR_MULTIPLIER = 1.5
+TP_ATR_MULTIPLIER = 3.0  # ریسک به ریوارد دقیق 1 به 2
+TIMEOUT_CANDLES = 16  # حدود 4 ساعت ماندگاری حداکثری در تایم فریم 15 دقیقه
 
 INITIAL_CAPITAL = 2000.0
 TRADE_MARGIN = 100.0
-LEVERAGE = 20.0  # اهرم امن و بهینه برای مدیریت کارمزد
+LEVERAGE = 20.0
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V107 — 15M 90-DAY ENGINE INITIALIZED")
+print("HUNTER-V108 — MULTI-TIMEFRAME QUANT ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
 
-def fetch_and_prepare_data(lbank_symbol):
+def fetch_ohlcv_data(lbank_symbol, timeframe):
     all_ohlcv = []
     current_since = since_timestamp
     last_seen = None
@@ -73,7 +73,7 @@ def fetch_and_prepare_data(lbank_symbol):
         for attempt in range(3):
             try:
                 batch = exchange.fetch_ohlcv(
-                    lbank_symbol, timeframe=TIMEFRAME, since=current_since, limit=1000
+                    lbank_symbol, timeframe=timeframe, since=current_since, limit=1000
                 )
                 break
             except Exception:
@@ -103,40 +103,44 @@ def fetch_and_prepare_data(lbank_symbol):
     df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
     df.sort_values("Date", inplace=True)
     df.reset_index(drop=True, inplace=True)
-
-    if len(df) < 500:
-        return None
-
-    df.set_index("Date", inplace=True)
-
-    # محاسبه اندیکاتورها برای تایم‌فریم 15 دقیقه
-    tr1 = df["High"] - df["Low"]
-    tr2 = np.abs(df["High"] - df["Close"].shift(1))
-    tr3 = np.abs(df["Low"] - df["Close"].shift(1))
-    df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
-    
-    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
-    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
-
-    # فیلتر مومنتوم RSI برای تایم‌فریم 15m
-    delta = df["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df["RSI"] = 100 - (100 / (1 + rs))
-
-    df.dropna(inplace=True)
-    if len(df) < EMA_WARMUP:
-        return None
-
     return df
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    df_res = fetch_and_prepare_data(lbank_symbol)
-    if df_res is not None:
-        processed_data[symbol] = df_res
+    # دریافت داده‌های ۱۵ دقیقه (اجرایی)
+    df_15m = fetch_ohlcv_data(lbank_symbol, EXEC_TIMEFRAME)
+    # دریافت داده‌های ۴ ساعته (روند کلان)
+    df_4h = fetch_ohlcv_data(lbank_symbol, MACRO_TIMEFRAME)
 
-print(f"Valid symbols loaded for backtest: {len(processed_data)}")
+    if df_15m is None or df_4h is None or len(df_15m) < 500 or len(df_4h) < 50:
+        continue
+
+    df_15m.set_index("Date", inplace=True)
+    df_4h.set_index("Date", inplace=True)
+
+    # محاسبه اندیکاتورهای 15m
+    tr1 = df_15m["High"] - df_15m["Low"]
+    tr2 = np.abs(df_15m["High"] - df_15m["Close"].shift(1))
+    tr3 = np.abs(df_15m["Low"] - df_15m["Close"].shift(1))
+    df_15m["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
+    df_15m["EMA50"] = df_15m["Close"].ewm(span=50, adjust=False).mean()
+    
+    delta = df_15m["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    df_15m["RSI"] = 100 - (100 / (1 + (gain / loss)))
+
+    # محاسبه روند 4h و مپ کردن آن روی تایم فریم 15m برای فیلتر جهت بازار
+    df_4h["EMA_Macro"] = df_4h["Close"].ewm(span=50, adjust=False).mean()
+    
+    # الحاق روند کلان 4 ساعته به جدول ۱۵ دقیقه بر اساس زمان
+    df_15m["Macro_Trend"] = df_4h["EMA_Macro"].reindex(df_15m.index, method="ffill")
+    df_15m["Macro_Close"] = df_4h["Close"].reindex(df_15m.index, method="ffill")
+
+    df_15m.dropna(inplace=True)
+    if len(df_15m) > 200:
+        processed_data[symbol] = df_15m
+
+print(f"Valid multi-timeframe symbols loaded: {len(processed_data)}")
 
 def get_all_timestamps(data):
     return sorted({ts for df in data.values() for ts in df.index})
@@ -205,7 +209,7 @@ def run_backtest(processed_data):
                 consecutive_losses += 1
                 current_loss_streak += 1
                 if consecutive_losses >= 3:
-                    global_cooldown = 12  # وقفه کوتاه در تایم فریم 15 دقیقه برای جلوگیری از ضرر زنجیره‌ای
+                    global_cooldown = 16
             else:
                 if current_loss_streak > 0:
                     loss_streaks_list.append(current_loss_streak)
@@ -224,7 +228,7 @@ def run_backtest(processed_data):
                 "Dollar_PnL": dollar_pnl,
             })
             
-            cooldown_counters[symbol] = 4
+            cooldown_counters[symbol] = 6
             symbols_to_close.append(symbol)
 
         for sym in symbols_to_close:
@@ -243,18 +247,19 @@ def run_backtest(processed_data):
                 continue
 
             i = df.index.get_loc(ts)
-            if i < EMA_WARMUP + 1:
+            if i < 50:
                 continue
 
             prev_c = df.iloc[i - 1]
             c15m = df.iloc[i]
 
-            # منطق ترید در 15 دقیقه: استمرار روند EMA50 و EMA200 همراه با تاییدیه مومنتوم RSI
-            trend_long = prev_c["Close"] > prev_c["EMA200"] and prev_c["EMA50"] > prev_c["EMA200"]
-            trend_short = prev_c["Close"] < prev_c["EMA200"] and prev_c["EMA50"] < prev_c["EMA200"]
+            # تاییدیه روند کلان ۴ ساعته (Macro Trend Filter)
+            macro_bullish = prev_c["Macro_Close"] > prev_c["Macro_Trend"]
+            macro_bearish = prev_c["Macro_Close"] < prev_c["Macro_Trend"]
 
-            valid_long = trend_long and (prev_c["RSI"] > 52) and (prev_c["Close"] > prev_c["Open"])
-            valid_short = trend_short and (prev_c["RSI"] < 48) and (prev_c["Close"] < prev_c["Open"])
+            # شرایط اجرایی روی ۱۵ دقیقه همراه با مومنتوم RSI
+            valid_long = macro_bullish and (prev_c["Close"] > prev_c["EMA50"]) and (50 < prev_c["RSI"] < 68) and (prev_c["Close"] > prev_c["Open"])
+            valid_short = macro_bearish and (prev_c["Close"] < prev_c["EMA50"]) and (32 < prev_c["RSI"] < 50) and (prev_c["Close"] < prev_c["Open"])
 
             if not (valid_long or valid_short):
                 continue
@@ -273,7 +278,7 @@ def run_backtest(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.005 <= sl_dist_pct <= 0.03):
+            if not (0.006 <= sl_dist_pct <= 0.025):
                 continue
 
             if len(active_positions) >= MAX_POSITIONS:
@@ -301,7 +306,7 @@ if __name__ == "__main__":
     max_streak = max(loss_streaks) if loss_streaks else 0
 
     print("=" * 72)
-    print("HUNTER-V107 BACKTEST RESULTS (90-DAY 15M)")
+    print("HUNTER-V108 BACKTEST RESULTS (90-DAY MULTI-TIMEFRAME)")
     print("=" * 72)
     print(f"Total Trades: {n}")
     print(f"Overall Win Rate: {win_rate:.2f}%")
