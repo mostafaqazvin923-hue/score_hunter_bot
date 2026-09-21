@@ -11,17 +11,11 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
     import ccxt
 
-try:
-    from sklearn.ensemble import RandomForestClassifier
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "scikit-learn"])
-    from sklearn.ensemble import RandomForestClassifier
-
 # ============================================================
-# HUNTER-V110 — MACHINE LEARNING QUANT ENGINE (WALK-FORWARD)
+# HUNTER-V111 — ULTRA-FAST OPTIMIZED QUANT ENGINE
 # ============================================================
 
-exchange = ccxt.lbank({"enableRateLimit": True})
+exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 15000})
 
 SYMBOLS = {
     "BTC": "BTC/USDT",
@@ -43,19 +37,12 @@ SYMBOLS = {
     "ADA": "ADA/USDT",
 }
 
-LOOKBACK_DAYS = 90
+LOOKBACK_DAYS = 30  # کاهش به ۳۰ روز برای اجرای فوق‌العاده سریع و بدون تایم‌اوت
 EXEC_TIMEFRAME = "15m"
-MACRO_TIMEFRAME = "4h"
 MAX_DAILY_TRADES = 3
 
 SLIPPAGE = 0.0002
 FEE_RATE = 0.0007
-
-ATR_PERIOD = 14
-INITIAL_ATR_MULTIPLIER = 1.6
-TP_ATR_MULTIPLIER = 3.2
-TIMEOUT_CANDLES = 20
-
 INITIAL_CAPITAL = 2000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 20.0
@@ -64,7 +51,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V110 — MACHINE LEARNING QUANT ENGINE INITIALIZED")
+print("HUNTER-V111 — FAST OPTIMIZED ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -72,32 +59,22 @@ processed_data = {}
 def fetch_ohlcv_data(lbank_symbol, timeframe):
     all_ohlcv = []
     current_since = since_timestamp
-    last_seen = None
-
-    while current_since < exchange.milliseconds():
-        batch = None
-        for attempt in range(3):
-            try:
-                batch = exchange.fetch_ohlcv(
-                    lbank_symbol, timeframe=timeframe, since=current_since, limit=1000
-                )
+    
+    try:
+        while current_since < exchange.milliseconds():
+            batch = exchange.fetch_ohlcv(lbank_symbol, timeframe=timeframe, since=current_since, limit=1000)
+            if not batch:
                 break
-            except Exception:
-                if attempt == 2:
-                    return None
-        if not batch:
-            break
-
-        last_ts = batch[-1][0]
-        if last_seen is not None and last_ts <= last_seen:
-            return None
-
-        all_ohlcv.extend(batch)
-        last_seen = last_ts
-        current_since = last_ts + 1
-
-        if len(batch) < 1000:
-            break
+            all_ohlcv.extend(batch)
+            last_ts = batch[-1][0]
+            if last_ts <= current_since:
+                break
+            current_since = last_ts + 1
+            if len(batch) < 1000:
+                break
+    except Exception as e:
+        print(f"Error fetching {lbank_symbol}: {e}")
+        return None
 
     if not all_ohlcv:
         return None
@@ -112,230 +89,118 @@ def fetch_ohlcv_data(lbank_symbol, timeframe):
     return df
 
 for symbol, lbank_symbol in SYMBOLS.items():
+    print(f"Downloading data for {symbol}...")
     df_15m = fetch_ohlcv_data(lbank_symbol, EXEC_TIMEFRAME)
-    df_4h = fetch_ohlcv_data(lbank_symbol, MACRO_TIMEFRAME)
 
-    if df_15m is None or df_4h is None or len(df_15m) < 500 or len(df_4h) < 50:
+    if df_15m is None or len(df_15m) < 100:
         continue
 
     df_15m.set_index("Date", inplace=True)
-    df_4h.set_index("Date", inplace=True)
 
-    # مهندسی ویژگی‌ها (Feature Engineering) برای یادگیری ماشین
+    # اندیکاتورهای سریع و برداری (Vectorized)
     tr1 = df_15m["High"] - df_15m["Low"]
     tr2 = np.abs(df_15m["High"] - df_15m["Close"].shift(1))
     tr3 = np.abs(df_15m["Low"] - df_15m["Close"].shift(1))
-    df_15m["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
-    
-    df_15m["Return_1"] = df_15m["Close"].pct_change(1)
-    df_15m["Return_4"] = df_15m["Close"].pct_change(4)
-    df_15m["Vol_Ratio"] = df_15m["Volume"] / df_15m["Volume"].rolling(24).mean()
+    df_15m["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
+    df_15m["EMA50"] = df_15m["Close"].ewm(span=50, adjust=False).mean()
     
     delta = df_15m["Close"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     df_15m["RSI"] = 100 - (100 / (1 + (gain / loss)))
 
-    df_4h["EMA_Macro"] = df_4h["Close"].ewm(span=50, adjust=False).mean()
-    df_15m["Macro_Trend_Diff"] = (df_4h["Close"] - df_4h["EMA_Macro"]).reindex(df_15m.index, method="ffill")
-
-    # هدف یادگیری ماشین: آیا سود آینده بیشتر از کارمزد و ریسک است؟
-    future_return = df_15m["Close"].shift(-4) / df_15m["Close"] - 1
-    df_15m["Target_Long"] = (future_return > 0.003).astype(int)
-    df_15m["Target_Short"] = (future_return < -0.003).astype(int)
-
     df_15m.dropna(inplace=True)
-    if len(df_15m) > 200:
+    if len(df_15m) > 50:
         processed_data[symbol] = df_15m
 
-print(f"Valid ML symbols loaded: {len(processed_data)}")
-
-def get_all_timestamps(data):
-    return sorted({ts for df in data.values() for ts in df.index})
+print(f"Successfully loaded symbols: {len(processed_data)}")
 
 def run_backtest(processed_data):
-    all_timestamps = get_all_timestamps(processed_data)
-    active_positions = {}
     all_trades = []
-    
     current_day = None
     daily_trade_count = 0
-    loss_streaks_list = []
-    current_loss_streak = 0
-
-    feature_cols = ["Return_1", "Return_4", "Vol_Ratio", "RSI", "Macro_Trend_Diff", "ATR"]
-
-    # آموزش مدل به روش Walk-Forward (آموزش روی داده‌های گذشته، پیش‌بینی آینده)
-    models_long = {}
-    models_short = {}
 
     for symbol, df in processed_data.items():
-        # آموزش اولیه روی ۵۰ درصد اول داده‌ها
-        split_idx = int(len(df) * 0.4)
-        train_df = df.iloc[:split_idx]
-        
-        if len(train_df) > 100:
-            X_train = train_df[feature_cols]
-            y_long = train_df["Target_Long"]
-            y_short = train_df["Target_Short"]
-            
-            clf_l = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42, n_jobs=-1)
-            clf_l.fit(X_train, y_long)
-            models_long[symbol] = (clf_l, split_idx)
+        for i in range(50, len(df)):
+            ts = df.index[i]
+            ts_date = ts.date()
+            if current_day != ts_date:
+                current_day = ts_date
+                daily_trade_count = 0
 
-            clf_s = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42, n_jobs=-1)
-            clf_s.fit(X_train, y_short)
-            models_short[symbol] = (clf_s, split_idx)
-
-    for ts in all_timestamps:
-        ts_date = ts.date()
-        if current_day != ts_date:
-            current_day = ts_date
-            daily_trade_count = 0
-
-        symbols_to_close = []
-
-        for symbol, pos in list(active_positions.items()):
-            df = processed_data[symbol]
-            if ts not in df.index:
-                continue
-            c15m = df.loc[ts]
-
-            if pos["side"] == "LONG":
-                hit_sl = c15m["Low"] <= pos["stop_loss"]
-                hit_tp = c15m["High"] >= pos["take_profit"]
-            else:
-                hit_sl = c15m["High"] >= pos["stop_loss"]
-                hit_tp = c15m["Low"] <= pos["take_profit"]
-
-            curr_i = df.index.get_loc(ts)
-            candles_held = curr_i - pos["entry_index"]
-            is_timeout = candles_held >= TIMEOUT_CANDLES
-
-            if not (hit_sl or hit_tp or is_timeout):
+            if daily_trade_count >= MAX_DAILY_TRADES:
                 continue
 
-            initial_risk = pos["initial_risk"]
-            if pos["side"] == "LONG":
-                if hit_tp:
-                    exit_p = pos["take_profit"]
-                elif hit_sl:
-                    exit_p = min(pos["stop_loss"], c15m["Open"])
-                else:
-                    exit_p = c15m["Close"]
-                r_real = ((exit_p - pos["entry_price"]) / initial_risk) - (FEE_RATE * 2)
-                price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
-            else:
-                if hit_tp:
-                    exit_p = pos["take_profit"]
-                elif hit_sl:
-                    exit_p = max(pos["stop_loss"], c15m["Open"])
-                else:
-                    exit_p = c15m["Close"]
-                r_real = ((pos["entry_price"] - exit_p) / initial_risk) - (FEE_RATE * 2)
-                price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
+            prev = df.iloc[i - 1]
+            curr = df.iloc[i]
 
-            outcome = "WIN" if r_real > 0 else "LOSS"
-            
-            if outcome == "LOSS":
-                current_loss_streak += 1
-            else:
-                if current_loss_streak > 0:
-                    loss_streaks_list.append(current_loss_streak)
-                current_loss_streak = 0
+            valid_long = (prev["Close"] > prev["EMA50"]) and (45 < prev["RSI"] < 65) and (prev["Close"] > prev["Open"])
+            valid_short = (prev["Close"] < prev["EMA50"]) and (35 < prev["RSI"] < 55) and (prev["Close"] < prev["Open"])
 
-            position_notional = TRADE_MARGIN * LEVERAGE
-            dollar_pnl = (position_notional * price_return_pct) - (position_notional * FEE_RATE * 2)
+            if not (valid_long or valid_short):
+                continue
+
+            side = "LONG" if valid_long else "SHORT"
+            entry_price = curr["Open"] * (1 + SLIPPAGE) if side == "LONG" else curr["Open"] * (1 - SLIPPAGE)
+            atr = curr["ATR"]
+
+            if np.isnan(atr) or atr <= 0:
+                continue
+
+            if side == "LONG":
+                sl = entry_price - (1.5 * atr)
+                tp = entry_price + (3.0 * atr)
+            else:
+                sl = entry_price + (1.5 * atr)
+                tp = entry_price - (3.0 * atr)
+
+            # بررسی نتیجه در کندل‌های بعدی (حداکثر ۲۰ کندل)
+            outcome = "LOSS"
+            exit_price = sl
+            for j in range(i + 1, min(i + 20, len(df))):
+                future_c = df.iloc[j]
+                if side == "LONG":
+                    if future_c["Low"] <= sl:
+                        exit_price = sl
+                        outcome = "LOSS"
+                        break
+                    if future_c["High"] >= tp:
+                        exit_price = tp
+                        outcome = "WIN"
+                        break
+                else:
+                    if future_c["High"] >= sl:
+                        exit_price = sl
+                        outcome = "LOSS"
+                        break
+                    if future_c["Low"] <= tp:
+                        exit_price = tp
+                        outcome = "WIN"
+                        break
+
+            price_ret = (exit_price - entry_price) / entry_price if side == "LONG" else (entry_price - exit_price) / entry_price
+            dollar_pnl = (TRADE_MARGIN * LEVERAGE * price_ret) - (TRADE_MARGIN * LEVERAGE * FEE_RATE * 2)
 
             all_trades.append({
-                "Timestamp": ts,
                 "Symbol": symbol,
-                "Side": pos["side"],
+                "Side": side,
                 "Outcome": outcome,
-                "Return": r_real,
-                "Dollar_PnL": dollar_pnl,
+                "Dollar_PnL": dollar_pnl
             })
-            
-            symbols_to_close.append(symbol)
-
-        for sym in symbols_to_close:
-            del active_positions[sym]
-
-        if daily_trade_count >= MAX_DAILY_TRADES:
-            continue
-
-        if len(active_positions) >= 2:
-            continue
-
-        for symbol, df in processed_data.items():
-            if symbol in active_positions:
-                continue
-            if ts not in df.index:
-                continue
-            if symbol not in models_long:
-                continue
-
-            i = df.index.get_loc(ts)
-            split_idx = models_long[symbol][1]
-            if i <= split_idx:
-                continue  # فقط روی داده‌های تست بعد از مدل ترید کن
-
-            c15m = df.iloc[i]
-            features_vector = c15m[feature_cols].values.reshape(1, -1)
-
-            pred_long = models_long[symbol][0].predict(features_vector)[0]
-            pred_short = models_short[symbol][0].predict(features_vector)[0]
-
-            if not (pred_long == 1 or pred_short == 1):
-                continue
-
-            side = "LONG" if pred_long == 1 else "SHORT"
-            entry_price = c15m["Open"] * (1 + SLIPPAGE) if side == "LONG" else c15m["Open"] * (1 - SLIPPAGE)
-            
-            initial_atr = c15m["ATR"]
-            if side == "LONG":
-                initial_sl = entry_price - (INITIAL_ATR_MULTIPLIER * initial_atr)
-                take_profit = entry_price + (TP_ATR_MULTIPLIER * initial_atr)
-            else:
-                initial_sl = entry_price + (INITIAL_ATR_MULTIPLIER * initial_atr)
-                take_profit = entry_price - (TP_ATR_MULTIPLIER * initial_atr)
-
-            initial_risk = abs(entry_price - initial_sl)
-            sl_dist_pct = initial_risk / entry_price
-
-            if not (0.008 <= sl_dist_pct <= 0.02):
-                continue
-
-            active_positions[symbol] = {
-                "side": side,
-                "entry_price": float(entry_price),
-                "stop_loss": float(initial_sl),
-                "take_profit": float(take_profit),
-                "initial_risk": float(initial_risk),
-                "entry_index": int(i),
-            }
-
             daily_trade_count += 1
-            break
 
-    if current_loss_streak > 0:
-        loss_streaks_list.append(current_loss_streak)
-
-    return pd.DataFrame(all_trades), loss_streaks_list
+    return pd.DataFrame(all_trades)
 
 if __name__ == "__main__":
-    trades_df, loss_streaks = run_backtest(processed_data)
+    trades_df = run_backtest(processed_data)
     n = len(trades_df)
     win_rate = (trades_df["Outcome"].eq("WIN").mean() * 100) if n > 0 else 0.0
     net_pnl = float(trades_df["Dollar_PnL"].sum()) if n > 0 else 0.0
-    max_streak = max(loss_streaks) if loss_streaks else 0
 
     print("=" * 72)
-    print("HUNTER-V110 BACKTEST RESULTS (MACHINE LEARNING)")
+    print("HUNTER-V111 BACKTEST RESULTS (FAST ENGINE)")
     print("=" * 72)
     print(f"Total Trades: {n}")
     print(f"Overall Win Rate: {win_rate:.2f}%")
     print(f"Net Dollar PnL: ${net_pnl:,.2f}")
-    print(f"Max Loss Streak: {max_streak}")
-    print(f"List of Consecutive Loss Streaks (Occurrences): {loss_streaks}")
     print("=" * 72)
