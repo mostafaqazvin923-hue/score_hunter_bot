@@ -13,12 +13,12 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V123 — 15 SYMBOLS (INCLUDING SOL, ETH, XRP) 1-YEAR BACKTEST
+# HUNTER-V123 — 14 ELITE GIANTS (XRP REMOVED) 1-YEAR BACKTEST
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
 
-# لیست ۱۵ تایی (۱۲ نماد قبل + سولانا، اتریوم و ریپل)
+# لیست ۱۴ تایی نهایی (ریپل حذف شد)
 SYMBOLS = {
     "CRV": "CRV/USDT",
     "DOGE": "DOGE/USDT",
@@ -33,8 +33,7 @@ SYMBOLS = {
     "ADA": "ADA/USDT",
     "BNB": "BNB/USDT",
     "SOL": "SOL/USDT",
-    "ETH": "ETH/USDT",
-    "XRP": "XRP/USDT"
+    "ETH": "ETH/USDT"
 }
 
 TIMEFRAME_BASE = "15m"
@@ -226,7 +225,7 @@ def run_backtest_on_data(processed_data):
 
 if __name__ == "__main__":
     print("=" * 72)
-    print("HUNTER-V123 — 15 SYMBOLS (SOL, ETH, XRP INCLUDED) BACKTEST INITIALIZED")
+    print("HUNTER-V123 — 14 ELITE GIANTS (XRP REMOVED) BACKTEST INITIALIZED")
     print("=" * 72)
 
     all_quarter_trades = []
@@ -321,7 +320,7 @@ if __name__ == "__main__":
         max_consecutive_losses = max(streaks) if streaks else 0
 
         print("\n" + "=" * 72)
-        print("===== 15 SYMBOLS — AGGREGATED 1-YEAR (365 DAYS) BACKTEST RESULT =====")
+        print("===== 14 ELITE SYMBOLS — AGGREGATED 1-YEAR (365 DAYS) RESULT =====")
         print(f"Total Trades (Full Year): {n}")
         print(f"Trades Per Month (Avg): {n / 12.0:.1f}")
         print(f"Win Rate: {win_rate:.2f}%")
@@ -334,7 +333,7 @@ if __name__ == "__main__":
         print(f"Maximum Consecutive Losses: {max_consecutive_losses}")
         print("-" * 72)
         
-        print("BY SYMBOL (15 GIANTS):")
+        print("BY SYMBOL (14 GIANTS):")
         for sym in list(SYMBOLS.keys()):
             sub = trades_df[trades_df["Symbol"] == sym]
             if len(sub) > 0:
@@ -343,7 +342,7 @@ if __name__ == "__main__":
                 print(f"  {sym:6} -> Trades: {len(sub):3}, Win Rate: {s_wr:5.2f}%, PnL: ${s_pnl:10,.2f}")
 
         print("-" * 72)
-        print("BY MONTH (15 GIANTS):")
+        print("BY MONTH (14 GIANTS):")
         for m, sub in trades_df.groupby("Month"):
             m_wr = sub["Outcome"].eq("WIN").mean() * 100
             m_pnl = sub["Dollar_PnL"].sum()
