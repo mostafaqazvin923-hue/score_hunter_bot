@@ -13,7 +13,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V117 — 90-DAY INSTITUTIONAL MULTI-TIMEFRAME ENGINE
+# HUNTER-V119 — INSTITUTIONAL ENGINE WITH COOLDOWN & BREAKEVEN
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
@@ -38,20 +38,20 @@ SYMBOLS = {
     "ADA": "ADA/USDT",
 }
 
-LOOKBACK_DAYS = 90  # تنظیم روی ۹۰ روز برای پایداری کامل و جلوگیری از تایم‌اوت
+LOOKBACK_DAYS = 180
 TIMEFRAME_BASE = "15m"
 
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 INITIAL_CAPITAL = 2000.0
 TRADE_MARGIN = 100.0
-LEVERAGE = 5.0
+LEVERAGE = 50.0
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS + 10)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V117 — 90-DAY INSTITUTIONAL CONFLUENCE ENGINE INITIALIZED")
+print("HUNTER-V119 — COOLDOWN & BREAKEVEN ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -71,7 +71,7 @@ def fetch_ohlcv_data(lbank_symbol, timeframe):
             current_since = last_ts + 1
             if len(batch) < 1000:
                 break
-            time.sleep(0.2)  # تأخیر کوتاه برای جلوگیری از Rate Limit و فریز شدن
+            time.sleep(0.2)
     except Exception as e:
         print(f"Error fetching {lbank_symbol}: {e}")
         return None
@@ -90,13 +90,12 @@ def fetch_ohlcv_data(lbank_symbol, timeframe):
     return df
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    print(f"Downloading 15m data for {symbol} (90 Days)...")
+    print(f"Downloading 15m data for {symbol} (180 Days)...")
     df_15m = fetch_ohlcv_data(lbank_symbol, TIMEFRAME_BASE)
 
-    if df_15m is None or len(df_15m) < 300:
+    if df_15m is None or len(df_15m) < 500:
         continue
 
-    # ساخت تایم فریم‌های بالاتر بدون نگاه به آینده (Resample دقیق)
     df_1h = df_15m.resample('1h').agg({
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).dropna()
@@ -105,23 +104,19 @@ for symbol, lbank_symbol in SYMBOLS.items():
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).dropna()
 
-    # 1. رژیم ۴ ساعته
     df_4h["EMA_50"] = df_4h["Close"].ewm(span=50, adjust=False).mean()
     df_4h["EMA_200"] = df_4h["Close"].ewm(span=200, adjust=False).mean()
     df_4h["Regime_Bullish"] = (df_4h["Close"] > df_4h["EMA_200"]) & (df_4h["EMA_50"] > df_4h["EMA_200"])
     df_4h["Regime_Bearish"] = (df_4h["Close"] < df_4h["EMA_200"]) & (df_4h["EMA_50"] < df_4h["EMA_200"])
 
-    # 2. ساختار و نقدینگی ۱ ساعته
     df_1h["Swing_High"] = df_1h["High"].rolling(5, center=True).max()
     df_1h["Swing_Low"] = df_1h["Low"].rolling(5, center=True).min()
     df_1h["ATR"] = (df_1h["High"] - df_1h["Low"]).rolling(14).mean()
 
-    # 3. اندیکاتورهای ۱۵ دقیقه برای ورود
     df_15m["ATR"] = (df_15m["High"] - df_15m["Low"]).rolling(14).mean()
     df_15m["Body"] = (df_15m["Close"] - df_15m["Open"]).abs()
     df_15m["Avg_Body"] = df_15m["Body"].rolling(20).mean()
 
-    # فیلتر بازه دقیق ۹۰ روزه
     cutoff_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
     df_15m = df_15m[df_15m.index >= cutoff_date]
 
@@ -142,7 +137,14 @@ def run_backtest(data_dict):
         df_1h = dsets["1h"]
         df_4h = dsets["4h"]
 
+        cooldown_bars = 0
+        consecutive_losses = 0
+
         for i in range(50, len(df_15)):
+            if cooldown_bars > 0:
+                cooldown_bars -= 1
+                continue
+
             t_curr = df_15.index[i]
             c_row = df_15.iloc[i]
             p_row = df_15.iloc[i-1]
@@ -186,45 +188,69 @@ def run_backtest(data_dict):
             if side == "LONG":
                 sl = entry_price - (1.5 * atr)
                 tp = entry_price + (3.0 * atr)
+                be_trigger = entry_price + (1.5 * atr) # سطح 1:1 برای انتقال SL به Entry
             else:
                 sl = entry_price + (1.5 * atr)
                 tp = entry_price - (3.0 * atr)
+                be_trigger = entry_price - (1.5 * atr)
 
             outcome = "LOSS"
             exit_price = sl
+            current_sl = sl
+            breakeven_activated = False
 
             for j in range(i + 1, min(i + 35, len(df_15))):
                 fut = df_15.iloc[j]
                 if side == "LONG":
-                    hit_sl = fut["Low"] <= sl
+                    # بررسی رسیدن به هدف Breakeven
+                    if not breakeven_activated and fut["High"] >= be_trigger:
+                        current_sl = entry_price
+                        breakeven_activated = True
+
+                    hit_sl = fut["Low"] <= current_sl
                     hit_tp = fut["High"] >= tp
+
                     if hit_sl and hit_tp:
-                        outcome = "LOSS"
-                        exit_price = sl
+                        outcome = "LOSS" if current_sl != entry_price else "BE"
+                        exit_price = current_sl if current_sl != entry_price else entry_price
                         break
                     elif hit_sl:
-                        outcome = "LOSS"
-                        exit_price = sl
+                        outcome = "LOSS" if current_sl != entry_price else "BE"
+                        exit_price = current_sl
                         break
                     elif hit_tp:
                         outcome = "WIN"
                         exit_price = tp
                         break
                 else:
-                    hit_sl = fut["High"] >= sl
+                    if not breakeven_activated and fut["Low"] <= be_trigger:
+                        current_sl = entry_price
+                        breakeven_activated = True
+
+                    hit_sl = fut["High"] >= current_sl
                     hit_tp = fut["Low"] <= tp
+
                     if hit_sl and hit_tp:
-                        outcome = "LOSS"
-                        exit_price = sl
+                        outcome = "LOSS" if current_sl != entry_price else "BE"
+                        exit_price = current_sl if current_sl != entry_price else entry_price
                         break
                     elif hit_sl:
-                        outcome = "LOSS"
-                        exit_price = sl
+                        outcome = "LOSS" if current_sl != entry_price else "BE"
+                        exit_price = current_sl
                         break
                     elif hit_tp:
                         outcome = "WIN"
                         exit_price = tp
                         break
+
+            # مدیریت استریک ضرر و Cooldown
+            if outcome == "LOSS":
+                consecutive_losses += 1
+                if consecutive_losses >= 2:
+                    cooldown_bars = 16 # استراحت به مدت ۱۶ کندل ۱۵ دقیقه‌ای (۴ ساعت) پس از ۲ باخت متوالی
+                    consecutive_losses = 0
+            elif outcome == "WIN":
+                consecutive_losses = 0
 
             price_ret = (exit_price - entry_price) / entry_price if side == "LONG" else (entry_price - exit_price) / entry_price
             dollar_pnl = (TRADE_MARGIN * LEVERAGE * price_ret) - (TRADE_MARGIN * LEVERAGE * FEE_RATE * 2)
@@ -278,8 +304,8 @@ if __name__ == "__main__":
     max_consecutive_losses = max(streaks) if streaks else 0
 
     print("=" * 72)
-    print("===== BACKTEST RESULT =====")
-    print(f"Period: 90 Days (LBank)")
+    print("===== BACKTEST RESULT (COOLDOWN & BREAKEVEN) =====")
+    print(f"Period: 180 Days (LBank)")
     print(f"Total Trades: {n}")
     print(f"Win Rate: {win_rate:.2f}%")
     print(f"Loss Rate: {loss_rate:.2f}%")
