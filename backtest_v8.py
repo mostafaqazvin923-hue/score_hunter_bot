@@ -15,8 +15,8 @@ except ImportError:
 
 
 # ============================================================
-# HUNTER-V130
-# HUNTER-V131 — CONTROLLED UNIVERSE TEST
+# HUNTER-V132
+# V129 BASELINE + DISPLACEMENT CLOSE-LOCATION FILTER
 #
 # Purpose:
 # Reproduce the original V123 behavior before applying
@@ -41,7 +41,7 @@ exchange = ccxt.lbank({
 # EXACT V123 SYMBOLS
 # ============================================================
 
-BASELINE_SYMBOLS = {
+SYMBOLS = {
     "CRV": "CRV/USDT",
     "DOGE": "DOGE/USDT",
     "ICP": "ICP/USDT",
@@ -54,14 +54,9 @@ BASELINE_SYMBOLS = {
     "XLM": "XLM/USDT",
     "ADA": "ADA/USDT",
     "BNB": "BNB/USDT",
+    "SOL": "SOL/USDT",
     "ETH": "ETH/USDT",
-    # Controlled test: SOL is removed and LINK is added.
-    "LINK": "LINK/USDT",
 }
-
-REMOVED_SYMBOL = "SOL"
-ADDED_SYMBOL = "LINK"
-SYMBOLS = BASELINE_SYMBOLS
 
 
 # ============================================================
@@ -373,14 +368,27 @@ def run_v123_engine(
         )
 
         # Original V123: displacement on CURRENT candle.
+        # V132 — ONE CONTROLLED SIGNAL-QUALITY FILTER.
+        # Require the displacement candle to close near its own extreme.
+        # This is calculated only from the completed current candle and
+        # does not change the V129 entry/exit mechanics.
+        candle_range = c_row["High"] - c_row["Low"]
+        close_location = (
+            (c_row["Close"] - c_row["Low"]) / candle_range
+            if candle_range > 0
+            else np.nan
+        )
+
         displacement_up = (
             c_row["Close"] > c_row["Open"]
             and c_row["Body"] > 2.0 * c_row["Avg_Body"]
+            and close_location >= 0.70
         )
 
         displacement_down = (
             c_row["Close"] < c_row["Open"]
             and c_row["Body"] > 2.0 * c_row["Avg_Body"]
+            and close_location <= 0.30
         )
 
         valid_long = (
@@ -532,112 +540,12 @@ def run_v123_engine(
 
 
 # ============================================================
-# UNIVERSE ANALYSIS
-# ============================================================
-
-def summarize_symbol(sub):
-    total = len(sub)
-    wins = int((sub["Outcome"] == "WIN").sum())
-    losses = int((sub["Outcome"] == "LOSS").sum())
-    be = int((sub["Outcome"] == "BE").sum())
-    pnl = float(sub["Dollar_PnL"].sum())
-    gross_profit = float(sub.loc[sub["Outcome"] == "WIN", "Dollar_PnL"].sum())
-    gross_loss = abs(float(sub.loc[sub["Outcome"] == "LOSS", "Dollar_PnL"].sum()))
-    pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
-    wr = wins / total * 100.0 if total else 0.0
-
-    streak = 0
-    max_streak = 0
-    for outcome in sub["Outcome"]:
-        if outcome == "LOSS":
-            streak += 1
-            max_streak = max(max_streak, streak)
-        else:
-            streak = 0
-
-    # Split by time for a simple robustness check. This does not fit
-    # parameters; it only checks whether performance persists later.
-    if total >= 10:
-        split_time = sub["Timestamp"].min() + (sub["Timestamp"].max() - sub["Timestamp"].min()) * 0.70
-        val = sub[sub["Timestamp"] >= split_time]
-    else:
-        val = sub.iloc[0:0]
-
-    val_total = len(val)
-    val_wr = ((val["Outcome"] == "WIN").mean() * 100.0) if val_total else 0.0
-    val_pnl = float(val["Dollar_PnL"].sum()) if val_total else 0.0
-
-    return {
-        "Trades": total,
-        "WR": wr,
-        "PnL": pnl,
-        "PF": pf,
-        "MaxLossStreak": max_streak,
-        "ValidationTrades": val_total,
-        "ValidationWR": val_wr,
-        "ValidationPnL": val_pnl,
-    }
-
-
-def print_universe_analysis(trades_df):
-    rows = []
-    for symbol in SYMBOLS:
-        sub = trades_df[trades_df["Symbol"] == symbol].sort_values("Timestamp")
-        if len(sub) == 0:
-            continue
-        r = summarize_symbol(sub)
-        r["Symbol"] = symbol
-        r["Type"] = "TEST UNIVERSE"
-        rows.append(r)
-
-    if not rows:
-        return
-
-    u = pd.DataFrame(rows)
-    cols = ["Symbol", "Type", "Trades", "WR", "PnL", "PF", "MaxLossStreak", "ValidationTrades", "ValidationWR", "ValidationPnL"]
-    u = u[cols]
-
-    print()
-    print("=" * 120)
-    print("UNIVERSE OPTIMIZATION — FULL PERIOD")
-    print("=" * 120)
-    print(u.sort_values(["Type", "PnL"], ascending=[True, False]).to_string(index=False, formatters={
-        "WR": "{:.2f}".format,
-        "PnL": "${:,.2f}".format,
-        "PF": "{:.2f}".format,
-        "ValidationWR": "{:.2f}".format,
-        "ValidationPnL": "${:,.2f}".format,
-    }))
-
-    print()
-    print("=" * 120)
-    print("CONTROLLED REPLACEMENT TEST")
-    print("=" * 120)
-    candidates = u.copy()
-    if len(candidates):
-        candidates = candidates.sort_values(
-            ["ValidationPnL", "ValidationWR", "PF"],
-            ascending=[False, False, False],
-        )
-        print(candidates.to_string(index=False, formatters={
-            "WR": "{:.2f}".format,
-            "PnL": "${:,.2f}".format,
-            "PF": "{:.2f}".format,
-            "ValidationWR": "{:.2f}".format,
-            "ValidationPnL": "${:,.2f}".format,
-        }))
-
-    print()
-    print("NOTE: V131 is a controlled test: SOL removed, LINK added. Accept only if the complete result improves V129 without relying on one metric alone.")
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
 def main():
     print("=" * 80)
-    print("HUNTER-V131 — V129 BASELINE WITH CONTROLLED LINK REPLACEMENT")
+    print("HUNTER-V129 — V123 EXACT-BEHAVIOR AUDIT")
     print("=" * 80)
 
     now = datetime.now()
@@ -650,13 +558,13 @@ def main():
     )
 
     print()
-    print("AUDIT MODE: V123 behavior intentionally preserved.")
+    print("AUDIT MODE: V129 baseline with exactly ONE signal-quality filter.")
     print("Data connection: V123")
-    print("Universe: V129 minus SOL + LINK")
+    print("Symbols: V123")
     print("HTF selection: V123")
     print("center=True: V123")
     print("Sweep: V123")
-    print("Displacement: V123")
+    print("Displacement: V129 + close-location >= 70% (LONG) / <= 30% (SHORT)")
     print("Entry: V123")
     print("SL/TP/BE: V123")
     print("35-candle scan: V123")
@@ -838,7 +746,7 @@ def main():
 
     print()
     print("=" * 80)
-    print("===== HUNTER-V129 — V123 AUDIT RESULT =====")
+    print("===== HUNTER-V132 — V129 + CLOSE-LOCATION FILTER =====")
     print("=" * 80)
 
     print(
@@ -987,19 +895,16 @@ def main():
     # --------------------------------------------------------
 
     print("-" * 80)
-    print("V129 BASELINE REFERENCE:")
+    print("ORIGINAL V123 TARGET FOR REPRODUCTION:")
 
-    print("  Trades:       1041")
-    print("  Win Rate:     53.31%")
-    print("  Net PnL:      +$38,076.67")
-    print("  Profit Factor: 8.11")
-    print("  Max DD:       -$256.08")
+    print("  Trades:       1032")
+    print("  Win Rate:     53.88%")
+    print("  Net PnL:      +$38,472.66")
+    print("  Profit Factor: 8.28")
+    print("  Max DD:       -$252.89")
     print("  Max Loss Streak: 4")
 
     print("=" * 80)
-
-    # Universe analysis is deliberately separate from the baseline report.
-    print_universe_analysis(trades_df)
 
     # --------------------------------------------------------
     # Optional CSV artifact for local inspection.
