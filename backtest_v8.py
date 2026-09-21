@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V106 — MOMENTUM BOLLINGER & RSI BREAKOUT ENGINE
+# HUNTER-V107 — 15M 90-DAY WALK-FORWARD SCALPING ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -37,28 +37,28 @@ SYMBOLS = {
     "ADA": "ADA/USDT",
 }
 
-LOOKBACK_DAYS = 365
-TIMEFRAME = "1h"
+LOOKBACK_DAYS = 90  # تست دقیق ۹۰ روزه
+TIMEFRAME = "15m"
 MAX_POSITIONS = 4
 
 SLIPPAGE = 0.0002
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-INITIAL_ATR_MULTIPLIER = 1.8
-TP_ATR_MULTIPLIER = 3.6  # ریسک به ریوارد مطمئن 1 به 2
-TIMEOUT_CANDLES = 18
+INITIAL_ATR_MULTIPLIER = 1.6
+TP_ATR_MULTIPLIER = 3.2  # ریسک به ریوارد دقیق 1 به 2
+TIMEOUT_CANDLES = 24  # در تایم فریم 15 دقیقه یعنی 6 ساعت حداکثر زمان ماندن در معامله
 EMA_WARMUP = 200
 
 INITIAL_CAPITAL = 2000.0
 TRADE_MARGIN = 100.0
-LEVERAGE = 20.0
+LEVERAGE = 20.0  # اهرم امن و بهینه برای مدیریت کارمزد
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V106 — MOMENTUM BOLLINGER ENGINE INITIALIZED")
+print("HUNTER-V107 — 15M 90-DAY ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -109,7 +109,7 @@ def fetch_and_prepare_data(lbank_symbol):
 
     df.set_index("Date", inplace=True)
 
-    # محاسبه اندیکاتورها (باند بولینگر و RSI به همراه میانگین‌ها)
+    # محاسبه اندیکاتورها برای تایم‌فریم 15 دقیقه
     tr1 = df["High"] - df["Low"]
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
@@ -118,14 +118,7 @@ def fetch_and_prepare_data(lbank_symbol):
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
-    # بولینگر بندز (20 دوره، انحراف معیار 2)
-    bb_period = 20
-    df["BB_Middle"] = df["Close"].rolling(bb_period).mean()
-    bb_std = df["Close"].rolling(bb_period).std()
-    df["BB_Upper"] = df["BB_Middle"] + (bb_std * 2.0)
-    df["BB_Lower"] = df["BB_Middle"] - (bb_std * 2.0)
-
-    # شاخص قدرت نسبی (RSI 14)
+    # فیلتر مومنتوم RSI برای تایم‌فریم 15m
     delta = df["Close"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -170,14 +163,14 @@ def run_backtest(processed_data):
             df = processed_data[symbol]
             if ts not in df.index:
                 continue
-            c1h = df.loc[ts]
+            c15m = df.loc[ts]
 
             if pos["side"] == "LONG":
-                hit_sl = c1h["Low"] <= pos["stop_loss"]
-                hit_tp = c1h["High"] >= pos["take_profit"]
+                hit_sl = c15m["Low"] <= pos["stop_loss"]
+                hit_tp = c15m["High"] >= pos["take_profit"]
             else:
-                hit_sl = c1h["High"] >= pos["stop_loss"]
-                hit_tp = c1h["Low"] <= pos["take_profit"]
+                hit_sl = c15m["High"] >= pos["stop_loss"]
+                hit_tp = c15m["Low"] <= pos["take_profit"]
 
             curr_i = df.index.get_loc(ts)
             candles_held = curr_i - pos["entry_index"]
@@ -191,18 +184,18 @@ def run_backtest(processed_data):
                 if hit_tp:
                     exit_p = pos["take_profit"]
                 elif hit_sl:
-                    exit_p = min(pos["stop_loss"], c1h["Open"])
+                    exit_p = min(pos["stop_loss"], c15m["Open"])
                 else:
-                    exit_p = c1h["Close"]
+                    exit_p = c15m["Close"]
                 r_real = ((exit_p - pos["entry_price"]) / initial_risk) - (FEE_RATE * 2)
                 price_return_pct = (exit_p - pos["entry_price"]) / pos["entry_price"]
             else:
                 if hit_tp:
                     exit_p = pos["take_profit"]
                 elif hit_sl:
-                    exit_p = max(pos["stop_loss"], c1h["Open"])
+                    exit_p = max(pos["stop_loss"], c15m["Open"])
                 else:
-                    exit_p = c1h["Close"]
+                    exit_p = c15m["Close"]
                 r_real = ((pos["entry_price"] - exit_p) / initial_risk) - (FEE_RATE * 2)
                 price_return_pct = (pos["entry_price"] - exit_p) / pos["entry_price"]
 
@@ -212,7 +205,7 @@ def run_backtest(processed_data):
                 consecutive_losses += 1
                 current_loss_streak += 1
                 if consecutive_losses >= 3:
-                    global_cooldown = 15  # توقف سریع تر برای جلوگیری از ضررهای زنجیره‌ای
+                    global_cooldown = 12  # وقفه کوتاه در تایم فریم 15 دقیقه برای جلوگیری از ضرر زنجیره‌ای
             else:
                 if current_loss_streak > 0:
                     loss_streaks_list.append(current_loss_streak)
@@ -231,7 +224,7 @@ def run_backtest(processed_data):
                 "Dollar_PnL": dollar_pnl,
             })
             
-            cooldown_counters[symbol] = 2
+            cooldown_counters[symbol] = 4
             symbols_to_close.append(symbol)
 
         for sym in symbols_to_close:
@@ -254,23 +247,22 @@ def run_backtest(processed_data):
                 continue
 
             prev_c = df.iloc[i - 1]
-            c1h = df.iloc[i]
+            c15m = df.iloc[i]
 
-            # ستاپ جدید: روند صعودی با بولینگر و RSI
+            # منطق ترید در 15 دقیقه: استمرار روند EMA50 و EMA200 همراه با تاییدیه مومنتوم RSI
             trend_long = prev_c["Close"] > prev_c["EMA200"] and prev_c["EMA50"] > prev_c["EMA200"]
             trend_short = prev_c["Close"] < prev_c["EMA200"] and prev_c["EMA50"] < prev_c["EMA200"]
 
-            # شرایط ورود بر اساس برخورد/شکست بند بالایی و پایینی بولینگر به همراه مومنتوم RSI
-            valid_long = trend_long and (prev_c["Close"] <= prev_c["BB_Lower"]) and (prev_c["RSI"] < 40)
-            valid_short = trend_short and (prev_c["Close"] >= prev_c["BB_Upper"]) and (prev_c["RSI"] > 60)
+            valid_long = trend_long and (prev_c["RSI"] > 52) and (prev_c["Close"] > prev_c["Open"])
+            valid_short = trend_short and (prev_c["RSI"] < 48) and (prev_c["Close"] < prev_c["Open"])
 
             if not (valid_long or valid_short):
                 continue
 
             side = "LONG" if valid_long else "SHORT"
-            entry_price = c1h["Open"] * (1 + SLIPPAGE) if side == "LONG" else c1h["Open"] * (1 - SLIPPAGE)
+            entry_price = c15m["Open"] * (1 + SLIPPAGE) if side == "LONG" else c15m["Open"] * (1 - SLIPPAGE)
             
-            initial_atr = c1h["ATR"]
+            initial_atr = c15m["ATR"]
             if side == "LONG":
                 initial_sl = entry_price - (INITIAL_ATR_MULTIPLIER * initial_atr)
                 take_profit = entry_price + (TP_ATR_MULTIPLIER * initial_atr)
@@ -281,7 +273,7 @@ def run_backtest(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.01 <= sl_dist_pct <= 0.05):
+            if not (0.005 <= sl_dist_pct <= 0.03):
                 continue
 
             if len(active_positions) >= MAX_POSITIONS:
@@ -309,7 +301,7 @@ if __name__ == "__main__":
     max_streak = max(loss_streaks) if loss_streaks else 0
 
     print("=" * 72)
-    print("HUNTER-V106 BACKTEST RESULTS (1-YEAR)")
+    print("HUNTER-V107 BACKTEST RESULTS (90-DAY 15M)")
     print("=" * 72)
     print(f"Total Trades: {n}")
     print(f"Overall Win Rate: {win_rate:.2f}%")
