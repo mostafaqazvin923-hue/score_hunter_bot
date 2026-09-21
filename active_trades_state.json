@@ -1,13 +1,4 @@
 {
-    "active": {
-        "SOL": {
-            "symbol": "SOL/USDT",
-            "direction": "LONG",
-            "entry_price": 111.17,
-            "tp": 118.53928571428573,
-            "sl": 107.48535714285714,
-            "time": "2026-09-20 23:00:00"
-        }
-    },
+    "active": {},
     "cooldown": {}
 }
