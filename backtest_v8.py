@@ -15,8 +15,8 @@ except ImportError:
 
 
 # ============================================================
-# HUNTER-V129
-# V123 EXACT-BEHAVIOR AUDIT
+# HUNTER-V130
+# V123 EXACT-BEHAVIOR + UNIVERSE OPTIMIZER
 #
 # Purpose:
 # Reproduce the original V123 behavior before applying
@@ -41,7 +41,7 @@ exchange = ccxt.lbank({
 # EXACT V123 SYMBOLS
 # ============================================================
 
-SYMBOLS = {
+BASELINE_SYMBOLS = {
     "CRV": "CRV/USDT",
     "DOGE": "DOGE/USDT",
     "ICP": "ICP/USDT",
@@ -57,6 +57,21 @@ SYMBOLS = {
     "SOL": "SOL/USDT",
     "ETH": "ETH/USDT",
 }
+
+# Candidate replacements are deliberately taken from the user's
+# previously working LBank USDT universe. No new exchange/symbol
+# notation is introduced here. These are TESTED alongside the
+# baseline; they are not automatically promoted to the live universe.
+CANDIDATE_SYMBOLS = {
+    "BTC": "BTC/USDT",
+    "XRP": "XRP/USDT",
+    "SUI": "SUI/USDT",
+    "LINK": "LINK/USDT",
+    "AVAX": "AVAX/USDT",
+    "DOT": "DOT/USDT",
+}
+
+SYMBOLS = {**BASELINE_SYMBOLS, **CANDIDATE_SYMBOLS}
 
 
 # ============================================================
@@ -527,12 +542,112 @@ def run_v123_engine(
 
 
 # ============================================================
+# UNIVERSE ANALYSIS
+# ============================================================
+
+def summarize_symbol(sub):
+    total = len(sub)
+    wins = int((sub["Outcome"] == "WIN").sum())
+    losses = int((sub["Outcome"] == "LOSS").sum())
+    be = int((sub["Outcome"] == "BE").sum())
+    pnl = float(sub["Dollar_PnL"].sum())
+    gross_profit = float(sub.loc[sub["Outcome"] == "WIN", "Dollar_PnL"].sum())
+    gross_loss = abs(float(sub.loc[sub["Outcome"] == "LOSS", "Dollar_PnL"].sum()))
+    pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    wr = wins / total * 100.0 if total else 0.0
+
+    streak = 0
+    max_streak = 0
+    for outcome in sub["Outcome"]:
+        if outcome == "LOSS":
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+
+    # Split by time for a simple robustness check. This does not fit
+    # parameters; it only checks whether performance persists later.
+    if total >= 10:
+        split_time = sub["Timestamp"].min() + (sub["Timestamp"].max() - sub["Timestamp"].min()) * 0.70
+        val = sub[sub["Timestamp"] >= split_time]
+    else:
+        val = sub.iloc[0:0]
+
+    val_total = len(val)
+    val_wr = ((val["Outcome"] == "WIN").mean() * 100.0) if val_total else 0.0
+    val_pnl = float(val["Dollar_PnL"].sum()) if val_total else 0.0
+
+    return {
+        "Trades": total,
+        "WR": wr,
+        "PnL": pnl,
+        "PF": pf,
+        "MaxLossStreak": max_streak,
+        "ValidationTrades": val_total,
+        "ValidationWR": val_wr,
+        "ValidationPnL": val_pnl,
+    }
+
+
+def print_universe_analysis(trades_df):
+    rows = []
+    for symbol in SYMBOLS:
+        sub = trades_df[trades_df["Symbol"] == symbol].sort_values("Timestamp")
+        if len(sub) == 0:
+            continue
+        r = summarize_symbol(sub)
+        r["Symbol"] = symbol
+        r["Type"] = "BASELINE" if symbol in BASELINE_SYMBOLS else "CANDIDATE"
+        rows.append(r)
+
+    if not rows:
+        return
+
+    u = pd.DataFrame(rows)
+    cols = ["Symbol", "Type", "Trades", "WR", "PnL", "PF", "MaxLossStreak", "ValidationTrades", "ValidationWR", "ValidationPnL"]
+    u = u[cols]
+
+    print()
+    print("=" * 120)
+    print("UNIVERSE OPTIMIZATION — FULL PERIOD")
+    print("=" * 120)
+    print(u.sort_values(["Type", "PnL"], ascending=[True, False]).to_string(index=False, formatters={
+        "WR": "{:.2f}".format,
+        "PnL": "${:,.2f}".format,
+        "PF": "{:.2f}".format,
+        "ValidationWR": "{:.2f}".format,
+        "ValidationPnL": "${:,.2f}".format,
+    }))
+
+    print()
+    print("=" * 120)
+    print("CANDIDATES — ROBUSTNESS VIEW")
+    print("=" * 120)
+    candidates = u[u["Type"] == "CANDIDATE"].copy()
+    if len(candidates):
+        candidates = candidates.sort_values(
+            ["ValidationPnL", "ValidationWR", "PF"],
+            ascending=[False, False, False],
+        )
+        print(candidates.to_string(index=False, formatters={
+            "WR": "{:.2f}".format,
+            "PnL": "${:,.2f}".format,
+            "PF": "{:.2f}".format,
+            "ValidationWR": "{:.2f}".format,
+            "ValidationPnL": "${:,.2f}".format,
+        }))
+
+    print()
+    print("NOTE: No candidate is automatically promoted. A replacement should improve the baseline without relying only on the full-year result.")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
 def main():
     print("=" * 80)
-    print("HUNTER-V129 — V123 EXACT-BEHAVIOR AUDIT")
+    print("HUNTER-V130 — V123 BASELINE + UNIVERSE OPTIMIZER")
     print("=" * 80)
 
     now = datetime.now()
@@ -882,16 +997,19 @@ def main():
     # --------------------------------------------------------
 
     print("-" * 80)
-    print("ORIGINAL V123 TARGET FOR REPRODUCTION:")
+    print("V129 BASELINE REFERENCE:")
 
-    print("  Trades:       1032")
-    print("  Win Rate:     53.88%")
-    print("  Net PnL:      +$38,472.66")
-    print("  Profit Factor: 8.28")
-    print("  Max DD:       -$252.89")
+    print("  Trades:       1041")
+    print("  Win Rate:     53.31%")
+    print("  Net PnL:      +$38,076.67")
+    print("  Profit Factor: 8.11")
+    print("  Max DD:       -$256.08")
     print("  Max Loss Streak: 4")
 
     print("=" * 80)
+
+    # Universe analysis is deliberately separate from the baseline report.
+    print_universe_analysis(trades_df)
 
     # --------------------------------------------------------
     # Optional CSV artifact for local inspection.
