@@ -13,12 +13,11 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V126 — 14 ELITE GIANTS (FAIR TIMEOUT & GOLDEN LOGIC)
+# HUNTER-V127 — 100% CAUSAL & REALISTIC EXECUTION ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
 
-# لیست ۱۴ تایی نهایی (ریپل حذف شد)
 SYMBOLS = {
     "CRV": "CRV/USDT",
     "DOGE": "DOGE/USDT",
@@ -42,7 +41,6 @@ FEE_RATE = 0.0007
 TRADE_MARGIN = 100.0
 LEVERAGE = 50.0
 
-# تعریف ۴ پارت زمانی (از امروز تا ۳۶۵ روز گذشته)
 QUARTERS = [
     {"name": "Q1 (Recent 90 Days)", "start_days_ago": 90, "end_days_ago": 0},
     {"name": "Q2 (90 to 180 Days)", "start_days_ago": 180, "end_days_ago": 90},
@@ -99,17 +97,20 @@ def run_backtest_on_data(processed_data):
         cooldown_bars = 0
         consecutive_losses = 0
 
-        for i in range(50, len(df_15)):
+        # شروع از ایندکس ۵۰ تا فضای کافی برای بررسی کندل‌های قبل و بعد داشته باشیم
+        for i in range(50, len(df_15) - 35):
             if cooldown_bars > 0:
                 cooldown_bars -= 1
                 continue
 
             t_curr = df_15.index[i]
-            c_row = df_15.iloc[i]
-            p_row = df_15.iloc[i-1]
+            c_row = df_15.iloc[i]     # کندل اجرایی (لحظه باز شدن در t_curr)
+            p_row = df_15.iloc[i-1]   # کندل سیگنال (کاملاً بسته شده)
+            pp_row = df_15.iloc[i-2]  # کندل ماقبل سیگنال برای بررسی سوئیپ
 
-            h_sub = df_1h[df_1h.index <= t_curr]
-            h_4sub = df_4h[df_4h.index <= t_curr]
+            # فیلتر تایم‌فریم بالاتر: فقط کندل‌های کاملاً بسته شده قبل از t_curr
+            h_sub = df_1h[df_1h.index < t_curr]
+            h_4sub = df_4h[df_4h.index < t_curr]
 
             if len(h_sub) < 10 or len(h_4sub) < 10:
                 continue
@@ -117,19 +118,20 @@ def run_backtest_on_data(processed_data):
             regime_bull = h_4sub.iloc[-1]["Regime_Bullish"]
             regime_bear = h_4sub.iloc[-1]["Regime_Bearish"]
 
-            recent_lows = h_sub["Low"].iloc[-10:-2]
-            recent_highs = h_sub["High"].iloc[-10:-2]
+            recent_lows = h_sub["Low"].iloc[-10:-1]
+            recent_highs = h_sub["High"].iloc[-10:-1]
             if len(recent_lows) == 0 or len(recent_highs) == 0:
                 continue
 
             min_support = recent_lows.min()
             max_resistance = recent_highs.max()
 
-            sweep_low = (p_row["Low"] < min_support) and (p_row["Close"] > min_support)
-            sweep_high = (p_row["High"] > max_resistance) and (p_row["Close"] < max_resistance)
+            # بررسی سوئیپ و دیسپلیسمنت روی کندل کاملاً بسته شده (p_row)
+            sweep_low = (pp_row["Low"] < min_support) and (p_row["Close"] > min_support)
+            sweep_high = (pp_row["High"] > max_resistance) and (p_row["Close"] < max_resistance)
 
-            displacement_up = (c_row["Close"] > c_row["Open"]) and (c_row["Body"] > 2.0 * c_row["Avg_Body"])
-            displacement_down = (c_row["Close"] < c_row["Open"]) and (c_row["Body"] > 2.0 * c_row["Avg_Body"])
+            displacement_up = (p_row["Close"] > p_row["Open"]) and (p_row["Body"] > 2.0 * p_row["Avg_Body"])
+            displacement_down = (p_row["Close"] < p_row["Open"]) and (p_row["Body"] > 2.0 * p_row["Avg_Body"])
 
             valid_long = regime_bull and sweep_low and displacement_up
             valid_short = regime_bear and sweep_high and displacement_down
@@ -138,8 +140,10 @@ def run_backtest_on_data(processed_data):
                 continue
 
             side = "LONG" if valid_long else "SHORT"
+            
+            # ورود کاملاً کائوسال روی قیمت Open کندل جاری (c_row)
             entry_price = c_row["Open"] * (1 + SLIPPAGE) if side == "LONG" else c_row["Open"] * (1 - SLIPPAGE)
-            atr = c_row["ATR"]
+            atr = p_row["ATR"]
 
             if np.isnan(atr) or atr <= 0:
                 continue
@@ -158,7 +162,8 @@ def run_backtest_on_data(processed_data):
             current_sl = sl
             breakeven_activated = False
 
-            for j in range(i + 1, min(i + 35, len(df_15))):
+            # بررسی روند معامله در کندل‌های آینده (تا ۳۴ کندل بعد از ورود)
+            for j in range(i, min(i + 34, len(df_15))):
                 fut = df_15.iloc[j]
                 if side == "LONG":
                     if not breakeven_activated and fut["High"] >= be_trigger:
@@ -201,9 +206,9 @@ def run_backtest_on_data(processed_data):
                         exit_price = tp
                         break
 
-            # بررسی منصفانه‌ی تایم‌اوت (بر اساس قیمت Close کندل آخر به جای باخت اجباری)
+            # بررسی منصفانه‌ی تایم‌اوت در صورت عدم برخورد با TP یا SL
             if outcome is None:
-                last_fut = df_15.iloc[min(i + 34, len(df_15) - 1)]
+                last_fut = df_15.iloc[min(i + 33, len(df_15) - 1)]
                 exit_price = last_fut["Close"]
                 if side == "LONG":
                     if exit_price > entry_price:
@@ -244,7 +249,7 @@ def run_backtest_on_data(processed_data):
 
 if __name__ == "__main__":
     print("=" * 72)
-    print("HUNTER-V126 — 14 ELITE GIANTS (FAIR TIMEOUT) BACKTEST INITIALIZED")
+    print("HUNTER-V127 — 100% CAUSAL & REALISTIC BACKTEST INITIALIZED")
     print("=" * 72)
 
     all_quarter_trades = []
@@ -276,8 +281,8 @@ if __name__ == "__main__":
             df_4h["Regime_Bullish"] = (df_4h["Close"] > df_4h["EMA_200"]) & (df_4h["EMA_50"] > df_4h["EMA_200"])
             df_4h["Regime_Bearish"] = (df_4h["Close"] < df_4h["EMA_200"]) & (df_4h["EMA_50"] < df_4h["EMA_200"])
 
-            df_1h["Swing_High"] = df_1h["High"].rolling(5, center=True).max()
-            df_1h["Swing_Low"] = df_1h["Low"].rolling(5, center=True).min()
+            df_1h["Swing_High"] = df_1h["High"].rolling(5).max()
+            df_1h["Swing_Low"] = df_1h["Low"].rolling(5).min()
             df_1h["ATR"] = (df_1h["High"] - df_1h["Low"]).rolling(14).mean()
 
             df_15m["ATR"] = (df_15m["High"] - df_15m["Low"]).rolling(14).mean()
@@ -339,7 +344,7 @@ if __name__ == "__main__":
         max_consecutive_losses = max(streaks) if streaks else 0
 
         print("\n" + "=" * 72)
-        print("===== HUNTER-V126 (FAIR TIMEOUT) — AGGREGATED 1-YEAR RESULT =====")
+        print("===== HUNTER-V127 (100% CAUSAL) — AGGREGATED 1-YEAR RESULT =====")
         print(f"Total Trades (Full Year): {n}")
         print(f"Trades Per Month (Avg): {n / 12.0:.1f}")
         print(f"Win Rate: {win_rate:.2f}%")
