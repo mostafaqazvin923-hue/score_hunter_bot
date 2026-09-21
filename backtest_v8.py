@@ -13,7 +13,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V123 — 14 ELITE GIANTS (STABLE BASELINE)
+# HUNTER-V125 — CLEAN CAUSAL & REALISTIC EXECUTION ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
@@ -97,7 +97,8 @@ def run_backtest_on_data(processed_data):
         cooldown_bars = 0
         consecutive_losses = 0
 
-        for i in range(50, len(df_15)):
+        # برای اینکه فضای کافی برای i+1 و بررسی آینده داشته باشیم
+        for i in range(50, len(df_15) - 36):
             if cooldown_bars > 0:
                 cooldown_bars -= 1
                 continue
@@ -136,7 +137,10 @@ def run_backtest_on_data(processed_data):
                 continue
 
             side = "LONG" if valid_long else "SHORT"
-            entry_price = c_row["Open"] * (1 + SLIPPAGE) if side == "LONG" else c_row["Open"] * (1 - SLIPPAGE)
+            
+            # ورود کاملاً علیّتی از Open کندل بعدی (i + 1)
+            next_row = df_15.iloc[i + 1]
+            entry_price = next_row["Open"] * (1 + SLIPPAGE) if side == "LONG" else next_row["Open"] * (1 - SLIPPAGE)
             atr = c_row["ATR"]
 
             if np.isnan(atr) or atr <= 0:
@@ -151,12 +155,14 @@ def run_backtest_on_data(processed_data):
                 tp = entry_price - (3.0 * atr)
                 be_trigger = entry_price - (1.5 * atr)
 
-            outcome = "LOSS"
-            exit_price = sl
+            outcome = None
+            exit_price = 0.0
             current_sl = sl
             breakeven_activated = False
 
-            for j in range(i + 1, min(i + 35, len(df_15))):
+            # بررسی آینده از کندل i+1 به بعد (تا ۳۴ کندل)
+            end_lookahead = min(i + 1 + 34, len(df_15))
+            for j in range(i + 1, end_lookahead):
                 fut = df_15.iloc[j]
                 if side == "LONG":
                     if not breakeven_activated and fut["High"] >= be_trigger:
@@ -199,6 +205,25 @@ def run_backtest_on_data(processed_data):
                         exit_price = tp
                         break
 
+            # خروج زمانی منطقی در صورت عدم برخورد با SL یا TP
+            if outcome is None:
+                last_fut = df_15.iloc[end_lookahead - 1]
+                exit_price = last_fut["Close"]
+                if side == "LONG":
+                    if exit_price > entry_price:
+                        outcome = "WIN"
+                    elif exit_price < entry_price:
+                        outcome = "LOSS"
+                    else:
+                        outcome = "BE"
+                else:
+                    if exit_price < entry_price:
+                        outcome = "WIN"
+                    elif exit_price > entry_price:
+                        outcome = "LOSS"
+                    else:
+                        outcome = "BE"
+
             if outcome == "LOSS":
                 consecutive_losses += 1
                 if consecutive_losses >= 2:
@@ -223,7 +248,7 @@ def run_backtest_on_data(processed_data):
 
 if __name__ == "__main__":
     print("=" * 72)
-    print("HUNTER-V123 — 14 ELITE GIANTS STABLE BASELINE INITIALIZED")
+    print("HUNTER-V125 — CLEAN CAUSAL BACKTEST INITIALIZED")
     print("=" * 72)
 
     all_quarter_trades = []
@@ -318,7 +343,7 @@ if __name__ == "__main__":
         max_consecutive_losses = max(streaks) if streaks else 0
 
         print("\n" + "=" * 72)
-        print("===== 14 ELITE SYMBOLS — STABLE BASELINE RESULT =====")
+        print("===== HUNTER-V125 (CLEAN CAUSAL) 1-YEAR BACKTEST RESULT =====")
         print(f"Total Trades (Full Year): {n}")
         print(f"Trades Per Month (Avg): {n / 12.0:.1f}")
         print(f"Win Rate: {win_rate:.2f}%")
@@ -331,7 +356,7 @@ if __name__ == "__main__":
         print(f"Maximum Consecutive Losses: {max_consecutive_losses}")
         print("-" * 72)
         
-        print("BY SYMBOL (14 GIANTS):")
+        print("BY SYMBOL:")
         for sym in list(SYMBOLS.keys()):
             sub = trades_df[trades_df["Symbol"] == sym]
             if len(sub) > 0:
@@ -340,7 +365,7 @@ if __name__ == "__main__":
                 print(f"  {sym:6} -> Trades: {len(sub):3}, Win Rate: {s_wr:5.2f}%, PnL: ${s_pnl:10,.2f}")
 
         print("-" * 72)
-        print("BY MONTH (14 GIANTS):")
+        print("BY MONTH:")
         for m, sub in trades_df.groupby("Month"):
             m_wr = sub["Outcome"].eq("WIN").mean() * 100
             m_pnl = sub["Dollar_PnL"].sum()
