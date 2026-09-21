@@ -1,13 +1,5 @@
 {
     "active": {
-        "ADA": {
-            "symbol": "ADA/USDT",
-            "direction": "LONG",
-            "entry_price": 0.2224,
-            "tp": 0.24434999999999996,
-            "sl": 0.211425,
-            "time": "2026-09-18 19:00:00"
-        },
         "SOL": {
             "symbol": "SOL/USDT",
             "direction": "LONG",
