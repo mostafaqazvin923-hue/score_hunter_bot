@@ -13,13 +13,12 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V119 — INSTITUTIONAL ENGINE WITH COOLDOWN & BREAKEVEN
+# HUNTER-V120 — 30-SYMBOL INSTITUTIONAL CONFLUENCE ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
 
 SYMBOLS = {
-    "BTC": "BTC/USDT",
     "ETH": "ETH/USDT",
     "SOL": "SOL/USDT",
     "XRP": "XRP/USDT",
@@ -36,6 +35,20 @@ SYMBOLS = {
     "DOGE": "DOGE/USDT",
     "BNB": "BNB/USDT",
     "ADA": "ADA/USDT",
+    "SUI": "SUI/USDT",
+    "APT": "APT/USDT",
+    "NEAR": "NEAR/USDT",
+    "PEPE": "PEPE/USDT",
+    "ARB": "ARB/USDT",
+    "OP": "OP/USDT",
+    "MATIC": "MATIC/USDT",
+    "FIL": "FIL/USDT",
+    "TIA": "TIA/USDT",
+    "SEI": "SEI/USDT",
+    "FET": "FET/USDT",
+    "NEAR": "NEAR/USDT",
+    "CRV": "CRV/USDT",
+    "PENDLE": "PENDLE/USDT"
 }
 
 LOOKBACK_DAYS = 180
@@ -51,7 +64,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS + 10)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V119 — COOLDOWN & BREAKEVEN ENGINE INITIALIZED")
+print("HUNTER-V120 — 30-SYMBOL EXPANDED ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -90,6 +103,8 @@ def fetch_ohlcv_data(lbank_symbol, timeframe):
     return df
 
 for symbol, lbank_symbol in SYMBOLS.items():
+    if symbol in processed_data:
+        continue
     print(f"Downloading 15m data for {symbol} (180 Days)...")
     df_15m = fetch_ohlcv_data(lbank_symbol, TIMEFRAME_BASE)
 
@@ -188,7 +203,7 @@ def run_backtest(data_dict):
             if side == "LONG":
                 sl = entry_price - (1.5 * atr)
                 tp = entry_price + (3.0 * atr)
-                be_trigger = entry_price + (1.5 * atr) # سطح 1:1 برای انتقال SL به Entry
+                be_trigger = entry_price + (1.5 * atr)
             else:
                 sl = entry_price + (1.5 * atr)
                 tp = entry_price - (3.0 * atr)
@@ -202,7 +217,6 @@ def run_backtest(data_dict):
             for j in range(i + 1, min(i + 35, len(df_15))):
                 fut = df_15.iloc[j]
                 if side == "LONG":
-                    # بررسی رسیدن به هدف Breakeven
                     if not breakeven_activated and fut["High"] >= be_trigger:
                         current_sl = entry_price
                         breakeven_activated = True
@@ -243,11 +257,10 @@ def run_backtest(data_dict):
                         exit_price = tp
                         break
 
-            # مدیریت استریک ضرر و Cooldown
             if outcome == "LOSS":
                 consecutive_losses += 1
                 if consecutive_losses >= 2:
-                    cooldown_bars = 16 # استراحت به مدت ۱۶ کندل ۱۵ دقیقه‌ای (۴ ساعت) پس از ۲ باخت متوالی
+                    cooldown_bars = 16
                     consecutive_losses = 0
             elif outcome == "WIN":
                 consecutive_losses = 0
@@ -304,7 +317,7 @@ if __name__ == "__main__":
     max_consecutive_losses = max(streaks) if streaks else 0
 
     print("=" * 72)
-    print("===== BACKTEST RESULT (COOLDOWN & BREAKEVEN) =====")
+    print("===== BACKTEST RESULT (30 SYMBOLS EXPANDED) =====")
     print(f"Period: 180 Days (LBank)")
     print(f"Total Trades: {n}")
     print(f"Win Rate: {win_rate:.2f}%")
@@ -328,7 +341,7 @@ if __name__ == "__main__":
         
         print("-" * 72)
         print("BY SYMBOL:")
-        for sym in SYMBOLS.keys():
+        for sym in list(processed_data.keys()):
             sub = trades_df[trades_df["Symbol"] == sym]
             if len(sub) > 0:
                 s_wr = sub["Outcome"].eq("WIN").mean() * 100
