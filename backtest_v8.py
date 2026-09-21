@@ -13,11 +13,12 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V125 — CLEAN CAUSAL & REALISTIC EXECUTION ENGINE
+# HUNTER-V126 — 14 ELITE GIANTS (FAIR TIMEOUT & GOLDEN LOGIC)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
 
+# لیست ۱۴ تایی نهایی (ریپل حذف شد)
 SYMBOLS = {
     "CRV": "CRV/USDT",
     "DOGE": "DOGE/USDT",
@@ -41,6 +42,7 @@ FEE_RATE = 0.0007
 TRADE_MARGIN = 100.0
 LEVERAGE = 50.0
 
+# تعریف ۴ پارت زمانی (از امروز تا ۳۶۵ روز گذشته)
 QUARTERS = [
     {"name": "Q1 (Recent 90 Days)", "start_days_ago": 90, "end_days_ago": 0},
     {"name": "Q2 (90 to 180 Days)", "start_days_ago": 180, "end_days_ago": 90},
@@ -97,8 +99,7 @@ def run_backtest_on_data(processed_data):
         cooldown_bars = 0
         consecutive_losses = 0
 
-        # برای اینکه فضای کافی برای i+1 و بررسی آینده داشته باشیم
-        for i in range(50, len(df_15) - 36):
+        for i in range(50, len(df_15)):
             if cooldown_bars > 0:
                 cooldown_bars -= 1
                 continue
@@ -137,10 +138,7 @@ def run_backtest_on_data(processed_data):
                 continue
 
             side = "LONG" if valid_long else "SHORT"
-            
-            # ورود کاملاً علیّتی از Open کندل بعدی (i + 1)
-            next_row = df_15.iloc[i + 1]
-            entry_price = next_row["Open"] * (1 + SLIPPAGE) if side == "LONG" else next_row["Open"] * (1 - SLIPPAGE)
+            entry_price = c_row["Open"] * (1 + SLIPPAGE) if side == "LONG" else c_row["Open"] * (1 - SLIPPAGE)
             atr = c_row["ATR"]
 
             if np.isnan(atr) or atr <= 0:
@@ -160,9 +158,7 @@ def run_backtest_on_data(processed_data):
             current_sl = sl
             breakeven_activated = False
 
-            # بررسی آینده از کندل i+1 به بعد (تا ۳۴ کندل)
-            end_lookahead = min(i + 1 + 34, len(df_15))
-            for j in range(i + 1, end_lookahead):
+            for j in range(i + 1, min(i + 35, len(df_15))):
                 fut = df_15.iloc[j]
                 if side == "LONG":
                     if not breakeven_activated and fut["High"] >= be_trigger:
@@ -205,9 +201,9 @@ def run_backtest_on_data(processed_data):
                         exit_price = tp
                         break
 
-            # خروج زمانی منطقی در صورت عدم برخورد با SL یا TP
+            # بررسی منصفانه‌ی تایم‌اوت (بر اساس قیمت Close کندل آخر به جای باخت اجباری)
             if outcome is None:
-                last_fut = df_15.iloc[end_lookahead - 1]
+                last_fut = df_15.iloc[min(i + 34, len(df_15) - 1)]
                 exit_price = last_fut["Close"]
                 if side == "LONG":
                     if exit_price > entry_price:
@@ -248,7 +244,7 @@ def run_backtest_on_data(processed_data):
 
 if __name__ == "__main__":
     print("=" * 72)
-    print("HUNTER-V125 — CLEAN CAUSAL BACKTEST INITIALIZED")
+    print("HUNTER-V126 — 14 ELITE GIANTS (FAIR TIMEOUT) BACKTEST INITIALIZED")
     print("=" * 72)
 
     all_quarter_trades = []
@@ -280,8 +276,8 @@ if __name__ == "__main__":
             df_4h["Regime_Bullish"] = (df_4h["Close"] > df_4h["EMA_200"]) & (df_4h["EMA_50"] > df_4h["EMA_200"])
             df_4h["Regime_Bearish"] = (df_4h["Close"] < df_4h["EMA_200"]) & (df_4h["EMA_50"] < df_4h["EMA_200"])
 
-            df_1h["Swing_High"] = df_1h["High"].rolling(5).max()
-            df_1h["Swing_Low"] = df_1h["Low"].rolling(5).min()
+            df_1h["Swing_High"] = df_1h["High"].rolling(5, center=True).max()
+            df_1h["Swing_Low"] = df_1h["Low"].rolling(5, center=True).min()
             df_1h["ATR"] = (df_1h["High"] - df_1h["Low"]).rolling(14).mean()
 
             df_15m["ATR"] = (df_15m["High"] - df_15m["Low"]).rolling(14).mean()
@@ -343,7 +339,7 @@ if __name__ == "__main__":
         max_consecutive_losses = max(streaks) if streaks else 0
 
         print("\n" + "=" * 72)
-        print("===== HUNTER-V125 (CLEAN CAUSAL) 1-YEAR BACKTEST RESULT =====")
+        print("===== HUNTER-V126 (FAIR TIMEOUT) — AGGREGATED 1-YEAR RESULT =====")
         print(f"Total Trades (Full Year): {n}")
         print(f"Trades Per Month (Avg): {n / 12.0:.1f}")
         print(f"Win Rate: {win_rate:.2f}%")
