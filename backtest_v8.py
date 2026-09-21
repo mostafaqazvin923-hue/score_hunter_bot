@@ -13,42 +13,28 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V120 — 30-SYMBOL INSTITUTIONAL CONFLUENCE ENGINE
+# HUNTER-V121 — 15 ELITE SYMBOLS (TARGET WIN-RATE > 50% & 4-5 TRADES/DAY)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
 
+# گلچین بهترین ۱۵ ارز با بالاترین راندمان
 SYMBOLS = {
-    "ETH": "ETH/USDT",
-    "SOL": "SOL/USDT",
-    "XRP": "XRP/USDT",
-    "LINK": "LINK/USDT",
-    "UNI": "UNI/USDT",
+    "CRV": "CRV/USDT",
+    "DOGE": "DOGE/USDT",
     "ICP": "ICP/USDT",
-    "INJ": "INJ/USDT",
-    "ATOM": "ATOM/USDT",
-    "RENDER": "RENDER/USDT",
-    "XLM": "XLM/USDT",
-    "AAVE": "AAVE/USDT",
+    "APT": "APT/USDT",
+    "PENDLE": "PENDLE/USDT",
     "WIF": "WIF/USDT",
     "ONDO": "ONDO/USDT",
-    "DOGE": "DOGE/USDT",
-    "BNB": "BNB/USDT",
-    "ADA": "ADA/USDT",
-    "SUI": "SUI/USDT",
-    "APT": "APT/USDT",
     "NEAR": "NEAR/USDT",
-    "PEPE": "PEPE/USDT",
-    "ARB": "ARB/USDT",
-    "OP": "OP/USDT",
-    "MATIC": "MATIC/USDT",
-    "FIL": "FIL/USDT",
-    "TIA": "TIA/USDT",
     "SEI": "SEI/USDT",
-    "FET": "FET/USDT",
-    "NEAR": "NEAR/USDT",
-    "CRV": "CRV/USDT",
-    "PENDLE": "PENDLE/USDT"
+    "ARB": "ARB/USDT",
+    "XLM": "XLM/USDT",
+    "ATOM": "ATOM/USDT",
+    "ADA": "ADA/USDT",
+    "BNB": "BNB/USDT",
+    "OP": "OP/USDT"
 }
 
 LOOKBACK_DAYS = 180
@@ -64,7 +50,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS + 10)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V120 — 30-SYMBOL EXPANDED ENGINE INITIALIZED")
+print("HUNTER-V121 — 15 ELITE SYMBOLS ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -184,8 +170,9 @@ def run_backtest(data_dict):
             sweep_low = (p_row["Low"] < min_support) and (p_row["Close"] > min_support)
             sweep_high = (p_row["High"] > max_resistance) and (p_row["Close"] < max_resistance)
 
-            displacement_up = (c_row["Close"] > c_row["Open"]) and (c_row["Body"] > 1.5 * c_row["Avg_Body"])
-            displacement_down = (c_row["Close"] < c_row["Open"]) and (c_row["Body"] > 1.5 * c_row["Avg_Body"])
+            # فیلتر شتاب سخت‌گیرانه‌تر (ضریب 2.0 برای کاهش ورودهای فیک و افزایش وین‌ریت)
+            displacement_up = (c_row["Close"] > c_row["Open"]) and (c_row["Body"] > 2.0 * c_row["Avg_Body"])
+            displacement_down = (c_row["Close"] < c_row["Open"]) and (c_row["Body"] > 2.0 * c_row["Avg_Body"])
 
             valid_long = regime_bull and sweep_low and displacement_up
             valid_short = regime_bear and sweep_high and displacement_down
@@ -317,9 +304,10 @@ if __name__ == "__main__":
     max_consecutive_losses = max(streaks) if streaks else 0
 
     print("=" * 72)
-    print("===== BACKTEST RESULT (30 SYMBOLS EXPANDED) =====")
+    print("===== BACKTEST RESULT (15 ELITE SYMBOLS - V121) =====")
     print(f"Period: 180 Days (LBank)")
     print(f"Total Trades: {n}")
+    print(f"Trades Per Day: {n / LOOKBACK_DAYS:.2f}")
     print(f"Win Rate: {win_rate:.2f}%")
     print(f"Loss Rate: {loss_rate:.2f}%")
     print(f"Net PnL: ${net_pnl:,.2f}")
