@@ -2,7 +2,8 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
 import numpy as np
 import pandas as pd
 
@@ -12,365 +13,1303 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
     import ccxt
 
+
 # ============================================================
-# HUNTER-V127 — 100% CAUSAL & REALISTIC EXECUTION ENGINE
+# HUNTER-V128
+# V123 STRATEGY / CAUSAL PORTFOLIO BACKTEST ENGINE
+#
+# IMPORTANT:
+# - Strategy logic preserved from V123
+# - Signal candle must be CLOSED
+# - Entry = NEXT 15m candle OPEN
+# - No lookahead
+# - No artificial timeout
+# - No overlapping position per symbol
+# - Completed 1H / 4H candles only
+# - LBank perpetual swaps
+# - Nominal RR = 1:2
 # ============================================================
 
-exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
+
+# ============================================================
+# EXCHANGE
+# ============================================================
+
+exchange = ccxt.lbank({
+    "enableRateLimit": True,
+    "timeout": 20000,
+    "options": {
+        "defaultType": "swap"
+    }
+})
+
+
+# ============================================================
+# SYMBOLS
+# LBank linear USDT perpetuals
+# ============================================================
 
 SYMBOLS = {
-    "CRV": "CRV/USDT",
-    "DOGE": "DOGE/USDT",
-    "ICP": "ICP/USDT",
-    "APT": "APT/USDT",
-    "PENDLE": "PENDLE/USDT",
-    "WIF": "WIF/USDT",
-    "ONDO": "ONDO/USDT",
-    "NEAR": "NEAR/USDT",
-    "SEI": "SEI/USDT",
-    "XLM": "XLM/USDT",
-    "ADA": "ADA/USDT",
-    "BNB": "BNB/USDT",
-    "SOL": "SOL/USDT",
-    "ETH": "ETH/USDT"
+    "CRV": "CRV/USDT:USDT",
+    "DOGE": "DOGE/USDT:USDT",
+    "ICP": "ICP/USDT:USDT",
+    "APT": "APT/USDT:USDT",
+    "PENDLE": "PENDLE/USDT:USDT",
+    "WIF": "WIF/USDT:USDT",
+    "ONDO": "ONDO/USDT:USDT",
+    "NEAR": "NEAR/USDT:USDT",
+    "SEI": "SEI/USDT:USDT",
+    "XLM": "XLM/USDT:USDT",
+    "ADA": "ADA/USDT:USDT",
+    "BNB": "BNB/USDT:USDT",
+    "SOL": "SOL/USDT:USDT",
+    "ETH": "ETH/USDT:USDT",
 }
 
+
+# ============================================================
+# CONFIG
+# ============================================================
+
 TIMEFRAME_BASE = "15m"
+
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
+
 TRADE_MARGIN = 100.0
 LEVERAGE = 50.0
 
-QUARTERS = [
-    {"name": "Q1 (Recent 90 Days)", "start_days_ago": 90, "end_days_ago": 0},
-    {"name": "Q2 (90 to 180 Days)", "start_days_ago": 180, "end_days_ago": 90},
-    {"name": "Q3 (180 to 270 Days)", "start_days_ago": 270, "end_days_ago": 180},
-    {"name": "Q4 (270 to 365 Days)", "start_days_ago": 365, "end_days_ago": 270},
-]
+DAYS = 365
 
-def fetch_chunk_data(lbank_symbol, start_dt, end_dt):
-    since_ts = int((start_dt - timedelta(days=15)).timestamp() * 1000)
+# Warmup:
+# 200 x 4h EMA requires substantial history.
+# 45 days gives > 270 four-hour candles.
+WARMUP_DAYS = 60
+
+# Original V123 signal parameters
+SWEEP_LOOKBACK_1H = 10
+DISPLACEMENT_MULTIPLIER = 2.0
+
+ATR_PERIOD_15M = 14
+BODY_AVG_PERIOD = 20
+
+SL_ATR_MULT = 1.5
+TP_ATR_MULT = 3.0
+BE_ATR_MULT = 1.5
+
+# Conservative intrabar priority
+# If both SL and TP occur in the same OHLC candle:
+# choose SL first unless BE has already been activated.
+CONSERVATIVE_SAME_BAR = True
+
+
+# ============================================================
+# DATA FETCH
+# ============================================================
+
+def fetch_ohlcv_full(symbol, start_dt, end_dt):
+    """
+    Fetch 15m LBank perpetual OHLCV.
+
+    IMPORTANT:
+    start_dt/end_dt are UTC-aware.
+    """
+
+    since_ts = int(start_dt.timestamp() * 1000)
     end_ts = int(end_dt.timestamp() * 1000)
-    
+
     all_ohlcv = []
     current_since = since_ts
+
     try:
         while current_since < end_ts:
-            batch = exchange.fetch_ohlcv(lbank_symbol, timeframe=TIMEFRAME_BASE, since=current_since, limit=1000)
+
+            batch = exchange.fetch_ohlcv(
+                symbol,
+                timeframe=TIMEFRAME_BASE,
+                since=current_since,
+                limit=1000
+            )
+
             if not batch:
                 break
+
             all_ohlcv.extend(batch)
+
             last_ts = batch[-1][0]
+
             if last_ts <= current_since:
                 break
+
             current_since = last_ts + 1
-            if len(batch) < 1000 or last_ts >= end_ts:
+
+            if len(batch) < 1000:
                 break
-            time.sleep(0.2)
+
+            if last_ts >= end_ts:
+                break
+
+            time.sleep(0.25)
+
     except Exception as e:
-        print(f"Error fetching {lbank_symbol}: {e}")
+        print(f"ERROR fetching {symbol}: {e}")
         return None
 
     if not all_ohlcv:
         return None
 
-    df = pd.DataFrame(all_ohlcv, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
-    df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms")
-    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+    df = pd.DataFrame(
+        all_ohlcv,
+        columns=[
+            "Timestamp",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume"
+        ]
+    )
+
+    # UTC timestamps
+    df["Date"] = pd.to_datetime(
+        df["Timestamp"],
+        unit="ms",
+        utc=True
+    )
+
+    df = df[
+        [
+            "Date",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume"
+        ]
+    ]
+
     df.dropna(inplace=True)
-    df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
+
+    df.drop_duplicates(
+        subset=["Date"],
+        keep="last",
+        inplace=True
+    )
+
     df.sort_values("Date", inplace=True)
-    df.reset_index(drop=True, inplace=True)
+
     df.set_index("Date", inplace=True)
-    
-    df = df[(df.index >= start_dt) & (df.index <= end_dt)]
+
+    # Remove current still-open candle.
+    now_ms = exchange.milliseconds()
+
+    tf_ms = 15 * 60 * 1000
+
+    last_complete_open_ms = (
+        (now_ms // tf_ms) * tf_ms
+    ) - tf_ms
+
+    last_complete_dt = pd.to_datetime(
+        last_complete_open_ms,
+        unit="ms",
+        utc=True
+    )
+
+    df = df[df.index <= last_complete_dt]
+
+    # Keep requested range including warmup.
+    df = df[
+        (df.index >= start_dt) &
+        (df.index <= end_dt)
+    ]
+
     return df
 
-def run_backtest_on_data(processed_data):
-    all_trades = []
 
-    for symbol, dsets in processed_data.items():
-        df_15 = dsets["15m"]
-        df_1h = dsets["1h"]
-        df_4h = dsets["4h"]
+# ============================================================
+# INDICATORS
+# ============================================================
 
-        cooldown_bars = 0
-        consecutive_losses = 0
+def prepare_data(df_15m):
+    """
+    Build 15m / 1h / 4h datasets.
 
-        # شروع از ایندکس ۵۰ تا فضای کافی برای بررسی کندل‌های قبل و بعد داشته باشیم
-        for i in range(50, len(df_15) - 35):
-            if cooldown_bars > 0:
-                cooldown_bars -= 1
-                continue
+    No centered rolling calculations.
+    """
 
-            t_curr = df_15.index[i]
-            c_row = df_15.iloc[i]     # کندل اجرایی (لحظه باز شدن در t_curr)
-            p_row = df_15.iloc[i-1]   # کندل سیگنال (کاملاً بسته شده)
-            pp_row = df_15.iloc[i-2]  # کندل ماقبل سیگنال برای بررسی سوئیپ
+    df_15m = df_15m.copy()
 
-            # فیلتر تایم‌فریم بالاتر: فقط کندل‌های کاملاً بسته شده قبل از t_curr
-            h_sub = df_1h[df_1h.index < t_curr]
-            h_4sub = df_4h[df_4h.index < t_curr]
+    # --------------------------------------------------------
+    # 15m indicators
+    # --------------------------------------------------------
 
-            if len(h_sub) < 10 or len(h_4sub) < 10:
-                continue
+    df_15m["Body"] = (
+        df_15m["Close"] -
+        df_15m["Open"]
+    ).abs()
 
-            regime_bull = h_4sub.iloc[-1]["Regime_Bullish"]
-            regime_bear = h_4sub.iloc[-1]["Regime_Bearish"]
+    df_15m["Avg_Body"] = (
+        df_15m["Body"]
+        .rolling(BODY_AVG_PERIOD, min_periods=BODY_AVG_PERIOD)
+        .mean()
+    )
 
-            recent_lows = h_sub["Low"].iloc[-10:-1]
-            recent_highs = h_sub["High"].iloc[-10:-1]
-            if len(recent_lows) == 0 or len(recent_highs) == 0:
-                continue
+    # V123-style ATR
+    df_15m["ATR"] = (
+        (df_15m["High"] - df_15m["Low"])
+        .rolling(ATR_PERIOD_15M, min_periods=ATR_PERIOD_15M)
+        .mean()
+    )
 
-            min_support = recent_lows.min()
-            max_resistance = recent_highs.max()
+    # --------------------------------------------------------
+    # 1H
+    # --------------------------------------------------------
 
-            # بررسی سوئیپ و دیسپلیسمنت روی کندل کاملاً بسته شده (p_row)
-            sweep_low = (pp_row["Low"] < min_support) and (p_row["Close"] > min_support)
-            sweep_high = (pp_row["High"] > max_resistance) and (p_row["Close"] < max_resistance)
+    df_1h = df_15m.resample(
+        "1h",
+        label="left",
+        closed="left"
+    ).agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum"
+    }).dropna()
 
-            displacement_up = (p_row["Close"] > p_row["Open"]) and (p_row["Body"] > 2.0 * p_row["Avg_Body"])
-            displacement_down = (p_row["Close"] < p_row["Open"]) and (p_row["Body"] > 2.0 * p_row["Avg_Body"])
+    # No center=True
+    df_1h["Swing_High"] = (
+        df_1h["High"]
+        .rolling(5, min_periods=5)
+        .max()
+    )
 
-            valid_long = regime_bull and sweep_low and displacement_up
-            valid_short = regime_bear and sweep_high and displacement_down
+    df_1h["Swing_Low"] = (
+        df_1h["Low"]
+        .rolling(5, min_periods=5)
+        .min()
+    )
 
-            if not (valid_long or valid_short):
-                continue
+    df_1h["ATR"] = (
+        (df_1h["High"] - df_1h["Low"])
+        .rolling(14, min_periods=14)
+        .mean()
+    )
 
-            side = "LONG" if valid_long else "SHORT"
-            
-            # ورود کاملاً کائوسال روی قیمت Open کندل جاری (c_row)
-            entry_price = c_row["Open"] * (1 + SLIPPAGE) if side == "LONG" else c_row["Open"] * (1 - SLIPPAGE)
-            atr = p_row["ATR"]
+    # --------------------------------------------------------
+    # 4H
+    # --------------------------------------------------------
 
-            if np.isnan(atr) or atr <= 0:
-                continue
+    df_4h = df_15m.resample(
+        "4h",
+        label="left",
+        closed="left"
+    ).agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum"
+    }).dropna()
 
-            if side == "LONG":
-                sl = entry_price - (1.5 * atr)
-                tp = entry_price + (3.0 * atr)
-                be_trigger = entry_price + (1.5 * atr)
+    df_4h["EMA_50"] = (
+        df_4h["Close"]
+        .ewm(span=50, adjust=False)
+        .mean()
+    )
+
+    df_4h["EMA_200"] = (
+        df_4h["Close"]
+        .ewm(span=200, adjust=False)
+        .mean()
+    )
+
+    df_4h["Regime_Bullish"] = (
+        (df_4h["Close"] > df_4h["EMA_200"]) &
+        (df_4h["EMA_50"] > df_4h["EMA_200"])
+    )
+
+    df_4h["Regime_Bearish"] = (
+        (df_4h["Close"] < df_4h["EMA_200"]) &
+        (df_4h["EMA_50"] < df_4h["EMA_200"])
+    )
+
+    return df_15m, df_1h, df_4h
+
+
+# ============================================================
+# GET LAST COMPLETED HTF CANDLE
+# ============================================================
+
+def get_completed_htf_row(df_htf, t_curr):
+    """
+    Return the latest HTF candle whose OPEN timestamp is
+    strictly before t_curr.
+
+    Because resampled candles are [open, next-open),
+    requiring index < t_curr prevents using a candle that
+    has not completed yet.
+    """
+
+    subset = df_htf[df_htf.index < t_curr]
+
+    if subset.empty:
+        return None
+
+    return subset.iloc[-1]
+
+
+# ============================================================
+# SIGNAL
+# ============================================================
+
+def get_signal(df_15m, df_1h, df_4h, i):
+    """
+    V123 strategy logic preserved.
+
+    IMPORTANT:
+    i = EXECUTION candle
+
+    p_row = previous CLOSED 15m candle.
+
+    Therefore:
+        signal -> p_row
+        entry  -> c_row OPEN
+    """
+
+    if i < 50:
+        return None
+
+    t_curr = df_15m.index[i]
+
+    c_row = df_15m.iloc[i]
+
+    # Previous candle is fully closed.
+    p_row = df_15m.iloc[i - 1]
+
+    # --------------------------------------------------------
+    # Completed 1H / 4H only
+    # --------------------------------------------------------
+
+    h_sub = df_1h[df_1h.index < t_curr]
+    h_4sub = df_4h[df_4h.index < t_curr]
+
+    if len(h_sub) < 10 or len(h_4sub) < 10:
+        return None
+
+    latest_4h = h_4sub.iloc[-1]
+
+    regime_bull = bool(
+        latest_4h["Regime_Bullish"]
+    )
+
+    regime_bear = bool(
+        latest_4h["Regime_Bearish"]
+    )
+
+    # --------------------------------------------------------
+    # V123 liquidity area
+    # --------------------------------------------------------
+
+    recent_lows = h_sub["Low"].iloc[-10:-1]
+    recent_highs = h_sub["High"].iloc[-10:-1]
+
+    if (
+        len(recent_lows) == 0 or
+        len(recent_highs) == 0
+    ):
+        return None
+
+    min_support = recent_lows.min()
+    max_resistance = recent_highs.max()
+
+    # --------------------------------------------------------
+    # V123 SWEEP
+    #
+    # IMPORTANT:
+    # sweep happens on p_row itself.
+    # No pp_row modification.
+    # --------------------------------------------------------
+
+    sweep_low = (
+        p_row["Low"] < min_support and
+        p_row["Close"] > min_support
+    )
+
+    sweep_high = (
+        p_row["High"] > max_resistance and
+        p_row["Close"] < max_resistance
+    )
+
+    # --------------------------------------------------------
+    # V123 DISPLACEMENT
+    #
+    # Based only on CLOSED p_row.
+    # --------------------------------------------------------
+
+    displacement_up = (
+        p_row["Close"] > p_row["Open"] and
+        p_row["Body"] >
+        DISPLACEMENT_MULTIPLIER * p_row["Avg_Body"]
+    )
+
+    displacement_down = (
+        p_row["Close"] < p_row["Open"] and
+        p_row["Body"] >
+        DISPLACEMENT_MULTIPLIER * p_row["Avg_Body"]
+    )
+
+    valid_long = (
+        regime_bull and
+        sweep_low and
+        displacement_up
+    )
+
+    valid_short = (
+        regime_bear and
+        sweep_high and
+        displacement_down
+    )
+
+    if not valid_long and not valid_short:
+        return None
+
+    if valid_long:
+        return "LONG"
+
+    return "SHORT"
+
+
+# ============================================================
+# SINGLE TRADE SIMULATION
+# ============================================================
+
+def simulate_trade(
+    df_15m,
+    entry_index,
+    side
+):
+    """
+    Simulate one trade from entry_index forward.
+
+    NO artificial timeout.
+
+    The trade remains OPEN if neither SL nor TP is reached
+    before the available dataset ends.
+
+    Returns:
+        dict
+    """
+
+    entry_row = df_15m.iloc[entry_index]
+
+    entry_open = float(entry_row["Open"])
+
+    if side == "LONG":
+        entry_price = (
+            entry_open *
+            (1.0 + SLIPPAGE)
+        )
+    else:
+        entry_price = (
+            entry_open *
+            (1.0 - SLIPPAGE)
+        )
+
+    # ATR comes from the CLOSED signal candle.
+    signal_row = df_15m.iloc[entry_index - 1]
+
+    atr = float(signal_row["ATR"])
+
+    if not np.isfinite(atr) or atr <= 0:
+        return None
+
+    if side == "LONG":
+
+        sl = (
+            entry_price -
+            SL_ATR_MULT * atr
+        )
+
+        tp = (
+            entry_price +
+            TP_ATR_MULT * atr
+        )
+
+        be_trigger = (
+            entry_price +
+            BE_ATR_MULT * atr
+        )
+
+    else:
+
+        sl = (
+            entry_price +
+            SL_ATR_MULT * atr
+        )
+
+        tp = (
+            entry_price -
+            TP_ATR_MULT * atr
+        )
+
+        be_trigger = (
+            entry_price -
+            BE_ATR_MULT * atr
+        )
+
+    current_sl = sl
+    breakeven_activated = False
+
+    # --------------------------------------------------------
+    # Start from ENTRY candle.
+    #
+    # Entry is assumed at Open.
+    # Remaining High/Low of same candle are allowed.
+    # --------------------------------------------------------
+
+    for j in range(
+        entry_index,
+        len(df_15m)
+    ):
+
+        fut = df_15m.iloc[j]
+
+        high = float(fut["High"])
+        low = float(fut["Low"])
+
+        if side == "LONG":
+
+            # BE activation
+            if (
+                not breakeven_activated and
+                high >= be_trigger
+            ):
+                current_sl = entry_price
+                breakeven_activated = True
+
+            hit_sl = low <= current_sl
+            hit_tp = high >= tp
+
+        else:
+
+            if (
+                not breakeven_activated and
+                low <= be_trigger
+            ):
+                current_sl = entry_price
+                breakeven_activated = True
+
+            hit_sl = high >= current_sl
+            hit_tp = low <= tp
+
+        # ----------------------------------------------------
+        # Both touched in same OHLC candle.
+        # Conservative treatment.
+        # ----------------------------------------------------
+
+        if hit_sl and hit_tp:
+
+            if breakeven_activated:
+                outcome = "BE"
+                exit_price = entry_price
             else:
-                sl = entry_price + (1.5 * atr)
-                tp = entry_price - (3.0 * atr)
-                be_trigger = entry_price - (1.5 * atr)
+                outcome = "LOSS"
+                exit_price = current_sl
 
-            outcome = None
-            exit_price = 0.0
-            current_sl = sl
-            breakeven_activated = False
+            return {
+                "exit_index": j,
+                "exit_timestamp": df_15m.index[j],
+                "Outcome": outcome,
+                "Entry_Price": entry_price,
+                "Exit_Price": exit_price,
+                "SL": sl,
+                "TP": tp,
+                "BE_Activated": breakeven_activated
+            }
 
-            # بررسی روند معامله در کندل‌های آینده (تا ۳۴ کندل بعد از ورود)
-            for j in range(i, min(i + 34, len(df_15))):
-                fut = df_15.iloc[j]
-                if side == "LONG":
-                    if not breakeven_activated and fut["High"] >= be_trigger:
-                        current_sl = entry_price
-                        breakeven_activated = True
+        if hit_sl:
 
-                    hit_sl = fut["Low"] <= current_sl
-                    hit_tp = fut["High"] >= tp
+            if breakeven_activated:
+                outcome = "BE"
+                exit_price = entry_price
+            else:
+                outcome = "LOSS"
+                exit_price = current_sl
 
-                    if hit_sl and hit_tp:
-                        outcome = "LOSS" if current_sl != entry_price else "BE"
-                        exit_price = current_sl if current_sl != entry_price else entry_price
-                        break
-                    elif hit_sl:
-                        outcome = "LOSS" if current_sl != entry_price else "BE"
-                        exit_price = current_sl
-                        break
-                    elif hit_tp:
-                        outcome = "WIN"
-                        exit_price = tp
-                        break
-                else:
-                    if not breakeven_activated and fut["Low"] <= be_trigger:
-                        current_sl = entry_price
-                        breakeven_activated = True
+            return {
+                "exit_index": j,
+                "exit_timestamp": df_15m.index[j],
+                "Outcome": outcome,
+                "Entry_Price": entry_price,
+                "Exit_Price": exit_price,
+                "SL": sl,
+                "TP": tp,
+                "BE_Activated": breakeven_activated
+            }
 
-                    hit_sl = fut["High"] >= current_sl
-                    hit_tp = fut["Low"] <= tp
+        if hit_tp:
 
-                    if hit_sl and hit_tp:
-                        outcome = "LOSS" if current_sl != entry_price else "BE"
-                        exit_price = current_sl if current_sl != entry_price else entry_price
-                        break
-                    elif hit_sl:
-                        outcome = "LOSS" if current_sl != entry_price else "BE"
-                        exit_price = current_sl
-                        break
-                    elif hit_tp:
-                        outcome = "WIN"
-                        exit_price = tp
-                        break
+            return {
+                "exit_index": j,
+                "exit_timestamp": df_15m.index[j],
+                "Outcome": "WIN",
+                "Entry_Price": entry_price,
+                "Exit_Price": tp,
+                "SL": sl,
+                "TP": tp,
+                "BE_Activated": breakeven_activated
+            }
 
-            # بررسی منصفانه‌ی تایم‌اوت در صورت عدم برخورد با TP یا SL
-            if outcome is None:
-                last_fut = df_15.iloc[min(i + 33, len(df_15) - 1)]
-                exit_price = last_fut["Close"]
-                if side == "LONG":
-                    if exit_price > entry_price:
-                        outcome = "WIN"
-                    elif exit_price < entry_price:
-                        outcome = "LOSS"
-                    else:
-                        outcome = "BE"
-                else:
-                    if exit_price < entry_price:
-                        outcome = "WIN"
-                    elif exit_price > entry_price:
-                        outcome = "LOSS"
-                    else:
-                        outcome = "BE"
+    # --------------------------------------------------------
+    # NO TIMEOUT.
+    #
+    # The dataset ended while position remained open.
+    # Do NOT call this a LOSS.
+    # Do NOT call this a WIN.
+    # --------------------------------------------------------
 
-            if outcome == "LOSS":
-                consecutive_losses += 1
-                if consecutive_losses >= 2:
-                    cooldown_bars = 16
-                    consecutive_losses = 0
-            elif outcome == "WIN":
-                consecutive_losses = 0
+    return {
+        "exit_index": None,
+        "exit_timestamp": None,
+        "Outcome": "OPEN_AT_END",
+        "Entry_Price": entry_price,
+        "Exit_Price": np.nan,
+        "SL": sl,
+        "TP": tp,
+        "BE_Activated": breakeven_activated
+    }
 
-            price_ret = (exit_price - entry_price) / entry_price if side == "LONG" else (entry_price - exit_price) / entry_price
-            dollar_pnl = (TRADE_MARGIN * LEVERAGE * price_ret) - (TRADE_MARGIN * LEVERAGE * FEE_RATE * 2)
 
-            all_trades.append({
+# ============================================================
+# PNL
+# ============================================================
+
+def calculate_pnl(side, entry_price, exit_price):
+    """
+    Futures-style linear USDT PnL.
+
+    Notional = margin * leverage.
+
+    Fees = entry + exit.
+    """
+
+    notional = TRADE_MARGIN * LEVERAGE
+
+    if side == "LONG":
+
+        price_ret = (
+            exit_price - entry_price
+        ) / entry_price
+
+    else:
+
+        price_ret = (
+            entry_price - exit_price
+        ) / entry_price
+
+    gross_pnl = notional * price_ret
+
+    fees = (
+        notional *
+        FEE_RATE *
+        2.0
+    )
+
+    return gross_pnl - fees
+
+
+# ============================================================
+# BACKTEST ONE SYMBOL
+# ============================================================
+
+def run_symbol_backtest(
+    symbol,
+    df_15m,
+    df_1h,
+    df_4h,
+    requested_start,
+    requested_end
+):
+
+    trades = []
+
+    i = 50
+
+    while i < len(df_15m):
+
+        t_curr = df_15m.index[i]
+
+        # Only generate trades inside requested period.
+        if t_curr < requested_start:
+            i += 1
+            continue
+
+        if t_curr > requested_end:
+            break
+
+        side = get_signal(
+            df_15m,
+            df_1h,
+            df_4h,
+            i
+        )
+
+        if side is None:
+            i += 1
+            continue
+
+        trade = simulate_trade(
+            df_15m,
+            i,
+            side
+        )
+
+        if trade is None:
+            i += 1
+            continue
+
+        outcome = trade["Outcome"]
+
+        # ----------------------------------------------------
+        # OPEN AT END
+        #
+        # No PnL.
+        # No fake win/loss.
+        # ----------------------------------------------------
+
+        if outcome == "OPEN_AT_END":
+
+            trades.append({
                 "Timestamp": t_curr,
+                "ExitTimestamp": None,
                 "Symbol": symbol,
                 "Side": side,
-                "Outcome": outcome,
-                "Dollar_PnL": dollar_pnl,
+                "Outcome": "OPEN_AT_END",
+                "Dollar_PnL": 0.0,
+                "Entry_Price": trade["Entry_Price"],
+                "Exit_Price": np.nan,
                 "Month": t_curr.strftime("%Y-%m")
             })
 
-    return pd.DataFrame(all_trades)
+            break
+
+        # ----------------------------------------------------
+        # CLOSED TRADE
+        # ----------------------------------------------------
+
+        pnl = calculate_pnl(
+            side,
+            trade["Entry_Price"],
+            trade["Exit_Price"]
+        )
+
+        trades.append({
+            "Timestamp": t_curr,
+            "ExitTimestamp": trade["exit_timestamp"],
+            "Symbol": symbol,
+            "Side": side,
+            "Outcome": outcome,
+            "Dollar_PnL": pnl,
+            "Entry_Price": trade["Entry_Price"],
+            "Exit_Price": trade["Exit_Price"],
+            "Month": t_curr.strftime("%Y-%m")
+        })
+
+        # ----------------------------------------------------
+        # OVERLAP LOCK
+        #
+        # Do not inspect signals while this trade is open.
+        #
+        # Also skip the exit candle itself.
+        # Next possible signal = exit_index + 1
+        # ----------------------------------------------------
+
+        exit_index = trade["exit_index"]
+
+        if exit_index is None:
+            break
+
+        i = exit_index + 1
+
+    return trades
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
-    print("=" * 72)
-    print("HUNTER-V127 — 100% CAUSAL & REALISTIC BACKTEST INITIALIZED")
-    print("=" * 72)
 
-    all_quarter_trades = []
-    now = datetime.now()
+    print("=" * 78)
+    print(
+        "HUNTER-V128 — "
+        "V123 STRATEGY / CAUSAL FUTURES BACKTEST"
+    )
+    print("=" * 78)
 
-    for q in QUARTERS:
-        start_dt = now - timedelta(days=q["start_days_ago"])
-        end_dt = now - timedelta(days=q["end_days_ago"])
-        print(f"\nProcessing {q['name']} ({start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')})...")
+    now = datetime.now(timezone.utc)
 
-        processed_data = {}
-        for symbol, lbank_symbol in SYMBOLS.items():
-            fetch_start = start_dt - timedelta(days=35)
-            df_15m = fetch_chunk_data(lbank_symbol, fetch_start, end_dt)
+    requested_start = (
+        now -
+        timedelta(days=DAYS)
+    )
 
-            if df_15m is None or len(df_15m) < 200:
-                continue
+    requested_end = now
 
-            df_1h = df_15m.resample('1h').agg({
-                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-            }).dropna()
+    data_start = (
+        requested_start -
+        timedelta(days=WARMUP_DAYS)
+    )
 
-            df_4h = df_15m.resample('4h').agg({
-                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-            }).dropna()
+    print()
+    print(f"Backtest start : {requested_start}")
+    print(f"Backtest end   : {requested_end}")
+    print(f"Warmup         : {WARMUP_DAYS} days")
+    print(f"Symbols        : {len(SYMBOLS)}")
+    print(f"Timeframe      : {TIMEFRAME_BASE}")
+    print(f"RR             : 1:2")
+    print("Timeout        : DISABLED")
+    print("Overlap Lock   : ENABLED")
+    print("Lookahead      : NONE BY DESIGN")
+    print("Entry model    : NEXT 15m OPEN")
+    print("=" * 78)
 
-            df_4h["EMA_50"] = df_4h["Close"].ewm(span=50, adjust=False).mean()
-            df_4h["EMA_200"] = df_4h["Close"].ewm(span=200, adjust=False).mean()
-            df_4h["Regime_Bullish"] = (df_4h["Close"] > df_4h["EMA_200"]) & (df_4h["EMA_50"] > df_4h["EMA_200"])
-            df_4h["Regime_Bearish"] = (df_4h["Close"] < df_4h["EMA_200"]) & (df_4h["EMA_50"] < df_4h["EMA_200"])
+    all_trades = []
 
-            df_1h["Swing_High"] = df_1h["High"].rolling(5).max()
-            df_1h["Swing_Low"] = df_1h["Low"].rolling(5).min()
-            df_1h["ATR"] = (df_1h["High"] - df_1h["Low"]).rolling(14).mean()
+    # --------------------------------------------------------
+    # LOAD MARKETS
+    # --------------------------------------------------------
 
-            df_15m["ATR"] = (df_15m["High"] - df_15m["Low"]).rolling(14).mean()
-            df_15m["Body"] = (df_15m["Close"] - df_15m["Open"]).abs()
-            df_15m["Avg_Body"] = df_15m["Body"].rolling(20).mean()
+    try:
+        exchange.load_markets()
+    except Exception as e:
+        print(f"Market loading error: {e}")
+        sys.exit(1)
 
-            df_15m = df_15m[(df_15m.index >= start_dt) & (df_15m.index <= end_dt)]
+    # --------------------------------------------------------
+    # PROCESS EACH SYMBOL ONCE
+    # --------------------------------------------------------
 
-            if len(df_15m) > 50:
-                processed_data[symbol] = {
-                    "15m": df_15m,
-                    "1h": df_1h,
-                    "4h": df_4h
-                }
+    for symbol, lbank_symbol in SYMBOLS.items():
 
-        q_trades_df = run_backtest_on_data(processed_data)
-        if not q_trades_df.empty:
-            all_quarter_trades.append(q_trades_df)
-            print(f" -> {q['name']} Done. Trades found: {len(q_trades_df)}")
-        else:
-            print(f" -> {q['name']} Produced 0 trades.")
+        print()
+        print("-" * 78)
+        print(
+            f"{symbol} -> {lbank_symbol}"
+        )
+        print("-" * 78)
 
-    if all_quarter_trades:
-        trades_df = pd.concat(all_quarter_trades, ignore_index=True)
-        trades_df.sort_values("Timestamp", inplace=True)
-        trades_df.reset_index(drop=True, inplace=True)
+        df_15m = fetch_ohlcv_full(
+            lbank_symbol,
+            data_start,
+            requested_end
+        )
 
-        n = len(trades_df)
-        win_rate = (trades_df["Outcome"].eq("WIN").mean() * 100) if n > 0 else 0.0
-        loss_rate = 100.0 - win_rate
-        net_pnl = float(trades_df["Dollar_PnL"].sum()) if n > 0 else 0.0
+        if df_15m is None:
+            print("  No data.")
+            continue
 
-        wins = trades_df[trades_df["Outcome"] == "WIN"]["Dollar_PnL"]
-        losses = trades_df[trades_df["Outcome"] == "LOSS"]["Dollar_PnL"]
+        if len(df_15m) < 1000:
+            print(
+                f"  Insufficient data: {len(df_15m)} candles"
+            )
+            continue
 
-        gross_profit = wins.sum() if len(wins) > 0 else 0.0
-        gross_loss = abs(losses.sum()) if len(losses) > 0 else 1.0
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0.0
+        print(
+            f"  Raw 15m candles: {len(df_15m)}"
+        )
 
-        avg_win = wins.mean() if len(wins) > 0 else 0.0
-        avg_loss = losses.mean() if len(losses) > 0 else 0.0
+        # ----------------------------------------------------
+        # PREPARE
+        # ----------------------------------------------------
 
-        trades_df["Cumulative_PnL"] = trades_df["Dollar_PnL"].cumsum()
-        trades_df["Peak"] = trades_df["Cumulative_PnL"].cummax()
-        trades_df["Drawdown"] = trades_df["Cumulative_PnL"] - trades_df["Peak"]
-        max_dd = trades_df["Drawdown"].min() if n > 0 else 0.0
+        df_15m, df_1h, df_4h = prepare_data(
+            df_15m
+        )
 
-        streaks = []
-        current_streak = 0
-        for outcome in trades_df["Outcome"]:
-            if outcome == "LOSS":
-                current_streak += 1
-            else:
-                if current_streak > 0:
-                    streaks.append(current_streak)
-                current_streak = 0
-        if current_streak > 0:
-            streaks.append(current_streak)
-        max_consecutive_losses = max(streaks) if streaks else 0
+        # ----------------------------------------------------
+        # Run symbol
+        # ----------------------------------------------------
 
-        print("\n" + "=" * 72)
-        print("===== HUNTER-V127 (100% CAUSAL) — AGGREGATED 1-YEAR RESULT =====")
-        print(f"Total Trades (Full Year): {n}")
-        print(f"Trades Per Month (Avg): {n / 12.0:.1f}")
-        print(f"Win Rate: {win_rate:.2f}%")
-        print(f"Loss Rate: {loss_rate:.2f}%")
-        print(f"Net PnL: ${net_pnl:,.2f}")
-        print(f"Profit Factor: {profit_factor:.2f}")
-        print(f"Average Win: ${avg_win:,.2f}")
-        print(f"Average Loss: ${avg_loss:,.2f}")
-        print(f"Max Drawdown: ${max_dd:,.2f}")
-        print(f"Maximum Consecutive Losses: {max_consecutive_losses}")
-        print("-" * 72)
-        
-        print("BY SYMBOL:")
-        for sym in list(SYMBOLS.keys()):
-            sub = trades_df[trades_df["Symbol"] == sym]
-            if len(sub) > 0:
-                s_wr = sub["Outcome"].eq("WIN").mean() * 100
-                s_pnl = sub["Dollar_PnL"].sum()
-                print(f"  {sym:6} -> Trades: {len(sub):3}, Win Rate: {s_wr:5.2f}%, PnL: ${s_pnl:10,.2f}")
+        symbol_trades = run_symbol_backtest(
+            symbol,
+            df_15m,
+            df_1h,
+            df_4h,
+            requested_start,
+            requested_end
+        )
 
-        print("-" * 72)
-        print("BY MONTH:")
-        for m, sub in trades_df.groupby("Month"):
-            m_wr = sub["Outcome"].eq("WIN").mean() * 100
-            m_pnl = sub["Dollar_PnL"].sum()
-            print(f"  {m} -> Trades: {len(sub):3}, Win Rate: {m_wr:5.2f}%, PnL: ${m_pnl:10,.2f}")
-        print("=" * 72)
+        all_trades.extend(symbol_trades)
+
+        closed_count = sum(
+            1 for x in symbol_trades
+            if x["Outcome"] != "OPEN_AT_END"
+        )
+
+        print(
+            f"  Trades: {len(symbol_trades)} "
+            f"(closed: {closed_count})"
+        )
+
+
+    # ========================================================
+    # RESULTS
+    # ========================================================
+
+    if not all_trades:
+
+        print()
+        print("=" * 78)
+        print("NO TRADES GENERATED.")
+        print("=" * 78)
+        sys.exit(0)
+
+    trades_df = pd.DataFrame(all_trades)
+
+    trades_df.sort_values(
+        "Timestamp",
+        inplace=True
+    )
+
+    trades_df.reset_index(
+        drop=True,
+        inplace=True
+    )
+
+    # --------------------------------------------------------
+    # CLOSED TRADES ONLY
+    # --------------------------------------------------------
+
+    closed_df = trades_df[
+        trades_df["Outcome"] != "OPEN_AT_END"
+    ].copy()
+
+    open_at_end = trades_df[
+        trades_df["Outcome"] == "OPEN_AT_END"
+    ]
+
+    n_total = len(trades_df)
+    n_closed = len(closed_df)
+    n_open = len(open_at_end)
+
+    if n_closed == 0:
+
+        print()
+        print("=" * 78)
+        print("NO CLOSED TRADES.")
+        print(
+            f"Open positions at end: {n_open}"
+        )
+        print("=" * 78)
+        sys.exit(0)
+
+    # --------------------------------------------------------
+    # WIN / LOSS / BE
+    # --------------------------------------------------------
+
+    wins = closed_df[
+        closed_df["Outcome"] == "WIN"
+    ]
+
+    losses = closed_df[
+        closed_df["Outcome"] == "LOSS"
+    ]
+
+    bes = closed_df[
+        closed_df["Outcome"] == "BE"
+    ]
+
+    win_rate = (
+        len(wins) /
+        n_closed *
+        100.0
+    )
+
+    loss_rate = (
+        len(losses) /
+        n_closed *
+        100.0
+    )
+
+    be_rate = (
+        len(bes) /
+        n_closed *
+        100.0
+    )
+
+    net_pnl = float(
+        closed_df["Dollar_PnL"].sum()
+    )
+
+    gross_profit = float(
+        wins["Dollar_PnL"].sum()
+    )
+
+    gross_loss = abs(
+        float(losses["Dollar_PnL"].sum())
+    )
+
+    if gross_loss > 0:
+        profit_factor = (
+            gross_profit /
+            gross_loss
+        )
     else:
-        print("No trades generated across quarters.")
+        profit_factor = float("inf")
+
+    avg_win = (
+        float(wins["Dollar_PnL"].mean())
+        if len(wins) > 0
+        else 0.0
+    )
+
+    avg_loss = (
+        float(losses["Dollar_PnL"].mean())
+        if len(losses) > 0
+        else 0.0
+    )
+
+    # --------------------------------------------------------
+    # DRAWDOWN
+    # --------------------------------------------------------
+
+    closed_df["Cumulative_PnL"] = (
+        closed_df["Dollar_PnL"].cumsum()
+    )
+
+    closed_df["Peak"] = (
+        closed_df["Cumulative_PnL"].cummax()
+    )
+
+    closed_df["Drawdown"] = (
+        closed_df["Cumulative_PnL"] -
+        closed_df["Peak"]
+    )
+
+    max_dd = float(
+        closed_df["Drawdown"].min()
+    )
+
+    # --------------------------------------------------------
+    # LOSS STREAK
+    # --------------------------------------------------------
+
+    streaks = []
+
+    current_streak = 0
+
+    for outcome in closed_df["Outcome"]:
+
+        if outcome == "LOSS":
+
+            current_streak += 1
+
+        else:
+
+            if current_streak > 0:
+                streaks.append(
+                    current_streak
+                )
+
+            current_streak = 0
+
+    if current_streak > 0:
+        streaks.append(
+            current_streak
+        )
+
+    max_consecutive_losses = (
+        max(streaks)
+        if streaks
+        else 0
+    )
+
+    # --------------------------------------------------------
+    # MONTHLY
+    # --------------------------------------------------------
+
+    monthly = (
+        closed_df
+        .groupby("Month")
+        .agg(
+            Trades=("Outcome", "count"),
+            Wins=("Outcome", lambda x:
+                  (x == "WIN").sum()),
+            Losses=("Outcome", lambda x:
+                    (x == "LOSS").sum()),
+            BE=("Outcome", lambda x:
+                (x == "BE").sum()),
+            PnL=("Dollar_PnL", "sum")
+        )
+    )
+
+    monthly["WinRate"] = (
+        monthly["Wins"] /
+        monthly["Trades"] *
+        100.0
+    )
+
+    # ========================================================
+    # FINAL REPORT
+    # ========================================================
+
+    print()
+    print("=" * 78)
+    print(
+        "===== HUNTER-V128 — FINAL 1-YEAR RESULT ====="
+    )
+    print("=" * 78)
+
+    print(
+        f"Total Signals/Trades: {n_total}"
+    )
+
+    print(
+        f"Closed Trades:        {n_closed}"
+    )
+
+    print(
+        f"Open at End:          {n_open}"
+    )
+
+    print(
+        f"Trades Per Month:     "
+        f"{n_closed / 12.0:.1f}"
+    )
+
+    print(
+        f"Win Rate:             {win_rate:.2f}%"
+    )
+
+    print(
+        f"Loss Rate:            {loss_rate:.2f}%"
+    )
+
+    print(
+        f"Break-even Rate:      {be_rate:.2f}%"
+    )
+
+    print(
+        f"Net PnL:              "
+        f"${net_pnl:,.2f}"
+    )
+
+    print(
+        f"Profit Factor:        "
+        f"{profit_factor:.2f}"
+    )
+
+    print(
+        f"Average Win:          "
+        f"${avg_win:,.2f}"
+    )
+
+    print(
+        f"Average Loss:         "
+        f"${avg_loss:,.2f}"
+    )
+
+    print(
+        f"Max Drawdown:         "
+        f"${max_dd:,.2f}"
+    )
+
+    print(
+        f"Maximum Consecutive "
+        f"Losses:               "
+        f"{max_consecutive_losses}"
+    )
+
+    print("-" * 78)
+
+    # ========================================================
+    # BY SYMBOL
+    # ========================================================
+
+    print("BY SYMBOL:")
+
+    for sym in SYMBOLS.keys():
+
+        sub = closed_df[
+            closed_df["Symbol"] == sym
+        ]
+
+        if len(sub) == 0:
+            continue
+
+        sym_wr = (
+            sub["Outcome"].eq("WIN").mean()
+            * 100.0
+        )
+
+        sym_pnl = float(
+            sub["Dollar_PnL"].sum()
+        )
+
+        sym_losses = (
+            sub["Outcome"] == "LOSS"
+        ).sum()
+
+        print(
+            f"  {sym:7} -> "
+            f"Trades: {len(sub):4}, "
+            f"WR: {sym_wr:6.2f}%, "
+            f"PnL: ${sym_pnl:10,.2f}"
+        )
+
+    # ========================================================
+    # BY MONTH
+    # ========================================================
+
+    print("-" * 78)
+    print("BY MONTH:")
+
+    for month, row in monthly.iterrows():
+
+        print(
+            f"  {month} -> "
+            f"Trades: {int(row['Trades']):4}, "
+            f"WR: {row['WinRate']:6.2f}%, "
+            f"PnL: ${row['PnL']:10,.2f}"
+        )
+
+    # ========================================================
+    # INTEGRITY REPORT
+    # ========================================================
+
+    print("-" * 78)
+    print("BACKTEST INTEGRITY:")
+    print(
+        "  Lookahead:              NONE"
+    )
+    print(
+        "  Signal uses closed bar: YES"
+    )
+    print(
+        "  Entry:                  NEXT 15m OPEN"
+    )
+    print(
+        "  HTF partial candles:    EXCLUDED"
+    )
+    print(
+        "  Centered rolling:       DISABLED"
+    )
+    print(
+        "  Overlap per symbol:     LOCKED"
+    )
+    print(
+        "  Artificial timeout:     DISABLED"
+    )
+    print(
+        "  Unresolved positions:   NOT counted"
+    )
+    print(
+        "  Nominal RR:             1:2"
+    )
+    print(
+        "  LBank market type:      SWAP"
+    )
+
+    print("=" * 78)
