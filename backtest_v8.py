@@ -16,7 +16,7 @@ except ImportError:
 
 # ============================================================
 # HUNTER-V130
-# V123 EXACT-BEHAVIOR + UNIVERSE OPTIMIZER
+# HUNTER-V131 — CONTROLLED UNIVERSE TEST
 #
 # Purpose:
 # Reproduce the original V123 behavior before applying
@@ -54,24 +54,14 @@ BASELINE_SYMBOLS = {
     "XLM": "XLM/USDT",
     "ADA": "ADA/USDT",
     "BNB": "BNB/USDT",
-    "SOL": "SOL/USDT",
     "ETH": "ETH/USDT",
-}
-
-# Candidate replacements are deliberately taken from the user's
-# previously working LBank USDT universe. No new exchange/symbol
-# notation is introduced here. These are TESTED alongside the
-# baseline; they are not automatically promoted to the live universe.
-CANDIDATE_SYMBOLS = {
-    "BTC": "BTC/USDT",
-    "XRP": "XRP/USDT",
-    "SUI": "SUI/USDT",
+    # Controlled test: SOL is removed and LINK is added.
     "LINK": "LINK/USDT",
-    "AVAX": "AVAX/USDT",
-    "DOT": "DOT/USDT",
 }
 
-SYMBOLS = {**BASELINE_SYMBOLS, **CANDIDATE_SYMBOLS}
+REMOVED_SYMBOL = "SOL"
+ADDED_SYMBOL = "LINK"
+SYMBOLS = BASELINE_SYMBOLS
 
 
 # ============================================================
@@ -597,7 +587,7 @@ def print_universe_analysis(trades_df):
             continue
         r = summarize_symbol(sub)
         r["Symbol"] = symbol
-        r["Type"] = "BASELINE" if symbol in BASELINE_SYMBOLS else "CANDIDATE"
+        r["Type"] = "TEST UNIVERSE"
         rows.append(r)
 
     if not rows:
@@ -621,9 +611,9 @@ def print_universe_analysis(trades_df):
 
     print()
     print("=" * 120)
-    print("CANDIDATES — ROBUSTNESS VIEW")
+    print("CONTROLLED REPLACEMENT TEST")
     print("=" * 120)
-    candidates = u[u["Type"] == "CANDIDATE"].copy()
+    candidates = u.copy()
     if len(candidates):
         candidates = candidates.sort_values(
             ["ValidationPnL", "ValidationWR", "PF"],
@@ -638,7 +628,7 @@ def print_universe_analysis(trades_df):
         }))
 
     print()
-    print("NOTE: No candidate is automatically promoted. A replacement should improve the baseline without relying only on the full-year result.")
+    print("NOTE: V131 is a controlled test: SOL removed, LINK added. Accept only if the complete result improves V129 without relying on one metric alone.")
 
 
 # ============================================================
@@ -647,7 +637,7 @@ def print_universe_analysis(trades_df):
 
 def main():
     print("=" * 80)
-    print("HUNTER-V130 — V123 BASELINE + UNIVERSE OPTIMIZER")
+    print("HUNTER-V131 — V129 BASELINE WITH CONTROLLED LINK REPLACEMENT")
     print("=" * 80)
 
     now = datetime.now()
@@ -662,7 +652,7 @@ def main():
     print()
     print("AUDIT MODE: V123 behavior intentionally preserved.")
     print("Data connection: V123")
-    print("Symbols: V123")
+    print("Universe: V129 minus SOL + LINK")
     print("HTF selection: V123")
     print("center=True: V123")
     print("Sweep: V123")
