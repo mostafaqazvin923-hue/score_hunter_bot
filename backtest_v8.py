@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V112 — 4H MACRO STRUCTURAL TREND ENGINE
+# HUNTER-V113 — 1-YEAR DAILY INSTITUTIONAL BREAKOUT & ADX ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
@@ -37,20 +37,20 @@ SYMBOLS = {
     "ADA": "ADA/USDT",
 }
 
-LOOKBACK_DAYS = 180  # داده‌های ۶ ماه گذشته در تایم‌فریم ۴ ساعته
-EXEC_TIMEFRAME = "4h"
+LOOKBACK_DAYS = 365  # بک‌تست دقیقاً یک‌ساله در تایم فریم روزانه
+EXEC_TIMEFRAME = "1d"
 
 SLIPPAGE = 0.0005
 FEE_RATE = 0.0007
 INITIAL_CAPITAL = 2000.0
 TRADE_MARGIN = 100.0
-LEVERAGE = 10.0  # اهرم امن‌تر برای تایم‌فریم بالا
+LEVERAGE = 5.0  # اهرم امن و منطقی برای تایم فریم روزانه
 
-start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
+start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS + 60)  # بافر برای محاسبه اندیکاتورهای بلندمدت
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V112 — 4H MACRO TREND ENGINE INITIALIZED")
+print("HUNTER-V113 — 1-YEAR DAILY INSTITUTIONAL ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -88,49 +88,69 @@ def fetch_ohlcv_data(lbank_symbol, timeframe):
     return df
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    print(f"Downloading 4h data for {symbol}...")
-    df_4h = fetch_ohlcv_data(lbank_symbol, EXEC_TIMEFRAME)
+    print(f"Downloading daily data for {symbol}...")
+    df_1d = fetch_ohlcv_data(lbank_symbol, EXEC_TIMEFRAME)
 
-    if df_4h is None or len(df_4h) < 200:
+    if df_1d is None or len(df_1d) < 100:
         continue
 
-    df_4h.set_index("Date", inplace=True)
+    df_1d.set_index("Date", inplace=True)
 
-    # اندیکاتورهای ساختاری روند کلان
-    tr1 = df_4h["High"] - df_4h["Low"]
-    tr2 = np.abs(df_4h["High"] - df_4h["Close"].shift(1))
-    tr3 = np.abs(df_4h["Low"] - df_4h["Close"].shift(1))
-    df_4h["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
+    # 1. محاسبه ATR برای مدیریت ریسک
+    tr1 = df_1d["High"] - df_1d["Low"]
+    tr2 = np.abs(df_1d["High"] - df_1d["Close"].shift(1))
+    tr3 = np.abs(df_1d["Low"] - df_1d["Close"].shift(1))
+    df_1d["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
+
+    # 2. کانال دونچیان (Donchian Channel 20 روزه برای شکست ساختار)
+    df_1d["Donchian_High"] = df_1d["High"].shift(1).rolling(20).max()
+    df_1d["Donchian_Low"] = df_1d["Low"].shift(1).rolling(20).min()
+
+    # 3. شاخص قدرت روند (ADX) برای جلوگیری از ورود در بازارهای خنثی
+    plus_dm = df_1d["High"].diff()
+    minus_dm = df_1d["Low"].diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
     
-    df_4h["EMA_Fast"] = df_4h["Close"].ewm(span=20, adjust=False).mean()
-    df_4h["EMA_Slow"] = df_4h["Close"].ewm(span=50, adjust=False).mean()
-    df_4h["EMA_Macro"] = df_4h["Close"].ewm(span=200, adjust=False).mean()
+    df_1d["Plus_DM"] = pd.Series(plus_dm, index=df_1d.index)
+    df_1d["Minus_DM"] = pd.Series(minus_dm, index=df_1d.index)
+    
+    tr = df_1d["ATR"] * 14
+    smoothed_tr = tr.ewm(alpha=1/14, adjust=False).mean()
+    smoothed_plus_dm = df_1d["Plus_DM"].ewm(alpha=1/14, adjust=False).mean()
+    smoothed_minus_dm = df_1d["Minus_DM"].ewm(alpha=1/14, adjust=False).mean()
 
-    df_4h.dropna(inplace=True)
-    if len(df_4h) > 50:
-        processed_data[symbol] = df_4h
+    plus_di = 100 * (smoothed_plus_dm / smoothed_tr)
+    minus_di = 100 * (smoothed_minus_dm / smoothed_tr)
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+    df_1d["ADX"] = dx.rolling(14).mean()
 
-print(f"Successfully loaded 4h symbols: {len(processed_data)}")
+    # فیلتر دقیق بازه یک ساله گذشته
+    cutoff_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
+    df_1d = df_1d[df_1d.index >= cutoff_date]
+
+    df_1d.dropna(inplace=True)
+    if len(df_1d) > 30:
+        processed_data[symbol] = df_1d
+
+print(f"Successfully loaded 1-year daily symbols: {len(processed_data)}")
 
 def run_backtest(processed_data):
     all_trades = []
 
     for symbol, df in processed_data.items():
-        for i in range(200, len(df)):
+        for i in range(25, len(df)):
             ts = df.index[i]
             prev = df.iloc[i - 1]
             curr = df.iloc[i]
 
-            # شرایط روند قدرتمند در تایم فریم ۴ ساعته
-            # قیمت بالای میانگین ۲۰۰ و تقاطع ایماهای سریع و کند
-            macro_bullish = prev["Close"] > prev["EMA_Macro"]
-            macro_bearish = prev["Close"] < prev["EMA_Macro"]
+            # استراتژی سازمانی: شکست کانال سقف/کف + فیلتر قدرت روند ADX بالای ۲۵
+            adx_strong = prev["ADX"] > 25
+            breakout_long = prev["Close"] >= prev["Donchian_High"]
+            breakout_short = prev["Close"] <= prev["Donchian_Low"]
 
-            crossover_long = (prev["EMA_Fast"] > prev["EMA_Slow"]) and (df.iloc[i - 2]["EMA_Fast"] <= df.iloc[i - 2]["EMA_Slow"])
-            crossover_short = (prev["EMA_Fast"] < prev["EMA_Slow"]) and (df.iloc[i - 2]["EMA_Fast"] >= df.iloc[i - 2]["EMA_Slow"])
-
-            valid_long = macro_bullish and crossover_long
-            valid_short = macro_bearish and crossover_short
+            valid_long = adx_strong and breakout_long
+            valid_short = adx_strong and breakout_short
 
             if not (valid_long or valid_short):
                 continue
@@ -142,18 +162,18 @@ def run_backtest(processed_data):
             if np.isnan(atr) or atr <= 0:
                 continue
 
-            # حد ضرر و حد سود بزرگتر متناسب با تایم فریم ۴ ساعته
+            # حد ضرر و حد سود مبتنی بر ATR روزانه
             if side == "LONG":
-                sl = entry_price - (2.0 * atr)
-                tp = entry_price + (5.0 * atr)
+                sl = entry_price - (2.5 * atr)
+                tp = entry_price + (6.0 * atr)
             else:
-                sl = entry_price + (2.0 * atr)
-                tp = entry_price - (5.0 * atr)
+                sl = entry_price + (2.5 * atr)
+                tp = entry_price - (6.0 * atr)
 
-            # بررسی نتیجه در کندل‌های بعدی ۴ ساعته (حداکثر ۳۰ کندل معادل ۵ روز)
+            # بررسی نتیجه در کندل‌های بعدی روزانه (حداکثر ۲۰ روز معاملاتی)
             outcome = "LOSS"
             exit_price = sl
-            for j in range(i + 1, min(i + 30, len(df))):
+            for j in range(i + 1, min(i + 20, len(df))):
                 future_c = df.iloc[j]
                 if side == "LONG":
                     if future_c["Low"] <= sl:
@@ -194,7 +214,7 @@ if __name__ == "__main__":
     net_pnl = float(trades_df["Dollar_PnL"].sum()) if n > 0 else 0.0
 
     print("=" * 72)
-    print("HUNTER-V112 BACKTEST RESULTS (4H MACRO TREND)")
+    print("HUNTER-V113 BACKTEST RESULTS (1-YEAR DAILY BREAKOUT)")
     print("=" * 72)
     print(f"Total Trades: {n}")
     print(f"Overall Win Rate: {win_rate:.2f}%")
