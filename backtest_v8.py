@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
@@ -12,7 +13,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V116 — 180-DAY INSTITUTIONAL MULTI-TIMEFRAME ENGINE
+# HUNTER-V117 — 90-DAY INSTITUTIONAL MULTI-TIMEFRAME ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
@@ -37,7 +38,7 @@ SYMBOLS = {
     "ADA": "ADA/USDT",
 }
 
-LOOKBACK_DAYS = 180  # تنظیم روی ۱۸۰ روز برای دریافت کامل و بدون نقص دیتای ۱۵ دقیقه
+LOOKBACK_DAYS = 90  # تنظیم روی ۹۰ روز برای پایداری کامل و جلوگیری از تایم‌اوت
 TIMEFRAME_BASE = "15m"
 
 SLIPPAGE = 0.0003
@@ -50,7 +51,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS + 10)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V116 — 180-DAY INSTITUTIONAL CONFLUENCE ENGINE INITIALIZED")
+print("HUNTER-V117 — 90-DAY INSTITUTIONAL CONFLUENCE ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -70,6 +71,7 @@ def fetch_ohlcv_data(lbank_symbol, timeframe):
             current_since = last_ts + 1
             if len(batch) < 1000:
                 break
+            time.sleep(0.2)  # تأخیر کوتاه برای جلوگیری از Rate Limit و فریز شدن
     except Exception as e:
         print(f"Error fetching {lbank_symbol}: {e}")
         return None
@@ -88,10 +90,10 @@ def fetch_ohlcv_data(lbank_symbol, timeframe):
     return df
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    print(f"Downloading 15m data for {symbol} (180 Days)...")
+    print(f"Downloading 15m data for {symbol} (90 Days)...")
     df_15m = fetch_ohlcv_data(lbank_symbol, TIMEFRAME_BASE)
 
-    if df_15m is None or len(df_15m) < 500:
+    if df_15m is None or len(df_15m) < 300:
         continue
 
     # ساخت تایم فریم‌های بالاتر بدون نگاه به آینده (Resample دقیق)
@@ -119,7 +121,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
     df_15m["Body"] = (df_15m["Close"] - df_15m["Open"]).abs()
     df_15m["Avg_Body"] = df_15m["Body"].rolling(20).mean()
 
-    # فیلتر بازه دقیق ۱۸۰ روزه
+    # فیلتر بازه دقیق ۹۰ روزه
     cutoff_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
     df_15m = df_15m[df_15m.index >= cutoff_date]
 
@@ -277,7 +279,7 @@ if __name__ == "__main__":
 
     print("=" * 72)
     print("===== BACKTEST RESULT =====")
-    print(f"Period: 180 Days (LBank)")
+    print(f"Period: 90 Days (LBank)")
     print(f"Total Trades: {n}")
     print(f"Win Rate: {win_rate:.2f}%")
     print(f"Loss Rate: {loss_rate:.2f}%")
