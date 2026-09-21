@@ -12,7 +12,7 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V108 — PROFESSIONAL MULTI-TIMEFRAME QUANT ENGINE
+# HUNTER-V109 — STRICT GLOBAL CAP & MULTI-TIMEFRAME ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -40,15 +40,16 @@ SYMBOLS = {
 LOOKBACK_DAYS = 90
 EXEC_TIMEFRAME = "15m"
 MACRO_TIMEFRAME = "4h"
-MAX_POSITIONS = 3
+MAX_DAILY_TRADES = 3  # محدودیت سخت‌گیرانه: حداکثر ۳ معامله در کل روز برای کل سیستم
+MAX_POSITIONS = 2
 
 SLIPPAGE = 0.0002
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
-INITIAL_ATR_MULTIPLIER = 1.5
-TP_ATR_MULTIPLIER = 3.0  # ریسک به ریوارد دقیق 1 به 2
-TIMEOUT_CANDLES = 16  # حدود 4 ساعت ماندگاری حداکثری در تایم فریم 15 دقیقه
+INITIAL_ATR_MULTIPLIER = 1.6
+TP_ATR_MULTIPLIER = 3.2  # ریسک به ریوارد دقیق 1 به 2
+TIMEOUT_CANDLES = 20
 
 INITIAL_CAPITAL = 2000.0
 TRADE_MARGIN = 100.0
@@ -58,7 +59,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V108 — MULTI-TIMEFRAME QUANT ENGINE INITIALIZED")
+print("HUNTER-V109 — STRICT GLOBAL CAP ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -106,9 +107,7 @@ def fetch_ohlcv_data(lbank_symbol, timeframe):
     return df
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    # دریافت داده‌های ۱۵ دقیقه (اجرایی)
     df_15m = fetch_ohlcv_data(lbank_symbol, EXEC_TIMEFRAME)
-    # دریافت داده‌های ۴ ساعته (روند کلان)
     df_4h = fetch_ohlcv_data(lbank_symbol, MACRO_TIMEFRAME)
 
     if df_15m is None or df_4h is None or len(df_15m) < 500 or len(df_4h) < 50:
@@ -117,7 +116,6 @@ for symbol, lbank_symbol in SYMBOLS.items():
     df_15m.set_index("Date", inplace=True)
     df_4h.set_index("Date", inplace=True)
 
-    # محاسبه اندیکاتورهای 15m
     tr1 = df_15m["High"] - df_15m["Low"]
     tr2 = np.abs(df_15m["High"] - df_15m["Close"].shift(1))
     tr3 = np.abs(df_15m["Low"] - df_15m["Close"].shift(1))
@@ -129,10 +127,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     df_15m["RSI"] = 100 - (100 / (1 + (gain / loss)))
 
-    # محاسبه روند 4h و مپ کردن آن روی تایم فریم 15m برای فیلتر جهت بازار
     df_4h["EMA_Macro"] = df_4h["Close"].ewm(span=50, adjust=False).mean()
-    
-    # الحاق روند کلان 4 ساعته به جدول ۱۵ دقیقه بر اساس زمان
     df_15m["Macro_Trend"] = df_4h["EMA_Macro"].reindex(df_15m.index, method="ffill")
     df_15m["Macro_Close"] = df_4h["Close"].reindex(df_15m.index, method="ffill")
 
@@ -150,16 +145,16 @@ def run_backtest(processed_data):
     active_positions = {}
     all_trades = []
     
-    consecutive_losses = 0
-    cooldown_counters = {sym: 0 for sym in processed_data.keys()}
-    global_cooldown = 0
+    current_day = None
+    daily_trade_count = 0
     loss_streaks_list = []
     current_loss_streak = 0
 
     for ts in all_timestamps:
-        if global_cooldown > 0:
-            global_cooldown -= 1
-            continue
+        ts_date = ts.date()
+        if current_day != ts_date:
+            current_day = ts_date
+            daily_trade_count = 0  # ریست شدن شمارشگر معاملات روزانه در شروع روز جدید
 
         symbols_to_close = []
 
@@ -206,14 +201,10 @@ def run_backtest(processed_data):
             outcome = "WIN" if r_real > 0 else "LOSS"
             
             if outcome == "LOSS":
-                consecutive_losses += 1
                 current_loss_streak += 1
-                if consecutive_losses >= 3:
-                    global_cooldown = 16
             else:
                 if current_loss_streak > 0:
                     loss_streaks_list.append(current_loss_streak)
-                consecutive_losses = 0
                 current_loss_streak = 0
 
             position_notional = TRADE_MARGIN * LEVERAGE
@@ -228,20 +219,20 @@ def run_backtest(processed_data):
                 "Dollar_PnL": dollar_pnl,
             })
             
-            cooldown_counters[symbol] = 6
             symbols_to_close.append(symbol)
 
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        if global_cooldown > 0:
+        # اگر سهمیه ۳ معامله امروز پر شده است، ترید جدیدی باز نکن
+        if daily_trade_count >= MAX_DAILY_TRADES:
+            continue
+
+        if len(active_positions) >= MAX_POSITIONS:
             continue
 
         for symbol, df in processed_data.items():
             if symbol in active_positions:
-                continue
-            if cooldown_counters[symbol] > 0:
-                cooldown_counters[symbol] -= 1
                 continue
             if ts not in df.index:
                 continue
@@ -253,13 +244,11 @@ def run_backtest(processed_data):
             prev_c = df.iloc[i - 1]
             c15m = df.iloc[i]
 
-            # تاییدیه روند کلان ۴ ساعته (Macro Trend Filter)
             macro_bullish = prev_c["Macro_Close"] > prev_c["Macro_Trend"]
             macro_bearish = prev_c["Macro_Close"] < prev_c["Macro_Trend"]
 
-            # شرایط اجرایی روی ۱۵ دقیقه همراه با مومنتوم RSI
-            valid_long = macro_bullish and (prev_c["Close"] > prev_c["EMA50"]) and (50 < prev_c["RSI"] < 68) and (prev_c["Close"] > prev_c["Open"])
-            valid_short = macro_bearish and (prev_c["Close"] < prev_c["EMA50"]) and (32 < prev_c["RSI"] < 50) and (prev_c["Close"] < prev_c["Open"])
+            valid_long = macro_bullish and (prev_c["Close"] > prev_c["EMA50"]) and (53 < prev_c["RSI"] < 65) and (prev_c["Close"] > prev_c["Open"])
+            valid_short = macro_bearish and (prev_c["Close"] < prev_c["EMA50"]) and (35 < prev_c["RSI"] < 47) and (prev_c["Close"] < prev_c["Open"])
 
             if not (valid_long or valid_short):
                 continue
@@ -278,11 +267,8 @@ def run_backtest(processed_data):
             initial_risk = abs(entry_price - initial_sl)
             sl_dist_pct = initial_risk / entry_price
 
-            if not (0.006 <= sl_dist_pct <= 0.025):
+            if not (0.008 <= sl_dist_pct <= 0.02):
                 continue
-
-            if len(active_positions) >= MAX_POSITIONS:
-                break
 
             active_positions[symbol] = {
                 "side": side,
@@ -292,6 +278,9 @@ def run_backtest(processed_data):
                 "initial_risk": float(initial_risk),
                 "entry_index": int(i),
             }
+
+            daily_trade_count += 1
+            break  # در هر کندل حداکثر یک پوزیشن باز شود تا کنترل کامل حفظ شود
 
     if current_loss_streak > 0:
         loss_streaks_list.append(current_loss_streak)
@@ -306,7 +295,7 @@ if __name__ == "__main__":
     max_streak = max(loss_streaks) if loss_streaks else 0
 
     print("=" * 72)
-    print("HUNTER-V108 BACKTEST RESULTS (90-DAY MULTI-TIMEFRAME)")
+    print("HUNTER-V109 BACKTEST RESULTS (STRICT GLOBAL DAILY CAP)")
     print("=" * 72)
     print(f"Total Trades: {n}")
     print(f"Overall Win Rate: {win_rate:.2f}%")
