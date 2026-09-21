@@ -13,11 +13,12 @@ except ImportError:
     import ccxt
 
 # ============================================================
-# HUNTER-V121 — AUTOMATED 1-YEAR (4-QUARTER) CHUNKED BACKTEST ENGINE
+# HUNTER-V123 — 15 SYMBOLS (INCLUDING SOL, ETH, XRP) 1-YEAR BACKTEST
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
 
+# لیست ۱۵ تایی (۱۲ نماد قبل + سولانا، اتریوم و ریپل)
 SYMBOLS = {
     "CRV": "CRV/USDT",
     "DOGE": "DOGE/USDT",
@@ -28,12 +29,12 @@ SYMBOLS = {
     "ONDO": "ONDO/USDT",
     "NEAR": "NEAR/USDT",
     "SEI": "SEI/USDT",
-    "ARB": "ARB/USDT",
     "XLM": "XLM/USDT",
-    "ATOM": "ATOM/USDT",
     "ADA": "ADA/USDT",
     "BNB": "BNB/USDT",
-    "OP": "OP/USDT"
+    "SOL": "SOL/USDT",
+    "ETH": "ETH/USDT",
+    "XRP": "XRP/USDT"
 }
 
 TIMEFRAME_BASE = "15m"
@@ -85,7 +86,6 @@ def fetch_chunk_data(lbank_symbol, start_dt, end_dt):
     df.reset_index(drop=True, inplace=True)
     df.set_index("Date", inplace=True)
     
-    # فیلتر دقیق محدوده پارت
     df = df[(df.index >= start_dt) & (df.index <= end_dt)]
     return df
 
@@ -226,7 +226,7 @@ def run_backtest_on_data(processed_data):
 
 if __name__ == "__main__":
     print("=" * 72)
-    print("HUNTER-V121 — AUTOMATED 1-YEAR (4-QUARTER) BACKTEST INITIALIZED")
+    print("HUNTER-V123 — 15 SYMBOLS (SOL, ETH, XRP INCLUDED) BACKTEST INITIALIZED")
     print("=" * 72)
 
     all_quarter_trades = []
@@ -239,7 +239,6 @@ if __name__ == "__main__":
 
         processed_data = {}
         for symbol, lbank_symbol in SYMBOLS.items():
-            # برای محاسبه درست اندیکاتورها، داده‌های کمی عقب‌تر را هم می‌گیریم
             fetch_start = start_dt - timedelta(days=35)
             df_15m = fetch_chunk_data(lbank_symbol, fetch_start, end_dt)
 
@@ -267,7 +266,6 @@ if __name__ == "__main__":
             df_15m["Body"] = (df_15m["Close"] - df_15m["Open"]).abs()
             df_15m["Avg_Body"] = df_15m["Body"].rolling(20).mean()
 
-            # اعمال برش نهایی روی بازه اصلی پارت
             df_15m = df_15m[(df_15m.index >= start_dt) & (df_15m.index <= end_dt)]
 
             if len(df_15m) > 50:
@@ -323,9 +321,9 @@ if __name__ == "__main__":
         max_consecutive_losses = max(streaks) if streaks else 0
 
         print("\n" + "=" * 72)
-        print("===== AGGREGATED 1-YEAR (365 DAYS) BACKTEST RESULT =====")
+        print("===== 15 SYMBOLS — AGGREGATED 1-YEAR (365 DAYS) BACKTEST RESULT =====")
         print(f"Total Trades (Full Year): {n}")
-        print(f"Trades Per Day: {n / 365.0:.2f}")
+        print(f"Trades Per Month (Avg): {n / 12.0:.1f}")
         print(f"Win Rate: {win_rate:.2f}%")
         print(f"Loss Rate: {loss_rate:.2f}%")
         print(f"Net PnL: ${net_pnl:,.2f}")
@@ -336,7 +334,7 @@ if __name__ == "__main__":
         print(f"Maximum Consecutive Losses: {max_consecutive_losses}")
         print("-" * 72)
         
-        print("BY SYMBOL (FULL YEAR):")
+        print("BY SYMBOL (15 GIANTS):")
         for sym in list(SYMBOLS.keys()):
             sub = trades_df[trades_df["Symbol"] == sym]
             if len(sub) > 0:
@@ -345,7 +343,7 @@ if __name__ == "__main__":
                 print(f"  {sym:6} -> Trades: {len(sub):3}, Win Rate: {s_wr:5.2f}%, PnL: ${s_pnl:10,.2f}")
 
         print("-" * 72)
-        print("BY MONTH (FULL YEAR):")
+        print("BY MONTH (15 GIANTS):")
         for m, sub in trades_df.groupby("Month"):
             m_wr = sub["Outcome"].eq("WIN").mean() * 100
             m_pnl = sub["Dollar_PnL"].sum()
