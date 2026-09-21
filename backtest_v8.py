@@ -11,8 +11,14 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
     import ccxt
 
+try:
+    from sklearn.ensemble import RandomForestClassifier
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "scikit-learn"])
+    from sklearn.ensemble import RandomForestClassifier
+
 # ============================================================
-# HUNTER-V109 — STRICT GLOBAL CAP & MULTI-TIMEFRAME ENGINE
+# HUNTER-V110 — MACHINE LEARNING QUANT ENGINE (WALK-FORWARD)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -40,15 +46,14 @@ SYMBOLS = {
 LOOKBACK_DAYS = 90
 EXEC_TIMEFRAME = "15m"
 MACRO_TIMEFRAME = "4h"
-MAX_DAILY_TRADES = 3  # محدودیت سخت‌گیرانه: حداکثر ۳ معامله در کل روز برای کل سیستم
-MAX_POSITIONS = 2
+MAX_DAILY_TRADES = 3
 
 SLIPPAGE = 0.0002
 FEE_RATE = 0.0007
 
 ATR_PERIOD = 14
 INITIAL_ATR_MULTIPLIER = 1.6
-TP_ATR_MULTIPLIER = 3.2  # ریسک به ریوارد دقیق 1 به 2
+TP_ATR_MULTIPLIER = 3.2
 TIMEOUT_CANDLES = 20
 
 INITIAL_CAPITAL = 2000.0
@@ -59,7 +64,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 68)
-print("HUNTER-V109 — STRICT GLOBAL CAP ENGINE INITIALIZED")
+print("HUNTER-V110 — MACHINE LEARNING QUANT ENGINE INITIALIZED")
 print("=" * 68)
 
 processed_data = {}
@@ -116,11 +121,15 @@ for symbol, lbank_symbol in SYMBOLS.items():
     df_15m.set_index("Date", inplace=True)
     df_4h.set_index("Date", inplace=True)
 
+    # مهندسی ویژگی‌ها (Feature Engineering) برای یادگیری ماشین
     tr1 = df_15m["High"] - df_15m["Low"]
     tr2 = np.abs(df_15m["High"] - df_15m["Close"].shift(1))
     tr3 = np.abs(df_15m["Low"] - df_15m["Close"].shift(1))
     df_15m["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
-    df_15m["EMA50"] = df_15m["Close"].ewm(span=50, adjust=False).mean()
+    
+    df_15m["Return_1"] = df_15m["Close"].pct_change(1)
+    df_15m["Return_4"] = df_15m["Close"].pct_change(4)
+    df_15m["Vol_Ratio"] = df_15m["Volume"] / df_15m["Volume"].rolling(24).mean()
     
     delta = df_15m["Close"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -128,14 +137,18 @@ for symbol, lbank_symbol in SYMBOLS.items():
     df_15m["RSI"] = 100 - (100 / (1 + (gain / loss)))
 
     df_4h["EMA_Macro"] = df_4h["Close"].ewm(span=50, adjust=False).mean()
-    df_15m["Macro_Trend"] = df_4h["EMA_Macro"].reindex(df_15m.index, method="ffill")
-    df_15m["Macro_Close"] = df_4h["Close"].reindex(df_15m.index, method="ffill")
+    df_15m["Macro_Trend_Diff"] = (df_4h["Close"] - df_4h["EMA_Macro"]).reindex(df_15m.index, method="ffill")
+
+    # هدف یادگیری ماشین: آیا سود آینده بیشتر از کارمزد و ریسک است؟
+    future_return = df_15m["Close"].shift(-4) / df_15m["Close"] - 1
+    df_15m["Target_Long"] = (future_return > 0.003).astype(int)
+    df_15m["Target_Short"] = (future_return < -0.003).astype(int)
 
     df_15m.dropna(inplace=True)
     if len(df_15m) > 200:
         processed_data[symbol] = df_15m
 
-print(f"Valid multi-timeframe symbols loaded: {len(processed_data)}")
+print(f"Valid ML symbols loaded: {len(processed_data)}")
 
 def get_all_timestamps(data):
     return sorted({ts for df in data.values() for ts in df.index})
@@ -150,11 +163,35 @@ def run_backtest(processed_data):
     loss_streaks_list = []
     current_loss_streak = 0
 
+    feature_cols = ["Return_1", "Return_4", "Vol_Ratio", "RSI", "Macro_Trend_Diff", "ATR"]
+
+    # آموزش مدل به روش Walk-Forward (آموزش روی داده‌های گذشته، پیش‌بینی آینده)
+    models_long = {}
+    models_short = {}
+
+    for symbol, df in processed_data.items():
+        # آموزش اولیه روی ۵۰ درصد اول داده‌ها
+        split_idx = int(len(df) * 0.4)
+        train_df = df.iloc[:split_idx]
+        
+        if len(train_df) > 100:
+            X_train = train_df[feature_cols]
+            y_long = train_df["Target_Long"]
+            y_short = train_df["Target_Short"]
+            
+            clf_l = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42, n_jobs=-1)
+            clf_l.fit(X_train, y_long)
+            models_long[symbol] = (clf_l, split_idx)
+
+            clf_s = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42, n_jobs=-1)
+            clf_s.fit(X_train, y_short)
+            models_short[symbol] = (clf_s, split_idx)
+
     for ts in all_timestamps:
         ts_date = ts.date()
         if current_day != ts_date:
             current_day = ts_date
-            daily_trade_count = 0  # ریست شدن شمارشگر معاملات روزانه در شروع روز جدید
+            daily_trade_count = 0
 
         symbols_to_close = []
 
@@ -224,11 +261,10 @@ def run_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # اگر سهمیه ۳ معامله امروز پر شده است، ترید جدیدی باز نکن
         if daily_trade_count >= MAX_DAILY_TRADES:
             continue
 
-        if len(active_positions) >= MAX_POSITIONS:
+        if len(active_positions) >= 2:
             continue
 
         for symbol, df in processed_data.items():
@@ -236,24 +272,24 @@ def run_backtest(processed_data):
                 continue
             if ts not in df.index:
                 continue
+            if symbol not in models_long:
+                continue
 
             i = df.index.get_loc(ts)
-            if i < 50:
-                continue
+            split_idx = models_long[symbol][1]
+            if i <= split_idx:
+                continue  # فقط روی داده‌های تست بعد از مدل ترید کن
 
-            prev_c = df.iloc[i - 1]
             c15m = df.iloc[i]
+            features_vector = c15m[feature_cols].values.reshape(1, -1)
 
-            macro_bullish = prev_c["Macro_Close"] > prev_c["Macro_Trend"]
-            macro_bearish = prev_c["Macro_Close"] < prev_c["Macro_Trend"]
+            pred_long = models_long[symbol][0].predict(features_vector)[0]
+            pred_short = models_short[symbol][0].predict(features_vector)[0]
 
-            valid_long = macro_bullish and (prev_c["Close"] > prev_c["EMA50"]) and (53 < prev_c["RSI"] < 65) and (prev_c["Close"] > prev_c["Open"])
-            valid_short = macro_bearish and (prev_c["Close"] < prev_c["EMA50"]) and (35 < prev_c["RSI"] < 47) and (prev_c["Close"] < prev_c["Open"])
-
-            if not (valid_long or valid_short):
+            if not (pred_long == 1 or pred_short == 1):
                 continue
 
-            side = "LONG" if valid_long else "SHORT"
+            side = "LONG" if pred_long == 1 else "SHORT"
             entry_price = c15m["Open"] * (1 + SLIPPAGE) if side == "LONG" else c15m["Open"] * (1 - SLIPPAGE)
             
             initial_atr = c15m["ATR"]
@@ -280,7 +316,7 @@ def run_backtest(processed_data):
             }
 
             daily_trade_count += 1
-            break  # در هر کندل حداکثر یک پوزیشن باز شود تا کنترل کامل حفظ شود
+            break
 
     if current_loss_streak > 0:
         loss_streaks_list.append(current_loss_streak)
@@ -295,7 +331,7 @@ if __name__ == "__main__":
     max_streak = max(loss_streaks) if loss_streaks else 0
 
     print("=" * 72)
-    print("HUNTER-V109 BACKTEST RESULTS (STRICT GLOBAL DAILY CAP)")
+    print("HUNTER-V110 BACKTEST RESULTS (MACHINE LEARNING)")
     print("=" * 72)
     print(f"Total Trades: {n}")
     print(f"Overall Win Rate: {win_rate:.2f}%")
