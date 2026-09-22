@@ -15,15 +15,15 @@ except ImportError:
 
 
 # ============================================================
-# HUNTER-V133-LIVE-CAUSAL
-# V123/V129 converted to causally executable backtest
+# HUNTER-V134
+# V123 EXACT-BEHAVIOR AUDIT
 #
 # Purpose:
 # Reproduce the original V123 behavior before applying
 # integrity corrections one at a time.
 #
 # IMPORTANT:
-# This build applies execution-integrity corrections for live-safe simulation.
+# This is an AUDIT build, not the final live-safe engine.
 # ============================================================
 
 
@@ -194,29 +194,108 @@ def fetch_chunk_data(lbank_symbol, start_dt, end_dt):
 def prepare_data(df_15m):
     df_15m = df_15m.copy()
 
+    # --------------------------------------------------------
+    # 4H
+    # --------------------------------------------------------
+
     df_4h = (
         df_15m.resample("4h")
-        .agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"})
+        .agg(
+            {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+        )
         .dropna()
     )
-    df_4h["EMA_50"] = df_4h["Close"].ewm(span=50, adjust=False).mean()
-    df_4h["EMA_200"] = df_4h["Close"].ewm(span=200, adjust=False).mean()
-    df_4h["Regime_Bullish"] = (df_4h["Close"] > df_4h["EMA_200"]) & (df_4h["EMA_50"] > df_4h["EMA_200"])
-    df_4h["Regime_Bearish"] = (df_4h["Close"] < df_4h["EMA_200"]) & (df_4h["EMA_50"] < df_4h["EMA_200"])
+
+    df_4h["EMA_50"] = df_4h["Close"].ewm(
+        span=50,
+        adjust=False,
+    ).mean()
+
+    df_4h["EMA_200"] = df_4h["Close"].ewm(
+        span=200,
+        adjust=False,
+    ).mean()
+
+    df_4h["Regime_Bullish"] = (
+        (df_4h["Close"] > df_4h["EMA_200"])
+        & (df_4h["EMA_50"] > df_4h["EMA_200"])
+    )
+
+    df_4h["Regime_Bearish"] = (
+        (df_4h["Close"] < df_4h["EMA_200"])
+        & (df_4h["EMA_50"] < df_4h["EMA_200"])
+    )
+
+    # --------------------------------------------------------
+    # 1H
+    #
+    # center=True intentionally preserved for audit.
+    # --------------------------------------------------------
 
     df_1h = (
         df_15m.resample("1h")
-        .agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"})
+        .agg(
+            {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+        )
         .dropna()
     )
-    df_1h["ATR"] = (df_1h["High"] - df_1h["Low"]).rolling(14).mean()
 
-    df_15m["ATR"] = (df_15m["High"] - df_15m["Low"]).rolling(14).mean()
-    df_15m["Body"] = (df_15m["Close"] - df_15m["Open"]).abs()
-    df_15m["Avg_Body"] = df_15m["Body"].rolling(20).mean()
+    df_1h["Swing_High"] = (
+        df_1h["High"]
+        .rolling(
+            5,
+            center=True,
+        )
+        .max()
+    )
 
-    # center=True swing columns from V123 were removed: they used
-    # future candles and were not required by the actual entry rule.
+    df_1h["Swing_Low"] = (
+        df_1h["Low"]
+        .rolling(
+            5,
+            center=True,
+        )
+        .min()
+    )
+
+    df_1h["ATR"] = (
+        (df_1h["High"] - df_1h["Low"])
+        .rolling(14)
+        .mean()
+    )
+
+    # --------------------------------------------------------
+    # 15M
+    # --------------------------------------------------------
+
+    df_15m["ATR"] = (
+        (df_15m["High"] - df_15m["Low"])
+        .rolling(14)
+        .mean()
+    )
+
+    df_15m["Body"] = (
+        df_15m["Close"] - df_15m["Open"]
+    ).abs()
+
+    df_15m["Avg_Body"] = (
+        df_15m["Body"]
+        .rolling(20)
+        .mean()
+    )
+
     return df_15m, df_1h, df_4h
 
 
@@ -226,67 +305,107 @@ def prepare_data(df_15m):
 # Intentionally preserves the original execution behavior.
 # ============================================================
 
-def run_v123_engine(symbol, df_15, df_1h, df_4h, start_dt, end_dt):
+def run_v123_engine(
+    symbol,
+    df_15,
+    df_1h,
+    df_4h,
+    start_dt,
+    end_dt,
+):
     trades = []
-    i = 50
 
-    while i < len(df_15) - 1:
-        t_signal = df_15.index[i]
-        if t_signal < start_dt:
-            i += 1
+    for i in range(50, len(df_15)):
+        t_curr = df_15.index[i]
+
+        if t_curr < start_dt:
             continue
-        if t_signal >= end_dt:
+
+        if t_curr > end_dt:
             break
 
         c_row = df_15.iloc[i]
         p_row = df_15.iloc[i - 1]
 
-        # Only completed 1H/4H candles. A candle with the same
-        # timestamp as t_signal is still forming at that moment.
-        h_sub = df_1h[df_1h.index < t_signal]
-        h_4sub = df_4h[df_4h.index < t_signal]
-        if len(h_sub) < 10 or len(h_4sub) < 1:
-            i += 1
+        # V134 ONLY CHANGE: use only fully closed 1H/4H candles.
+        h_sub = df_1h[(df_1h.index + pd.Timedelta(hours=1)) <= t_curr]
+        h_4sub = df_4h[(df_4h.index + pd.Timedelta(hours=4)) <= t_curr]
+
+        if len(h_sub) < 10:
             continue
 
-        regime_bull = bool(h_4sub.iloc[-1]["Regime_Bullish"])
-        regime_bear = bool(h_4sub.iloc[-1]["Regime_Bearish"])
+        if len(h_4sub) < 1:
+            continue
+
+        regime_bull = bool(
+            h_4sub.iloc[-1]["Regime_Bullish"]
+        )
+
+        regime_bear = bool(
+            h_4sub.iloc[-1]["Regime_Bearish"]
+        )
+
         recent_lows = h_sub["Low"].iloc[-10:-2]
         recent_highs = h_sub["High"].iloc[-10:-2]
-        if len(recent_lows) == 0 or len(recent_highs) == 0:
-            i += 1
+
+        if len(recent_lows) == 0:
+            continue
+
+        if len(recent_highs) == 0:
             continue
 
         min_support = recent_lows.min()
         max_resistance = recent_highs.max()
-        sweep_low = p_row["Low"] < min_support and p_row["Close"] > min_support
-        sweep_high = p_row["High"] > max_resistance and p_row["Close"] < max_resistance
 
-        # Displacement is confirmed by the CLOSED signal candle.
-        displacement_up = c_row["Close"] > c_row["Open"] and c_row["Body"] > 2.0 * c_row["Avg_Body"]
-        displacement_down = c_row["Close"] < c_row["Open"] and c_row["Body"] > 2.0 * c_row["Avg_Body"]
-        valid_long = regime_bull and sweep_low and displacement_up
-        valid_short = regime_bear and sweep_high and displacement_down
+        sweep_low = (
+            p_row["Low"] < min_support
+            and p_row["Close"] > min_support
+        )
+
+        sweep_high = (
+            p_row["High"] > max_resistance
+            and p_row["Close"] < max_resistance
+        )
+
+        # Original V123: displacement on CURRENT candle.
+        displacement_up = (
+            c_row["Close"] > c_row["Open"]
+            and c_row["Body"] > 2.0 * c_row["Avg_Body"]
+        )
+
+        displacement_down = (
+            c_row["Close"] < c_row["Open"]
+            and c_row["Body"] > 2.0 * c_row["Avg_Body"]
+        )
+
+        valid_long = (
+            regime_bull
+            and sweep_low
+            and displacement_up
+        )
+
+        valid_short = (
+            regime_bear
+            and sweep_high
+            and displacement_down
+        )
+
         if not valid_long and not valid_short:
-            i += 1
             continue
 
-        # Causal execution: after candle i closes, earliest standard
-        # execution is the OPEN of candle i+1.
-        entry_i = i + 1
-        entry_row = df_15.iloc[entry_i]
-        entry_timestamp = df_15.index[entry_i]
-        if entry_timestamp > end_dt:
-            break
+        if valid_long:
+            side = "LONG"
+            entry_price = c_row["Open"] * (1.0 + SLIPPAGE)
+        else:
+            side = "SHORT"
+            entry_price = c_row["Open"] * (1.0 - SLIPPAGE)
 
-        side = "LONG" if valid_long else "SHORT"
-        entry_price = (entry_row["Open"] * (1.0 + SLIPPAGE) if side == "LONG"
-                       else entry_row["Open"] * (1.0 - SLIPPAGE))
         atr = c_row["ATR"]
+
         if not np.isfinite(atr) or atr <= 0:
-            i += 1
             continue
 
+        # Original V123 1:2 structure.
         if side == "LONG":
             sl = entry_price - 1.5 * atr
             tp = entry_price + 3.0 * atr
@@ -298,48 +417,111 @@ def run_v123_engine(symbol, df_15, df_1h, df_4h, start_dt, end_dt):
 
         current_sl = sl
         be_active = False
-        outcome = "OPEN"
-        exit_price = np.nan
+
+        outcome = "LOSS"
+        exit_price = sl
         exit_index = None
 
-        # No artificial timeout: scan until real SL/TP or data end.
-        for j in range(entry_i, len(df_15)):
+        # Original V123 scan window.
+        for j in range(
+            i + 1,
+            min(i + 35, len(df_15)),
+        ):
             fut = df_15.iloc[j]
-            high, low = fut["High"], fut["Low"]
+
+            high = fut["High"]
+            low = fut["Low"]
+
             if side == "LONG":
                 if not be_active and high >= be_trigger:
-                    current_sl, be_active = entry_price, True
-                hit_sl, hit_tp = low <= current_sl, high >= tp
+                    current_sl = entry_price
+                    be_active = True
+
+                hit_sl = low <= current_sl
+                hit_tp = high >= tp
+
+                # Conservative SL priority.
                 if hit_sl:
-                    outcome, exit_price, exit_index = ("BE", entry_price, j) if be_active else ("LOSS", current_sl, j)
+                    if be_active:
+                        outcome = "BE"
+                        exit_price = entry_price
+                    else:
+                        outcome = "LOSS"
+                        exit_price = current_sl
+
+                    exit_index = j
                     break
+
                 if hit_tp:
-                    outcome, exit_price, exit_index = "WIN", tp, j
+                    outcome = "WIN"
+                    exit_price = tp
+                    exit_index = j
                     break
+
             else:
                 if not be_active and low <= be_trigger:
-                    current_sl, be_active = entry_price, True
-                hit_sl, hit_tp = high >= current_sl, low <= tp
+                    current_sl = entry_price
+                    be_active = True
+
+                hit_sl = high >= current_sl
+                hit_tp = low <= tp
+
+                # Conservative SL priority.
                 if hit_sl:
-                    outcome, exit_price, exit_index = ("BE", entry_price, j) if be_active else ("LOSS", current_sl, j)
-                    break
-                if hit_tp:
-                    outcome, exit_price, exit_index = "WIN", tp, j
+                    if be_active:
+                        outcome = "BE"
+                        exit_price = entry_price
+                    else:
+                        outcome = "LOSS"
+                        exit_price = current_sl
+
+                    exit_index = j
                     break
 
-        if outcome == "OPEN":
-            trades.append({"Timestamp": entry_timestamp, "SignalTimestamp": t_signal, "ExitTimestamp": None, "Symbol": symbol, "Side": side, "Outcome": "OPEN", "Dollar_PnL": np.nan, "Entry_Price": entry_price, "Exit_Price": np.nan, "Entry_Index": entry_i, "Exit_Index": None})
-            break
+                if hit_tp:
+                    outcome = "WIN"
+                    exit_price = tp
+                    exit_index = j
+                    break
+
+        # Preserve original V123 unresolved-trade behavior:
+        # if neither SL nor TP is hit in the scan window,
+        # outcome remains LOSS at SL.
 
         notional = TRADE_MARGIN * LEVERAGE
-        price_ret = ((exit_price - entry_price) / entry_price if side == "LONG"
-                     else (entry_price - exit_price) / entry_price)
-        dollar_pnl = notional * price_ret - notional * FEE_RATE * 2.0
 
-        trades.append({"Timestamp": entry_timestamp, "SignalTimestamp": t_signal, "ExitTimestamp": df_15.index[exit_index], "Symbol": symbol, "Side": side, "Outcome": outcome, "Dollar_PnL": dollar_pnl, "Entry_Price": entry_price, "Exit_Price": exit_price, "Entry_Index": entry_i, "Exit_Index": exit_index})
+        if side == "LONG":
+            price_ret = (
+                exit_price - entry_price
+            ) / entry_price
+        else:
+            price_ret = (
+                entry_price - exit_price
+            ) / entry_price
 
-        # Overlap lock and same-close re-entry block.
-        i = exit_index + 1
+        dollar_pnl = (
+            notional * price_ret
+            - notional * FEE_RATE * 2.0
+        )
+
+        trades.append(
+            {
+                "Timestamp": t_curr,
+                "ExitTimestamp": (
+                    df_15.index[exit_index]
+                    if exit_index is not None
+                    else None
+                ),
+                "Symbol": symbol,
+                "Side": side,
+                "Outcome": outcome,
+                "Dollar_PnL": dollar_pnl,
+                "Entry_Price": entry_price,
+                "Exit_Price": exit_price,
+                "Entry_Index": i,
+                "Exit_Index": exit_index,
+            }
+        )
 
     return trades
 
@@ -350,7 +532,7 @@ def run_v123_engine(symbol, df_15, df_1h, df_4h, start_dt, end_dt):
 
 def main():
     print("=" * 80)
-    print("HUNTER-V133 — LIVE-CAUSAL BACKTEST")
+    print("HUNTER-V129 — V123 EXACT-BEHAVIOR AUDIT")
     print("=" * 80)
 
     now = datetime.now()
@@ -363,18 +545,18 @@ def main():
     )
 
     print()
-    print("LIVE-CAUSAL MODE: execution/information timing corrected.")
+    print("AUDIT MODE: V123 behavior intentionally preserved.")
     print("Data connection: V123")
     print("Symbols: V123")
-    print("HTF selection: COMPLETED 1H/4H ONLY")
-    print("center=True: REMOVED")
+    print("HTF selection: V123")
+    print("center=True: V123")
     print("Sweep: V123")
     print("Displacement: V123")
-    print("Entry: NEXT 15M OPEN")
+    print("Entry: V123")
     print("SL/TP/BE: V123")
-    print("Timeout: DISABLED")
-    print("Unresolved trade: OPEN / EXCLUDED FROM PnL")
-    print("Overlap lock: ENABLED")
+    print("35-candle scan: V123")
+    print("Unresolved trade behavior: V123")
+    print("Overlap behavior: V123")
     print("=" * 80)
 
     all_trades = []
@@ -436,12 +618,6 @@ def main():
         drop=True,
         inplace=True,
     )
-
-    open_count = int((trades_df["Outcome"] == "OPEN").sum())
-    trades_df = trades_df[trades_df["Outcome"].isin(["WIN", "LOSS", "BE"])].copy()
-    if trades_df.empty:
-        print(f"Open at dataset end: {open_count}")
-        return
 
     total_trades = len(trades_df)
 
@@ -557,16 +733,16 @@ def main():
 
     print()
     print("=" * 80)
-    print("===== HUNTER-V133 — LIVE-CAUSAL RESULT =====")
+    print("===== HUNTER-V129 — V123 AUDIT RESULT =====")
     print("=" * 80)
 
     print(
         f"Total Trades:          {total_trades}"
     )
 
-    print(f"Open at Dataset End:    {open_count}")
-
-    print(f"Trades / Month:         {total_trades / 12.0:.1f}")
+    print(
+        f"Trades / Month:        {total_trades / 12.0:.1f}"
+    )
 
     print(
         f"Win Rate:              {win_rate:.2f}%"
@@ -701,6 +877,20 @@ def main():
             f"PnL: ${pnl:10,.2f}"
         )
 
+    # --------------------------------------------------------
+    # Audit target
+    # --------------------------------------------------------
+
+    print("-" * 80)
+    print("ORIGINAL V123 TARGET FOR REPRODUCTION:")
+
+    print("  Trades:       1032")
+    print("  Win Rate:     53.88%")
+    print("  Net PnL:      +$38,472.66")
+    print("  Profit Factor: 8.28")
+    print("  Max DD:       -$252.89")
+    print("  Max Loss Streak: 4")
+
     print("=" * 80)
 
     # --------------------------------------------------------
@@ -709,11 +899,11 @@ def main():
 
     try:
         trades_df.to_csv(
-            "v133_live_causal_trades.csv",
+            "v129_audit_trades.csv",
             index=False,
         )
         print(
-            "Trade log saved: v133_live_causal_trades.csv"
+            "Trade log saved: v129_audit_trades.csv"
         )
     except Exception as e:
         print(
