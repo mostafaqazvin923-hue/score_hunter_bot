@@ -15,8 +15,8 @@ except ImportError:
 
 
 # ============================================================
-# HUNTER-V135
-# V129 + NO-TIMEOUT CONTROLLED TEST
+# HUNTER-V136
+# V129 + NEXT-OPEN ENTRY CONTROLLED TEST
 #
 # Purpose:
 # Reproduce the original V123 behavior before applying
@@ -393,12 +393,21 @@ def run_v123_engine(
         if not valid_long and not valid_short:
             continue
 
+        # V136 ONLY CHANGE:
+        # The current candle is fully closed before displacement is known.
+        # Enter at the NEXT 15m candle OPEN.
+        entry_index = i + 1
+        if entry_index >= len(df_15):
+            continue
+
+        entry_row = df_15.iloc[entry_index]
+
         if valid_long:
             side = "LONG"
-            entry_price = c_row["Open"] * (1.0 + SLIPPAGE)
+            entry_price = entry_row["Open"] * (1.0 + SLIPPAGE)
         else:
             side = "SHORT"
-            entry_price = c_row["Open"] * (1.0 - SLIPPAGE)
+            entry_price = entry_row["Open"] * (1.0 - SLIPPAGE)
 
         atr = c_row["ATR"]
 
@@ -418,16 +427,15 @@ def run_v123_engine(
         current_sl = sl
         be_active = False
 
-        outcome = "OPEN"
-        exit_price = np.nan
+        outcome = "LOSS"
+        exit_price = sl
         exit_index = None
 
-        # V135 ONLY CHANGE:
-        # No artificial 35-candle timeout.
-        # Scan until SL/TP is actually hit or dataset ends.
+        # V136 keeps V129's original 35-candle exit scan.
+        # The first scanned candle is the actual entry candle.
         for j in range(
-            i + 1,
-            len(df_15),
+            entry_index,
+            min(entry_index + 34, len(df_15)),
         ):
             fut = df_15.iloc[j]
 
@@ -486,28 +494,25 @@ def run_v123_engine(
                     exit_index = j
                     break
 
-        # V135: if neither SL nor TP is hit before the dataset ends,
-        # keep the trade OPEN. It is not counted as WIN/LOSS/BE and
-        # contributes zero realized PnL.
+        # Preserve original V123 unresolved-trade behavior:
+        # if neither SL nor TP is hit in the scan window,
+        # outcome remains LOSS at SL.
 
         notional = TRADE_MARGIN * LEVERAGE
 
-        if outcome == "OPEN":
-            dollar_pnl = 0.0
+        if side == "LONG":
+            price_ret = (
+                exit_price - entry_price
+            ) / entry_price
         else:
-            if side == "LONG":
-                price_ret = (
-                    exit_price - entry_price
-                ) / entry_price
-            else:
-                price_ret = (
-                    entry_price - exit_price
-                ) / entry_price
+            price_ret = (
+                entry_price - exit_price
+            ) / entry_price
 
-            dollar_pnl = (
-                notional * price_ret
-                - notional * FEE_RATE * 2.0
-            )
+        dollar_pnl = (
+            notional * price_ret
+            - notional * FEE_RATE * 2.0
+        )
 
         trades.append(
             {
@@ -523,7 +528,7 @@ def run_v123_engine(
                 "Dollar_PnL": dollar_pnl,
                 "Entry_Price": entry_price,
                 "Exit_Price": exit_price,
-                "Entry_Index": i,
+                "Entry_Index": entry_index,
                 "Exit_Index": exit_index,
             }
         )
@@ -551,16 +556,16 @@ def main():
 
     print()
     print("AUDIT MODE: V123 behavior intentionally preserved.")
-    print("TEST TYPE: V129 + ONLY NO-TIMEOUT CHANGE")
+    print("TEST TYPE: V129 + ONLY NEXT-OPEN ENTRY CHANGE")
     print("Symbols: V123")
     print("HTF selection: V123")
     print("center=True: V123")
     print("Sweep: V123")
     print("Displacement: V123")
-    print("Entry: V123")
+    print("Entry: NEXT 15M OPEN AFTER CLOSED DISPLACEMENT")
     print("SL/TP/BE: V123")
-    print("Timeout: DISABLED (V135 ONLY CHANGE)")
-    print("Unresolved trade behavior: OPEN at dataset end")
+    print("35-candle scan: V129 (UNCHANGED)")
+    print("Unresolved trade behavior: V123")
     print("Overlap behavior: V123")
     print("=" * 80)
 
@@ -625,40 +630,29 @@ def main():
     )
 
     total_trades = len(trades_df)
-    open_trades = trades_df[
-        trades_df["Outcome"] == "OPEN"
-    ]
-    realized_df = trades_df[
-        trades_df["Outcome"] != "OPEN"
-    ]
 
-    wins = realized_df[
+    wins = trades_df[
         trades_df["Outcome"] == "WIN"
     ]
 
-    losses = realized_df[
-        realized_df["Outcome"] == "LOSS"
+    losses = trades_df[
+        trades_df["Outcome"] == "LOSS"
     ]
 
-    bes = realized_df[
-        realized_df["Outcome"] == "BE"
+    bes = trades_df[
+        trades_df["Outcome"] == "BE"
     ]
-
-    realized_trades = len(realized_df)
 
     win_rate = (
-        len(wins) / realized_trades * 100.0
-        if realized_trades else 0.0
+        len(wins) / total_trades * 100.0
     )
 
     loss_rate = (
-        len(losses) / realized_trades * 100.0
-        if realized_trades else 0.0
+        len(losses) / total_trades * 100.0
     )
 
     be_rate = (
-        len(bes) / realized_trades * 100.0
-        if realized_trades else 0.0
+        len(bes) / total_trades * 100.0
     )
 
     net_pnl = float(
@@ -749,16 +743,16 @@ def main():
 
     print()
     print("=" * 80)
-    print("===== HUNTER-V135 — NO-TIMEOUT RESULT =====")
+    print("===== HUNTER-V136 — NEXT-OPEN ENTRY RESULT =====")
     print("=" * 80)
 
     print(
         f"Total Trades:          {total_trades}"
     )
 
-    print(f"Trades / Month:        {total_trades / 12.0:.1f}")
-    print(f"Open at Dataset End:   {len(open_trades)}")
-    print(f"Realized Trades:       {realized_trades}")
+    print(
+        f"Trades / Month:        {total_trades / 12.0:.1f}"
+    )
 
     print(
         f"Win Rate:              {win_rate:.2f}%"
