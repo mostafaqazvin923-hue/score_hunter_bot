@@ -1,4 +1,13 @@
 {
-    "active": {},
+    "active": {
+        "DOT": {
+            "symbol": "DOT/USDT",
+            "direction": "LONG",
+            "entry_price": 1.196,
+            "tp": 1.3034999999999999,
+            "sl": 1.14225,
+            "time": "2026-09-22 20:00:00"
+        }
+    },
     "cooldown": {}
 }
