@@ -155,14 +155,14 @@ def engine(sym,d,h1,h4,start,end):
             e=float(ent.Open)*(1+SLIPPAGE); sl=float(s.Low)-0.15*a
             risk=e-sl
             if 0.60*a<=risk<=3.50*a:
-                pos={"Symbol":sym,"Side":"LONG","EntryTimestamp":d.index[i+1],"e":e,
+                pos={"symbol":sym,"side":"LONG","EntryTimestamp":d.index[i+1],"e":e,
                      "sl":sl,"InitialSL":sl,"tp":e+2*risk,"be_trigger":e+risk,"be":False,
                      "Entry_Price":e}
         elif short_sweep and short_confirm:
             e=float(ent.Open)*(1-SLIPPAGE); sl=float(s.High)+0.15*a
             risk=sl-e
             if 0.60*a<=risk<=3.50*a:
-                pos={"Symbol":sym,"Side":"SHORT","EntryTimestamp":d.index[i+1],"e":e,
+                pos={"symbol":sym,"side":"SHORT","EntryTimestamp":d.index[i+1],"e":e,
                      "sl":sl,"InitialSL":sl,"tp":e-2*risk,"be_trigger":e-risk,"be":False,
                      "Entry_Price":e}
     if pos:
@@ -239,7 +239,11 @@ def main():
         print("  Candles:",len(d))
         x,h1,h4=prep(d); tr=engine(sym,x,h1,h4,start,end); alltr.extend(tr)
         print("  Trades:",len(tr))
-    if alltr: report(pd.DataFrame(alltr))
+    if alltr:
+        out = pd.DataFrame(alltr)
+        out["Symbol"] = out["symbol"]
+        out["Side"] = out["side"]
+        report(out)
     else: print("NO TRADES GENERATED")
 
 if __name__=="__main__":
