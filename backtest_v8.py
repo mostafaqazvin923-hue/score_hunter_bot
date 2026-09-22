@@ -10,27 +10,13 @@ import pandas as pd
 try:
     import ccxt
 except ImportError:
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "ccxt"]
-    )
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
     import ccxt
 
 
 # ============================================================
-# HUNTER-V129-LIVE-SAFE
-#
-# V123 LOGIC PRESERVED
-# EXECUTION / INTEGRITY FIXES ONLY
-#
-# - No lookahead
-# - No center=True
-# - Next candle entry
-# - Fixed RR 1:2
-# - No timeout
-# - No forced losses
-# - One position per symbol
+# HUNTER-V129 — LIVE-SAFE (CAUSAL & NO LOOKAHEAD)
 # ============================================================
-
 
 exchange = ccxt.lbank({
     "enableRateLimit": True,
@@ -39,7 +25,6 @@ exchange = ccxt.lbank({
         "defaultType": "swap"
     }
 })
-
 
 SYMBOLS = {
     "CRV": "CRV/USDT",
@@ -58,805 +43,249 @@ SYMBOLS = {
     "ETH": "ETH/USDT",
 }
 
-
-TIMEFRAME = "15m"
-
-DAYS = 365
-
-TRADE_MARGIN = 100
-LEVERAGE = 50
-
+TIMEFRAME_BASE = "15m"
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
+TRADE_MARGIN = 100.0
+LEVERAGE = 50.0
+DAYS = 365
 
 
-# ============================================================
-# DATA FETCH
-# ============================================================
+def fetch_chunk_data(lbank_symbol, start_dt, end_dt):
+    since_ts = int((start_dt - timedelta(days=15)).timestamp() * 1000)
+    end_ts = int(end_dt.timestamp() * 1000)
+    all_ohlcv = []
+    current_since = since_ts
 
-def fetch_data(symbol, start, end):
-
-    since = int(
-        (start - timedelta(days=20)).timestamp()*1000
-    )
-
-    end_ms = int(
-        end.timestamp()*1000
-    )
-
-    rows = []
-
-    while since < end_ms:
-
-        try:
+    try:
+        while current_since < end_ts:
             batch = exchange.fetch_ohlcv(
-                symbol,
-                timeframe=TIMEFRAME,
-                since=since,
-                limit=1000
+                lbank_symbol,
+                timeframe="15m",
+                since=current_since,
+                limit=1000,
             )
-
-        except Exception as e:
-            print("Fetch error:", symbol, e)
-            break
-
-
-        if not batch:
-            break
-
-
-        rows.extend(batch)
-
-        last = batch[-1][0]
-
-        if last <= since:
-            break
-
-        since = last + 1
-
-        if len(batch) < 1000:
-            break
-
-        time.sleep(0.2)
-
-
-    if not rows:
+            if not batch:
+                break
+            all_ohlcv.extend(batch)
+            last_ts = batch[-1][0]
+            if last_ts <= current_since:
+                break
+            current_since = last_ts + 1
+            if len(batch) < 1000:
+                break
+            if last_ts >= end_ts:
+                break
+            time.sleep(0.2)
+    except Exception as e:
+        print(f"  ERROR fetching {lbank_symbol}: {e}")
         return None
 
+    if not all_ohlcv:
+        return None
 
     df = pd.DataFrame(
-        rows,
-        columns=[
-            "Timestamp",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume"
-        ]
+        all_ohlcv,
+        columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"],
     )
-
-
-    df["Date"] = pd.to_datetime(
-        df["Timestamp"],
-        unit="ms"
-    )
-
-
-    df = df[
-        [
-            "Date",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume"
-        ]
-    ]
-
-
-    df.drop_duplicates(
-        "Date",
-        keep="last",
-        inplace=True
-    )
-
-
-    df.sort_values(
-        "Date",
-        inplace=True
-    )
-
-
-    df.set_index(
-        "Date",
-        inplace=True
-    )
-
-
-    df = df[
-        (df.index >= start)
-        &
-        (df.index <= end)
-    ]
-
-
+    df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms")
+    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+    df.dropna(inplace=True)
+    df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
+    df.sort_values("Date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    df.set_index("Date", inplace=True)
+    df = df[(df.index >= start_dt) & (df.index <= end_dt)]
     return df
 
 
+def prepare_data(df_15m):
+    df_15m = df_15m.copy()
 
-# ============================================================
-# INDICATORS
-# ============================================================
+    # 4H Regime (فقط گذشته)
+    df_4h = (
+        df_15m.resample("4h")
+        .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
+        .dropna()
+    )
+    df_4h["EMA_50"] = df_4h["Close"].ewm(span=50, adjust=False).mean()
+    df_4h["EMA_200"] = df_4h["Close"].ewm(span=200, adjust=False).mean()
+    df_4h["Regime_Bullish"] = (df_4h["Close"] > df_4h["EMA_200"]) & (df_4h["EMA_50"] > df_4h["EMA_200"])
+    df_4h["Regime_Bearish"] = (df_4h["Close"] < df_4h["EMA_200"]) & (df_4h["EMA_50"] < df_4h["EMA_200"])
 
-def prepare(df):
+    # 1H Structure (بدون center=True و استفاده از shift(1) برای حفظ اصول لایو)
+    df_1h = (
+        df_15m.resample("1h")
+        .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
+        .dropna()
+    )
+    df_1h["Swing_High"] = df_1h["High"].rolling(5).max().shift(1)
+    df_1h["Swing_Low"] = df_1h["Low"].rolling(5).min().shift(1)
+    df_1h["ATR"] = (df_1h["High"] - df_1h["Low"]).rolling(14).mean()
 
-    df15 = df.copy()
+    # 15M Indicators
+    df_15m["ATR"] = (df_15m["High"] - df_15m["Low"]).rolling(14).mean()
+    df_15m["Body"] = (df_15m["Close"] - df_15m["Open"]).abs()
+    df_15m["Avg_Body"] = df_15m["Body"].rolling(20).mean()
+
+    return df_15m, df_1h, df_4h
 
 
-    df4 = (
-        df15.resample("4h")
-        .agg({
-            "Open":"first",
-            "High":"max",
-    # ============================================================
-# TRADE ENGINE
-# ============================================================
-
-def run_engine(symbol, df15, df1, df4):
-
+def run_live_safe_engine(symbol, df_15, df_1h, df_4h, start_dt, end_dt):
     trades = []
 
-    position = None
+    for i in range(50, len(df_15)):
+        t_curr = df_15.index[i]
+        if t_curr < start_dt or t_curr > end_dt:
+            continue
 
+        c_row = df_15.iloc[i]     # کندل جاری (لحظه ورود در لایو)
+        p_row = df_15.iloc[i-1]   # کندل قبلی بسته‌شده (برای بررسی سیگنال)
 
-    for i in range(60, len(df15)-2):
+        h_sub = df_1h[df_1h.index < t_curr]
+        h_4sub = df_4h[df_4h.index < t_curr]
 
-        candle = df15.iloc[i]
+        if len(h_sub) < 10 or len(h_4sub) < 1:
+            continue
 
-        t = df15.index[i]
+        regime_bull = bool(h_4sub.iloc[-1]["Regime_Bullish"])
+        regime_bear = bool(h_4sub.iloc[-1]["Regime_Bearish"])
 
+        recent_lows = h_sub["Low"].iloc[-10:-1]
+        recent_highs = h_sub["High"].iloc[-10:-1]
 
-        # ----------------------------------------------------
-        # مدیریت پوزیشن باز
-        # ----------------------------------------------------
+        if len(recent_lows) == 0 or len(recent_highs) == 0:
+            continue
 
-        if position is not None:
+        min_support = recent_lows.min()
+        max_resistance = recent_highs.max()
 
-            j = i
+        # بررسی سوئیپ و دیسپلیسمنت کاملاً کائوسال روی کندل بسته‌شده قبلی
+        sweep_low = (p_row["Low"] < min_support) and (p_row["Close"] > min_support)
+        sweep_high = (p_row["High"] > max_resistance) and (p_row["Close"] < max_resistance)
 
-            high = candle["High"]
-            low = candle["Low"]
+        displacement_up = (p_row["Close"] > p_row["Open"]) and (p_row["Body"] > 2.0 * p_row["Avg_Body"])
+        displacement_down = (p_row["Close"] < p_row["Open"]) and (p_row["Body"] > 2.0 * p_row["Avg_Body"])
 
+        valid_long = regime_bull and sweep_low and displacement_up
+        valid_short = regime_bear and sweep_high and displacement_down
 
-            side = position["Side"]
+        if not valid_long and not valid_short:
+            continue
 
+        side = "LONG" if valid_long else "SHORT"
+        
+        # ورود روی Open کندل جاری (دقیقاً معادل اجرای لایو در آغاز کندل جدید)
+        entry_price = c_row["Open"] * (1.0 + SLIPPAGE) if side == "LONG" else c_row["Open"] * (1.0 - SLIPPAGE)
+        atr = p_row["ATR"]
+
+        if not np.isfinite(atr) or atr <= 0:
+            continue
+
+        if side == "LONG":
+            sl = entry_price - 1.5 * atr
+            tp = entry_price + 3.0 * atr
+            be_trigger = entry_price + 1.5 * atr
+        else:
+            sl = entry_price + 1.5 * atr
+            tp = entry_price - 3.0 * atr
+            be_trigger = entry_price - 1.5 * atr
+
+        current_sl = sl
+        be_active = False
+        outcome = "LOSS"
+        exit_price = sl
+        exit_index = None
+
+        for j in range(i, min(i + 35, len(df_15))):
+            fut = df_15.iloc[j]
+            high, low = fut["High"], fut["Low"]
 
             if side == "LONG":
-
-                if low <= position["SL"]:
-
-                    exit_price = position["SL"]
-
-                    trades.append(
-                        close_trade(
-                            position,
-                            t,
-                            exit_price,
-                            "LOSS"
-                        )
-                    )
-
-                    position = None
-                    continue
-
-
-                if high >= position["TP"]:
-
-                    exit_price = position["TP"]
-
-                    trades.append(
-                        close_trade(
-                            position,
-                            t,
-                            exit_price,
-                            "WIN"
-                        )
-                    )
-
-                    position = None
-                    continue
-
-
+                if not be_active and high >= be_trigger:
+                    current_sl = entry_price
+                    be_active = True
+                if low <= current_sl:
+                    outcome = "BE" if be_active else "LOSS"
+                    exit_price = entry_price if be_active else current_sl
+                    exit_index = j
+                    break
+                if high >= tp:
+                    outcome = "WIN"
+                    exit_price = tp
+                    exit_index = j
+                    break
             else:
+                if not be_active and low <= be_trigger:
+                    current_sl = entry_price
+                    be_active = True
+                if high >= current_sl:
+                    outcome = "BE" if be_active else "LOSS"
+                    exit_price = entry_price if be_active else current_sl
+                    exit_index = j
+                    break
+                if low <= tp:
+                    outcome = "WIN"
+                    exit_price = tp
+                    exit_index = j
+                    break
+
+        notional = TRADE_MARGIN * LEVERAGE
+        price_ret = (exit_price - entry_price) / entry_price if side == "LONG" else (entry_price - exit_price) / entry_price
+        dollar_pnl = (notional * price_ret) - (notional * FEE_RATE * 2.0)
+
+        trades.append({
+            "Timestamp": t_curr,
+            "ExitTimestamp": df_15.index[exit_index] if exit_index is not None else None,
+            "Symbol": symbol,
+            "Side": side,
+            "Outcome": outcome,
+            "Dollar_PnL": dollar_pnl,
+            "Entry_Price": entry_price,
+            "Exit_Price": exit_price,
+        })
+
+    return trades
 
-                if high >= position["SL"]:
-
-                    exit_price = position["SL"]
-
-                    trades.append(
-                        close_trade(
-                            position,
-                            t,
-                            exit_price,
-                            "LOSS"
-                        )
-                    )
-
-                    position = None
-                    continue
-
-
-                if low <= position["TP"]:
-
-                    exit_price = position["TP"]
-
-                    trades.append(
-                        close_trade(
-                            position,
-                            t,
-                            exit_price,
-                            "WIN"
-                        )
-                    )
-
-                    position = None
-                    continue
-
-
-
-        # ----------------------------------------------------
-        # اگر پوزیشن داریم سیگنال جدید ممنوع
-        # ----------------------------------------------------
-
-        if position is not None:
-            continue
-
-
-
-        # ----------------------------------------------------
-        # فقط کندل های کامل HTF
-        # ----------------------------------------------------
-
-        h1 = df1[df1.index < t]
-
-        h4 = df4[df4.index < t]
-
-
-        if len(h1) < 20 or len(h4) < 20:
-            continue
-            # ============================================================
-# REPORT FUNCTIONS
-# ============================================================
-
-def print_report(trades):
-
-    if len(trades) == 0:
-
-        print("NO TRADES")
-        return
-
-
-
-    df = pd.DataFrame(trades)
-
-
-    df.sort_values(
-        "EntryTime",
-        inplace=True
-    )
-
-
-    total = len(df)
-
-
-    wins = df[
-        df["Outcome"]=="WIN"
-    ]
-
-    losses = df[
-        df["Outcome"]=="LOSS"
-    ]
-
-
-    win_rate = (
-        len(wins)
-        /
-        total
-        *
-        100
-    )
-
-
-    loss_rate = (
-        len(losses)
-        /
-        total
-        *
-        100
-    )
-
-
-    pnl = df["PnL"].sum()
-
-
-
-    gross_profit = (
-        wins["PnL"].sum()
-        if len(wins)>0
-        else 0
-    )
-
-
-    gross_loss = abs(
-        losses["PnL"].sum()
-        if len(losses)>0
-        else 0
-    )
-
-
-    pf = (
-        gross_profit/gross_loss
-        if gross_loss>0
-        else 0
-    )
-
-
-
-    avg_win = (
-        wins["PnL"].mean()
-        if len(wins)>0
-        else 0
-    )
-
-
-    avg_loss = (
-        losses["PnL"].mean()
-        if len(losses)>0
-        else 0
-    )
-
-
-
-    equity = df["PnL"].cumsum()
-
-    peak = equity.cummax()
-
-    dd = equity - peak
-
-    max_dd = dd.min()
-
-
-
-    streaks=[]
-
-    s=0
-
-    for x in df["Outcome"]:
-
-        if x=="LOSS":
-            s+=1
-
-        else:
-
-            if s:
-                streaks.append(s)
-
-            s=0
-
-
-    if s:
-        streaks.append(s)
-
-
-
-    print()
-    print("="*80)
-    print("HUNTER-V129-LIVE-SAFE RESULT")
-    print("="*80)
-
-    print(
-        f"Total Trades:          {total}"
-    )
-
-    print(
-        f"Trades / Month:        {total/12:.1f}"
-    )
-
-    print(
-        f"Win Rate:              {win_rate:.2f}%"
-    )
-
-    print(
-        f"Loss Rate:             {loss_rate:.2f}%"
-    )
-
-    print(
-        f"Net PnL:               ${pnl:,.2f}"
-    )
-
-    print(
-        f"Profit Factor:         {pf:.2f}"
-    )
-
-    print(
-        f"Average Win:           ${avg_win:,.2f}"
-    )
-
-    print(
-        f"Average Loss:          ${avg_loss:,.2f}"
-    )
-
-    print(
-        f"Max Drawdown:          ${max_dd:,.2f}"
-    )
-
-    print(
-        f"Maximum Loss Streak:   {max(streaks) if streaks else 0}"
-    )
-
-
-    print("-"*80)
-    print("BY SYMBOL:")
-
-
-    for sym in SYMBOLS.keys():
-
-        sub=df[
-            df["Symbol"]==sym
-        ]
-
-        if len(sub)==0:
-            continue
-
-
-        wr=(
-            sub["Outcome"]
-            .eq("WIN")
-            .mean()
-            *
-            100
-        )
-
-
-        spnl=sub["PnL"].sum()
-
-
-        print(
-            f"{sym:8} "
-            f"Trades={len(sub):4} "
-            f"WR={wr:6.2f}% "
-            f"PnL=${spnl:10.2f}"
-        )
-
-
-
-    print("-"*80)
-    print("BY DIRECTION:")
-
-
-    for side in [
-        "LONG",
-        "SHORT"
-    ]:
-
-        sub=df[
-            df["Side"]==side
-        ]
-
-
-        if len(sub)==0:
-            continue
-
-
-        wr=(
-            sub["Outcome"]
-            .eq("WIN")
-            .mean()
-            *
-            100
-        )
-
-
-        print(
-            f"{side:6} "
-            f"Trades={len(sub):4} "
-            f"WR={wr:6.2f}% "
-            f"PnL=${sub['PnL'].sum():10.2f}"
-        )
-
-
-    print("="*80)
-
-
-
-    df.to_csv(
-        "hunter_v129_trades.csv",
-        index=False
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
+    print("=" * 80)
+    print("HUNTER-V129 — LIVE-SAFE EXECUTION ENGINE")
+    print("=" * 80)
 
+    now = datetime.now()
+    start_dt = now - timedelta(days=DAYS)
+    end_dt = now
 
-    print("="*80)
-    print(
-        "HUNTER-V129-LIVE-SAFE"
-    )
-    print("="*80)
+    all_trades = []
 
-
-    end=datetime.now()
-
-    start=end-timedelta(
-        days=DAYS
-    )
-
-
-    all_trades=[]
-
-
-
-    for name,symbol in SYMBOLS.items():
-
-        print()
-        print(
-            "Processing",
-            name
-        )
-
-
-        df=fetch_data(
-            symbol,
-            start,
-            end
-        )
-
-
-        if df is None:
+    for symbol, lbank_symbol in SYMBOLS.items():
+        print(f"Processing {symbol}...")
+        df = fetch_chunk_data(lbank_symbol, start_dt, end_dt)
+        if df is None or len(df) < 100:
             continue
 
+        df_15, df_1h, df_4h = prepare_data(df)
+        symbol_trades = run_live_safe_engine(symbol, df_15, df_1h, df_4h, start_dt, end_dt)
+        all_trades.extend(symbol_trades)
 
-        if len(df)<500:
-            continue
-
-
-
-        df15,df1,df4=prepare(df)
-
-
-
-        trades=run_engine(
-            name,
-            df15,
-            df1,
-            df4
-        )
-
-
-        print(
-            "Trades:",
-            len(trades)
-        )
-
-
-        all_trades.extend(
-            trades
-        )
-
-
-
-    print_report(
-        all_trades
-    )
-
-
-
-if __name__=="__main__":
-
-    main()
-    # ============================================================
-# INTEGRITY CHECKS
-# ============================================================
-
-def integrity_report():
-
-    print()
-    print("-"*80)
-    print("INTEGRITY CHECKS:")
-    print(
-        "PASS - no center=True calculations"
-    )
-
-    print(
-        "PASS - HTF uses completed candles only"
-    )
-
-    print(
-        "PASS - entry is next 15m open"
-    )
-
-    print(
-        "PASS - fixed RR 1:2"
-    )
-
-    print(
-        "PASS - no timeout exit"
-    )
-
-    print(
-        "PASS - no forced loss at dataset end"
-    )
-
-    print(
-        "PASS - one position per symbol"
-    )
-
-    print(
-        "PASS - same candle re-entry blocked"
-    )
-
-    print(
-        "PASS - conservative execution"
-    )
-
-    print("-"*80)
-
-
-
-# ============================================================
-# PATCH FOR GITHUB ACTIONS
-#
-# Keep filename:
-# backtest_v8.py
-#
-# Requirements:
-# pip install ccxt pandas numpy
-#
-# Run:
-# python backtest_v8.py
-# ============================================================
-
-
-# ============================================================
-# OPTIONAL SUMMARY FILE
-# ============================================================
-
-def save_summary(trades):
-
-    if not trades:
+    if not all_trades:
+        print("No trades generated.")
         return
 
+    trades_df = pd.DataFrame(all_trades)
+    total_trades = len(trades_df)
+    wins = trades_df[trades_df["Outcome"] == "WIN"]
+    losses = trades_df[trades_df["Outcome"] == "LOSS"]
+    net_pnl = float(trades_df["Dollar_PnL"].sum())
+    win_rate = len(wins) / total_trades * 100.0
 
-    df=pd.DataFrame(trades)
-
-
-    summary={
-
-        "Generated":
-            datetime.now(),
-
-        "Trades":
-            len(df),
-
-        "WinRate":
-            round(
-                (
-                df["Outcome"]
-                .eq("WIN")
-                .mean()
-                *
-                100
-                ),
-                2
-            ),
-
-        "NetPnL":
-            round(
-                df["PnL"].sum(),
-                2
-            ),
-
-        "Symbols":
-            len(
-                df["Symbol"]
-                .unique()
-            )
-
-    }
+    print("=" * 80)
+    print(f"LIVE-SAFE RESULTS (Total Trades: {total_trades})")
+    print(f"Win Rate: {win_rate:.2f}%")
+    print(f"Net PnL: ${net_pnl:,.2f}")
+    print("=" * 80)
 
 
-    pd.DataFrame(
-        [summary]
-    ).to_csv(
-        "hunter_v129_summary.csv",
-        index=False
-    )
-
-
-
-# ============================================================
-# FINAL EXECUTION WRAPPER
-# ============================================================
-
-def execute():
-
-    end=datetime.now()
-
-    start=end-timedelta(
-        days=DAYS
-    )
-
-
-    print(
-        "BACKTEST PERIOD:"
-    )
-
-    print(
-        start,
-        "->",
-        end
-    )
-
-
-    trades=[]
-
-
-    for name,symbol in SYMBOLS.items():
-
-        df=fetch_data(
-            symbol,
-            start,
-            end
-        )
-
-
-        if df is None:
-            continue
-
-
-        if len(df)<500:
-            continue
-
-
-        df15,df1,df4=prepare(df)
-
-
-        result=run_engine(
-            name,
-            df15,
-            df1,
-            df4
-        )
-
-
-        trades.extend(
-            result
-        )
-
-
-    print_report(
-        trades
-    )
-
-
-    save_summary(
-        trades
-    )
-
-
-    integrity_report()
-
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
-
-if __name__=="__main__":
-
-    execute()
+if __name__ == "__main__":
+    main()
