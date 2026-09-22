@@ -1,309 +1,148 @@
-# HUNTER-V147 — Liquidity Sweep + FVG Retest
-# Live-safe backtest engine
-# RR 1:2 | No lookahead | No repaint
+# HUNTER-V148
+# Ichimoku Professional Ranking Engine
+# 30 Symbols | RR 1:2 | No lookahead
 
 import time
 from datetime import datetime, timedelta
-
-import numpy as np
-import pandas as pd
 import ccxt
-
+import pandas as pd
+import numpy as np
 
 exchange = ccxt.lbank({
     "enableRateLimit": True,
     "timeout": 20000,
-    "options": {"defaultType": "swap"}
+    "options":{"defaultType":"swap"}
 })
 
 SYMBOLS = {
-    "BTC": "BTC/USDT",
-    "ETH": "ETH/USDT",
-    "SOL": "SOL/USDT",
-    "XRP": "XRP/USDT",
-    "ADA": "ADA/USDT",
-    "LINK": "LINK/USDT",
-    "AVAX": "AVAX/USDT",
-    "DOT": "DOT/USDT",
-    "SUI": "SUI/USDT",
-    "NEAR": "NEAR/USDT",
+"BTC":"BTC/USDT","ETH":"ETH/USDT","SOL":"SOL/USDT","XRP":"XRP/USDT",
+"BNB":"BNB/USDT","ADA":"ADA/USDT","DOGE":"DOGE/USDT","AVAX":"AVAX/USDT",
+"LINK":"LINK/USDT","DOT":"DOT/USDT","SUI":"SUI/USDT","NEAR":"NEAR/USDT",
+"APT":"APT/USDT","ATOM":"ATOM/USDT","LTC":"LTC/USDT","BCH":"BCH/USDT",
+"ETC":"ETC/USDT","FIL":"FIL/USDT","ICP":"ICP/USDT","ARB":"ARB/USDT",
+"OP":"OP/USDT","INJ":"INJ/USDT","TIA":"TIA/USDT","AAVE":"AAVE/USDT",
+"UNI":"UNI/USDT","MATIC":"MATIC/USDT","MKR":"MKR/USDT",
+"RUNE":"RUNE/USDT","TRX":"TRX/USDT","XLM":"XLM/USDT"
 }
 
-DAYS = 365
-MARGIN = 100
-LEVERAGE = 50
-FEE = 0.0007
-SLIPPAGE = 0.0003
+DAYS=365
+RR=2
+MARGIN=100
+LEVERAGE=50
+FEE=0.0007
 
 
-def fetch_data(symbol, start, end):
-    rows = []
-    since = int(start.timestamp() * 1000)
-    end_ms = int(end.timestamp() * 1000)
-
-    while since < end_ms:
+def fetch(symbol,start,end):
+    data=[]
+    since=int(start.timestamp()*1000)
+    while True:
         try:
-            batch = exchange.fetch_ohlcv(
-                symbol,
-                timeframe="15m",
-                since=since,
-                limit=1000
-            )
-        except Exception:
+            batch=exchange.fetch_ohlcv(symbol,"15m",since=since,limit=1000)
+        except:
             break
-
         if not batch:
             break
-
-        rows.extend(batch)
-        new_since = batch[-1][0] + 1
-
-        if new_since <= since:
+        data+=batch
+        nxt=batch[-1][0]+1
+        if nxt<=since or len(batch)<1000:
             break
+        since=nxt
+        time.sleep(.2)
 
-        since = new_since
-
-        if len(batch) < 1000:
-            break
-
-        time.sleep(0.2)
-
-    if not rows:
+    if not data:
         return None
 
-    df = pd.DataFrame(
-        rows,
-        columns=["ts","Open","High","Low","Close","Volume"]
-    )
-
-    df["Date"] = pd.to_datetime(df["ts"], unit="ms")
-    df = df.drop_duplicates("Date")
-    df = df.set_index("Date")
-    return df.loc[start:end][[
-        "Open","High","Low","Close","Volume"
-    ]]
+    df=pd.DataFrame(data,columns=["ts","Open","High","Low","Close","Volume"])
+    df["Date"]=pd.to_datetime(df.ts,unit="ms")
+    df=df.drop_duplicates("Date").set_index("Date")
+    return df.loc[start:end]
 
 
-def prepare(df):
-
-    x = df.copy()
-
-    x["ATR"] = (
-        (x["High"] - x["Low"])
-        .rolling(14)
-        .mean()
-    )
-
-    x["VOL_AVG"] = (
-        x["Volume"]
-        .rolling(20)
-        .mean()
-    )
-
-    # confirmed liquidity from past only
-    x["Prev_High"] = (
-        x["High"]
-        .rolling(20)
-        .max()
-        .shift(1)
-    )
-
-    x["Prev_Low"] = (
-        x["Low"]
-        .rolling(20)
-        .min()
-        .shift(1)
-    )
-
-    # Fair Value Gap using closed candles only
-    x["Bull_FVG"] = (
-        x["Low"] > x["High"].shift(2)
-    )
-
-    x["Bear_FVG"] = (
-        x["High"] < x["Low"].shift(2)
-    )
-
+def ichimoku(df):
+    x=df.copy()
+    x["tenkan"]=(x.High.rolling(9).max()+x.Low.rolling(9).min())/2
+    x["kijun"]=(x.High.rolling(26).max()+x.Low.rolling(26).min())/2
+    x["senkou_a"]=((x.tenkan+x.kijun)/2).shift(26)
+    x["senkou_b"]=((x.High.rolling(52).max()+x.Low.rolling(52).min())/2).shift(26)
+    x["chikou"]=x.Close.shift(26)
+    x["atr"]=(x.High-x.Low).rolling(14).mean()
+    x["vol"]=x.Volume/x.Volume.rolling(20).mean()
     return x
 
 
-def get_signal(df, i):
-
-    if i < 50:
-        return None
-
-    p = df.iloc[i-1]
-    c = df.iloc[i]
-
-    bull = (
-        p["Low"] < p["Prev_Low"]
-        and
-        c["Close"] > p["High"]
-        and
-        c["Close"] > c["Open"]
-        and
-        c["Volume"] > c["VOL_AVG"]
-        and
-        df.iloc[i-2]["Bull_FVG"]
-    )
-
-    bear = (
-        p["High"] > p["Prev_High"]
-        and
-        c["Close"] < p["Low"]
-        and
-        c["Close"] < c["Open"]
-        and
-        c["Volume"] > c["VOL_AVG"]
-        and
-        df.iloc[i-2]["Bear_FVG"]
-    )
-
-    if bull:
-        return "LONG"
-
-    if bear:
-        return "SHORT"
-
-    return None
+def score(row):
+    s=0
+    if row.Close>max(row.senkou_a,row.senkou_b): s+=2
+    if row.tenkan>row.kijun: s+=2
+    if row.chikou>row.Close: s+=1
+    if row.vol>1: s+=1
+    return s
 
 
-def backtest(df, symbol):
-
+def run(df,symbol):
     trades=[]
+    for i in range(60,len(df)-2):
+        r=df.iloc[i-1]
 
-    for i in range(50, len(df)-2):
-
-        side=get_signal(df,i)
-
-        if not side:
+        if score(r)<5:
             continue
 
-        entry=df.iloc[i+1]["Open"]
-        atr=df.iloc[i]["ATR"]
+        side="LONG" if r.tenkan>r.kijun else "SHORT"
+        entry=df.iloc[i].Open
+        atr=r.atr
 
         if not np.isfinite(atr):
             continue
 
-        if side=="LONG":
-            sl=entry-atr
-            tp=entry+(atr*2)
-
-        else:
-            sl=entry+atr
-            tp=entry-(atr*2)
-
+        sl=entry-atr if side=="LONG" else entry+atr
+        tp=entry+atr*RR if side=="LONG" else entry-atr*RR
 
         result=None
-        exit_price=None
+        price=None
 
-        for j in range(i+2,len(df)):
-
-            h=df.iloc[j]["High"]
-            l=df.iloc[j]["Low"]
+        for j in range(i+1,len(df)):
+            c=df.iloc[j]
 
             if side=="LONG":
-
-                if l<=sl:
-                    result="LOSS"
-                    exit_price=sl
-                    break
-
-                if h>=tp:
-                    result="WIN"
-                    exit_price=tp
-                    break
-
+                if c.Low<=sl:
+                    result="LOSS";price=sl;break
+                if c.High>=tp:
+                    result="WIN";price=tp;break
             else:
-
-                if h>=sl:
-                    result="LOSS"
-                    exit_price=sl
-                    break
-
-                if l<=tp:
-                    result="WIN"
-                    exit_price=tp
-                    break
-
+                if c.High>=sl:
+                    result="LOSS";price=sl;break
+                if c.Low<=tp:
+                    result="WIN";price=tp;break
 
         if result:
-
-            ret = (
-                (exit_price-entry)/entry
-                if side=="LONG"
-                else
-                (entry-exit_price)/entry
-            )
-
-            pnl = (
-                ret *
-                MARGIN *
-                LEVERAGE
-            ) - (
-                MARGIN *
-                LEVERAGE *
-                FEE *
-                2
-            )
-
-            trades.append({
-                "Symbol":symbol,
-                "Side":side,
-                "Outcome":result,
-                "PnL":pnl
-            })
-
+            pnl=((price-entry)/entry if side=="LONG" else (entry-price)/entry)*MARGIN*LEVERAGE
+            pnl-=MARGIN*LEVERAGE*FEE*2
+            trades.append([symbol,side,result,pnl])
 
     return trades
 
 
 def main():
-
     end=datetime.utcnow()
     start=end-timedelta(days=DAYS)
+    all=[]
 
-    trades=[]
-
-    for name,symbol in SYMBOLS.items():
-
-        print("Loading",name)
-
-        df=fetch_data(symbol,start,end)
-
+    for n,s in SYMBOLS.items():
+        print("Loading",n)
+        df=fetch(s,start,end)
         if df is not None:
-            trades.extend(
-                backtest(
-                    prepare(df),
-                    name
-                )
-            )
+            all+=run(ichimoku(df),n)
 
-
-    if not trades:
-        print("No trades generated")
+    if not all:
+        print("No trades")
         return
 
-
-    t=pd.DataFrame(trades)
-
-    win=t[t.Outcome=="WIN"]
-    loss=t[t.Outcome=="LOSS"]
-
+    t=pd.DataFrame(all,columns=["Symbol","Side","Outcome","PnL"])
     print("="*70)
-    print("HUNTER-V147 REPORT")
+    print("HUNTER-V148 REPORT")
     print("Trades:",len(t))
-    print("Win Rate:",round(len(win)/len(t)*100,2))
+    print("Win Rate:",round((t.Outcome=="WIN").mean()*100,2))
     print("PnL:",round(t.PnL.sum(),2))
-
-    pf = (
-        win.PnL.sum() /
-        abs(loss.PnL.sum())
-        if len(loss)
-        else 0
-    )
-
-    print("Profit Factor:",round(pf,2))
     print(t.groupby("Symbol").PnL.sum())
     print("="*70)
 
