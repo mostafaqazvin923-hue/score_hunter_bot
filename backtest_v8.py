@@ -15,8 +15,8 @@ except ImportError:
 
 
 # ============================================================
-# HUNTER-V134
-# V123 EXACT-BEHAVIOR AUDIT
+# HUNTER-V135
+# V129 + NO-TIMEOUT CONTROLLED TEST
 #
 # Purpose:
 # Reproduce the original V123 behavior before applying
@@ -327,9 +327,9 @@ def run_v123_engine(
         c_row = df_15.iloc[i]
         p_row = df_15.iloc[i - 1]
 
-        # V134 ONLY CHANGE: use only fully closed 1H/4H candles.
-        h_sub = df_1h[(df_1h.index + pd.Timedelta(hours=1)) <= t_curr]
-        h_4sub = df_4h[(df_4h.index + pd.Timedelta(hours=4)) <= t_curr]
+        # Original V129 HTF selection.
+        h_sub = df_1h[df_1h.index <= t_curr]
+        h_4sub = df_4h[df_4h.index <= t_curr]
 
         if len(h_sub) < 10:
             continue
@@ -418,14 +418,16 @@ def run_v123_engine(
         current_sl = sl
         be_active = False
 
-        outcome = "LOSS"
-        exit_price = sl
+        outcome = "OPEN"
+        exit_price = np.nan
         exit_index = None
 
-        # Original V123 scan window.
+        # V135 ONLY CHANGE:
+        # No artificial 35-candle timeout.
+        # Scan until SL/TP is actually hit or dataset ends.
         for j in range(
             i + 1,
-            min(i + 35, len(df_15)),
+            len(df_15),
         ):
             fut = df_15.iloc[j]
 
@@ -484,25 +486,28 @@ def run_v123_engine(
                     exit_index = j
                     break
 
-        # Preserve original V123 unresolved-trade behavior:
-        # if neither SL nor TP is hit in the scan window,
-        # outcome remains LOSS at SL.
+        # V135: if neither SL nor TP is hit before the dataset ends,
+        # keep the trade OPEN. It is not counted as WIN/LOSS/BE and
+        # contributes zero realized PnL.
 
         notional = TRADE_MARGIN * LEVERAGE
 
-        if side == "LONG":
-            price_ret = (
-                exit_price - entry_price
-            ) / entry_price
+        if outcome == "OPEN":
+            dollar_pnl = 0.0
         else:
-            price_ret = (
-                entry_price - exit_price
-            ) / entry_price
+            if side == "LONG":
+                price_ret = (
+                    exit_price - entry_price
+                ) / entry_price
+            else:
+                price_ret = (
+                    entry_price - exit_price
+                ) / entry_price
 
-        dollar_pnl = (
-            notional * price_ret
-            - notional * FEE_RATE * 2.0
-        )
+            dollar_pnl = (
+                notional * price_ret
+                - notional * FEE_RATE * 2.0
+            )
 
         trades.append(
             {
@@ -546,7 +551,7 @@ def main():
 
     print()
     print("AUDIT MODE: V123 behavior intentionally preserved.")
-    print("Data connection: V123")
+    print("TEST TYPE: V129 + ONLY NO-TIMEOUT CHANGE")
     print("Symbols: V123")
     print("HTF selection: V123")
     print("center=True: V123")
@@ -554,8 +559,8 @@ def main():
     print("Displacement: V123")
     print("Entry: V123")
     print("SL/TP/BE: V123")
-    print("35-candle scan: V123")
-    print("Unresolved trade behavior: V123")
+    print("Timeout: DISABLED (V135 ONLY CHANGE)")
+    print("Unresolved trade behavior: OPEN at dataset end")
     print("Overlap behavior: V123")
     print("=" * 80)
 
@@ -620,29 +625,40 @@ def main():
     )
 
     total_trades = len(trades_df)
+    open_trades = trades_df[
+        trades_df["Outcome"] == "OPEN"
+    ]
+    realized_df = trades_df[
+        trades_df["Outcome"] != "OPEN"
+    ]
 
-    wins = trades_df[
+    wins = realized_df[
         trades_df["Outcome"] == "WIN"
     ]
 
-    losses = trades_df[
-        trades_df["Outcome"] == "LOSS"
+    losses = realized_df[
+        realized_df["Outcome"] == "LOSS"
     ]
 
-    bes = trades_df[
-        trades_df["Outcome"] == "BE"
+    bes = realized_df[
+        realized_df["Outcome"] == "BE"
     ]
+
+    realized_trades = len(realized_df)
 
     win_rate = (
-        len(wins) / total_trades * 100.0
+        len(wins) / realized_trades * 100.0
+        if realized_trades else 0.0
     )
 
     loss_rate = (
-        len(losses) / total_trades * 100.0
+        len(losses) / realized_trades * 100.0
+        if realized_trades else 0.0
     )
 
     be_rate = (
-        len(bes) / total_trades * 100.0
+        len(bes) / realized_trades * 100.0
+        if realized_trades else 0.0
     )
 
     net_pnl = float(
@@ -733,16 +749,16 @@ def main():
 
     print()
     print("=" * 80)
-    print("===== HUNTER-V129 — V123 AUDIT RESULT =====")
+    print("===== HUNTER-V135 — NO-TIMEOUT RESULT =====")
     print("=" * 80)
 
     print(
         f"Total Trades:          {total_trades}"
     )
 
-    print(
-        f"Trades / Month:        {total_trades / 12.0:.1f}"
-    )
+    print(f"Trades / Month:        {total_trades / 12.0:.1f}")
+    print(f"Open at Dataset End:   {len(open_trades)}")
+    print(f"Realized Trades:       {realized_trades}")
 
     print(
         f"Win Rate:              {win_rate:.2f}%"
@@ -882,7 +898,7 @@ def main():
     # --------------------------------------------------------
 
     print("-" * 80)
-    print("ORIGINAL V123 TARGET FOR REPRODUCTION:")
+    print("V129 BASELINE REFERENCE:")
 
     print("  Trades:       1032")
     print("  Win Rate:     53.88%")
