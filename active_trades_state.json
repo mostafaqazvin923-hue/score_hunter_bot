@@ -1,21 +1,4 @@
 {
-    "active": {
-        "DOT": {
-            "symbol": "DOT/USDT",
-            "direction": "LONG",
-            "entry_price": 1.196,
-            "tp": 1.3034999999999999,
-            "sl": 1.14225,
-            "time": "2026-09-22 20:00:00"
-        },
-        "BTC": {
-            "symbol": "BTC/USDT",
-            "direction": "LONG",
-            "entry_price": 87165.88,
-            "tp": 90600.17500000002,
-            "sl": 85448.7325,
-            "time": "2026-09-23 04:00:00"
-        }
-    },
+    "active": {},
     "cooldown": {}
 }
