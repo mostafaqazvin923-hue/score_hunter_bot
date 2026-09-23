@@ -13,7 +13,7 @@ except ImportError:
   import ccxt
 
 # ============================================================
-# SCORE-HUNTER PRO — V13 OPTIMIZED STATISTICAL ENGINE
+# SCORE-HUNTER PRO — V14 STATISTICAL & INSTITUTIONAL FVG ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
@@ -92,7 +92,7 @@ def prepare_quantitative_indicators(df):
   rolling_std = df["Close"].rolling(window).std()
   df["Z_Score"] = (df["Close"] - rolling_mean) / rolling_std
 
-  # 2. فیلتر فشردگی نوسان پیشرفته با ATR
+  # 2. فیلتر فشردگی نوسان با ATR
   high_low = df["High"] - df["Low"]
   high_close = np.abs(df["High"] - df["Close"].shift())
   low_close = np.abs(df["Low"] - df["Close"].shift())
@@ -100,11 +100,17 @@ def prepare_quantitative_indicators(df):
   df["ATR"] = ranges.max(axis=1).rolling(14).mean()
   df["ATR_SMA"] = df["ATR"].rolling(20).mean()
 
-  # 3. تاییدیه مومنتوم بدنه کندل
+  # 3. شناسایی نواحی عدم تعادل (Fair Value Gaps - FVG) جهت تایید ورود نهادی
+  # Bullish FVG: کف کندل فعلی بالاتر از سقف کندل دو تا قبل است
+  df["Bullish_FVG"] = df["Low"] > df["High"].shift(2)
+  # Bearish FVG: سقف کندل فعلی پایین‌تر از کف کندل دو تا قبل است
+  df["Bearish_FVG"] = df["High"] < df["Low"].shift(2)
+
+  # 4. تاییدیه مومنتوم بدنه کندل
   df["Body"] = (df["Close"] - df["Open"]).abs()
   df["Avg_Body"] = df["Body"].rolling(20).mean()
 
-  # 4. روند کلان ۴ ساعته جهت فیلتر هم‌راستایی
+  # 5. روند کلان ۴ ساعته جهت هم‌راستایی ساختاری
   df_4h = df.resample("4h").agg({
       "Open": "first",
       "High": "max",
@@ -133,7 +139,7 @@ def run_backtest_engine(symbol, df):
     prev_candle = df.iloc[i - 1]
 
     if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-      i += 30  # استراحت طولانی‌تر پس از ۳ باخت متوالی جهت حفظ سرمایه
+      i += 30  # استراحت کنترلی جهت حفاظت از سرمایه
       consecutive_losses = 0
       continue
 
@@ -146,17 +152,19 @@ def run_backtest_engine(symbol, df):
       i += 1
       continue
 
-    # سخت‌گیرانه‌تر کردن آستانه Z-Score به 1.5 برای ورود در نقاط اشباع واقعی
+    # ترکیب Z-Score به همراه وجود ناحیه عدم تعادل (FVG) و مومنتوم ساختاری
     is_long_setup = (
         is_macro_bullish
         and prev_candle["Z_Score"] < -1.5
-        and prev_candle["Body"] > 1.3 * prev_candle["Avg_Body"]
+        and (prev_candle["Bullish_FVG"] or df.iloc[i - 2]["Bullish_FVG"])
+        and prev_candle["Body"] > 1.2 * prev_candle["Avg_Body"]
     )
 
     is_short_setup = (
         is_macro_bearish
         and prev_candle["Z_Score"] > 1.5
-        and prev_candle["Body"] > 1.3 * prev_candle["Avg_Body"]
+        and (prev_candle["Bearish_FVG"] or df.iloc[i - 2]["Bearish_FVG"])
+        and prev_candle["Body"] > 1.2 * prev_candle["Avg_Body"]
     )
 
     if not is_long_setup and not is_short_setup:
@@ -186,7 +194,7 @@ def run_backtest_engine(symbol, df):
     exit_price = sl
     exit_index = i + 1
 
-    # اسکن کندل‌ها با رعایت کامل قفل همپوشانی (Overlap Lock)
+    # اسکن کندل‌ها با قفل کامل همپوشانی (Overlap Lock)
     for j in range(i + 1, min(i + 60, len(df))):
       future_candle = df.iloc[j]
       h, l = future_candle["High"], future_candle["Low"]
@@ -247,8 +255,7 @@ def run_backtest_engine(symbol, df):
 def main():
   print("=" * 70)
   print(
-      "SCORE-HUNTER PRO — V13 OPTIMIZED STATISTICAL ENGINE SIMULATION IN"
-      " PROGRESS..."
+      "SCORE-HUNTER PRO — V14 STATISTICAL & FVG ENGINE SIMULATION IN PROGRESS..."
   )
   print("=" * 70)
 
@@ -291,7 +298,7 @@ def main():
   max_streak = max(loss_streaks) if loss_streaks else 0
 
   print("\n" + "=" * 70)
-  print("== SCORE-HUNTER PRO: V13 OPTIMIZED RESULTS (1 YEAR) ==")
+  print("== SCORE-HUNTER PRO: V14 FVG & STATISTICAL RESULTS (1 YEAR) ==")
   print("=" * 70)
   print(f"Total Trades:              {total_trades}")
   print(f"Win Rate:                  {win_rate:.2f}%")
