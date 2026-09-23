@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# تنظیمات اصلی LBank و CLE-1 (بهینه‌سازی شده برای فرکانس بالاتر)
+# تنظیمات اصلی LBank و سبد گسترده ارزها برای افزایش فرکانس
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -37,19 +37,30 @@ SYMBOLS = {
     "DOGE": "DOGE/USDT",
     "BNB": "BNB/USDT",
     "ADA": "ADA/USDT",
+    "NEAR": "NEAR/USDT",
+    "OP": "OP/USDT",
+    "HBAR": "HBAR/USDT",
+    "AVAX": "AVAX/USDT",
+    "SUI": "SUI/USDT",
+    "TIA": "TIA/USDT",
+    "FET": "FET/USDT",
+    "SEI": "SEI/USDT",
+    "ARB": "ARB/USDT",
+    "DOT": "DOT/USDT",
+    "ETC": "ETC/USDT",
+    "SHIB": "SHIB/USDT",
+    "STX": "STX/USDT",
+    "APT": "APT/USDT",
+    "LTC": "LTC/USDT",
+    "AR": "AR/USDT",
+    "IMX": "IMX/USDT",
+    "PEPE": "PEPE/USDT",
+    "BONK": "BONK/USDT",
 }
-
-REMOVED_COINS = {
-    "NEAR", "OP", "HYPE", "HBAR", "AVAX", "SUI", "PENDLE", "TIA",
-    "FET", "SEI", "ARB", "DOT", "ETC", "SHIB", "STX", "RUNE",
-    "MKR", "APT", "LTC", "AR", "IMX", "PEPE", "BONK",
-}
-
-SYMBOLS = {k: v for k, v in SYMBOLS.items() if k not in REMOVED_COINS}
 
 LOOKBACK_DAYS = 365
 TIMEFRAME = "4h"
-MAX_POSITIONS = 5
+MAX_POSITIONS = 8  # افزایش ظرفیت هم‌زمان پوزیشن‌ها با بزرگ شدن سبد
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 ATR_PERIOD = 14
@@ -61,7 +72,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - CLE-1 روی پلتفرم LBank")
+print("📥 دریافت داده‌ها - سبد گسترده LBank و موتور CLE-1")
 print("=" * 60)
 
 processed_data = {}
@@ -134,8 +145,8 @@ for symbol, lbank_symbol in SYMBOLS.items():
     if df4h is not None:
         processed_data[symbol] = df4h
 
-print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست CLE-1 با سیستم امتیازدهی بهینه‌شده...")
+print(f"✅ تعداد نمادهای معتبر بارگذاری شده: {len(processed_data)} از {len(SYMBOLS)}")
+print("⚙️ شروع اجرای بک‌تست با محدودیت جدید ۴ ضرر متوالی...")
 
 
 # ============================================================
@@ -203,11 +214,12 @@ def run_cle_lbank_backtest(processed_data):
                     "Net_PnL": net_pnl,
                 })
                 
+                # اعمال محدودیت جدید: توقف پس از ۴ ضرر متوالی
                 if not is_win:
                     consecutive_losses += 1
-                    if consecutive_losses >= 5:
+                    if consecutive_losses >= 4:
                         trading_paused = True
-                        pause_timer = 10
+                        pause_timer = 8
                 else:
                     consecutive_losses = 0
 
@@ -216,7 +228,6 @@ def run_cle_lbank_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # بررسی ورود جدید (افزایش فرکانس با کاهش حدنصاب امتیاز به 4)
         if len(active_positions) >= MAX_POSITIONS or equity < TRADE_MARGIN:
             continue
 
@@ -276,7 +287,6 @@ def run_cle_lbank_backtest(processed_data):
             if np.isfinite(vol_mean) and current_candle["Volume"] > (1.05 * vol_mean):
                 score += 2
 
-            # حد نصاب امتیاز کاهش یافته به 4 برای فرکانس بالاتر
             if score < 4:
                 continue
 
@@ -314,7 +324,7 @@ def run_cle_lbank_backtest(processed_data):
 
 def summarize_cle_result(trades_df, final_equity):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی CLE-1 روی داده‌های واقعی LBank")
+    print("📊 گزارش نهایی استراتژی CLE-1 روی سبد گسترده LBank")
     print("=" * 68)
 
     if trades_df.empty:
@@ -374,4 +384,4 @@ def summarize_cle_result(trades_df, final_equity):
 if __name__ == "__main__":
     df_trades, final_equity = run_cle_lbank_backtest(processed_data)
     summarize_cle_result(df_trades, final_equity)
-    print("\n✨ بک‌تست CLE-1 با موفقیت به پایان رسید.")
+    print("\n✨ بک‌تست سبد گسترده CLE-1 به پایان رسید.")
