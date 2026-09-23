@@ -1,26 +1,26 @@
-from dataclasses import dataclass
-from typing import Callable, Optional
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any
 import pandas as pd
 import numpy as np
 
 
 # ============================================================
-# 1. RISK MANAGER & CONFIG (مارجین ۱۰۰، اهرم ۵۰، ریوارد ۱ به ۲ ثابت)
+# 1. CONFIG & RISK ENGINE
 # ============================================================
 
 @dataclass
-class RiskConfig:
+class CLEConfig:
     risk_reward: float = 2.0
-    max_consecutive_losses: int = 5
-    min_trades_for_stats: int = 50
     trade_margin: float = 100.0
     leverage: float = 50.0
     fee_rate: float = 0.0007
+    min_confluence_score: int = 7  # امتیاز حداقلی برای ورود (قابل تنظیم با بهینه‌سازی)
+    max_consecutive_losses: int = 5
 
 
-class RiskManager:
-    def __init__(self, initial_equity: float, cfg: RiskConfig = None):
-        self.cfg = cfg or RiskConfig()
+class CLERiskManager:
+    def __init__(self, initial_equity: float, config: CLEConfig = None):
+        self.cfg = config or CLEConfig()
         self.equity = initial_equity
         self.initial_equity = initial_equity
         self.open_trade = None
@@ -34,9 +34,10 @@ class RiskManager:
             return False
         return True
 
-    def position_size(self, entry_price: float) -> float:
-        position_notional = self.cfg.trade_margin * self.cfg.leverage
-        return position_notional / entry_price
+    def position_size(self, entry_price: float, stop_price: float) -> float:
+        # حجم بر اساس مارجین ۱۰۰ و اهرم ۵۰
+        notional_value = self.cfg.trade_margin * self.cfg.leverage
+        return notional_value / entry_price
 
     def register_result(self, pnl_amount: float, is_win: bool):
         notional = self.cfg.trade_margin * self.cfg.leverage
@@ -53,208 +54,222 @@ class RiskManager:
             self.consecutive_losses += 1
             if self.consecutive_losses >= self.cfg.max_consecutive_losses:
                 self.trading_paused = True
-                self.pause_timer = 8
+                self.pause_timer = 10
         else:
             self.consecutive_losses = 0
 
-    def tick_pause_timer(self):
+    def tick_pause(self):
         if self.trading_paused:
             self.pause_timer -= 1
             if self.pause_timer <= 0:
                 self.trading_paused = False
                 self.consecutive_losses = 0
 
-    def stats(self):
-        total_trades = len(self.trade_history)
-        if total_trades == 0:
-            return {"trades": 0, "win_rate": 0.0, "valid": False}
-        
-        wins = [t for t in self.trade_history if t["win"]]
-        win_rate = (len(wins) / total_trades) * 100.0
-        
-        valid = total_trades >= self.cfg.min_trades_for_stats
+    def get_stats(self) -> Dict[str, Any]:
+        total = len(self.trade_history)
+        if total == 0:
+            return {"trades": 0, "win_rate": 0.0, "equity": self.equity}
+        wins = sum(1 for t in self.trade_history if t["win"])
         return {
-            "trades": total_trades,
-            "win_rate": round(win_rate, 2),
-            "valid": valid
+            "trades": total,
+            "win_rate": round((wins / total) * 100, 2),
+            "equity": round(self.equity, 2)
         }
 
 
 # ============================================================
-# 2. STRATEGY CORE
+# 2. CAUSAL MARKET STRUCTURE & REGIME DETECTOR (بدون Lookahead)
+# ============================================================
+
+class MarketContextAnalyzer:
+    @staticmethod
+    def get_market_regime(df_4h: pd.DataFrame, current_idx: int) -> str:
+        """تشخیص رژیم بازار در تایم‌فریم 4 ساعته به‌صورت کاملاً علّی (Causal)"""
+        if current_idx < 50:
+            return "Neutral"
+        
+        subset = df_4h.iloc[:current_idx + 1]
+        close = subset["close"].iloc[-1]
+        
+        # محاسبه EMA 50
+        ema_50 = subset["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+        
+        # تشخیص ساختار ساده (مقایسه سقف و کف‌های اخیر بدون نگاه به آینده)
+        recent_highs = subset["high"].rolling(10).max().iloc[-1]
+        recent_lows = subset["low"].rolling(10).min().iloc[-1]
+        
+        if close > ema_50 and close >= recent_highs * 0.99:
+            return "Bull"
+        elif close < ema_50 and close <= recent_lows * 1.01:
+            return "Bear"
+        
+        return "Neutral"
+
+
+# ============================================================
+# 3. CLE-1 SIGNAL GENERATOR (سیستم امتیازدهی Confluence Score)
 # ============================================================
 
 @dataclass
-class Trade:
+class TradeOrder:
     direction: str
-    entry_time: object
     entry_price: float
     stop_price: float
     target_price: float
     size: float
+    score: int
 
 
-class StrategyCore:
-    def __init__(self, risk_manager: RiskManager, signal_fn: Callable):
+class CLEStrategyCore:
+    def __init__(self, risk_manager: CLERiskManager, config: CLEConfig = None):
         self.rm = risk_manager
-        self.signal_fn = signal_fn
-        self._pending_entry = None
+        self.cfg = config or CLEConfig()
 
-    def on_new_closed_candle(self, index: int, candle: dict, history_up_to_here) -> Optional[dict]:
-        event = None
-
-        if self.rm.open_trade is not None:
-            event = self._check_exit(candle)
-        elif self._pending_entry is not None:
-            event = self._execute_entry(candle)
-
-        if self.rm.can_open_new_trade() and self._pending_entry is None and self.rm.open_trade is None:
-            sig = self.signal_fn(history_up_to_here)
-            if sig is not None:
-                self._pending_entry = sig
-
-        self.rm.tick_pause_timer()
-        return event
-
-    def _execute_entry(self, candle: dict) -> dict:
-        sig = self._pending_entry
-        self._pending_entry = None
-        entry_price = candle["open"]
-        stop_price = sig["stop_price"]
-        
-        if sig["direction"] == "long":
-            target_price = entry_price + (self.rm.cfg.risk_reward * abs(entry_price - stop_price))
-        else:
-            target_price = entry_price - (self.rm.cfg.risk_reward * abs(entry_price - stop_price))
-
-        size = self.rm.position_size(entry_price)
-        self.rm.open_trade = Trade(
-            direction=sig["direction"],
-            entry_time=candle.get("time"),
-            entry_price=entry_price,
-            stop_price=stop_price,
-            target_price=target_price,
-            size=size
-        )
-        return {"type": "entry", "trade": self.rm.open_trade}
-
-    def _check_exit(self, candle: dict) -> Optional[dict]:
-        t = self.rm.open_trade
-        hit_stop = False
-        hit_target = False
-
-        if t.direction == "long":
-            hit_stop = candle["low"] <= t.stop_price
-            hit_target = candle["high"] >= t.target_price
-        else:
-            hit_stop = candle["high"] >= t.stop_price
-            hit_target = candle["low"] <= t.target_price
-
-        if not hit_stop and not hit_target:
+    def evaluate_signal(self, df_15m: pd.DataFrame, df_4h: pd.DataFrame, idx_15m: int) -> Optional[Dict[str, Any]]:
+        if idx_15m < 30:
             return None
 
-        if hit_stop:
-            pnl_amount = -t.size * abs(t.entry_price - t.stop_price)
-            is_win = False
+        subset = df_15m.iloc[:idx_15m + 1]
+        current_candle = subset.iloc[-1]
+        prev_candle = subset.iloc[-2]
+        
+        # معادل‌سازی زمان 4 ساعته برای رژیم
+        regime = MarketContextAnalyzer.get_market_regime(df_4h, max(0, idx_15m // 16)) # فرض تقریب نسبت تایم‌فریم‌ها
+        if regime == "Neutral":
+            return None
+
+        score = 0
+        direction = "long" if regime == "Bull" else "short"
+
+        # 1. رژیم بازار (+2 امتیاز)
+        score += 2
+
+        # 2. تشخیص نقدینگی و Sweep (بررسی نفوذ به کف یا سقف قبلی و بازگشت)
+        lookback_liq = 15
+        recent_high = subset["high"].iloc[-lookback_liq:-1].max()
+        recent_low = subset["low"].iloc[-lookback_liq:-1].min()
+
+        liquidity_swept = False
+        if direction == "long" and current_candle["low"] < recent_low and current_candle["close"] > recent_low:
+            liquidity_swept = True
+            score += 2
+        elif direction == "short" and current_candle["high"] > recent_high and current_candle["close"] < recent_high:
+            liquidity_swept = True
+            score += 2
+
+        # 3. شتاب و Displacement (قدرت کندل فعلی نسبت به ATR)
+        high_low = subset["high"] - subset["low"]
+        atr = high_low.rolling(14).mean().iloc[-1]
+        candle_range = current_candle["high"] - current_candle["low"]
+
+        is_displacement = candle_range > (1.2 * atr)
+        if is_displacement:
+            score += 2
+
+        # 4. حجم یا پروکسی حجم (+1 امتیاز)
+        if "volume" in subset.columns:
+            vol_mean = subset["volume"].rolling(14).mean().iloc[-1]
+            if current_candle["volume"] > (1.2 * vol_mean):
+                score += 1
+
+        # بررسی حد نصاب امتیاز Confluence Score
+        if score < self.cfg.min_confluence_score:
+            return None
+
+        # تعیین حد ضرر و حد سود با رعایت دقیق ریوارد ۱:۲
+        entry_price = current_candle["close"]
+        if direction == "long":
+            stop_price = recent_low - (atr * 0.5)  # پشت نقدینگی + بافر ATR
+            risk_dist = entry_price - stop_price
+            if risk_dist <= 0: return None
+            target_price = entry_price + (risk_dist * self.cfg.risk_reward)
         else:
-            pnl_amount = t.size * abs(t.target_price - t.entry_price)
-            is_win = True
+            stop_price = recent_high + (atr * 0.5)
+            risk_dist = stop_price - entry_price
+            if risk_dist <= 0: return None
+            target_price = entry_price - (risk_dist * self.cfg.risk_reward)
 
-        self.rm.register_result(pnl_amount, is_win)
-        self.rm.open_trade = None
-        return {"type": "exit", "result": "win" if is_win else "loss"}
+        size = self.rm.position_size(entry_price, stop_price)
 
-
-# ============================================================
-# 3. STATISTICAL Z-SCORE MEAN REVERSION SIGNAL
-# ============================================================
-
-def z_score_mean_reversion_signal(history_list):
-    if len(history_list) < 30:
-        return None
-
-    df = pd.DataFrame(history_list)
-    
-    # محاسبه میانگین متحرک و انحراف معیار برای Z-Score
-    window = 20
-    df["SMA"] = df["close"].rolling(window).mean()
-    df["STD"] = df["close"].rolling(window).std()
-    
-    # محاسبه Z-Score لحظه‌ای
-    df["Z_Score"] = (df["close"] - df["SMA"]) / (df["STD"] + 1e-10)
-
-    # محاسبه ATR برای حد ضرر پویا
-    high_low = df["High"] - df["Low"] if "High" in df else df["high"] - df["low"]
-    df["ATR"] = high_low.rolling(14).mean()
-
-    last_z = df["Z_Score"].iloc[-1]
-    last_close = df["close"].iloc[-1]
-    current_atr = df["ATR"].iloc[-1]
-
-    if not np.isfinite(last_z) or not np.isfinite(current_atr) or current_atr <= 0:
-        return None
-
-    # آستانه آماری برای ورود با فرکانس بالا و دقت بالا
-    threshold = 1.5
-
-    # اگر قیمت بیش از حد پایین آمده باشد (اشباع فروش -> لانگ)
-    if last_z < -threshold:
-        stop_price = last_close - (current_atr * 1.0)
-        return {"direction": "long", "stop_price": stop_price}
-    
-    # اگر قیمت بیش از حد بالا رفته باشد (اشباع خرید -> شورت)
-    elif last_z > threshold:
-        stop_price = last_close + (current_atr * 1.0)
-        return {"direction": "short", "stop_price": stop_price}
-
-    return None
+        return {
+            "direction": direction,
+            "entry_price": entry_price,
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "size": size,
+            "score": score
+        }
 
 
 # ============================================================
-# 4. BACKTEST RUNNER
+# 4. BACKTEST RUNNER (اجرای ارزیابی ساختاری)
 # ============================================================
 
-def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskConfig = None):
-    risk_cfg = risk_cfg or RiskConfig()
-    rm = RiskManager(initial_equity, risk_cfg)
-    engine = StrategyCore(rm, signal_fn)
+def run_cle_backtest(df_15m: pd.DataFrame, df_4h: pd.DataFrame, initial_equity: float = 1000.0):
+    cfg = CLEConfig()
+    rm = CLERiskManager(initial_equity, cfg)
+    strategy = CLEStrategyCore(rm, cfg)
 
-    records = df.to_dict("records")
-    log = []
+    open_trade = None
 
-    for i, candle in enumerate(records):
-        history = records[: i + 1]
-        event = engine.on_new_closed_candle(i, candle, history)
-        if rm.equity <= 0:
-            break
-        if event:
-            log.append({"index": i, "time": candle.get("time"), **event})
+    for i in range(30, len(df_15m)):
+        candle = df_15m.iloc[i]
+        
+        # مدیریت پوزیشن باز
+        if open_trade is not None:
+            hit_stop = False
+            hit_target = False
 
-    stats = rm.stats()
+            if open_trade["direction"] == "long":
+                hit_stop = candle["low"] <= open_trade["stop_price"]
+                hit_target = candle["high"] >= open_trade["target_price"]
+            else:
+                hit_stop = candle["high"] >= open_trade["stop_price"]
+                hit_target = candle["low"] <= open_trade["target_price"]
+
+            if hit_stop or hit_target:
+                is_win = hit_target
+                pnl = (open_trade["target_price"] - open_trade["entry_price"]) * open_trade["size"] if is_win else \
+                      (open_trade["stop_price"] - open_trade["entry_price"]) * open_trade["size"]
+                pnl = abs(pnl) if is_win else -abs(pnl)
+                
+                rm.register_result(pnl, is_win)
+                open_trade = None
+
+        # بررسی ورود جدید
+        elif rm.can_open_new_trade():
+            signal = strategy.evaluate_signal(df_15m, df_4h, i)
+            if signal is not None:
+                open_trade = signal
+
+        rm.tick_pause()
+
+    stats = rm.get_stats()
     print("=" * 60)
-    print("== Z-SCORE STATISTICAL BACKTEST RESULTS (RR 1:2) ==")
+    print("== CLE-1 BACKTEST RESULTS (CAUSAL ENGINE) ==")
     print("=" * 60)
     print(f"تعداد معاملات کل:           {stats['trades']}")
     print(f"وین‌ریت (Win Rate):          {stats['win_rate']}%")
-    print(f"سرمایه‌ی نهایی (USD):        ${round(rm.equity, 2)}")
-    print(f"اعتبار آماری:               {'تایید شد' if stats['valid'] else 'نیاز به داده بیشتر'}")
-    if rm.equity <= 0:
-        print(f"⚠️ حساب لیکویید / صفر شد")
+    print(f"سرمایه‌ی نهایی (USD):        ${stats['equity']}")
     print("=" * 60)
-
-    return {"log": log, "stats": stats, "final_equity": rm.equity, "risk_manager": rm}
+    return stats
 
 
 if __name__ == "__main__":
+    # تست اولیه با دیتای مصنوعی استاندارد
     np.random.seed(42)
-    n = 3500
-    price = 100 + np.cumsum(np.random.randn(n) * 0.35)
-    test_df = pd.DataFrame({
-        "time": range(n),
+    n = 2000
+    price = 100 + np.cumsum(np.random.randn(n) * 0.25)
+    
+    df_15 = pd.DataFrame({
         "open": price,
-        "high": price + np.random.rand(n) * 0.7,
-        "low": price - np.random.rand(n) * 0.7,
-        "close": price + np.random.randn(n) * 0.18,
+        "high": price + np.random.rand(n) * 0.5,
+        "low": price - np.random.rand(n) * 0.5,
+        "close": price + np.random.randn(n) * 0.1,
+        "volume": np.random.randint(500, 2000, n)
     })
+    
+    # شبیه‌سازی 4 ساعته با ریتم کندتر
+    df_4 = df_15.iloc[::16].copy()
 
-    run_backtest(test_df, z_score_mean_reversion_signal)
+    run_cle_backtest(df_15, df_4)
