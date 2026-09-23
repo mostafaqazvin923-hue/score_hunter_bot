@@ -13,7 +13,7 @@ except ImportError:
   import ccxt
 
 # ============================================================
-# SCORE-HUNTER PRO — V14 STATISTICAL & INSTITUTIONAL FVG ENGINE
+# SCORE-HUNTER PRO — V15 DONCHIAN BREAKOUT & MOMENTUM ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
@@ -83,34 +83,25 @@ def fetch_lbank_data(lbank_symbol, start_dt, end_dt):
   return df[(df.index >= start_dt) & (df.index <= end_dt)]
 
 
-def prepare_quantitative_indicators(df):
+def prepare_breakout_indicators(df):
   df = df.copy()
 
-  # 1. محاسبه Z-Score آماری پیشرفته (پنجره ۵۰ دوره‌ای)
-  window = 50
-  rolling_mean = df["Close"].rolling(window).mean()
-  rolling_std = df["Close"].rolling(window).std()
-  df["Z_Score"] = (df["Close"] - rolling_mean) / rolling_std
+  # 1. کانال دانچیان (Donchian Channel) برای تشخیص شکست سقف و کف ۲۰ دوره‌ای
+  period = 20
+  df["Donchian_High"] = df["High"].rolling(period).max()
+  df["Donchian_Low"] = df["Low"].rolling(period).min()
 
-  # 2. فیلتر فشردگی نوسان با ATR
+  # 2. میانگین محدوده واقعی (ATR) برای تعیین حدود حد سود و ضرر
   high_low = df["High"] - df["Low"]
   high_close = np.abs(df["High"] - df["Close"].shift())
   low_close = np.abs(df["Low"] - df["Close"].shift())
   ranges = pd.concat([high_low, high_close, low_close], axis=1)
   df["ATR"] = ranges.max(axis=1).rolling(14).mean()
-  df["ATR_SMA"] = df["ATR"].rolling(20).mean()
 
-  # 3. شناسایی نواحی عدم تعادل (Fair Value Gaps - FVG) جهت تایید ورود نهادی
-  # Bullish FVG: کف کندل فعلی بالاتر از سقف کندل دو تا قبل است
-  df["Bullish_FVG"] = df["Low"] > df["High"].shift(2)
-  # Bearish FVG: سقف کندل فعلی پایین‌تر از کف کندل دو تا قبل است
-  df["Bearish_FVG"] = df["High"] < df["Low"].shift(2)
+  # 3. تاییدیه حجم معاملات نسبت به میانگین ۲۰ دوره
+  df["Volume_SMA"] = df["Volume"].rolling(20).mean()
 
-  # 4. تاییدیه مومنتوم بدنه کندل
-  df["Body"] = (df["Close"] - df["Open"]).abs()
-  df["Avg_Body"] = df["Body"].rolling(20).mean()
-
-  # 5. روند کلان ۴ ساعته جهت هم‌راستایی ساختاری
+  # 4. روند کلان ۴ ساعته جهت فیلتر جهت کلی بازار
   df_4h = df.resample("4h").agg({
       "Open": "first",
       "High": "max",
@@ -133,45 +124,37 @@ def run_backtest_engine(symbol, df):
   position_size = TRADE_MARGIN * LEVERAGE
   consecutive_losses = 0
 
-  i = 60
+  i = 30
   while i < len(df):
     current_candle = df.iloc[i]
     prev_candle = df.iloc[i - 1]
 
     if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-      i += 30  # استراحت کنترلی جهت حفاظت از سرمایه
+      i += 20  # استراحت کنترلی جهت جلوگیری از دراوداون‌های متوالی
       consecutive_losses = 0
       continue
 
     is_macro_bullish = prev_candle["Macro_Close"] > prev_candle["Macro_EMA"]
     is_macro_bearish = prev_candle["Macro_Close"] < prev_candle["Macro_EMA"]
 
-    is_volatility_expanded = prev_candle["ATR"] > prev_candle["ATR_SMA"]
-
-    if not is_volatility_expanded:
-      i += 1
-      continue
-
-    # ترکیب Z-Score به همراه وجود ناحیه عدم تعادل (FVG) و مومنتوم ساختاری
-    is_long_setup = (
+    # شرایط ورود بر اساس شکست سقف/کف کانال ۲۰ دوره‌ای + تاییدیه حجم
+    is_breakout_long = (
         is_macro_bullish
-        and prev_candle["Z_Score"] < -1.5
-        and (prev_candle["Bullish_FVG"] or df.iloc[i - 2]["Bullish_FVG"])
-        and prev_candle["Body"] > 1.2 * prev_candle["Avg_Body"]
+        and prev_candle["Close"] >= prev_candle["Donchian_High"]
+        and prev_candle["Volume"] > 1.2 * prev_candle["Volume_SMA"]
     )
 
-    is_short_setup = (
+    is_breakout_short = (
         is_macro_bearish
-        and prev_candle["Z_Score"] > 1.5
-        and (prev_candle["Bearish_FVG"] or df.iloc[i - 2]["Bearish_FVG"])
-        and prev_candle["Body"] > 1.2 * prev_candle["Avg_Body"]
+        and prev_candle["Close"] <= prev_candle["Donchian_Low"]
+        and prev_candle["Volume"] > 1.2 * prev_candle["Volume_SMA"]
     )
 
-    if not is_long_setup and not is_short_setup:
+    if not is_breakout_long and not is_breakout_short:
       i += 1
       continue
 
-    side = "LONG" if is_long_setup else "SHORT"
+    side = "LONG" if is_breakout_long else "SHORT"
     entry_price = (
         current_candle["Open"] * (1.0 + SLIPPAGE)
         if side == "LONG"
@@ -255,7 +238,8 @@ def run_backtest_engine(symbol, df):
 def main():
   print("=" * 70)
   print(
-      "SCORE-HUNTER PRO — V14 STATISTICAL & FVG ENGINE SIMULATION IN PROGRESS..."
+      "SCORE-HUNTER PRO — V15 DONCHIAN BREAKOUT ENGINE SIMULATION IN"
+      " PROGRESS..."
   )
   print("=" * 70)
 
@@ -267,10 +251,10 @@ def main():
   for symbol, lbank_symbol in SYMBOLS.items():
     print(f"Fetching & Backtesting {symbol} ({lbank_symbol})...")
     df = fetch_lbank_data(lbank_symbol, start_dt, end_dt)
-    if df is None or len(df) < 100:
+    if df is None or len(df) < 50:
       continue
 
-    df_prepared = prepare_quantitative_indicators(df)
+    df_prepared = prepare_breakout_indicators(df)
     trades = run_backtest_engine(symbol, df_prepared)
     all_trades.extend(trades)
 
@@ -298,7 +282,7 @@ def main():
   max_streak = max(loss_streaks) if loss_streaks else 0
 
   print("\n" + "=" * 70)
-  print("== SCORE-HUNTER PRO: V14 FVG & STATISTICAL RESULTS (1 YEAR) ==")
+  print("== SCORE-HUNTER PRO: V15 BREAKOUT RESULTS (1 YEAR) ==")
   print("=" * 70)
   print(f"Total Trades:              {total_trades}")
   print(f"Win Rate:                  {win_rate:.2f}%")
