@@ -13,7 +13,7 @@ except ImportError:
   import ccxt
 
 # ============================================================
-# SCORE-HUNTER PRO — V10 MULTI-TIMEFRAME ENGINE
+# SCORE-HUNTER PRO — V99 STABLE CORE & OVERLAP LOCK
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
@@ -83,13 +83,10 @@ def fetch_lbank_data(lbank_symbol, start_dt, end_dt):
   return df[(df.index >= start_dt) & (df.index <= end_dt)]
 
 
-def prepare_multi_timeframe_indicators(df):
+def prepare_indicators(df):
   df = df.copy()
-
-  # 1. اندیکاتورهای تایم‌فریم اجرایی (15m)
   df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
-  df["Body"] = (df["Close"] - df["Open"]).abs()
-  df["Avg_Body"] = df["Body"].rolling(20).mean()
+  df["EMA_200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
   high_low = df["High"] - df["Low"]
   high_close = np.abs(df["High"] - df["Close"].shift())
@@ -97,20 +94,8 @@ def prepare_multi_timeframe_indicators(df):
   ranges = pd.concat([high_low, high_close, low_close], axis=1)
   df["ATR"] = ranges.max(axis=1).rolling(14).mean()
 
-  # 2. ساخت تایم‌فریم کلان (1h) از طریق Resample برای روند کلی
-  df_1h = df.resample("1h").agg({
-      "Open": "first",
-      "High": "max",
-      "Low": "min",
-      "Close": "last",
-      "Volume": "sum",
-  })
-  df_1h["EMA_Macro"] = df_1h["Close"].ewm(span=50, adjust=False).mean()
-
-  # الحاق روند کلان 1 ساعته به دیفریم اصلی 15 دقیقه‌ای (Forward Fill برای جلوگیری از Look-ahead)
-  df["EMA_Macro"] = df_1h["EMA_Macro"].reindex(df.index, method="ffill")
-  df["Close_Macro"] = df_1h["Close"].reindex(df.index, method="ffill")
-
+  df["Body"] = (df["Close"] - df["Open"]).abs()
+  df["Avg_Body"] = df["Body"].rolling(20).mean()
   return df
 
 
@@ -126,31 +111,28 @@ def run_backtest_engine(symbol, df):
     prev_candle = df.iloc[i - 1]
 
     if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-      i += 30  # استراحت کنترل‌شده پس از باخت‌های متوالی
+      i += 20
       consecutive_losses = 0
       continue
 
-    # فیلتر روند کلان (Multi-Timeframe Alignment)
-    is_macro_bullish = prev_candle["Close_Macro"] > prev_candle["EMA_Macro"]
-    is_macro_bearish = prev_candle["Close_Macro"] < prev_candle["EMA_Macro"]
-
-    # تریگر اجرایی در 15م
-    is_bullish_trigger = (
-        is_macro_bullish
-        and prev_candle["Close"] > prev_candle["EMA_50"]
-        and prev_candle["Body"] > 1.2 * prev_candle["Avg_Body"]
+    is_bullish_trend = (
+        prev_candle["Close"] > prev_candle["EMA_200"]
+        and prev_candle["EMA_50"] > prev_candle["EMA_200"]
     )
-    is_bearish_trigger = (
-        is_macro_bearish
-        and prev_candle["Close"] < prev_candle["EMA_50"]
-        and prev_candle["Body"] > 1.2 * prev_candle["Avg_Body"]
+    is_bearish_trend = (
+        prev_candle["Close"] < prev_candle["EMA_200"]
+        and prev_candle["EMA_50"] < prev_candle["EMA_200"]
     )
 
-    if not is_bullish_trigger and not is_bearish_trigger:
+    strong_momentum = (
+        prev_candle["Body"] > 1.2 * prev_candle["Avg_Body"]
+    ) if "Avg_Body" in prev_candle else True
+
+    if not (is_bullish_trend or is_bearish_trend) or not strong_momentum:
       i += 1
       continue
 
-    side = "LONG" if is_bullish_trigger else "SHORT"
+    side = "LONG" if is_bullish_trend else "SHORT"
     entry_price = (
         current_candle["Open"] * (1.0 + SLIPPAGE)
         if side == "LONG"
@@ -173,7 +155,7 @@ def run_backtest_engine(symbol, df):
     exit_price = sl
     exit_index = i + 1
 
-    # اسکن کندل‌ها تا تعیین تکلیف قطعی معامله (قفل همپوشانی)
+    # اسکن کندل‌ها با رعایت کامل قفل همپوشانی
     for j in range(i + 1, min(i + 100, len(df))):
       future_candle = df.iloc[j]
       h, l = future_candle["High"], future_candle["Low"]
@@ -226,7 +208,7 @@ def run_backtest_engine(symbol, df):
         "Capital": capital,
     })
 
-    # پرش به بعد از اتمام معامله (حفظ قانون عدم همپوشانی)
+    # جهش دقیق به بعد از اتمام پوزیشن فعال
     i = exit_index + 1
 
   return trades
@@ -235,7 +217,7 @@ def run_backtest_engine(symbol, df):
 def main():
   print("=" * 70)
   print(
-      "SCORE-HUNTER PRO — V10 MULTI-TIMEFRAME ENGINE SIMULATION IN PROGRESS..."
+      "SCORE-HUNTER PRO — V99 STABLE CORE ENGINE SIMULATION IN PROGRESS..."
   )
   print("=" * 70)
 
@@ -250,7 +232,7 @@ def main():
     if df is None or len(df) < 200:
       continue
 
-    df_prepared = prepare_multi_timeframe_indicators(df)
+    df_prepared = prepare_indicators(df)
     trades = run_backtest_engine(symbol, df_prepared)
     all_trades.extend(trades)
 
@@ -278,7 +260,7 @@ def main():
   max_streak = max(loss_streaks) if loss_streaks else 0
 
   print("\n" + "=" * 70)
-  print("== SCORE-HUNTER PRO: V10 MULTI-TIMEFRAME RESULTS (1 YEAR) ==")
+  print("== SCORE-HUNTER PRO: V99 STABLE RESULTS (1 YEAR) ==")
   print("=" * 70)
   print(f"Total Trades:              {total_trades}")
   print(f"Win Rate:                  {win_rate:.2f}%")
