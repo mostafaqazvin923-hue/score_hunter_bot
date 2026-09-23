@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# تنظیمات اصلی LBank و سبد گسترده ارزها برای افزایش فرکانس
+# تنظیمات اصلی LBank - سیستم چندتایم‌فریمی (4h Trend + 1h Execution)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -59,8 +59,7 @@ SYMBOLS = {
 }
 
 LOOKBACK_DAYS = 365
-TIMEFRAME = "4h"
-MAX_POSITIONS = 8  # افزایش ظرفیت هم‌زمان پوزیشن‌ها با بزرگ شدن سبد
+MAX_POSITIONS = 8
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 ATR_PERIOD = 14
@@ -72,12 +71,13 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها - سبد گسترده LBank و موتور CLE-1")
+print("📥 دریافت داده‌های چندتایم‌فریمی (1h و 4h) از صرافی LBank")
 print("=" * 60)
 
-processed_data = {}
+processed_data_1h = {}
+processed_data_4h = {}
 
-def fetch_symbol_data(lbank_symbol):
+def fetch_data(lbank_symbol, timeframe):
     all_ohlcv = []
     current_since = since_timestamp
     last_seen = None
@@ -88,7 +88,7 @@ def fetch_symbol_data(lbank_symbol):
             try:
                 batch = exchange.fetch_ohlcv(
                     lbank_symbol,
-                    timeframe=TIMEFRAME,
+                    timeframe=timeframe,
                     since=current_since,
                     limit=1000,
                 )
@@ -141,21 +141,24 @@ def fetch_symbol_data(lbank_symbol):
     return df
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    df4h = fetch_symbol_data(lbank_symbol)
-    if df4h is not None:
-        processed_data[symbol] = df4h
+    df1h = fetch_data(lbank_symbol, "1h")
+    df4h = fetch_data(lbank_symbol, "4h")
+    
+    if df1h is not None and df4h is not None:
+        processed_data_1h[symbol] = df1h
+        processed_data_4h[symbol] = df4h
 
-print(f"✅ تعداد نمادهای معتبر بارگذاری شده: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست با محدودیت جدید ۴ ضرر متوالی...")
+print(f"✅ تعداد نمادهای بارگذاری شده: {len(processed_data_1h)} نماد")
+print("⚙️ شروع اجرای بک‌تست Multi-Timeframe (روند 4h + ورود 1h)...")
 
 
 # ============================================================
-# موتور منطقی و اجرایی CLE-1
+# موتور معاملاتی چندتایم‌فریمی
 # ============================================================
 
-def run_cle_lbank_backtest(processed_data):
+def run_multi_timeframe_backtest(data_1h, data_4h):
     all_timestamps = sorted({
-        ts for df in processed_data.values() for ts in df.index
+        ts for df in data_1h.values() for ts in df.index
     })
     
     active_positions = {}
@@ -175,22 +178,22 @@ def run_cle_lbank_backtest(processed_data):
 
         symbols_to_close = []
         
-        # مدیریت پوزیشن‌های باز
+        # 1. مدیریت پوزیشن‌های باز روی تایم‌فریم 1 ساعته
         for symbol, pos in list(active_positions.items()):
-            df = processed_data[symbol]
-            if ts not in df.index:
+            df1 = data_1h[symbol]
+            if ts not in df1.index:
                 continue
             
-            c4h = df.loc[ts]
+            c1h = df1.loc[ts]
             hit_stop = False
             hit_target = False
 
             if pos["side"] == "LONG":
-                hit_stop = c4h["Low"] <= pos["stop_price"]
-                hit_target = c4h["High"] >= pos["target_price"]
+                hit_stop = c1h["Low"] <= pos["stop_price"]
+                hit_target = c1h["High"] >= pos["target_price"]
             else:
-                hit_stop = c4h["High"] >= pos["stop_price"]
-                hit_target = c4h["Low"] <= pos["target_price"]
+                hit_stop = c1h["High"] >= pos["stop_price"]
+                hit_target = c1h["Low"] <= pos["target_price"]
 
             if hit_stop or hit_target:
                 is_win = hit_target
@@ -214,12 +217,11 @@ def run_cle_lbank_backtest(processed_data):
                     "Net_PnL": net_pnl,
                 })
                 
-                # اعمال محدودیت جدید: توقف پس از ۴ ضرر متوالی
                 if not is_win:
                     consecutive_losses += 1
                     if consecutive_losses >= 4:
                         trading_paused = True
-                        pause_timer = 8
+                        pause_timer = 12 # مکث طولانی‌تر در تایم 1h
                 else:
                     consecutive_losses = 0
 
@@ -231,30 +233,33 @@ def run_cle_lbank_backtest(processed_data):
         if len(active_positions) >= MAX_POSITIONS or equity < TRADE_MARGIN:
             continue
 
-        for symbol, df in processed_data.items():
-            if symbol in active_positions or ts not in df.index:
+        # 2. بررسی سیگنال ورود روی هر نماد
+        for symbol, df1 in data_1h.items():
+            if symbol in active_positions or ts not in df1.index:
                 continue
 
-            i = df.index.get_loc(ts)
-            if i < 30:
+            i1 = df1.index.get_loc(ts)
+            if i1 < 30:
                 continue
 
-            subset = df.iloc[:i + 1]
-            current_candle = subset.iloc[-1]
-            close = current_candle["Close"]
-            ema_50 = current_candle["EMA50"]
-            atr = current_candle["ATR"]
-
-            if not np.isfinite(atr) or atr <= 0:
+            subset_1h = df1.iloc[:i1 + 1]
+            c1h = subset_1h.iloc[-1]
+            
+            # --- دریافت رژیم روند از تایم‌فریم 4 ساعته بدون نگاه به آینده ---
+            df4 = data_4h[symbol]
+            # پیدا کردن آخرین کندل 4 ساعته که قبل از زمان ts بسته شده است
+            past_4h = df4[df4.index <= ts]
+            if len(past_4h) < 30:
                 continue
-
-            recent_highs = subset["High"].rolling(10).max().iloc[-1]
-            recent_lows = subset["Low"].rolling(10).min().iloc[-1]
+            
+            c4h = past_4h.iloc[-1]
+            recent_highs_4h = past_4h["High"].rolling(10).max().iloc[-1]
+            recent_lows_4h = past_4h["Low"].rolling(10).min().iloc[-1]
 
             regime = "Neutral"
-            if close > ema_50 and close >= recent_highs * 0.99:
+            if c4h["Close"] > c4h["EMA50"] and c4h["Close"] >= recent_highs_4h * 0.99:
                 regime = "Bull"
-            elif close < ema_50 and close <= recent_lows * 1.01:
+            elif c4h["Close"] < c4h["EMA50"] and c4h["Close"] <= recent_lows_4h * 1.01:
                 regime = "Bear"
 
             if regime == "Neutral":
@@ -263,45 +268,49 @@ def run_cle_lbank_backtest(processed_data):
             score = 0
             direction = "LONG" if regime == "Bull" else "SHORT"
 
-            # 1. رژیم بازار -> 3 امتیاز
+            # 1. رژیم روند کلان 4h -> 3 امتیاز
             score += 3
 
-            # 2. نقدینگی و Sweep -> 3 امتیاز
-            lookback_liq = 15
-            if len(subset) > lookback_liq:
-                recent_high = subset["High"].iloc[-lookback_liq:-1].max()
-                recent_low = subset["Low"].iloc[-lookback_liq:-1].min()
+            # 2. سویپ نقدینگی در تایم‌فریم 1h -> 3 امتیاز
+            lookback_liq = 20
+            if len(subset_1h) > lookback_liq:
+                recent_high_1h = subset_1h["High"].iloc[-lookback_liq:-1].max()
+                recent_low_1h = subset_1h["Low"].iloc[-lookback_liq:-1].min()
 
-                if direction == "LONG" and current_candle["Low"] < recent_low and current_candle["Close"] > recent_low:
+                if direction == "LONG" and c1h["Low"] < recent_low_1h and c1h["Close"] > recent_low_1h:
                     score += 3
-                elif direction == "SHORT" and current_candle["High"] > recent_high and current_candle["Close"] < recent_high:
+                elif direction == "SHORT" and c1h["High"] > recent_high_1h and c1h["Close"] < recent_high_1h:
                     score += 3
 
-            # 3. شتاب (Displacement) -> 2 امتیاز
-            candle_range = current_candle["High"] - current_candle["Low"]
-            if candle_range > (1.05 * atr):
+            # 3. شتاب در 1h -> 2 امتیاز
+            atr_1h = c1h["ATR"]
+            if not np.isfinite(atr_1h) or atr_1h <= 0:
+                continue
+                
+            candle_range = c1h["High"] - c1h["Low"]
+            if candle_range > (1.05 * atr_1h):
                 score += 2
 
-            # 4. حجم LBank -> 2 امتیاز
-            vol_mean = subset["Volume"].rolling(14).mean().iloc[-1]
-            if np.isfinite(vol_mean) and current_candle["Volume"] > (1.05 * vol_mean):
+            # 4. حجم در 1h -> 2 امتیاز
+            vol_mean_1h = subset_1h["Volume"].rolling(14).mean().iloc[-1]
+            if np.isfinite(vol_mean_1h) and c1h["Volume"] > (1.05 * vol_mean_1h):
                 score += 2
 
             if score < 4:
                 continue
 
-            entry_price = current_candle["Open"] * (1 + SLIPPAGE) if direction == "LONG" else current_candle["Open"] * (1 - SLIPPAGE)
+            entry_price = c1h["Open"] * (1 + SLIPPAGE) if direction == "LONG" else c1h["Open"] * (1 - SLIPPAGE)
             
             if direction == "LONG":
-                stop_price = recent_low - (atr * 0.5)
+                stop_price = recent_low_1h - (atr_1h * 0.5)
                 if entry_price - stop_price <= 0:
-                    stop_price = entry_price - atr
+                    stop_price = entry_price - atr_1h
                 risk_dist = entry_price - stop_price
                 target_price = entry_price + (risk_dist * 2.0)
             else:
-                stop_price = recent_high + (atr * 0.5)
+                stop_price = recent_high_1h + (atr_1h * 0.5)
                 if stop_price - entry_price <= 0:
-                    stop_price = entry_price + atr
+                    stop_price = entry_price + atr_1h
                 risk_dist = stop_price - entry_price
                 target_price = entry_price - (risk_dist * 2.0)
 
@@ -322,9 +331,9 @@ def run_cle_lbank_backtest(processed_data):
     return pd.DataFrame(all_trades), equity
 
 
-def summarize_cle_result(trades_df, final_equity):
+def summarize_result(trades_df, final_equity):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی CLE-1 روی سبد گسترده LBank")
+    print("📊 گزارش نهایی استراتژی چندتایم‌فریمی (Trend 4h + Entry 1h)")
     print("=" * 68)
 
     if trades_df.empty:
@@ -382,6 +391,6 @@ def summarize_cle_result(trades_df, final_equity):
 
 
 if __name__ == "__main__":
-    df_trades, final_equity = run_cle_lbank_backtest(processed_data)
-    summarize_cle_result(df_trades, final_equity)
-    print("\n✨ بک‌تست سبد گسترده CLE-1 به پایان رسید.")
+    df_trades, final_equity = run_multi_timeframe_backtest(processed_data_1h, processed_data_4h)
+    summarize_result(df_trades, final_equity)
+    print("\n✨ بک‌تست سیستم چندتایم‌فریمی به پایان رسید.")
