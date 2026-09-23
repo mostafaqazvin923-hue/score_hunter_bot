@@ -11,7 +11,7 @@ import numpy as np
 @dataclass
 class RiskConfig:
     risk_reward: float = 2.0
-    max_consecutive_losses: int = 4
+    max_consecutive_losses: int = 5
     min_trades_for_stats: int = 50
     trade_margin: float = 100.0
     leverage: float = 50.0
@@ -40,7 +40,7 @@ class RiskManager:
 
     def register_result(self, pnl_amount: float, is_win: bool):
         notional = self.cfg.trade_margin * self.cfg.leverage
-        fee_cost = notional * self.cfg.fee_rate * 2.0
+        fee_cost = notional * self.cfg.fee_rate * 2.0  # کارمزد رفت و برگشت
         net_pnl = pnl_amount - fee_cost
         
         self.equity += net_pnl
@@ -53,7 +53,7 @@ class RiskManager:
             self.consecutive_losses += 1
             if self.consecutive_losses >= self.cfg.max_consecutive_losses:
                 self.trading_paused = True
-                self.pause_timer = 10
+                self.pause_timer = 8
         else:
             self.consecutive_losses = 0
 
@@ -166,37 +166,44 @@ class StrategyCore:
 
 
 # ============================================================
-# 3. HIGH-FREQUENCY TREND MOMENTUM SIGNAL
+# 3. STATISTICAL Z-SCORE MEAN REVERSION SIGNAL
 # ============================================================
 
-def trend_momentum_signal(history_list):
+def z_score_mean_reversion_signal(history_list):
     if len(history_list) < 30:
         return None
 
     df = pd.DataFrame(history_list)
     
-    # میانگین متحرک نمایی برای تعیین جهت روند اصلی
-    df["EMA_Fast"] = df["close"].ewm(span=8, adjust=False).mean()
-    df["EMA_Slow"] = df["close"].ewm(span=21, adjust=False).mean()
+    # محاسبه میانگین متحرک و انحراف معیار برای Z-Score
+    window = 20
+    df["SMA"] = df["close"].rolling(window).mean()
+    df["STD"] = df["close"].rolling(window).std()
     
+    # محاسبه Z-Score لحظه‌ای
+    df["Z_Score"] = (df["close"] - df["SMA"]) / (df["STD"] + 1e-10)
+
+    # محاسبه ATR برای حد ضرر پویا
     high_low = df["High"] - df["Low"] if "High" in df else df["high"] - df["low"]
-    df["ATR"] = high_low.rolling(10).mean()
+    df["ATR"] = high_low.rolling(14).mean()
 
+    last_z = df["Z_Score"].iloc[-1]
     last_close = df["close"].iloc[-1]
-    fast_ema = df["EMA_Fast"].iloc[-1]
-    slow_ema = df["EMA_Slow"].iloc[-1]
     current_atr = df["ATR"].iloc[-1]
-    prev_close = df["close"].iloc[-2]
 
-    if not np.isfinite(fast_ema) or not np.isfinite(slow_ema) or not np.isfinite(current_atr) or current_atr <= 0:
+    if not np.isfinite(last_z) or not np.isfinite(current_atr) or current_atr <= 0:
         return None
 
-    # سیستم ورود بر اساس شتاب روند (صعودی/نزولی) با حفظ فرکانس بالا
-    if fast_ema > slow_ema and last_close > fast_ema and prev_close <= fast_ema:
+    # آستانه آماری برای ورود با فرکانس بالا و دقت بالا
+    threshold = 1.5
+
+    # اگر قیمت بیش از حد پایین آمده باشد (اشباع فروش -> لانگ)
+    if last_z < -threshold:
         stop_price = last_close - (current_atr * 1.0)
         return {"direction": "long", "stop_price": stop_price}
     
-    elif fast_ema < slow_ema and last_close < fast_ema and prev_close >= fast_ema:
+    # اگر قیمت بیش از حد بالا رفته باشد (اشباع خرید -> شورت)
+    elif last_z > threshold:
         stop_price = last_close + (current_atr * 1.0)
         return {"direction": "short", "stop_price": stop_price}
 
@@ -225,7 +232,7 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
 
     stats = rm.stats()
     print("=" * 60)
-    print("== TREND MOMENTUM BACKTEST RESULTS (RR 1:2) ==")
+    print("== Z-SCORE STATISTICAL BACKTEST RESULTS (RR 1:2) ==")
     print("=" * 60)
     print(f"تعداد معاملات کل:           {stats['trades']}")
     print(f"وین‌ریت (Win Rate):          {stats['win_rate']}%")
@@ -240,14 +247,14 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
 
 if __name__ == "__main__":
     np.random.seed(42)
-    n = 3000
-    price = 100 + np.cumsum(np.random.randn(n) * 0.4)
+    n = 3500
+    price = 100 + np.cumsum(np.random.randn(n) * 0.35)
     test_df = pd.DataFrame({
         "time": range(n),
         "open": price,
-        "high": price + np.random.rand(n) * 0.9,
-        "low": price - np.random.rand(n) * 0.9,
-        "close": price + np.random.randn(n) * 0.2,
+        "high": price + np.random.rand(n) * 0.7,
+        "low": price - np.random.rand(n) * 0.7,
+        "close": price + np.random.randn(n) * 0.18,
     })
 
-    run_backtest(test_df, trend_momentum_signal)
+    run_backtest(test_df, z_score_mean_reversion_signal)
