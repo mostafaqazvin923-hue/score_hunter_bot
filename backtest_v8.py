@@ -5,15 +5,16 @@ import numpy as np
 
 
 # ============================================================
-# 1. RISK MANAGER & CONFIG
+# 1. RISK MANAGER & CONFIG (قانون سفت‌وسخت: مارجین ۱۰۰ و اهرم ۵۰)
 # ============================================================
 
 @dataclass
 class RiskConfig:
+    risk_reward: float = 1.8
     max_consecutive_losses: int = 5
     min_trades_for_stats: int = 50
     trade_margin: float = 100.0
-    leverage: float = 50.0
+    leverage: float = 50.0  # ضریب ثابت و دست‌نزده
     fee_rate: float = 0.0007
 
 
@@ -29,27 +30,30 @@ class RiskManager:
         self.trade_history = []
 
     def can_open_new_trade(self) -> bool:
-        if self.trading_paused or self.open_trade is not None:
+        if self.trading_paused or self.open_trade is not None or self.equity < self.cfg.trade_margin:
             return False
         return True
 
-    def position_size(self, entry_price: float, stop_price: float) -> float:
+    def position_size(self, entry_price: float) -> float:
         position_notional = self.cfg.trade_margin * self.cfg.leverage
         return position_notional / entry_price
 
     def register_result(self, pnl_amount: float, is_win: bool):
         notional = self.cfg.trade_margin * self.cfg.leverage
-        fee_cost = notional * self.cfg.fee_rate * 2.0
+        fee_cost = notional * self.cfg.fee_rate * 2.0  # کارمزد رفت و برگشت
         net_pnl = pnl_amount - fee_cost
         
         self.equity += net_pnl
-        self.trade_history.append({"win": is_win, "pnl_amount": net_pnl})
+        if self.equity < 0:
+            self.equity = 0.0
+
+        self.trade_history.append({"win": is_win, "net_pnl": net_pnl})
 
         if not is_win:
             self.consecutive_losses += 1
             if self.consecutive_losses >= self.cfg.max_consecutive_losses:
                 self.trading_paused = True
-                self.pause_timer = 10  # استراحت کوتاه برای فرکانس بالا
+                self.pause_timer = 10
         else:
             self.consecutive_losses = 0
 
@@ -86,7 +90,7 @@ class Trade:
     entry_time: object
     entry_price: float
     stop_price: float
-    target_ema_span: int
+    target_price: float
     size: float
 
 
@@ -100,7 +104,7 @@ class StrategyCore:
         event = None
 
         if self.rm.open_trade is not None:
-            event = self._check_exit(candle, history_up_to_here)
+            event = self._check_exit(candle)
         elif self._pending_entry is not None:
             event = self._execute_entry(candle)
 
@@ -118,40 +122,42 @@ class StrategyCore:
         entry_price = candle["open"]
         stop_price = sig["stop_price"]
         
-        size = self.rm.position_size(entry_price, stop_price)
+        if sig["direction"] == "long":
+            target_price = entry_price + (self.rm.cfg.risk_reward * abs(entry_price - stop_price))
+        else:
+            target_price = entry_price - (self.rm.cfg.risk_reward * abs(entry_price - stop_price))
+
+        size = self.rm.position_size(entry_price)
         self.rm.open_trade = Trade(
             direction=sig["direction"],
             entry_time=candle.get("time"),
             entry_price=entry_price,
             stop_price=stop_price,
-            target_ema_span=sig["target_ema_span"],
+            target_price=target_price,
             size=size
         )
         return {"type": "entry", "trade": self.rm.open_trade}
 
-    def _check_exit(self, candle: dict, history_list) -> Optional[dict]:
+    def _check_exit(self, candle: dict) -> Optional[dict]:
         t = self.rm.open_trade
-        df = pd.DataFrame(history_list)
-        current_ema = df["close"].ewm(span=t.target_ema_span, adjust=False).mean().iloc[-1]
-
         hit_stop = False
-        hit_target_mean = False
+        hit_target = False
 
         if t.direction == "long":
             hit_stop = candle["low"] <= t.stop_price
-            hit_target_mean = candle["high"] >= current_ema
+            hit_target = candle["high"] >= t.target_price
         else:
             hit_stop = candle["high"] >= t.stop_price
-            hit_target_mean = candle["low"] <= current_ema
+            hit_target = candle["low"] <= t.target_price
 
-        if not hit_stop and not hit_target_mean:
+        if not hit_stop and not hit_target:
             return None
 
         if hit_stop:
             pnl_amount = -t.size * abs(t.entry_price - t.stop_price)
             is_win = False
         else:
-            pnl_amount = t.size * abs(current_ema - t.entry_price) if t.direction == "long" else t.size * abs(t.entry_price - current_ema)
+            pnl_amount = t.size * abs(t.target_price - t.entry_price)
             is_win = True
 
         self.rm.register_result(pnl_amount, is_win)
@@ -160,46 +166,53 @@ class StrategyCore:
 
 
 # ============================================================
-# 3. HIGH-FREQUENCY RSI SCALPING SIGNAL
+# 3. ADVANCED HYBRID SIGNAL (ATR SQUEEZE + VOLUME MOMENTUM)
 # ============================================================
 
-def high_frequency_rsi_signal(history_list):
-    if len(history_list) < 25:
+def hybrid_institutional_signal(history_list):
+    if len(history_list) < 40:
         return None
 
     df = pd.DataFrame(history_list)
-    span = 9
-    df["EMA"] = df["close"].ewm(span=span, adjust=False).mean()
-
-    # محاسبه سریع RSI ۷ دوره‌ای برای بالا بردن فرکانس سیگنال‌ها
-    delta = df["close"].diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
     
-    avg_gain = gain.rolling(7).mean()
-    avg_loss = loss.rolling(7).mean()
-    
-    rs = avg_gain / (avg_loss + 1e-10)
-    df["RSI"] = 100 - (100 / (1 + rs))
-
+    # محاسبه باندهای نوسانی برای تشخیص فشردگی (ATR Squeeze)
     high_low = df["High"] - df["Low"] if "High" in df else df["high"] - df["low"]
     df["ATR"] = high_low.rolling(14).mean()
+    df["ATR_MA"] = df["ATR"].rolling(20).mean()
 
-    last_rsi = df["RSI"].iloc[-1]
+    # کانال دانچیان سریع برای شکست نوسانی
+    df["Donchian_High"] = df["High"].rolling(15).max() if "High" in df else df["high"].rolling(15).max()
+    df["Donchian_Low"] = df["Low"].rolling(15).min() if "Low" in df else df["low"].rolling(15).min()
+
+    # حجم معاملات
+    if "Volume" in df:
+        df["Vol_SMA"] = df["Volume"].rolling(20).mean()
+        current_vol = df["Volume"].iloc[-1]
+        vol_sma = df["Vol_SMA"].iloc[-1]
+    else:
+        current_vol, vol_sma = 1.0, 1.0
+
     last_close = df["close"].iloc[-1]
+    prev_dhigh = df["Donchian_High"].shift(1).iloc[-1]
+    prev_dlow = df["Donchian_Low"].shift(1).iloc[-1]
     current_atr = df["ATR"].iloc[-1]
+    atr_ma = df["ATR_MA"].iloc[-1]
 
-    if not np.isfinite(last_rsi) or not np.isfinite(current_atr) or current_atr <= 0:
+    if not np.isfinite(current_atr) or not np.isfinite(atr_ma) or current_atr <= 0:
         return None
 
-    # فرکانس بالا: آستانه های اشباع ملایم‌تر (RSI < 35 برای لانگ و RSI > 65 برای شورت)
-    if last_rsi < 35:
-        stop_price = last_close - (current_atr * 1.0)
-        return {"direction": "long", "stop_price": stop_price, "target_ema_span": span}
+    # فیلتر تاییدیه حجم و خروج از فشردگی نوسان
+    is_volume_ok = current_vol > (1.2 * vol_sma) if "Volume" in df else True
+
+    # ستاپ لانگ: شکست سقف کانال + حجم بالا + هم‌راستایی نوسان
+    if last_close > prev_dhigh and is_volume_ok:
+        stop_price = last_close - (current_atr * 1.2)
+        return {"direction": "long", "stop_price": stop_price}
     
-    elif last_rsi > 65:
-        stop_price = last_close + (current_atr * 1.0)
-        return {"direction": "short", "stop_price": stop_price, "target_ema_span": span}
+    # ستاپ شورت: شکست کف کانال + حجم بالا
+    elif last_close < prev_dlow and is_volume_ok:
+        stop_price = last_close + (current_atr * 1.2)
+        return {"direction": "short", "stop_price": stop_price}
 
     return None
 
@@ -219,19 +232,21 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
     for i, candle in enumerate(records):
         history = records[: i + 1]
         event = engine.on_new_closed_candle(i, candle, history)
+        if rm.equity <= 0:
+            break
         if event:
             log.append({"index": i, "time": candle.get("time"), **event})
 
     stats = rm.stats()
     print("=" * 60)
-    print("== ULTRA HIGH-FREQUENCY RSI BACKTEST RESULTS ==")
+    print("== HYBRID INSTITUTIONAL BACKTEST RESULTS (LEVERAGE 50) ==")
     print("=" * 60)
     print(f"تعداد معاملات کل:           {stats['trades']}")
     print(f"وین‌ریت (Win Rate):          {stats['win_rate']}%")
     print(f"سرمایه‌ی نهایی (USD):        ${round(rm.equity, 2)}")
     print(f"اعتبار آماری:               {'تایید شد' if stats['valid'] else 'نیاز به داده بیشتر'}")
-    if rm.trading_paused:
-        print(f"⚠️ محافظ سرمایه فعال شد (توقف اضطراری)")
+    if rm.equity <= 0:
+        print(f"⚠️ حساب لیکویید / صفر شد")
     print("=" * 60)
 
     return {"log": log, "stats": stats, "final_equity": rm.equity, "risk_manager": rm}
@@ -247,6 +262,7 @@ if __name__ == "__main__":
         "high": price + np.random.rand(n) * 1.0,
         "low": price - np.random.rand(n) * 1.0,
         "close": price + np.random.randn(n) * 0.2,
+        "Volume": np.random.randint(1000, 5000, n)
     })
 
-    run_backtest(test_df, high_frequency_rsi_signal)
+    run_backtest(test_df, hybrid_institutional_signal)
