@@ -166,53 +166,46 @@ class StrategyCore:
 
 
 # ============================================================
-# 3. TS-MOMENTUM SIGNAL FUNCTION (استراتژی مومنتوم سری زمانی نهادی)
+# 3. HIGH-FREQUENCY PULLBACK SIGNAL FUNCTION (سیگنال پربازدد و دقیق)
 # ============================================================
 
-def ts_momentum_signal(history_list):
-    if len(history_list) < 50:
+def high_frequency_pullback_signal(history_list):
+    if len(history_list) < 30:
         return None
 
     df = pd.DataFrame(history_list)
     
-    # ۱. محاسبه بازدهی مومنتوم ۲۴ دوره گذشته (شتاب قیمت)
-    df["Momentum_24"] = df["close"].pct_change(24)
+    # میانگین‌های متحرک سریع برای تشخیص جهت روند کوتاه‌مدت
+    df["EMA_9"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["EMA_21"] = df["close"].ewm(span=21, adjust=False).mean()
     
-    # ۲. فیلتر روند کلان با میانگین متحرک ۵۰ دوره
-    df["EMA_50"] = df["close"].ewm(span=50, adjust=False).mean()
-
-    # ۳. فیلتر نوسان ATR برای تعیین حد ضرر و تایید پویایی نوسان
+    # محاسبه ATR جهت تعیین حد ضرر پویا
     high_low = df["High"] - df["Low"] if "High" in df else df["high"] - df["low"]
     high_close = np.abs(df["High"] - df["close"].shift()) if "High" in df else np.abs(df["high"] - df["close"].shift())
     low_close = np.abs(df["Low"] - df["close"].shift()) if "High" in df else np.abs(df["low"] - df["close"].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     df["ATR"] = ranges.max(axis=1).rolling(14).mean()
-    df["ATR_SMA"] = df["ATR"].rolling(20).mean()
 
-    # مقادیر آخرین کندل بسته‌شده
     last_close = df["close"].iloc[-1]
-    last_mom = df["Momentum_24"].iloc[-1]
-    last_ema = df["EMA_50"].iloc[-1]
+    prev_close = df["close"].iloc[-2]
+    ema_9 = df["EMA_9"].iloc[-1]
+    ema_21 = df["EMA_21"].iloc[-1]
     current_atr = df["ATR"].iloc[-1]
-    atr_sma = df["ATR_SMA"].iloc[-1]
 
-    if not np.isfinite(current_atr) or current_atr <= 0 or not np.isfinite(last_mom):
+    if not np.isfinite(current_atr) or current_atr <= 0:
         return None
 
-    # فیلتر تاییدیه انبساط نوسان (جلوگیری از ورود در بازارهای خنثی و فرسایشی)
-    is_volatility_active = current_atr > atr_sma
+    is_uptrend = ema_9 > ema_21
+    is_downtrend = ema_9 < ema_21
 
-    if not is_volatility_active:
-        return None
-
-    # ستاپ لانگ: مومنتوم مثبت قوی + قیمت بالای EMA 50
-    if last_mom > 0.015 and last_close > last_ema:
-        stop_price = last_close - (current_atr * 1.5)
+    # پولبک لانگ: روند صعودی، اصلاح به زیر EMA 9 و بازگشت با قدرت در کندل بسته شده
+    if is_uptrend and prev_close <= ema_9 and last_close > ema_9 and last_close > prev_close:
+        stop_price = last_close - (current_atr * 1.2)
         return {"direction": "long", "stop_price": stop_price}
     
-    # ستاپ شورت: مومنتوم منفی قوی + قیمت پایین EMA 50
-    elif last_mom < -0.015 and last_close < last_ema:
-        stop_price = last_close + (current_atr * 1.5)
+    # پولبک شورت: روند نزولی، اصلاح به بالای EMA 9 و ریزش مجدد در کندل بسته شده
+    elif is_downtrend and prev_close >= ema_9 and last_close < ema_9 and last_close < prev_close:
+        stop_price = last_close + (current_atr * 1.2)
         return {"direction": "short", "stop_price": stop_price}
 
     return None
@@ -238,7 +231,7 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
 
     stats = rm.stats()
     print("=" * 60)
-    print("== TS-MOMENTUM INSTITUTIONAL BACKTEST RESULTS ==")
+    print("== HIGH-FREQUENCY PULLBACK BACKTEST RESULTS ==")
     print("=" * 60)
     print(f"تعداد معاملات کل:           {stats['trades']}")
     print(f"وین‌ریت (Win Rate):          {stats['win_rate']}%")
@@ -256,13 +249,13 @@ if __name__ == "__main__":
     # تست اولیه با داده‌های شبیه‌سازی‌شده
     np.random.seed(42)
     n = 2000
-    price = 100 + np.cumsum(np.random.randn(n) * 0.6)
+    price = 100 + np.cumsum(np.random.randn(n) * 0.5)
     test_df = pd.DataFrame({
         "time": range(n),
         "open": price,
-        "high": price + np.random.rand(n) * 1.5,
-        "low": price - np.random.rand(n) * 1.5,
-        "close": price + np.random.randn(n) * 0.3,
+        "high": price + np.random.rand(n) * 1.2,
+        "low": price - np.random.rand(n) * 1.2,
+        "close": price + np.random.randn(n) * 0.2,
     })
 
-    run_backtest(test_df, ts_momentum_signal)
+    run_backtest(test_df, high_frequency_pullback_signal)
