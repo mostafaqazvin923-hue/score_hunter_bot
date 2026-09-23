@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# تنظیمات اصلی LBank - سیستم 1 ساعته با فیلترهای ضد نویز (ADX + RSI)
+# تنظیمات اصلی LBank - تایم‌فریم 4h با مکانیزم Break-Even
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -59,52 +59,25 @@ SYMBOLS = {
 }
 
 LOOKBACK_DAYS = 365
+TIMEFRAME = "4h"
 MAX_POSITIONS = 8
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 ATR_PERIOD = 14
 INITIAL_CAPITAL = 1000.0
-TRADE_MARGIN = 100.0
-LEVERAGE = 50.0
+TRADE_MARGIN = 100.0  # ثابت و بدون تغییر
+LEVERAGE = 50.0       # ثابت و بدون تغییر
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌ها و محاسبه اندیکاتورهای ضد نویز (ADX, RSI) از LBank")
+print("📥 دریافت داده‌های 4 ساعته از صرافی LBank (حالت Break-Even)")
 print("=" * 60)
 
-processed_data_1h = {}
-processed_data_4h = {}
+processed_data = {}
 
-def calculate_adx(df, period=14):
-    alpha = 1 / period
-    plus_dm = df['High'].diff()
-    minus_dm = df['Low'].diff()
-    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
-    
-    tr1 = df["High"] - df["Low"]
-    tr2 = np.abs(df["High"] - df["Close"].shift(1))
-    tr3 = np.abs(df["Low"] - df["Close"].shift(1))
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    
-    atr = tr.ewm(alpha=alpha, adjust=False).mean()
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=alpha, adjust=False).mean() / atr
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=alpha, adjust=False).mean() / atr
-    
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
-    adx = dx.ewm(alpha=alpha, adjust=False).mean()
-    return adx
-
-def calculate_rsi(df, period=14):
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-    rs = gain / (loss + 1e-10)
-    return 100 - (100 / (1 + rs))
-
-def fetch_data(lbank_symbol, timeframe):
+def fetch_symbol_data(lbank_symbol):
     all_ohlcv = []
     current_since = since_timestamp
     last_seen = None
@@ -115,7 +88,7 @@ def fetch_data(lbank_symbol, timeframe):
             try:
                 batch = exchange.fetch_ohlcv(
                     lbank_symbol,
-                    timeframe=timeframe,
+                    timeframe=TIMEFRAME,
                     since=current_since,
                     limit=1000,
                 )
@@ -163,31 +136,26 @@ def fetch_data(lbank_symbol, timeframe):
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
-    df["ADX"] = calculate_adx(df)
-    df["RSI"] = calculate_rsi(df)
 
     df.set_index("Date", inplace=True)
     return df
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    df1h = fetch_data(lbank_symbol, "1h")
-    df4h = fetch_data(lbank_symbol, "4h")
-    
-    if df1h is not None and df4h is not None:
-        processed_data_1h[symbol] = df1h
-        processed_data_4h[symbol] = df4h
+    df4h = fetch_symbol_data(lbank_symbol)
+    if df4h is not None:
+        processed_data[symbol] = df4h
 
-print(f"✅ تعداد نمادهای بارگذاری شده: {len(processed_data_1h)} نماد")
-print("⚙️ شروع اجرای بک‌تست با فیلترهای ضد نویز (ADX + RSI)...")
+print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} نماد")
+print("⚙️ شروع اجرای بک‌تست 4h با قابلیت Break-Even Stop...")
 
 
 # ============================================================
-# موتور معاملاتی با فیلترهای سخت‌گیرانه ضد نویز
+# موتور معاملاتی 4h همراه با انتقال استاپ به نقطه ورود (Break-Even)
 # ============================================================
 
-def run_anti_noise_backtest(data_1h, data_4h):
+def run_breakeven_backtest(processed_data):
     all_timestamps = sorted({
-        ts for df in data_1h.values() for ts in df.index
+        ts for df in processed_data.values() for ts in df.index
     })
     
     active_positions = {}
@@ -209,35 +177,55 @@ def run_anti_noise_backtest(data_1h, data_4h):
         
         # مدیریت پوزیشن‌های باز
         for symbol, pos in list(active_positions.items()):
-            df1 = data_1h[symbol]
-            if ts not in df1.index:
+            df = processed_data[symbol]
+            if ts not in df.index:
                 continue
             
-            c1h = df1.loc[ts]
+            c4h = df.loc[ts]
+            
+            # --- بررسی مکانیزم Break-Even (اگر قیمت نصف مسیر تا تارجت را رفت، استاپ بیاد روی نقطه ورود) ---
+            if not pos["is_breakeven"]:
+                if pos["side"] == "LONG":
+                    halfway_price = pos["entry_price"] + (pos["target_price"] - pos["entry_price"]) * 0.5
+                    if c4h["High"] >= halfway_price:
+                        pos["stop_price"] = pos["entry_price"]
+                        pos["is_breakeven"] = True
+                else:  # SHORT
+                    halfway_price = pos["entry_price"] - (pos["entry_price"] - pos["target_price"]) * 0.5
+                    if c4h["Low"] <= halfway_price:
+                        pos["stop_price"] = pos["entry_price"]
+                        pos["is_breakeven"] = True
+
             hit_stop = False
             hit_target = False
 
             if pos["side"] == "LONG":
-                hit_stop = c1h["Low"] <= pos["stop_price"]
-                hit_target = c1h["High"] >= pos["target_price"]
+                hit_stop = c4h["Low"] <= pos["stop_price"]
+                hit_target = c4h["High"] >= pos["target_price"]
             else:
-                hit_stop = c1h["High"] >= pos["stop_price"]
-                hit_target = c1h["Low"] <= pos["target_price"]
+                hit_stop = c4h["High"] >= pos["stop_price"]
+                hit_target = c4h["Low"] <= pos["target_price"]
 
             if hit_stop or hit_target:
                 is_win = hit_target
+                is_be = (not is_win) and pos["is_breakeven"] and (pos["stop_price"] == pos["entry_price"])
+                
                 notional = TRADE_MARGIN * LEVERAGE
                 fee_cost = notional * FEE_RATE * 2.0
                 
                 if is_win:
                     pnl_amount = abs(pos["target_price"] - pos["entry_price"]) * pos["size"]
+                    outcome = "WIN"
+                elif is_be:
+                    pnl_amount = 0.0
+                    outcome = "BREAK_EVEN"
                 else:
                     pnl_amount = -abs(pos["entry_price"] - pos["stop_price"]) * pos["size"]
+                    outcome = "LOSS"
                 
                 net_pnl = pnl_amount - fee_cost
                 equity += net_pnl
                 
-                outcome = "WIN" if is_win else "LOSS"
                 all_trades.append({
                     "Timestamp": ts,
                     "Symbol": symbol,
@@ -246,13 +234,15 @@ def run_anti_noise_backtest(data_1h, data_4h):
                     "Net_PnL": net_pnl,
                 })
                 
-                if not is_win:
+                # مدیریت ضررهای متوالی (معاملات سر‌به‌سر نه ضرر محسوب میشن و نه برد، بی‌تأثیرند)
+                if outcome == "LOSS":
                     consecutive_losses += 1
-                    if consecutive_losses >= 3: # سخت‌گیرانه: مکث بعد از ۳ ضرر متوالی
+                    if consecutive_losses >= 4:
                         trading_paused = True
-                        pause_timer = 18 
-                else:
+                        pause_timer = 6
+                elif outcome == "WIN":
                     consecutive_losses = 0
+                # در حالت BREAK_EVEN تغییری در consecutive_losses ایجاد نمی‌شود
 
                 symbols_to_close.append(symbol)
 
@@ -262,36 +252,31 @@ def run_anti_noise_backtest(data_1h, data_4h):
         if len(active_positions) >= MAX_POSITIONS or equity < TRADE_MARGIN:
             continue
 
-        # بررسی سیگنال ورود با فیلترهای ضد نویز
-        for symbol, df1 in data_1h.items():
-            if symbol in active_positions or ts not in df1.index:
+        # بررسی سیگنال ورود
+        for symbol, df in processed_data.items():
+            if symbol in active_positions or ts not in df.index:
                 continue
 
-            i1 = df1.index.get_loc(ts)
-            if i1 < 30:
+            i = df.index.get_loc(ts)
+            if i < 30:
                 continue
 
-            subset_1h = df1.iloc[:i1 + 1]
-            c1h = subset_1h.iloc[-1]
-            
-            # --- فیلتر ضد نویز 1: قدرت روند ADX (باید بازار رنج نباشد) ---
-            if c1h["ADX"] < 22:
+            subset = df.iloc[:i + 1]
+            current_candle = subset.iloc[-1]
+            close = current_candle["Close"]
+            ema_50 = current_candle["EMA50"]
+            atr = current_candle["ATR"]
+
+            if not np.isfinite(atr) or atr <= 0:
                 continue
 
-            # دریافت رژیم 4 ساعته بدون نگاه به آینده
-            df4 = data_4h[symbol]
-            past_4h = df4[df4.index <= ts]
-            if len(past_4h) < 30:
-                continue
-            
-            c4h = past_4h.iloc[-1]
-            recent_highs_4h = past_4h["High"].rolling(10).max().iloc[-1]
-            recent_lows_4h = past_4h["Low"].rolling(10).min().iloc[-1]
+            recent_highs = subset["High"].rolling(10).max().iloc[-1]
+            recent_lows = subset["Low"].rolling(10).min().iloc[-1]
 
             regime = "Neutral"
-            if c4h["Close"] > c4h["EMA50"] and c4h["Close"] >= recent_highs_4h * 0.99:
+            if close > ema_50 and close >= recent_highs * 0.99:
                 regime = "Bull"
-            elif c4h["Close"] < c4h["EMA50"] and c4h["Close"] <= recent_lows_4h * 1.01:
+            elif close < ema_50 and close <= recent_lows * 1.01:
                 regime = "Bear"
 
             if regime == "Neutral":
@@ -300,61 +285,47 @@ def run_anti_noise_backtest(data_1h, data_4h):
             score = 0
             direction = "LONG" if regime == "Bull" else "SHORT"
 
-            # 1. رژیم روند کلان 4h -> 3 امتیاز
+            # 1. رژیم بازار -> 3 امتیاز
             score += 3
 
-            # --- فیلتر ضد نویز 2: RSI (جلوگیری از اشباع خرید/فروش خطرناک) ---
-            if direction == "LONG" and c1h["RSI"] > 68: # اگر بیش از حد خریده شده، لانگ نرو
-                continue
-            if direction == "SHORT" and c1h["RSI"] < 32: # اگر بیش از حد فروخته شده، شورت نرو
-                continue
+            # 2. نقدینگی و Sweep -> 3 امتیاز
+            lookback_liq = 15
+            if len(subset) > lookback_liq:
+                recent_high = subset["High"].iloc[-lookback_liq:-1].max()
+                recent_low = subset["Low"].iloc[-lookback_liq:-1].min()
 
-            if 40 <= c1h["RSI"] <= 60:
-                score += 1 # امتیاز تعادل RSI
-
-            # 2. سویپ نقدینگی در 1h -> 3 امتیاز
-            lookback_liq = 20
-            if len(subset_1h) > lookback_liq:
-                recent_high_1h = subset_1h["High"].iloc[-lookback_liq:-1].max()
-                recent_low_1h = subset_1h["Low"].iloc[-lookback_liq:-1].min()
-
-                if direction == "LONG" and c1h["Low"] < recent_low_1h and c1h["Close"] > recent_low_1h:
+                if direction == "LONG" and current_candle["Low"] < recent_low and current_candle["Close"] > recent_low:
                     score += 3
-                elif direction == "SHORT" and c1h["High"] > recent_high_1h and c1h["Close"] < recent_high_1h:
+                elif direction == "SHORT" and current_candle["High"] > recent_high and current_candle["Close"] < recent_high:
                     score += 3
 
-            # 3. شتاب در 1h -> 2 امتیاز
-            atr_1h = c1h["ATR"]
-            if not np.isfinite(atr_1h) or atr_1h <= 0:
-                continue
-                
-            candle_range = c1h["High"] - c1h["Low"]
-            if candle_range > (1.1 * atr_1h):
+            # 3. شتاب (Displacement) -> 2 امتیاز
+            candle_range = current_candle["High"] - current_candle["Low"]
+            if candle_range > (1.0 * atr):
                 score += 2
 
-            # 4. حجم در 1h -> 2 امتیاز
-            vol_mean_1h = subset_1h["Volume"].rolling(14).mean().iloc[-1]
-            if np.isfinite(vol_mean_1h) and c1h["Volume"] > (1.1 * vol_mean_1h):
+            # 4. حجم LBank -> 2 امتیاز
+            vol_mean = subset["Volume"].rolling(14).mean().iloc[-1]
+            if np.isfinite(vol_mean) and current_candle["Volume"] > (1.0 * vol_mean):
                 score += 2
 
-            # حد نصاب سخت‌گیرانه‌تر امتیاز (حداقل 6 امتیاز برای ورود)
-            if score < 6:
+            if score < 4:
                 continue
 
-            entry_price = c1h["Open"] * (1 + SLIPPAGE) if direction == "LONG" else c1h["Open"] * (1 - SLIPPAGE)
+            entry_price = current_candle["Open"] * (1 + SLIPPAGE) if direction == "LONG" else current_candle["Open"] * (1 - SLIPPAGE)
             
             if direction == "LONG":
-                stop_price = recent_low_1h - (atr_1h * 0.5)
+                stop_price = recent_low - (atr * 0.5)
                 if entry_price - stop_price <= 0:
-                    stop_price = entry_price - atr_1h
+                    stop_price = entry_price - atr
                 risk_dist = entry_price - stop_price
-                target_price = entry_price + (risk_dist * 2.2) # ریسک به ریوارد بهتر
+                target_price = entry_price + (risk_dist * 2.0)
             else:
-                stop_price = recent_high_1h + (atr_1h * 0.5)
+                stop_price = recent_high + (atr * 0.5)
                 if stop_price - entry_price <= 0:
-                    stop_price = entry_price + atr_1h
+                    stop_price = entry_price + atr
                 risk_dist = stop_price - entry_price
-                target_price = entry_price - (risk_dist * 2.2)
+                target_price = entry_price - (risk_dist * 2.0)
 
             notional_value = TRADE_MARGIN * LEVERAGE
             size = notional_value / entry_price
@@ -365,6 +336,7 @@ def run_anti_noise_backtest(data_1h, data_4h):
                 "stop_price": stop_price,
                 "target_price": target_price,
                 "size": size,
+                "is_breakeven": False,
             }
 
             if len(active_positions) >= MAX_POSITIONS:
@@ -375,7 +347,7 @@ def run_anti_noise_backtest(data_1h, data_4h):
 
 def summarize_result(trades_df, final_equity):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی 1 ساعته با فیلترهای ضد نویز (ADX + RSI)")
+    print("📊 گزارش نهایی استراتژی 4 ساعته با سیستم Break-Even Stop")
     print("=" * 68)
 
     if trades_df.empty:
@@ -387,7 +359,11 @@ def summarize_result(trades_df, final_equity):
     total_trades = len(trades_df)
     wins = int((trades_df["Outcome"] == "WIN").sum())
     losses = int((trades_df["Outcome"] == "LOSS").sum())
-    wr = (wins / total_trades * 100) if total_trades > 0 else 0
+    breakevens = int((trades_df["Outcome"] == "BREAK_EVEN").sum())
+    
+    # وین‌ریت واقعی بر اساس معاملات قطعی
+    decisive_trades = wins + losses
+    wr = (wins / decisive_trades * 100) if decisive_trades > 0 else 0
     total_dollar_pnl = float(trades_df["Net_PnL"].sum())
 
     max_losses = 0
@@ -401,10 +377,11 @@ def summarize_result(trades_df, final_equity):
             if temp_loss_seq > 0:
                 loss_sequences.append(temp_loss_seq)
                 temp_loss_seq = 0
-        else:
+        elif outcome == "LOSS":
             current_losses += 1
             temp_loss_seq += 1
             max_losses = max(max_losses, current_losses)
+        # معاملات Break-Even نقشی در قطع یا ایجاد استریک ندارند
 
     if temp_loss_seq > 0:
         loss_sequences.append(temp_loss_seq)
@@ -414,10 +391,10 @@ def summarize_result(trades_df, final_equity):
 
     print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
     print(f"🔸 مارجین: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
-    print(f"🔸 تعداد کل معاملات: {total_trades}")
-    print(f"   🔹 معاملات لانگ: کل = {len(longs_df)} | برنده = {int((longs_df['Outcome'] == 'WIN').sum())} | بازنده = {int((longs_df['Outcome'] == 'LOSS').sum())}")
-    print(f"   🔸 معاملات شورت: کل = {len(shorts_df)} | برنده = {int((shorts_df['Outcome'] == 'WIN').sum())} | بازنده = {int((shorts_df['Outcome'] == 'LOSS').sum())}")
-    print(f"🎯 وین‌ریت کلی: {wr:.2f}%")
+    print(f"🔸 تعداد کل معاملات: {total_trades} (برنده: {wins} | بازنده: {losses} | سر‌به‌سر: {breakevens})")
+    print(f"   🔹 معاملات لانگ: کل = {len(longs_df)}")
+    print(f"   🔸 معاملات شورت: کل = {len(shorts_df)}")
+    print(f"🎯 وین‌ریت واقعی: {wr:.2f}%")
     print(f"💵 مجموع سود/زیان دلاری خالص: ${total_dollar_pnl:,.2f}")
     print(f"🏦 سرمایه نهایی: ${final_equity:,.2f}")
     print(f"❄️ حداکثر ضررهای متوالی کل سبد: {max_losses}")
@@ -433,6 +410,6 @@ def summarize_result(trades_df, final_equity):
 
 
 if __name__ == "__main__":
-    df_trades, final_equity = run_anti_noise_backtest(processed_data_1h, processed_data_4h)
+    df_trades, final_equity = run_breakeven_backtest(processed_data)
     summarize_result(df_trades, final_equity)
-    print("\n✨ بک‌تست سیستم ضد نویز به پایان رسید.")
+    print("\n✨ بک‌تست Break-Even به پایان رسید.")
