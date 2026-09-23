@@ -5,13 +5,13 @@ import numpy as np
 
 
 # ============================================================
-# 1. RISK MANAGER & CONFIG
+# 1. RISK MANAGER & CONFIG (مدیریت ریسک و سرمایه نهادی)
 # ============================================================
 
 @dataclass
 class RiskConfig:
     risk_reward: float = 2.0
-    max_consecutive_losses: int = 4
+    max_consecutive_losses: int = 3
     min_trades_for_stats: int = 30
     trade_margin: float = 100.0
     leverage: float = 50.0
@@ -35,12 +35,13 @@ class RiskManager:
         return True
 
     def position_size(self, entry_price: float, stop_price: float) -> float:
-        # حجم مارجین ثابت در لوریج مشخص
+        # محاسبه دقیق تعداد واحدهای دارایی بر اساس مارجین و لوریج
         position_notional = self.cfg.trade_margin * self.cfg.leverage
-        return position_notional
+        quantity = position_notional / entry_price
+        return quantity
 
     def register_result(self, pnl_r: float, pnl_amount: float):
-        # کسر کارمزد صرافی از سود/زیان خالص
+        # کسر هزینه کارمزد فیوچرز از سود/زیان خالص
         notional = self.cfg.trade_margin * self.cfg.leverage
         fee_cost = notional * self.cfg.fee_rate * 2.0
         net_pnl = pnl_amount - fee_cost
@@ -52,7 +53,7 @@ class RiskManager:
             self.consecutive_losses += 1
             if self.consecutive_losses >= self.cfg.max_consecutive_losses:
                 self.trading_paused = True
-                self.pause_timer = 24  # تعداد کندل استراحت اجباری
+                self.pause_timer = 30  # کندل استراحت اجباری جهت قطع زنجیره باخت
         else:
             self.consecutive_losses = 0
 
@@ -84,7 +85,7 @@ class RiskManager:
 
 
 # ============================================================
-# 2. STRATEGY CORE (ساختار پیشنهادی شما)
+# 2. STRATEGY CORE (هسته ضد نگاه به آینده و قفل همپوشانی)
 # ============================================================
 
 @dataclass
@@ -165,43 +166,48 @@ class StrategyCore:
 
 
 # ============================================================
-# 3. STATISTICAL SIGNAL FUNCTION (منطق آماری Z-Score بدون نگاه به آینده)
+# 3. INSTITUTIONAL MOMENTUM MEAN REVERSION SIGNAL (منطق حرفه‌ای)
 # ============================================================
 
-def statistical_zscore_signal(history_list):
+def institutional_mean_reversion_signal(history_list):
     if len(history_list) < 60:
         return None
 
-    # تبدیل لیست کندل‌ها به دیتافریم برای محاسبات برداری ایمن
     df = pd.DataFrame(history_list)
     
-    # محاسبه Z-Score روی داده‌های بسته‌شده تا همین لحظه
+    # لایه ۱: ارزش تعادلی (EMA 50) و باندهای انحراف معیار پویا (Bollinger Bands)
     window = 50
-    rolling_mean = df["close"].rolling(window).mean()
+    df["EMA"] = df["close"].ewm(span=window, adjust=False).mean()
     rolling_std = df["close"].rolling(window).std()
     
-    z_scores = (df["close"] - rolling_mean) / rolling_std
-    
-    # محاسبه ATR برای تعیین حد ضرر پویا
+    df["Upper_Band"] = df["EMA"] + (2.3 * rolling_std)
+    df["Lower_Band"] = df["EMA"] - (2.3 * rolling_std)
+
+    # لایه ۲: سنجش نوسان واقعی با ATR برای حد ضرر پویا
     high_low = df["High"] - df["Low"] if "High" in df else df["high"] - df["low"]
     high_close = np.abs(df["High"] - df["close"].shift()) if "High" in df else np.abs(df["high"] - df["close"].shift())
-    low_close = np.abs(df["Low"] - df["close"].shift()) if "Low" in df else np.abs(df["low"] - df["close"].shift())
+    low_close = np.abs(df["Low"] - df["close"].shift()) if "High" in df else np.abs(df["low"] - df["close"].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    atr = ranges.max(axis=1).rolling(14).mean()
+    df["ATR"] = ranges.max(axis=1).rolling(14).mean()
 
-    current_z = z_scores.iloc[-1]
-    current_atr = atr.iloc[-1]
+    # اطلاعات کندل بسته‌شده فعلی و قبلی
     last_close = df["close"].iloc[-1]
+    prev_close = df["close"].iloc[-2]
+    lower_b = df["Lower_Band"].iloc[-1]
+    upper_b = df["Upper_Band"].iloc[-1]
+    current_atr = df["ATR"].iloc[-1]
 
-    if not np.isfinite(current_z) or not np.isfinite(current_atr) or current_atr <= 0:
+    if not np.isfinite(current_atr) or current_atr <= 0 or not np.isfinite(lower_b):
         return None
 
-    # استراتژی: اشباع فروش شدید (Z < -1.5) -> لانگ | اشباع خرید شدید (Z > 1.5) -> شورت
-    if current_z < -1.5:
+    # لایه ۳: تاییدیه مومنتوم بازگشتی (قیمت از باند عبور کرده اما شروع به برگشت کرده است)
+    # لانگ: نفوذ به زیر باند پایینی و بازگشت تاییدشده در کندل بسته شده
+    if last_close <= lower_b and last_close > prev_close:
         stop_price = last_close - (current_atr * 1.5)
         return {"direction": "long", "stop_price": stop_price}
     
-    elif current_z > 1.5:
+    # شورت: نفوذ به بالای باند بالایی و بازگشت تاییدشده در کندل بسته شده
+    elif last_close >= upper_b and last_close < prev_close:
         stop_price = last_close + (current_atr * 1.5)
         return {"direction": "short", "stop_price": stop_price}
 
@@ -209,7 +215,7 @@ def statistical_zscore_signal(history_list):
 
 
 # ============================================================
-# 4. BACKTEST RUNNER
+# 4. BACKTEST RUNNER (موتور اجرای ارزیابی عملکرد)
 # ============================================================
 
 def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskConfig = None):
@@ -227,28 +233,32 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
             log.append({"index": i, "time": candle.get("time"), **event})
 
     stats = rm.stats()
-    print("=== نتیجه‌ی بک‌تست ساختاریافته ===")
-    print(f"تعداد معاملات: {stats['trades']}")
-    print(f"وین‌ریت: {stats['win_rate']}%")
-    print(f"اکسپکتانسی (بر حسب واحد R): {stats['expectancy_r']}")
-    print(f"سرمایه‌ی نهایی: {round(rm.equity, 2)}")
+    print("=" * 60)
+    print("== INSTITUTIONAL MEAN REVERSION BACKTEST RESULTS ==")
+    print("=" * 60)
+    print(f"تعداد معاملات کل:           {stats['trades']}")
+    print(f"وین‌ریت (Win Rate):          {stats['win_rate']}%")
+    print(f"اکسپکتانسی (واحد R):         {stats['expectancy_r']}")
+    print(f"سرمایه‌ی نهایی (USD):        ${round(rm.equity, 2)}")
+    print(f"اعتبار آماری:               {'تایید شد' if stats['valid'] else 'نیاز به داده بیشتر'}")
     if rm.trading_paused:
-        print(f"⚠️ استراتژی متوقف شده است.")
+        print(f"⚠️ محافظ سرمایه فعال شد (توقف اضطراری)")
+    print("=" * 60)
 
     return {"log": log, "stats": stats, "final_equity": rm.equity, "risk_manager": rm}
 
 
 if __name__ == "__main__":
-    # تست با داده‌ی ساختگی فرضی
-    np.random.seed(42)
-    n = 1000
-    price = 100 + np.cumsum(np.random.randn(n) * 0.5)
+    # تست اولیه با داده‌های شبیه‌سازی‌شده (جهت اطمینان از صحت اجرا)
+    np.random.seed(101)
+    n = 1500
+    price = 100 + np.cumsum(np.random.randn(n) * 0.4)
     test_df = pd.DataFrame({
         "time": range(n),
         "open": price,
-        "high": price + np.random.rand(n) * 1.2,
-        "low": price - np.random.rand(n) * 1.2,
+        "high": price + np.random.rand(n) * 1.0,
+        "low": price - np.random.rand(n) * 1.0,
         "close": price + np.random.randn(n) * 0.2,
     })
 
-    run_backtest(test_df, statistical_zscore_signal)
+    run_backtest(test_df, institutional_mean_reversion_signal)
