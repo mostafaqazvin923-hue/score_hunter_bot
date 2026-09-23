@@ -5,7 +5,7 @@ import numpy as np
 
 
 # ============================================================
-# 1. RISK MANAGER & CONFIG (مدیریت ریسک ضد باگ)
+# 1. RISK MANAGER & CONFIG
 # ============================================================
 
 @dataclass
@@ -35,13 +35,11 @@ class RiskManager:
         return True
 
     def position_size(self, entry_price: float, stop_price: float) -> float:
-        # محاسبه دقیق تعداد واحد دارایی بر اساس مارجین و لوریج
         position_notional = self.cfg.trade_margin * self.cfg.leverage
         quantity = position_notional / entry_price
         return quantity
 
     def register_result(self, pnl_r: float, pnl_amount: float):
-        # کسر هزینه کارمزد فیوچرز از سود/زیان خالص
         notional = self.cfg.trade_margin * self.cfg.leverage
         fee_cost = notional * self.cfg.fee_rate * 2.0
         net_pnl = pnl_amount - fee_cost
@@ -53,7 +51,7 @@ class RiskManager:
             self.consecutive_losses += 1
             if self.consecutive_losses >= self.cfg.max_consecutive_losses:
                 self.trading_paused = True
-                self.pause_timer = 24  # استراحت اجباری جهت جلوگیری از دراوداون‌های متوالی
+                self.pause_timer = 24
         else:
             self.consecutive_losses = 0
 
@@ -85,7 +83,7 @@ class RiskManager:
 
 
 # ============================================================
-# 2. STRATEGY CORE (هسته اجرایی ضد نگاه به آینده و قفل همپوشانی)
+# 2. STRATEGY CORE (هسته ضد نگاه به آینده)
 # ============================================================
 
 @dataclass
@@ -166,20 +164,28 @@ class StrategyCore:
 
 
 # ============================================================
-# 3. HIGH-FREQUENCY PULLBACK SIGNAL FUNCTION (سیگنال پربازدد و دقیق)
+# 3. VOLATILITY BREAKOUT & VOLUME SURGE SIGNAL FUNCTION
 # ============================================================
 
-def high_frequency_pullback_signal(history_list):
-    if len(history_list) < 30:
+def volume_breakout_signal(history_list):
+    if len(history_list) < 50:
         return None
 
     df = pd.DataFrame(history_list)
     
-    # میانگین‌های متحرک سریع برای تشخیص جهت روند کوتاه‌مدت
-    df["EMA_9"] = df["close"].ewm(span=9, adjust=False).mean()
-    df["EMA_21"] = df["close"].ewm(span=21, adjust=False).mean()
+    # ۱. کانال دانچیان ۲۰ دوره‌ای برای شناسایی سقف و کف مهم قیمت
+    df["Donchian_High"] = df["High"].rolling(20).max() if "High" in df else df["high"].rolling(20).max()
+    df["Donchian_Low"] = df["Low"].rolling(20).min() if "Low" in df else df["low"].rolling(20).min()
     
-    # محاسبه ATR جهت تعیین حد ضرر پویا
+    # ۲. میانگین حجم ۲۰ دوره برای سنجش قدرت حجم ورود نقدینگی
+    if "Volume" in df:
+        df["Vol_SMA"] = df["Volume"].rolling(20).mean()
+        current_vol = df["Volume"].iloc[-1]
+        vol_sma = df["Vol_SMA"].iloc[-1]
+    else:
+        current_vol, vol_sma = 1.0, 1.0
+
+    # ۳. محاسبه ATR برای تعیین حد ضرر پویا
     high_low = df["High"] - df["Low"] if "High" in df else df["high"] - df["low"]
     high_close = np.abs(df["High"] - df["close"].shift()) if "High" in df else np.abs(df["high"] - df["close"].shift())
     low_close = np.abs(df["Low"] - df["close"].shift()) if "High" in df else np.abs(df["low"] - df["close"].shift())
@@ -187,25 +193,24 @@ def high_frequency_pullback_signal(history_list):
     df["ATR"] = ranges.max(axis=1).rolling(14).mean()
 
     last_close = df["close"].iloc[-1]
-    prev_close = df["close"].iloc[-2]
-    ema_9 = df["EMA_9"].iloc[-1]
-    ema_21 = df["EMA_21"].iloc[-1]
+    prev_high = df["Donchian_High"].shift(1).iloc[-1]
+    prev_low = df["Donchian_Low"].shift(1).iloc[-1]
     current_atr = df["ATR"].iloc[-1]
 
     if not np.isfinite(current_atr) or current_atr <= 0:
         return None
 
-    is_uptrend = ema_9 > ema_21
-    is_downtrend = ema_9 < ema_21
+    # فیلتر حجم صعودی (حجم کندل فعلی حداقل ۱.۵ برابر میانگین باشد)
+    is_volume_confirmed = current_vol > (1.5 * vol_sma) if "Volume" in df else True
 
-    # پولبک لانگ: روند صعودی، اصلاح به زیر EMA 9 و بازگشت با قدرت در کندل بسته شده
-    if is_uptrend and prev_close <= ema_9 and last_close > ema_9 and last_close > prev_close:
-        stop_price = last_close - (current_atr * 1.2)
+    # ستاپ لانگ: شکست سقف ۲۰ دوره قبل + تاییدیه حجم سنگین
+    if last_close > prev_high and is_volume_confirmed:
+        stop_price = last_close - (current_atr * 1.5)
         return {"direction": "long", "stop_price": stop_price}
     
-    # پولبک شورت: روند نزولی، اصلاح به بالای EMA 9 و ریزش مجدد در کندل بسته شده
-    elif is_downtrend and prev_close >= ema_9 and last_close < ema_9 and last_close < prev_close:
-        stop_price = last_close + (current_atr * 1.2)
+    # ستاپ شورت: شکست کف ۲۰ دوره قبل + تاییدیه حجم سنگین
+    elif last_close < prev_low and is_volume_confirmed:
+        stop_price = last_close + (current_atr * 1.5)
         return {"direction": "short", "stop_price": stop_price}
 
     return None
@@ -231,7 +236,7 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
 
     stats = rm.stats()
     print("=" * 60)
-    print("== HIGH-FREQUENCY PULLBACK BACKTEST RESULTS ==")
+    print("== VOLUME BREAKOUT INSTITUTIONAL BACKTEST RESULTS ==")
     print("=" * 60)
     print(f"تعداد معاملات کل:           {stats['trades']}")
     print(f"وین‌ریت (Win Rate):          {stats['win_rate']}%")
@@ -246,7 +251,6 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
 
 
 if __name__ == "__main__":
-    # تست اولیه با داده‌های شبیه‌سازی‌شده
     np.random.seed(42)
     n = 2000
     price = 100 + np.cumsum(np.random.randn(n) * 0.5)
@@ -256,6 +260,7 @@ if __name__ == "__main__":
         "high": price + np.random.rand(n) * 1.2,
         "low": price - np.random.rand(n) * 1.2,
         "close": price + np.random.randn(n) * 0.2,
+        "Volume": np.random.randint(1000, 5000, n)
     })
 
-    run_backtest(test_df, high_frequency_pullback_signal)
+    run_backtest(test_df, volume_breakout_signal)
