@@ -13,7 +13,7 @@ except ImportError:
   import ccxt
 
 # ============================================================
-# SCORE-HUNTER PRO — DYNAMIC TRAILING STOP ENGINE
+# SCORE-HUNTER PRO — FIXED ENGINE (NO OVERLAPPING TRADES)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
@@ -43,9 +43,6 @@ DAYS = 365
 MAX_CONSECUTIVE_LOSSES = 4
 
 
-# ============================================================
-# 1. DATA INGESTION (LBank API)
-# ============================================================
 def fetch_lbank_data(lbank_symbol, start_dt, end_dt):
   since_ts = int((start_dt - timedelta(days=15)).timestamp() * 1000)
   end_ts = int(end_dt.timestamp() * 1000)
@@ -86,9 +83,6 @@ def fetch_lbank_data(lbank_symbol, start_dt, end_dt):
   return df[(df.index >= start_dt) & (df.index <= end_dt)]
 
 
-# ============================================================
-# 2. INDICATOR ENGINE (Zero Look-Ahead)
-# ============================================================
 def prepare_indicators(df):
   df = df.copy()
   df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
@@ -99,45 +93,43 @@ def prepare_indicators(df):
   low_close = np.abs(df["Low"] - df["Close"].shift())
   ranges = pd.concat([high_low, high_close, low_close], axis=1)
   df["ATR"] = ranges.max(axis=1).rolling(14).mean()
-
-  df["Body"] = (df["Close"] - df["Open"]).abs()
-  df["Avg_Body"] = df["Body"].rolling(20).mean()
   return df
 
 
-# ============================================================
-# 3. BACKTEST EXECUTION WITH TRAILING STOP
-# ============================================================
 def run_backtest_engine(symbol, df):
   trades = []
   capital = INITIAL_CAPITAL
   position_size = TRADE_MARGIN * LEVERAGE
   consecutive_losses = 0
 
-  for i in range(200, len(df)):
+  i = 200
+  while i < len(df):
     current_candle = df.iloc[i]
     prev_candle = df.iloc[i - 1]
+    prev_prev = df.iloc[i - 2]
 
+    # محافظت در برابر باخت‌های متوالی
     if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+      # استراحت ربات به مدت ۲۰ کندل (۵ ساعت) پس از ۴ باخت متوالی
+      i += 20
       consecutive_losses = 0
+      continue
 
-    is_bullish_trend = (
-        prev_candle["Close"] > prev_candle["EMA_200"]
+    # شرط ورود دقیق‌تر (کراس صعودی یا نزولی EMA 50 و EMA 200 به همراه تاییدیه)
+    cross_bullish = (
+        prev_prev["EMA_50"] <= prev_prev["EMA_200"]
         and prev_candle["EMA_50"] > prev_candle["EMA_200"]
     )
-    is_bearish_trend = (
-        prev_candle["Close"] < prev_candle["EMA_200"]
+    cross_bearish = (
+        prev_prev["EMA_50"] >= prev_prev["EMA_200"]
         and prev_candle["EMA_50"] < prev_candle["EMA_200"]
     )
 
-    strong_momentum = (
-        prev_candle["Body"] > 1.2 * prev_candle["Avg_Body"]
-    ) if "Avg_Body" in prev_candle else True
-
-    if not (is_bullish_trend or is_bearish_trend) or not strong_momentum:
+    if not cross_bullish and not cross_bearish:
+      i += 1
       continue
 
-    side = "LONG" if is_bullish_trend else "SHORT"
+    side = "LONG" if cross_bullish else "SHORT"
     entry_price = (
         current_candle["Open"] * (1.0 + SLIPPAGE)
         if side == "LONG"
@@ -146,6 +138,7 @@ def run_backtest_engine(symbol, df):
     atr = prev_candle["ATR"]
 
     if not np.isfinite(atr) or atr <= 0:
+      i += 1
       continue
 
     if side == "LONG":
@@ -157,40 +150,34 @@ def run_backtest_engine(symbol, df):
 
     outcome = "LOSS"
     exit_price = sl
+    exit_index = i + 1
 
-    # اسکن کندل‌های آینده همراه با تریلینگ استاپ پویا
-    for j in range(i + 1, min(i + 50, len(df))):
+    # اسکن کندل‌های آینده تا بسته شدن این پوزیشن مشخص
+    for j in range(i + 1, min(i + 100, len(df))):
       future_candle = df.iloc[j]
       h, l = future_candle["High"], future_candle["Low"]
 
       if side == "LONG":
-        # فعال‌سازی تریلینگ اگر قیمت به اندازه 1 * ATR صعود کند
-        if h >= entry_price + atr:
-          new_sl = h - atr
-          if new_sl > sl:
-            sl = new_sl  # قفل کردن سود
-
         if l <= sl:
-          outcome = "WIN" if sl > entry_price else "LOSS"
+          outcome = "LOSS"
           exit_price = sl
+          exit_index = j
           break
         elif h >= tp:
           outcome = "WIN"
           exit_price = tp
+          exit_index = j
           break
       else:
-        if l <= entry_price - atr:
-          new_sl = l + atr
-          if new_sl < sl:
-            sl = new_sl
-
         if h >= sl:
-          outcome = "WIN" if sl < entry_price else "LOSS"
+          outcome = "LOSS"
           exit_price = sl
+          exit_index = j
           break
         elif l <= tp:
           outcome = "WIN"
           exit_price = tp
+          exit_index = j
           break
 
     price_ret = (
@@ -218,17 +205,15 @@ def run_backtest_engine(symbol, df):
         "Capital": capital,
     })
 
+    # جهش به کندل بعد از خروج از پوزیشن (جلوگیری از همپوشانی)
+    i = exit_index + 1
+
   return trades
 
 
-# ============================================================
-# 4. REPORTING & EXECUTION
-# ============================================================
 def main():
   print("=" * 70)
-  print(
-      "SCORE-HUNTER PRO — DYNAMIC TRAILING BACKTEST SIMULATION IN PROGRESS..."
-  )
+  print("SCORE-HUNTER PRO — FIXED ENGINE SIMULATION IN PROGRESS...")
   print("=" * 70)
 
   end_dt = datetime.now()
@@ -270,7 +255,7 @@ def main():
   max_streak = max(loss_streaks) if loss_streaks else 0
 
   print("\n" + "=" * 70)
-  print("== SCORE-HUNTER PRO: OPTIMIZED TRAILING RESULTS (1 YEAR) ==")
+  print("== SCORE-HUNTER PRO: CORRECTED RESULTS (1 YEAR) ==")
   print("=" * 70)
   print(f"Total Trades:              {total_trades}")
   print(f"Win Rate:                  {win_rate:.2f}%")
