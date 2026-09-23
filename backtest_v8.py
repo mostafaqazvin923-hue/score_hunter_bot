@@ -1,259 +1,346 @@
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
-import pandas as pd
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
+import subprocess
+import sys
+from datetime import datetime, timedelta
+
+try:
+    import ccxt
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
+    import ccxt
+
 import numpy as np
-import os
-
-
-# ============================================================
-# 1. CONFIG & RISK ENGINE
-# ============================================================
-
-@dataclass
-class CLEConfig:
-    risk_reward: float = 2.0
-    trade_margin: float = 100.0
-    leverage: float = 50.0
-    fee_rate: float = 0.0007
-    min_confluence_score: int = 5  # آستانه امتیاز منعطف (از ۱۰ امتیاز)
-    max_consecutive_losses: int = 5
-
-
-class CLERiskManager:
-    def __init__(self, initial_equity: float, config: CLEConfig = None):
-        self.cfg = config or CLEConfig()
-        self.equity = initial_equity
-        self.initial_equity = initial_equity
-        self.open_trade = None
-        self.consecutive_losses = 0
-        self.trading_paused = False
-        self.pause_timer = 0
-        self.trade_history = []
-
-    def can_open_new_trade(self) -> bool:
-        if self.trading_paused or self.open_trade is not None or self.equity < self.cfg.trade_margin:
-            return False
-        return True
-
-    def position_size(self, entry_price: float, stop_price: float) -> float:
-        notional_value = self.cfg.trade_margin * self.cfg.leverage
-        return notional_value / entry_price
-
-    def register_result(self, pnl_amount: float, is_win: bool):
-        notional = self.cfg.trade_margin * self.cfg.leverage
-        fee_cost = notional * self.cfg.fee_rate * 2.0  # کارمزد رفت و برگشت
-        net_pnl = pnl_amount - fee_cost
-        
-        self.equity += net_pnl
-        if self.equity < 0:
-            self.equity = 0.0
-
-        self.trade_history.append({"win": is_win, "net_pnl": net_pnl})
-
-        if not is_win:
-            self.consecutive_losses += 1
-            if self.consecutive_losses >= self.cfg.max_consecutive_losses:
-                self.trading_paused = True
-                self.pause_timer = 10
-        else:
-            self.consecutive_losses = 0
-
-    def tick_pause(self):
-        if self.trading_paused:
-            self.pause_timer -= 1
-            if self.pause_timer <= 0:
-                self.trading_paused = False
-                self.consecutive_losses = 0
-
-    def get_stats(self) -> Dict[str, Any]:
-        total = len(self.trade_history)
-        if total == 0:
-            return {"trades": 0, "win_rate": 0.0, "equity": self.equity}
-        wins = sum(1 for t in self.trade_history if t["win"])
-        return {
-            "trades": total,
-            "win_rate": round((wins / total) * 100, 2),
-            "equity": round(self.equity, 2)
-        }
-
+import pandas as pd
 
 # ============================================================
-# 2. CAUSAL MARKET STRUCTURE & REGIME DETECTOR (بدون Lookahead)
+# تنظیمات اصلی LBank و CLE-1
 # ============================================================
 
-class MarketContextAnalyzer:
-    @staticmethod
-    def get_market_regime(df_4h: pd.DataFrame, current_idx: int) -> str:
-        if current_idx < 50:
-            return "Neutral"
-        
-        subset = df_4h.iloc[:current_idx + 1]
-        close = subset["close"].iloc[-1]
-        ema_50 = subset["close"].ewm(span=50, adjust=False).mean().iloc[-1]
-        
-        recent_highs = subset["high"].rolling(10).max().iloc[-1]
-        recent_lows = subset["low"].rolling(10).min().iloc[-1]
-        
-        if close > ema_50 and close >= recent_highs * 0.99:
-            return "Bull"
-        elif close < ema_50 and close <= recent_lows * 1.01:
-            return "Bear"
-        
-        return "Neutral"
+exchange = ccxt.lbank({"enableRateLimit": True})
 
+SYMBOLS = {
+    "BTC": "BTC/USDT",
+    "ETH": "ETH/USDT",
+    "SOL": "SOL/USDT",
+    "XRP": "XRP/USDT",
+    "LINK": "LINK/USDT",
+    "UNI": "UNI/USDT",
+    "ICP": "ICP/USDT",
+    "INJ": "INJ/USDT",
+    "ATOM": "ATOM/USDT",
+    "RENDER": "RENDER/USDT",
+    "XLM": "XLM/USDT",
+    "AAVE": "AAVE/USDT",
+    "WIF": "WIF/USDT",
+    "ONDO": "ONDO/USDT",
+    "DOGE": "DOGE/USDT",
+    "BNB": "BNB/USDT",
+    "ADA": "ADA/USDT",
+}
 
-# ============================================================
-# 3. CLE-1 SIGNAL GENERATOR
-# ============================================================
+REMOVED_COINS = {
+    "NEAR", "OP", "HYPE", "HBAR", "AVAX", "SUI", "PENDLE", "TIA",
+    "FET", "SEI", "ARB", "DOT", "ETC", "SHIB", "STX", "RUNE",
+    "MKR", "APT", "LTC", "AR", "IMX", "PEPE", "BONK",
+}
 
-class CLEStrategyCore:
-    def __init__(self, risk_manager: CLERiskManager, config: CLEConfig = None):
-        self.rm = risk_manager
-        self.cfg = config or CLEConfig()
+SYMBOLS = {k: v for k, v in SYMBOLS.items() if k not in REMOVED_COINS}
 
-    def evaluate_signal(self, df_15m: pd.DataFrame, df_4h: pd.DataFrame, idx_15m: int) -> Optional[Dict[str, Any]]:
-        if idx_15m < 30:
+LOOKBACK_DAYS = 365
+TIMEFRAME = "4h"  # به عنوان پایه بازار یا برای انطباق
+TIMEFRAME_15M = "15m" # اگر لایو 15 دقیقه بخواهیم، اما برای تطبیق با ساختار لایو روی 4h پیاده می‌کنیم
+MAX_POSITIONS = 5
+SLIPPAGE = 0.0003
+FEE_RATE = 0.0007
+ATR_PERIOD = 14
+INITIAL_CAPITAL = 1000.0
+TRADE_MARGIN = 100.0
+LEVERAGE = 50.0
+
+start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
+since_timestamp = int(start_date.timestamp() * 1000)
+
+print("=" * 60)
+print("📥 دریافت داده‌ها - CLE-1 روی پلتفرم LBank")
+print("=" * 60)
+
+processed_data = {}
+
+def fetch_symbol_data(lbank_symbol):
+    all_ohlcv = []
+    current_since = since_timestamp
+    last_seen = None
+
+    while current_since < exchange.milliseconds():
+        batch = None
+        for attempt in range(3):
+            try:
+                batch = exchange.fetch_ohlcv(
+                    lbank_symbol,
+                    timeframe=TIMEFRAME,
+                    since=current_since,
+                    limit=1000,
+                )
+                break
+            except Exception:
+                if attempt == 2:
+                    return None
+
+        if not batch:
+            break
+
+        first_ts = batch[0][0]
+        last_ts = batch[-1][0]
+
+        if last_seen is not None and last_ts <= last_seen:
             return None
 
-        subset = df_15m.iloc[:idx_15m + 1]
-        current_candle = subset.iloc[-1]
-        
-        # تطبیق ایندکس 15 دقیقه‌ای با تایم‌فریم 4 ساعته (هر 16 کندل 15م = یک کندل 4ساعت)
-        idx_4h = max(0, idx_15m // 16)
-        regime = MarketContextAnalyzer.get_market_regime(df_4h, idx_4h)
-        if regime == "Neutral":
-            return None
+        all_ohlcv.extend(batch)
+        last_seen = last_ts
+        current_since = last_ts + 1
 
-        score = 0
-        direction = "long" if regime == "Bull" else "short"
+        if len(batch) < 1000:
+            break
 
-        # 1. رژیم بازار -> 3 امتیاز
-        score += 3
+    if not all_ohlcv:
+        return None
 
-        # 2. تشخیص نقدینگی و Sweep -> 3 امتیاز
-        lookback_liq = 15
-        recent_high = subset["high"].iloc[-lookback_liq:-1].max()
-        recent_low = subset["low"].iloc[-lookback_liq:-1].min()
+    df = pd.DataFrame(
+        all_ohlcv,
+        columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"],
+    )
+    df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms")
+    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
 
-        if direction == "long" and current_candle["low"] < recent_low and current_candle["close"] > recent_low:
-            score += 3
-        elif direction == "short" and current_candle["high"] > recent_high and current_candle["close"] < recent_high:
-            score += 3
+    df.dropna(inplace=True)
+    df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
+    df.sort_values("Date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
 
-        # 3. شتاب و Displacement -> 2 امتیاز
-        high_low = subset["high"] - subset["low"]
-        atr = high_low.rolling(14).mean().iloc[-1]
-        candle_range = current_candle["high"] - current_candle["low"]
+    if len(df) < 50:
+        return None
 
-        if np.isfinite(atr) and atr > 0 and candle_range > (1.1 * atr):
-            score += 2
+    tr1 = df["High"] - df["Low"]
+    tr2 = np.abs(df["High"] - df["Close"].shift(1))
+    tr3 = np.abs(df["Low"] - df["Close"].shift(1))
+    df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
-        # 4. حجم LBank -> 2 امتیاز
-        if "volume" in subset.columns:
-            vol_mean = subset["volume"].rolling(14).mean().iloc[-1]
-            if np.isfinite(vol_mean) and current_candle["volume"] > (1.1 * vol_mean):
-                score += 2
+    df.set_index("Date", inplace=True)
+    return df
 
-        if score < self.cfg.min_confluence_score:
-            return None
+for symbol, lbank_symbol in SYMBOLS.items():
+    df4h = fetch_symbol_data(lbank_symbol)
+    if df4h is not None:
+        processed_data[symbol] = df4h
 
-        entry_price = current_candle["close"]
-        if not np.isfinite(atr) or atr <= 0:
-            atr = candle_range if candle_range > 0 else 1.0
-
-        if direction == "long":
-            stop_price = recent_low - (atr * 0.5)
-            risk_dist = entry_price - stop_price
-            if risk_dist <= 0:
-                stop_price = entry_price - atr
-                risk_dist = atr
-            target_price = entry_price + (risk_dist * self.cfg.risk_reward)
-        else:
-            stop_price = recent_high + (atr * 0.5)
-            risk_dist = stop_price - entry_price
-            if risk_dist <= 0:
-                stop_price = entry_price + atr
-                risk_dist = atr
-            target_price = entry_price - (risk_dist * self.cfg.risk_reward)
-
-        size = self.rm.position_size(entry_price, stop_price)
-
-        return {
-            "direction": direction,
-            "entry_price": entry_price,
-            "stop_price": stop_price,
-            "target_price": target_price,
-            "size": size,
-            "score": score
-        }
+print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
+print("⚙️ شروع اجرای بک‌تست CLE-1 با سیستم امتیازدهی (Confluence Score)...")
 
 
 # ============================================================
-# 4. BACKTEST RUNNER (مختص دیتای واقعی LBank)
+# موتور منطقی و اجرایی CLE-1
 # ============================================================
 
-def run_cle_backtest(df_15m: pd.DataFrame, df_4h: pd.DataFrame, initial_equity: float = 1000.0):
-    cfg = CLEConfig()
-    rm = CLERiskManager(initial_equity, cfg)
-    strategy = CLEStrategyCore(rm, cfg)
+def run_cle_lbank_backtest(processed_data):
+    all_timestamps = sorted({
+        ts for df in processed_data.values() for ts in df.index
+    })
+    
+    active_positions = {}
+    all_trades = []
+    equity = INITIAL_CAPITAL
+    consecutive_losses = 0
+    trading_paused = False
+    pause_timer = 0
 
-    open_trade = None
+    for ts in all_timestamps:
+        if trading_paused:
+            pause_timer -= 1
+            if pause_timer <= 0:
+                trading_paused = False
+                consecutive_losses = 0
+            continue
 
-    for i in range(30, len(df_15m)):
-        candle = df_15m.iloc[i]
+        symbols_to_close = []
         
-        if open_trade is not None:
+        # مدیریت پوزیشن‌های باز
+        for symbol, pos in list(active_positions.items()):
+            df = processed_data[symbol]
+            if ts not in df.index:
+                continue
+            
+            c4h = df.loc[ts]
             hit_stop = False
             hit_target = False
 
-            if open_trade["direction"] == "long":
-                hit_stop = candle["low"] <= open_trade["stop_price"]
-                hit_target = candle["high"] >= open_trade["target_price"]
+            if pos["side"] == "LONG":
+                hit_stop = c4h["Low"] <= pos["stop_price"]
+                hit_target = c4h["High"] >= pos["target_price"]
             else:
-                hit_stop = candle["high"] >= open_trade["stop_price"]
-                hit_target = candle["low"] <= open_trade["target_price"]
+                hit_stop = c4h["High"] >= pos["stop_price"]
+                hit_target = c4h["Low"] <= pos["target_price"]
 
             if hit_stop or hit_target:
                 is_win = hit_target
-                if is_win:
-                    pnl = abs(open_trade["target_price"] - open_trade["entry_price"]) * open_trade["size"]
-                else:
-                    pnl = -abs(open_trade["entry_price"] - open_trade["stop_price"]) * open_trade["size"]
+                notional = TRADE_MARGIN * LEVERAGE
+                fee_cost = notional * FEE_RATE * 2.0
                 
-                rm.register_result(pnl, is_win)
-                open_trade = None
+                if is_win:
+                    pnl_amount = abs(pos["target_price"] - pos["entry_price"]) * pos["size"]
+                else:
+                    pnl_amount = -abs(pos["entry_price"] - pos["stop_price"]) * pos["size"]
+                
+                net_pnl = pnl_amount - fee_cost
+                equity += net_pnl
+                
+                outcome = "WIN" if is_win else "LOSS"
+                all_trades.append({
+                    "Timestamp": ts,
+                    "Symbol": symbol,
+                    "Side": pos["side"],
+                    "Outcome": outcome,
+                    "Net_PnL": net_pnl,
+                })
+                
+                if not is_win:
+                    consecutive_losses += 1
+                    if consecutive_losses >= 5:
+                        trading_paused = True
+                        pause_timer = 10
+                else:
+                    consecutive_losses = 0
 
-        elif rm.can_open_new_trade():
-            signal = strategy.evaluate_signal(df_15m, df_4h, i)
-            if signal is not None:
-                open_trade = signal
+                symbols_to_close.append(symbol)
 
-        rm.tick_pause()
+        for sym in symbols_to_close:
+            del active_positions[sym]
 
-    stats = rm.get_stats()
-    print("=" * 60)
-    print("== CLE-1 LBANK REAL DATA BACKTEST RESULTS ==")
-    print("=" * 60)
-    print(f"تعداد معاملات کل:           {stats['trades']}")
-    print(f"وین‌ریت (Win Rate):          {stats['win_rate']}%")
-    print(f"سرمایه‌ی نهایی (USD):        ${stats['equity']}")
-    print("=" * 60)
-    return stats
+        # بررسی ورود جدید برای هر نماد با سیستم امتیازدهی CLE-1
+        if len(active_positions) >= MAX_POSITIONS or equity < TRADE_MARGIN:
+            continue
+
+        for symbol, df in processed_data.items():
+            if symbol in active_positions or ts not in df.index:
+                continue
+
+            i = df.index.get_loc(ts)
+            if i < 30:
+                continue
+
+            subset = df.iloc[:i + 1]
+            current_candle = subset.iloc[-1]
+            close = current_candle["Close"]
+            ema_50 = current_candle["EMA50"]
+            atr = current_candle["ATR"]
+
+            if not np.isfinite(atr) or atr <= 0:
+                continue
+
+            # رژیم بازار (پایه 4 ساعته)
+            recent_highs = subset["High"].rolling(10).max().iloc[-1]
+            recent_lows = subset["Low"].rolling(10).min().iloc[-1]
+
+            regime = "Neutral"
+            if close > ema_50 and close >= recent_highs * 0.99:
+                regime = "Bull"
+            elif close < ema_50 and close <= recent_lows * 1.01:
+                regime = "Bear"
+
+            if regime == "Neutral":
+                continue
+
+            score = 0
+            direction = "LONG" if regime == "Bull" else "SHORT"
+
+            # 1. رژیم بازار -> 3 امتیاز
+            score += 3
+
+            # 2. نقدینگی و Sweep -> 3 امتیاز
+            lookback_liq = 15
+            if len(subset) > lookback_liq:
+                recent_high = subset["High"].iloc[-lookback_liq:-1].max()
+                recent_low = subset["Low"].iloc[-lookback_liq:-1].min()
+
+                if direction == "LONG" and current_candle["Low"] < recent_low and current_candle["Close"] > recent_low:
+                    score += 3
+                elif direction == "SHORT" and current_candle["High"] > recent_high and current_candle["Close"] < recent_high:
+                    score += 3
+
+            # 3. شتاب (Displacement) -> 2 امتیاز
+            candle_range = current_candle["High"] - current_candle["Low"]
+            if candle_range > (1.1 * atr):
+                score += 2
+
+            # 4. حجم LBank -> 2 امتیاز
+            vol_mean = subset["Volume"].rolling(14).mean().iloc[-1]
+            if np.isfinite(vol_mean) and current_candle["Volume"] > (1.1 * vol_mean):
+                score += 2
+
+            # حد نصاب امتیاز (حداقل ۵ از ۱۰)
+            if score < 5:
+                continue
+
+            # تنظیمات پوزیشن و ریسک به ریوارد 1:2
+            entry_price = current_candle["Open"] * (1 + SLIPPAGE) if direction == "LONG" else current_candle["Open"] * (1 - SLIPPAGE)
+            
+            if direction == "LONG":
+                stop_price = recent_low - (atr * 0.5)
+                if entry_price - stop_price <= 0:
+                    stop_price = entry_price - atr
+                risk_dist = entry_price - stop_price
+                target_price = entry_price + (risk_dist * 2.0)
+            else:
+                stop_price = recent_high + (atr * 0.5)
+                if stop_price - entry_price <= 0:
+                    stop_price = entry_price + atr
+                risk_dist = stop_price - entry_price
+                target_price = entry_price - (risk_dist * 2.0)
+
+            notional_value = TRADE_MARGIN * LEVERAGE
+            size = notional_value / entry_price
+
+            active_positions[symbol] = {
+                "side": direction,
+                "entry_price": entry_price,
+                "stop_price": stop_price,
+                "target_price": target_price,
+                "size": size,
+            }
+
+            if len(active_positions) >= MAX_POSITIONS:
+                break
+
+    return pd.DataFrame(all_trades), equity
+
+
+def summarize_cle_result(trades_df, final_equity):
+    print("\n" + "=" * 68)
+    print("📊 گزارش نهایی استراتژی CLE-1 روی داده‌های واقعی LBank")
+    print("=" * 68)
+
+    if trades_df.empty:
+        print("⚠️ هیچ معامله‌ای ثبت نشد.")
+        return
+
+    total_trades = len(trades_df)
+    wins = int((trades_df["Outcome"] == "WIN").sum())
+    losses = int((trades_df["Outcome"] == "LOSS").sum())
+    wr = (wins / total_trades * 100) if total_trades > 0 else 0
+    total_dollar_pnl = float(trades_df["Net_PnL"].sum())
+
+    print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
+    print(f"🔸 مارجین: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
+    print(f"🔸 تعداد کل معاملات: {total_trades}")
+    print(f"   🔹 معاملات برنده: {wins} | معاملات بازنده: {losses}")
+    print(f"🎯 وین‌ریت کلی: {wr:.2f}%")
+    print(f"💵 مجموع سود/زیان دلاری خالص: ${total_dollar_pnl:,.2f}")
+    print(f"🏦 سرمایه نهایی: ${final_equity:,.2f}")
+    print("=" * 68)
 
 
 if __name__ == "__main__":
-    # مسیر فایل‌های واقعی LBank خودت را اینجا وارد کن (مثلاً فایل‌های CSV یا Parquet موجود در پروژه)
-    data_path_15m = "lbank_data_15m.csv"  # نام فایل دیتای ۱۵ دقیقه‌ای ال‌بنک
-    data_path_4h = "lbank_data_4h.csv"    # نام فایل دیتای ۴ ساعته ال‌بنک
-
-    if os.path.exists(data_path_15m) and os.path.exists(data_path_4h):
-        df_15 = pd.read_csv(data_path_15m)
-        df_4 = pd.read_csv(data_path_4h)
-        
-        # اطمینان از نام ستون‌ها (استاندارد ال‌بنک)
-        for df in [df_15, df_4]:
-            df.columns = [c.lower() for c in df.columns]
-
-        run_cle_backtest(df_15, df_4)
-    else:
-        print(f"⚠️ فایل‌های دیتا در مسیر پیدا نشدند. لطفاً مسیر فایل‌های LBank را اصلاح کن.")
+    df_trades, final_equity = run_cle_lbank_backtest(processed_data)
+    summarize_cle_result(df_trades, final_equity)
+    print("\n✨ بک‌تست CLE-1 با موفقیت روی دیتای زنده صرافی به پایان رسید.")
