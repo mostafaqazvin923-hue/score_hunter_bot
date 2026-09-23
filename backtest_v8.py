@@ -5,16 +5,16 @@ import numpy as np
 
 
 # ============================================================
-# 1. RISK MANAGER & CONFIG (قانون سفت‌وسخت: مارجین ۱۰۰ و اهرم ۵۰)
+# 1. RISK MANAGER & CONFIG (مارجین ۱۰۰، اهرم ۵۰، ریوارد ۱ به ۲)
 # ============================================================
 
 @dataclass
 class RiskConfig:
-    risk_reward: float = 1.8
-    max_consecutive_losses: int = 5
+    risk_reward: float = 2.0  # اصلاح دقیق به ریوارد ۱ به ۲
+    max_consecutive_losses: int = 6
     min_trades_for_stats: int = 50
     trade_margin: float = 100.0
-    leverage: float = 50.0  # ضریب ثابت و دست‌نزده
+    leverage: float = 50.0
     fee_rate: float = 0.0007
 
 
@@ -53,7 +53,7 @@ class RiskManager:
             self.consecutive_losses += 1
             if self.consecutive_losses >= self.cfg.max_consecutive_losses:
                 self.trading_paused = True
-                self.pause_timer = 10
+                self.pause_timer = 5
         else:
             self.consecutive_losses = 0
 
@@ -122,6 +122,7 @@ class StrategyCore:
         entry_price = candle["open"]
         stop_price = sig["stop_price"]
         
+        # اعمال دقیق ضریب ۲.۰ برای حد سود بر اساس فاصله تا استاپ‌لاوس
         if sig["direction"] == "long":
             target_price = entry_price + (self.rm.cfg.risk_reward * abs(entry_price - stop_price))
         else:
@@ -166,52 +167,41 @@ class StrategyCore:
 
 
 # ============================================================
-# 3. ADVANCED HYBRID SIGNAL (ATR SQUEEZE + VOLUME MOMENTUM)
+# 3. HIGH-FREQUENCY ULTRA-FAST RSI MEAN REVERSION SIGNAL
 # ============================================================
 
-def hybrid_institutional_signal(history_list):
-    if len(history_list) < 40:
+def ultra_fast_rsi_signal(history_list):
+    if len(history_list) < 15:
         return None
 
     df = pd.DataFrame(history_list)
     
-    # محاسبه باندهای نوسانی برای تشخیص فشردگی (ATR Squeeze)
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    
+    avg_gain = gain.rolling(2).mean()
+    avg_loss = loss.rolling(2).mean()
+    
+    rs = avg_gain / (avg_loss + 1e-10)
+    df["RSI2"] = 100 - (100 / (1 + rs))
+
     high_low = df["High"] - df["Low"] if "High" in df else df["high"] - df["low"]
-    df["ATR"] = high_low.rolling(14).mean()
-    df["ATR_MA"] = df["ATR"].rolling(20).mean()
+    df["ATR"] = high_low.rolling(10).mean()
 
-    # کانال دانچیان سریع برای شکست نوسانی
-    df["Donchian_High"] = df["High"].rolling(15).max() if "High" in df else df["high"].rolling(15).max()
-    df["Donchian_Low"] = df["Low"].rolling(15).min() if "Low" in df else df["low"].rolling(15).min()
-
-    # حجم معاملات
-    if "Volume" in df:
-        df["Vol_SMA"] = df["Volume"].rolling(20).mean()
-        current_vol = df["Volume"].iloc[-1]
-        vol_sma = df["Vol_SMA"].iloc[-1]
-    else:
-        current_vol, vol_sma = 1.0, 1.0
-
+    last_rsi = df["RSI2"].iloc[-1]
     last_close = df["close"].iloc[-1]
-    prev_dhigh = df["Donchian_High"].shift(1).iloc[-1]
-    prev_dlow = df["Donchian_Low"].shift(1).iloc[-1]
     current_atr = df["ATR"].iloc[-1]
-    atr_ma = df["ATR_MA"].iloc[-1]
 
-    if not np.isfinite(current_atr) or not np.isfinite(atr_ma) or current_atr <= 0:
+    if not np.isfinite(last_rsi) or not np.isfinite(current_atr) or current_atr <= 0:
         return None
 
-    # فیلتر تاییدیه حجم و خروج از فشردگی نوسان
-    is_volume_ok = current_vol > (1.2 * vol_sma) if "Volume" in df else True
-
-    # ستاپ لانگ: شکست سقف کانال + حجم بالا + هم‌راستایی نوسان
-    if last_close > prev_dhigh and is_volume_ok:
-        stop_price = last_close - (current_atr * 1.2)
+    if last_rsi < 10:
+        stop_price = last_close - (current_atr * 0.8)
         return {"direction": "long", "stop_price": stop_price}
     
-    # ستاپ شورت: شکست کف کانال + حجم بالا
-    elif last_close < prev_dlow and is_volume_ok:
-        stop_price = last_close + (current_atr * 1.2)
+    elif last_rsi > 90:
+        stop_price = last_close + (current_atr * 0.8)
         return {"direction": "short", "stop_price": stop_price}
 
     return None
@@ -239,7 +229,7 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
 
     stats = rm.stats()
     print("=" * 60)
-    print("== HYBRID INSTITUTIONAL BACKTEST RESULTS (LEVERAGE 50) ==")
+    print("== ULTRA HIGH-FREQUENCY RSI(2) BACKTEST RESULTS (RR 1:2) ==")
     print("=" * 60)
     print(f"تعداد معاملات کل:           {stats['trades']}")
     print(f"وین‌ریت (Win Rate):          {stats['win_rate']}%")
@@ -254,15 +244,14 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
 
 if __name__ == "__main__":
     np.random.seed(42)
-    n = 2000
-    price = 100 + np.cumsum(np.random.randn(n) * 0.4)
+    n = 2500
+    price = 100 + np.cumsum(np.random.randn(n) * 0.3)
     test_df = pd.DataFrame({
         "time": range(n),
         "open": price,
-        "high": price + np.random.rand(n) * 1.0,
-        "low": price - np.random.rand(n) * 1.0,
-        "close": price + np.random.randn(n) * 0.2,
-        "Volume": np.random.randint(1000, 5000, n)
+        "high": price + np.random.rand(n) * 0.8,
+        "low": price - np.random.rand(n) * 0.8,
+        "close": price + np.random.randn(n) * 0.15,
     })
 
-    run_backtest(test_df, hybrid_institutional_signal)
+    run_backtest(test_df, ultra_fast_rsi_signal)
