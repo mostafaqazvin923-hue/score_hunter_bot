@@ -10,8 +10,8 @@ import numpy as np
 
 @dataclass
 class RiskConfig:
-    max_consecutive_losses: int = 4
-    min_trades_for_stats: int = 20
+    max_consecutive_losses: int = 5
+    min_trades_for_stats: int = 50
     trade_margin: float = 100.0
     leverage: float = 50.0
     fee_rate: float = 0.0007
@@ -49,7 +49,7 @@ class RiskManager:
             self.consecutive_losses += 1
             if self.consecutive_losses >= self.cfg.max_consecutive_losses:
                 self.trading_paused = True
-                self.pause_timer = 15
+                self.pause_timer = 10  # استراحت کوتاه برای فرکانس بالا
         else:
             self.consecutive_losses = 0
 
@@ -150,50 +150,55 @@ class StrategyCore:
         if hit_stop:
             pnl_amount = -t.size * abs(t.entry_price - t.stop_price)
             is_win = False
-            result = "loss"
         else:
             pnl_amount = t.size * abs(current_ema - t.entry_price) if t.direction == "long" else t.size * abs(t.entry_price - current_ema)
             is_win = True
-            result = "win"
 
         self.rm.register_result(pnl_amount, is_win)
         self.rm.open_trade = None
-        return {"type": "exit", "result": result}
+        return {"type": "exit", "result": "win" if is_win else "loss"}
 
 
 # ============================================================
-# 3. OPTIMIZED Z-SCORE SIGNAL (فریاد حجم و فرکانس بالا)
+# 3. HIGH-FREQUENCY RSI SCALPING SIGNAL
 # ============================================================
 
-def zscore_mean_reversion_signal(history_list):
-    if len(history_list) < 30:
+def high_frequency_rsi_signal(history_list):
+    if len(history_list) < 25:
         return None
 
     df = pd.DataFrame(history_list)
-    span = 14  # کاهش دوره برای حساسیت و تعداد سیگنال بیشتر
+    span = 9
     df["EMA"] = df["close"].ewm(span=span, adjust=False).mean()
-    rolling_std = df["close"].rolling(span).std()
+
+    # محاسبه سریع RSI ۷ دوره‌ای برای بالا بردن فرکانس سیگنال‌ها
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
     
-    df["Z_Score"] = (df["close"] - df["EMA"]) / rolling_std
+    avg_gain = gain.rolling(7).mean()
+    avg_loss = loss.rolling(7).mean()
+    
+    rs = avg_gain / (avg_loss + 1e-10)
+    df["RSI"] = 100 - (100 / (1 + rs))
 
     high_low = df["High"] - df["Low"] if "High" in df else df["high"] - df["low"]
     df["ATR"] = high_low.rolling(14).mean()
 
-    last_z = df["Z_Score"].iloc[-1]
+    last_rsi = df["RSI"].iloc[-1]
     last_close = df["close"].iloc[-1]
-    prev_close = df["close"].iloc[-2] if len(df) > 1 else last_close
     current_atr = df["ATR"].iloc[-1]
 
-    if not np.isfinite(last_z) or not np.isfinite(current_atr) or current_atr <= 0:
+    if not np.isfinite(last_rsi) or not np.isfinite(current_atr) or current_atr <= 0:
         return None
 
-    # کاهش آستانه به 1.5 برای افزایش تعداد معاملات + تاییدیه بازگشت کندل
-    if last_z < -1.5 and last_close > prev_close:
-        stop_price = last_close - (current_atr * 1.5)
+    # فرکانس بالا: آستانه های اشباع ملایم‌تر (RSI < 35 برای لانگ و RSI > 65 برای شورت)
+    if last_rsi < 35:
+        stop_price = last_close - (current_atr * 1.0)
         return {"direction": "long", "stop_price": stop_price, "target_ema_span": span}
     
-    elif last_z > 1.5 and last_close < prev_close:
-        stop_price = last_close + (current_atr * 1.5)
+    elif last_rsi > 65:
+        stop_price = last_close + (current_atr * 1.0)
         return {"direction": "short", "stop_price": stop_price, "target_ema_span": span}
 
     return None
@@ -219,7 +224,7 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
 
     stats = rm.stats()
     print("=" * 60)
-    print("== HIGH-FREQUENCY Z-SCORE BACKTEST RESULTS ==")
+    print("== ULTRA HIGH-FREQUENCY RSI BACKTEST RESULTS ==")
     print("=" * 60)
     print(f"تعداد معاملات کل:           {stats['trades']}")
     print(f"وین‌ریت (Win Rate):          {stats['win_rate']}%")
@@ -244,4 +249,4 @@ if __name__ == "__main__":
         "close": price + np.random.randn(n) * 0.2,
     })
 
-    run_backtest(test_df, zscore_mean_reversion_signal)
+    run_backtest(test_df, high_frequency_rsi_signal)
