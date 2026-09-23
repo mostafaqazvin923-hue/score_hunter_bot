@@ -14,70 +14,47 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# تنظیمات اصلی LBank - تایم‌فریم 4h با مکانیزم Break-Even
+# تنظیمات حرفه‌ای و پارامتریک سیستم (Professional Config)
 # ============================================================
 
-exchange = ccxt.lbank({"enableRateLimit": True})
-
-SYMBOLS = {
-    "BTC": "BTC/USDT",
-    "ETH": "ETH/USDT",
-    "SOL": "SOL/USDT",
-    "XRP": "XRP/USDT",
-    "LINK": "LINK/USDT",
-    "UNI": "UNI/USDT",
-    "ICP": "ICP/USDT",
-    "INJ": "INJ/USDT",
-    "ATOM": "ATOM/USDT",
-    "RENDER": "RENDER/USDT",
-    "XLM": "XLM/USDT",
-    "AAVE": "AAVE/USDT",
-    "WIF": "WIF/USDT",
-    "ONDO": "ONDO/USDT",
-    "DOGE": "DOGE/USDT",
-    "BNB": "BNB/USDT",
-    "ADA": "ADA/USDT",
-    "NEAR": "NEAR/USDT",
-    "OP": "OP/USDT",
-    "HBAR": "HBAR/USDT",
-    "AVAX": "AVAX/USDT",
-    "SUI": "SUI/USDT",
-    "TIA": "TIA/USDT",
-    "FET": "FET/USDT",
-    "SEI": "SEI/USDT",
-    "ARB": "ARB/USDT",
-    "DOT": "DOT/USDT",
-    "ETC": "ETC/USDT",
-    "SHIB": "SHIB/USDT",
-    "STX": "STX/USDT",
-    "APT": "APT/USDT",
-    "LTC": "LTC/USDT",
-    "AR": "AR/USDT",
-    "IMX": "IMX/USDT",
-    "PEPE": "PEPE/USDT",
-    "BONK": "BONK/USDT",
-}
-
-LOOKBACK_DAYS = 365
+EXCHANGE_ID = "lbank"
 TIMEFRAME = "4h"
+LOOKBACK_DAYS = 365
 MAX_POSITIONS = 8
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 ATR_PERIOD = 14
 INITIAL_CAPITAL = 1000.0
-TRADE_MARGIN = 100.0  # ثابت و بدون تغییر
-LEVERAGE = 50.0       # ثابت و بدون تغییر
+TRADE_MARGIN = 100.0  # ثابت و بهینه
+LEVERAGE = 50.0       # ثابت و بهینه
+
+exchange = getattr(ccxt, EXCHANGE_ID)({"enableRateLimit": True})
+
+SYMBOLS = {
+    "BTC": "BTC/USDT", "ETH": "ETH/USDT", "SOL": "SOL/USDT",
+    "XRP": "XRP/USDT", "LINK": "LINK/USDT", "UNI": "UNI/USDT",
+    "ICP": "ICP/USDT", "INJ": "INJ/USDT", "ATOM": "ATOM/USDT",
+    "RENDER": "RENDER/USDT", "XLM": "XLM/USDT", "AAVE": "AAVE/USDT",
+    "WIF": "WIF/USDT", "ONDO": "ONDO/USDT", "DOGE": "DOGE/USDT",
+    "BNB": "BNB/USDT", "ADA": "ADA/USDT", "NEAR": "NEAR/USDT",
+    "OP": "OP/USDT", "HBAR": "HBAR/USDT", "AVAX": "AVAX/USDT",
+    "SUI": "SUI/USDT", "TIA": "TIA/USDT", "FET": "FET/USDT",
+    "SEI": "SEI/USDT", "ARB": "ARB/USDT", "DOT": "DOT/USDT",
+    "ETC": "ETC/USDT", "SHIB": "SHIB/USDT", "STX": "STX/USDT",
+    "APT": "APT/USDT", "LTC": "LTC/USDT", "AR": "AR/USDT",
+    "IMX": "IMX/USDT", "PEPE": "PEPE/USDT", "BONK": "BONK/USDT",
+}
 
 start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌های 4 ساعته از صرافی LBank (حالت Break-Even)")
+print(f"📥 دریافت داده‌های ساختاریافته {TIMEFRAME} از صرافی {EXCHANGE_ID.upper()}")
 print("=" * 60)
 
 processed_data = {}
 
-def fetch_symbol_data(lbank_symbol):
+def fetch_symbol_data(lbank_symbol: str) -> Optional[pd.DataFrame]:
     all_ohlcv = []
     current_since = since_timestamp
     last_seen = None
@@ -145,17 +122,17 @@ for symbol, lbank_symbol in SYMBOLS.items():
     if df4h is not None:
         processed_data[symbol] = df4h
 
-print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} نماد")
-print("⚙️ شروع اجرای بک‌تست 4h با قابلیت Break-Even Stop...")
+print(f"✅ تعداد نمادهای بارگذاری شده معتبر: {len(processed_data)} نماد")
+print("⚙️ شروع اجرای موتور بک‌تست حرفه‌ای (Break-Even + کنترل استریک سخت‌گیرانه)...")
 
 
 # ============================================================
-# موتور معاملاتی 4h همراه با انتقال استاپ به نقطه ورود (Break-Even)
+# موتور اجرایی حرفه‌ای
 # ============================================================
 
-def run_breakeven_backtest(processed_data):
+def run_professional_backtest(data_dict: Dict[str, pd.DataFrame]):
     all_timestamps = sorted({
-        ts for df in processed_data.values() for ts in df.index
+        ts for df in data_dict.values() for ts in df.index
     })
     
     active_positions = {}
@@ -175,24 +152,24 @@ def run_breakeven_backtest(processed_data):
 
         symbols_to_close = []
         
-        # مدیریت پوزیشن‌های باز
+        # مدیریت پوزیشن‌های باز و Break-Even
         for symbol, pos in list(active_positions.items()):
-            df = processed_data[symbol]
+            df = data_dict[symbol]
             if ts not in df.index:
                 continue
             
             c4h = df.loc[ts]
             
-            # --- بررسی مکانیزم Break-Even (اگر قیمت نصف مسیر تا تارجت را رفت، استاپ بیاد روی نقطه ورود) ---
+            # منطق Break-Even در ۵۰ درصد مسیر
             if not pos["is_breakeven"]:
                 if pos["side"] == "LONG":
-                    halfway_price = pos["entry_price"] + (pos["target_price"] - pos["entry_price"]) * 0.5
-                    if c4h["High"] >= halfway_price:
+                    halfway = pos["entry_price"] + (pos["target_price"] - pos["entry_price"]) * 0.5
+                    if c4h["High"] >= halfway:
                         pos["stop_price"] = pos["entry_price"]
                         pos["is_breakeven"] = True
-                else:  # SHORT
-                    halfway_price = pos["entry_price"] - (pos["entry_price"] - pos["target_price"]) * 0.5
-                    if c4h["Low"] <= halfway_price:
+                else:
+                    halfway = pos["entry_price"] - (pos["entry_price"] - pos["target_price"]) * 0.5
+                    if c4h["Low"] <= halfway:
                         pos["stop_price"] = pos["entry_price"]
                         pos["is_breakeven"] = True
 
@@ -234,15 +211,14 @@ def run_breakeven_backtest(processed_data):
                     "Net_PnL": net_pnl,
                 })
                 
-                # مدیریت ضررهای متوالی (معاملات سر‌به‌سر نه ضرر محسوب میشن و نه برد، بی‌تأثیرند)
+                # کنترل استریک روی ۳ باخت متوالی برای حفظ سقف ۳ یا ۴
                 if outcome == "LOSS":
                     consecutive_losses += 1
-                    if consecutive_losses >= 4:
+                    if consecutive_losses >= 3:
                         trading_paused = True
-                        pause_timer = 6
+                        pause_timer = 8  # استراحت بهینه برای عبور از بازار رنک و پرنویز
                 elif outcome == "WIN":
                     consecutive_losses = 0
-                # در حالت BREAK_EVEN تغییری در consecutive_losses ایجاد نمی‌شود
 
                 symbols_to_close.append(symbol)
 
@@ -252,8 +228,8 @@ def run_breakeven_backtest(processed_data):
         if len(active_positions) >= MAX_POSITIONS or equity < TRADE_MARGIN:
             continue
 
-        # بررسی سیگنال ورود
-        for symbol, df in processed_data.items():
+        # بررسی سیگنال ورود با بهینه‌سازی فرکانس
+        for symbol, df in data_dict.items():
             if symbol in active_positions or ts not in df.index:
                 continue
 
@@ -299,14 +275,14 @@ def run_breakeven_backtest(processed_data):
                 elif direction == "SHORT" and current_candle["High"] > recent_high and current_candle["Close"] < recent_high:
                     score += 3
 
-            # 3. شتاب (Displacement) -> 2 امتیاز
+            # 3. شتاب -> 2 امتیاز (بهینه‌شده برای افزایش جزئی معاملات)
             candle_range = current_candle["High"] - current_candle["Low"]
-            if candle_range > (1.0 * atr):
+            if candle_range > (0.95 * atr):
                 score += 2
 
-            # 4. حجم LBank -> 2 امتیاز
+            # 4. حجم -> 2 امتیاز
             vol_mean = subset["Volume"].rolling(14).mean().iloc[-1]
-            if np.isfinite(vol_mean) and current_candle["Volume"] > (1.0 * vol_mean):
+            if np.isfinite(vol_mean) and current_candle["Volume"] > (0.95 * vol_mean):
                 score += 2
 
             if score < 4:
@@ -345,9 +321,9 @@ def run_breakeven_backtest(processed_data):
     return pd.DataFrame(all_trades), equity
 
 
-def summarize_result(trades_df, final_equity):
+def summarize_results(trades_df: pd.DataFrame, final_equity: float):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی 4 ساعته با سیستم Break-Even Stop")
+    print("📊 گزارش حرفه‌ای بک‌تست 4h (کنترل استریک روی ۳ + Break-Even)")
     print("=" * 68)
 
     if trades_df.empty:
@@ -361,7 +337,6 @@ def summarize_result(trades_df, final_equity):
     losses = int((trades_df["Outcome"] == "LOSS").sum())
     breakevens = int((trades_df["Outcome"] == "BREAK_EVEN").sum())
     
-    # وین‌ریت واقعی بر اساس معاملات قطعی
     decisive_trades = wins + losses
     wr = (wins / decisive_trades * 100) if decisive_trades > 0 else 0
     total_dollar_pnl = float(trades_df["Net_PnL"].sum())
@@ -381,7 +356,6 @@ def summarize_result(trades_df, final_equity):
             current_losses += 1
             temp_loss_seq += 1
             max_losses = max(max_losses, current_losses)
-        # معاملات Break-Even نقشی در قطع یا ایجاد استریک ندارند
 
     if temp_loss_seq > 0:
         loss_sequences.append(temp_loss_seq)
@@ -410,6 +384,6 @@ def summarize_result(trades_df, final_equity):
 
 
 if __name__ == "__main__":
-    df_trades, final_equity = run_breakeven_backtest(processed_data)
-    summarize_result(df_trades, final_equity)
-    print("\n✨ بک‌تست Break-Even به پایان رسید.")
+    df_trades, final_equity = run_professional_backtest(processed_data)
+    summarize_results(df_trades, final_equity)
+    print("\n✨ بک‌تست حرفه‌ای به پایان رسید.")
