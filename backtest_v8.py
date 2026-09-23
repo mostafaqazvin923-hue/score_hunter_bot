@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 import pandas as pd
 import numpy as np
+import os
 
 
 # ============================================================
@@ -102,7 +103,7 @@ class MarketContextAnalyzer:
 
 
 # ============================================================
-# 3. CLE-1 SIGNAL GENERATOR (سیستم امتیازدهی مقیاس‌پذیر)
+# 3. CLE-1 SIGNAL GENERATOR
 # ============================================================
 
 class CLEStrategyCore:
@@ -117,7 +118,9 @@ class CLEStrategyCore:
         subset = df_15m.iloc[:idx_15m + 1]
         current_candle = subset.iloc[-1]
         
-        regime = MarketContextAnalyzer.get_market_regime(df_4h, max(0, idx_15m // 16))
+        # تطبیق ایندکس 15 دقیقه‌ای با تایم‌فریم 4 ساعته (هر 16 کندل 15م = یک کندل 4ساعت)
+        idx_4h = max(0, idx_15m // 16)
+        regime = MarketContextAnalyzer.get_market_regime(df_4h, idx_4h)
         if regime == "Neutral":
             return None
 
@@ -145,17 +148,15 @@ class CLEStrategyCore:
         if np.isfinite(atr) and atr > 0 and candle_range > (1.1 * atr):
             score += 2
 
-        # 4. حجم یا پروکسی حجم -> 2 امتیاز
+        # 4. حجم LBank -> 2 امتیاز
         if "volume" in subset.columns:
             vol_mean = subset["volume"].rolling(14).mean().iloc[-1]
             if np.isfinite(vol_mean) and current_candle["volume"] > (1.1 * vol_mean):
                 score += 2
 
-        # بررسی حد نصاب امتیاز (حداقل ۵ از ۱۰)
         if score < self.cfg.min_confluence_score:
             return None
 
-        # تعیین حد ضرر و سود با ریسک به ریوارد دقیق ۱:۲
         entry_price = current_candle["close"]
         if not np.isfinite(atr) or atr <= 0:
             atr = candle_range if candle_range > 0 else 1.0
@@ -188,7 +189,7 @@ class CLEStrategyCore:
 
 
 # ============================================================
-# 4. BACKTEST RUNNER
+# 4. BACKTEST RUNNER (مختص دیتای واقعی LBank)
 # ============================================================
 
 def run_cle_backtest(df_15m: pd.DataFrame, df_4h: pd.DataFrame, initial_equity: float = 1000.0):
@@ -231,7 +232,7 @@ def run_cle_backtest(df_15m: pd.DataFrame, df_4h: pd.DataFrame, initial_equity: 
 
     stats = rm.get_stats()
     print("=" * 60)
-    print("== CLE-1 FLEXIBLE CONFLUENCE BACKTEST RESULTS ==")
+    print("== CLE-1 LBANK REAL DATA BACKTEST RESULTS ==")
     print("=" * 60)
     print(f"تعداد معاملات کل:           {stats['trades']}")
     print(f"وین‌ریت (Win Rate):          {stats['win_rate']}%")
@@ -241,18 +242,18 @@ def run_cle_backtest(df_15m: pd.DataFrame, df_4h: pd.DataFrame, initial_equity: 
 
 
 if __name__ == "__main__":
-    np.random.seed(42)
-    n = 2000
-    price = 100 + np.cumsum(np.random.randn(n) * 0.25)
-    
-    df_15 = pd.DataFrame({
-        "open": price,
-        "high": price + np.random.rand(n) * 0.5,
-        "low": price - np.random.rand(n) * 0.5,
-        "close": price + np.random.randn(n) * 0.1,
-        "volume": np.random.randint(500, 2000, n)
-    })
-    
-    df_4 = df_15.iloc[::16].copy()
+    # مسیر فایل‌های واقعی LBank خودت را اینجا وارد کن (مثلاً فایل‌های CSV یا Parquet موجود در پروژه)
+    data_path_15m = "lbank_data_15m.csv"  # نام فایل دیتای ۱۵ دقیقه‌ای ال‌بنک
+    data_path_4h = "lbank_data_4h.csv"    # نام فایل دیتای ۴ ساعته ال‌بنک
 
-    run_cle_backtest(df_15, df_4)
+    if os.path.exists(data_path_15m) and os.path.exists(data_path_4h):
+        df_15 = pd.read_csv(data_path_15m)
+        df_4 = pd.read_csv(data_path_4h)
+        
+        # اطمینان از نام ستون‌ها (استاندارد ال‌بنک)
+        for df in [df_15, df_4]:
+            df.columns = [c.lower() for c in df.columns]
+
+        run_cle_backtest(df_15, df_4)
+    else:
+        print(f"⚠️ فایل‌های دیتا در مسیر پیدا نشدند. لطفاً مسیر فایل‌های LBank را اصلاح کن.")
