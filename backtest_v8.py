@@ -1,4 +1,3 @@
-import os
 import subprocess
 import sys
 import time
@@ -14,7 +13,7 @@ except ImportError:
   import ccxt
 
 # ============================================================
-# SCORE-HUNTER PRO: Live & Backtest Engine
+# SCORE-HUNTER PRO — DYNAMIC TRAILING STOP ENGINE
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
@@ -41,11 +40,11 @@ TRADE_MARGIN = 100.0
 LEVERAGE = 50.0
 RISK_REWARD = 2.0
 DAYS = 365
-MAX_CONSECUTIVE_LOSSES = 4  # مکانیزم کنترل حد نصاب باخت متوالی
+MAX_CONSECUTIVE_LOSSES = 4
 
 
 # ============================================================
-# 1. DATA FETCHING (LBank API Integration)
+# 1. DATA INGESTION (LBank API)
 # ============================================================
 def fetch_lbank_data(lbank_symbol, start_dt, end_dt):
   since_ts = int((start_dt - timedelta(days=15)).timestamp() * 1000)
@@ -88,7 +87,7 @@ def fetch_lbank_data(lbank_symbol, start_dt, end_dt):
 
 
 # ============================================================
-# 2. INDICATORS & PREPARATION
+# 2. INDICATOR ENGINE (Zero Look-Ahead)
 # ============================================================
 def prepare_indicators(df):
   df = df.copy()
@@ -100,42 +99,45 @@ def prepare_indicators(df):
   low_close = np.abs(df["Low"] - df["Close"].shift())
   ranges = pd.concat([high_low, high_close, low_close], axis=1)
   df["ATR"] = ranges.max(axis=1).rolling(14).mean()
+
+  df["Body"] = (df["Close"] - df["Open"]).abs()
+  df["Avg_Body"] = df["Body"].rolling(20).mean()
   return df
 
 
 # ============================================================
-# 3. BACKTEST ENGINE (Zero Look-Ahead Bias)
+# 3. BACKTEST EXECUTION WITH TRAILING STOP
 # ============================================================
-def run_engine(symbol, df):
+def run_backtest_engine(symbol, df):
   trades = []
   capital = INITIAL_CAPITAL
   position_size = TRADE_MARGIN * LEVERAGE
-
   consecutive_losses = 0
 
   for i in range(200, len(df)):
     current_candle = df.iloc[i]
-    prev_candle = df.iloc[i - 1]  # تکیه کامل بر کندل بسته شده
+    prev_candle = df.iloc[i - 1]
 
-    # بررسی فیلتر حفاظتی ضررهای متوالی
     if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-      # وقفه حفاظتی یا ریست موقت ربات
-      consecutive_losses = 0  # پس از استراحت بازنشانی می‌شود
+      consecutive_losses = 0
 
-    # منطق سیگنال‌دهی استاندارد روند و مومنتوم
-    is_bullish = (
+    is_bullish_trend = (
         prev_candle["Close"] > prev_candle["EMA_200"]
         and prev_candle["EMA_50"] > prev_candle["EMA_200"]
     )
-    is_bearish = (
+    is_bearish_trend = (
         prev_candle["Close"] < prev_candle["EMA_200"]
         and prev_candle["EMA_50"] < prev_candle["EMA_200"]
     )
 
-    if not is_bullish and not is_bearish:
+    strong_momentum = (
+        prev_candle["Body"] > 1.2 * prev_candle["Avg_Body"]
+    ) if "Avg_Body" in prev_candle else True
+
+    if not (is_bullish_trend or is_bearish_trend) or not strong_momentum:
       continue
 
-    side = "LONG" if is_bullish else "SHORT"
+    side = "LONG" if is_bullish_trend else "SHORT"
     entry_price = (
         current_candle["Open"] * (1.0 + SLIPPAGE)
         if side == "LONG"
@@ -153,17 +155,23 @@ def run_engine(symbol, df):
       sl = entry_price + (atr * 1.5)
       tp = entry_price - (atr * 1.5 * RISK_REWARD)
 
-    # اسکن کندل‌های بعدی برای برخورد با TP یا SL
     outcome = "LOSS"
     exit_price = sl
 
-    for j in range(i + 1, min(i + 35, len(df))):
+    # اسکن کندل‌های آینده همراه با تریلینگ استاپ پویا
+    for j in range(i + 1, min(i + 50, len(df))):
       future_candle = df.iloc[j]
       h, l = future_candle["High"], future_candle["Low"]
 
       if side == "LONG":
+        # فعال‌سازی تریلینگ اگر قیمت به اندازه 1 * ATR صعود کند
+        if h >= entry_price + atr:
+          new_sl = h - atr
+          if new_sl > sl:
+            sl = new_sl  # قفل کردن سود
+
         if l <= sl:
-          outcome = "LOSS"
+          outcome = "WIN" if sl > entry_price else "LOSS"
           exit_price = sl
           break
         elif h >= tp:
@@ -171,8 +179,13 @@ def run_engine(symbol, df):
           exit_price = tp
           break
       else:
+        if l <= entry_price - atr:
+          new_sl = l + atr
+          if new_sl < sl:
+            sl = new_sl
+
         if h >= sl:
-          outcome = "LOSS"
+          outcome = "WIN" if sl < entry_price else "LOSS"
           exit_price = sl
           break
         elif l <= tp:
@@ -180,7 +193,6 @@ def run_engine(symbol, df):
           exit_price = tp
           break
 
-    # محاسبه سود و زیان دلاری با احتساب کمیسیون صرافی
     price_ret = (
         (exit_price - entry_price) / entry_price
         if side == "LONG"
@@ -210,12 +222,14 @@ def run_engine(symbol, df):
 
 
 # ============================================================
-# 4. MAIN EXECUTION PIPELINE
+# 4. REPORTING & EXECUTION
 # ============================================================
 def main():
-  print("=" * 60)
-  print("SCORE-HUNTER PRO — LIVE & BACKTEST SYSTEM INITIALIZED")
-  print("=" * 60)
+  print("=" * 70)
+  print(
+      "SCORE-HUNTER PRO — DYNAMIC TRAILING BACKTEST SIMULATION IN PROGRESS..."
+  )
+  print("=" * 70)
 
   end_dt = datetime.now()
   start_dt = end_dt - timedelta(days=DAYS)
@@ -223,13 +237,13 @@ def main():
   all_trades = []
 
   for symbol, lbank_symbol in SYMBOLS.items():
-    print(f"Processing {symbol} from LBank...")
+    print(f"Fetching & Backtesting {symbol} ({lbank_symbol})...")
     df = fetch_lbank_data(lbank_symbol, start_dt, end_dt)
     if df is None or len(df) < 200:
       continue
 
     df_prepared = prepare_indicators(df)
-    trades = run_engine(symbol, df_prepared)
+    trades = run_backtest_engine(symbol, df_prepared)
     all_trades.extend(trades)
 
   if not all_trades:
@@ -239,14 +253,30 @@ def main():
   trades_df = pd.DataFrame(all_trades)
   total_trades = len(trades_df)
   wins = trades_df[trades_df["Outcome"] == "WIN"]
-  win_rate = (len(wins) / total_trades) * 100.0
+
+  win_rate = (len(wins) / total_trades) * 100.0 if total_trades > 0 else 0
   net_pnl = trades_df["PnL"].sum()
 
-  print("\n" + "=" * 60)
-  print(f"TOTAL TRADES: {total_trades}")
-  print(f"WIN RATE:     {win_rate:.2f}%")
-  print(f"NET PNL:      ${net_pnl:,.2f}")
-  print("=" * 60)
+  loss_streaks, current_streak = [], 0
+  for outcome in trades_df["Outcome"]:
+    if outcome == "LOSS":
+      current_streak += 1
+    else:
+      if current_streak > 0:
+        loss_streaks.append(current_streak)
+      current_streak = 0
+  if current_streak > 0:
+    loss_streaks.append(current_streak)
+  max_streak = max(loss_streaks) if loss_streaks else 0
+
+  print("\n" + "=" * 70)
+  print("== SCORE-HUNTER PRO: OPTIMIZED TRAILING RESULTS (1 YEAR) ==")
+  print("=" * 70)
+  print(f"Total Trades:              {total_trades}")
+  print(f"Win Rate:                  {win_rate:.2f}%")
+  print(f"Net Profit (USD):          ${net_pnl:,.2f}")
+  print(f"Max Consecutive Losses:    {max_streak}")
+  print("=" * 70)
 
 
 if __name__ == "__main__":
