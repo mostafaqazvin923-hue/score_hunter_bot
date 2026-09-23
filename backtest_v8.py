@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# تنظیمات حرفه‌ای و پارامتریک سیستم (Professional Config)
+# تنظیمات استاندارد و ایزوله (Production Grade Config)
 # ============================================================
 
 EXCHANGE_ID = "lbank"
@@ -25,8 +25,8 @@ SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 ATR_PERIOD = 14
 INITIAL_CAPITAL = 1000.0
-TRADE_MARGIN = 100.0  # ثابت و بهینه
-LEVERAGE = 50.0       # ثابت و بهینه
+TRADE_MARGIN = 100.0
+LEVERAGE = 50.0
 
 exchange = getattr(ccxt, EXCHANGE_ID)({"enableRateLimit": True})
 
@@ -49,7 +49,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print(f"📥 دریافت داده‌های ساختاریافته {TIMEFRAME} از صرافی {EXCHANGE_ID.upper()}")
+print(f"📥 دریافت و پاک‌سازی داده‌های {TIMEFRAME} از صرافی {EXCHANGE_ID.upper()}")
 print("=" * 60)
 
 processed_data = {}
@@ -122,37 +122,70 @@ for symbol, lbank_symbol in SYMBOLS.items():
     if df4h is not None:
         processed_data[symbol] = df4h
 
-print(f"✅ تعداد نمادهای بارگذاری شده معتبر: {len(processed_data)} نماد")
-print("⚙️ شروع اجرای موتور بک‌تست حرفه‌ای (Break-Even + کنترل استریک سخت‌گیرانه)...")
+print(f"✅ نمادهای معتبر بارگذاری شده: {len(processed_data)}")
+print("⚙️ اجرای موتور استاندارد و بدون باگ بک‌تست...")
 
 
 # ============================================================
-# موتور اجرایی حرفه‌ای
+# موتور بک‌تست بدون Lookahead و با مدیریت صحیح پوزیشن‌ها
 # ============================================================
 
-def run_professional_backtest(data_dict: Dict[str, pd.DataFrame]):
+def run_integrity_backtest(data_dict: Dict[str, pd.DataFrame]):
     all_timestamps = sorted({
         ts for df in data_dict.values() for ts in df.index
     })
     
     active_positions = {}
+    pending_signals = []  # ذخیره سیگنال‌های کندل N برای اجرا در کندل N+1
     all_trades = []
     equity = INITIAL_CAPITAL
+    peak_equity = INITIAL_CAPITAL
+    max_drawdown = 0.0
+    
     consecutive_losses = 0
     trading_paused = False
     pause_timer = 0
 
     for ts in all_timestamps:
+        # ۱. مدیریت تایمر مکث (فقط روی ورودهای جدید تاثیر دارد و جلوی مدیریت پوزیشن را نمی‌گیرد)
         if trading_paused:
             pause_timer -= 1
             if pause_timer <= 0:
                 trading_paused = False
                 consecutive_losses = 0
-            continue
 
+        # ۲. ابتدا اجرای ورودهایی که از کندل قبل صادر شده بودند (در Open کندل فعلی)
+        symbols_to_execute = pending_signals
+        pending_signals = []
+
+        for sig in symbols_to_execute:
+            symbol = sig["symbol"]
+            if symbol in active_positions or len(active_positions) >= MAX_POSITIONS or equity < TRADE_MARGIN:
+                continue
+            
+            df = data_dict[symbol]
+            if ts not in df.index:
+                continue
+            
+            c4h = df.loc[ts]
+            # ورود در Open کندل فعلی به همراه اسلیپیج ورود
+            open_price = c4h["Open"]
+            entry_price = open_price * (1 + SLIPPAGE) if sig["side"] == "LONG" else open_price * (1 - SLIPPAGE)
+            
+            notional_value = TRADE_MARGIN * LEVERAGE
+            size = notional_value / entry_price
+
+            active_positions[symbol] = {
+                "side": sig["side"],
+                "entry_price": entry_price,
+                "stop_price": sig["stop_price"],
+                "target_price": sig["target_price"],
+                "size": size,
+                "is_breakeven": False,
+            }
+
+        # ۳. مدیریت پوزیشن‌های باز در کندل جاری
         symbols_to_close = []
-        
-        # مدیریت پوزیشن‌های باز و Break-Even
         for symbol, pos in list(active_positions.items()):
             df = data_dict[symbol]
             if ts not in df.index:
@@ -160,7 +193,7 @@ def run_professional_backtest(data_dict: Dict[str, pd.DataFrame]):
             
             c4h = df.loc[ts]
             
-            # منطق Break-Even در ۵۰ درصد مسیر
+            # بررسی Break-Even محافظه‌کارانه
             if not pos["is_breakeven"]:
                 if pos["side"] == "LONG":
                     halfway = pos["entry_price"] + (pos["target_price"] - pos["entry_price"]) * 0.5
@@ -184,11 +217,13 @@ def run_professional_backtest(data_dict: Dict[str, pd.DataFrame]):
                 hit_target = c4h["Low"] <= pos["target_price"]
 
             if hit_stop or hit_target:
-                is_win = hit_target
+                # اگر هر دو رخ داد، حالت محافظه‌کارانه این است که استاپ را مقدم بدانیم (مگر اینکه مشخص باشد تارجت اول زده شده)
+                is_win = hit_target and not hit_stop
                 is_be = (not is_win) and pos["is_breakeven"] and (pos["stop_price"] == pos["entry_price"])
                 
                 notional = TRADE_MARGIN * LEVERAGE
-                fee_cost = notional * FEE_RATE * 2.0
+                fee_cost = notional * FEE_RATE * 2.0  # کارمزد دوطرفه
+                exit_slippage_cost = notional * SLIPPAGE  # اسلیپیج خروج
                 
                 if is_win:
                     pnl_amount = abs(pos["target_price"] - pos["entry_price"]) * pos["size"]
@@ -200,8 +235,14 @@ def run_professional_backtest(data_dict: Dict[str, pd.DataFrame]):
                     pnl_amount = -abs(pos["entry_price"] - pos["stop_price"]) * pos["size"]
                     outcome = "LOSS"
                 
-                net_pnl = pnl_amount - fee_cost
+                net_pnl = pnl_amount - fee_cost - exit_slippage_cost
                 equity += net_pnl
+                
+                # ثبت Drawdown
+                if equity > peak_equity:
+                    peak_equity = equity
+                dd = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0
+                max_drawdown = max(max_drawdown, dd)
                 
                 all_trades.append({
                     "Timestamp": ts,
@@ -211,12 +252,11 @@ def run_professional_backtest(data_dict: Dict[str, pd.DataFrame]):
                     "Net_PnL": net_pnl,
                 })
                 
-                # کنترل استریک روی ۳ باخت متوالی برای حفظ سقف ۳ یا ۴
                 if outcome == "LOSS":
                     consecutive_losses += 1
-                    if consecutive_losses >= 3:
+                    if consecutive_losses >= 3 and not trading_paused:
                         trading_paused = True
-                        pause_timer = 8  # استراحت بهینه برای عبور از بازار رنک و پرنویز
+                        pause_timer = 8
                 elif outcome == "WIN":
                     consecutive_losses = 0
 
@@ -225,105 +265,89 @@ def run_professional_backtest(data_dict: Dict[str, pd.DataFrame]):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        if len(active_positions) >= MAX_POSITIONS or equity < TRADE_MARGIN:
-            continue
+        # ۴. اسکن سیگنال‌های جدید در پایان کندل جاری (برای اجرا در کندل بعدی)
+        if not trading_paused:
+            for symbol, df in data_dict.items():
+                if symbol in active_positions or ts not in df.index:
+                    continue
 
-        # بررسی سیگنال ورود با بهینه‌سازی فرکانس
-        for symbol, df in data_dict.items():
-            if symbol in active_positions or ts not in df.index:
-                continue
+                i = df.index.get_loc(ts)
+                if i < 30:
+                    continue
 
-            i = df.index.get_loc(ts)
-            if i < 30:
-                continue
+                subset = df.iloc[:i + 1]
+                current_candle = subset.iloc[-1]
+                close = current_candle["Close"]
+                ema_50 = current_candle["EMA50"]
+                atr = current_candle["ATR"]
 
-            subset = df.iloc[:i + 1]
-            current_candle = subset.iloc[-1]
-            close = current_candle["Close"]
-            ema_50 = current_candle["EMA50"]
-            atr = current_candle["ATR"]
+                if not np.isfinite(atr) or atr <= 0:
+                    continue
 
-            if not np.isfinite(atr) or atr <= 0:
-                continue
+                recent_highs = subset["High"].iloc[:-1].rolling(10).max().iloc[-1] if len(subset) > 10 else subset["High"].max()
+                recent_lows = subset["Low"].iloc[:-1].rolling(10).min().iloc[-1] if len(subset) > 10 else subset["Low"].min()
 
-            recent_highs = subset["High"].rolling(10).max().iloc[-1]
-            recent_lows = subset["Low"].rolling(10).min().iloc[-1]
+                regime = "Neutral"
+                if close > ema_50 and close >= recent_highs * 0.99:
+                    regime = "Bull"
+                elif close < ema_50 and close <= recent_lows * 1.01:
+                    regime = "Bear"
 
-            regime = "Neutral"
-            if close > ema_50 and close >= recent_highs * 0.99:
-                regime = "Bull"
-            elif close < ema_50 and close <= recent_lows * 1.01:
-                regime = "Bear"
+                if regime == "Neutral":
+                    continue
 
-            if regime == "Neutral":
-                continue
+                score = 0
+                direction = "LONG" if regime == "Bull" else "SHORT"
+                score += 3  # رژیم
 
-            score = 0
-            direction = "LONG" if regime == "Bull" else "SHORT"
+                # نقدینگی بدون لوک‌آهد کامل کندل جاری
+                lookback_liq = 15
+                if len(subset) > lookback_liq:
+                    recent_high = subset["High"].iloc[-lookback_liq:-1].max()
+                    recent_low = subset["Low"].iloc[-lookback_liq:-1].min()
 
-            # 1. رژیم بازار -> 3 امتیاز
-            score += 3
+                    if direction == "LONG" and current_candle["Low"] < recent_low and current_candle["Close"] > recent_low:
+                        score += 3
+                    elif direction == "SHORT" and current_candle["High"] > recent_high and current_candle["Close"] < recent_high:
+                        score += 3
 
-            # 2. نقدینگی و Sweep -> 3 امتیاز
-            lookback_liq = 15
-            if len(subset) > lookback_liq:
-                recent_high = subset["High"].iloc[-lookback_liq:-1].max()
-                recent_low = subset["Low"].iloc[-lookback_liq:-1].min()
+                candle_range = current_candle["High"] - current_candle["Low"]
+                if candle_range > (0.95 * atr):
+                    score += 2
 
-                if direction == "LONG" and current_candle["Low"] < recent_low and current_candle["Close"] > recent_low:
-                    score += 3
-                elif direction == "SHORT" and current_candle["High"] > recent_high and current_candle["Close"] < recent_high:
-                    score += 3
+                vol_mean = subset["Volume"].rolling(14).mean().iloc[-1]
+                if np.isfinite(vol_mean) and current_candle["Volume"] > (0.95 * vol_mean):
+                    score += 2
 
-            # 3. شتاب -> 2 امتیاز (بهینه‌شده برای افزایش جزئی معاملات)
-            candle_range = current_candle["High"] - current_candle["Low"]
-            if candle_range > (0.95 * atr):
-                score += 2
+                if score < 4:
+                    continue
 
-            # 4. حجم -> 2 امتیاز
-            vol_mean = subset["Volume"].rolling(14).mean().iloc[-1]
-            if np.isfinite(vol_mean) and current_candle["Volume"] > (0.95 * vol_mean):
-                score += 2
+                if direction == "LONG":
+                    stop_price = recent_lows - (atr * 0.5)
+                    risk_dist = current_candle["Close"] - stop_price
+                    if risk_dist <= 0:
+                        risk_dist = atr
+                    target_price = current_candle["Close"] + (risk_dist * 2.0)
+                else:
+                    stop_price = recent_highs + (atr * 0.5)
+                    risk_dist = stop_price - current_candle["Close"]
+                    if risk_dist <= 0:
+                        risk_dist = atr
+                    target_price = current_candle["Close"] - (risk_dist * 2.0)
 
-            if score < 4:
-                continue
+                pending_signals.append({
+                    "symbol": symbol,
+                    "side": direction,
+                    "stop_price": stop_price,
+                    "target_price": target_price,
+                })
 
-            entry_price = current_candle["Open"] * (1 + SLIPPAGE) if direction == "LONG" else current_candle["Open"] * (1 - SLIPPAGE)
-            
-            if direction == "LONG":
-                stop_price = recent_low - (atr * 0.5)
-                if entry_price - stop_price <= 0:
-                    stop_price = entry_price - atr
-                risk_dist = entry_price - stop_price
-                target_price = entry_price + (risk_dist * 2.0)
-            else:
-                stop_price = recent_high + (atr * 0.5)
-                if stop_price - entry_price <= 0:
-                    stop_price = entry_price + atr
-                risk_dist = stop_price - entry_price
-                target_price = entry_price - (risk_dist * 2.0)
-
-            notional_value = TRADE_MARGIN * LEVERAGE
-            size = notional_value / entry_price
-
-            active_positions[symbol] = {
-                "side": direction,
-                "entry_price": entry_price,
-                "stop_price": stop_price,
-                "target_price": target_price,
-                "size": size,
-                "is_breakeven": False,
-            }
-
-            if len(active_positions) >= MAX_POSITIONS:
-                break
-
-    return pd.DataFrame(all_trades), equity
+    return pd.DataFrame(all_trades), equity, max_drawdown
 
 
-def summarize_results(trades_df: pd.DataFrame, final_equity: float):
+def summarize_integrity_results(trades_df: pd.DataFrame, final_equity: float, max_dd: float):
     print("\n" + "=" * 68)
-    print("📊 گزارش حرفه‌ای بک‌تست 4h (کنترل استریک روی ۳ + Break-Even)")
+    print("📊 گزارش نهایی و استاندارد بک‌تست (بدون Lookahead و ایزوله)")
     print("=" * 68)
 
     if trades_df.empty:
@@ -338,8 +362,16 @@ def summarize_results(trades_df: pd.DataFrame, final_equity: float):
     breakevens = int((trades_df["Outcome"] == "BREAK_EVEN").sum())
     
     decisive_trades = wins + losses
-    wr = (wins / decisive_trades * 100) if decisive_trades > 0 else 0
+    decisive_wr = (wins / decisive_trades * 100) if decisive_trades > 0 else 0
+    total_wr = (wins / total_trades * 100) if total_trades > 0 else 0
+    be_rate = (breakevens / total_trades * 100) if total_trades > 0 else 0
+    
     total_dollar_pnl = float(trades_df["Net_PnL"].sum())
+    
+    # محاسبه Profit Factor
+    gross_profits = trades_df[trades_df["Net_PnL"] > 0]["Net_PnL"].sum()
+    gross_losses = abs(trades_df[trades_df["Net_PnL"] < 0]["Net_PnL"].sum())
+    profit_factor = (gross_profits / gross_losses) if gross_losses > 0 else 0.0
 
     max_losses = 0
     current_losses = 0
@@ -365,10 +397,17 @@ def summarize_results(trades_df: pd.DataFrame, final_equity: float):
 
     print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
     print(f"🔸 مارجین: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
-    print(f"🔸 تعداد کل معاملات: {total_trades} (برنده: {wins} | بازنده: {losses} | سر‌به‌سر: {breakevens})")
-    print(f"   🔹 معاملات لانگ: کل = {len(longs_df)}")
-    print(f"   🔸 معاملات شورت: کل = {len(shorts_df)}")
-    print(f"🎯 وین‌ریت واقعی: {wr:.2f}%")
+    print(f"🔸 تعداد کل معاملات: {total_trades}")
+    print(f"   🔹 معاملات برنده (WIN): {wins}")
+    print(f"   🔸 معاملات بازنده (LOSS): {losses}")
+    print(f"   🔹 معاملات سر‌به‌سر (BREAK-EVEN): {breakevens}")
+    print(f"   🔹 معاملات لانگ: {len(longs_df)} | شورت: {len(shorts_df)}")
+    print("-" * 68)
+    print(f"🎯 وین‌ریت قطعی (Decisive Win Rate): {decisive_wr:.2f}%  *(Win / [Win + Loss])*")
+    print(f"🎯 وین‌ریت کل (Total Win Rate): {total_wr:.2f}%  *(Win / Total)*")
+    print(f"⚖️ نرخ معاملات سر‌به‌سر (BE Rate): {be_rate:.2f}%")
+    print(f"📈 فاکتور سود (Profit Factor): {profit_factor:.2f}")
+    print(f"📉 حداکثر افت سرمایه (Max Drawdown): {max_dd * 100:.2f}%")
     print(f"💵 مجموع سود/زیان دلاری خالص: ${total_dollar_pnl:,.2f}")
     print(f"🏦 سرمایه نهایی: ${final_equity:,.2f}")
     print(f"❄️ حداکثر ضررهای متوالی کل سبد: {max_losses}")
@@ -384,6 +423,6 @@ def summarize_results(trades_df: pd.DataFrame, final_equity: float):
 
 
 if __name__ == "__main__":
-    df_trades, final_equity = run_professional_backtest(processed_data)
-    summarize_results(df_trades, final_equity)
-    print("\n✨ بک‌تست حرفه‌ای به پایان رسید.")
+    df_trades, final_equity, max_dd = run_integrity_backtest(processed_data)
+    summarize_integrity_results(df_trades, final_equity, max_dd)
+    print("\n✨ بک‌تست ایزوله و بدون باگ به پایان رسید.")
