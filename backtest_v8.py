@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# تنظیمات اصلی LBank - سیستم چندتایم‌فریمی (4h Trend + 1h Execution)
+# تنظیمات اصلی LBank - سیستم 1 ساعته با فیلترهای ضد نویز (ADX + RSI)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -71,11 +71,38 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print("📥 دریافت داده‌های چندتایم‌فریمی (1h و 4h) از صرافی LBank")
+print("📥 دریافت داده‌ها و محاسبه اندیکاتورهای ضد نویز (ADX, RSI) از LBank")
 print("=" * 60)
 
 processed_data_1h = {}
 processed_data_4h = {}
+
+def calculate_adx(df, period=14):
+    alpha = 1 / period
+    plus_dm = df['High'].diff()
+    minus_dm = df['Low'].diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+    
+    tr1 = df["High"] - df["Low"]
+    tr2 = np.abs(df["High"] - df["Close"].shift(1))
+    tr3 = np.abs(df["Low"] - df["Close"].shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    atr = tr.ewm(alpha=alpha, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=alpha, adjust=False).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=alpha, adjust=False).mean() / atr
+    
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+    adx = dx.ewm(alpha=alpha, adjust=False).mean()
+    return adx
+
+def calculate_rsi(df, period=14):
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / (loss + 1e-10)
+    return 100 - (100 / (1 + rs))
 
 def fetch_data(lbank_symbol, timeframe):
     all_ohlcv = []
@@ -136,6 +163,8 @@ def fetch_data(lbank_symbol, timeframe):
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
     df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+    df["ADX"] = calculate_adx(df)
+    df["RSI"] = calculate_rsi(df)
 
     df.set_index("Date", inplace=True)
     return df
@@ -149,14 +178,14 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data_4h[symbol] = df4h
 
 print(f"✅ تعداد نمادهای بارگذاری شده: {len(processed_data_1h)} نماد")
-print("⚙️ شروع اجرای بک‌تست Multi-Timeframe (روند 4h + ورود 1h)...")
+print("⚙️ شروع اجرای بک‌تست با فیلترهای ضد نویز (ADX + RSI)...")
 
 
 # ============================================================
-# موتور معاملاتی چندتایم‌فریمی
+# موتور معاملاتی با فیلترهای سخت‌گیرانه ضد نویز
 # ============================================================
 
-def run_multi_timeframe_backtest(data_1h, data_4h):
+def run_anti_noise_backtest(data_1h, data_4h):
     all_timestamps = sorted({
         ts for df in data_1h.values() for ts in df.index
     })
@@ -178,7 +207,7 @@ def run_multi_timeframe_backtest(data_1h, data_4h):
 
         symbols_to_close = []
         
-        # 1. مدیریت پوزیشن‌های باز روی تایم‌فریم 1 ساعته
+        # مدیریت پوزیشن‌های باز
         for symbol, pos in list(active_positions.items()):
             df1 = data_1h[symbol]
             if ts not in df1.index:
@@ -219,9 +248,9 @@ def run_multi_timeframe_backtest(data_1h, data_4h):
                 
                 if not is_win:
                     consecutive_losses += 1
-                    if consecutive_losses >= 4:
+                    if consecutive_losses >= 3: # سخت‌گیرانه: مکث بعد از ۳ ضرر متوالی
                         trading_paused = True
-                        pause_timer = 12 # مکث طولانی‌تر در تایم 1h
+                        pause_timer = 18 
                 else:
                     consecutive_losses = 0
 
@@ -233,7 +262,7 @@ def run_multi_timeframe_backtest(data_1h, data_4h):
         if len(active_positions) >= MAX_POSITIONS or equity < TRADE_MARGIN:
             continue
 
-        # 2. بررسی سیگنال ورود روی هر نماد
+        # بررسی سیگنال ورود با فیلترهای ضد نویز
         for symbol, df1 in data_1h.items():
             if symbol in active_positions or ts not in df1.index:
                 continue
@@ -245,9 +274,12 @@ def run_multi_timeframe_backtest(data_1h, data_4h):
             subset_1h = df1.iloc[:i1 + 1]
             c1h = subset_1h.iloc[-1]
             
-            # --- دریافت رژیم روند از تایم‌فریم 4 ساعته بدون نگاه به آینده ---
+            # --- فیلتر ضد نویز 1: قدرت روند ADX (باید بازار رنج نباشد) ---
+            if c1h["ADX"] < 22:
+                continue
+
+            # دریافت رژیم 4 ساعته بدون نگاه به آینده
             df4 = data_4h[symbol]
-            # پیدا کردن آخرین کندل 4 ساعته که قبل از زمان ts بسته شده است
             past_4h = df4[df4.index <= ts]
             if len(past_4h) < 30:
                 continue
@@ -271,7 +303,16 @@ def run_multi_timeframe_backtest(data_1h, data_4h):
             # 1. رژیم روند کلان 4h -> 3 امتیاز
             score += 3
 
-            # 2. سویپ نقدینگی در تایم‌فریم 1h -> 3 امتیاز
+            # --- فیلتر ضد نویز 2: RSI (جلوگیری از اشباع خرید/فروش خطرناک) ---
+            if direction == "LONG" and c1h["RSI"] > 68: # اگر بیش از حد خریده شده، لانگ نرو
+                continue
+            if direction == "SHORT" and c1h["RSI"] < 32: # اگر بیش از حد فروخته شده، شورت نرو
+                continue
+
+            if 40 <= c1h["RSI"] <= 60:
+                score += 1 # امتیاز تعادل RSI
+
+            # 2. سویپ نقدینگی در 1h -> 3 امتیاز
             lookback_liq = 20
             if len(subset_1h) > lookback_liq:
                 recent_high_1h = subset_1h["High"].iloc[-lookback_liq:-1].max()
@@ -288,15 +329,16 @@ def run_multi_timeframe_backtest(data_1h, data_4h):
                 continue
                 
             candle_range = c1h["High"] - c1h["Low"]
-            if candle_range > (1.05 * atr_1h):
+            if candle_range > (1.1 * atr_1h):
                 score += 2
 
             # 4. حجم در 1h -> 2 امتیاز
             vol_mean_1h = subset_1h["Volume"].rolling(14).mean().iloc[-1]
-            if np.isfinite(vol_mean_1h) and c1h["Volume"] > (1.05 * vol_mean_1h):
+            if np.isfinite(vol_mean_1h) and c1h["Volume"] > (1.1 * vol_mean_1h):
                 score += 2
 
-            if score < 4:
+            # حد نصاب سخت‌گیرانه‌تر امتیاز (حداقل 6 امتیاز برای ورود)
+            if score < 6:
                 continue
 
             entry_price = c1h["Open"] * (1 + SLIPPAGE) if direction == "LONG" else c1h["Open"] * (1 - SLIPPAGE)
@@ -306,13 +348,13 @@ def run_multi_timeframe_backtest(data_1h, data_4h):
                 if entry_price - stop_price <= 0:
                     stop_price = entry_price - atr_1h
                 risk_dist = entry_price - stop_price
-                target_price = entry_price + (risk_dist * 2.0)
+                target_price = entry_price + (risk_dist * 2.2) # ریسک به ریوارد بهتر
             else:
                 stop_price = recent_high_1h + (atr_1h * 0.5)
                 if stop_price - entry_price <= 0:
                     stop_price = entry_price + atr_1h
                 risk_dist = stop_price - entry_price
-                target_price = entry_price - (risk_dist * 2.0)
+                target_price = entry_price - (risk_dist * 2.2)
 
             notional_value = TRADE_MARGIN * LEVERAGE
             size = notional_value / entry_price
@@ -333,7 +375,7 @@ def run_multi_timeframe_backtest(data_1h, data_4h):
 
 def summarize_result(trades_df, final_equity):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی چندتایم‌فریمی (Trend 4h + Entry 1h)")
+    print("📊 گزارش نهایی استراتژی 1 ساعته با فیلترهای ضد نویز (ADX + RSI)")
     print("=" * 68)
 
     if trades_df.empty:
@@ -391,6 +433,6 @@ def summarize_result(trades_df, final_equity):
 
 
 if __name__ == "__main__":
-    df_trades, final_equity = run_multi_timeframe_backtest(processed_data_1h, processed_data_4h)
+    df_trades, final_equity = run_anti_noise_backtest(processed_data_1h, processed_data_4h)
     summarize_result(df_trades, final_equity)
-    print("\n✨ بک‌تست سیستم چندتایم‌فریمی به پایان رسید.")
+    print("\n✨ بک‌تست سیستم ضد نویز به پایان رسید.")
