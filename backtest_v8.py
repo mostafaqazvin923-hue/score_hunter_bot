@@ -5,7 +5,7 @@ import numpy as np
 
 
 # ============================================================
-# 1. RISK MANAGER & CONFIG (مدیریت ریسک و سرمایه نهادی)
+# 1. RISK MANAGER & CONFIG (مدیریت ریسک ضد باگ)
 # ============================================================
 
 @dataclass
@@ -35,7 +35,7 @@ class RiskManager:
         return True
 
     def position_size(self, entry_price: float, stop_price: float) -> float:
-        # محاسبه دقیق تعداد واحدهای دارایی بر اساس مارجین و لوریج
+        # محاسبه دقیق تعداد واحد دارایی بر اساس مارجین و لوریج
         position_notional = self.cfg.trade_margin * self.cfg.leverage
         quantity = position_notional / entry_price
         return quantity
@@ -53,7 +53,7 @@ class RiskManager:
             self.consecutive_losses += 1
             if self.consecutive_losses >= self.cfg.max_consecutive_losses:
                 self.trading_paused = True
-                self.pause_timer = 30  # کندل استراحت اجباری جهت قطع زنجیره باخت
+                self.pause_timer = 24  # استراحت اجباری جهت جلوگیری از دراوداون‌های متوالی
         else:
             self.consecutive_losses = 0
 
@@ -85,7 +85,7 @@ class RiskManager:
 
 
 # ============================================================
-# 2. STRATEGY CORE (هسته ضد نگاه به آینده و قفل همپوشانی)
+# 2. STRATEGY CORE (هسته اجرایی ضد نگاه به آینده و قفل همپوشانی)
 # ============================================================
 
 @dataclass
@@ -166,48 +166,52 @@ class StrategyCore:
 
 
 # ============================================================
-# 3. INSTITUTIONAL MOMENTUM MEAN REVERSION SIGNAL (منطق حرفه‌ای)
+# 3. TS-MOMENTUM SIGNAL FUNCTION (استراتژی مومنتوم سری زمانی نهادی)
 # ============================================================
 
-def institutional_mean_reversion_signal(history_list):
-    if len(history_list) < 60:
+def ts_momentum_signal(history_list):
+    if len(history_list) < 50:
         return None
 
     df = pd.DataFrame(history_list)
     
-    # لایه ۱: ارزش تعادلی (EMA 50) و باندهای انحراف معیار پویا (Bollinger Bands)
-    window = 50
-    df["EMA"] = df["close"].ewm(span=window, adjust=False).mean()
-    rolling_std = df["close"].rolling(window).std()
+    # ۱. محاسبه بازدهی مومنتوم ۲۴ دوره گذشته (شتاب قیمت)
+    df["Momentum_24"] = df["close"].pct_change(24)
     
-    df["Upper_Band"] = df["EMA"] + (2.3 * rolling_std)
-    df["Lower_Band"] = df["EMA"] - (2.3 * rolling_std)
+    # ۲. فیلتر روند کلان با میانگین متحرک ۵۰ دوره
+    df["EMA_50"] = df["close"].ewm(span=50, adjust=False).mean()
 
-    # لایه ۲: سنجش نوسان واقعی با ATR برای حد ضرر پویا
+    # ۳. فیلتر نوسان ATR برای تعیین حد ضرر و تایید پویایی نوسان
     high_low = df["High"] - df["Low"] if "High" in df else df["high"] - df["low"]
     high_close = np.abs(df["High"] - df["close"].shift()) if "High" in df else np.abs(df["high"] - df["close"].shift())
     low_close = np.abs(df["Low"] - df["close"].shift()) if "High" in df else np.abs(df["low"] - df["close"].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     df["ATR"] = ranges.max(axis=1).rolling(14).mean()
+    df["ATR_SMA"] = df["ATR"].rolling(20).mean()
 
-    # اطلاعات کندل بسته‌شده فعلی و قبلی
+    # مقادیر آخرین کندل بسته‌شده
     last_close = df["close"].iloc[-1]
-    prev_close = df["close"].iloc[-2]
-    lower_b = df["Lower_Band"].iloc[-1]
-    upper_b = df["Upper_Band"].iloc[-1]
+    last_mom = df["Momentum_24"].iloc[-1]
+    last_ema = df["EMA_50"].iloc[-1]
     current_atr = df["ATR"].iloc[-1]
+    atr_sma = df["ATR_SMA"].iloc[-1]
 
-    if not np.isfinite(current_atr) or current_atr <= 0 or not np.isfinite(lower_b):
+    if not np.isfinite(current_atr) or current_atr <= 0 or not np.isfinite(last_mom):
         return None
 
-    # لایه ۳: تاییدیه مومنتوم بازگشتی (قیمت از باند عبور کرده اما شروع به برگشت کرده است)
-    # لانگ: نفوذ به زیر باند پایینی و بازگشت تاییدشده در کندل بسته شده
-    if last_close <= lower_b and last_close > prev_close:
+    # فیلتر تاییدیه انبساط نوسان (جلوگیری از ورود در بازارهای خنثی و فرسایشی)
+    is_volatility_active = current_atr > atr_sma
+
+    if not is_volatility_active:
+        return None
+
+    # ستاپ لانگ: مومنتوم مثبت قوی + قیمت بالای EMA 50
+    if last_mom > 0.015 and last_close > last_ema:
         stop_price = last_close - (current_atr * 1.5)
         return {"direction": "long", "stop_price": stop_price}
     
-    # شورت: نفوذ به بالای باند بالایی و بازگشت تاییدشده در کندل بسته شده
-    elif last_close >= upper_b and last_close < prev_close:
+    # ستاپ شورت: مومنتوم منفی قوی + قیمت پایین EMA 50
+    elif last_mom < -0.015 and last_close < last_ema:
         stop_price = last_close + (current_atr * 1.5)
         return {"direction": "short", "stop_price": stop_price}
 
@@ -215,7 +219,7 @@ def institutional_mean_reversion_signal(history_list):
 
 
 # ============================================================
-# 4. BACKTEST RUNNER (موتور اجرای ارزیابی عملکرد)
+# 4. BACKTEST RUNNER
 # ============================================================
 
 def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskConfig = None):
@@ -234,7 +238,7 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
 
     stats = rm.stats()
     print("=" * 60)
-    print("== INSTITUTIONAL MEAN REVERSION BACKTEST RESULTS ==")
+    print("== TS-MOMENTUM INSTITUTIONAL BACKTEST RESULTS ==")
     print("=" * 60)
     print(f"تعداد معاملات کل:           {stats['trades']}")
     print(f"وین‌ریت (Win Rate):          {stats['win_rate']}%")
@@ -249,16 +253,16 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
 
 
 if __name__ == "__main__":
-    # تست اولیه با داده‌های شبیه‌سازی‌شده (جهت اطمینان از صحت اجرا)
-    np.random.seed(101)
-    n = 1500
-    price = 100 + np.cumsum(np.random.randn(n) * 0.4)
+    # تست اولیه با داده‌های شبیه‌سازی‌شده
+    np.random.seed(42)
+    n = 2000
+    price = 100 + np.cumsum(np.random.randn(n) * 0.6)
     test_df = pd.DataFrame({
         "time": range(n),
         "open": price,
-        "high": price + np.random.rand(n) * 1.0,
-        "low": price - np.random.rand(n) * 1.0,
-        "close": price + np.random.randn(n) * 0.2,
+        "high": price + np.random.rand(n) * 1.5,
+        "low": price - np.random.rand(n) * 1.5,
+        "close": price + np.random.randn(n) * 0.3,
     })
 
-    run_backtest(test_df, institutional_mean_reversion_signal)
+    run_backtest(test_df, ts_momentum_signal)
