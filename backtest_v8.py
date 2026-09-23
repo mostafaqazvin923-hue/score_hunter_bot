@@ -1,161 +1,259 @@
-# HUNTER-V149 - Ichimoku Institutional Pullback Backtest
-# Single file version
 
 import time
+import subprocess
+import sys
 from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
-import ccxt
+
+try:
+    import ccxt
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
+    import ccxt
+
+
+# ============================================================
+# HUNTER-V150
+# ICHIMOKU + SMART MONEY HYBRID ENGINE
+# Causal / No Lookahead / Fixed RR 1:2
+# ============================================================
 
 exchange = ccxt.lbank({
-    'enableRateLimit': True,
-    'timeout': 20000,
-    'options': {'defaultType':'swap'}
+    "enableRateLimit": True,
+    "timeout": 20000,
+    "options": {"defaultType": "swap"}
 })
 
 SYMBOLS = {
-'BTC':'BTC/USDT','ETH':'ETH/USDT','SOL':'SOL/USDT','BNB':'BNB/USDT',
-'XRP':'XRP/USDT','ADA':'ADA/USDT','AVAX':'AVAX/USDT',
-'LINK':'LINK/USDT','DOGE':'DOGE/USDT','DOT':'DOT/USDT'
+    "BTC":"BTC/USDT",
+    "ETH":"ETH/USDT",
+    "SOL":"SOL/USDT",
+    "BNB":"BNB/USDT",
+    "XRP":"XRP/USDT",
+    "ADA":"ADA/USDT",
+    "DOGE":"DOGE/USDT",
+    "AVAX":"AVAX/USDT",
+    "LINK":"LINK/USDT",
+    "DOT":"DOT/USDT",
 }
 
-DAYS=365
-RR=2
-ATR_MULT=1.5
-MARGIN=100
-LEV=50
-FEE=0.0007
+DAYS = 365
+MARGIN = 100
+LEVERAGE = 50
+FEE = 0.0007
+SLIPPAGE = 0.0003
+MAX_POSITIONS = 3
 
 
-def fetch(symbol,start,end):
+def load_data(symbol):
+    end = datetime.now()
+    start = end - timedelta(days=DAYS)
+    since = int(start.timestamp()*1000)
     data=[]
-    since=int((start-timedelta(days=10)).timestamp()*1000)
-    while since < int(end.timestamp()*1000):
-        try:
-            batch=exchange.fetch_ohlcv(symbol,'15m',since=since,limit=1000)
-        except:
+
+    while True:
+        batch = exchange.fetch_ohlcv(
+            symbol,
+            timeframe="15m",
+            since=since,
+            limit=1000
+        )
+        if not batch:
             break
-        if not batch: break
         data.extend(batch)
-        since=batch[-1][0]+1
-        if len(batch)<1000: break
+        last=batch[-1][0]
+        if last <= since or len(batch)<1000:
+            break
+        since=last+1
         time.sleep(.2)
 
-    if not data:return None
+    if not data:
+        return None
 
-    df=pd.DataFrame(data,columns=['ts','Open','High','Low','Close','Volume'])
-    df['Date']=pd.to_datetime(df.ts,unit='ms')
-    df=df.drop(columns=['ts']).drop_duplicates('Date').set_index('Date').sort_index()
-    return df[(df.index>=start)&(df.index<=end)]
+    df=pd.DataFrame(
+        data,
+        columns=["ts","Open","High","Low","Close","Volume"]
+    )
+    df["Date"]=pd.to_datetime(df.ts,unit="ms")
+    df=df.set_index("Date")[["Open","High","Low","Close","Volume"]]
+    df=df[~df.index.duplicated()]
+    return df
 
 
-def ichi(df):
-    x=df.copy()
-    x['tenkan']=(x.High.rolling(9).max()+x.Low.rolling(9).min())/2
-    x['kijun']=(x.High.rolling(26).max()+x.Low.rolling(26).min())/2
-    x['span_a']=((x.tenkan+x.kijun)/2).shift(26)
-    x['span_b']=((x.High.rolling(52).max()+x.Low.rolling(52).min())/2).shift(26)
-    return x
+def ichimoku(df):
+    high9=df.High.rolling(9).max()
+    low9=df.Low.rolling(9).min()
+
+    high26=df.High.rolling(26).max()
+    low26=df.Low.rolling(26).min()
+
+    high52=df.High.rolling(52).max()
+    low52=df.Low.rolling(52).min()
+
+    df["tenkan"]=(high9+low9)/2
+    df["kijun"]=(high26+low26)/2
+    df["span_a"]=((df.tenkan+df.kijun)/2).shift(26)
+    df["span_b"]=((high52+low52)/2).shift(26)
+
+    return df
 
 
 def prepare(df):
-    h1=df.resample('1h').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
-    h4=df.resample('4h').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
 
-    h1=ichi(h1)
-    h4=ichi(h4)
+    df=df.copy()
 
-    df['ATR']=(df.High-df.Low).rolling(14).mean()
-    df['VOLAVG']=df.Volume.rolling(20).mean()
+    df["ATR"]=(df.High-df.Low).rolling(14).mean()
 
-    return df,h1,h4
+    # Volume confirmation
+    df["vol_ma"]=df.Volume.rolling(30).mean()
+
+    # Market structure
+    df["swing_high"]=df.High.rolling(20).max().shift(1)
+    df["swing_low"]=df.Low.rolling(20).min().shift(1)
+
+    df["bos_up"]=df.Close>df.swing_high
+    df["bos_down"]=df.Close<df.swing_low
+
+    df=ichimoku(df)
+
+    # Liquidity sweep
+    df["sweep_low"]=(df.Low<df.swing_low) & (df.Close>df.swing_low)
+    df["sweep_high"]=(df.High>df.swing_high) & (df.Close<df.swing_high)
+
+    return df
 
 
-def get_signal(t,df,h1,h4):
-    a=h1[h1.index<t]
-    b=h4[h4.index<t]
+def signal(df,i):
 
-    if len(a)<60 or len(b)<60:return None
+    r=df.iloc[i]
 
-    c=a.iloc[-1]
-    p=df.iloc[df.index.get_loc(t)-1]
+    if not np.isfinite(r.ATR):
+        return None
 
-    bull=c.Close>max(c.span_a,c.span_b) and c.tenkan>c.kijun
-    bear=c.Close<min(c.span_a,c.span_b) and c.tenkan<c.kijun
+    cloud_bull = (
+        r.Close > r.span_a and
+        r.Close > r.span_b and
+        r.tenkan > r.kijun
+    )
 
-    long_pull=p.Low<=c.kijun and p.Close>p.Open and p.Volume>p.VOLAVG if 'VOLAVG' in p else False
-    short_pull=p.High>=c.kijun and p.Close<p.Open
+    cloud_bear = (
+        r.Close < r.span_a and
+        r.Close < r.span_b and
+        r.tenkan < r.kijun
+    )
 
-    if bull and long_pull:return 'LONG'
-    if bear and short_pull:return 'SHORT'
+    volume = r.Volume > r.vol_ma*1.2
+
+    long = cloud_bull and r.sweep_low and r.bos_up and volume
+    short = cloud_bear and r.sweep_high and r.bos_down and volume
+
+    if long:
+        return "LONG"
+    if short:
+        return "SHORT"
     return None
 
 
-def run(dataset):
+def backtest_symbol(symbol,df):
+
     trades=[]
 
-    for sym,(df,h1,h4) in dataset.items():
-        for i in range(100,len(df)-2):
-            t=df.index[i]
-            side=get_signal(t,df,h1,h4)
+    for i in range(100,len(df)-10):
 
-            if not side:continue
+        side=signal(df,i)
 
-            entry=df.iloc[i+1].Open
-            atr=df.iloc[i].ATR
-            if not np.isfinite(atr):continue
+        if not side:
+            continue
 
-            if side=='LONG':
-                sl=entry-ATR_MULT*atr
-                tp=entry+ATR_MULT*atr*RR
+        entry=df.Close.iloc[i]
+
+        atr=df.ATR.iloc[i]
+
+        if side=="LONG":
+            sl=entry-1.5*atr
+            tp=entry+3*atr
+        else:
+            sl=entry+1.5*atr
+            tp=entry-3*atr
+
+        result="LOSS"
+        exit_price=sl
+
+        for j in range(i+1,len(df)):
+
+            h=df.High.iloc[j]
+            l=df.Low.iloc[j]
+
+            if side=="LONG":
+                if l<=sl:
+                    break
+                if h>=tp:
+                    result="WIN"
+                    exit_price=tp
+                    break
+
             else:
-                sl=entry+ATR_MULT*atr
-                tp=entry-ATR_MULT*atr*RR
+                if h>=sl:
+                    break
+                if l<=tp:
+                    result="WIN"
+                    exit_price=tp
+                    break
 
-            result='LOSS'
-            price=sl
+        pnl=((exit_price-entry)/entry if side=="LONG"
+             else (entry-exit_price)/entry)
 
-            for j in range(i+1,len(df)):
-                r=df.iloc[j]
-                if side=='LONG':
-                    if r.Low<=sl:break
-                    if r.High>=tp:
-                        result='WIN';price=tp;break
-                else:
-                    if r.High>=sl:break
-                    if r.Low<=tp:
-                        result='WIN';price=tp;break
+        pnl*=MARGIN*LEVERAGE
+        pnl-=MARGIN*LEVERAGE*FEE*2
 
-            ret=(price-entry)/entry if side=='LONG' else (entry-price)/entry
-            pnl=MARGIN*LEV*ret-MARGIN*LEV*FEE*2
+        trades.append({
+            "Symbol":symbol,
+            "Side":side,
+            "Result":result,
+            "PnL":pnl
+        })
 
-            trades.append([sym,side,result,pnl])
-
-    return pd.DataFrame(trades,columns=['Symbol','Side','Result','PnL'])
+    return trades
 
 
 def main():
-    end=datetime.now()
-    start=end-timedelta(days=DAYS)
 
-    data={}
+    all_trades=[]
 
-    for k,v in SYMBOLS.items():
-        print('Loading',k)
-        df=fetch(v,start,end)
-        if df is not None:
-            data[k]=prepare(df)
+    for name,symbol in SYMBOLS.items():
 
-    out=run(data)
+        print("Loading",name)
 
-    print('='*60)
-    print('HUNTER-V149 REPORT')
-    print('Trades:',len(out))
+        df=load_data(symbol)
 
-    if len(out):
-        print('Win Rate:',round((out.Result=='WIN').mean()*100,2))
-        print('PnL:',round(out.PnL.sum(),2))
-        print(out.groupby('Symbol').PnL.sum())
+        if df is None:
+            continue
 
-if __name__=='__main__':
+        df=prepare(df)
+
+        all_trades += backtest_symbol(name,df)
+
+
+    if not all_trades:
+        print("No trades")
+        return
+
+    t=pd.DataFrame(all_trades)
+
+    wins=t[t.Result=="WIN"]
+    total=len(t)
+
+    print("="*60)
+    print("HUNTER-V150 REPORT")
+    print("Trades:",total)
+    print("Win Rate:",round(len(wins)/total*100,2))
+    print("PnL:",round(t.PnL.sum(),2))
+    print("="*60)
+
+    print(t.groupby("Symbol").PnL.sum())
+
+
+if __name__=="__main__":
     main()
