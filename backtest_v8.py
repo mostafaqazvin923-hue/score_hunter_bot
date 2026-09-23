@@ -1,209 +1,143 @@
-# backtest_v152.py
-import ccxt, pandas as pd, numpy as np, time
-from datetime import datetime, timedelta, timezone
+# V153 LBank Futures Research Engine
+# Causal research: no lookahead, no centered windows, no timeout.
+import time
+from pathlib import Path
+from collections import defaultdict
+import ccxt, numpy as np, pandas as pd
 
-SYMBOLS={"BTC":"BTC/USDT","ETH":"ETH/USDT","SOL":"SOL/USDT","BNB":"BNB/USDT",
-"XRP":"XRP/USDT","ADA":"ADA/USDT","AVAX":"AVAX/USDT","LINK":"LINK/USDT",
-"DOGE":"DOGE/USDT","DOT":"DOT/USDT"}
-TIMEFRAME="15m"; DAYS=365; WARMUP_DAYS=60
-INITIAL_BALANCE=1000.; TRADE_MARGIN=100.; LEVERAGE=50.
-FEE_RATE=.0007; SLIPPAGE=.0003; MAX_OPEN_POSITIONS=3
-LOSS_STREAK_BREAKER=4; BREAKER_PAUSE_BARS=16
+DAYS=365; WARMUP_DAYS=70; TIMEFRAME='15m'; LIMIT=1000
+SYMBOLS=['BTC/USDT:USDT','ETH/USDT:USDT','SOL/USDT:USDT','BNB/USDT:USDT','XRP/USDT:USDT','ADA/USDT:USDT','AVAX/USDT:USDT','LINK/USDT:USDT','DOGE/USDT:USDT','DOT/USDT:USDT']
+TRADE_MARGIN=100.0; LEVERAGE=50; FEE_RATE=0.0007; SLIPPAGE=0.0003; RR=2.0; MAX_OPEN_POSITIONS=3
+ATR_N=14; EMA_FAST=20; EMA_SLOW=50; EMA_TREND=200; VOL_N=20; BREAKOUT_LOOKBACK=20
+FAMILIES=['TREND_BREAKOUT','BREAKOUT_PULLBACK','MOMENTUM_CONTINUATION','VOL_EXPANSION']; OUT=Path('.')
 
-def fetch(symbol,since,until):
-    ex=exchange; rows=[]; cur=since
-    while cur<until:
-        b=ex.fetch_ohlcv(symbol,TIMEFRAME,since=cur,limit=1000)
+def exchange(): return ccxt.lbank({'enableRateLimit':True,'timeout':20000,'options':{'defaultType':'swap'}})
+def fetch(ex,symbol,start_ms,end_ms):
+    rows=[]; since=start_ms
+    while since<end_ms:
+        b=ex.fetch_ohlcv(symbol,TIMEFRAME,since=since,limit=LIMIT)
         if not b: break
-        rows+=b
-        if b[-1][0]<=cur: break
-        cur=b[-1][0]+1
-        if len(b)<1000: break
-        time.sleep(.2)
-    if not rows: return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
-    d=pd.DataFrame(rows,columns=["timestamp","Open","High","Low","Close","Volume"])
-    d["Date"]=pd.to_datetime(d.timestamp,unit="ms",utc=True)
-    d=d.drop_duplicates("Date").sort_values("Date").set_index("Date")
-    tf=15*60*1000; last=(ex.milliseconds()//tf)*tf-tf
-    d=d[d.timestamp<=last]
-    d=d[(d.index>=pd.to_datetime(since,unit="ms",utc=True))&(d.index<pd.to_datetime(until,unit="ms",utc=True))]
-    return d[["Open","High","Low","Close","Volume"]]
+        rows.extend(b); last=int(b[-1][0])
+        if last<=since: break
+        since=last+1; time.sleep(.2)
+    if not rows:return pd.DataFrame()
+    d=pd.DataFrame(rows,columns=['timestamp','open','high','low','close','volume'])
+    d['timestamp']=pd.to_datetime(d['timestamp'],unit='ms',utc=True)
+    d=d.drop_duplicates('timestamp').sort_values('timestamp').set_index('timestamp')
+    tf=15*60*1000; last_complete=(ex.milliseconds()//tf)*tf-tf
+    d=d[d.index<=pd.to_datetime(last_complete,unit='ms',utc=True)]
+    return d.astype(float)
 
-def tr(d):
-    pc=d.Close.shift(1)
-    return pd.concat([d.High-d.Low,(d.High-pc).abs(),(d.Low-pc).abs()],axis=1).max(axis=1)
-def atr(d,n=14): return tr(d).rolling(n,min_periods=n).mean()
-def ema(s,n): return s.ewm(span=n,adjust=False,min_periods=n).mean()
-def rvol(d,n): return d.Volume/d.Volume.rolling(n,min_periods=n).mean()
+def atr(d,n=14):
+    p=d.close.shift(1); tr=pd.concat([d.high-d.low,(d.high-p).abs(),(d.low-p).abs()],axis=1).max(axis=1)
+    return tr.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
 
-def adx(d,n=14):
-    up=d.High.diff(); dn=-d.Low.diff()
-    p=pd.Series(np.where((up>dn)&(up>0),up,0.),index=d.index)
-    m=pd.Series(np.where((dn>up)&(dn>0),dn,0.),index=d.index)
-    a=tr(d).rolling(n,min_periods=n).mean()
-    pdi=100*p.rolling(n,min_periods=n).mean()/a.replace(0,np.nan)
-    mdi=100*m.rolling(n,min_periods=n).mean()/a.replace(0,np.nan)
-    dx=100*(pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan)
-    return dx.rolling(n,min_periods=n).mean()
+def enrich(d):
+    x=d.copy(); x['atr']=atr(x,ATR_N); x['atr_pct']=x.atr/x.close
+    x['ema20']=x.close.ewm(span=EMA_FAST,adjust=False).mean(); x['ema50']=x.close.ewm(span=EMA_SLOW,adjust=False).mean(); x['ema200']=x.close.ewm(span=EMA_TREND,adjust=False).mean()
+    x['vol_ma']=x.volume.rolling(VOL_N,min_periods=VOL_N).mean(); x['rvol']=x.volume/x.vol_ma
+    x['range']=x.high-x.low; x['body']=(x.close-x.open).abs(); x['body_ratio']=x.body/x['range'].replace(0,np.nan)
+    x['prior_high_20']=x.high.rolling(BREAKOUT_LOOKBACK,min_periods=BREAKOUT_LOOKBACK).max().shift(1); x['prior_low_20']=x.low.rolling(BREAKOUT_LOOKBACK,min_periods=BREAKOUT_LOOKBACK).min().shift(1)
+    x['range_ma']=x['range'].rolling(20,min_periods=20).mean().shift(1); x['ema50_prev']=x.ema50.shift(4)
+    return x
 
-def resample(d,rule):
-    x=pd.concat([d.Open.resample(rule).first(),d.High.resample(rule).max(),
-                 d.Low.resample(rule).min(),d.Close.resample(rule).last(),
-                 d.Volume.resample(rule).sum()],axis=1)
-    x.columns=["Open","High","Low","Close","Volume"]
-    return x.dropna()
+def candidates(symbol,d):
+    x=enrich(d); test_start=d.index.max()-pd.Timedelta(days=DAYS); rows=[]
+    for i in range(max(EMA_TREND+5,BREAKOUT_LOOKBACK+5),len(x)-1):
+        ts=x.index[i]
+        if ts<test_start: continue
+        r=x.iloc[i]; p=x.iloc[i-1]
+        if not np.isfinite(r.atr) or r.atr<=0: continue
+        tl=r.close>r.ema50>r.ema200 and r.ema50>r.ema50_prev; ts_=r.close<r.ema50<r.ema200 and r.ema50<r.ema50_prev
+        rl=r.close>r.prior_high_20; rs=r.close<r.prior_low_20
+        q=np.isfinite(r.rvol) and r.rvol>=1 and np.isfinite(r.body_ratio) and r.body_ratio>=.45
+        ml=r.close>r.open and r.body_ratio>=.55 and np.isfinite(r.range_ma) and r.range>=.90*r.range_ma
+        ms=r.close<r.open and r.body_ratio>=.55 and np.isfinite(r.range_ma) and r.range>=.90*r.range_ma
+        ve=np.isfinite(r.range_ma) and r.range>=1.25*r.range_ma and np.isfinite(r.rvol) and r.rvol>=1.15
+        ll=p.prior_high_20; ls=p.prior_low_20
+        pl=np.isfinite(ll) and p.close>ll and r.low<=ll*1.0015 and r.close>ll and r.close>r.open
+        ps=np.isfinite(ls) and p.close<ls and r.high>=ls*.9985 and r.close<ls and r.close<r.open
+        specs={'TREND_BREAKOUT':(tl and rl,ts_ and rs),'BREAKOUT_PULLBACK':(tl and pl,ts_ and ps),'MOMENTUM_CONTINUATION':(tl and ml,ts_ and ms),'VOL_EXPANSION':((tl or r.close>r.ema200) and ve and ml,(ts_ or r.close<r.ema200) and ve and ms)}
+        raws={'TREND_BREAKOUT':(rl,rs),'BREAKOUT_PULLBACK':(rl or pl,rs or ps),'MOMENTUM_CONTINUATION':(tl,ts_),'VOL_EXPANSION':(ve,ve)}
+        for fam in FAMILIES:
+            for side,sig,raw in [('LONG',specs[fam][0],raws[fam][0]),('SHORT',specs[fam][1],raws[fam][1])]:
+                if not raw: continue
+                ei=i+1; entry=float(x.iloc[ei].open)
+                if side=='LONG': sl=min(float(r.low),float(p.low))-.15*float(r.atr); risk=entry-sl; tp=entry+RR*risk
+                else: sl=max(float(r.high),float(p.high))+.15*float(r.atr); risk=sl-entry; tp=entry-RR*risk
+                if risk<=0 or not .001<=risk/entry<=.04: continue
+                rows.append({'Family':fam,'Symbol':symbol,'SignalTime':ts,'EntryTime':x.index[ei],'Side':side,'Entry':entry,'SL':sl,'TP':tp,'RiskPct':risk/entry,'ATRpct':float(r.atr_pct),'RVOL':float(r.rvol) if np.isfinite(r.rvol) else np.nan,'RegimePass':int(tl if side=='LONG' else ts_),'QualityPass':int(q),'MomentumPass':int(ml if side=='LONG' else ms)})
+    return pd.DataFrame(rows)
 
-def features(d):
-    m=d.copy(); m["ATR"]=atr(m); m["RVOL"]=rvol(m,20)
-    m["Body"]=(m.Close-m.Open).abs()
-    rng=(m.High-m.Low).replace(0,np.nan); m["CP"]=(m.Close-m.Low)/rng
-    h=resample(d,"1h"); h["ATR"]=atr(h); h["RVOL"]=rvol(h,20); h["Body"]=(h.Close-h.Open).abs()
-    rr=(h.High-h.Low).replace(0,np.nan); h["CP"]=(h.Close-h.Low)/rr
-    h["RH"]=h.High.rolling(24,min_periods=24).max().shift(1)
-    h["RL"]=h.Low.rolling(24,min_periods=24).min().shift(1)
-    h["RW"]=(h.RH-h.RL)/h.Close
-    q=resample(d,"4h"); q["E50"]=ema(q.Close,50); q["E200"]=ema(q.Close,200)
-    q["ATR"]=atr(q); q["ADX"]=adx(q); q["Slope"]=q.E50/q.E50.shift(8)-1
-    q["Reg"]=0
-    q.loc[(q.Close>q.E200)&(q.E50>q.E200)&(q.Slope>.0015)&(q.ADX>=18),"Reg"]=1
-    q.loc[(q.Close<q.E200)&(q.E50<q.E200)&(q.Slope<-.0015)&(q.ADX>=18),"Reg"]=-1
-    return m,h,q
-
-def asof(htf,t,col):
-    p=htf.index.searchsorted(t,side="left")-1
-    return np.nan if p<0 else htf.iloc[p][col]
-
-def candidates(d):
-    m,h,q=features(d); out=[]; state=None; seen=None
-    for i,t in enumerate(m.index):
-        if state and t>state["exp"]: state=None
-        hp=h.index.searchsorted(t,side="right")-1
-        if hp>=0:
-            ht=h.index[hp]
-            if t>=ht+pd.Timedelta("1h") and ht!=seen:
-                seen=ht; r=h.iloc[hp]
-                width_ok=.010<=r.RW<=.060 if np.isfinite(r.RW) else False
-                body_ok=np.isfinite(r.ATR) and r.Body>=.45*r.ATR
-                vol_ok=np.isfinite(r.RVOL) and r.RVOL>=.90
-                reg=asof(q,ht,"Reg")
-                if width_ok and body_ok and vol_ok and reg==1 and r.Close>r.RH+.10*r.ATR and r.CP>=.65:
-                    state={"d":1,"bt":ht,"bp":r.Close,"rb":r.RH,"exp":t+pd.Timedelta("3h")}
-                elif width_ok and body_ok and vol_ok and reg==-1 and r.Close<r.RL-.10*r.ATR and r.CP<=.35:
-                    state={"d":-1,"bt":ht,"bp":r.Close,"rb":r.RL,"exp":t+pd.Timedelta("3h")}
-        if not state or t<=state["bt"]: continue
-        r=m.iloc[i]
-        if not np.isfinite(r.ATR): continue
-        if state["d"]==1:
-            touched=r.Low<=state["rb"]+.35*r.ATR and r.Close>=state["rb"]-.35*r.ATR
-            depth=state["bp"]-r.Low
-            ok=0<=depth<=1.25*r.ATR and depth>=.05*max(abs(state["bp"]-state["rb"]),r.ATR)
-            trig=touched and ok and r.Close>r.Open and r.CP>=.60 and r.Body>=.30*r.ATR and r.RVOL>=.85
-            prev=m.High.iloc[max(0,i-3):i].max()
-            if trig and r.Close>prev:
-                sl=min(m.Low.iloc[max(0,i-3):i+1].min(),state["rb"])-.15*r.ATR
-                risk=r.Close-sl
-                if .55*r.ATR<=risk<=2.20*r.ATR and risk/r.Close<=.025:
-                    out.append({"signal_time":t,"direction":1,"sl":float(sl),"source":"AMBP_LONG"}); state=None
-        else:
-            touched=r.High>=state["rb"]-.35*r.ATR and r.Close<=state["rb"]+.35*r.ATR
-            depth=r.High-state["bp"]
-            ok=0<=depth<=1.25*r.ATR and depth>=.05*max(abs(state["bp"]-state["rb"]),r.ATR)
-            trig=touched and ok and r.Close<r.Open and r.CP<=.40 and r.Body>=.30*r.ATR and r.RVOL>=.85
-            prev=m.Low.iloc[max(0,i-3):i].min()
-            if trig and r.Close<prev:
-                sl=max(m.High.iloc[max(0,i-3):i+1].max(),state["rb"])+.15*r.ATR
-                risk=sl-r.Close
-                if .55*r.ATR<=risk<=2.20*r.ATR and risk/r.Close<=.025:
-                    out.append({"signal_time":t,"direction":-1,"sl":float(sl),"source":"AMBP_SHORT"}); state=None
-    return pd.DataFrame(out)
-
-def entry_price(p,direction):
-    return p*(1+SLIPPAGE if direction==1 else 1-SLIPPAGE)
-def exit_price(p,direction):
-    return p*(1-SLIPPAGE if direction==1 else 1+SLIPPAGE)
-def pnl(e,x,d,q):
-    return (x-e)*q if d==1 else (e-x)*q
-def resolve(pos,row):
-    if pos["d"]==1:
-        if row.Low<=pos["sl"]: return exit_price(pos["sl"],1),"SL"
-        if row.High>=pos["tp"]: return exit_price(pos["tp"],1),"TP"
-    else:
-        if row.High>=pos["sl"]: return exit_price(pos["sl"],-1),"SL"
-        if row.Low<=pos["tp"]: return exit_price(pos["tp"],-1),"TP"
-    return None,None
-
-def simulate(data,cands,start,end):
-    events=[]
-    for s,c in cands.items():
-        if c.empty: continue
-        for _,r in c.iterrows():
-            events.append((r.signal_time+pd.Timedelta("15m"),s,r))
-    events.sort(key=lambda z:(z[0],z[1]))
-    times=sorted(set().union(*[set(x.index) for x in data.values()]))
-    active={}; last_exit={}; trades=[]; streak=0; breaker=None; ei=0
-    by={t:[] for t,_,_ in events}
-    for t,s,r in events: by.setdefault(t,[]).append((s,r))
+def execute(c,candles):
+    if c.empty:return pd.DataFrame()
+    c=c.sort_values(['EntryTime','Symbol']).reset_index(drop=True); active={}; done=[]; last_close={}; em=defaultdict(list)
+    for i,r in c.iterrows(): em[r.EntryTime].append(i)
+    times=sorted(set(t for d in candles.values() for t in d.index))
     for t in times:
-        exited=[]
-        for s,pos in list(active.items()):
-            if t<=pos["entry"]: continue
-            x=data[s].loc[t]; ep,why=resolve(pos,x)
-            if ep is not None:
-                gross=pnl(pos["entry"],ep,pos["d"],pos["qty"])
-                fees=(pos["entry"]*pos["qty"]+ep*pos["qty"])*FEE_RATE
-                p=gross-fees
-                trades.append({**pos,"exit":t,"exit_price":ep,"reason":why,"pnl":p})
-                streak=streak+1 if p<0 else 0
-                if streak>=LOSS_STREAK_BREAKER: breaker=t+pd.Timedelta(minutes=15*BREAKER_PAUSE_BARS)
-                last_exit[s]=t; exited.append(s)
-        for s in exited: del active[s]
-        if breaker is not None and t<breaker: continue
-        for s,r in by.get(t,[]):
-            if s in active or last_exit.get(s)==t or len(active)>=MAX_OPEN_POSITIONS: continue
-            row=data[s].loc[t]; d=int(r.direction); e=entry_price(row.Open,d); sl=float(r.sl)
-            risk=e-sl if d==1 else sl-e
-            if risk<=0 or risk/e>.025: continue
-            tp=e+2*risk if d==1 else e-2*risk; q=TRADE_MARGIN*LEVERAGE/e
-            active[s]={"symbol":s,"entry":t,"entry_price":e,"d":d,"sl":sl,"tp":tp,"qty":q,"signal_time":r.signal_time,"source":r.source}
-    for s,p in active.items(): trades.append({**p,"exit":pd.NaT,"exit_price":np.nan,"reason":"OPEN_AT_END","pnl":np.nan})
-    return trades
+        for sym in list(active):
+            tr=active[sym]
+            if t<=tr['EntryTime'] or t not in candles[sym].index: continue
+            b=candles[sym].loc[t]
+            slhit=float(b.low)<=tr['SL'] if tr['Side']=='LONG' else float(b.high)>=tr['SL']; tphit=float(b.high)>=tr['TP'] if tr['Side']=='LONG' else float(b.low)<=tr['TP']
+            if slhit or tphit:
+                result='LOSS' if slhit else 'WIN'; ep=tr['SL'] if slhit else tr['TP']
+                gross=((ep-tr['Entry'])/tr['Entry'] if tr['Side']=='LONG' else (tr['Entry']-ep)/tr['Entry'])*TRADE_MARGIN*LEVERAGE
+                fee=(tr['Entry']+ep)*TRADE_MARGIN*LEVERAGE/tr['Entry']*FEE_RATE; pnl=gross-fee-TRADE_MARGIN*LEVERAGE*SLIPPAGE*2
+                z=dict(tr); z.update({'ExitTime':t,'Exit':ep,'Result':result,'PnL':pnl,'HoldingHours':(t-tr['EntryTime']).total_seconds()/3600}); done.append(z); del active[sym]; last_close[sym]=t
+        for i in em.get(t,[]):
+            r=c.iloc[i]; sym=r.Symbol
+            if sym in active or last_close.get(sym)==t or len(active)>=MAX_OPEN_POSITIONS: continue
+            active[sym]=r.to_dict()
+    for sym,tr in active.items():
+        z=dict(tr); z.update({'ExitTime':pd.NaT,'Exit':np.nan,'Result':'OPEN_AT_END','PnL':np.nan,'HoldingHours':np.nan}); done.append(z)
+    return pd.DataFrame(done)
 
-def report(trades,start,end):
-    r=pd.DataFrame(trades)
-    if r.empty: print("NO TRADES"); return
-    c=r[r.reason!="OPEN_AT_END"].copy(); w=c[c.pnl>0]; l=c[c.pnl<0]
-    wr=100*len(w)/len(c) if len(c) else 0; gp=w.pnl.sum(); gl=-l.pnl.sum()
-    pf=gp/gl if gl else np.inf; eq=1000+c.pnl.cumsum(); dd=(eq-eq.cummax()).min()
-    st=[]; n=0
-    for p in c.pnl:
-        if p<0:n+=1
-        elif n:st.append(n);n=0
-    if n:st.append(n)
-    days=max((end-start).total_seconds()/86400,1)
-    print("\n"+"="*70); print("AMBP V152 — CAUSAL BACKTEST"); print("="*70)
-    print(f"Total: {len(r)} | Closed: {len(c)} | Open: {len(r)-len(c)}")
-    print(f"Trades/day: {len(c)/days:.2f} | WR: {wr:.2f}% | Loss: {100*len(l)/len(c) if len(c) else 0:.2f}%")
-    print(f"Net PnL: ${c.pnl.sum():,.2f} | PF: {pf:.2f} | Avg Win: ${w.pnl.mean() if len(w) else 0:.2f} | Avg Loss: ${l.pnl.mean() if len(l) else 0:.2f}")
-    print(f"Max DD: ${dd:,.2f} | Max loss streak: {max(st) if st else 0} | Streaks: {st}")
-    print("RR: 1:2 FIXED | Timeout: DISABLED | Lookahead: NONE | Entry: NEXT 15m OPEN")
-    print("\nPER SYMBOL")
-    for s,g in c.groupby("symbol"):
-        print(f"{s:5} {len(g):4} trades | WR {100*(g.pnl>0).mean():6.2f}% | PnL ${g.pnl.sum():10.2f}")
-    r.to_csv("ambp_v152_trades.csv",index=False); print("\nSaved ambp_v152_trades.csv")
+def summarize(t):
+    if t is None or t.empty:return {'Trades':0,'Wins':0,'Losses':0,'WinRatePct':0,'NetPnL':0,'PF':0,'AvgWin':0,'AvgLoss':0,'MaxDD':0,'MaxConsecutiveLosses':0,'LossStreaks':'','TradesPerDay':0,'OpenAtEnd':0}
+    c=t[t.Result.isin(['WIN','LOSS'])].copy(); op=int((t.Result=='OPEN_AT_END').sum())
+    if c.empty: z=summarize(pd.DataFrame()); z['OpenAtEnd']=op; return z
+    w=c[c.Result=='WIN']; l=c[c.Result=='LOSS']; p=c.PnL.astype(float); eq=p.cumsum(); dd=eq-eq.cummax(); cur=0; st=[]
+    for r in c.Result:
+        if r=='LOSS':cur+=1
+        elif cur:st.append(cur);cur=0
+    if cur:st.append(cur)
+    elapsed=max(1,(c.EntryTime.max()-c.EntryTime.min()).total_seconds()/86400); gw=w.PnL.sum(); gl=l.PnL.sum()
+    return {'Trades':len(c),'Wins':len(w),'Losses':len(l),'WinRatePct':100*len(w)/len(c),'NetPnL':p.sum(),'PF':gw/abs(gl) if gl<0 else np.inf,'AvgWin':w.PnL.mean() if len(w) else 0,'AvgLoss':l.PnL.mean() if len(l) else 0,'MaxDD':dd.min(),'MaxConsecutiveLosses':max(st) if st else 0,'LossStreaks':','.join(map(str,st)),'TradesPerDay':len(c)/elapsed,'OpenAtEnd':op}
 
-exchange=ccxt.lbank({"enableRateLimit":True,"timeout":20000})
 def main():
-    end=datetime.now(timezone.utc).replace(second=0,microsecond=0); start=end-timedelta(days=DAYS)
-    fetch_start=start-timedelta(days=WARMUP_DAYS); si=int(fetch_start.timestamp()*1000); ui=int(end.timestamp()*1000)
-    data={}; cs={}
-    for name,sym in SYMBOLS.items():
-        print("Fetching",name)
+    ex=exchange(); ex.load_markets(); now=pd.Timestamp.now(tz='UTC'); test_start=now-pd.Timedelta(days=DAYS); fetch_start=test_start-pd.Timedelta(days=WARMUP_DAYS); sm=int(fetch_start.timestamp()*1000); em=int(now.timestamp()*1000)
+    candles={}; byfam={f:[] for f in FAMILIES}
+    for sym in SYMBOLS:
+        print('\nFetching',sym)
         try:
-            d=fetch(sym,si,ui)
-            if len(d)<1000: print(" skip",len(d)); continue
-            data[name]=d; c=candidates(d)
-            c=c[(c.signal_time>=pd.Timestamp(start))&(c.signal_time<pd.Timestamp(end))] if not c.empty else c
-            cs[name]=c; print(" candidates",len(c))
-        except Exception as e: print(" ERROR",e)
-    report(simulate(data,cs,start,end),pd.Timestamp(start),pd.Timestamp(end))
-if __name__=="__main__": main()
+            d=fetch(ex,sym,sm,em)
+            if d.empty: print(' NO DATA'); continue
+            candles[sym]=d; cc=candidates(sym,d); print(' candles=',len(d))
+            for f in FAMILIES:
+                z=cc[cc.Family==f].copy(); byfam[f].append(z); print(' ',f,len(z))
+        except Exception as e: print(' ERROR',type(e).__name__,e)
+    if not candles: raise RuntimeError('NO LBank DATA RECEIVED')
+    summaries=[]; stages=[]; frames=[]
+    for f in FAMILIES:
+        c=pd.concat(byfam[f],ignore_index=True) if byfam[f] else pd.DataFrame(); stages.append({'Family':f,'Candidates':len(c),'RegimePass':int(c.RegimePass.sum()) if not c.empty else 0,'QualityPass':int(c.QualityPass.sum()) if not c.empty else 0,'MomentumPass':int(c.MomentumPass.sum()) if not c.empty else 0})
+        tr=execute(c,candles)
+        if not tr.empty: frames.append(tr.assign(Family=f))
+        s=summarize(tr); s['Family']=f; summaries.append(s); print('\n',f,s)
+    summary=pd.DataFrame(summaries); stage=pd.DataFrame(stages); alltr=pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
+    summary.to_csv('v153_summary.csv',index=False); stage.to_csv('v153_stage_counts.csv',index=False)
+    if not alltr.empty:
+        alltr.to_csv('v153_trades.csv',index=False); closed=alltr[alltr.Result.isin(['WIN','LOSS'])].copy()
+        rows=[]
+        for (f,sym),g in closed.groupby(['Family','Symbol']): z=summarize(g); z.update({'Family':f,'Symbol':sym}); rows.append(z)
+        pd.DataFrame(rows).to_csv('v153_symbol_stats.csv',index=False)
+        rows=[]
+        for (f,side),g in closed.groupby(['Family','Side']): z=summarize(g); z.update({'Family':f,'Side':side}); rows.append(z)
+        pd.DataFrame(rows).to_csv('v153_direction_stats.csv',index=False)
+        closed['Month']=closed.ExitTime.dt.to_period('M').astype(str); rows=[]
+        for (f,m),g in closed.groupby(['Family','Month']): z=summarize(g); z.update({'Family':f,'Month':m}); rows.append(z)
+        pd.DataFrame(rows).to_csv('v153_monthly.csv',index=False)
+    print('\nV153 COMPLETE | RR=1:2 | TIMEOUT=DISABLED | LOOKAHEAD=NONE | NEXT-OPEN ENTRY | MAX OPEN=3')
+    print(summary.to_string(index=False)); print('\nSTAGES'); print(stage.to_string(index=False))
+
+if __name__=='__main__': main()
