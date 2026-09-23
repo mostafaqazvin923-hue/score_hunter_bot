@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# تنظیمات اصلی LBank و CLE-1
+# تنظیمات اصلی LBank و CLE-1 (بهینه‌سازی شده برای فرکانس بالاتر)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True})
@@ -48,8 +48,7 @@ REMOVED_COINS = {
 SYMBOLS = {k: v for k, v in SYMBOLS.items() if k not in REMOVED_COINS}
 
 LOOKBACK_DAYS = 365
-TIMEFRAME = "4h"  # به عنوان پایه بازار یا برای انطباق
-TIMEFRAME_15M = "15m" # اگر لایو 15 دقیقه بخواهیم، اما برای تطبیق با ساختار لایو روی 4h پیاده می‌کنیم
+TIMEFRAME = "4h"
 MAX_POSITIONS = 5
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
@@ -136,7 +135,7 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر: {len(processed_data)} از {len(SYMBOLS)}")
-print("⚙️ شروع اجرای بک‌تست CLE-1 با سیستم امتیازدهی (Confluence Score)...")
+print("⚙️ شروع اجرای بک‌تست CLE-1 با سیستم امتیازدهی بهینه‌شده...")
 
 
 # ============================================================
@@ -217,7 +216,7 @@ def run_cle_lbank_backtest(processed_data):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # بررسی ورود جدید برای هر نماد با سیستم امتیازدهی CLE-1
+        # بررسی ورود جدید (افزایش فرکانس با کاهش حدنصاب امتیاز به 4)
         if len(active_positions) >= MAX_POSITIONS or equity < TRADE_MARGIN:
             continue
 
@@ -238,7 +237,6 @@ def run_cle_lbank_backtest(processed_data):
             if not np.isfinite(atr) or atr <= 0:
                 continue
 
-            # رژیم بازار (پایه 4 ساعته)
             recent_highs = subset["High"].rolling(10).max().iloc[-1]
             recent_lows = subset["Low"].rolling(10).min().iloc[-1]
 
@@ -270,19 +268,18 @@ def run_cle_lbank_backtest(processed_data):
 
             # 3. شتاب (Displacement) -> 2 امتیاز
             candle_range = current_candle["High"] - current_candle["Low"]
-            if candle_range > (1.1 * atr):
+            if candle_range > (1.05 * atr):
                 score += 2
 
             # 4. حجم LBank -> 2 امتیاز
             vol_mean = subset["Volume"].rolling(14).mean().iloc[-1]
-            if np.isfinite(vol_mean) and current_candle["Volume"] > (1.1 * vol_mean):
+            if np.isfinite(vol_mean) and current_candle["Volume"] > (1.05 * vol_mean):
                 score += 2
 
-            # حد نصاب امتیاز (حداقل ۵ از ۱۰)
-            if score < 5:
+            # حد نصاب امتیاز کاهش یافته به 4 برای فرکانس بالاتر
+            if score < 4:
                 continue
 
-            # تنظیمات پوزیشن و ریسک به ریوارد 1:2
             entry_price = current_candle["Open"] * (1 + SLIPPAGE) if direction == "LONG" else current_candle["Open"] * (1 - SLIPPAGE)
             
             if direction == "LONG":
@@ -324,23 +321,57 @@ def summarize_cle_result(trades_df, final_equity):
         print("⚠️ هیچ معامله‌ای ثبت نشد.")
         return
 
+    trades_df = trades_df.sort_values(["Timestamp"], kind="stable").reset_index(drop=True)
+
     total_trades = len(trades_df)
     wins = int((trades_df["Outcome"] == "WIN").sum())
     losses = int((trades_df["Outcome"] == "LOSS").sum())
     wr = (wins / total_trades * 100) if total_trades > 0 else 0
     total_dollar_pnl = float(trades_df["Net_PnL"].sum())
 
+    max_losses = 0
+    current_losses = 0
+    loss_sequences = []
+    temp_loss_seq = 0
+
+    for outcome in trades_df["Outcome"]:
+        if outcome == "WIN":
+            current_losses = 0
+            if temp_loss_seq > 0:
+                loss_sequences.append(temp_loss_seq)
+                temp_loss_seq = 0
+        else:
+            current_losses += 1
+            temp_loss_seq += 1
+            max_losses = max(max_losses, current_losses)
+
+    if temp_loss_seq > 0:
+        loss_sequences.append(temp_loss_seq)
+
+    longs_df = trades_df[trades_df["Side"] == "LONG"]
+    shorts_df = trades_df[trades_df["Side"] == "SHORT"]
+
     print(f"🔸 سرمایه اولیه: ${INITIAL_CAPITAL:,.2f}")
     print(f"🔸 مارجین: ${TRADE_MARGIN:,.2f} | لورج: {LEVERAGE}x")
     print(f"🔸 تعداد کل معاملات: {total_trades}")
-    print(f"   🔹 معاملات برنده: {wins} | معاملات بازنده: {losses}")
+    print(f"   🔹 معاملات لانگ: کل = {len(longs_df)} | برنده = {int((longs_df['Outcome'] == 'WIN').sum())} | بازنده = {int((longs_df['Outcome'] == 'LOSS').sum())}")
+    print(f"   🔸 معاملات شورت: کل = {len(shorts_df)} | برنده = {int((shorts_df['Outcome'] == 'WIN').sum())} | بازنده = {int((shorts_df['Outcome'] == 'LOSS').sum())}")
     print(f"🎯 وین‌ریت کلی: {wr:.2f}%")
     print(f"💵 مجموع سود/زیان دلاری خالص: ${total_dollar_pnl:,.2f}")
     print(f"🏦 سرمایه نهایی: ${final_equity:,.2f}")
+    print(f"❄️ حداکثر ضررهای متوالی کل سبد: {max_losses}")
+
+    print("\n------------------------------------------------------------")
+    print("📉 لیست کامل زنجیره‌های ضرر متوالی:")
+    print("------------------------------------------------------------")
+    if loss_sequences:
+        print(", ".join(map(str, loss_sequences)))
+    else:
+        print("هیچ زنجیره ضرری ثبت نشد.")
     print("=" * 68)
 
 
 if __name__ == "__main__":
     df_trades, final_equity = run_cle_lbank_backtest(processed_data)
     summarize_cle_result(df_trades, final_equity)
-    print("\n✨ بک‌تست CLE-1 با موفقیت روی دیتای زنده صرافی به پایان رسید.")
+    print("\n✨ بک‌تست CLE-1 با موفقیت به پایان رسید.")
