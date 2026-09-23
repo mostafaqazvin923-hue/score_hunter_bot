@@ -5,13 +5,13 @@ import numpy as np
 
 
 # ============================================================
-# 1. RISK MANAGER & CONFIG (مارجین ۱۰۰، اهرم ۵۰، ریوارد ۱ به ۲)
+# 1. RISK MANAGER & CONFIG (مارجین ۱۰۰، اهرم ۵۰، ریوارد ۱ به ۲ ثابت)
 # ============================================================
 
 @dataclass
 class RiskConfig:
-    risk_reward: float = 2.0  # اصلاح دقیق به ریوارد ۱ به ۲
-    max_consecutive_losses: int = 6
+    risk_reward: float = 2.0
+    max_consecutive_losses: int = 4
     min_trades_for_stats: int = 50
     trade_margin: float = 100.0
     leverage: float = 50.0
@@ -40,7 +40,7 @@ class RiskManager:
 
     def register_result(self, pnl_amount: float, is_win: bool):
         notional = self.cfg.trade_margin * self.cfg.leverage
-        fee_cost = notional * self.cfg.fee_rate * 2.0  # کارمزد رفت و برگشت
+        fee_cost = notional * self.cfg.fee_rate * 2.0
         net_pnl = pnl_amount - fee_cost
         
         self.equity += net_pnl
@@ -53,7 +53,7 @@ class RiskManager:
             self.consecutive_losses += 1
             if self.consecutive_losses >= self.cfg.max_consecutive_losses:
                 self.trading_paused = True
-                self.pause_timer = 5
+                self.pause_timer = 10
         else:
             self.consecutive_losses = 0
 
@@ -122,7 +122,6 @@ class StrategyCore:
         entry_price = candle["open"]
         stop_price = sig["stop_price"]
         
-        # اعمال دقیق ضریب ۲.۰ برای حد سود بر اساس فاصله تا استاپ‌لاوس
         if sig["direction"] == "long":
             target_price = entry_price + (self.rm.cfg.risk_reward * abs(entry_price - stop_price))
         else:
@@ -167,41 +166,38 @@ class StrategyCore:
 
 
 # ============================================================
-# 3. HIGH-FREQUENCY ULTRA-FAST RSI MEAN REVERSION SIGNAL
+# 3. HIGH-FREQUENCY TREND MOMENTUM SIGNAL
 # ============================================================
 
-def ultra_fast_rsi_signal(history_list):
-    if len(history_list) < 15:
+def trend_momentum_signal(history_list):
+    if len(history_list) < 30:
         return None
 
     df = pd.DataFrame(history_list)
     
-    delta = df["close"].diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
+    # میانگین متحرک نمایی برای تعیین جهت روند اصلی
+    df["EMA_Fast"] = df["close"].ewm(span=8, adjust=False).mean()
+    df["EMA_Slow"] = df["close"].ewm(span=21, adjust=False).mean()
     
-    avg_gain = gain.rolling(2).mean()
-    avg_loss = loss.rolling(2).mean()
-    
-    rs = avg_gain / (avg_loss + 1e-10)
-    df["RSI2"] = 100 - (100 / (1 + rs))
-
     high_low = df["High"] - df["Low"] if "High" in df else df["high"] - df["low"]
     df["ATR"] = high_low.rolling(10).mean()
 
-    last_rsi = df["RSI2"].iloc[-1]
     last_close = df["close"].iloc[-1]
+    fast_ema = df["EMA_Fast"].iloc[-1]
+    slow_ema = df["EMA_Slow"].iloc[-1]
     current_atr = df["ATR"].iloc[-1]
+    prev_close = df["close"].iloc[-2]
 
-    if not np.isfinite(last_rsi) or not np.isfinite(current_atr) or current_atr <= 0:
+    if not np.isfinite(fast_ema) or not np.isfinite(slow_ema) or not np.isfinite(current_atr) or current_atr <= 0:
         return None
 
-    if last_rsi < 10:
-        stop_price = last_close - (current_atr * 0.8)
+    # سیستم ورود بر اساس شتاب روند (صعودی/نزولی) با حفظ فرکانس بالا
+    if fast_ema > slow_ema and last_close > fast_ema and prev_close <= fast_ema:
+        stop_price = last_close - (current_atr * 1.0)
         return {"direction": "long", "stop_price": stop_price}
     
-    elif last_rsi > 90:
-        stop_price = last_close + (current_atr * 0.8)
+    elif fast_ema < slow_ema and last_close < fast_ema and prev_close >= fast_ema:
+        stop_price = last_close + (current_atr * 1.0)
         return {"direction": "short", "stop_price": stop_price}
 
     return None
@@ -229,7 +225,7 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
 
     stats = rm.stats()
     print("=" * 60)
-    print("== ULTRA HIGH-FREQUENCY RSI(2) BACKTEST RESULTS (RR 1:2) ==")
+    print("== TREND MOMENTUM BACKTEST RESULTS (RR 1:2) ==")
     print("=" * 60)
     print(f"تعداد معاملات کل:           {stats['trades']}")
     print(f"وین‌ریت (Win Rate):          {stats['win_rate']}%")
@@ -244,14 +240,14 @@ def run_backtest(df, signal_fn, initial_equity: float = 1000.0, risk_cfg: RiskCo
 
 if __name__ == "__main__":
     np.random.seed(42)
-    n = 2500
-    price = 100 + np.cumsum(np.random.randn(n) * 0.3)
+    n = 3000
+    price = 100 + np.cumsum(np.random.randn(n) * 0.4)
     test_df = pd.DataFrame({
         "time": range(n),
         "open": price,
-        "high": price + np.random.rand(n) * 0.8,
-        "low": price - np.random.rand(n) * 0.8,
-        "close": price + np.random.randn(n) * 0.15,
+        "high": price + np.random.rand(n) * 0.9,
+        "low": price - np.random.rand(n) * 0.9,
+        "close": price + np.random.randn(n) * 0.2,
     })
 
-    run_backtest(test_df, ultra_fast_rsi_signal)
+    run_backtest(test_df, trend_momentum_signal)
