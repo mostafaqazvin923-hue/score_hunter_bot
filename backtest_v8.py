@@ -13,7 +13,7 @@ except ImportError:
   import ccxt
 
 # ============================================================
-# SCORE-HUNTER PRO — V99 STABLE CORE & OVERLAP LOCK
+# SCORE-HUNTER PRO — V11 MULTI-TIMEFRAME (4H MACRO + 1H ENTRY)
 # ============================================================
 
 exchange = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
@@ -31,20 +31,20 @@ SYMBOLS = {
     "CRV": "CRV/USDT",
 }
 
-TIMEFRAME = "15m"
+TIMEFRAME = "1h"  # پایه اجرایی روی کندل‌های ۱ ساعته
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
 
 INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 50.0
-RISK_REWARD = 2.0
+RISK_REWARD = 2.5
 DAYS = 365
-MAX_CONSECUTIVE_LOSSES = 4
+MAX_CONSECUTIVE_LOSSES = 3
 
 
 def fetch_lbank_data(lbank_symbol, start_dt, end_dt):
-  since_ts = int((start_dt - timedelta(days=15)).timestamp() * 1000)
+  since_ts = int((start_dt - timedelta(days=20)).timestamp() * 1000)
   end_ts = int(end_dt.timestamp() * 1000)
   all_ohlcv = []
   current_since = since_ts
@@ -83,19 +83,34 @@ def fetch_lbank_data(lbank_symbol, start_dt, end_dt):
   return df[(df.index >= start_dt) & (df.index <= end_dt)]
 
 
-def prepare_indicators(df):
+def prepare_multi_timeframe_data(df):
   df = df.copy()
-  df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
-  df["EMA_200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
+  # اندیکاتورهای تایم‌فریم اجرایی (1h)
+  df["EMA_20"] = df["Close"].ewm(span=20, adjust=False).mean()
   high_low = df["High"] - df["Low"]
   high_close = np.abs(df["High"] - df["Close"].shift())
   low_close = np.abs(df["Low"] - df["Close"].shift())
   ranges = pd.concat([high_low, high_close, low_close], axis=1)
   df["ATR"] = ranges.max(axis=1).rolling(14).mean()
-
   df["Body"] = (df["Close"] - df["Open"]).abs()
   df["Avg_Body"] = df["Body"].rolling(20).mean()
+
+  # ساخت تایم‌فریم ۴ ساعته (Macro Trend) از طریق Resample
+  df_4h = df.resample("4h").agg({
+      "Open": "first",
+      "High": "max",
+      "Low": "min",
+      "Close": "last",
+      "Volume": "sum",
+  })
+  df_4h.dropna(inplace=True)
+  df_4h["EMA_50_4h"] = df_4h["Close"].ewm(span=50, adjust=False).mean()
+
+  # انتقال مقادیر ۴ ساعته به دیفریم ۱ ساعته با متد Forward Fill (بدون لیک‌آد)
+  df["Trend_4h_Close"] = df_4h["Close"].reindex(df.index, method="ffill")
+  df["Trend_4h_EMA"] = df_4h["EMA_50_4h"].reindex(df.index, method="ffill")
+
   return df
 
 
@@ -105,34 +120,37 @@ def run_backtest_engine(symbol, df):
   position_size = TRADE_MARGIN * LEVERAGE
   consecutive_losses = 0
 
-  i = 200
+  i = 100
   while i < len(df):
     current_candle = df.iloc[i]
     prev_candle = df.iloc[i - 1]
 
     if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-      i += 20
+      i += 24  # استراحت ۲۴ ساعته پس از ۳ باخت متوالی
       consecutive_losses = 0
       continue
 
-    is_bullish_trend = (
-        prev_candle["Close"] > prev_candle["EMA_200"]
-        and prev_candle["EMA_50"] > prev_candle["EMA_200"]
+    # فیلتر روند کلان ۴ ساعته
+    is_4h_bullish = prev_candle["Trend_4h_Close"] > prev_candle["Trend_4h_EMA"]
+    is_4h_bearish = prev_candle["Trend_4h_Close"] < prev_candle["Trend_4h_EMA"]
+
+    # تریگر اجرایی ۱ ساعته هم‌راستا با روند ۴ ساعته
+    is_1h_bullish_trigger = (
+        is_4h_bullish
+        and prev_candle["Close"] > prev_candle["EMA_20"]
+        and prev_candle["Body"] > 1.5 * prev_candle["Avg_Body"]
     )
-    is_bearish_trend = (
-        prev_candle["Close"] < prev_candle["EMA_200"]
-        and prev_candle["EMA_50"] < prev_candle["EMA_200"]
+    is_1h_bearish_trigger = (
+        is_4h_bearish
+        and prev_candle["Close"] < prev_candle["EMA_20"]
+        and prev_candle["Body"] > 1.5 * prev_candle["Avg_Body"]
     )
 
-    strong_momentum = (
-        prev_candle["Body"] > 1.2 * prev_candle["Avg_Body"]
-    ) if "Avg_Body" in prev_candle else True
-
-    if not (is_bullish_trend or is_bearish_trend) or not strong_momentum:
+    if not is_1h_bullish_trigger and not is_1h_bearish_trigger:
       i += 1
       continue
 
-    side = "LONG" if is_bullish_trend else "SHORT"
+    side = "LONG" if is_1h_bullish_trigger else "SHORT"
     entry_price = (
         current_candle["Open"] * (1.0 + SLIPPAGE)
         if side == "LONG"
@@ -145,18 +163,18 @@ def run_backtest_engine(symbol, df):
       continue
 
     if side == "LONG":
-      sl = entry_price - (atr * 1.5)
-      tp = entry_price + (atr * 1.5 * RISK_REWARD)
+      sl = entry_price - (atr * 2.0)
+      tp = entry_price + (atr * 2.0 * RISK_REWARD)
     else:
-      sl = entry_price + (atr * 1.5)
-      tp = entry_price - (atr * 1.5 * RISK_REWARD)
+      sl = entry_price + (atr * 2.0)
+      tp = entry_price - (atr * 2.0 * RISK_REWARD)
 
     outcome = "LOSS"
     exit_price = sl
     exit_index = i + 1
 
-    # اسکن کندل‌ها با رعایت کامل قفل همپوشانی
-    for j in range(i + 1, min(i + 100, len(df))):
+    # اسکن کندل‌ها تا تعیین تکلیف قطعی (قفل همپوشانی)
+    for j in range(i + 1, min(i + 50, len(df))):
       future_candle = df.iloc[j]
       h, l = future_candle["High"], future_candle["Low"]
 
@@ -208,7 +226,7 @@ def run_backtest_engine(symbol, df):
         "Capital": capital,
     })
 
-    # جهش دقیق به بعد از اتمام پوزیشن فعال
+    # پرش به کندل بعد از خروج (قفل همپوشانی)
     i = exit_index + 1
 
   return trades
@@ -217,7 +235,7 @@ def run_backtest_engine(symbol, df):
 def main():
   print("=" * 70)
   print(
-      "SCORE-HUNTER PRO — V99 STABLE CORE ENGINE SIMULATION IN PROGRESS..."
+      "SCORE-HUNTER PRO — V11 MULTI-TIMEFRAME ENGINE SIMULATION IN PROGRESS..."
   )
   print("=" * 70)
 
@@ -232,7 +250,7 @@ def main():
     if df is None or len(df) < 200:
       continue
 
-    df_prepared = prepare_indicators(df)
+    df_prepared = prepare_multi_timeframe_data(df)
     trades = run_backtest_engine(symbol, df_prepared)
     all_trades.extend(trades)
 
@@ -260,7 +278,7 @@ def main():
   max_streak = max(loss_streaks) if loss_streaks else 0
 
   print("\n" + "=" * 70)
-  print("== SCORE-HUNTER PRO: V99 STABLE RESULTS (1 YEAR) ==")
+  print("== SCORE-HUNTER PRO: V11 MULTI-TIMEFRAME RESULTS (1 YEAR) ==")
   print("=" * 70)
   print(f"Total Trades:              {total_trades}")
   print(f"Win Rate:                  {win_rate:.2f}%")
