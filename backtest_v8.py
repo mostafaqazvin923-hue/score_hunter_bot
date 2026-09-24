@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-HUNTER-XT-STYLE2-ULTIMATE
-High Win-Rate & Strict Streak Control Engine (1h + Trend Filter)
-- Focus: Win Rate > 50%, Max Loss Streak <= 4, Controlled Trade Count
+HUNTER-XT-STYLE3-BREAKOUT-SQUEEZE
+Volatility Squeeze & Expansion Engine (1h Timeframe)
+- Focus: Breakout Momentum, High Win Rate, Strict Streak Control
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ CORRELATION_CLUSTERS = {
     "WIF": "MEME",
 }
 
-DATA_DIR = Path("data/xt_futures_style2_ult")
-OUT_DIR = DATA_DIR / "backtest_style2_ult"
+DATA_DIR = Path("data/xt_futures_style3")
+OUT_DIR = DATA_DIR / "backtest_style3"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -36,10 +36,9 @@ FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 RR = 2.0
 ATR_N = 14
-VOLUME_IMBALANCE_THRESHOLD = 0.70  # Stricter accumulation filter
-MAX_OPEN_POSITIONS = 2             
+MAX_OPEN_POSITIONS = 2
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 24      # Strict lockout after 2 losses to protect streaks
+CIRCUIT_BREAKER_COOLDOWN = 12  # Strict cooling after consecutive losses
 
 
 def parse_args():
@@ -92,10 +91,11 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     return df.dropna(subset=required[1:])
 
 
-def calculate_ultimate_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates rigorous trend and order flow filters to force Win Rate > 50%."""
+def calculate_squeeze_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculates Bollinger Bands & Keltner Channels Squeeze and Breakout signals using shift(1)."""
     prev_close = df["close"].shift(1)
     
+    # ATR for channels and risk
     tr = pd.concat([
         df["high"] - df["low"],
         (df["high"] - prev_close).abs(),
@@ -103,28 +103,38 @@ def calculate_ultimate_features(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
 
-    # Dual EMA Trend Filter (Fast and Slow) to guarantee we trade with strong momentum
-    df["ema_fast"] = prev_close.ewm(span=20, adjust=False).mean()
-    df["ema_slow"] = prev_close.ewm(span=60, adjust=False).mean()
-    df["trend_strong"] = (prev_close > df["ema_fast"]) & (df["ema_fast"] > df["ema_slow"])
-
-    # Volume Delta Imbalance
-    hl_range = df["high"] - df["low"] + 1e-8
-    buy_volume_proxy = df["volume"] * (df["close"] - df["low"]) / hl_range
+    # 20 SMA
+    sma20 = prev_close.rolling(window=20).mean()
     
+    # Bollinger Bands (20, 2.0)
+    std20 = prev_close.rolling(window=20).std()
+    bb_upper = sma20 + (2.0 * std20)
+    bb_lower = sma20 - (2.0 * std20)
+
+    # Keltner Channels (20, 1.5 ATR)
+    kc_upper = sma20 + (1.5 * df["atr"])
+    kc_lower = sma20 - (1.5 * df["atr"])
+
+    # Squeeze Condition: Bollinger Bands are inside Keltner Channels
+    df["squeeze_on"] = (bb_upper < kc_upper) & (bb_lower > kc_lower)
+    
+    # Squeeze fired (was on, now off) or momentum breakout
+    df["squeeze_off"] = df["squeeze_on"].shift(1) & (~df["squeeze_on"])
+    
+    # Momentum filter (Linear regression or price channeling)
+    df["momentum"] = prev_close - sma20
+    df["breakout_long"] = df["squeeze_off"] & (df["momentum"] > 0) & (prev_close > sma20)
+
+    # Volume surge confirmation
     prev_volume = df["volume"].shift(1)
-    prev_buy_volume = buy_volume_proxy.shift(1)
-    
-    df["buy_delta_ratio"] = prev_buy_volume / (prev_volume + 1e-8)
     df["avg_volume"] = prev_volume.rolling(window=20).mean()
-    df["volume_surge"] = prev_volume > (1.25 * df["avg_volume"])
+    df["volume_surge"] = prev_volume > (1.15 * df["avg_volume"])
 
-    # Setup condition
-    df["setup_valid"] = df["trend_strong"] & (df["buy_delta_ratio"] >= VOLUME_IMBALANCE_THRESHOLD) & df["volume_surge"]
+    df["setup_valid"] = df["breakout_long"] & df["volume_surge"]
     return df
 
 
-def run_ultimate_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_squeeze_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -224,7 +234,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-STYLE2-ULTIMATE (High Win Rate & Streak Control)")
+    print("HUNTER-XT-STYLE3-BREAKOUT-SQUEEZE")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -233,11 +243,11 @@ def main():
     for asset in SYMBOLS:
         try:
             df = load_xt_csv(data_dir, asset)
-            all_data[asset] = calculate_ultimate_features(df)
+            all_data[asset] = calculate_squeeze_features(df)
         except Exception:
             pass
 
-    trades = run_ultimate_backtest(all_data)
+    trades = run_squeeze_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -252,7 +262,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== STYLE 2 ULTIMATE RESULTS =====")
+    print("\n===== STYLE 3 SQUEEZE RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
