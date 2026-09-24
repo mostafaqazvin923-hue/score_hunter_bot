@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-HUNTER-MTF1 — XT USDT-M Futures / 1D→4H→1H / 365d
+HUNTER-MTF1 COVERAGE AUDIT — XT USDT-M Futures / 1D→4H→1H / 365d
 
 Purpose
 -------
-This is NOT a claim that the old V129 result is valid.
+Diagnostic-only coverage audit for MTF1. It does NOT change the strategy rules or claim profitability.
 It is a causal/integrity rebuild of the V129/V123 signal logic so that
 the strategy can be evaluated fairly on the current XT Futures dataset.
 
@@ -523,6 +523,67 @@ def context_4h(row, daily_regime):
     return "NEUTRAL"
 
 
+
+def coverage_audit(asset: str, df15: pd.DataFrame) -> dict:
+    """Diagnostic-only coverage audit. Does not change strategy or create trades."""
+    h1, h4, d1 = prepare_mtf(df15)
+    c = {
+        "h1_bars": len(h1), "daily_bull": 0, "daily_bear": 0, "daily_neutral": 0,
+        "htf_ready": 0, "ctx_bull_trend": 0, "ctx_bull_pullback": 0,
+        "ctx_bear_trend": 0, "ctx_bear_pullback": 0,
+        "h1_pullback_long": 0, "h1_pullback_short": 0,
+        "body_pass": 0, "volume_pass": 0,
+        "long_trigger": 0, "short_trigger": 0,
+        "long_all_before_trigger": 0, "short_all_before_trigger": 0,
+        "final_long": 0, "final_short": 0,
+    }
+    start = max(EMA_SLOW + 10, PULLBACK_LOOKBACK + VOL_N + 5)
+    for i in range(start, len(h1) - 1):
+        signal_ts = h1.index[i]
+        dsub = d1[d1.index < signal_ts]
+        h4sub = h4[h4.index < signal_ts]
+        if len(dsub) < EMA_SLOW or len(h4sub) < EMA_SLOW:
+            continue
+        c["htf_ready"] += 1
+        dreg = regime_daily(dsub.iloc[-1])
+        if dreg == "BULL": c["daily_bull"] += 1
+        elif dreg == "BEAR": c["daily_bear"] += 1
+        else: c["daily_neutral"] += 1
+        ctx = context_4h(h4sub.iloc[-1], dreg)
+        if ctx == "BULL_TREND": c["ctx_bull_trend"] += 1
+        elif ctx == "BULL_PULLBACK": c["ctx_bull_pullback"] += 1
+        elif ctx == "BEAR_TREND": c["ctx_bear_trend"] += 1
+        elif ctx == "BEAR_PULLBACK": c["ctx_bear_pullback"] += 1
+
+        prev, cur = h1.iloc[i-1], h1.iloc[i]
+        recent = h1.iloc[i-PULLBACK_LOOKBACK:i]
+        atr = float(cur["atr"])
+        if not np.isfinite(atr) or atr <= 0: continue
+        rng = float(cur["high"]-cur["low"])
+        body = abs(float(cur["close"]-cur["open"]))
+        body_ok = rng > 0 and body >= BODY_ATR_MIN*atr
+        if body_ok: c["body_pass"] += 1
+        vol_avg = float(cur["vol_avg"])
+        vol_ok = np.isfinite(vol_avg) and vol_avg > 0 and float(cur["volume"]) >= VOL_MULT*vol_avg
+        if vol_ok: c["volume_pass"] += 1
+        pull_l = bool((recent["low"] <= recent["ema20"]).any() or float(recent["low"].min()) < float(h4sub.iloc[-1]["close"]))
+        pull_s = bool((recent["high"] >= recent["ema20"]).any() or float(recent["high"].max()) > float(h4sub.iloc[-1]["close"]))
+        if pull_l: c["h1_pullback_long"] += 1
+        if pull_s: c["h1_pullback_short"] += 1
+        if rng <= 0: continue
+        close_top=(cur["close"]-cur["low"])/rng
+        close_bottom=(cur["high"]-cur["close"])/rng
+        lt=bool(cur["close"]>cur["open"] and cur["close"]>prev["high"] and close_top>=0.70)
+        st=bool(cur["close"]<cur["open"] and cur["close"]<prev["low"] and close_bottom>=0.70)
+        if lt: c["long_trigger"] += 1
+        if st: c["short_trigger"] += 1
+        if dreg=="BULL" and ctx in {"BULL_TREND","BULL_PULLBACK"} and pull_l and body_ok and vol_ok: c["long_all_before_trigger"] += 1
+        if dreg=="BEAR" and ctx in {"BEAR_TREND","BEAR_PULLBACK"} and pull_s and body_ok and vol_ok: c["short_all_before_trigger"] += 1
+        if dreg=="BULL" and ctx in {"BULL_TREND","BULL_PULLBACK"} and pull_l and body_ok and vol_ok and lt: c["final_long"] += 1
+        if dreg=="BEAR" and ctx in {"BEAR_TREND","BEAR_PULLBACK"} and pull_s and body_ok and vol_ok and st: c["final_short"] += 1
+    return c
+
+
 def generate_candidates(asset: str, df15: pd.DataFrame) -> list[dict]:
     h1, h4, d1 = prepare_mtf(df15)
     candidates = []
@@ -799,7 +860,14 @@ def main():
             for item in seg_candidates:
                 item["segment_end_ts"] = seg.index[-1]
             c.extend(seg_candidates)
+        audit = {"segments": []}
+        for seg in segs:
+            audit["segments"].append(coverage_audit(asset, seg))
+        merged = {}
+        for key in audit["segments"][0].keys() if audit["segments"] else []:
+            merged[key] = sum(x.get(key, 0) for x in audit["segments"])
         print(f"{asset:6s} rows={len(df):6d} segments={len(segs):2d} candidates={len(c):4d}")
+        print("  AUDIT", " ".join(f"{k}={v}" for k,v in merged.items()))
         all_candidates.extend(c)
 
     print(f"Raw candidates: {len(all_candidates)}")
