@@ -12,7 +12,8 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
-EXCHANGE = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
+EXCHANGE = ccxt.lbank({"enableRateLimit": True, "timeout": 20000, "options": {"defaultType": "swap"}})
+EXCHANGE.load_markets()
 SYMBOLS = [
     "BTC/USDT:USDT","ETH/USDT:USDT","SOL/USDT:USDT","SUI/USDT:USDT",
     "AVAX/USDT:USDT","NEAR/USDT:USDT","ADA/USDT:USDT","BNB/USDT:USDT",
@@ -44,8 +45,10 @@ def cluster_of(sym):
 
 def fetch_ohlcv(symbol, since_ms, until_ms):
     rows=[]; cur=since_ms
+    market = EXCHANGE.market(symbol)
+    request_symbol = market["symbol"]
     while cur < until_ms:
-        batch=EXCHANGE.fetch_ohlcv(symbol,TIMEFRAME,since=cur,limit=1000)
+        batch=EXCHANGE.fetch_ohlcv(request_symbol,TIMEFRAME,since=cur,limit=1000)
         if not batch: break
         rows.extend(batch)
         nxt=batch[-1][0]+15*60*1000
@@ -191,7 +194,18 @@ def main():
     target_start=now-timedelta(days=DAYS)
     fetch_start=target_start-timedelta(days=WARMUP_DAYS)
     data={}
+    valid_symbols=[]
     for sym in SYMBOLS:
+        try:
+            market=EXCHANGE.market(sym)
+            if market.get("swap") and market.get("quote")=="USDT":
+                valid_symbols.append(sym)
+            else:
+                print(f"SKIP {sym}: not an eligible USDT swap market")
+        except Exception as e:
+            print(f"SKIP {sym}: market not found ({e})")
+    print(f"Valid LBank swap markets: {len(valid_symbols)} / {len(SYMBOLS)}")
+    for sym in valid_symbols:
         print(f"دریافت و آماده‌سازی: {sym.split('/')[0]} ...")
         raw=fetch_ohlcv(sym,int(fetch_start.timestamp()*1000),int(now.timestamp()*1000))
         if raw.empty:
