@@ -38,8 +38,13 @@ The existing XT collector in this project can create these files.
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import requests
 
 import numpy as np
 import pandas as pd
@@ -76,6 +81,286 @@ def parse_args():
     p.add_argument("--out-dir", default=str(OUT_DIR))
     return p.parse_args()
 
+
+# ---------------------------------------------------------------------------
+# XT FUTURES DATA COLLECTOR
+# ---------------------------------------------------------------------------
+BASE = "https://fapi.xt.com"
+SYMBOL_LIST_URL = f"{BASE}/future/market/v1/public/symbol/list"
+KLINE_URL = f"{BASE}/future/market/v1/public/q/kline"
+INTERVAL = "15m"
+LIMIT = 1500
+TIMEOUT = 20
+RETRIES = 5
+SLEEP = 0.12
+
+def _now_utc():
+    return datetime.now(timezone.utc)
+
+def _to_ms(dt):
+    return int(dt.timestamp() * 1000)
+
+def _api_json(session, url, params=None):
+    last = None
+    for attempt in range(1, RETRIES + 1):
+        try:
+            r = session.get(url, params=params, timeout=TIMEOUT)
+            r.raise_for_status()
+            payload = r.json()
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"XT unexpected response type: {type(payload).__name__}")
+            rc = payload.get("returnCode")
+            if rc not in (None, 0, "0"):
+                raise RuntimeError(
+                    f"XT API error: {payload.get('error') or payload.get('msgInfo') or payload}"
+                )
+            return payload
+        except Exception as exc:
+            last = exc
+            if attempt < RETRIES:
+                time.sleep(min(2 * attempt, 5))
+    raise RuntimeError(f"XT API request failed after {RETRIES} attempts: {last}")
+
+def _extract_list(payload):
+    result = payload.get("result")
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        for key in ("items", "list", "data", "symbols"):
+            if isinstance(result.get(key), list):
+                return result[key]
+    raise RuntimeError("Could not find XT symbol list in response")
+
+def _discover_symbols(session):
+    items = _extract_list(_api_json(session, SYMBOL_LIST_URL))
+    found = {}
+    for item in items:
+        if isinstance(item, str):
+            raw = item
+        elif isinstance(item, dict):
+            raw = item.get("symbol") or item.get("s") or item.get("name") or item.get("pair")
+        else:
+            raw = None
+        if raw:
+            found[str(raw).strip().upper()] = item
+    if not found:
+        raise RuntimeError("XT symbol list returned zero usable symbols")
+    return found
+
+def _resolve_symbol(asset, discovered):
+    wanted = asset.upper()
+    candidates = [f"{wanted}_USDT", f"{wanted}/USDT", f"{wanted}-USDT", wanted]
+    for candidate in candidates:
+        if candidate.upper() in discovered:
+            return candidate.upper()
+    def norm(x):
+        return str(x).upper().replace("/", "_").replace("-", "_")
+    matches = [actual for actual in discovered if norm(actual) == f"{wanted}_USDT"]
+    return matches[0] if len(matches) == 1 else None
+
+def _normalize_kline_rows(rows, symbol):
+    records = []
+    for row in rows:
+        if isinstance(row, dict):
+            required = ("t", "o", "h", "l", "c", "a")
+            if not all(k in row for k in required):
+                raise RuntimeError(f"{symbol}: malformed XT kline row")
+            records.append({
+                "Timestamp": int(row["t"]),
+                "Open": float(row["o"]),
+                "High": float(row["h"]),
+                "Low": float(row["l"]),
+                "Close": float(row["c"]),
+                "Volume": float(row["a"]),
+                "Turnover": float(row["v"]) if row.get("v") is not None else float("nan"),
+            })
+        elif isinstance(row, (list, tuple)) and len(row) >= 6:
+            records.append({
+                "Timestamp": int(row[0]),
+                "Open": float(row[1]),
+                "High": float(row[2]),
+                "Low": float(row[3]),
+                "Close": float(row[4]),
+                "Volume": float(row[5]),
+                "Turnover": float(row[6]) if len(row) > 6 else float("nan"),
+            })
+        else:
+            raise RuntimeError(f"{symbol}: unsupported XT kline row")
+
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
+    return df
+
+def _fetch_xt_batch(session, symbol, start_ms, end_ms):
+    payload = _api_json(
+        session, KLINE_URL,
+        {
+            "symbol": symbol.strip().lower(),
+            "interval": INTERVAL,
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "limit": LIMIT,
+        },
+    )
+    rows = payload.get("result")
+    if not isinstance(rows, list):
+        raise RuntimeError(f"{symbol}: XT kline result is not a list")
+    return _normalize_kline_rows(rows, symbol)
+
+def _audit_download(df, symbol):
+    if df.empty:
+        raise RuntimeError(f"{symbol}: empty XT dataset")
+    bad = (
+        (df[["Open", "High", "Low", "Close"]] <= 0).any(axis=1)
+        | (df["Volume"] < 0)
+        | (df["High"] < df[["Open", "Close", "Low"]].max(axis=1))
+        | (df["Low"] > df[["Open", "Close", "High"]].min(axis=1))
+    )
+    if bad.any():
+        raise RuntimeError(f"{symbol}: {int(bad.sum())} invalid OHLCV rows")
+    diffs = df["Date"].diff().dropna()
+    gaps = diffs[diffs > pd.Timedelta(minutes=15)]
+    return {
+        "rows": int(len(df)),
+        "start": df["Date"].iloc[0].isoformat(),
+        "end": df["Date"].iloc[-1].isoformat(),
+        "duplicates": int(df["Date"].duplicated().sum()),
+        "gaps": int(len(gaps)),
+        "max_gap_minutes": int(gaps.max().total_seconds() / 60) if len(gaps) else 15,
+    }
+
+def _download_symbol(session, symbol, start_dt, end_dt):
+    start_ms = _to_ms(start_dt)
+    cursor_end = _to_ms(end_dt)
+    batches = []
+    calls = 0
+
+    while cursor_end >= start_ms:
+        batch = _fetch_xt_batch(session, symbol, start_ms, cursor_end)
+        calls += 1
+        if batch.empty:
+            break
+
+        batch = batch.sort_values("Date").reset_index(drop=True)
+        first = int(batch["Timestamp"].iloc[0])
+        last = int(batch["Timestamp"].iloc[-1])
+
+        if first < start_ms:
+            batch = batch[batch["Timestamp"] >= start_ms].copy()
+            if batch.empty:
+                break
+            first = int(batch["Timestamp"].iloc[0])
+            last = int(batch["Timestamp"].iloc[-1])
+
+        if last > cursor_end:
+            raise RuntimeError(f"{symbol}: XT returned candle beyond requested end")
+
+        batches.append(batch)
+        print(
+            f"  {symbol}: request={calls:02d} rows={len(batch):4d} "
+            f"{batch['Date'].iloc[0]} -> {batch['Date'].iloc[-1]}"
+        )
+
+        if first <= start_ms:
+            break
+
+        next_end = first - 1
+        if next_end >= cursor_end:
+            raise RuntimeError(f"{symbol}: XT backward pagination made no progress")
+
+        cursor_end = next_end
+        if calls > 1000:
+            raise RuntimeError(f"{symbol}: XT pagination safety stop")
+        time.sleep(SLEEP)
+
+    if not batches:
+        raise RuntimeError(f"{symbol}: XT returned zero historical candles")
+
+    df = (
+        pd.concat(batches, ignore_index=True)
+        .drop_duplicates(subset=["Date"], keep="last")
+        .sort_values("Date")
+        .reset_index(drop=True)
+    )
+    df = df[
+        (df["Date"] >= pd.Timestamp(start_dt))
+        & (df["Date"] <= pd.Timestamp(end_dt))
+    ].copy()
+
+    now = _now_utc()
+    if not df.empty and df["Date"].iloc[-1] + pd.Timedelta(minutes=15) > pd.Timestamp(now):
+        df = df.iloc[:-1].copy()
+
+    report = _audit_download(df, symbol)
+    report["api_requests"] = calls
+    if report["rows"] < 30000:
+        raise RuntimeError(
+            f"{symbol}: incomplete XT coverage: {report['rows']} rows (expected roughly 35,000)"
+        )
+    return df, report
+
+def ensure_xt_data(data_dir: Path):
+    """Ensure all 14 XT 15m datasets exist in THIS GitHub Actions run."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    end_dt = _now_utc()
+    start_dt = end_dt - timedelta(days=365)
+
+    valid = True
+    for asset in SYMBOLS:
+        path = data_dir / f"{asset}_USDT_15m.csv"
+        if not path.exists():
+            valid = False
+            break
+        try:
+            probe = pd.read_csv(path, usecols=["Date"])
+            if len(probe) < 30000:
+                valid = False
+                break
+            dates = pd.to_datetime(probe["Date"], utc=True)
+            if dates.max() < pd.Timestamp(end_dt - timedelta(days=2)):
+                valid = False
+                break
+            if dates.min() > pd.Timestamp(start_dt + timedelta(days=2)):
+                valid = False
+                break
+        except Exception:
+            valid = False
+            break
+
+    if valid:
+        print("XT data audit: 14/14 existing CSVs have sufficient 365-day coverage.")
+        return
+
+    print("XT data audit: CSVs missing/incomplete/stale -> downloading 365 days from XT Futures...")
+    session = requests.Session()
+    session.headers.update({"User-Agent": "HUNTER-V129-AUDITED/1.0"})
+
+    discovered = _discover_symbols(session)
+    resolved = {asset: _resolve_symbol(asset, discovered) for asset in SYMBOLS}
+    unresolved = [a for a, v in resolved.items() if v is None]
+    if unresolved:
+        raise RuntimeError("Unresolved XT Futures symbols: " + ", ".join(unresolved))
+
+    for asset in SYMBOLS:
+        actual = resolved[asset]
+        df, report = _download_symbol(session, actual, start_dt, end_dt)
+        out = data_dir / f"{asset}_USDT_15m.csv"
+        df.to_csv(out, index=False)
+        print(
+            f"XT DATA OK {asset}: rows={report['rows']:,}, "
+            f"start={report['start']}, end={report['end']}, "
+            f"gaps={report['gaps']}, requests={report['api_requests']}"
+        )
+
+    missing = [
+        asset for asset in SYMBOLS
+        if not (data_dir / f"{asset}_USDT_15m.csv").exists()
+    ]
+    if missing:
+        raise RuntimeError("XT final data verification failed; missing: " + ", ".join(missing))
+
+    print("XT data audit: 14/14 files successfully downloaded and verified.")
 
 def load_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     path = data_dir / f"{asset}_USDT_15m.csv"
@@ -566,6 +851,9 @@ def main():
     data_dir = Path(args.data_dir)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # GitHub Actions runners are fresh; data must be prepared in the same run.
+    ensure_xt_data(data_dir)
 
     print("=" * 88)
     print("HUNTER-V129-AUDITED — XT USDT-M FUTURES")
