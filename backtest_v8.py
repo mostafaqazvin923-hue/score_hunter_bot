@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-HUNTER-XT-INSTITUTIONAL-OB-ENGINE (Audited & Fixed)
-Institutional Liquidity Sweep & Order Block Strategy
-- Strict Causal Execution / No-Lookahead
-- Margin: $100 | Leverage: 50x | RR: 1:2
-- Circuit Breaker Protection against consecutive losses
+HUNTER-XT-MULTI-TIMEFRAME-ENGINE (4h Trend + 1h Entry)
+Institutional Multi-Timeframe Strategy for XT.com USDT-M Futures
+- 4h TF: Macro Trend & Regime Filter
+- 1h TF: Precise Entry Trigger & Order Block / Pullback
+- Risk Management: 1:2 RR, $100 Margin, 50x Leverage, Circuit Breaker
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ CORRELATION_CLUSTERS = {
     "WIF": "MEME",
 }
 
-DATA_DIR = Path("data/xt_futures_15m")
-OUT_DIR = DATA_DIR / "backtest_institutional_ob"
+DATA_DIR = Path("data/xt_futures_multitf")
+OUT_DIR = DATA_DIR / "backtest_multitf"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -40,7 +40,7 @@ RR = 2.0
 ATR_N = 14
 MAX_OPEN_POSITIONS = 2
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 16  # 4 hours pause after 2 losses
+CIRCUIT_BREAKER_COOLDOWN = 12  # Pause after 2 losses
 
 
 def parse_args():
@@ -51,6 +51,7 @@ def parse_args():
 
 
 def ensure_xt_data(data_dir: Path, symbols: list[str]):
+    """Downloads both 1h and 4h XT Futures data."""
     data_dir.mkdir(parents=True, exist_ok=True)
     try:
         import ccxt
@@ -61,20 +62,21 @@ def ensure_xt_data(data_dir: Path, symbols: list[str]):
     exchange.options['defaultType'] = 'swap'
 
     for symbol in symbols:
-        file_path = data_dir / f"{symbol}_USDT_15m.csv"
-        if file_path.exists() and file_path.stat().st_size > 200:
-            continue
-        try:
-            ccxt_symbol = f"{symbol}/USDT:USDT"
-            ohlcv = exchange.fetch_ohlcv(ccxt_symbol, timeframe='15m', limit=1500)
-            if ohlcv:
-                pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).to_csv(file_path, index=False)
-        except Exception:
-            pass
+        for tf in ['1h', '4h']:
+            file_path = data_dir / f"{symbol}_USDT_{tf}.csv"
+            if file_path.exists() and file_path.stat().st_size > 200:
+                continue
+            try:
+                ccxt_symbol = f"{symbol}/USDT:USDT"
+                ohlcv = exchange.fetch_ohlcv(ccxt_symbol, timeframe=tf, limit=1500)
+                if ohlcv:
+                    pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).to_csv(file_path, index=False)
+            except Exception:
+                pass
 
 
-def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
-    path = data_dir / f"{asset}_USDT_15m.csv"
+def load_xt_csv(data_dir: Path, asset: str, tf: str) -> pd.DataFrame:
+    path = data_dir / f"{asset}_USDT_{tf}.csv"
     if not path.exists():
         raise FileNotFoundError(f"Missing file: {path}")
 
@@ -93,33 +95,40 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     return df.dropna(subset=required[1:])
 
 
-def calculate_institutional_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates Causal Swing Lows, Liquidity Sweeps, and Order Blocks with strict shift logic."""
-    prev_close = df["close"].shift(1)
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev_close).abs(),
-        (df["low"] - prev_close).abs(),
+def process_multi_timeframe(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> pd.DataFrame:
+    """Aligns 4h macro trend with 1h execution frame strictly using causal shifts."""
+    
+    # 1. 4H Macro Trend Filter (Causal)
+    prev_close_4h = df_4h["close"].shift(1)
+    df_4h["ema_macro"] = prev_close_4h.ewm(span=50, adjust=False).mean()
+    df_4h["macro_bullish"] = prev_close_4h > df_4h["ema_macro"]
+
+    # 2. 1H Execution Indicators (Causal)
+    prev_close_1h = df_1h["close"].shift(1)
+    tr_1h = pd.concat([
+        df_1h["high"] - df_1h["low"],
+        (df_1h["high"] - prev_close_1h).abs(),
+        (df_1h["low"] - prev_close_1h).abs(),
     ], axis=1).max(axis=1)
 
-    df["atr"] = tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
+    df_1h["atr"] = tr_1h.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
+    df_1h["swing_low"] = df_1h["low"].shift(2).rolling(window=12).min()
+    df_1h["sweep_low"] = (df_1h["low"].shift(1) < df_1h["swing_low"]) & (df_1h["close"].shift(1) > df_1h["swing_low"])
     
-    # FIXED: Swing low correctly calculated from the preceding 10 bars (excluding current evaluated bar)
-    df["swing_low"] = df["low"].shift(2).rolling(window=10).min()
-    
-    # Liquidity Sweep: Previous candle low breaks swing low, but closes back above it
-    df["sweep_low"] = (df["low"].shift(1) < df["swing_low"]) & (df["close"].shift(1) > df["swing_low"])
-    
-    # Displacement / Strong Bullish Expansion
-    df["body"] = df["close"].shift(1) - df["open"].shift(1)
-    df["is_displacement"] = (df["body"] > 1.2 * df["atr"]) & (df["body"] > 0)
-    
-    # Combined Institutional Setup Signal
-    df["setup_valid"] = df["sweep_low"] & df["is_displacement"]
-    return df
+    # Clean expansion body
+    df_1h["body"] = df_1h["close"].shift(1) - df_1h["open"].shift(1)
+    df_1h["expansion"] = (df_1h["body"] > 1.0 * df_1h["atr"]) & (df_1h["body"] > 0)
+
+    # 3. Merge 4h macro state into 1h dataframe using backward fill (reindex/merge_asof) to avoid lookahead
+    df_4h_resampled = df_4h[["macro_bullish"]].reindex(df_1h.index, method="ffill")
+    df_1h["macro_bullish"] = df_4h_resampled["macro_bullish"]
+
+    # Final Setup: 4h is bullish AND 1h gives a liquidity sweep + expansion
+    df_1h["setup_valid"] = df_1h["macro_bullish"].fillna(False) & df_1h["sweep_low"] & df_1h["expansion"]
+    return df_1h
 
 
-def run_institutional_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_multitf_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -137,7 +146,7 @@ def run_institutional_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
         if cooldown_counter > 0:
             cooldown_counter -= 1
 
-        # 1. Manage active positions
+        # 1. Manage active positions on 1h high/low
         for symbol, pos in list(active_positions.items()):
             df = all_data[symbol]
             if ts not in df.index:
@@ -173,7 +182,7 @@ def run_institutional_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 })
                 del active_positions[symbol]
 
-        # 2. Institutional Setup Execution (No-Lookahead)
+        # 2. Entry Execution (No-Lookahead)
         if cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
             for symbol, df in all_data.items():
                 if ts not in df.index:
@@ -196,7 +205,6 @@ def run_institutional_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
                 atr = row["atr"]
                 
-                # Stop loss placed safely below the sweep low
                 sl = float(row["swing_low"]) - (0.2 * atr)
                 risk = entry - sl
                 if risk <= 0:
@@ -218,7 +226,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-INSTITUTIONAL-OB-ENGINE (Audited & Fixed)")
+    print("HUNTER-XT-MULTI-TIMEFRAME-ENGINE (4h Trend + 1h Entry)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -226,12 +234,13 @@ def main():
     all_data = {}
     for asset in SYMBOLS:
         try:
-            df = load_xt_csv(data_dir, asset)
-            all_data[asset] = calculate_institutional_features(df)
+            df_1h = load_xt_csv(data_dir, asset, "1h")
+            df_4h = load_xt_csv(data_dir, asset, "4h")
+            all_data[asset] = process_multi_timeframe(df_1h, df_4h)
         except Exception:
             pass
 
-    trades = run_institutional_backtest(all_data)
+    trades = run_multitf_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -246,7 +255,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== INSTITUTIONAL RESULTS (FIXED) =====")
+    print("\n===== MULTI-TIMEFRAME RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
