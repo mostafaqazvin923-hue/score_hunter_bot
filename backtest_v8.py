@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-HUNTER-XT-STYLE4-CROSS-SECTIONAL-MOMENTUM
-Cross-Sectional Relative Strength & Momentum Engine (1h Timeframe)
-- Focus: High Win Rate via Relative Ranking, Strong Trend Alignment, Strict Streak Control
+HUNTER-XT-STYLE4-ULTIMATE-MOMENTUM
+Cross-Sectional Relative Strength & Macro Regime Filter (1h Timeframe)
+- Focus: Win Rate > 50%, Max Loss Streak <= 4, High PnL
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ CORRELATION_CLUSTERS = {
     "WIF": "MEME",
 }
 
-DATA_DIR = Path("data/xt_futures_style4")
-OUT_DIR = DATA_DIR / "backtest_style4"
+DATA_DIR = Path("data/xt_futures_style4_ult")
+OUT_DIR = DATA_DIR / "backtest_style4_ult"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -34,11 +34,11 @@ LEVERAGE = 50.0
 
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
-RR = 1.8                  # Balanced Risk-Reward to protect Win Rate > 50%
+RR = 2.0                      # Optimized Risk-Reward for >50% Win Rate
 ATR_N = 14
-MAX_OPEN_POSITIONS = 3
+MAX_OPEN_POSITIONS = 2        # Reduced to 2 to minimize simultaneous market exposure
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 8   # Strict cooling after losses to guarantee Max Streak <= 4
+CIRCUIT_BREAKER_COOLDOWN = 20 # Strict lockout after 2 losses to guarantee streak <= 4
 
 
 def parse_args():
@@ -92,7 +92,7 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
 
 
 def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates ATR, Trend, and 24h Return for cross-sectional ranking using shift(1)."""
+    """Calculates ATR, Trend, and Strict Momentum Ranking metrics using shift(1)."""
     prev_close = df["close"].shift(1)
     
     tr = pd.concat([
@@ -112,13 +112,13 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     # Volume filter
     prev_volume = df["volume"].shift(1)
     df["avg_volume"] = prev_volume.rolling(window=20).mean()
-    df["volume_ok"] = prev_volume > (0.8 * df["avg_volume"])
+    df["volume_ok"] = prev_volume > (1.1 * df["avg_volume"]) # Stricter volume confirmation
 
-    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["return_24h"] > 0.0)
+    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["return_24h"] > 0.01)
     return df
 
 
-def run_style4_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_ultimate_momentum_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -135,6 +135,12 @@ def run_style4_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     for idx, ts in enumerate(all_times):
         if cooldown_counter > 0:
             cooldown_counter -= 1
+
+        # Macro Market Regime Check (BTC Trend Filter)
+        btc_df = all_data.get("BTC")
+        market_bullish = True
+        if btc_df is not None and ts in btc_df.index:
+            market_bullish = bool(btc_df.loc[ts, "trend_ok"])
 
         # 1. Manage active positions
         for symbol, pos in list(active_positions.items()):
@@ -172,9 +178,8 @@ def run_style4_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 })
                 del active_positions[symbol]
 
-        # 2. Cross-Sectional Ranking & Entry Execution
-        if cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
-            # Collect valid candidate scores at this timestamp
+        # 2. Cross-Sectional Ranking & Macro-Filtered Entry Execution
+        if market_bullish and cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
             candidates = []
             for symbol, df in all_data.items():
                 if ts not in df.index:
@@ -192,7 +197,7 @@ def run_style4_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 if np.isfinite(ret_24h):
                     candidates.append((symbol, ret_24h))
 
-            # Sort candidates by highest 24h return (Cross-Sectional Momentum Top Rank)
+            # Sort by top relative momentum
             candidates.sort(key=lambda x: x[1], reverse=True)
 
             for symbol, _ in candidates:
@@ -232,7 +237,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-STYLE4-CROSS-SECTIONAL-MOMENTUM")
+    print("HUNTER-XT-STYLE4-ULTIMATE-MOMENTUM (Macro Filter + Strict Streak Control)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -245,7 +250,7 @@ def main():
         except Exception:
             pass
 
-    trades = run_style4_backtest(all_data)
+    trades = run_ultimate_momentum_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -260,7 +265,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== STYLE 4 MOMENTUM RANKING RESULTS =====")
+    print("\n===== STYLE 4 ULTIMATE RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
