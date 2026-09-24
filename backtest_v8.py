@@ -518,6 +518,111 @@ def prepare_htf(df15: pd.DataFrame):
     return x, h1, h4
 
 
+def diagnose_segment(asset: str, df15: pd.DataFrame) -> dict:
+    """Diagnostic-only causal funnel for V129.
+
+    This function does NOT alter signal rules or create trades. It counts how
+    many completed candles survive each exact V129 condition so a zero-signal
+    result can be traced to the first restrictive stage.
+    """
+    x, h1, h4 = prepare_htf(df15)
+    d = {
+        "bars": len(x),
+        "loop_bars": 0,
+        "h1_available": 0,
+        "h4_available": 0,
+        "h4_ema200_ready": 0,
+        "bull_regime": 0,
+        "bear_regime": 0,
+        "sweep_low": 0,
+        "sweep_high": 0,
+        "displacement_up": 0,
+        "displacement_down": 0,
+        "long_sweep_and_displacement": 0,
+        "short_sweep_and_displacement": 0,
+        "long_final": 0,
+        "short_final": 0,
+        "atr_valid": 0,
+        "near_long_without_regime": 0,
+        "near_short_without_regime": 0,
+    }
+
+    start_i = max(250, BODY_N + 5)
+    for i in range(start_i, len(x) - 1):
+        d["loop_bars"] += 1
+        signal_ts = x.index[i]
+        h1_sub = h1[h1.index < signal_ts]
+        h4_sub = h4[h4.index < signal_ts]
+        if len(h1_sub) < 10:
+            continue
+        d["h1_available"] += 1
+        if len(h4_sub) < 1:
+            continue
+        d["h4_available"] += 1
+
+        regime = h4_sub.iloc[-1]
+        if pd.isna(regime["ema200"]):
+            continue
+        d["h4_ema200_ready"] += 1
+        if bool(regime["bull"]):
+            d["bull_regime"] += 1
+        if bool(regime["bear"]):
+            d["bear_regime"] += 1
+
+        lows = h1_sub["low"].iloc[-10:-2]
+        highs = h1_sub["high"].iloc[-10:-2]
+        if len(lows) == 0 or len(highs) == 0:
+            continue
+
+        support = float(lows.min())
+        resistance = float(highs.max())
+        prev = x.iloc[i - 1]
+        curr = x.iloc[i]
+
+        sweep_low = bool(prev["low"] < support and prev["close"] > support)
+        sweep_high = bool(prev["high"] > resistance and prev["close"] < resistance)
+        if sweep_low:
+            d["sweep_low"] += 1
+        if sweep_high:
+            d["sweep_high"] += 1
+
+        disp_up = bool(
+            curr["close"] > curr["open"]
+            and curr["body"] > 2.0 * curr["avg_body"]
+        )
+        disp_down = bool(
+            curr["close"] < curr["open"]
+            and curr["body"] > 2.0 * curr["avg_body"]
+        )
+        if disp_up:
+            d["displacement_up"] += 1
+        if disp_down:
+            d["displacement_down"] += 1
+
+        long_pair = sweep_low and disp_up
+        short_pair = sweep_high and disp_down
+        if long_pair:
+            d["long_sweep_and_displacement"] += 1
+            if not bool(regime["bull"]):
+                d["near_long_without_regime"] += 1
+        if short_pair:
+            d["short_sweep_and_displacement"] += 1
+            if not bool(regime["bear"]):
+                d["near_short_without_regime"] += 1
+
+        atr = float(curr["atr15"]) if pd.notna(curr["atr15"]) else np.nan
+        if np.isfinite(atr) and atr > 0:
+            d["atr_valid"] += 1
+
+        if bool(regime["bull"]) and long_pair:
+            d["long_final"] += 1
+        if bool(regime["bear"]) and short_pair:
+            d["short_final"] += 1
+
+    d["final_total"] = d["long_final"] + d["short_final"]
+    return d
+
+
 def generate_candidates(asset: str, df15: pd.DataFrame) -> list[dict]:
     """
     Candidate timestamp = the COMPLETED displacement candle.
@@ -890,8 +995,25 @@ def main():
         )
 
         for seg in split_segments(df):
+            diag = diagnose_segment(asset, seg)
+            print(
+                f"  DIAG {asset:6s} bars={diag['bars']:5d} "
+                f"H1={diag['h1_available']:5d} H4={diag['h4_ema200_ready']:5d} "
+                f"bull={diag['bull_regime']:5d} bear={diag['bear_regime']:5d} "
+                f"sweepL={diag['sweep_low']:5d} sweepS={diag['sweep_high']:5d} "
+                f"dispL={diag['displacement_up']:5d} dispS={diag['displacement_down']:5d} "
+                f"pairL={diag['long_sweep_and_displacement']:4d} "
+                f"pairS={diag['short_sweep_and_displacement']:4d} "
+                f"FINAL_L={diag['long_final']:3d} FINAL_S={diag['short_final']:3d}"
+            )
             all_candidates.extend(generate_candidates(asset, seg))
 
+    print()
+    print("DIAGNOSTIC INTERPRETATION:")
+    print("  sweep = previous 15m candle only")
+    print("  displacement = completed signal candle only")
+    print("  HTF = only candles closed strictly before signal timestamp")
+    print("  FINAL = exact unchanged V129 signal condition")
     print()
     print(f"Raw candidates: {len(all_candidates)}")
 
