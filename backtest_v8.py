@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V131-A
+# HUNTER-V132-A
 # Portfolio-Level / Strict No-Lookahead / Pure 1:2
 #
 # Architecture:
@@ -96,18 +96,18 @@ MAX_OPEN_POSITIONS = 3
 MAX_ONE_PER_CLUSTER = True
 
 MAX_LOSS_STREAK = 4
-LOSS_PAUSE_BARS = 16  # 16 x 15m = 4 hours
+LOSS_PAUSE_BARS = 16  # risk-control pause; existing positions continue
 
 ATR_PERIOD = 14
 BODY_AVG_PERIOD = 20
 
 # Structure / liquidity
-STRUCTURE_LOOKBACK_1H = 15
-SWEEP_BUFFER_ATR = 0.15
+STRUCTURE_LOOKBACK_1H = 12
+SWEEP_BUFFER_ATR = 0.10
 
 # Displacement
-DISPLACEMENT_ATR = 0.80
-DISPLACEMENT_BODY_RATIO = 0.60
+DISPLACEMENT_ATR = 0.65
+DISPLACEMENT_BODY_RATIO = 0.55
 
 # FVG
 USE_FVG_CONFIRMATION = True
@@ -118,10 +118,10 @@ FVG_MIN_ATR = 0.05
 #   regime + 1H structure + liquidity sweep
 #
 # Additional confirmations contribute score.
-MIN_CONFIRMATION_SCORE = 2
+MIN_CONFIRMATION_SCORE = 1
 
 # A hard cap prevents absurdly wide structural stops.
-MAX_STOP_ATR = 2.5
+MAX_STOP_ATR = 2.25
 
 # Higher-timeframe alignment:
 # 4H bar timestamp represents its opening time after resample.
@@ -297,18 +297,17 @@ def prepare_data(df_15m):
     df_4h["PLUS_DI"] = plus_di
     df_4h["MINUS_DI"] = minus_di
 
+    # V132 change: EMA structure defines direction. Slope and DI are
+    # confirmations, not mandatory gates. This reduces over-filtering
+    # while preserving a directional higher-timeframe regime.
     df_4h["Regime_Bullish"] = (
         (df_4h["Close"] > df_4h["EMA_200"])
         & (df_4h["EMA_50"] > df_4h["EMA_200"])
-        & (df_4h["EMA_Slope"] > 0)
-        & (df_4h["PLUS_DI"] > df_4h["MINUS_DI"])
     )
 
     df_4h["Regime_Bearish"] = (
         (df_4h["Close"] < df_4h["EMA_200"])
         & (df_4h["EMA_50"] < df_4h["EMA_200"])
-        & (df_4h["EMA_Slope"] < 0)
-        & (df_4h["MINUS_DI"] > df_4h["PLUS_DI"])
     )
 
     # -----------------------------
@@ -433,24 +432,22 @@ def get_structure_context(h_rows):
 
     recent = h_rows.iloc[-STRUCTURE_LOOKBACK_1H:]
 
-    prior_high = recent["High"].shift(1).max()
-    prior_low = recent["Low"].shift(1).min()
+    # All levels come from completed 1H candles only.
+    prior_high = float(recent["High"].max())
+    prior_low = float(recent["Low"].min())
 
-    last_close = recent.iloc[-1]["Close"]
+    # Confirmed pivots are optional secondary references.
+    swing_high = recent["Last_Swing_High"].iloc[-1]
+    swing_low = recent["Last_Swing_Low"].iloc[-1]
 
     if not np.isfinite(prior_high) or not np.isfinite(prior_low):
         return None
 
     return {
-        "prior_high": float(prior_high),
-        "prior_low": float(prior_low),
-        "last_close": float(last_close),
-        "last_swing_high": float(recent["Last_Swing_High"].iloc[-1])
-        if np.isfinite(recent["Last_Swing_High"].iloc[-1])
-        else np.nan,
-        "last_swing_low": float(recent["Last_Swing_Low"].iloc[-1])
-        if np.isfinite(recent["Last_Swing_Low"].iloc[-1])
-        else np.nan,
+        "prior_high": prior_high,
+        "prior_low": prior_low,
+        "last_swing_high": float(swing_high) if np.isfinite(swing_high) else np.nan,
+        "last_swing_low": float(swing_low) if np.isfinite(swing_low) else np.nan,
     }
 
 
@@ -491,15 +488,23 @@ def calculate_fvg(df_15, i, side):
 
 def signal_on_closed_candle(df_15, df_1h, df_4h, i):
     """
-    Generate a signal ONLY from information known at the CLOSE of
-    15M candle i. Entry occurs on candle i+1 open.
+    V132 balanced signal model.
+
+    Mandatory core:
+      1) completed 4H directional regime
+      2) prior-candle liquidity sweep of completed 1H structure
+      3) current closed-candle displacement in regime direction
+
+    Confirmations are additive rather than all mandatory:
+      FVG / VWAP / volume / ADX-DI alignment
+
+    Entry is always the NEXT 15M candle open.
     """
-    if i < max(60, ATR_PERIOD + BODY_AVG_PERIOD + 5):
+    if i < max(80, ATR_PERIOD + BODY_AVG_PERIOD + 5):
         return None
 
     row = df_15.iloc[i]
     prev = df_15.iloc[i - 1]
-
     current_close_time = df_15.index[i] + FIFTEEN_MIN
 
     regime = get_regime(df_4h, current_close_time)
@@ -514,47 +519,39 @@ def signal_on_closed_candle(df_15, df_1h, df_4h, i):
     if structure is None:
         return None
 
-    atr = row["ATR"]
-    candle_range = row["Range"]
+    atr = float(row["ATR"])
+    candle_range = float(row["Range"])
+    body = float(row["Body"])
 
-    if not np.isfinite(atr) or atr <= 0:
+    if not np.isfinite(atr) or atr <= 0 or not np.isfinite(candle_range) or candle_range <= 0:
         return None
 
-    if not np.isfinite(candle_range) or candle_range <= 0:
-        return None
-
-    # Liquidity reference uses PRIOR completed 1H candles.
     support = structure["prior_low"]
     resistance = structure["prior_high"]
-
     sweep_buffer = SWEEP_BUFFER_ATR * atr
 
     sweep_low = (
-        prev["Low"] < (support - sweep_buffer)
-        and prev["Close"] > support
+        float(prev["Low"]) < support - sweep_buffer
+        and float(prev["Close"]) > support
     )
-
     sweep_high = (
-        prev["High"] > (resistance + sweep_buffer)
-        and prev["Close"] < resistance
+        float(prev["High"]) > resistance + sweep_buffer
+        and float(prev["Close"]) < resistance
     )
 
-    # Displacement on current CLOSED 15M candle.
-    body = row["Body"]
     body_ratio = body / candle_range
 
     displacement_up = (
         regime == "LONG"
         and sweep_low
-        and row["Close"] > row["Open"]
+        and float(row["Close"]) > float(row["Open"])
         and body >= DISPLACEMENT_ATR * atr
         and body_ratio >= DISPLACEMENT_BODY_RATIO
     )
-
     displacement_down = (
         regime == "SHORT"
         and sweep_high
-        and row["Close"] < row["Open"]
+        and float(row["Close"]) < float(row["Open"])
         and body >= DISPLACEMENT_ATR * atr
         and body_ratio >= DISPLACEMENT_BODY_RATIO
     )
@@ -563,53 +560,58 @@ def signal_on_closed_candle(df_15, df_1h, df_4h, i):
         return None
 
     side = "LONG" if displacement_up else "SHORT"
-
     score = 0
-    confirmations = []
+    confirmations = ["CORE_SWEEP", "DISPLACEMENT"]
 
-    # 1) Displacement
-    score += 1
-    confirmations.append("DISPLACEMENT")
-
-    # 2) FVG
+    # Confirmation 1: FVG
     fvg = calculate_fvg(df_15, i, side)
-    if USE_FVG_CONFIRMATION and fvg is not None:
+    if fvg is not None:
         score += 1
         confirmations.append("FVG")
 
-    # 3) VWAP alignment
-    vwap = row["VWAP_48"]
+    # Confirmation 2: rolling VWAP
+    vwap = float(row["VWAP_48"]) if np.isfinite(row["VWAP_48"]) else np.nan
     if np.isfinite(vwap):
-        if side == "LONG" and row["Close"] > vwap:
-            score += 1
-            confirmations.append("VWAP")
-        elif side == "SHORT" and row["Close"] < vwap:
+        if (side == "LONG" and float(row["Close"]) > vwap) or (side == "SHORT" and float(row["Close"]) < vwap):
             score += 1
             confirmations.append("VWAP")
 
-    # 4) Volume expansion
-    vol_ma = row["Volume_MA"]
-    if np.isfinite(vol_ma) and vol_ma > 0:
-        if row["Volume"] > 1.10 * vol_ma:
-            score += 1
-            confirmations.append("VOLUME")
+    # Confirmation 3: relative volume.
+    vol_ma = float(row["Volume_MA"]) if np.isfinite(row["Volume_MA"]) else np.nan
+    if np.isfinite(vol_ma) and vol_ma > 0 and float(row["Volume"]) >= 1.05 * vol_ma:
+        score += 1
+        confirmations.append("RVOL")
 
+    # Confirmation 4: 4H directional strength.
+    h4 = completed_htf_row(df_4h, current_close_time, FOUR_HOURS)
+    if h4 is not None:
+        adx = h4.get("ADX", np.nan)
+        pdi = h4.get("PLUS_DI", np.nan)
+        mdi = h4.get("MINUS_DI", np.nan)
+        slope = h4.get("EMA_Slope", np.nan)
+        if np.isfinite(adx) and adx >= 18:
+            if side == "LONG" and np.isfinite(pdi) and np.isfinite(mdi) and pdi > mdi:
+                score += 1
+                confirmations.append("ADX_DI")
+            elif side == "SHORT" and np.isfinite(pdi) and np.isfinite(mdi) and mdi > pdi:
+                score += 1
+                confirmations.append("ADX_DI")
+        if np.isfinite(slope) and ((side == "LONG" and slope > 0) or (side == "SHORT" and slope < 0)):
+            score += 1
+            confirmations.append("SLOPE")
+
+    # At least one independent confirmation beyond the core setup.
     if score < MIN_CONFIRMATION_SCORE:
         return None
 
-    # Structural SL:
-    # Long below the liquidity sweep low.
-    # Short above the liquidity sweep high.
+    # Stop is tied to the actual liquidity event, not an arbitrary percent.
     if side == "LONG":
         structural_extreme = min(float(prev["Low"]), float(row["Low"]))
-        sl_reference = structural_extreme - 0.15 * atr
+        sl_reference = structural_extreme - 0.10 * atr
     else:
         structural_extreme = max(float(prev["High"]), float(row["High"]))
-        sl_reference = structural_extreme + 0.15 * atr
+        sl_reference = structural_extreme + 0.10 * atr
 
-    # Entry will be next candle OPEN, so risk is calculated from
-    # that actual future execution price. This is NOT used to
-    # decide whether the signal exists.
     return {
         "side": side,
         "score": score,
@@ -911,10 +913,8 @@ def run_portfolio_backtest(processed_data, start_dt, end_dt):
                     "cluster": cluster,
                 })
 
-                # Don't queue more than remaining capacity + a small
-                # deterministic buffer. Final execution sorts by score.
-                if len(pending_entries) >= MAX_OPEN_POSITIONS * 2:
-                    break
+                # Keep all eligible candidates from this bar; execution
+                # later sorts them deterministically by confirmation score.
 
     # ------------------------------------------------------------
     # Final open positions: report separately, don't fabricate exits.
@@ -1045,7 +1045,7 @@ def print_symbol_report(trades_df):
 
 def summarize(trades, open_positions):
     print("\n" + "=" * 90)
-    print("HUNTER-V131-A — FINAL AUDITED REPORT")
+    print("HUNTER-V132-A — FINAL AUDITED REPORT")
     print("=" * 90)
 
     trades_df = pd.DataFrame(trades)
@@ -1220,7 +1220,7 @@ def summarize(trades, open_positions):
 
 def main():
     print("=" * 90)
-    print("HUNTER-V131-A — LIQUIDITY / STRUCTURE / REPRICING")
+    print("HUNTER-V132-A — LIQUIDITY / STRUCTURE / REPRICING")
     print("STRICT PORTFOLIO-LEVEL NO-LOOKAHEAD BACKTEST")
     print("=" * 90)
 
