@@ -238,14 +238,18 @@ def audit(df, symbol):
 
 
 def download_symbol(session, symbol, start_dt, end_dt):
-    cursor = to_ms(start_dt)
-    end_ms = to_ms(end_dt)
+    # IMPORTANT: XT returns the newest candles first when a wide time range is
+    # supplied. Therefore forward pagination (cursor -> last candle) loops back
+    # into the same 1500-candle page. We paginate BACKWARD instead:
+    # first request = [start, end], then [start, first_timestamp - 1].
+    start_ms = to_ms(start_dt)
+    cursor_end = to_ms(end_dt)
     all_batches = []
     calls = 0
-    previous_last = None
+    interval_ms = 15 * 60 * 1000
 
-    while cursor <= end_ms:
-        batch = fetch_batch(session, symbol, cursor, end_ms)
+    while cursor_end >= start_ms:
+        batch = fetch_batch(session, symbol, start_ms, cursor_end)
         calls += 1
 
         if batch.empty:
@@ -255,14 +259,18 @@ def download_symbol(session, symbol, start_dt, end_dt):
         first = int(batch["Timestamp"].iloc[0])
         last = int(batch["Timestamp"].iloc[-1])
 
-        if previous_last is not None and first <= previous_last:
-            raise RuntimeError(
-                f"{symbol}: pagination overlap/non-progress: "
-                f"first={first}, previous_last={previous_last}"
-            )
+        if first < start_ms:
+            batch = batch[batch["Timestamp"] >= start_ms].copy()
+            if batch.empty:
+                break
+            first = int(batch["Timestamp"].iloc[0])
+            last = int(batch["Timestamp"].iloc[-1])
 
-        if last < cursor:
-            raise RuntimeError(f"{symbol}: API moved backwards")
+        if last > cursor_end:
+            raise RuntimeError(
+                f"{symbol}: API returned candle beyond requested end: "
+                f"last={last}, cursor_end={cursor_end}"
+            )
 
         all_batches.append(batch)
 
@@ -272,11 +280,20 @@ def download_symbol(session, symbol, start_dt, end_dt):
             f"{batch['Date'].iloc[0]} -> {batch['Date'].iloc[-1]}"
         )
 
-        if last >= end_ms:
+        # We reached the beginning of the requested historical period.
+        if first <= start_ms:
             break
 
-        previous_last = last
-        cursor = last + 1
+        # Move strictly backward. Using first-1 avoids inclusive-boundary
+        # duplication if XT treats endTime as inclusive.
+        next_end = first - 1
+        if next_end >= cursor_end:
+            raise RuntimeError(
+                f"{symbol}: backward pagination made no progress: "
+                f"first={first}, previous_end={cursor_end}"
+            )
+
+        cursor_end = next_end
 
         if calls > 1000:
             raise RuntimeError(f"{symbol}: pagination safety stop")
