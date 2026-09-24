@@ -12,6 +12,16 @@ import numpy as np
 import pandas as pd
 import requests
 
+# XT USDT-M Futures API configuration
+BASE = "https://fapi.xt.com"
+SYMBOL_LIST_URL = f"{BASE}/future/market/v1/public/symbol/list"
+KLINE_URL = f"{BASE}/future/market/v1/public/q/kline"
+INTERVAL = "15m"
+LIMIT = 1500
+TIMEOUT = 20
+RETRIES = 5
+SLEEP = 0.12
+
 def now_utc():
     return datetime.now(timezone.utc)
 
