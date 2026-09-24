@@ -309,7 +309,8 @@ def main():
     now = datetime.now(timezone.utc)
     end_ms = int(now.timestamp() * 1000)
     start_ms = int((now - timedelta(days=DAYS + WARMUP_DAYS)).timestamp() * 1000)
-    target_start = pd.Timestamp(now - timedelta(days=DAYS), tz='UTC')
+    # `now` is already UTC timezone-aware; do not pass tz= again.
+    target_start = pd.Timestamp(now - timedelta(days=DAYS)).tz_convert('UTC')
 
     data = {}
     valid = []
