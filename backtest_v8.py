@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-HUNTER-XT-INSTITUTIONAL-OB-ENGINE
-Institutional Liquidity Sweep & Order Block Mitigation Strategy
+HUNTER-XT-INSTITUTIONAL-OB-ENGINE (Audited & Fixed)
+Institutional Liquidity Sweep & Order Block Strategy
 - Strict Causal Execution / No-Lookahead
 - Margin: $100 | Leverage: 50x | RR: 1:2
 - Circuit Breaker Protection against consecutive losses
@@ -94,7 +94,7 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
 
 
 def calculate_institutional_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates Causal Swing Highs, Liquidity Sweeps, and Order Blocks strictly using shift(1)."""
+    """Calculates Causal Swing Lows, Liquidity Sweeps, and Order Blocks with strict shift logic."""
     prev_close = df["close"].shift(1)
     tr = pd.concat([
         df["high"] - df["low"],
@@ -104,10 +104,10 @@ def calculate_institutional_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df["atr"] = tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
     
-    # Local swing low over 10 bars (using past data only)
-    df["swing_low"] = df["low"].shift(1).rolling(window=10).min()
+    # FIXED: Swing low correctly calculated from the preceding 10 bars (excluding current evaluated bar)
+    df["swing_low"] = df["low"].shift(2).rolling(window=10).min()
     
-    # Liquidity Sweep: Current bar low goes below swing low, but closes back above it
+    # Liquidity Sweep: Previous candle low breaks swing low, but closes back above it
     df["sweep_low"] = (df["low"].shift(1) < df["swing_low"]) & (df["close"].shift(1) > df["swing_low"])
     
     # Displacement / Strong Bullish Expansion
@@ -218,7 +218,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-INSTITUTIONAL-OB-ENGINE (Liquidity Sweep & Order Block)")
+    print("HUNTER-XT-INSTITUTIONAL-OB-ENGINE (Audited & Fixed)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -246,7 +246,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== INSTITUTIONAL RESULTS =====")
+    print("\n===== INSTITUTIONAL RESULTS (FIXED) =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
