@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-HUNTER-XT-STYLE3-HIGH-FREQUENCY-SQUEEZE
-High-Frequency Volatility Squeeze & Momentum Expansion Engine (1h Timeframe)
-- Focus: High Trade Count, Win Rate > 50%, Strict Streak Control
+HUNTER-XT-STYLE-LIQUIDITY-SWEEP
+Institutional Liquidity Sweep & Stop Hunt Reversal Engine (1h Timeframe)
+- Focus: High Win Rate, Smart Money Sweep Detection, Strict Streak Control
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ CORRELATION_CLUSTERS = {
     "WIF": "MEME",
 }
 
-DATA_DIR = Path("data/xt_futures_style3_hf")
-OUT_DIR = DATA_DIR / "backtest_style3_hf"
+DATA_DIR = Path("data/xt_futures_sweep")
+OUT_DIR = DATA_DIR / "backtest_sweep"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -36,9 +36,9 @@ FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 RR = 2.0
 ATR_N = 14
-MAX_OPEN_POSITIONS = 3
+MAX_OPEN_POSITIONS = 2
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 8   # Smart cooling to protect streaks
+CIRCUIT_BREAKER_COOLDOWN = 10  # Strict circuit breaker to keep streaks low
 
 
 def parse_args():
@@ -91,9 +91,11 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     return df.dropna(subset=required[1:])
 
 
-def calculate_hf_squeeze_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates High-Frequency Bandwidth Squeeze & Momentum Breakout using shift(1)."""
+def calculate_liquidity_sweep_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculates Liquidity Sweeps (Stop Hunts) and Rejection Impulses using shift(1)."""
     prev_close = df["close"].shift(1)
+    prev_low = df["low"].shift(1)
+    prev_high = df["high"].shift(1)
     
     tr = pd.concat([
         df["high"] - df["low"],
@@ -102,32 +104,28 @@ def calculate_hf_squeeze_features(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
 
-    # Bollinger Bands (20, 2.0)
-    sma20 = prev_close.rolling(window=20).mean()
-    std20 = prev_close.rolling(window=20).std()
-    bb_width = (4.0 * std20) / (sma20 + 1e-8)
+    # Macro trend filter (50 EMA)
+    df["ema50"] = prev_close.ewm(span=50, adjust=False).mean()
+    df["trend_bullish"] = prev_close > df["ema50"]
 
-    # Squeeze: BB Width is in the lower 25 percentile of its recent 50-period range
-    bb_width_min = bb_width.rolling(window=50).quantile(0.25)
-    df["squeeze_cond"] = bb_width <= bb_width_min
+    # Recent swing lows for liquidity pool
+    swing_low = prev_low.rolling(window=20).min().shift(1)
 
-    # Trend & Momentum filter
-    df["ema_trend"] = prev_close.ewm(span=30, adjust=False).mean()
-    df["trend_ok"] = prev_close > df["ema_trend"]
+    # Sweep Condition: Previous bar dipped below the 20-period swing low (swept stops)
+    # But closed strong or reclaimed the level (rejection wick / spring)
+    is_sweep = prev_low < swing_low
+    is_rejection = prev_close > (df["low"].shift(1) + 0.4 * (df["high"].shift(1) - df["low"].shift(1)))
 
-    # Breakout execution: Squeeze was active recently, now price breaks above 20 SMA with volume surge
-    df["breakout_long"] = df["squeeze_cond"].shift(1) & (prev_close > sma20) & (prev_close > prev_close.shift(1))
-
-    # Volume surge confirmation
+    # Volume spike during the sweep (indicates institutional absorption)
     prev_volume = df["volume"].shift(1)
     df["avg_volume"] = prev_volume.rolling(window=20).mean()
-    df["volume_surge"] = prev_volume > (1.1 * df["avg_volume"])
+    df["volume_surge"] = prev_volume > (1.3 * df["avg_volume"])
 
-    df["setup_valid"] = df["trend_ok"] & df["breakout_long"] & df["volume_surge"]
+    df["setup_valid"] = df["trend_bullish"] & is_sweep & is_rejection & df["volume_surge"]
     return df
 
 
-def run_hf_squeeze_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_sweep_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -202,11 +200,10 @@ def run_hf_squeeze_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 
                 next_ts = next_indices[0]
                 entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
-                atr = row["atr"]
-                if not np.isfinite(atr) or atr <= 0:
-                    continue
-
-                sl = entry - (1.5 * atr)
+                
+                # Stop loss placed right below the sweep bar's low
+                sweep_low = float(df.loc[ts, "low"])
+                sl = sweep_low - (0.5 * row["atr"])
                 risk = entry - sl
                 if risk <= 0:
                     continue
@@ -227,7 +224,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-STYLE3-HIGH-FREQUENCY-SQUEEZE")
+    print("HUNTER-XT-STYLE-LIQUIDITY-SWEEP (Institutional Smart Money Engine)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -236,11 +233,11 @@ def main():
     for asset in SYMBOLS:
         try:
             df = load_xt_csv(data_dir, asset)
-            all_data[asset] = calculate_hf_squeeze_features(df)
+            all_data[asset] = calculate_liquidity_sweep_features(df)
         except Exception:
             pass
 
-    trades = run_hf_squeeze_backtest(all_data)
+    trades = run_sweep_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -255,7 +252,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== STYLE 3 HF SQUEEZE RESULTS =====")
+    print("\n===== LIQUIDITY SWEEP RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
