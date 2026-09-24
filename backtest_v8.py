@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-HUNTER-XT-MULTI-TIMEFRAME-ENGINE (4h Trend + 1h Entry)
-Institutional Multi-Timeframe Strategy for XT.com USDT-M Futures
-- 4h TF: Macro Trend & Regime Filter
-- 1h TF: Precise Entry Trigger & Order Block / Pullback
+HUNTER-XT-STYLE1-STAT-ARB
+Cross-Sectional Statistical Mean Reversion Engine (1h Timeframe)
+- Focus: High Win Rate via Relative Value / Z-Score Reversion
 - Risk Management: 1:2 RR, $100 Margin, 50x Leverage, Circuit Breaker
 """
 
@@ -27,8 +26,8 @@ CORRELATION_CLUSTERS = {
     "WIF": "MEME",
 }
 
-DATA_DIR = Path("data/xt_futures_multitf")
-OUT_DIR = DATA_DIR / "backtest_multitf"
+DATA_DIR = Path("data/xt_futures_style1")
+OUT_DIR = DATA_DIR / "backtest_style1"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -38,9 +37,11 @@ FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 RR = 2.0
 ATR_N = 14
-MAX_OPEN_POSITIONS = 2
+LOOKBACK_RETURN = 24  # 24 hours lookback for cross-sectional return
+Z_ENTRY_THRESHOLD = -1.5  # Oversold threshold relative to peer group
+MAX_OPEN_POSITIONS = 3
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 12  # Pause after 2 losses
+CIRCUIT_BREAKER_COOLDOWN = 12
 
 
 def parse_args():
@@ -51,7 +52,6 @@ def parse_args():
 
 
 def ensure_xt_data(data_dir: Path, symbols: list[str]):
-    """Downloads both 1h and 4h XT Futures data."""
     data_dir.mkdir(parents=True, exist_ok=True)
     try:
         import ccxt
@@ -62,21 +62,20 @@ def ensure_xt_data(data_dir: Path, symbols: list[str]):
     exchange.options['defaultType'] = 'swap'
 
     for symbol in symbols:
-        for tf in ['1h', '4h']:
-            file_path = data_dir / f"{symbol}_USDT_{tf}.csv"
-            if file_path.exists() and file_path.stat().st_size > 200:
-                continue
-            try:
-                ccxt_symbol = f"{symbol}/USDT:USDT"
-                ohlcv = exchange.fetch_ohlcv(ccxt_symbol, timeframe=tf, limit=1500)
-                if ohlcv:
-                    pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).to_csv(file_path, index=False)
-            except Exception:
-                pass
+        file_path = data_dir / f"{symbol}_USDT_1h.csv"
+        if file_path.exists() and file_path.stat().st_size > 200:
+            continue
+        try:
+            ccxt_symbol = f"{symbol}/USDT:USDT"
+            ohlcv = exchange.fetch_ohlcv(ccxt_symbol, timeframe='1h', limit=1500)
+            if ohlcv:
+                pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).to_csv(file_path, index=False)
+        except Exception:
+            pass
 
 
-def load_xt_csv(data_dir: Path, asset: str, tf: str) -> pd.DataFrame:
-    path = data_dir / f"{asset}_USDT_{tf}.csv"
+def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
+    path = data_dir / f"{asset}_USDT_1h.csv"
     if not path.exists():
         raise FileNotFoundError(f"Missing file: {path}")
 
@@ -95,40 +94,22 @@ def load_xt_csv(data_dir: Path, asset: str, tf: str) -> pd.DataFrame:
     return df.dropna(subset=required[1:])
 
 
-def process_multi_timeframe(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> pd.DataFrame:
-    """Aligns 4h macro trend with 1h execution frame strictly using causal shifts."""
-    
-    # 1. 4H Macro Trend Filter (Causal)
-    prev_close_4h = df_4h["close"].shift(1)
-    df_4h["ema_macro"] = prev_close_4h.ewm(span=50, adjust=False).mean()
-    df_4h["macro_bullish"] = prev_close_4h > df_4h["ema_macro"]
-
-    # 2. 1H Execution Indicators (Causal)
-    prev_close_1h = df_1h["close"].shift(1)
-    tr_1h = pd.concat([
-        df_1h["high"] - df_1h["low"],
-        (df_1h["high"] - prev_close_1h).abs(),
-        (df_1h["low"] - prev_close_1h).abs(),
+def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculates causal indicators on 1h timeframe."""
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs(),
     ], axis=1).max(axis=1)
 
-    df_1h["atr"] = tr_1h.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
-    df_1h["swing_low"] = df_1h["low"].shift(2).rolling(window=12).min()
-    df_1h["sweep_low"] = (df_1h["low"].shift(1) < df_1h["swing_low"]) & (df_1h["close"].shift(1) > df_1h["swing_low"])
-    
-    # Clean expansion body
-    df_1h["body"] = df_1h["close"].shift(1) - df_1h["open"].shift(1)
-    df_1h["expansion"] = (df_1h["body"] > 1.0 * df_1h["atr"]) & (df_1h["body"] > 0)
-
-    # 3. Merge 4h macro state into 1h dataframe using backward fill (reindex/merge_asof) to avoid lookahead
-    df_4h_resampled = df_4h[["macro_bullish"]].reindex(df_1h.index, method="ffill")
-    df_1h["macro_bullish"] = df_4h_resampled["macro_bullish"]
-
-    # Final Setup: 4h is bullish AND 1h gives a liquidity sweep + expansion
-    df_1h["setup_valid"] = df_1h["macro_bullish"].fillna(False) & df_1h["sweep_low"] & df_1h["expansion"]
-    return df_1h
+    df["atr"] = tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
+    # Causal percentage return over lookback
+    df["return_period"] = prev_close.pct_change(LOOKBACK_RETURN)
+    return df
 
 
-def run_multitf_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_stat_arb_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -182,40 +163,62 @@ def run_multitf_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 })
                 del active_positions[symbol]
 
-        # 2. Entry Execution (No-Lookahead)
+        # 2. Cross-Sectional Z-Score Calculation (Causal & Point-in-Time)
         if cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
+            cross_returns = {}
             for symbol, df in all_data.items():
-                if ts not in df.index:
-                    continue
-                row = df.loc[ts]
-                if not row.get("setup_valid", False):
-                    continue
+                if ts in df.index:
+                    val = df.loc[ts, "return_period"]
+                    if np.isfinite(val):
+                        cross_returns[symbol] = val
 
-                cluster = CORRELATION_CLUSTERS.get(symbol, "OTHER")
-                if symbol in active_positions or (MAX_ONE_PER_CLUSTER and cluster_active(cluster)):
-                    continue
-                if len(active_positions) >= MAX_OPEN_POSITIONS:
-                    break
+            if len(cross_returns) >= 5:  # Need minimum breadth
+                ret_values = list(cross_returns.values())
+                mean_ret = np.mean(ret_values)
+                std_ret = np.std(ret_values)
 
-                next_indices = df.index[df.index > ts]
-                if len(next_indices) == 0:
-                    continue
-                
-                next_ts = next_indices[0]
-                entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
-                atr = row["atr"]
-                
-                sl = float(row["swing_low"]) - (0.2 * atr)
-                risk = entry - sl
-                if risk <= 0:
-                    continue
-                
-                tp = entry + (RR * risk)
+                if std_ret > 0:
+                    scores = []
+                    for symbol, ret in cross_returns.items():
+                        z_score = (ret - mean_ret) / std_ret
+                        # If Z-score is deeply negative, asset is oversold relative to peers -> Mean Reversion Long
+                        if z_score <= Z_ENTRY_THRESHOLD:
+                            scores.append({"symbol": symbol, "z_score": z_score})
 
-                active_positions[symbol] = {
-                    "symbol": symbol, "side": "LONG",
-                    "entry_ts": next_ts, "entry": entry, "sl": sl, "tp": tp,
-                }
+                    # Sort by most oversold
+                    scores.sort(key=lambda x: x["z_score"])
+
+                    for item in scores:
+                        symbol = item["symbol"]
+                        cluster = CORRELATION_CLUSTERS.get(symbol, "OTHER")
+
+                        if symbol in active_positions or (MAX_ONE_PER_CLUSTER and cluster_active(cluster)):
+                            continue
+                        if len(active_positions) >= MAX_OPEN_POSITIONS:
+                            break
+
+                        df = all_data[symbol]
+                        next_indices = df.index[df.index > ts]
+                        if len(next_indices) == 0:
+                            continue
+                        
+                        next_ts = next_indices[0]
+                        entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
+                        atr = float(df.loc[ts, "atr"])
+                        if not np.isfinite(atr) or atr <= 0:
+                            continue
+
+                        sl = entry - (1.5 * atr)
+                        risk = entry - sl
+                        if risk <= 0:
+                            continue
+                        
+                        tp = entry + (RR * risk)
+
+                        active_positions[symbol] = {
+                            "symbol": symbol, "side": "LONG",
+                            "entry_ts": next_ts, "entry": entry, "sl": sl, "tp": tp,
+                        }
 
     return trades
 
@@ -226,7 +229,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-MULTI-TIMEFRAME-ENGINE (4h Trend + 1h Entry)")
+    print("HUNTER-XT-STYLE1-STAT-ARB (Cross-Sectional Z-Score Mean Reversion - 1h)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -234,13 +237,12 @@ def main():
     all_data = {}
     for asset in SYMBOLS:
         try:
-            df_1h = load_xt_csv(data_dir, asset, "1h")
-            df_4h = load_xt_csv(data_dir, asset, "4h")
-            all_data[asset] = process_multi_timeframe(df_1h, df_4h)
+            df = load_xt_csv(data_dir, asset)
+            all_data[asset] = calculate_features(df)
         except Exception:
             pass
 
-    trades = run_multitf_backtest(all_data)
+    trades = run_stat_arb_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -255,7 +257,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== MULTI-TIMEFRAME RESULTS =====")
+    print("\n===== STYLE 1 STAT-ARB RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
