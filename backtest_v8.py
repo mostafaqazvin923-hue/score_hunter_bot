@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# تنظیمات سیستماتیک و پیشرفته (Institutional Setup Config)
+# تنظیمات استاندارد و حرفه‌ای سیستم
 # ============================================================
 
 EXCHANGE_ID = "lbank"
@@ -23,6 +23,7 @@ LOOKBACK_DAYS = 365
 MAX_POSITIONS = 6
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
+ATR_PERIOD = 14
 INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 50.0
@@ -48,7 +49,7 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print(f"📥 دریافت و آماده‌سازی داده‌های ساختاریافته {TIMEFRAME} از صرافی {EXCHANGE_ID.upper()}")
+print(f"📥 دریافت داده‌های ساختاریافته {TIMEFRAME} از صرافی {EXCHANGE_ID.upper()}")
 print("=" * 60)
 
 processed_data = {}
@@ -107,20 +108,13 @@ def fetch_symbol_data(lbank_symbol: str) -> Optional[pd.DataFrame]:
     if len(df) < 50:
         return None
 
-    # اندیکاتورهای پیشرفته کمی (Statistical & Quantitative Indicators)
-    period = 20
-    df["EMA_20"] = df["Close"].ewm(span=period, adjust=False).mean()
-    rolling_std = df["Close"].rolling(window=period).std()
-    
-    # محاسبه Z-Score قیمت
-    df["Z_Score"] = (df["Close"] - df["EMA_20"]) / (rolling_std + 1e-9)
-    
-    # محاسبه ATR و رژیم نوسانی
+    # اندیکاتورهای ساختاری
+    df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
     tr1 = df["High"] - df["Low"]
     tr2 = np.abs(df["High"] - df["Close"].shift(1))
     tr3 = np.abs(df["Low"] - df["Close"].shift(1))
-    df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
-    df["ATR_MA"] = df["ATR"].rolling(20).mean()
+    df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
+    df["Vol_MA"] = df["Volume"].rolling(20).mean()
 
     df.set_index("Date", inplace=True)
     return df
@@ -131,20 +125,20 @@ for symbol, lbank_symbol in SYMBOLS.items():
         processed_data[symbol] = df4h
 
 print(f"✅ تعداد نمادهای معتبر تاییدشده: {len(processed_data)}")
-print("⚙️ اجرای موتور کوانت پیشرفته (بدون Lookahead و با مدیریت کامل پوزیشن‌ها)...")
+print("⚙️ اجرای موتور کوانت مبتنی بر شکار نقدینگی و پرایس اکشن نهادی...")
 
 
 # ============================================================
-# موتور اجرای استراتژی کوانت (Institutional Backtest Engine)
+# موتور اجرای بک‌تست ایزوله (Institutional Execution Engine)
 # ============================================================
 
-def run_institutional_backtest(data_dict: Dict[str, pd.DataFrame]):
+def run_liquidity_sweep_backtest(data_dict: Dict[str, pd.DataFrame]):
     all_timestamps = sorted({
         ts for df in data_dict.values() for ts in df.index
     })
     
     active_positions = {}
-    pending_signals = []  # سیگنال‌های کندل N برای اجرا در Open کندل N+1
+    pending_signals = []  # صف اجرای کندل N در Open کندل N+1
     all_trades = []
     equity = INITIAL_CAPITAL
     peak_equity = INITIAL_CAPITAL
@@ -155,14 +149,14 @@ def run_institutional_backtest(data_dict: Dict[str, pd.DataFrame]):
     pause_timer = 0
 
     for ts in all_timestamps:
-        # ۱. مدیریت تایمر مکث (فقط مانع ورودهای جدید می‌شود و کاری به مدیریت پوزیشن‌های باز ندارد)
+        # ۱. مدیریت تایمر مکث (فقط ورودهای جدید مسدود می‌شوند، مدیریت پوزیشن‌های باز کاملاً برقرار است)
         if trading_paused:
             pause_timer -= 1
             if pause_timer <= 0:
                 trading_paused = False
                 consecutive_losses = 0
 
-        # ۲. اجرای سیگنال‌های کندل قبل در Open کندل جاری (بدون Lookahead)
+        # ۲. اجرای سیگنال‌های صادرشده از کندل قبل در قیمت Open کندل جاری
         signals_to_execute = pending_signals
         pending_signals = []
 
@@ -191,7 +185,7 @@ def run_institutional_backtest(data_dict: Dict[str, pd.DataFrame]):
                 "is_breakeven": False,
             }
 
-        # ۳. مدیریت کامل پوزیشن‌های باز (همیشه و حتی زمان Pause اجرا می‌شود)
+        # ۳. مدیریت پوزیشن‌های باز در کندل جاری
         symbols_to_close = []
         for symbol, pos in list(active_positions.items()):
             df = data_dict[symbol]
@@ -200,7 +194,7 @@ def run_institutional_backtest(data_dict: Dict[str, pd.DataFrame]):
             
             c4h = df.loc[ts]
             
-            # مدیریت Break-Even محافظه‌کارانه در ۵۰ درصد مسیر
+            # مکانیزم Break-Even استاندارد در ۵۰ درصد مسیر سود
             if not pos["is_breakeven"]:
                 if pos["side"] == "LONG":
                     halfway = pos["entry_price"] + (pos["target_price"] - pos["entry_price"]) * 0.5
@@ -224,7 +218,7 @@ def run_institutional_backtest(data_dict: Dict[str, pd.DataFrame]):
                 hit_target = c4h["Low"] <= pos["target_price"]
 
             if hit_stop or hit_target:
-                # اگر همزمان استاپ و تارجت زده شد، حالت محافظه‌کارانه (استاپ) اعمال می‌شود
+                # قانون محافظه‌کارانه داخل کندلی: در صورت برخورد همزمان، استاپ مقدم است
                 is_win = hit_target and not hit_stop
                 is_be = (not is_win) and pos["is_breakeven"] and (pos["stop_price"] == pos["entry_price"])
                 
@@ -258,12 +252,11 @@ def run_institutional_backtest(data_dict: Dict[str, pd.DataFrame]):
                     "Net_PnL": net_pnl,
                 })
                 
-                # کنترل استریک ضد ضرر متوالی
                 if outcome == "LOSS":
                     consecutive_losses += 1
                     if consecutive_losses >= 3 and not trading_paused:
                         trading_paused = True
-                        pause_timer = 6  # استراحت بهینه
+                        pause_timer = 8
                 elif outcome == "WIN":
                     consecutive_losses = 0
 
@@ -272,7 +265,7 @@ def run_institutional_backtest(data_dict: Dict[str, pd.DataFrame]):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # ۴. اسکن سیگنال‌های جدید بر اساس Z-Score و رژیم نوسانی (برای ثبت در صف کندل بعدی)
+        # ۴. اسکن سیگنال‌های جدید (Liquidity Sweep + Rejection + Volume)
         if not trading_paused:
             for symbol, df in data_dict.items():
                 if symbol in active_positions or ts not in df.index:
@@ -284,56 +277,60 @@ def run_institutional_backtest(data_dict: Dict[str, pd.DataFrame]):
 
                 subset = df.iloc[:i + 1]
                 current = subset.iloc[-1]
+                prev = subset.iloc[-2]
                 
-                z_score = current["Z_Score"]
                 atr = current["ATR"]
-                atr_ma = current["ATR_MA"]
+                ema_50 = current["EMA_50"]
+                vol_ma = current["Vol_MA"]
 
-                if not np.isfinite(z_score) or not np.isfinite(atr) or atr <= 0:
+                if not np.isfinite(atr) or atr <= 0 or not np.isfinite(vol_ma):
                     continue
 
-                # فیلتر رژیم بازار: نوسان باید بالاتر از میانگین باشد (بازار پویا، نه رِنج مرده)
-                if atr < atr_ma * 0.9:
-                    continue
+                # تعیین سطوح نقدینگی (سقف و کف ۲۰ کندل گذشته بدون احتساب کندل جاری)
+                recent_highs = subset["High"].iloc[:-1].rolling(20).max().iloc[-1]
+                recent_lows = subset["Low"].iloc[:-1].rolling(20).min().iloc[-1]
 
                 direction = None
-                # استراتژی بازگشت آماری به میانگین (Mean Reversion) با انحراف شدید Z-Score
-                if z_score <= -2.0:  # اشباع فروش شدید -> پتانسیل لانگ
+                stop_price = 0.0
+                target_price = 0.0
+
+                # الف) جاروب کف (Sweep Low) و بازگشت به بالا (Bullish Rejection)
+                # قیمت کفِ قبلی را با ویک لمس کرده (Low < recent_lows) اما بسته شدن کندل بالای کف است (Close > recent_lows)
+                is_sweep_low = current["Low"] < recent_lows and current["Close"] > recent_lows
+                is_volume_spike = current["Volume"] > vol_ema_threshold if 'vol_ema_threshold' in locals() else current["Volume"] > (vol_ma * 1.2)
+
+                if is_sweep_low and current["Close"] > ema_50 and is_volume_spike:
                     direction = "LONG"
-                elif z_score >= 2.0:  # اشباع خرید شدید -> پتانسیل شورت
-                    direction = "SHORT"
-
-                if direction is None:
-                    continue
-
-                # تاییدیه حجم
-                vol_mean = subset["Volume"].rolling(14).mean().iloc[-1]
-                if np.isfinite(vol_mean) and current["Volume"] < vol_mean * 0.9:
-                    continue
-
-                # محاسبات ریسک پویا با ATR
-                if direction == "LONG":
-                    stop_price = current["Close"] - (atr * 1.5)
+                    stop_price = current["Low"] - (atr * 0.5)
                     risk_dist = current["Close"] - stop_price
-                    target_price = current["Close"] + (risk_dist * 2.0)
-                else:
-                    stop_price = current["Close"] + (atr * 1.5)
-                    risk_dist = stop_price - current["Close"]
-                    target_price = current["Close"] - (risk_dist * 2.0)
+                    if risk_dist <= 0:
+                        risk_dist = atr
+                    target_price = current["Close"] + (risk_dist * 2.5)
 
-                pending_signals.append({
-                    "symbol": symbol,
-                    "side": direction,
-                    "stop_price": stop_price,
-                    "target_price": target_price,
-                })
+                # ب) جاروب سقف (Sweep High) و بازگشت به پایین (Bearish Rejection)
+                is_sweep_high = current["High"] > recent_highs and current["Close"] < recent_highs
+                if is_sweep_high and current["Close"] < ema_50 and is_volume_spike:
+                    direction = "SHORT"
+                    stop_price = current["High"] + (atr * 0.5)
+                    risk_dist = stop_price - current["Close"]
+                    if risk_dist <= 0:
+                        risk_dist = atr
+                    target_price = current["Close"] - (risk_dist * 2.5)
+
+                if direction is not None:
+                    pending_signals.append({
+                        "symbol": symbol,
+                        "side": direction,
+                        "stop_price": stop_price,
+                        "target_price": target_price,
+                    })
 
     return pd.DataFrame(all_trades), equity, max_drawdown
 
 
-def summarize_institutional_results(trades_df: pd.DataFrame, final_equity: float, max_dd: float):
+def summarize_results(trades_df: pd.DataFrame, final_equity: float, max_dd: float):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی کوانت جدید (بدون باگ و کاملاً ایزوله)")
+    print("📊 گزارش نهایی استراتژی شکار نقدینگی (Institutional Liquidity Sweep)")
     print("=" * 68)
 
     if trades_df.empty:
@@ -408,6 +405,6 @@ def summarize_institutional_results(trades_df: pd.DataFrame, final_equity: float
 
 
 if __name__ == "__main__":
-    df_trades, final_equity, max_dd = run_institutional_backtest(processed_data)
-    summarize_institutional_results(df_trades, final_equity, max_dd)
-    print("\n✨ اجرای تست استراتژی کوانت جدید به پایان رسید.")
+    df_trades, final_equity, max_dd = run_liquidity_sweep_backtest(processed_data)
+    summarize_results(df_trades, final_equity, max_dd)
+    print("\n✨ اجرای تست استراتژی نهادی به پایان رسید.")
