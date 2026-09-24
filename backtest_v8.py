@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 HUNTER-XT-CROSS-MOMENTUM-AUDITED
-Strict No-Lookahead / Causal Ranking / Cluster Limits / XT Futures Engine
+Strict No-Lookahead / Causal Ranking / Cluster Limits / Auto-Download XT Futures Engine
 """
 
 from __future__ import annotations
@@ -49,6 +49,35 @@ def parse_args():
     return p.parse_args()
 
 
+def ensure_xt_data(data_dir: Path, symbols: list[str]):
+    """Automatically downloads XT Futures 15m data if missing (fixes GitHub Actions stateless issue)."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import ccxt
+    except ImportError:
+        print("CCXT is not installed. Please add 'ccxt' to your requirements.txt")
+        return
+
+    exchange = ccxt.xt({'enableRateLimit': True})
+    exchange.options['defaultType'] = 'swap'  # XT Futures (USDT-M)
+
+    for symbol in symbols:
+        file_path = data_dir / f"{symbol}_USDT_15m.csv"
+        if file_path.exists() and file_path.stat().st_size > 200:
+            continue
+        
+        print(f"Downloading XT Futures 15m data for {symbol}...")
+        try:
+            ccxt_symbol = f"{symbol}/USDT:USDT"
+            ohlcv = exchange.fetch_ohlcv(ccxt_symbol, timeframe='15m', limit=1000)
+            if ohlcv:
+                df_dl = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df_dl.to_csv(file_path, index=False)
+                print(f"Successfully saved -> {file_path} ({len(df_dl)} rows)")
+        except Exception as e:
+            print(f"Warning: Could not download {symbol} via CCXT: {e}")
+
+
 def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     path = data_dir / f"{asset}_USDT_15m.csv"
     if not path.exists():
@@ -84,8 +113,6 @@ def calculate_causal_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
 
     df["atr"] = tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
-    
-    # Momentum must use shift(1) so current unclosed bar doesn't contaminate ranking
     df["momentum"] = df["close"].shift(1).pct_change(MOMENTUM_LOOKBACK)
     df["ema_trend"] = df["close"].shift(1).ewm(span=200, adjust=False).mean()
     return df
@@ -119,7 +146,6 @@ def run_audited_backtest(all_data: dict[str, pd.DataFrame]) -> tuple[list[dict],
             hit_tp = hi >= tp if side == "LONG" else lo <= tp
 
             if hit_sl or hit_tp:
-                # Conservative rule: SL wins if both hit on same candle
                 exit_price, outcome = (sl, "LOSS") if (hit_sl and hit_tp or hit_sl) else (tp, "WIN")
 
                 gross = (exit_price - entry) / entry * notional if side == "LONG" else (entry - exit_price) / entry * notional
@@ -162,7 +188,7 @@ def run_audited_backtest(all_data: dict[str, pd.DataFrame]) -> tuple[list[dict],
                 if len(active_positions) >= MAX_OPEN_POSITIONS:
                     break
                 if MAX_ONE_PER_CLUSTER and cluster_active(cluster):
-                    continue  # Block high correlation cluster stacking
+                    continue
 
                 df = all_data[symbol]
                 next_indices = df.index[df.index > ts]
@@ -198,19 +224,26 @@ def run_audited_backtest(all_data: dict[str, pd.DataFrame]) -> tuple[list[dict],
 def main():
     args = parse_args()
     data_dir, out_dir = Path(args.data_dir), Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("=" * 88)
+    print("HUNTER-XT-CROSS-MOMENTUM-AUDITED — Auto-Download & Causal Engine")
+    print("=" * 88)
 
-    print("=" * 88)
-    print("HUNTER-XT-CROSS-MOMENTUM-AUDITED — Strict Causal & Cluster-Protected Engine")
-    print("=" * 88)
+    # Ensure data exists dynamically for GitHub Actions
+    ensure_xt_data(data_dir, SYMBOLS)
 
     all_data = {}
     for asset in SYMBOLS:
         try:
             df = load_xt_csv(data_dir, asset)
             all_data[asset] = calculate_causal_indicators(df)
+            print(f"Loaded {asset}: {len(df):,} rows")
         except Exception as e:
             print(f"Skipping {asset}: {e}")
+
+    if not all_data:
+        print("Error: No data loaded. Aborting backtest.")
+        return
 
     trades, open_positions = run_audited_backtest(all_data)
     
