@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/init/env python3
 """
-HUNTER-XT-STYLE4-ULTIMATE-MOMENTUM
-Cross-Sectional Relative Strength & Macro Regime Filter (1h Timeframe)
-- Focus: Win Rate > 50%, Max Loss Streak <= 4, High PnL
+HUNTER-XT-STYLE4-FIXED-RR2
+Cross-Sectional Momentum Engine with Strict RR = 2.0 (1h Timeframe)
+- Focus: Fixed RR 2.0, High Trade Count, Win Rate > 50%, Max Loss Streak <= 4
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ CORRELATION_CLUSTERS = {
     "WIF": "MEME",
 }
 
-DATA_DIR = Path("data/xt_futures_style4_ult")
-OUT_DIR = DATA_DIR / "backtest_style4_ult"
+DATA_DIR = Path("data/xt_futures_style4_fixed")
+OUT_DIR = DATA_DIR / "backtest_style4_fixed"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -34,11 +34,11 @@ LEVERAGE = 50.0
 
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
-RR = 2.0                      # Optimized Risk-Reward for >50% Win Rate
+RR = 2.0                      # Fixed Risk-Reward exactly at 1:2 as requested
 ATR_N = 14
-MAX_OPEN_POSITIONS = 2        # Reduced to 2 to minimize simultaneous market exposure
+MAX_OPEN_POSITIONS = 3
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 20 # Strict lockout after 2 losses to guarantee streak <= 4
+CIRCUIT_BREAKER_COOLDOWN = 4  # Smart local cooldown to control max streaks
 
 
 def parse_args():
@@ -92,7 +92,7 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
 
 
 def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates ATR, Trend, and Strict Momentum Ranking metrics using shift(1)."""
+    """Calculates features using shift(1) with optimized momentum thresholds."""
     prev_close = df["close"].shift(1)
     
     tr = pd.concat([
@@ -103,22 +103,22 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df["atr"] = tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
 
     # Trend filter
-    df["ema_trend"] = prev_close.ewm(span=40, adjust=False).mean()
+    df["ema_trend"] = prev_close.ewm(span=35, adjust=False).mean()
     df["trend_ok"] = prev_close > df["ema_trend"]
 
-    # 24-period return for momentum ranking
+    # 24-period return for ranking
     df["return_24h"] = prev_close.pct_change(24)
 
     # Volume filter
     prev_volume = df["volume"].shift(1)
     df["avg_volume"] = prev_volume.rolling(window=20).mean()
-    df["volume_ok"] = prev_volume > (1.1 * df["avg_volume"]) # Stricter volume confirmation
+    df["volume_ok"] = prev_volume > (0.85 * df["avg_volume"])
 
-    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["return_24h"] > 0.01)
+    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["return_24h"] > 0.005)
     return df
 
 
-def run_ultimate_momentum_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_fixed_rr_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -135,12 +135,6 @@ def run_ultimate_momentum_backtest(all_data: dict[str, pd.DataFrame]) -> list[di
     for idx, ts in enumerate(all_times):
         if cooldown_counter > 0:
             cooldown_counter -= 1
-
-        # Macro Market Regime Check (BTC Trend Filter)
-        btc_df = all_data.get("BTC")
-        market_bullish = True
-        if btc_df is not None and ts in btc_df.index:
-            market_bullish = bool(btc_df.loc[ts, "trend_ok"])
 
         # 1. Manage active positions
         for symbol, pos in list(active_positions.items()):
@@ -178,8 +172,8 @@ def run_ultimate_momentum_backtest(all_data: dict[str, pd.DataFrame]) -> list[di
                 })
                 del active_positions[symbol]
 
-        # 2. Cross-Sectional Ranking & Macro-Filtered Entry Execution
-        if market_bullish and cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
+        # 2. Entry Execution with Fixed RR=2.0
+        if cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
             candidates = []
             for symbol, df in all_data.items():
                 if ts not in df.index:
@@ -197,7 +191,6 @@ def run_ultimate_momentum_backtest(all_data: dict[str, pd.DataFrame]) -> list[di
                 if np.isfinite(ret_24h):
                     candidates.append((symbol, ret_24h))
 
-            # Sort by top relative momentum
             candidates.sort(key=lambda x: x[1], reverse=True)
 
             for symbol, _ in candidates:
@@ -221,6 +214,7 @@ def run_ultimate_momentum_backtest(all_data: dict[str, pd.DataFrame]) -> list[di
                 if risk <= 0:
                     continue
                 
+                # Strictly Fixed RR = 2.0
                 tp = entry + (RR * risk)
 
                 active_positions[symbol] = {
@@ -237,7 +231,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-STYLE4-ULTIMATE-MOMENTUM (Macro Filter + Strict Streak Control)")
+    print("HUNTER-XT-STYLE4-FIXED-RR2 (Strict RR 1:2 Setup)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -250,7 +244,7 @@ def main():
         except Exception:
             pass
 
-    trades = run_ultimate_momentum_backtest(all_data)
+    trades = run_fixed_rr_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -265,7 +259,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== STYLE 4 ULTIMATE RESULTS =====")
+    print("\n===== STYLE 4 FIXED RR=2.0 RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
