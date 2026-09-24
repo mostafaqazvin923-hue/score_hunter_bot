@@ -1,227 +1,333 @@
 
 #!/usr/bin/env python3
 """
-LBank Futures / TradingView CSV -> clean 15m dataset
-HUNTER-V3 data loader.
+XT USDT-M Futures 15m historical collector.
 
-IMPORTANT:
-- This loader expects CSV exported from TradingView for LBank perpetual futures,
-  e.g. LBANK:BTCUSDT.P.
-- It does NOT use CCXT fetch_ohlcv(), because LBank Futures historical OHLCV
-  is not reliably exposed through CCXT's unified endpoint.
-- Put one exported CSV per symbol in INPUT_DIR.
-- The script validates, deduplicates, checks 15-minute spacing, removes an
-  incomplete final candle when requested, and writes normalized CSVs.
+Uses XT's public Futures Kline endpoint directly (not CCXT):
+GET https://fapi.xt.com/future/market/v1/public/q/kline
 
-Expected TradingView columns can be:
-time, open, high, low, close, Volume
-or:
-Time, Open, High, Low, Close, Volume
+Pagination is timestamp-based and capped at 1500 rows/request.
+The collector downloads one year of REAL XT Futures OHLCV per symbol,
+deduplicates candles, validates OHLCV, checks 15m gaps, and writes CSVs.
+
+Run:
+    python xt_futures_15m_collector.py --days 365 --symbols BTC_USDT
+
+For the full 14-symbol set:
+    python xt_futures_15m_collector.py --days 365
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-import re
+import argparse
+import json
 import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
 import pandas as pd
+import requests
 
-INPUT_DIR = Path("data/tv_lbank_futures_raw")
-OUTPUT_DIR = Path("data/lbank_futures_15m")
+BASE_URL = "https://fapi.xt.com/future/market/v1/public/q/kline"
+INTERVAL = "15m"
+LIMIT = 1500
+REQUEST_TIMEOUT = 20
+RETRIES = 5
+SLEEP_SECONDS = 0.12
 DAYS = 365
-INTERVAL_MINUTES = 15
-REMOVE_INCOMPLETE_LAST = True
 
-SYMBOLS = {
-    "BTCUSDT.P": "BTC",
-    "ETHUSDT.P": "ETH",
-    "SOLUSDT.P": "SOL",
-    "SUIUSDT.P": "SUI",
-    "AVAXUSDT.P": "AVAX",
-    "NEARUSDT.P": "NEAR",
-    "ADAUSDT.P": "ADA",
-    "BNBUSDT.P": "BNB",
-    "APTUSDT.P": "APT",
-    "CRVUSDT.P": "CRV",
-    "ONDOUSDT.P": "ONDO",
-    "PENDLEUSDT.P": "PENDLE",
-    "ICPUSDT.P": "ICP",
-    "WIFUSDT.P": "WIF",
-}
+SYMBOLS = [
+    "BTC_USDT", "ETH_USDT", "SOL_USDT", "SUI_USDT", "AVAX_USDT",
+    "NEAR_USDT", "ADA_USDT", "BNB_USDT", "APT_USDT", "CRV_USDT",
+    "ONDO_USDT", "PENDLE_USDT", "ICP_USDT", "WIF_USDT",
+]
 
-REQUIRED = ["Timestamp", "Open", "High", "Low", "Close", "Volume"]
+OUTPUT_DIR = Path("data/xt_futures_15m")
 
 
-def normalize_col(name: str) -> str:
-    s = str(name).strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "", s)
-    aliases = {
-        "time": "Timestamp",
-        "timestamp": "Timestamp",
-        "date": "Timestamp",
-        "datetime": "Timestamp",
-        "open": "Open",
-        "high": "High",
-        "low": "Low",
-        "close": "Close",
-        "volume": "Volume",
-        "vol": "Volume",
+def ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_result(payload):
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected XT response type: {type(payload).__name__}")
+
+    rc = payload.get("returnCode")
+    if rc not in (0, "0", None):
+        err = payload.get("error") or payload.get("msgInfo") or payload
+        raise RuntimeError(f"XT API error: {err}")
+
+    result = payload.get("result")
+    if result is None:
+        # Fail loudly rather than silently accepting an empty/changed schema.
+        raise RuntimeError(f"XT response has no result: {payload}")
+
+    if not isinstance(result, list):
+        raise RuntimeError(f"XT result is not a list: {type(result).__name__}")
+
+    return result
+
+
+def fetch_batch(session: requests.Session, symbol: str, start_ms: int, end_ms: int):
+    params = {
+        "symbol": symbol,
+        "interval": INTERVAL,
+        "startTime": start_ms,
+        "endTime": end_ms,
+        "limit": LIMIT,
     }
-    return aliases.get(s, str(name).strip())
 
+    last_error = None
+    for attempt in range(1, RETRIES + 1):
+        try:
+            r = session.get(BASE_URL, params=params, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            return parse_result(r.json())
+        except Exception as exc:
+            last_error = exc
+            if attempt < RETRIES:
+                time.sleep(min(2.0 * attempt, 5.0))
 
-def read_tv_csv(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df.columns = [normalize_col(c) for c in df.columns]
-
-    missing = [c for c in REQUIRED if c not in df.columns]
-    if missing:
-        raise ValueError(f"{path.name}: missing columns {missing}")
-
-    df = df[REQUIRED].copy()
-
-    # TradingView exports normally use epoch seconds for time. Also accept
-    # milliseconds and ISO-like timestamps.
-    raw_time = df["Timestamp"]
-    if pd.api.types.is_numeric_dtype(raw_time):
-        vals = pd.to_numeric(raw_time, errors="coerce")
-        unit = "ms" if vals.dropna().median() > 10_000_000_000 else "s"
-        df["Timestamp"] = pd.to_datetime(vals, unit=unit, utc=True, errors="coerce")
-    else:
-        df["Timestamp"] = pd.to_datetime(raw_time, utc=True, errors="coerce")
-
-    for c in REQUIRED[1:]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df.dropna(subset=REQUIRED)
-    df = df.drop_duplicates(subset=["Timestamp"], keep="last")
-    df = df.sort_values("Timestamp").reset_index(drop=True)
-
-    # OHLC integrity.
-    bad = (
-        (df["High"] < df[["Open", "Close", "Low"]].max(axis=1))
-        | (df["Low"] > df[["Open", "Close", "High"]].min(axis=1))
-        | (df[["Open", "High", "Low", "Close"]] <= 0).any(axis=1)
-        | (df["Volume"] < 0)
+    raise RuntimeError(
+        f"Failed {symbol} start={start_ms} end={end_ms}: {last_error}"
     )
-    if bad.any():
-        raise ValueError(f"{path.name}: {int(bad.sum())} invalid OHLCV rows")
 
-    if REMOVE_INCOMPLETE_LAST and not df.empty:
-        now = pd.Timestamp.now(tz="UTC")
-        last = df["Timestamp"].iloc[-1]
-        # A 15m candle is complete only after its interval has elapsed.
-        if last + pd.Timedelta(minutes=INTERVAL_MINUTES) > now:
-            df = df.iloc[:-1].copy()
 
+def normalize_batch(rows, symbol: str) -> pd.DataFrame:
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError(f"{symbol}: unexpected kline row: {row!r}")
+
+        # XT documented fields: a=volume, c=close, h=high, l=low,
+        # o=open, s=symbol, t=time, v=turnover.
+        required = ("t", "o", "h", "l", "c", "a")
+        if any(k not in row for k in required):
+            raise RuntimeError(f"{symbol}: malformed kline row: {row!r}")
+
+        out.append({
+            "Timestamp": int(row["t"]),
+            "Open": float(row["o"]),
+            "High": float(row["h"]),
+            "Low": float(row["l"]),
+            "Close": float(row["c"]),
+            "Volume": float(row["a"]),
+            "Turnover": float(row["v"]) if row.get("v") is not None else float("nan"),
+        })
+
+    df = pd.DataFrame(out)
+    if df.empty:
+        return df
+
+    df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
     return df
 
 
-def validate_15m(df: pd.DataFrame, label: str) -> dict:
+def validate_ohlcv(df: pd.DataFrame, symbol: str):
     if df.empty:
-        raise ValueError(f"{label}: dataset is empty")
+        raise RuntimeError(f"{symbol}: no candles downloaded")
 
-    diffs = df["Timestamp"].diff().dropna()
-    gaps = diffs[diffs > pd.Timedelta(minutes=INTERVAL_MINUTES)]
-    duplicates = int(df["Timestamp"].duplicated().sum())
+    bad = (
+        (df["Open"] <= 0) | (df["High"] <= 0) |
+        (df["Low"] <= 0) | (df["Close"] <= 0) |
+        (df["Volume"] < 0) |
+        (df["High"] < df[["Open", "Close", "Low"]].max(axis=1)) |
+        (df["Low"] > df[["Open", "Close", "High"]].min(axis=1))
+    )
+    if bad.any():
+        raise RuntimeError(f"{symbol}: {int(bad.sum())} invalid OHLCV rows")
 
-    # We do not silently fill missing candles. HUNTER-V3 must see the real data.
+    diffs = df["Date"].diff().dropna()
+    gaps = diffs[diffs > pd.Timedelta(minutes=15)]
+    wrong = diffs[diffs < pd.Timedelta(minutes=15)]
+
     return {
-        "rows": len(df),
-        "start": str(df["Timestamp"].iloc[0]),
-        "end": str(df["Timestamp"].iloc[-1]),
-        "duplicates": duplicates,
-        "gaps": len(gaps),
+        "rows": int(len(df)),
+        "start": df["Date"].iloc[0].isoformat(),
+        "end": df["Date"].iloc[-1].isoformat(),
+        "duplicates": int(df["Date"].duplicated().sum()),
+        "gaps": int(len(gaps)),
         "max_gap_minutes": (
             int(gaps.max().total_seconds() / 60) if len(gaps) else 15
         ),
+        "wrong_intervals": int(len(wrong)),
     }
 
 
-def locate_symbol_file(tv_symbol: str) -> Path | None:
-    candidates = [
-        INPUT_DIR / f"{tv_symbol}.csv",
-        INPUT_DIR / f"{tv_symbol.replace('.', '_')}.csv",
-        INPUT_DIR / f"{tv_symbol.lower()}.csv",
-        INPUT_DIR / f"{tv_symbol.replace('.', '_').lower()}.csv",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
+def download_symbol(
+    session: requests.Session,
+    symbol: str,
+    start_dt: datetime,
+    end_dt: datetime,
+):
+    start_ms = ms(start_dt)
+    end_ms = ms(end_dt)
+    cursor = start_ms
+    rows = []
+    requests_count = 0
 
-    # Fallback: find a CSV containing the symbol name.
-    for p in INPUT_DIR.glob("*.csv"):
-        if tv_symbol.lower() in p.stem.lower():
-            return p
-    return None
+    while cursor <= end_ms:
+        batch = fetch_batch(session, symbol, cursor, end_ms)
+        requests_count += 1
 
+        if not batch:
+            break
 
-def process_symbol(tv_symbol: str, short_name: str) -> dict:
-    src = locate_symbol_file(tv_symbol)
-    if src is None:
-        raise FileNotFoundError(
-            f"Missing CSV for {tv_symbol}. Expected {INPUT_DIR / (tv_symbol + '.csv')}"
+        df = normalize_batch(batch, symbol)
+        if df.empty:
+            break
+
+        rows.extend(df.to_dict("records"))
+
+        last_ts = int(df["Timestamp"].max())
+
+        # Strict forward progress. This prevents infinite loops and overlap.
+        if last_ts < cursor:
+            raise RuntimeError(
+                f"{symbol}: API returned data before cursor "
+                f"({last_ts} < {cursor})"
+            )
+
+        next_cursor = last_ts + 1
+
+        print(
+            f"  {symbol}: request={requests_count:02d} "
+            f"batch={len(df):4d} "
+            f"through={pd.to_datetime(last_ts, unit='ms', utc=True)}"
         )
 
-    df = read_tv_csv(src)
+        if last_ts >= end_ms:
+            break
 
-    # Keep approximately the latest 365 days from the available export.
-    end = df["Timestamp"].iloc[-1]
-    start = end - pd.Timedelta(days=DAYS)
-    df = df[(df["Timestamp"] >= start) & (df["Timestamp"] <= end)].copy()
+        if len(df) < LIMIT:
+            # With an explicit endTime this normally means the requested
+            # interval has been exhausted.
+            break
 
-    report = validate_15m(df, tv_symbol)
+        cursor = next_cursor
+        time.sleep(SLEEP_SECONDS)
 
-    out = OUTPUT_DIR / f"{short_name}_USDT_FUTURES_15m.csv"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out, index=False)
+        if requests_count > 1000:
+            raise RuntimeError(f"{symbol}: pagination safety limit exceeded")
 
-    report.update({
-        "tv_symbol": tv_symbol,
-        "symbol": short_name,
-        "output": str(out),
-    })
-    return report
+    if not rows:
+        raise RuntimeError(f"{symbol}: zero rows returned")
+
+    all_df = pd.DataFrame(rows)
+    all_df["Date"] = pd.to_datetime(all_df["Timestamp"], unit="ms", utc=True)
+
+    all_df = (
+        all_df
+        .drop_duplicates(subset=["Date"], keep="last")
+        .sort_values("Date")
+        .reset_index(drop=True)
+    )
+
+    # Exact requested range.
+    all_df = all_df[
+        (all_df["Date"] >= pd.Timestamp(start_dt)) &
+        (all_df["Date"] <= pd.Timestamp(end_dt))
+    ].copy()
+
+    # Never include a still-forming 15m candle.
+    now = pd.Timestamp.now(tz="UTC")
+    if not all_df.empty:
+        last = all_df["Date"].iloc[-1]
+        if last + pd.Timedelta(minutes=15) > now:
+            all_df = all_df.iloc[:-1].copy()
+
+    report = validate_ohlcv(all_df, symbol)
+    report["api_requests"] = requests_count
+    return all_df, report
 
 
-def main() -> int:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=DAYS)
+    ap.add_argument("--symbols", nargs="*", default=SYMBOLS)
+    ap.add_argument("--output", default=str(OUTPUT_DIR))
+    args = ap.parse_args()
+
+    if args.days <= 0:
+        raise SystemExit("--days must be positive")
+
+    symbols = args.symbols
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    end_dt = utc_now()
+    start_dt = end_dt - timedelta(days=args.days)
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "HUNTER-XT-Futures-Backtest/1.0"})
 
     reports = []
     failures = []
 
-    for tv_symbol, short_name in SYMBOLS.items():
+    print("=== XT USDT-M FUTURES 15m HISTORICAL COLLECTOR ===")
+    print(f"Endpoint : {BASE_URL}")
+    print(f"Interval : {INTERVAL}")
+    print(f"Range    : {start_dt.isoformat()} -> {end_dt.isoformat()}")
+    print(f"Symbols  : {len(symbols)}")
+    print()
+
+    for symbol in symbols:
         try:
-            reports.append(process_symbol(tv_symbol, short_name))
+            print(f"Downloading {symbol} ...")
+            df, report = download_symbol(session, symbol, start_dt, end_dt)
+
+            out = out_dir / f"{symbol}_15m.csv"
+            df.to_csv(out, index=False)
+
+            report["symbol"] = symbol
+            report["output"] = str(out)
+            reports.append(report)
+
+            print(
+                f"  OK rows={report['rows']:,} "
+                f"requests={report['api_requests']} "
+                f"gaps={report['gaps']} "
+                f"max_gap={report['max_gap_minutes']}m"
+            )
+            print()
+
         except Exception as exc:
-            failures.append({"symbol": tv_symbol, "error": str(exc)})
+            failures.append((symbol, str(exc)))
+            print(f"  FAIL {symbol}: {exc}")
+            print()
 
-    print("\n=== LBank Futures / TradingView 15m DATA AUDIT ===")
-    print(f"Symbols requested : {len(SYMBOLS)}")
-    print(f"Symbols loaded    : {len(reports)}")
-    print(f"Symbols failed    : {len(failures)}")
+    report_path = out_dir / "AUDIT_REPORT.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "generated_at": utc_now().isoformat(),
+                "days": args.days,
+                "interval": INTERVAL,
+                "reports": reports,
+                "failures": [
+                    {"symbol": s, "error": e} for s, e in failures
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
-    for r in reports:
-        print(
-            f"OK {r['symbol']:7s} rows={r['rows']:6d} "
-            f"{r['start']} -> {r['end']} gaps={r['gaps']} "
-            f"max_gap={r['max_gap_minutes']}m"
-        )
+    print("=== FINAL AUDIT ===")
+    print(f"Loaded : {len(reports)}/{len(symbols)}")
+    print(f"Failed : {len(failures)}")
+    print(f"Report : {report_path}")
 
-    for f in failures:
-        print(f"FAIL {f['symbol']}: {f['error']}")
-
+    # A failed symbol must fail the workflow. No partial backtest.
     if failures:
-        print("\nNo strategy/backtest should be run until all required symbols load.")
-        return 2
-
-    # 365 days of 15m bars is approximately 35,040 rows/symbol.
-    expected = DAYS * 24 * 60 // INTERVAL_MINUTES
-    print(f"\nExpected rows for a complete {DAYS}d export: ~{expected:,}/symbol")
-    print(f"Normalized files: {OUTPUT_DIR.resolve()}")
-
-    return 0
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
