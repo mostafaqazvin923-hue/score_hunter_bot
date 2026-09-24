@@ -14,16 +14,15 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# تنظیمات استاندارد و حرفه‌ای سیستم
+# تنظیمات سیستماتیک چندتایم‌فریمه (Multi-Timeframe Setup)
 # ============================================================
 
 EXCHANGE_ID = "lbank"
-TIMEFRAME = "4h"
+BASE_TIMEFRAME = "1h"  # تایم‌فریم پایه برای استخراج دقیق سه تایم‌فریم
 LOOKBACK_DAYS = 365
 MAX_POSITIONS = 6
 SLIPPAGE = 0.0003
 FEE_RATE = 0.0007
-ATR_PERIOD = 14
 INITIAL_CAPITAL = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 50.0
@@ -49,12 +48,12 @@ start_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
 since_timestamp = int(start_date.timestamp() * 1000)
 
 print("=" * 60)
-print(f"📥 دریافت داده‌های ساختاریافته {TIMEFRAME} از صرافی {EXCHANGE_ID.upper()}")
+print(f"📥 دریافت داده‌های ۱ ساعته و ساختاربندی سه‌تایم‌فریمه از صرافی {EXCHANGE_ID.upper()}")
 print("=" * 60)
 
-processed_data = {}
+multi_tf_data = {}
 
-def fetch_symbol_data(lbank_symbol: str) -> Optional[pd.DataFrame]:
+def fetch_and_prepare_data(lbank_symbol: str) -> Optional[Dict[str, pd.DataFrame]]:
     all_ohlcv = []
     current_since = since_timestamp
     last_seen = None
@@ -65,7 +64,7 @@ def fetch_symbol_data(lbank_symbol: str) -> Optional[pd.DataFrame]:
             try:
                 batch = exchange.fetch_ohlcv(
                     lbank_symbol,
-                    timeframe=TIMEFRAME,
+                    timeframe=BASE_TIMEFRAME,
                     since=current_since,
                     limit=1000,
                 )
@@ -77,9 +76,7 @@ def fetch_symbol_data(lbank_symbol: str) -> Optional[pd.DataFrame]:
         if not batch:
             break
 
-        first_ts = batch[0][0]
         last_ts = batch[-1][0]
-
         if last_seen is not None and last_ts <= last_seen:
             return None
 
@@ -90,55 +87,64 @@ def fetch_symbol_data(lbank_symbol: str) -> Optional[pd.DataFrame]:
         if len(batch) < 1000:
             break
 
-    if not all_ohlcv:
+    if not all_ohlcv or len(all_ohlcv) < 200:
         return None
 
-    df = pd.DataFrame(
+    df_1h = pd.DataFrame(
         all_ohlcv,
         columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"],
     )
-    df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms")
-    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+    df_1h["Date"] = pd.to_datetime(df_1h["Timestamp"], unit="ms")
+    df_1h = df_1h[["Date", "Open", "High", "Low", "Close", "Volume"]]
+    df_1h.dropna(inplace=True)
+    df_1h.drop_duplicates(subset=["Date"], keep="last", inplace=True)
+    df_1h.set_index("Date", inplace=True)
 
-    df.dropna(inplace=True)
-    df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
-    df.sort_values("Date", inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    # ساخت تایم‌فریم ۴ ساعته از روی ۱ ساعته
+    df_4h = df_1h.resample("4h").agg({
+        "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
+    }).dropna()
 
-    if len(df) < 50:
+    # ساخت تایم‌فریم روزانه از روی ۱ ساعته
+    df_1d = df_1h.resample("1d").agg({
+        "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
+    }).dropna()
+
+    if len(df_4h) < 50 or len(df_1d) < 50:
         return None
 
-    # اندیکاتورهای ساختاری
-    df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
-    tr1 = df["High"] - df["Low"]
-    tr2 = np.abs(df["High"] - df["Close"].shift(1))
-    tr3 = np.abs(df["Low"] - df["Close"].shift(1))
-    df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(ATR_PERIOD).mean()
-    df["Vol_MA"] = df["Volume"].rolling(20).mean()
+    # اندیکاتورها
+    df_1d["EMA_200"] = df_1d["Close"].ewm(span=200, adjust=False).mean()
+    
+    tr1 = df_1h["High"] - df_1h["Low"]
+    tr2 = np.abs(df_1h["High"] - df_1h["Close"].shift(1))
+    tr3 = np.abs(df_1h["Low"] - df_1h["Close"].shift(1))
+    df_1h["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
+    df_1h["Vol_MA"] = df_1h["Volume"].rolling(20).mean()
 
-    df.set_index("Date", inplace=True)
-    return df
+    return {"1h": df_1h, "4h": df_4h, "1d": df_1d}
 
 for symbol, lbank_symbol in SYMBOLS.items():
-    df4h = fetch_symbol_data(lbank_symbol)
-    if df4h is not None:
-        processed_data[symbol] = df4h
+    data_pack = fetch_and_prepare_data(lbank_symbol)
+    if data_pack is not None:
+        multi_tf_data[symbol] = data_pack
 
-print(f"✅ تعداد نمادهای معتبر تاییدشده: {len(processed_data)}")
-print("⚙️ اجرای موتور کوانت مبتنی بر شکار نقدینگی و پرایس اکشن نهادی...")
+print(f"✅ تعداد نمادهای معتبر سه‌تایم‌فریمه تاییدشده: {len(multi_tf_data)}")
+print("⚙️ اجرای موتور بک‌تست پیشرفته چندتایم‌فریمه (تارگت 1:2 ثابت + Break-End نیمه راه)...")
 
 
 # ============================================================
-# موتور اجرای بک‌تست ایزوله (Institutional Execution Engine)
+# موتور اجرای بک‌تست (Multi-Timeframe Execution Engine)
 # ============================================================
 
-def run_liquidity_sweep_backtest(data_dict: Dict[str, pd.DataFrame]):
+def run_multi_tf_backtest(data_dict: Dict[str, Dict[str, pd.DataFrame]]):
+    # مرجع زمانی کندل‌های ۱ ساعته برای گردش سیستم
     all_timestamps = sorted({
-        ts for df in data_dict.values() for ts in df.index
+        ts for d in data_dict.values() for ts in d["1h"].index
     })
     
     active_positions = {}
-    pending_signals = []  # صف اجرای کندل N در Open کندل N+1
+    pending_signals = []
     all_trades = []
     equity = INITIAL_CAPITAL
     peak_equity = INITIAL_CAPITAL
@@ -149,14 +155,13 @@ def run_liquidity_sweep_backtest(data_dict: Dict[str, pd.DataFrame]):
     pause_timer = 0
 
     for ts in all_timestamps:
-        # ۱. مدیریت تایمر مکث (فقط ورودهای جدید مسدود می‌شوند، مدیریت پوزیشن‌های باز کاملاً برقرار است)
         if trading_paused:
             pause_timer -= 1
             if pause_timer <= 0:
                 trading_paused = False
                 consecutive_losses = 0
 
-        # ۲. اجرای سیگنال‌های صادرشده از کندل قبل در قیمت Open کندل جاری
+        # اجرای سیگنال‌های کندل ۱ ساعته قبل در Open کندل جاری
         signals_to_execute = pending_signals
         pending_signals = []
 
@@ -165,12 +170,12 @@ def run_liquidity_sweep_backtest(data_dict: Dict[str, pd.DataFrame]):
             if symbol in active_positions or len(active_positions) >= MAX_POSITIONS or equity < TRADE_MARGIN:
                 continue
             
-            df = data_dict[symbol]
-            if ts not in df.index:
+            df_1h = data_dict[symbol]["1h"]
+            if ts not in df_1h.index:
                 continue
             
-            c4h = df.loc[ts]
-            open_price = c4h["Open"]
+            c1h = df_1h.loc[ts]
+            open_price = c1h["Open"]
             entry_price = open_price * (1 + SLIPPAGE) if sig["side"] == "LONG" else open_price * (1 - SLIPPAGE)
             
             notional_value = TRADE_MARGIN * LEVERAGE
@@ -185,25 +190,25 @@ def run_liquidity_sweep_backtest(data_dict: Dict[str, pd.DataFrame]):
                 "is_breakeven": False,
             }
 
-        # ۳. مدیریت پوزیشن‌های باز در کندل جاری
+        # مدیریت پوزیشن‌های باز در هر کندل ۱ ساعته
         symbols_to_close = []
         for symbol, pos in list(active_positions.items()):
-            df = data_dict[symbol]
-            if ts not in df.index:
+            df_1h = data_dict[symbol]["1h"]
+            if ts not in df_1h.index:
                 continue
             
-            c4h = df.loc[ts]
+            c1h = df_1h.loc[ts]
             
-            # مکانیزم Break-Even استاندارد در ۵۰ درصد مسیر سود
+            # مکانیزم Break-Even در ۵۰ درصد مسیر رسیدن به تارگت 1:2
             if not pos["is_breakeven"]:
                 if pos["side"] == "LONG":
                     halfway = pos["entry_price"] + (pos["target_price"] - pos["entry_price"]) * 0.5
-                    if c4h["High"] >= halfway:
+                    if c1h["High"] >= halfway:
                         pos["stop_price"] = pos["entry_price"]
                         pos["is_breakeven"] = True
                 else:
                     halfway = pos["entry_price"] - (pos["entry_price"] - pos["target_price"]) * 0.5
-                    if c4h["Low"] <= halfway:
+                    if c1h["Low"] <= halfway:
                         pos["stop_price"] = pos["entry_price"]
                         pos["is_breakeven"] = True
 
@@ -211,14 +216,13 @@ def run_liquidity_sweep_backtest(data_dict: Dict[str, pd.DataFrame]):
             hit_target = False
 
             if pos["side"] == "LONG":
-                hit_stop = c4h["Low"] <= pos["stop_price"]
-                hit_target = c4h["High"] >= pos["target_price"]
+                hit_stop = c1h["Low"] <= pos["stop_price"]
+                hit_target = c1h["High"] >= pos["target_price"]
             else:
-                hit_stop = c4h["High"] >= pos["stop_price"]
-                hit_target = c4h["Low"] <= pos["target_price"]
+                hit_stop = c1h["High"] >= pos["stop_price"]
+                hit_target = c1h["Low"] <= pos["target_price"]
 
             if hit_stop or hit_target:
-                # قانون محافظه‌کارانه داخل کندلی: در صورت برخورد همزمان، استاپ مقدم است
                 is_win = hit_target and not hit_stop
                 is_be = (not is_win) and pos["is_breakeven"] and (pos["stop_price"] == pos["entry_price"])
                 
@@ -256,7 +260,7 @@ def run_liquidity_sweep_backtest(data_dict: Dict[str, pd.DataFrame]):
                     consecutive_losses += 1
                     if consecutive_losses >= 3 and not trading_paused:
                         trading_paused = True
-                        pause_timer = 8
+                        pause_timer = 12
                 elif outcome == "WIN":
                     consecutive_losses = 0
 
@@ -265,57 +269,81 @@ def run_liquidity_sweep_backtest(data_dict: Dict[str, pd.DataFrame]):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # ۴. اسکن سیگنال‌های جدید (Liquidity Sweep + Rejection + Volume)
+        # اسکن سیگنال‌های جدید در صورت عدم مکث ربات
         if not trading_paused:
-            for symbol, df in data_dict.items():
-                if symbol in active_positions or ts not in df.index:
+            for symbol, d_pack in data_dict.items():
+                if symbol in active_positions:
                     continue
 
-                i = df.index.get_loc(ts)
-                if i < 30:
+                df_1h = d_pack["1h"]
+                df_4h = d_pack["4h"]
+                df_1d = d_pack["1d"]
+
+                if ts not in df_1h.index:
                     continue
 
-                subset = df.iloc[:i + 1]
-                current = subset.iloc[-1]
-                prev = subset.iloc[-2]
-                
-                atr = current["ATR"]
-                ema_50 = current["EMA_50"]
-                vol_ma = current["Vol_MA"]
+                # پیدا کردن تناظر کندل ۴ ساعته و روزانه مربوط به این timestamp
+                d_ts = pd.Timestamp(ts).normalize()
+                if d_ts not in df_1d.index:
+                    continue
+                daily_row = df_1d.loc[d_ts]
+
+                # فیلتر ۱: روند کلان روزانه (EMA 200)
+                macro_close = daily_row["Close"]
+                macro_ema = daily_row["EMA_200"]
+                if not np.isfinite(macro_ema):
+                    continue
+
+                allowed_side = "LONG" if macro_close > macro_ema else "SHORT"
+
+                # فیلتر ۲: ساختار ۴ ساعته (یافتن نزدیک‌ترین کندل ۴ ساعته قبل یا مساوی ts)
+                valid_4h = df_4h[df_4h.index <= ts]
+                if len(valid_4h) < 20:
+                    continue
+                recent_4h = valid_4h.iloc[-10:]
+                struct_high = recent_4h["High"].max()
+                struct_low = recent_4h["Low"].min()
+
+                # فیلتر ۳: تریگر ۱ ساعته (نقطه ورود)
+                i_1h = df_1h.index.get_loc(ts)
+                if i_1h < 20:
+                    continue
+
+                current_1h = df_1h.iloc[i_1h]
+                atr = current_1h["ATR"]
+                vol_ma = current_1h["Vol_MA"]
 
                 if not np.isfinite(atr) or atr <= 0 or not np.isfinite(vol_ma):
                     continue
-
-                # تعیین سطوح نقدینگی (سقف و کف ۲۰ کندل گذشته بدون احتساب کندل جاری)
-                recent_highs = subset["High"].iloc[:-1].rolling(20).max().iloc[-1]
-                recent_lows = subset["Low"].iloc[:-1].rolling(20).min().iloc[-1]
 
                 direction = None
                 stop_price = 0.0
                 target_price = 0.0
 
-                # الف) جاروب کف (Sweep Low) و بازگشت به بالا (Bullish Rejection)
-                # قیمت کفِ قبلی را با ویک لمس کرده (Low < recent_lows) اما بسته شدن کندل بالای کف است (Close > recent_lows)
-                is_sweep_low = current["Low"] < recent_lows and current["Close"] > recent_lows
-                is_volume_spike = current["Volume"] > vol_ema_threshold if 'vol_ema_threshold' in locals() else current["Volume"] > (vol_ma * 1.2)
+                # بررسی شرایط لانگ بر اساس ساختار
+                if allowed_side == "LONG":
+                    # جاروب کف ۴ ساعته توسط کندل ۱ ساعته و بازگشت به بالا
+                    is_sweep = current_1h["Low"] < struct_low and current_1h["Close"] > struct_low
+                    is_vol = current_1h["Volume"] > (vol_ma * 1.1)
+                    if is_sweep and is_vol:
+                        direction = "LONG"
+                        stop_price = current_1h["Low"] - (atr * 0.5)
+                        risk_dist = current_1h["Close"] - stop_price
+                        if risk_dist <= 0:
+                            risk_dist = atr
+                        target_price = current_1h["Close"] + (risk_dist * 2.0)  # ریوارد ثابت 1:2
 
-                if is_sweep_low and current["Close"] > ema_50 and is_volume_spike:
-                    direction = "LONG"
-                    stop_price = current["Low"] - (atr * 0.5)
-                    risk_dist = current["Close"] - stop_price
-                    if risk_dist <= 0:
-                        risk_dist = atr
-                    target_price = current["Close"] + (risk_dist * 2.5)
-
-                # ب) جاروب سقف (Sweep High) و بازگشت به پایین (Bearish Rejection)
-                is_sweep_high = current["High"] > recent_highs and current["Close"] < recent_highs
-                if is_sweep_high and current["Close"] < ema_50 and is_volume_spike:
-                    direction = "SHORT"
-                    stop_price = current["High"] + (atr * 0.5)
-                    risk_dist = stop_price - current["Close"]
-                    if risk_dist <= 0:
-                        risk_dist = atr
-                    target_price = current["Close"] - (risk_dist * 2.5)
+                # بررسی شرایط شورت بر اساس ساختار
+                elif allowed_side == "SHORT":
+                    is_sweep = current_1h["High"] > struct_high and current_1h["Close"] < struct_high
+                    is_vol = current_1h["Volume"] > (vol_ma * 1.1)
+                    if is_sweep and is_vol:
+                        direction = "SHORT"
+                        stop_price = current_1h["High"] + (atr * 0.5)
+                        risk_dist = stop_price - current_1h["Close"]
+                        if risk_dist <= 0:
+                            risk_dist = atr
+                        target_price = current_1h["Close"] - (risk_dist * 2.0)  # ریوارد ثابت 1:2
 
                 if direction is not None:
                     pending_signals.append({
@@ -328,9 +356,9 @@ def run_liquidity_sweep_backtest(data_dict: Dict[str, pd.DataFrame]):
     return pd.DataFrame(all_trades), equity, max_drawdown
 
 
-def summarize_results(trades_df: pd.DataFrame, final_equity: float, max_dd: float):
+def summarize_multi_tf_results(trades_df: pd.DataFrame, final_equity: float, max_dd: float):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی شکار نقدینگی (Institutional Liquidity Sweep)")
+    print("📊 گزارش نهایی استراتژی چندتایم‌فریمه (تارگت 1:2 + Break-Even)")
     print("=" * 68)
 
     if trades_df.empty:
@@ -405,6 +433,6 @@ def summarize_results(trades_df: pd.DataFrame, final_equity: float, max_dd: floa
 
 
 if __name__ == "__main__":
-    df_trades, final_equity, max_dd = run_liquidity_sweep_backtest(processed_data)
-    summarize_results(df_trades, final_equity, max_dd)
-    print("\n✨ اجرای تست استراتژی نهادی به پایان رسید.")
+    df_trades, final_equity, max_dd = run_multi_tf_backtest(multi_tf_data)
+    summarize_multi_tf_results(df_trades, final_equity, max_dd)
+    print("\n✨ اجرای تست چندتایم‌فریمه جدید به پایان رسید.")
