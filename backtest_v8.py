@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-HUNTER-XT-STRICT-CIRCUIT-BREAKER
-Strict Causal / Circuit-Breaker Protected Engine / XT USDT-M Futures
-- Target Win Rate: > 50%
-- Risk-to-Reward: 1:2 (Fixed)
-- Max Consecutive Losses: <= 4 (Enforced via Circuit Breaker)
+HUNTER-XT-INSTITUTIONAL-OB-ENGINE
+Institutional Liquidity Sweep & Order Block Mitigation Strategy
+- Strict Causal Execution / No-Lookahead
+- Margin: $100 | Leverage: 50x | RR: 1:2
+- Circuit Breaker Protection against consecutive losses
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ CORRELATION_CLUSTERS = {
 }
 
 DATA_DIR = Path("data/xt_futures_15m")
-OUT_DIR = DATA_DIR / "backtest_circuit_breaker"
+OUT_DIR = DATA_DIR / "backtest_institutional_ob"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -38,10 +38,9 @@ FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 RR = 2.0
 ATR_N = 14
-MOMENTUM_LOOKBACK = 48
-MAX_OPEN_POSITIONS = 2  # Reduced to minimize exposure
+MAX_OPEN_POSITIONS = 2
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 12  # Pause trading for 12 bars (3 hours) after 2 consecutive losses
+CIRCUIT_BREAKER_COOLDOWN = 16  # 4 hours pause after 2 losses
 
 
 def parse_args():
@@ -94,7 +93,8 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     return df.dropna(subset=required[1:])
 
 
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_institutional_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculates Causal Swing Highs, Liquidity Sweeps, and Order Blocks strictly using shift(1)."""
     prev_close = df["close"].shift(1)
     tr = pd.concat([
         df["high"] - df["low"],
@@ -103,16 +103,23 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
 
     df["atr"] = tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
-    df["momentum"] = df["close"].shift(1).pct_change(MOMENTUM_LOOKBACK)
-    df["ema_trend"] = df["close"].shift(1).ewm(span=150, adjust=False).mean()
     
-    # Strict filter: Body must be clean and strong
-    df["body"] = (df["close"].shift(1) - df["open"].shift(1)).abs()
-    df["clean_candle"] = df["body"] >= (0.75 * df["atr"])
+    # Local swing low over 10 bars (using past data only)
+    df["swing_low"] = df["low"].shift(1).rolling(window=10).min()
+    
+    # Liquidity Sweep: Current bar low goes below swing low, but closes back above it
+    df["sweep_low"] = (df["low"].shift(1) < df["swing_low"]) & (df["close"].shift(1) > df["swing_low"])
+    
+    # Displacement / Strong Bullish Expansion
+    df["body"] = df["close"].shift(1) - df["open"].shift(1)
+    df["is_displacement"] = (df["body"] > 1.2 * df["atr"]) & (df["body"] > 0)
+    
+    # Combined Institutional Setup Signal
+    df["setup_valid"] = df["sweep_low"] & df["is_displacement"]
     return df
 
 
-def run_backtest_with_circuit_breaker(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_institutional_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -121,13 +128,12 @@ def run_backtest_with_circuit_breaker(all_data: dict[str, pd.DataFrame]) -> list
     peak_equity = INITIAL_EQUITY
     
     consecutive_losses = 0
-    cooldown_counter = 0  # Circuit breaker timer
+    cooldown_counter = 0
 
     def cluster_active(cluster_name):
         return any(CORRELATION_CLUSTERS.get(p["symbol"], "OTHER") == cluster_name for p in active_positions.values())
 
     for idx, ts in enumerate(all_times):
-        # Decrement cooldown if active
         if cooldown_counter > 0:
             cooldown_counter -= 1
 
@@ -157,9 +163,9 @@ def run_backtest_with_circuit_breaker(all_data: dict[str, pd.DataFrame]) -> list
                 if outcome == "LOSS":
                     consecutive_losses += 1
                     if consecutive_losses >= 2:
-                        cooldown_counter = CIRCUIT_BREAKER_COOLDOWN  # Trigger circuit breaker pause
+                        cooldown_counter = CIRCUIT_BREAKER_COOLDOWN
                 else:
-                    consecutive_losses = 0  # Reset streak on win
+                    consecutive_losses = 0
 
                 trades.append({
                     "symbol": symbol, "side": side, "entry_ts": pos["entry_ts"], "exit_ts": ts,
@@ -167,43 +173,35 @@ def run_backtest_with_circuit_breaker(all_data: dict[str, pd.DataFrame]) -> list
                 })
                 del active_positions[symbol]
 
-        # 2. Rebalancing only if Circuit Breaker is NOT active
-        if cooldown_counter == 0 and idx % 16 == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
-            scores = []
+        # 2. Institutional Setup Execution (No-Lookahead)
+        if cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
             for symbol, df in all_data.items():
                 if ts not in df.index:
                     continue
                 row = df.loc[ts]
-                mom, close, ema, atr, clean = row.get("momentum"), row.get("close"), row.get("ema_trend"), row.get("atr"), row.get("clean_candle")
+                if not row.get("setup_valid", False):
+                    continue
 
-                if all(np.isfinite([mom, close, ema, atr])) and atr > 0:
-                    if close > ema and clean:
-                        scores.append({"symbol": symbol, "score": mom, "atr": atr, "cluster": CORRELATION_CLUSTERS.get(symbol, "OTHER")})
-
-            scores.sort(key=lambda x: x["score"], reverse=True)
-
-            for item in scores:
-                symbol = item["symbol"]
-                cluster = item["cluster"]
-
+                cluster = CORRELATION_CLUSTERS.get(symbol, "OTHER")
                 if symbol in active_positions or (MAX_ONE_PER_CLUSTER and cluster_active(cluster)):
                     continue
                 if len(active_positions) >= MAX_OPEN_POSITIONS:
                     break
 
-                df = all_data[symbol]
                 next_indices = df.index[df.index > ts]
                 if len(next_indices) == 0:
                     continue
                 
                 next_ts = next_indices[0]
                 entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
-                atr = item["atr"]
-                sl = entry - (1.5 * atr)
-                risk = entry - sl
+                atr = row["atr"]
                 
+                # Stop loss placed safely below the sweep low
+                sl = float(row["swing_low"]) - (0.2 * atr)
+                risk = entry - sl
                 if risk <= 0:
                     continue
+                
                 tp = entry + (RR * risk)
 
                 active_positions[symbol] = {
@@ -220,7 +218,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-STRICT-CIRCUIT-BREAKER Engine")
+    print("HUNTER-XT-INSTITUTIONAL-OB-ENGINE (Liquidity Sweep & Order Block)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -229,11 +227,11 @@ def main():
     for asset in SYMBOLS:
         try:
             df = load_xt_csv(data_dir, asset)
-            all_data[asset] = calculate_indicators(df)
+            all_data[asset] = calculate_institutional_features(df)
         except Exception:
             pass
 
-    trades = run_backtest_with_circuit_breaker(all_data)
+    trades = run_institutional_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -248,7 +246,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== CIRCUIT BREAKER RESULTS =====")
+    print("\n===== INSTITUTIONAL RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
