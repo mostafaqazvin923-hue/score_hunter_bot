@@ -469,17 +469,28 @@ def wilder_atr(df: pd.DataFrame, n: int = ATR_N) -> pd.Series:
 
 
 def aggregate_htf(df15: pd.DataFrame):
-    """Build closed 1H/4H/1D bars from 15m data. No forward filling."""
+    """Build CLOSED, complete 1H/4H/1D bars from the full history.
+
+    Important: HTF indicators must not be recomputed separately after every
+    15m data gap. Doing that destroys the 1D EMA200 warm-up on segmented
+    data and can produce zero signals across the whole portfolio.
+    Incomplete HTF bars are rejected instead of forward-filled.
+    """
     agg = dict(
         open=("open", "first"),
         high=("high", "max"),
         low=("low", "min"),
         close=("close", "last"),
         volume=("volume", "sum"),
+        n=("close", "count"),
     )
-    h1 = df15.resample("1h", label="right", closed="left", origin="epoch").agg(**agg).dropna()
-    h4 = df15.resample("4h", label="right", closed="left", origin="epoch").agg(**agg).dropna()
-    d1 = df15.resample("1D", label="right", closed="left", origin="epoch").agg(**agg).dropna()
+    def build(rule: str, expected: int):
+        x = df15.resample(rule, label="right", closed="left", origin="epoch").agg(**agg)
+        x = x[(x["n"] == expected)].drop(columns=["n"]).dropna()
+        return x
+    h1 = build("1h", 4)
+    h4 = build("4h", 16)
+    d1 = build("1D", 96)
     return h1, h4, d1
 
 
@@ -524,9 +535,11 @@ def context_4h(row, daily_regime):
 
 
 
-def coverage_audit(asset: str, df15: pd.DataFrame) -> dict:
-    """Diagnostic-only coverage audit. Does not change strategy or create trades."""
-    h1, h4, d1 = prepare_mtf(df15)
+def coverage_audit(asset: str, df15: pd.DataFrame, h4_global: pd.DataFrame | None = None, d1_global: pd.DataFrame | None = None) -> dict:
+    """Diagnostic-only coverage audit. Uses full-history HTF context."""
+    h1, h4_local, d1_local = prepare_mtf(df15)
+    h4 = h4_global if h4_global is not None else h4_local
+    d1 = d1_global if d1_global is not None else d1_local
     c = {
         "h1_bars": len(h1), "daily_bull": 0, "daily_bear": 0, "daily_neutral": 0,
         "htf_ready": 0, "ctx_bull_trend": 0, "ctx_bull_pullback": 0,
@@ -537,7 +550,8 @@ def coverage_audit(asset: str, df15: pd.DataFrame) -> dict:
         "long_all_before_trigger": 0, "short_all_before_trigger": 0,
         "final_long": 0, "final_short": 0,
     }
-    start = max(EMA_SLOW + 10, PULLBACK_LOOKBACK + VOL_N + 5)
+    # H1 EMA200 is not a strategy gate; only H1 ATR/EMA20/volume need warm-up.
+    start = max(ATR_N + 5, PULLBACK_LOOKBACK + VOL_N + 5)
     for i in range(start, len(h1) - 1):
         signal_ts = h1.index[i]
         dsub = d1[d1.index < signal_ts]
@@ -584,12 +598,16 @@ def coverage_audit(asset: str, df15: pd.DataFrame) -> dict:
     return c
 
 
-def generate_candidates(asset: str, df15: pd.DataFrame) -> list[dict]:
-    h1, h4, d1 = prepare_mtf(df15)
+def generate_candidates(asset: str, df15: pd.DataFrame, h4_global: pd.DataFrame | None = None, d1_global: pd.DataFrame | None = None) -> list[dict]:
+    # H1 setup is local to the current gap-free segment.
+    # 4H/1D context comes from the FULL asset history so EMA200 has enough warm-up.
+    h1, h4_local, d1_local = prepare_mtf(df15)
+    h4 = h4_global if h4_global is not None else h4_local
+    d1 = d1_global if d1_global is not None else d1_local
     candidates = []
 
     # We intentionally require completed 1H bars and enter on the next 1H open.
-    for i in range(max(EMA_SLOW + 10, PULLBACK_LOOKBACK + VOL_N + 5), len(h1) - 1):
+    for i in range(max(ATR_N + 5, PULLBACK_LOOKBACK + VOL_N + 5), len(h1) - 1):
         signal_ts = h1.index[i]
         entry_ts = h1.index[i + 1]
 
@@ -845,6 +863,9 @@ def main():
     all_candidates, reports = [], {}
     for asset in SYMBOLS:
         df = load_csv(data_dir, asset)
+        # Compute HTF context ONCE from the full history. Segments are only for
+        # signal/simulation isolation around 15m gaps.
+        _, h4_global, d1_global = prepare_mtf(df)
         segs = split_segments(df)
         gap_count = int((df.index.to_series().diff() > pd.Timedelta(minutes=15)).sum())
         reports[asset] = {
@@ -856,13 +877,13 @@ def main():
         }
         c = []
         for seg in segs:
-            seg_candidates = generate_candidates(asset, seg)
+            seg_candidates = generate_candidates(asset, seg, h4_global, d1_global)
             for item in seg_candidates:
                 item["segment_end_ts"] = seg.index[-1]
             c.extend(seg_candidates)
         audit = {"segments": []}
         for seg in segs:
-            audit["segments"].append(coverage_audit(asset, seg))
+            audit["segments"].append(coverage_audit(asset, seg, h4_global, d1_global))
         merged = {}
         for key in audit["segments"][0].keys() if audit["segments"] else []:
             merged[key] = sum(x.get(key, 0) for x in audit["segments"])
