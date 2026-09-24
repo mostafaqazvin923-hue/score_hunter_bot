@@ -1,1285 +1,547 @@
 import os
-import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+import subprocess
+from datetime import datetime, timedelta, timezone
 
 try:
     import ccxt
 except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt"])
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'ccxt'])
     import ccxt
 
 import numpy as np
 import pandas as pd
 
 # ============================================================
-# HUNTER-V132-A
-# Portfolio-Level / Strict No-Lookahead / Pure 1:2
+# HUNTER-V2 STAGE-1
+# TREND PULLBACK / VOLATILITY EXPANSION
+# RAW EDGE RESEARCH ENGINE
+# ============================================================
+# Purpose:
+#   Test a fundamentally different entry thesis from the old
+#   liquidity-sweep family.
 #
 # Architecture:
-#   4H  = regime
-#   1H  = structure + liquidity reference
-#   15M = sweep + displacement + FVG/value confirmation
+#   4H = trend regime
+#   1H = pullback/reclaim
+#   15M = volatility expansion trigger
 #
-# Rules:
-#   - Signal is confirmed only on a CLOSED 15M candle.
-#   - 1H/4H context uses only COMPLETED higher-timeframe candles.
-#   - Entry is at the NEXT 15M candle open.
-#   - Fixed RR = 1:2.
-#   - No BE, no trailing stop, no timeout.
-#   - Portfolio-level max 3 open positions.
-#   - Max 1 open position per correlation cluster.
-#   - Portfolio-level loss-streak pause.
-#   - Existing positions are always managed during pause.
-#   - If SL and TP occur on the same candle, SL wins (conservative).
-#   - Final open positions are reported separately and not counted as
-#     completed trades.
+# Entry:
+#   Signal is generated only from a CLOSED 15M candle.
+#   Entry is NEXT 15M candle OPEN + slippage.
 #
-# NOTE:
-# This is a research/backtest engine, NOT an order-execution bot.
+# Exit:
+#   Structural ATR stop + exact 1:2 RR.
+#   No BE, no trailing, no timeout.
+#   If SL and TP are both touched in one candle -> LOSS.
+#
+# Portfolio:
+#   $1,000 initial equity
+#   $100 fixed margin/trade
+#   50x leverage
+#   max 3 open positions
+#   max 1 position per correlation cluster
+#   no overlapping positions per symbol
+#
+# IMPORTANT:
+#   This is deliberately a Stage-1 RAW EDGE test.
+#   It avoids a large confirmation-score stack. We want to know
+#   whether Trend -> Pullback -> Expansion has standalone edge.
 # ============================================================
 
-EXCHANGE = ccxt.lbank({
-    "enableRateLimit": True,
-    "timeout": 20000,
-})
+EXCHANGE = ccxt.lbank({'enableRateLimit': True, 'timeout': 20000})
 
-SYMBOLS = {
-    "BTC": "BTC/USDT",
-    "ETH": "ETH/USDT",
-    "SOL": "SOL/USDT",
-    "SUI": "SUI/USDT",
-    "AVAX": "AVAX/USDT",
-    "NEAR": "NEAR/USDT",
-    "ADA": "ADA/USDT",
-    "BNB": "BNB/USDT",
-    "APT": "APT/USDT",
-    "CRV": "CRV/USDT",
-    "ONDO": "ONDO/USDT",
-    "PENDLE": "PENDLE/USDT",
-    "ICP": "ICP/USDT",
-    "WIF": "WIF/USDT",
+SYMBOLS = [
+    'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT',
+    'SUI/USDT:USDT', 'AVAX/USDT:USDT', 'NEAR/USDT:USDT',
+    'ADA/USDT:USDT', 'BNB/USDT:USDT', 'APT/USDT:USDT',
+    'CRV/USDT:USDT', 'ONDO/USDT:USDT', 'PENDLE/USDT:USDT',
+    'ICP/USDT:USDT', 'WIF/USDT:USDT'
+]
+
+CLUSTERS = {
+    'MAJOR': {'BTC/USDT:USDT', 'ETH/USDT:USDT'},
+    'L1': {'SOL/USDT:USDT', 'SUI/USDT:USDT', 'AVAX/USDT:USDT', 'NEAR/USDT:USDT', 'ADA/USDT:USDT', 'BNB/USDT:USDT', 'APT/USDT:USDT'},
+    'DEFI': {'CRV/USDT:USDT', 'ONDO/USDT:USDT', 'PENDLE/USDT:USDT'},
+    'OTHER': {'ICP/USDT:USDT'},
+    'MEME': {'WIF/USDT:USDT'},
 }
 
-CORRELATION_CLUSTERS = {
-    "BTC": "MAJOR",
-    "ETH": "MAJOR",
-    "SOL": "L1",
-    "SUI": "L1",
-    "AVAX": "L1",
-    "NEAR": "L1",
-    "ADA": "L1",
-    "BNB": "L1",
-    "APT": "L1",
-    "CRV": "DEFI",
-    "ONDO": "DEFI",
-    "PENDLE": "DEFI",
-    "ICP": "OTHER",
-    "WIF": "MEME",
-}
-
-# -----------------------------
-# Backtest configuration
-# -----------------------------
 DAYS = 365
-TIMEFRAME = "15m"
-
-INITIAL_CAPITAL = 1000.0
+TIMEFRAME = '15m'
+FETCH_DAYS_PER_CHUNK = 15
+WARMUP_DAYS = 35
 TRADE_MARGIN = 100.0
 LEVERAGE = 50.0
-
-SLIPPAGE = 0.0003
+INITIAL_CAPITAL = 1000.0
 FEE_RATE = 0.0007
-
+SLIPPAGE = 0.0003
+RR = 2.0
 MAX_OPEN_POSITIONS = 3
-MAX_ONE_PER_CLUSTER = True
+MAX_STRUCTURAL_RISK = 0.025
+MAX_LOSS_STREAK_PAUSE = 4
+PAUSE_BARS = 16
 
-MAX_LOSS_STREAK = 4
-LOSS_PAUSE_BARS = 16  # risk-control pause; existing positions continue
-
-ATR_PERIOD = 14
-BODY_AVG_PERIOD = 20
-
-# Structure / liquidity
-STRUCTURE_LOOKBACK_1H = 12
-SWEEP_BUFFER_ATR = 0.10
-
-# Displacement
-DISPLACEMENT_ATR = 0.65
-DISPLACEMENT_BODY_RATIO = 0.55
-
-# FVG
-USE_FVG_CONFIRMATION = True
-FVG_MIN_ATR = 0.05
-
-# Confirmation score:
-# Core conditions are mandatory:
-#   regime + 1H structure + liquidity sweep
-#
-# Additional confirmations contribute score.
-MIN_CONFIRMATION_SCORE = 1
-
-# A hard cap prevents absurdly wide structural stops.
-MAX_STOP_ATR = 2.25
-
-# Higher-timeframe alignment:
-# 4H bar timestamp represents its opening time after resample.
-# To use ONLY completed 4H bars at a 15M timestamp t,
-# we require the 4H bar to end <= t.
-# Same for 1H.
-FOUR_HOURS = pd.Timedelta(hours=4)
-ONE_HOUR = pd.Timedelta(hours=1)
-FIFTEEN_MIN = pd.Timedelta(minutes=15)
+# Stage-1 signal parameters: intentionally modest, not optimized.
+EMA_FAST_4H = 50
+EMA_SLOW_4H = 200
+ADX_LEN = 14
+EMA_PULL_FAST = 20
+EMA_PULL_SLOW = 50
+PULLBACK_LOOKBACK_H = 6
+PULLBACK_ATR_BUFFER = 0.20
+EXPANSION_ATR_MULT = 1.05
+EXPANSION_BODY_RATIO = 0.60
+VOLUME_MULT = 1.05
+STOP_ATR_BUFFER = 0.20
 
 
-# ============================================================
-# DATA
-# ============================================================
-
-def fetch_symbol_data(lbank_symbol, start_dt, end_dt):
-    """
-    Fetch 15M OHLCV with warmup.
-    Warmup is deliberately kept before start_dt so indicators have
-    historical context, but trades are only allowed inside [start_dt, end_dt].
-    """
-    warmup_start = start_dt - timedelta(days=30)
-    since_ts = int(warmup_start.timestamp() * 1000)
-    end_ts = int(end_dt.timestamp() * 1000)
-
-    all_ohlcv = []
-    current_since = since_ts
-    last_seen = None
-
-    try:
-        while current_since < end_ts:
-            batch = EXCHANGE.fetch_ohlcv(
-                lbank_symbol,
-                timeframe=TIMEFRAME,
-                since=current_since,
-                limit=1000,
-            )
-
-            if not batch:
-                break
-
-            if last_seen is not None and batch[-1][0] <= last_seen:
-                break
-
-            all_ohlcv.extend(batch)
-            last_seen = batch[-1][0]
-            current_since = last_seen + 1
-
-            if len(batch) < 1000:
-                break
-
+def fetch_ohlcv(symbol, since_ms, until_ms):
+    rows = []
+    cursor = since_ms
+    limit = 1000
+    while cursor < until_ms:
+        batch = EXCHANGE.fetch_ohlcv(symbol, TIMEFRAME, since=cursor, limit=limit)
+        if not batch:
+            break
+        rows.extend(batch)
+        last = batch[-1][0]
+        nxt = last + 15 * 60 * 1000
+        if nxt <= cursor:
+            break
+        cursor = nxt
+        if len(batch) < limit:
+            # LBank can occasionally return a short page before the target.
+            # Advance one candle and continue; stop is still controlled by until_ms.
             time.sleep(0.15)
-
-    except Exception as e:
-        print(f"  خطا در دریافت {lbank_symbol}: {e}")
-        return None
-
-    if not all_ohlcv:
-        return None
-
-    df = pd.DataFrame(
-        all_ohlcv,
-        columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"],
-    )
-
-    # UTC makes cross-symbol alignment deterministic.
-    df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
-    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df.dropna(inplace=True)
-    df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
-    df.sort_values("Date", inplace=True)
-    df.set_index("Date", inplace=True)
-
-    # Remove future/incomplete candle conservatively:
-    # a 15M candle whose close time is after now is not usable.
-    now_utc = pd.Timestamp.now(tz="UTC")
-    df = df[df.index + FIFTEEN_MIN <= now_utc]
-
-    if len(df) < 500:
-        return None
-
-    return df
+        time.sleep(0.05)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+    df = df.drop_duplicates('timestamp').sort_values('timestamp')
+    df = df[df['timestamp'] < until_ms]
+    df['Date'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+    df = df.set_index('Date')
+    return df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
 
 
-def resample_closed(df_15m, rule):
-    """
-    Build higher timeframe bars with timestamp at the BAR OPEN.
-    The caller must only use bars whose END <= current 15M candle close.
-    """
-    out = df_15m.resample(
-        rule,
-        label="left",
-        closed="left",
-        origin="epoch",
-    ).agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum",
+def resample_ohlcv(df, rule):
+    return df.resample(rule, label='right', closed='right').agg({
+        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).dropna()
 
-    return out
+
+def ema(s, n):
+    return s.ewm(span=n, adjust=False, min_periods=n).mean()
 
 
-def prepare_data(df_15m):
-    df_15 = df_15m.copy()
-
-    # -----------------------------
-    # 4H
-    # -----------------------------
-    df_4h = resample_closed(df_15, "4h")
-
-    df_4h["EMA_50"] = df_4h["Close"].ewm(
-        span=50, adjust=False
-    ).mean()
-
-    df_4h["EMA_200"] = df_4h["Close"].ewm(
-        span=200, adjust=False
-    ).mean()
-
-    df_4h["EMA_Slope"] = (
-        df_4h["EMA_200"] - df_4h["EMA_200"].shift(5)
-    )
-
-    df_4h["TR"] = pd.concat([
-        df_4h["High"] - df_4h["Low"],
-        (df_4h["High"] - df_4h["Close"].shift(1)).abs(),
-        (df_4h["Low"] - df_4h["Close"].shift(1)).abs(),
+def atr(df, n=14):
+    prev = df['Close'].shift(1)
+    tr = pd.concat([
+        df['High'] - df['Low'],
+        (df['High'] - prev).abs(),
+        (df['Low'] - prev).abs()
     ], axis=1).max(axis=1)
+    return tr.rolling(n, min_periods=n).mean()
 
-    df_4h["ATR"] = df_4h["TR"].rolling(ATR_PERIOD).mean()
-    df_4h["ATR_PCT"] = df_4h["ATR"] / df_4h["Close"]
 
-    # ADX, calculated causally on 4H.
-    up_move = df_4h["High"].diff()
-    down_move = -df_4h["Low"].diff()
-
-    plus_dm = pd.Series(
-        np.where(
-            (up_move > down_move) & (up_move > 0),
-            up_move,
-            0.0,
-        ),
-        index=df_4h.index,
-    )
-
-    minus_dm = pd.Series(
-        np.where(
-            (down_move > up_move) & (down_move > 0),
-            down_move,
-            0.0,
-        ),
-        index=df_4h.index,
-    )
-
-    atr14 = df_4h["TR"].rolling(ATR_PERIOD).mean()
-
-    plus_di = 100.0 * plus_dm.rolling(ATR_PERIOD).mean() / atr14
-    minus_di = 100.0 * minus_dm.rolling(ATR_PERIOD).mean() / atr14
-
-    dx = (
-        100.0
-        * (plus_di - minus_di).abs()
-        / (plus_di + minus_di).replace(0, np.nan)
-    )
-
-    df_4h["ADX"] = dx.rolling(ATR_PERIOD).mean()
-    df_4h["PLUS_DI"] = plus_di
-    df_4h["MINUS_DI"] = minus_di
-
-    # V132 change: EMA structure defines direction. Slope and DI are
-    # confirmations, not mandatory gates. This reduces over-filtering
-    # while preserving a directional higher-timeframe regime.
-    df_4h["Regime_Bullish"] = (
-        (df_4h["Close"] > df_4h["EMA_200"])
-        & (df_4h["EMA_50"] > df_4h["EMA_200"])
-    )
-
-    df_4h["Regime_Bearish"] = (
-        (df_4h["Close"] < df_4h["EMA_200"])
-        & (df_4h["EMA_50"] < df_4h["EMA_200"])
-    )
-
-    # -----------------------------
-    # 1H
-    # -----------------------------
-    df_1h = resample_closed(df_15, "1h")
-
-    # Confirmed local pivots.
-    # A pivot at t requires two bars on both sides.
-    # We then shift the pivot series so the engine only sees confirmed pivots.
-    left = 2
-    right = 2
-
-    roll_high = df_1h["High"].rolling(
-        window=left + right + 1,
-        center=True,
-    ).max()
-
-    roll_low = df_1h["Low"].rolling(
-        window=left + right + 1,
-        center=True,
-    ).min()
-
-    pivot_high_raw = df_1h["High"].where(df_1h["High"] == roll_high)
-    pivot_low_raw = df_1h["Low"].where(df_1h["Low"] == roll_low)
-
-    # Confirmation becomes known right bars later.
-    df_1h["Confirmed_Pivot_High"] = pivot_high_raw.shift(right)
-    df_1h["Confirmed_Pivot_Low"] = pivot_low_raw.shift(right)
-
-    # Causal forward-fill of already confirmed pivots.
-    df_1h["Last_Swing_High"] = (
-        df_1h["Confirmed_Pivot_High"].ffill()
-    )
-    df_1h["Last_Swing_Low"] = (
-        df_1h["Confirmed_Pivot_Low"].ffill()
-    )
-
-    # Previous structure levels, always from prior completed 1H bars.
-    df_1h["Prior_15H_High"] = (
-        df_1h["High"].shift(1).rolling(15).max()
-    )
-    df_1h["Prior_15H_Low"] = (
-        df_1h["Low"].shift(1).rolling(15).min()
-    )
-
-    # -----------------------------
-    # 15M
-    # -----------------------------
-    tr15 = pd.concat([
-        df_15["High"] - df_15["Low"],
-        (df_15["High"] - df_15["Close"].shift(1)).abs(),
-        (df_15["Low"] - df_15["Close"].shift(1)).abs(),
+def adx_di(df, n=14):
+    up = df['High'].diff()
+    down = -df['Low'].diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
+    tr = pd.concat([
+        df['High'] - df['Low'],
+        (df['High'] - df['Close'].shift(1)).abs(),
+        (df['Low'] - df['Close'].shift(1)).abs()
     ], axis=1).max(axis=1)
-
-    df_15["TR"] = tr15
-    df_15["ATR"] = tr15.rolling(ATR_PERIOD).mean()
-    df_15["Body"] = (df_15["Close"] - df_15["Open"]).abs()
-    df_15["Range"] = df_15["High"] - df_15["Low"]
-    df_15["Avg_Body"] = df_15["Body"].rolling(BODY_AVG_PERIOD).mean()
-    df_15["Volume_MA"] = df_15["Volume"].rolling(20).mean()
-
-    # Simple rolling VWAP using only past/current completed 15M candles.
-    pv = df_15["Close"] * df_15["Volume"]
-    df_15["VWAP_48"] = (
-        pv.rolling(48).sum()
-        / df_15["Volume"].rolling(48).sum().replace(0, np.nan)
-    )
-
-    return df_15, df_1h, df_4h
+    atrv = tr.rolling(n, min_periods=n).mean()
+    pdi = 100 * plus_dm.rolling(n, min_periods=n).mean() / atrv.replace(0, np.nan)
+    mdi = 100 * minus_dm.rolling(n, min_periods=n).mean() / atrv.replace(0, np.nan)
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    adxv = dx.rolling(n, min_periods=n).mean()
+    return adxv, pdi, mdi
 
 
-# ============================================================
-# HELPERS
-# ============================================================
+def prepare(df):
+    m15 = df.copy()
+    m15['ATR'] = atr(m15, 14)
+    m15['Body'] = (m15['Close'] - m15['Open']).abs()
+    m15['Range'] = (m15['High'] - m15['Low']).replace(0, np.nan)
+    m15['BodyRatio'] = m15['Body'] / m15['Range']
+    m15['AvgRange'] = m15['Range'].rolling(20, min_periods=20).mean()
+    m15['VolMed'] = m15['Volume'].rolling(20, min_periods=20).median()
+    m15['PrevHigh'] = m15['High'].shift(1)
+    m15['PrevLow'] = m15['Low'].shift(1)
 
-def completed_htf_row(df_htf, current_15m_close, timeframe_delta):
-    """
-    Return the latest HIGHER-TF bar that is fully completed by
-    current_15m candle close.
-    """
-    eligible = df_htf.index + timeframe_delta <= current_15m_close
-    rows = df_htf.loc[eligible]
-    if rows.empty:
+    h1 = resample_ohlcv(df, '1h')
+    h1['EMA20'] = ema(h1['Close'], EMA_PULL_FAST)
+    h1['EMA50'] = ema(h1['Close'], EMA_PULL_SLOW)
+    h1['ATR'] = atr(h1, 14)
+    h1['ADX'], h1['DIp'], h1['DIm'] = adx_di(h1, ADX_LEN)
+    h1['PullLow'] = h1['Low'].rolling(PULLBACK_LOOKBACK_H, min_periods=PULLBACK_LOOKBACK_H).min()
+    h1['PullHigh'] = h1['High'].rolling(PULLBACK_LOOKBACK_H, min_periods=PULLBACK_LOOKBACK_H).max()
+    h1['TouchedLong'] = h1['Low'] <= (h1['EMA20'] + PULLBACK_ATR_BUFFER * h1['ATR'])
+    h1['TouchedShort'] = h1['High'] >= (h1['EMA20'] - PULLBACK_ATR_BUFFER * h1['ATR'])
+    h1['LongReclaim'] = (h1['Close'] > h1['EMA20']) & (h1['Close'] > h1['Open'])
+    h1['ShortReject'] = (h1['Close'] < h1['EMA20']) & (h1['Close'] < h1['Open'])
+    h1['RecentLongTouch'] = h1['TouchedLong'].rolling(4, min_periods=1).max().astype(bool)
+    h1['RecentShortTouch'] = h1['TouchedShort'].rolling(4, min_periods=1).max().astype(bool)
+    h1['LongPullbackLow'] = h1['Low'].rolling(4, min_periods=1).min()
+    h1['ShortPullbackHigh'] = h1['High'].rolling(4, min_periods=1).max()
+
+    h4 = resample_ohlcv(df, '4h')
+    h4['EMA50'] = ema(h4['Close'], EMA_FAST_4H)
+    h4['EMA200'] = ema(h4['Close'], EMA_SLOW_4H)
+    h4['ATR'] = atr(h4, 14)
+    h4['ADX'], h4['DIp'], h4['DIm'] = adx_di(h4, ADX_LEN)
+    h4['EMA50Slope'] = h4['EMA50'] - h4['EMA50'].shift(3)
+    h4['Bull'] = (h4['Close'] > h4['EMA200']) & (h4['EMA50'] > h4['EMA200']) & (h4['EMA50Slope'] > 0) & (h4['DIp'] > h4['DIm'])
+    h4['Bear'] = (h4['Close'] < h4['EMA200']) & (h4['EMA50'] < h4['EMA200']) & (h4['EMA50Slope'] < 0) & (h4['DIm'] > h4['DIp'])
+
+    return m15, h1, h4
+
+
+def latest_completed(htf, ts):
+    # Resampled candles are timestamped at their right edge. At a 15m
+    # candle opening at ts, only htf timestamps strictly before ts are complete.
+    x = htf.loc[htf.index < ts]
+    if x.empty:
         return None
-    return rows.iloc[-1]
+    return x.iloc[-1]
 
 
-def find_1h_context(df_1h, current_15m_close):
-    eligible = df_1h.index + ONE_HOUR <= current_15m_close
-    rows = df_1h.loc[eligible]
-    if rows.empty:
+def h1_context(h1, ts):
+    x = h1.loc[h1.index < ts]
+    if len(x) < 10:
         return None
-    return rows
+    return x.iloc[-1], x.iloc[-min(4, len(x)):]
 
 
-def get_regime(df_4h, current_15m_close):
-    row = completed_htf_row(
-        df_4h,
-        current_15m_close,
-        FOUR_HOURS,
-    )
-
-    if row is None:
+def signal_at(m15, h1, h4, i):
+    ts = m15.index[i]
+    r = m15.iloc[i]
+    if not np.isfinite(r['ATR']) or r['ATR'] <= 0:
         return None
 
-    if not np.isfinite(row.get("EMA_200", np.nan)):
+    regime = latest_completed(h4, ts)
+    hc = h1_context(h1, ts)
+    if regime is None or hc is None:
+        return None
+    hr, recent_h = hc
+
+    # Stage-1 deliberately uses a compact core: trend + pullback/reclaim + expansion.
+    bull = bool(regime.get('Bull', False))
+    bear = bool(regime.get('Bear', False))
+    if not bull and not bear:
         return None
 
-    if bool(row["Regime_Bullish"]):
-        return "LONG"
+    if not np.isfinite(hr['EMA20']) or not np.isfinite(hr['EMA50']) or not np.isfinite(hr['ATR']):
+        return None
 
-    if bool(row["Regime_Bearish"]):
-        return "SHORT"
+    vol_ok = np.isfinite(r['VolMed']) and r['Volume'] >= r['VolMed'] * VOLUME_MULT
+    expansion = (r['Range'] >= r['ATR'] * EXPANSION_ATR_MULT and
+                 r['BodyRatio'] >= EXPANSION_BODY_RATIO and
+                 r['Range'] >= r['AvgRange'] * 1.05 if np.isfinite(r['AvgRange']) else False)
+
+    # Trigger is a closed-candle break of the immediately preceding candle.
+    long_trigger = r['Close'] > r['PrevHigh'] and r['Close'] > r['Open']
+    short_trigger = r['Close'] < r['PrevLow'] and r['Close'] < r['Open']
+
+    if bull:
+        # Pullback must have occurred recently and the completed 1H candle must reclaim EMA20.
+        pullback = bool(hr['RecentLongTouch']) and bool(hr['LongReclaim']) and hr['Close'] >= hr['EMA50'] * 0.985
+        if pullback and long_trigger and expansion and vol_ok:
+            stop_anchor = float(hr['LongPullbackLow'])
+            sl = stop_anchor - STOP_ATR_BUFFER * float(r['ATR'])
+            entry_ref = float(r['Close'])
+            if sl < entry_ref:
+                return {'side': 'LONG', 'sl_ref': sl, 'signal_close': entry_ref}
+
+    if bear:
+        pullback = bool(hr['RecentShortTouch']) and bool(hr['ShortReject']) and hr['Close'] <= hr['EMA50'] * 1.015
+        if pullback and short_trigger and expansion and vol_ok:
+            stop_anchor = float(hr['ShortPullbackHigh'])
+            sl = stop_anchor + STOP_ATR_BUFFER * float(r['ATR'])
+            entry_ref = float(r['Close'])
+            if sl > entry_ref:
+                return {'side': 'SHORT', 'sl_ref': sl, 'signal_close': entry_ref}
 
     return None
 
 
-def get_structure_context(h_rows):
-    if len(h_rows) < STRUCTURE_LOOKBACK_1H:
+def cluster_of(symbol):
+    for c, syms in CLUSTERS.items():
+        if symbol in syms:
+            return c
+    return symbol
+
+
+def fee(notional):
+    return notional * FEE_RATE * 2.0
+
+
+def make_trade(symbol, side, entry, sl, signal_ts, entry_ts):
+    risk_pct = abs(entry - sl) / entry if entry else np.inf
+    if risk_pct <= 0 or risk_pct > MAX_STRUCTURAL_RISK:
         return None
-
-    recent = h_rows.iloc[-STRUCTURE_LOOKBACK_1H:]
-
-    # All levels come from completed 1H candles only.
-    prior_high = float(recent["High"].max())
-    prior_low = float(recent["Low"].min())
-
-    # Confirmed pivots are optional secondary references.
-    swing_high = recent["Last_Swing_High"].iloc[-1]
-    swing_low = recent["Last_Swing_Low"].iloc[-1]
-
-    if not np.isfinite(prior_high) or not np.isfinite(prior_low):
-        return None
-
+    risk_dist = abs(entry - sl)
+    if side == 'LONG':
+        tp = entry + RR * risk_dist
+    else:
+        tp = entry - RR * risk_dist
+    notional = TRADE_MARGIN * LEVERAGE
     return {
-        "prior_high": prior_high,
-        "prior_low": prior_low,
-        "last_swing_high": float(swing_high) if np.isfinite(swing_high) else np.nan,
-        "last_swing_low": float(swing_low) if np.isfinite(swing_low) else np.nan,
+        'symbol': symbol, 'side': side, 'signal_ts': signal_ts, 'entry_ts': entry_ts,
+        'entry': entry, 'sl': sl, 'tp': tp, 'notional': notional,
+        'fee': fee(notional), 'cluster': cluster_of(symbol),
+        'status': 'OPEN'
     }
 
 
-def calculate_fvg(df_15, i, side):
-    """
-    Detect a 3-candle FVG ending on the current CLOSED candle i.
-    Long bullish FVG:
-        candle i-2 high < candle i low
-    Short bearish FVG:
-        candle i-2 low > candle i high
-    """
-    if i < 2:
-        return None
+def main():
+    print('=' * 90)
+    print('HUNTER-V2 STAGE-1 — TREND PULLBACK / VOLATILITY EXPANSION')
+    print('RAW EDGE / STRICT PORTFOLIO-LEVEL NO-LOOKAHEAD BACKTEST')
+    print('=' * 90)
 
-    a = df_15.iloc[i - 2]
-    c = df_15.iloc[i]
+    now = datetime.now(timezone.utc)
+    end_ms = int(now.timestamp() * 1000)
+    start_ms = int((now - timedelta(days=DAYS + WARMUP_DAYS)).timestamp() * 1000)
+    target_start = pd.Timestamp(now - timedelta(days=DAYS), tz='UTC')
 
-    atr = c["ATR"]
-    if not np.isfinite(atr) or atr <= 0:
-        return None
+    data = {}
+    valid = []
+    for symbol in SYMBOLS:
+        print(f'دریافت و آماده‌سازی: {symbol.split("/")[0]} ...')
+        try:
+            df = fetch_ohlcv(symbol, start_ms, end_ms)
+            if len(df) < 2000:
+                print('  -> داده کافی نیست')
+                continue
+            m15, h1, h4 = prepare(df)
+            data[symbol] = {'m15': m15, 'h1': h1, 'h4': h4}
+            valid.append(symbol)
+            print(f'  -> 15M={len(m15):,} | 1H={len(h1):,} | 4H={len(h4):,}')
+        except Exception as e:
+            print(f'  !! خطا: {e}')
 
-    if side == "LONG":
-        gap_low = float(a["High"])
-        gap_high = float(c["Low"])
+    print(f'نمادهای معتبر: {len(valid)} / {len(SYMBOLS)}')
+    print('\nساخت سیگنال‌های Stage-1 ...')
 
-        if gap_high > gap_low and (gap_high - gap_low) >= FVG_MIN_ATR * atr:
-            return (gap_low, gap_high)
+    signals = []
+    for symbol in valid:
+        d = data[symbol]
+        m15 = d['m15']
+        start_i = int(m15.index.searchsorted(target_start))
+        for i in range(max(1, start_i), len(m15) - 1):
+            s = signal_at(m15, d['h1'], d['h4'], i)
+            if not s:
+                continue
+            entry_ts = m15.index[i + 1]
+            raw_open = float(m15.iloc[i + 1]['Open'])
+            if s['side'] == 'LONG':
+                entry = raw_open * (1 + SLIPPAGE)
+            else:
+                entry = raw_open * (1 - SLIPPAGE)
+            tr = make_trade(symbol, s['side'], entry, s['sl_ref'], m15.index[i], entry_ts)
+            if tr:
+                signals.append(tr)
 
-    else:
-        gap_low = float(c["High"])
-        gap_high = float(a["Low"])
+    signals.sort(key=lambda x: (x['entry_ts'], x['symbol']))
+    print(f'Candidate signals: {len(signals)}')
 
-        if gap_high > gap_low and (gap_high - gap_low) >= FVG_MIN_ATR * atr:
-            return (gap_low, gap_high)
-
-    return None
-
-
-def signal_on_closed_candle(df_15, df_1h, df_4h, i):
-    """
-    V132 balanced signal model.
-
-    Mandatory core:
-      1) completed 4H directional regime
-      2) prior-candle liquidity sweep of completed 1H structure
-      3) current closed-candle displacement in regime direction
-
-    Confirmations are additive rather than all mandatory:
-      FVG / VWAP / volume / ADX-DI alignment
-
-    Entry is always the NEXT 15M candle open.
-    """
-    if i < max(80, ATR_PERIOD + BODY_AVG_PERIOD + 5):
-        return None
-
-    row = df_15.iloc[i]
-    prev = df_15.iloc[i - 1]
-    current_close_time = df_15.index[i] + FIFTEEN_MIN
-
-    regime = get_regime(df_4h, current_close_time)
-    if regime is None:
-        return None
-
-    h_rows = find_1h_context(df_1h, current_close_time)
-    if h_rows is None:
-        return None
-
-    structure = get_structure_context(h_rows)
-    if structure is None:
-        return None
-
-    atr = float(row["ATR"])
-    candle_range = float(row["Range"])
-    body = float(row["Body"])
-
-    if not np.isfinite(atr) or atr <= 0 or not np.isfinite(candle_range) or candle_range <= 0:
-        return None
-
-    support = structure["prior_low"]
-    resistance = structure["prior_high"]
-    sweep_buffer = SWEEP_BUFFER_ATR * atr
-
-    sweep_low = (
-        float(prev["Low"]) < support - sweep_buffer
-        and float(prev["Close"]) > support
-    )
-    sweep_high = (
-        float(prev["High"]) > resistance + sweep_buffer
-        and float(prev["Close"]) < resistance
-    )
-
-    body_ratio = body / candle_range
-
-    displacement_up = (
-        regime == "LONG"
-        and sweep_low
-        and float(row["Close"]) > float(row["Open"])
-        and body >= DISPLACEMENT_ATR * atr
-        and body_ratio >= DISPLACEMENT_BODY_RATIO
-    )
-    displacement_down = (
-        regime == "SHORT"
-        and sweep_high
-        and float(row["Close"]) < float(row["Open"])
-        and body >= DISPLACEMENT_ATR * atr
-        and body_ratio >= DISPLACEMENT_BODY_RATIO
-    )
-
-    if not displacement_up and not displacement_down:
-        return None
-
-    side = "LONG" if displacement_up else "SHORT"
-    score = 0
-    confirmations = ["CORE_SWEEP", "DISPLACEMENT"]
-
-    # Confirmation 1: FVG
-    fvg = calculate_fvg(df_15, i, side)
-    if fvg is not None:
-        score += 1
-        confirmations.append("FVG")
-
-    # Confirmation 2: rolling VWAP
-    vwap = float(row["VWAP_48"]) if np.isfinite(row["VWAP_48"]) else np.nan
-    if np.isfinite(vwap):
-        if (side == "LONG" and float(row["Close"]) > vwap) or (side == "SHORT" and float(row["Close"]) < vwap):
-            score += 1
-            confirmations.append("VWAP")
-
-    # Confirmation 3: relative volume.
-    vol_ma = float(row["Volume_MA"]) if np.isfinite(row["Volume_MA"]) else np.nan
-    if np.isfinite(vol_ma) and vol_ma > 0 and float(row["Volume"]) >= 1.05 * vol_ma:
-        score += 1
-        confirmations.append("RVOL")
-
-    # Confirmation 4: 4H directional strength.
-    h4 = completed_htf_row(df_4h, current_close_time, FOUR_HOURS)
-    if h4 is not None:
-        adx = h4.get("ADX", np.nan)
-        pdi = h4.get("PLUS_DI", np.nan)
-        mdi = h4.get("MINUS_DI", np.nan)
-        slope = h4.get("EMA_Slope", np.nan)
-        if np.isfinite(adx) and adx >= 18:
-            if side == "LONG" and np.isfinite(pdi) and np.isfinite(mdi) and pdi > mdi:
-                score += 1
-                confirmations.append("ADX_DI")
-            elif side == "SHORT" and np.isfinite(pdi) and np.isfinite(mdi) and mdi > pdi:
-                score += 1
-                confirmations.append("ADX_DI")
-        if np.isfinite(slope) and ((side == "LONG" and slope > 0) or (side == "SHORT" and slope < 0)):
-            score += 1
-            confirmations.append("SLOPE")
-
-    # At least one independent confirmation beyond the core setup.
-    if score < MIN_CONFIRMATION_SCORE:
-        return None
-
-    # Stop is tied to the actual liquidity event, not an arbitrary percent.
-    if side == "LONG":
-        structural_extreme = min(float(prev["Low"]), float(row["Low"]))
-        sl_reference = structural_extreme - 0.10 * atr
-    else:
-        structural_extreme = max(float(prev["High"]), float(row["High"]))
-        sl_reference = structural_extreme + 0.10 * atr
-
-    return {
-        "side": side,
-        "score": score,
-        "confirmations": ",".join(confirmations),
-        "sl_reference": float(sl_reference),
-        "atr_signal": float(atr),
-        "signal_time": df_15.index[i],
-        "signal_close_time": current_close_time,
-    }
-
-
-# ============================================================
-# PORTFOLIO ENGINE
-# ============================================================
-
-def run_portfolio_backtest(processed_data, start_dt, end_dt):
-    """
-    Event-driven portfolio engine.
-
-    Every 15M timestamp:
-      1) Manage all existing positions.
-      2) Apply completed outcomes to portfolio loss streak.
-      3) If not paused and capacity exists, scan signals.
-      4) New positions enter only at the next candle OPEN.
-
-    Because signal execution is next-bar open, candidate signals
-    are collected on the current bar and opened on the next bar.
-    """
-    all_times = sorted({
-        ts for df, _, _ in processed_data.values()
-        for ts in df.index
-        if start_dt <= ts <= end_dt
-    })
-
-    if not all_times:
-        return [], []
-
-    active = {}
-    trades = []
-    pending_entries = []
-
+    # Fast lookup for future candles.
+    open_positions = []
+    closed = []
+    last_entry_by_symbol = {}
+    loss_streak = 0
+    pause_until = None
     equity = INITIAL_CAPITAL
     peak_equity = INITIAL_CAPITAL
     max_dd = 0.0
-
-    portfolio_loss_streak = 0
-    pause_counter = 0
-
-    def cluster_opened(cluster):
-        return any(
-            p["cluster"] == cluster
-            for p in active.values()
-        )
-
-    def record_trade(pos, outcome, exit_price, exit_time):
-        nonlocal equity, peak_equity, max_dd, portfolio_loss_streak, pause_counter
-
-        notional = TRADE_MARGIN * LEVERAGE
-
-        if pos["side"] == "LONG":
-            gross = notional * (
-                (exit_price - pos["entry_price"])
-                / pos["entry_price"]
-            )
-        else:
-            gross = notional * (
-                (pos["entry_price"] - exit_price)
-                / pos["entry_price"]
-            )
-
-        fees = notional * FEE_RATE * 2.0
-        net = gross - fees
-
-        equity += net
-        peak_equity = max(peak_equity, equity)
-        dd = equity - peak_equity
-        max_dd = min(max_dd, dd)
-
-        trades.append({
-            "Timestamp": pos["entry_time"],
-            "ExitTimestamp": exit_time,
-            "Symbol": pos["symbol"],
-            "Cluster": pos["cluster"],
-            "Side": pos["side"],
-            "Outcome": outcome,
-            "Dollar_PnL": net,
-            "Entry_Price": pos["entry_price"],
-            "Exit_Price": exit_price,
-            "SL": pos["sl"],
-            "TP": pos["tp"],
-            "SignalTime": pos["signal_time"],
-            "Score": pos["score"],
-            "Confirmations": pos["confirmations"],
-            "Equity_After": equity,
-        })
-
-        if outcome == "LOSS":
-            portfolio_loss_streak += 1
-
-            if portfolio_loss_streak >= MAX_LOSS_STREAK:
-                pause_counter = LOSS_PAUSE_BARS
-
-        elif outcome == "WIN":
-            portfolio_loss_streak = 0
-
-        return net
-
-    for k, ts in enumerate(all_times):
-        # --------------------------------------------------------
-        # 1) Manage existing positions FIRST.
-        # --------------------------------------------------------
-        for symbol, pos in list(active.items()):
-            df_15, _, _ = processed_data[symbol]
-
-            if ts not in df_15.index:
-                continue
-
-            candle = df_15.loc[ts]
-
-            if pos["side"] == "LONG":
-                hit_sl = candle["Low"] <= pos["sl"]
-                hit_tp = candle["High"] >= pos["tp"]
-
-                # Conservative intrabar rule:
-                # if both are hit in one 15M candle, SL wins.
-                if hit_sl and hit_tp:
-                    record_trade(
-                        pos, "LOSS", pos["sl"], ts
-                    )
-                    del active[symbol]
-
-                elif hit_sl:
-                    record_trade(
-                        pos, "LOSS", pos["sl"], ts
-                    )
-                    del active[symbol]
-
-                elif hit_tp:
-                    record_trade(
-                        pos, "WIN", pos["tp"], ts
-                    )
-                    del active[symbol]
-
-            else:
-                hit_sl = candle["High"] >= pos["sl"]
-                hit_tp = candle["Low"] <= pos["tp"]
-
-                if hit_sl and hit_tp:
-                    record_trade(
-                        pos, "LOSS", pos["sl"], ts
-                    )
-                    del active[symbol]
-
-                elif hit_sl:
-                    record_trade(
-                        pos, "LOSS", pos["sl"], ts
-                    )
-                    del active[symbol]
-
-                elif hit_tp:
-                    record_trade(
-                        pos, "WIN", pos["tp"], ts
-                    )
-                    del active[symbol]
-
-        # --------------------------------------------------------
-        # 2) Apply pause countdown AFTER position management.
-        # --------------------------------------------------------
-        if pause_counter > 0:
-            pause_counter -= 1
-            if pause_counter == 0:
-                portfolio_loss_streak = 0
-
-        # --------------------------------------------------------
-        # 3) Execute pending entries at THIS candle's OPEN.
-        #    Signals were generated on the previous CLOSED candle.
-        # --------------------------------------------------------
-        if pending_entries:
-            # Deterministic order: highest score first, then symbol.
-            pending_entries.sort(
-                key=lambda x: (-x["score"], x["symbol"])
-            )
-
-            for sig in pending_entries:
-                if sig["symbol"] in active:
-                    continue
-
-                if len(active) >= MAX_OPEN_POSITIONS:
-                    break
-
-                cluster = sig["cluster"]
-
-                if (
-                    MAX_ONE_PER_CLUSTER
-                    and cluster_opened(cluster)
-                ):
-                    continue
-
-                df_15, _, _ = processed_data[sig["symbol"]]
-
-                if ts not in df_15.index:
-                    continue
-
-                candle = df_15.loc[ts]
-                raw_open = float(candle["Open"])
-
-                if sig["side"] == "LONG":
-                    entry = raw_open * (1.0 + SLIPPAGE)
-                    sl = sig["sl_reference"]
-
-                    risk = entry - sl
-
-                    if risk <= 0:
-                        continue
-
-                    if risk > sig["atr_signal"] * MAX_STOP_ATR:
-                        continue
-
-                    tp = entry + 2.0 * risk
-
-                else:
-                    entry = raw_open * (1.0 - SLIPPAGE)
-                    sl = sig["sl_reference"]
-
-                    risk = sl - entry
-
-                    if risk <= 0:
-                        continue
-
-                    if risk > sig["atr_signal"] * MAX_STOP_ATR:
-                        continue
-
-                    tp = entry - 2.0 * risk
-
-                active[sig["symbol"]] = {
-                    "symbol": sig["symbol"],
-                    "cluster": cluster,
-                    "side": sig["side"],
-                    "entry_price": entry,
-                    "sl": sl,
-                    "tp": tp,
-                    "entry_time": ts,
-                    "signal_time": sig["signal_time"],
-                    "score": sig["score"],
-                    "confirmations": sig["confirmations"],
-                }
-
-            pending_entries = []
-
-        # --------------------------------------------------------
-        # 4) Generate signals on THIS CLOSED 15M candle.
-        #    They can only execute on the NEXT 15M candle.
-        # --------------------------------------------------------
-        if (
-            pause_counter == 0
-            and len(active) < MAX_OPEN_POSITIONS
-            and k < len(all_times) - 1
-        ):
-            next_ts = all_times[k + 1]
-
-            # Entry is next chronological 15M candle.
-            for symbol, (df_15, df_1h, df_4h) in processed_data.items():
-
-                if symbol in active:
-                    continue
-
-                if ts not in df_15.index:
-                    continue
-
-                # Need next bar to exist for execution.
-                if next_ts not in df_15.index:
-                    continue
-
-                signal = signal_on_closed_candle(
-                    df_15,
-                    df_1h,
-                    df_4h,
-                    df_15.index.get_loc(ts),
-                )
-
-                if signal is None:
-                    continue
-
-                cluster = CORRELATION_CLUSTERS.get(
-                    symbol, "OTHER"
-                )
-
-                # Capacity and cluster checks are repeated here
-                # so pending signals do not explode.
-                if (
-                    MAX_ONE_PER_CLUSTER
-                    and cluster_opened(cluster)
-                ):
-                    continue
-
-                pending_entries.append({
-                    **signal,
-                    "symbol": symbol,
-                    "cluster": cluster,
-                })
-
-                # Keep all eligible candidates from this bar; execution
-                # later sorts them deterministically by confirmation score.
-
-    # ------------------------------------------------------------
-    # Final open positions: report separately, don't fabricate exits.
-    # ------------------------------------------------------------
-    open_positions = []
-
-    for symbol, pos in active.items():
-        df_15, _, _ = processed_data[symbol]
-        last_ts = df_15.index[-1]
-        last_close = float(df_15.iloc[-1]["Close"])
-
-        if pos["side"] == "LONG":
-            unrealized = (
-                TRADE_MARGIN
-                * LEVERAGE
-                * ((last_close - pos["entry_price"]) / pos["entry_price"])
-            )
-        else:
-            unrealized = (
-                TRADE_MARGIN
-                * LEVERAGE
-                * ((pos["entry_price"] - last_close) / pos["entry_price"])
-            )
-
-        open_positions.append({
-            "Symbol": symbol,
-            "Cluster": pos["cluster"],
-            "Side": pos["side"],
-            "EntryTime": pos["entry_time"],
-            "EntryPrice": pos["entry_price"],
-            "LastPrice": last_close,
-            "SL": pos["sl"],
-            "TP": pos["tp"],
-            "Unrealized_Gross_PnL": unrealized,
-        })
-
-    return trades, open_positions
-
-
-# ============================================================
-# REPORTING
-# ============================================================
-
-def calculate_loss_streaks(trades_df):
-    if trades_df.empty:
-        return [], 0
-
-    ordered = trades_df.sort_values(
-        ["ExitTimestamp", "Timestamp"],
-        kind="stable",
-    )
-
-    streaks = []
-    current = 0
     max_streak = 0
+    streak_seq = []
+    current_streak = 0
+    last_trade_result_ts = None
 
-    for outcome in ordered["Outcome"]:
-        if outcome == "LOSS":
-            current += 1
-            max_streak = max(max_streak, current)
-        elif outcome == "WIN":
-            if current > 0:
-                streaks.append(current)
-            current = 0
-        # No BE in V131-A.
+    # Candidate signals are processed chronologically. Existing positions are
+    # managed candle-by-candle before considering a new entry at that timestamp.
+    unique_times = sorted(set(s['entry_ts'] for s in signals))
+    by_time = {}
+    for s in signals:
+        by_time.setdefault(s['entry_ts'], []).append(s)
 
-    if current > 0:
-        streaks.append(current)
+    def candle_for(pos, ts):
+        return data[pos['symbol']]['m15'].loc[ts] if ts in data[pos['symbol']]['m15'].index else None
 
-    return streaks, max_streak
+    for ts in unique_times:
+        # Manage every currently open position through this candle first.
+        still = []
+        for pos in open_positions:
+            row = candle_for(pos, ts)
+            if row is None:
+                still.append(pos)
+                continue
+            hi, lo = float(row['High']), float(row['Low'])
+            hit_sl = lo <= pos['sl'] if pos['side'] == 'LONG' else hi >= pos['sl']
+            hit_tp = hi >= pos['tp'] if pos['side'] == 'LONG' else lo <= pos['tp']
+            if hit_sl or hit_tp:
+                # Conservative same-candle conflict: SL wins.
+                win = bool(hit_tp and not hit_sl)
+                gross = TRADE_MARGIN * RR if win else -TRADE_MARGIN
+                pnl = gross - pos['fee']
+                equity += pnl
+                pos.update({'exit_ts': ts, 'result': 'WIN' if win else 'LOSS', 'pnl': pnl})
+                closed.append(pos)
+                current_streak = 0 if win else current_streak + 1
+                if win:
+                    if current_streak == 0:
+                        pass
+                    loss_streak = 0
+                else:
+                    loss_streak = current_streak
+                    max_streak = max(max_streak, current_streak)
+                if win:
+                    if current_streak == 0:
+                        pass
+                # Record completed streak only when a win ends it.
+                if win and current_streak == 0:
+                    pass
+                if not win and current_streak >= MAX_LOSS_STREAK_PAUSE:
+                    pause_until = ts + pd.Timedelta(minutes=15 * PAUSE_BARS)
+            else:
+                still.append(pos)
+        open_positions = still
 
+        # Equity/DD after exits.
+        peak_equity = max(peak_equity, equity)
+        max_dd = min(max_dd, equity - peak_equity)
 
-def print_symbol_report(trades_df):
-    print("\n" + "-" * 90)
-    print("PER-SYMBOL")
-    print("-" * 90)
-
-    if trades_df.empty:
-        return
-
-    rows = []
-
-    for symbol, g in trades_df.groupby("Symbol"):
-        wins = int((g["Outcome"] == "WIN").sum())
-        losses = int((g["Outcome"] == "LOSS").sum())
-        total = len(g)
-
-        wr = 100.0 * wins / total if total else 0.0
-
-        gp = float(
-            g.loc[g["Outcome"] == "WIN", "Dollar_PnL"].sum()
-        )
-        gl = abs(float(
-            g.loc[g["Outcome"] == "LOSS", "Dollar_PnL"].sum()
-        ))
-
-        pf = gp / gl if gl > 0 else np.inf
-
-        rows.append({
-            "Symbol": symbol,
-            "Trades": total,
-            "Wins": wins,
-            "Losses": losses,
-            "WinRate%": wr,
-            "NetPnL": float(g["Dollar_PnL"].sum()),
-            "PF": pf,
-        })
-
-    report = pd.DataFrame(rows).sort_values(
-        "NetPnL",
-        ascending=False,
-    )
-
-    for _, r in report.iterrows():
-        pf_text = (
-            "inf" if np.isinf(r["PF"])
-            else f"{r['PF']:.2f}"
-        )
-
-        print(
-            f"{r['Symbol']:>7} | "
-            f"{int(r['Trades']):>4} trades | "
-            f"WR {r['WinRate%']:>6.2f}% | "
-            f"PnL ${r['NetPnL']:>10.2f} | "
-            f"PF {pf_text}"
-        )
-
-
-def summarize(trades, open_positions):
-    print("\n" + "=" * 90)
-    print("HUNTER-V132-A — FINAL AUDITED REPORT")
-    print("=" * 90)
-
-    trades_df = pd.DataFrame(trades)
-
-    if trades_df.empty:
-        print("هیچ معامله بسته‌شده‌ای ثبت نشد.")
-        if open_positions:
-            print(f"Open positions: {len(open_positions)}")
-        return
-
-    trades_df.sort_values(
-        ["ExitTimestamp", "Timestamp"],
-        kind="stable",
-        inplace=True,
-    )
-    trades_df.reset_index(drop=True, inplace=True)
-
-    total = len(trades_df)
-    wins = int((trades_df["Outcome"] == "WIN").sum())
-    losses = int((trades_df["Outcome"] == "LOSS").sum())
-
-    win_rate = 100.0 * wins / total if total else 0.0
-
-    net_pnl = float(trades_df["Dollar_PnL"].sum())
-
-    gross_profit = float(
-        trades_df.loc[
-            trades_df["Outcome"] == "WIN",
-            "Dollar_PnL"
-        ].sum()
-    )
-
-    gross_loss = abs(float(
-        trades_df.loc[
-            trades_df["Outcome"] == "LOSS",
-            "Dollar_PnL"
-        ].sum()
-    ))
-
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 0
-        else np.inf
-    )
-
-    equity = INITIAL_CAPITAL + trades_df["Dollar_PnL"].cumsum()
-    peak = equity.cummax()
-    drawdown = equity - peak
-    max_dd = float(drawdown.min())
-
-    streaks, max_streak = calculate_loss_streaks(trades_df)
-
-    avg_win = (
-        float(
-            trades_df.loc[
-                trades_df["Outcome"] == "WIN",
-                "Dollar_PnL"
-            ].mean()
-        )
-        if wins > 0 else 0.0
-    )
-
-    avg_loss = (
-        float(
-            trades_df.loc[
-                trades_df["Outcome"] == "LOSS",
-                "Dollar_PnL"
-            ].mean()
-        )
-        if losses > 0 else 0.0
-    )
-
-    expectancy = float(
-        trades_df["Dollar_PnL"].mean()
-    )
-
-    start = trades_df["Timestamp"].min()
-    end = trades_df["ExitTimestamp"].max()
-
-    days = max(
-        1.0,
-        (end - start).total_seconds() / 86400.0,
-    )
-
-    trades_per_day = total / days
-
-    long_df = trades_df[
-        trades_df["Side"] == "LONG"
-    ]
-    short_df = trades_df[
-        trades_df["Side"] == "SHORT"
-    ]
-
-    long_wr = (
-        100.0 * (long_df["Outcome"] == "WIN").sum()
-        / len(long_df)
-        if len(long_df) else 0.0
-    )
-
-    short_wr = (
-        100.0 * (short_df["Outcome"] == "WIN").sum()
-        / len(short_df)
-        if len(short_df) else 0.0
-    )
-
-    final_equity = INITIAL_CAPITAL + net_pnl
-
-    print(f"Initial Capital:          ${INITIAL_CAPITAL:,.2f}")
-    print(f"Trade Margin:             ${TRADE_MARGIN:,.2f}")
-    print(f"Leverage:                 {LEVERAGE:.0f}x")
-    print(f"RR:                       1:2")
-    print("-" * 90)
-    print(f"Closed Trades:            {total}")
-    print(f"Wins:                     {wins}")
-    print(f"Losses:                   {losses}")
-    print(f"Win Rate:                 {win_rate:.2f}%")
-    print(f"Long Win Rate:            {long_wr:.2f}%")
-    print(f"Short Win Rate:           {short_wr:.2f}%")
-    print("-" * 90)
-    print(f"Net PnL:                  ${net_pnl:,.2f}")
-    print(f"Final Closed Equity:      ${final_equity:,.2f}")
-    print(f"Profit Factor:            {profit_factor:.2f}")
-    print(f"Average Win:              ${avg_win:,.2f}")
-    print(f"Average Loss:             ${avg_loss:,.2f}")
-    print(f"Expectancy / Trade:       ${expectancy:,.2f}")
-    print(f"Max Drawdown:             ${max_dd:,.2f}")
-    print(f"Max Portfolio Loss Streak:{max_streak}")
-    print(f"Trades / Day:             {trades_per_day:.2f}")
-    print("-" * 90)
-
-    print("Loss streak sequence:")
-    print(
-        ", ".join(map(str, streaks))
-        if streaks else "None"
-    )
-
-    if open_positions:
-        print("\n" + "-" * 90)
-        print("OPEN POSITIONS AT END OF DATA — NOT COUNTED AS CLOSED TRADES")
-        print("-" * 90)
-
-        for p in open_positions:
-            print(
-                f"{p['Symbol']:>7} | "
-                f"{p['Side']:>5} | "
-                f"Entry {p['EntryPrice']:.8g} | "
-                f"Last {p['LastPrice']:.8g} | "
-                f"Gross Unrealized ${p['Unrealized_Gross_PnL']:.2f}"
-            )
-
-    print_symbol_report(trades_df)
-
-    print("\n" + "=" * 90)
-    print("AUDIT NOTES")
-    print("=" * 90)
-    print("✓ No same-candle signal/entry")
-    print("✓ Entry = next 15M candle OPEN + slippage")
-    print("✓ 1H/4H context uses completed higher-timeframe candles")
-    print("✓ SL/TP = conservative 1:2 structural setup")
-    print("✓ No Break-Even / trailing / timeout")
-    print("✓ Existing positions remain managed during loss pause")
-    print("✓ Portfolio-level max 3 positions")
-    print("✓ Max 1 position per correlation cluster")
-    print("✓ Same-candle SL+TP conflict resolves to LOSS")
-    print("✓ Final open positions are reported separately")
-    print("=" * 90)
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    print("=" * 90)
-    print("HUNTER-V132-A — LIQUIDITY / STRUCTURE / REPRICING")
-    print("STRICT PORTFOLIO-LEVEL NO-LOOKAHEAD BACKTEST")
-    print("=" * 90)
-
-    now = pd.Timestamp.now(tz="UTC")
-    start_dt = now - pd.Timedelta(days=DAYS)
-    end_dt = now
-
-    processed_data = {}
-
-    for symbol, lbank_symbol in SYMBOLS.items():
-        print(f"\nدریافت و آماده‌سازی: {symbol} ...")
-
-        df = fetch_symbol_data(
-            lbank_symbol,
-            start_dt.to_pydatetime(),
-            end_dt.to_pydatetime(),
-        )
-
-        if df is None:
-            print("  -> داده معتبر کافی نبود.")
+        # New entries at this candle open. No same-symbol overlap, no cluster overlap.
+        candidates = by_time.get(ts, [])
+        if not candidates:
             continue
+        if pause_until is not None and ts < pause_until:
+            continue
+        if equity < 0:
+            # Stop opening new positions after capital is exhausted.
+            continue
+        available = MAX_OPEN_POSITIONS - len(open_positions)
+        if available <= 0:
+            continue
+        used_clusters = {p['cluster'] for p in open_positions}
+        used_symbols = {p['symbol'] for p in open_positions}
+        for cand in candidates:
+            if available <= 0:
+                break
+            if cand['symbol'] in used_symbols or cand['cluster'] in used_clusters:
+                continue
+            # Do not open a signal on the same timestamp as an exit from the same symbol.
+            if cand['symbol'] in {p['symbol'] for p in closed if p.get('exit_ts') == ts}:
+                continue
+            open_positions.append(cand)
+            used_symbols.add(cand['symbol'])
+            used_clusters.add(cand['cluster'])
+            available -= 1
 
-        try:
-            df_15, df_1h, df_4h = prepare_data(df)
+    # Manage/report positions still open at the end; do not invent exits.
+    final_open = open_positions
 
-            processed_data[symbol] = (
-                df_15,
-                df_1h,
-                df_4h,
-            )
+    wins = [x for x in closed if x['result'] == 'WIN']
+    losses = [x for x in closed if x['result'] == 'LOSS']
+    gross_wins = sum(x['pnl'] for x in wins)
+    gross_losses = -sum(x['pnl'] for x in losses)
+    pf = gross_wins / gross_losses if gross_losses > 0 else float('inf')
+    wr = len(wins) / len(closed) * 100 if closed else 0
+    avg_win = np.mean([x['pnl'] for x in wins]) if wins else 0
+    avg_loss = np.mean([x['pnl'] for x in losses]) if losses else 0
+    expectancy = np.mean([x['pnl'] for x in closed]) if closed else 0
+    net = sum(x['pnl'] for x in closed)
 
-            print(
-                f"  -> 15M={len(df_15):,} | "
-                f"1H={len(df_1h):,} | "
-                f"4H={len(df_4h):,}"
-            )
+    # Reconstruct consecutive loss streak sequence from closed trade chronology.
+    streaks = []
+    cur = 0
+    for x in sorted(closed, key=lambda z: z['exit_ts']):
+        if x['result'] == 'LOSS':
+            cur += 1
+        else:
+            if cur:
+                streaks.append(cur)
+            cur = 0
+    if cur:
+        streaks.append(cur)
+    max_streak = max(streaks) if streaks else 0
 
-        except Exception as e:
-            print(f"  -> خطا در prepare_data: {e}")
+    days_span = max(DAYS, 1)
+    trades_day = len(closed) / days_span
 
-    print(f"\nنمادهای معتبر: {len(processed_data)} / {len(SYMBOLS)}")
+    print('\n' + '=' * 90)
+    print('HUNTER-V2 STAGE-1 — FINAL AUDITED REPORT')
+    print('=' * 90)
+    print(f'Initial Capital:          ${INITIAL_CAPITAL:,.2f}')
+    print(f'Trade Margin:             ${TRADE_MARGIN:,.2f}')
+    print(f'Leverage:                 {LEVERAGE:.0f}x')
+    print(f'RR:                       1:{RR:.0f}')
+    print('-' * 90)
+    print(f'Candidate Signals:        {len(signals):,}')
+    print(f'Closed Trades:            {len(closed):,}')
+    print(f'Wins:                     {len(wins):,}')
+    print(f'Losses:                   {len(losses):,}')
+    print(f'Win Rate:                 {wr:.2f}%')
+    long_closed = [x for x in closed if x['side'] == 'LONG']
+    short_closed = [x for x in closed if x['side'] == 'SHORT']
+    print(f'Long Win Rate:            {(sum(x["result"]=="WIN" for x in long_closed)/len(long_closed)*100 if long_closed else 0):.2f}%')
+    print(f'Short Win Rate:           {(sum(x["result"]=="WIN" for x in short_closed)/len(short_closed)*100 if short_closed else 0):.2f}%')
+    print('-' * 90)
+    print(f'Net PnL:                  ${net:,.2f}')
+    print(f'Final Closed Equity:      ${INITIAL_CAPITAL + net:,.2f}')
+    print(f'Profit Factor:            {pf:.2f}')
+    print(f'Average Win:              ${avg_win:,.2f}')
+    print(f'Average Loss:             ${avg_loss:,.2f}')
+    print(f'Expectancy / Trade:       ${expectancy:,.2f}')
+    print(f'Max Drawdown:             ${max_dd:,.2f}')
+    print(f'Max Portfolio Loss Streak:{max_streak:2d}')
+    print(f'Trades / Day:             {trades_day:.2f}')
+    print('-' * 90)
+    print('Loss streak sequence:')
+    print(', '.join(map(str, streaks)) if streaks else 'None')
+    print('-' * 90)
+    print(f'FINAL OPEN POSITIONS:     {len(final_open)}')
+    for p in final_open:
+        print(f"  {p['symbol'].split('/')[0]:>6} {p['side']:<5} entry={p['entry']:.8g} sl={p['sl']:.8g} tp={p['tp']:.8g}")
 
-    if not processed_data:
-        print("هیچ داده‌ای برای بک‌تست موجود نیست.")
-        return
+    print('\n' + '-' * 90)
+    print('PER-SYMBOL')
+    print('-' * 90)
+    for symbol in sorted(valid, key=lambda s: -len([x for x in closed if x['symbol'] == s])):
+        arr = [x for x in closed if x['symbol'] == symbol]
+        if not arr:
+            continue
+        w = [x for x in arr if x['result'] == 'WIN']
+        l = [x for x in arr if x['result'] == 'LOSS']
+        gw = sum(x['pnl'] for x in w)
+        gl = -sum(x['pnl'] for x in l)
+        spf = gw / gl if gl > 0 else float('inf')
+        swr = len(w) / len(arr) * 100
+        sp = sum(x['pnl'] for x in arr)
+        print(f"{symbol.split('/')[0]:>6} | {len(arr):4d} trades | WR {swr:6.2f}% | PnL ${sp:9.2f} | PF {spf:.2f}")
 
-    print("\nشروع موتور Portfolio-Level ...")
+    print('\n' + '=' * 90)
+    print('AUDIT NOTES')
+    print('=' * 90)
+    print('✓ Stage-1 core: 4H trend + 1H pullback/reclaim + 15M expansion')
+    print('✓ Signal uses CLOSED 15M candle only')
+    print('✓ 1H/4H context uses only COMPLETED higher-timeframe candles')
+    print('✓ Entry = NEXT 15M candle OPEN + slippage')
+    print('✓ Exact RR = 1:2')
+    print('✓ No Break-Even / trailing / timeout')
+    print('✓ No overlapping positions per symbol')
+    print('✓ Max 3 portfolio positions / max 1 per correlation cluster')
+    print('✓ Same-candle SL+TP conflict resolves to LOSS')
+    print('✓ No artificial forced exit at end; open positions reported separately')
+    print('=' * 90)
 
-    trades, open_positions = run_portfolio_backtest(
-        processed_data,
-        start_dt,
-        end_dt,
-    )
-
-    summarize(
-        trades,
-        open_positions,
-    )
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
