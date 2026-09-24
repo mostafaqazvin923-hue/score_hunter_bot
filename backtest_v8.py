@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HUNTER-V4B — XT USDT-M Futures / 15m / 365d
+HUNTER-V4B-R1 — XT USDT-M Futures / 15m / 365d
 HTF Liquidity + Market Structure, strict no-lookahead.
 
 Design:
@@ -61,7 +61,7 @@ CLUSTERS = {
 }
 
 DATA_DIR = Path("data/xt_futures_15m")
-OUT_DIR = DATA_DIR / "backtest_v4b"
+OUT_DIR = DATA_DIR / "backtest_v4b_r1_no_regime"
 
 INITIAL_EQUITY = 1000.0
 MARGIN = 100.0
@@ -494,18 +494,12 @@ def generate_candidates(asset, df, diagnostics=None):
             if bool(row.long_event):
                 side = "LONG"
                 d["h1_liquidity_displacement_long"] += 1
-                if not bool(regime.bull):
-                    d["blocked_by_4h_regime"] += 1
-                    continue
                 sweep_extreme = float(row.low)
                 bos_seen = bool(row.bos_up)
                 fvg_seen = bool(row.bull_fvg)
             else:
                 side = "SHORT"
                 d["h1_liquidity_displacement_short"] += 1
-                if not bool(regime.bear):
-                    d["blocked_by_4h_regime"] += 1
-                    continue
                 sweep_extreme = float(row.high)
                 bos_seen = bool(row.bos_down)
                 fvg_seen = bool(row.bear_fvg)
@@ -764,7 +758,7 @@ def run_backtest(data_dir, out_dir):
         }
 
     report = {
-        "strategy": "HUNTER-V4B HTF Liquidity + Market Structure",
+        "strategy": "HUNTER-V4B-R1 H1 Liquidity + Displacement (4H regime diagnostic removed)",
         "raw_candidates": len(all_candidates),
         "simulated_closed_candidates": len(all_closed),
         "accepted_closed_trades": len(trades),
@@ -789,7 +783,7 @@ def run_backtest(data_dir, out_dir):
     )
 
     print("=" * 90)
-    print("HUNTER-V4B — XT USDT-M FUTURES / 15m / 365-DAY BACKTEST")
+    print("HUNTER-V4B-R1 — NO 4H HARD REGIME / XT USDT-M FUTURES / 15m / 365-DAY BACKTEST")
     print("=" * 90)
     print(f"Raw candidates          : {len(all_candidates)}")
     print(f"Simulated closed        : {len(all_closed)}")
@@ -860,13 +854,8 @@ def main():
     data_dir = Path(args.data_dir)
     out_dir = Path(args.out_dir)
 
-    # The backtest must never assume that the GitHub Actions workspace
-    # contains the historical XT CSVs. Each Actions run starts from a fresh
-    # workspace, so ensure_xt_data() is mandatory before load_csv().
-    # --download is retained for backward CLI compatibility, but is no longer
-    # required to trigger the data bootstrap.
+    # Always ensure data exists. --download is retained for backwards compatibility.
     ensure_xt_data(data_dir)
-
     run_backtest(data_dir, out_dir)
 
 
