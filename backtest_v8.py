@@ -18,7 +18,7 @@ import pandas as pd
 # ============================================================
 
 EXCHANGE_ID = "lbank"
-BASE_TIMEFRAME = "1h"  # تایم‌فریم پایه برای استخراج دقیق سه تایم‌فریم
+BASE_TIMEFRAME = "1h"
 LOOKBACK_DAYS = 365
 MAX_POSITIONS = 6
 SLIPPAGE = 0.0003
@@ -100,12 +100,10 @@ def fetch_and_prepare_data(lbank_symbol: str) -> Optional[Dict[str, pd.DataFrame
     df_1h.drop_duplicates(subset=["Date"], keep="last", inplace=True)
     df_1h.set_index("Date", inplace=True)
 
-    # ساخت تایم‌فریم ۴ ساعته از روی ۱ ساعته
     df_4h = df_1h.resample("4h").agg({
         "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
     }).dropna()
 
-    # ساخت تایم‌فریم روزانه از روی ۱ ساعته
     df_1d = df_1h.resample("1d").agg({
         "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
     }).dropna()
@@ -113,7 +111,6 @@ def fetch_and_prepare_data(lbank_symbol: str) -> Optional[Dict[str, pd.DataFrame
     if len(df_4h) < 50 or len(df_1d) < 50:
         return None
 
-    # اندیکاتورها
     df_1d["EMA_200"] = df_1d["Close"].ewm(span=200, adjust=False).mean()
     
     tr1 = df_1h["High"] - df_1h["Low"]
@@ -130,15 +127,14 @@ for symbol, lbank_symbol in SYMBOLS.items():
         multi_tf_data[symbol] = data_pack
 
 print(f"✅ تعداد نمادهای معتبر سه‌تایم‌فریمه تاییدشده: {len(multi_tf_data)}")
-print("⚙️ اجرای موتور بک‌تست پیشرفته چندتایم‌فریمه (تارگت 1:2 ثابت + Break-End نیمه راه)...")
+print("⚙️ اجرای مجدد موتور بک‌تست با اصلاح منطق اسکن ساختار ۴ ساعته...")
 
 
 # ============================================================
-# موتور اجرای بک‌تست (Multi-Timeframe Execution Engine)
+# موتور اجرای بک‌تست اصلاح‌شده
 # ============================================================
 
 def run_multi_tf_backtest(data_dict: Dict[str, Dict[str, pd.DataFrame]]):
-    # مرجع زمانی کندل‌های ۱ ساعته برای گردش سیستم
     all_timestamps = sorted({
         ts for d in data_dict.values() for ts in d["1h"].index
     })
@@ -161,7 +157,6 @@ def run_multi_tf_backtest(data_dict: Dict[str, Dict[str, pd.DataFrame]]):
                 trading_paused = False
                 consecutive_losses = 0
 
-        # اجرای سیگنال‌های کندل ۱ ساعته قبل در Open کندل جاری
         signals_to_execute = pending_signals
         pending_signals = []
 
@@ -190,7 +185,6 @@ def run_multi_tf_backtest(data_dict: Dict[str, Dict[str, pd.DataFrame]]):
                 "is_breakeven": False,
             }
 
-        # مدیریت پوزیشن‌های باز در هر کندل ۱ ساعته
         symbols_to_close = []
         for symbol, pos in list(active_positions.items()):
             df_1h = data_dict[symbol]["1h"]
@@ -199,7 +193,6 @@ def run_multi_tf_backtest(data_dict: Dict[str, Dict[str, pd.DataFrame]]):
             
             c1h = df_1h.loc[ts]
             
-            # مکانیزم Break-Even در ۵۰ درصد مسیر رسیدن به تارگت 1:2
             if not pos["is_breakeven"]:
                 if pos["side"] == "LONG":
                     halfway = pos["entry_price"] + (pos["target_price"] - pos["entry_price"]) * 0.5
@@ -269,7 +262,6 @@ def run_multi_tf_backtest(data_dict: Dict[str, Dict[str, pd.DataFrame]]):
         for sym in symbols_to_close:
             del active_positions[sym]
 
-        # اسکن سیگنال‌های جدید در صورت عدم مکث ربات
         if not trading_paused:
             for symbol, d_pack in data_dict.items():
                 if symbol in active_positions:
@@ -282,13 +274,11 @@ def run_multi_tf_backtest(data_dict: Dict[str, Dict[str, pd.DataFrame]]):
                 if ts not in df_1h.index:
                     continue
 
-                # پیدا کردن تناظر کندل ۴ ساعته و روزانه مربوط به این timestamp
                 d_ts = pd.Timestamp(ts).normalize()
                 if d_ts not in df_1d.index:
                     continue
                 daily_row = df_1d.loc[d_ts]
 
-                # فیلتر ۱: روند کلان روزانه (EMA 200)
                 macro_close = daily_row["Close"]
                 macro_ema = daily_row["EMA_200"]
                 if not np.isfinite(macro_ema):
@@ -296,15 +286,16 @@ def run_multi_tf_backtest(data_dict: Dict[str, Dict[str, pd.DataFrame]]):
 
                 allowed_side = "LONG" if macro_close > macro_ema else "SHORT"
 
-                # فیلتر ۲: ساختار ۴ ساعته (یافتن نزدیک‌ترین کندل ۴ ساعته قبل یا مساوی ts)
-                valid_4h = df_4h[df_4h.index <= ts]
+                # اصلاح کلیدی: فقط کندل‌های ۴ ساعته‌ی کاملاً بسته‌شده‌ی قبل از زمان فعلی (برای جلوگیری از خطای خودمقایسه‌ای)
+                current_4h_floor = pd.Timestamp(ts).floor("4h")
+                valid_4h = df_4h[df_4h.index < current_4h_floor]
                 if len(valid_4h) < 20:
                     continue
+                
                 recent_4h = valid_4h.iloc[-10:]
                 struct_high = recent_4h["High"].max()
                 struct_low = recent_4h["Low"].min()
 
-                # فیلتر ۳: تریگر ۱ ساعته (نقطه ورود)
                 i_1h = df_1h.index.get_loc(ts)
                 if i_1h < 20:
                     continue
@@ -320,9 +311,7 @@ def run_multi_tf_backtest(data_dict: Dict[str, Dict[str, pd.DataFrame]]):
                 stop_price = 0.0
                 target_price = 0.0
 
-                # بررسی شرایط لانگ بر اساس ساختار
                 if allowed_side == "LONG":
-                    # جاروب کف ۴ ساعته توسط کندل ۱ ساعته و بازگشت به بالا
                     is_sweep = current_1h["Low"] < struct_low and current_1h["Close"] > struct_low
                     is_vol = current_1h["Volume"] > (vol_ma * 1.1)
                     if is_sweep and is_vol:
@@ -331,9 +320,8 @@ def run_multi_tf_backtest(data_dict: Dict[str, Dict[str, pd.DataFrame]]):
                         risk_dist = current_1h["Close"] - stop_price
                         if risk_dist <= 0:
                             risk_dist = atr
-                        target_price = current_1h["Close"] + (risk_dist * 2.0)  # ریوارد ثابت 1:2
+                        target_price = current_1h["Close"] + (risk_dist * 2.0)
 
-                # بررسی شرایط شورت بر اساس ساختار
                 elif allowed_side == "SHORT":
                     is_sweep = current_1h["High"] > struct_high and current_1h["Close"] < struct_high
                     is_vol = current_1h["Volume"] > (vol_ma * 1.1)
@@ -343,7 +331,7 @@ def run_multi_tf_backtest(data_dict: Dict[str, Dict[str, pd.DataFrame]]):
                         risk_dist = stop_price - current_1h["Close"]
                         if risk_dist <= 0:
                             risk_dist = atr
-                        target_price = current_1h["Close"] - (risk_dist * 2.0)  # ریوارد ثابت 1:2
+                        target_price = current_1h["Close"] - (risk_dist * 2.0)
 
                 if direction is not None:
                     pending_signals.append({
@@ -358,7 +346,7 @@ def run_multi_tf_backtest(data_dict: Dict[str, Dict[str, pd.DataFrame]]):
 
 def summarize_multi_tf_results(trades_df: pd.DataFrame, final_equity: float, max_dd: float):
     print("\n" + "=" * 68)
-    print("📊 گزارش نهایی استراتژی چندتایم‌فریمه (تارگت 1:2 + Break-Even)")
+    print("📊 گزارش نهایی استراتژی چندتایم‌فریمه (اصلاح‌شده)")
     print("=" * 68)
 
     if trades_df.empty:
@@ -421,18 +409,10 @@ def summarize_multi_tf_results(trades_df: pd.DataFrame, final_equity: float, max
     print(f"💵 مجموع سود/زیان دلاری خالص: ${total_dollar_pnl:,.2f}")
     print(f"🏦 سرمایه نهایی: ${final_equity:,.2f}")
     print(f"❄️ حداکثر ضررهای متوالی کل سبد: {max_losses}")
-
-    print("\n------------------------------------------------------------")
-    print("📉 لیست کامل زنجیره‌های ضرر متوالی:")
-    print("------------------------------------------------------------")
-    if loss_sequences:
-        print(", ".join(map(str, loss_sequences)))
-    else:
-        print("هیچ زنجیره ضرری ثبت نشد.")
     print("=" * 68)
 
 
 if __name__ == "__main__":
     df_trades, final_equity, max_dd = run_multi_tf_backtest(multi_tf_data)
     summarize_multi_tf_results(df_trades, final_equity, max_dd)
-    print("\n✨ اجرای تست چندتایم‌فریمه جدید به پایان رسید.")
+    print("\n✨ تست مجدد به پایان رسید.")
