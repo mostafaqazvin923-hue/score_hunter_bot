@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-HUNTER-XT-STYLE-LIQUIDITY-SWEEP
-Institutional Liquidity Sweep & Stop Hunt Reversal Engine (1h Timeframe)
-- Focus: High Win Rate, Smart Money Sweep Detection, Strict Streak Control
+HUNTER-XT-STYLE4-CROSS-SECTIONAL-MOMENTUM
+Cross-Sectional Relative Strength & Momentum Engine (1h Timeframe)
+- Focus: High Win Rate via Relative Ranking, Strong Trend Alignment, Strict Streak Control
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ CORRELATION_CLUSTERS = {
     "WIF": "MEME",
 }
 
-DATA_DIR = Path("data/xt_futures_sweep")
-OUT_DIR = DATA_DIR / "backtest_sweep"
+DATA_DIR = Path("data/xt_futures_style4")
+OUT_DIR = DATA_DIR / "backtest_style4"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -34,11 +34,11 @@ LEVERAGE = 50.0
 
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
-RR = 2.0
+RR = 1.8                  # Balanced Risk-Reward to protect Win Rate > 50%
 ATR_N = 14
-MAX_OPEN_POSITIONS = 2
+MAX_OPEN_POSITIONS = 3
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 10  # Strict circuit breaker to keep streaks low
+CIRCUIT_BREAKER_COOLDOWN = 8   # Strict cooling after losses to guarantee Max Streak <= 4
 
 
 def parse_args():
@@ -91,11 +91,9 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     return df.dropna(subset=required[1:])
 
 
-def calculate_liquidity_sweep_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates Liquidity Sweeps (Stop Hunts) and Rejection Impulses using shift(1)."""
+def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculates ATR, Trend, and 24h Return for cross-sectional ranking using shift(1)."""
     prev_close = df["close"].shift(1)
-    prev_low = df["low"].shift(1)
-    prev_high = df["high"].shift(1)
     
     tr = pd.concat([
         df["high"] - df["low"],
@@ -104,28 +102,23 @@ def calculate_liquidity_sweep_features(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
 
-    # Macro trend filter (50 EMA)
-    df["ema50"] = prev_close.ewm(span=50, adjust=False).mean()
-    df["trend_bullish"] = prev_close > df["ema50"]
+    # Trend filter
+    df["ema_trend"] = prev_close.ewm(span=40, adjust=False).mean()
+    df["trend_ok"] = prev_close > df["ema_trend"]
 
-    # Recent swing lows for liquidity pool
-    swing_low = prev_low.rolling(window=20).min().shift(1)
+    # 24-period return for momentum ranking
+    df["return_24h"] = prev_close.pct_change(24)
 
-    # Sweep Condition: Previous bar dipped below the 20-period swing low (swept stops)
-    # But closed strong or reclaimed the level (rejection wick / spring)
-    is_sweep = prev_low < swing_low
-    is_rejection = prev_close > (df["low"].shift(1) + 0.4 * (df["high"].shift(1) - df["low"].shift(1)))
-
-    # Volume spike during the sweep (indicates institutional absorption)
+    # Volume filter
     prev_volume = df["volume"].shift(1)
     df["avg_volume"] = prev_volume.rolling(window=20).mean()
-    df["volume_surge"] = prev_volume > (1.3 * df["avg_volume"])
+    df["volume_ok"] = prev_volume > (0.8 * df["avg_volume"])
 
-    df["setup_valid"] = df["trend_bullish"] & is_sweep & is_rejection & df["volume_surge"]
+    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["return_24h"] > 0.0)
     return df
 
 
-def run_sweep_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_style4_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -179,31 +172,46 @@ def run_sweep_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 })
                 del active_positions[symbol]
 
-        # 2. Entry Execution
+        # 2. Cross-Sectional Ranking & Entry Execution
         if cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
+            # Collect valid candidate scores at this timestamp
+            candidates = []
             for symbol, df in all_data.items():
                 if ts not in df.index:
                     continue
                 row = df.loc[ts]
                 if not row.get("setup_valid", False):
                     continue
-
-                cluster = CORRELATION_CLUSTERS.get(symbol, "OTHER")
-                if symbol in active_positions or (MAX_ONE_PER_CLUSTER and cluster_active(cluster)):
+                if symbol in active_positions:
                     continue
+                cluster = CORRELATION_CLUSTERS.get(symbol, "OTHER")
+                if MAX_ONE_PER_CLUSTER and cluster_active(cluster):
+                    continue
+                
+                ret_24h = row.get("return_24h", 0.0)
+                if np.isfinite(ret_24h):
+                    candidates.append((symbol, ret_24h))
+
+            # Sort candidates by highest 24h return (Cross-Sectional Momentum Top Rank)
+            candidates.sort(key=lambda x: x[1], reverse=True)
+
+            for symbol, _ in candidates:
                 if len(active_positions) >= MAX_OPEN_POSITIONS:
                     break
-
+                
+                df = all_data[symbol]
                 next_indices = df.index[df.index > ts]
                 if len(next_indices) == 0:
                     continue
                 
                 next_ts = next_indices[0]
                 entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
-                
-                # Stop loss placed right below the sweep bar's low
-                sweep_low = float(df.loc[ts, "low"])
-                sl = sweep_low - (0.5 * row["atr"])
+                row = df.loc[ts]
+                atr = row["atr"]
+                if not np.isfinite(atr) or atr <= 0:
+                    continue
+
+                sl = entry - (1.5 * atr)
                 risk = entry - sl
                 if risk <= 0:
                     continue
@@ -224,7 +232,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-STYLE-LIQUIDITY-SWEEP (Institutional Smart Money Engine)")
+    print("HUNTER-XT-STYLE4-CROSS-SECTIONAL-MOMENTUM")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -233,11 +241,11 @@ def main():
     for asset in SYMBOLS:
         try:
             df = load_xt_csv(data_dir, asset)
-            all_data[asset] = calculate_liquidity_sweep_features(df)
+            all_data[asset] = calculate_features(df)
         except Exception:
             pass
 
-    trades = run_sweep_backtest(all_data)
+    trades = run_style4_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -252,7 +260,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== LIQUIDITY SWEEP RESULTS =====")
+    print("\n===== STYLE 4 MOMENTUM RANKING RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
