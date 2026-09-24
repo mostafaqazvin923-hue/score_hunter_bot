@@ -265,5 +265,5 @@ def main():
     print("=" * 88)
 
 
-if __name__ == "__main"></id>
+if __name__ == "__main__":
     main()
