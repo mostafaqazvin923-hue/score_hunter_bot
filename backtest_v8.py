@@ -193,8 +193,12 @@ def normalize_rows(rows, symbol):
 
 
 def fetch_batch(session, symbol, start_ms, end_ms):
+    # XT Futures Kline API uses the exchange market id in lowercase (e.g. btc_usdt),
+    # while symbol discovery may return the same id in uppercase (BTC_USDT).
+    # XT's API is case-sensitive here.
+    api_symbol = symbol.strip().lower()
     params = {
-        "symbol": symbol,
+        "symbol": api_symbol,
         "interval": INTERVAL,
         "startTime": start_ms,
         "endTime": end_ms,
