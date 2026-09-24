@@ -227,13 +227,26 @@ def audit(df, symbol, start_dt=None, end_dt=None):
     if duplicates:
         raise RuntimeError(f"{symbol}: duplicate timestamps remain: {duplicates}")
 
+    # Every candle timestamp itself must be aligned to the 15m grid.
+    # A missing candle creates a 30m/45m/... delta; that is a DATA GAP,
+    # not a malformed candle interval, and must NOT make the collector fail.
+    # The engine later splits the series at gaps so indicators never bridge
+    # across missing market data.
+    interval_ms = 15 * 60 * 1000
+    ts_ms = (df["Date"].astype("int64") // 1_000_000)
+    misaligned = int((ts_ms % interval_ms != 0).sum())
+    if misaligned:
+        raise RuntimeError(
+            f"{symbol}: {misaligned} timestamps are not aligned to 15m grid"
+        )
+
     diffs = df["Date"].diff().dropna()
-    wrong = diffs[diffs != pd.Timedelta(minutes=15)]
+    overlaps = diffs[diffs < pd.Timedelta(minutes=15)]
     gaps = diffs[diffs > pd.Timedelta(minutes=15)]
 
-    if len(wrong):
+    if len(overlaps):
         raise RuntimeError(
-            f"{symbol}: non-15m intervals remain: {len(wrong)}"
+            f"{symbol}: {len(overlaps)} overlapping/non-increasing 15m intervals remain"
         )
 
     if start_dt is not None and df["Date"].iloc[0] > pd.Timestamp(start_dt) + pd.Timedelta(minutes=15):
@@ -252,7 +265,9 @@ def audit(df, symbol, start_dt=None, end_dt=None):
         "gaps": int(len(gaps)),
         "missing_bars": int((diffs[diffs > pd.Timedelta(minutes=15)] / pd.Timedelta(minutes=15) - 1).sum()) if len(gaps) else 0,
         "max_gap_minutes": int(gaps.max().total_seconds() / 60) if len(gaps) else 15,
-        "wrong_intervals": int(len(wrong)),
+        "wrong_intervals": 0,
+        "misaligned_timestamps": misaligned,
+        "overlaps": int(len(overlaps)),
     }
 
 
@@ -381,7 +396,23 @@ def download_symbol(session, symbol, start_dt, end_dt):
         df = df.iloc[:-1].copy()
 
     report = audit(df, symbol, start_dt=start_dt, end_dt=end_dt)
+
+    expected_rows = int(((pd.Timestamp(end_dt) - pd.Timestamp(start_dt)) / pd.Timedelta(minutes=15)) + 1)
+    missing_ratio = report["missing_bars"] / max(expected_rows, 1)
+    if missing_ratio > MAX_MISSING_BARS_RATIO:
+        raise RuntimeError(
+            f"{symbol}: too many missing 15m bars: {report['missing_bars']} "
+            f"({missing_ratio:.3%} of expected {expected_rows})"
+        )
+    if report["max_gap_minutes"] > MAX_SINGLE_GAP_BARS * 15:
+        raise RuntimeError(
+            f"{symbol}: single historical gap too large: "
+            f"{report['max_gap_minutes']} minutes"
+        )
+
     report["api_requests"] = calls
+    report["expected_rows"] = expected_rows
+    report["missing_ratio"] = missing_ratio
     return df, report
 
 
@@ -462,7 +493,10 @@ MIN_EXPANSION = 1.10
 # The collector already reports real gaps. We do not pretend missing candles
 # are present. Indicators are calculated separately inside contiguous 15m
 # segments, so a gap cannot contaminate rolling windows across the gap.
-MAX_ALLOWED_GAP_BARS = 0
+# Gaps are allowed when they are genuinely absent from XT history, but are
+# reported and bounded so a broken response cannot silently pass as valid data.
+MAX_MISSING_BARS_RATIO = 0.005   # 0.5% of the expected 15m candles
+MAX_SINGLE_GAP_BARS = 8          # > 2 hours of missing 15m bars => fail
 
 # XT exposes leverage brackets publicly. The engine uses the first applicable
 # bracket for the fixed $5,000 notional. The bracket data is fetched at runtime
@@ -1057,7 +1091,12 @@ def ensure_xt_data(data_dir: Path, days: int = 365):
             report = audit(df, asset, start_dt=start_dt, end_dt=end_dt)
             if report["rows"] < int(expected * 0.995):
                 raise RuntimeError(f"{asset}: insufficient coverage {report['rows']}/{expected}")
-            print(f"  VALID {asset}: rows={report['rows']:,} gaps={report['gaps']} missing_bars={report['missing_bars']}")
+            missing_ratio = report["missing_bars"] / max(expected, 1)
+            if missing_ratio > MAX_MISSING_BARS_RATIO:
+                raise RuntimeError(f"{asset}: too many missing bars: {report['missing_bars']} ({missing_ratio:.3%})")
+            if report["max_gap_minutes"] > MAX_SINGLE_GAP_BARS * 15:
+                raise RuntimeError(f"{asset}: single gap too large: {report['max_gap_minutes']} minutes")
+            print(f"  VALID {asset}: rows={report['rows']:,} gaps={report['gaps']} missing_bars={report['missing_bars']} ({missing_ratio:.3%})")
         return
 
     print("\n=== XT FUTURES DATA MISSING — DOWNLOADING AUDITED DATA ===")
