@@ -12,7 +12,7 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
-EXCHANGE = ccxt.lbank({"enableRateLimit": True, "timeout": 20000, "options": {"defaultType": "swap"}})
+EXCHANGE = ccxt.lbank({"enableRateLimit": True, "timeout": 20000})
 EXCHANGE.load_markets()
 SYMBOLS = [
     "BTC/USDT:USDT","ETH/USDT:USDT","SOL/USDT:USDT","SUI/USDT:USDT",
@@ -46,7 +46,7 @@ def cluster_of(sym):
 def fetch_ohlcv(symbol, since_ms, until_ms):
     rows=[]; cur=since_ms
     market = EXCHANGE.market(symbol)
-    request_symbol = market["symbol"]
+    request_symbol = symbol
     while cur < until_ms:
         batch=EXCHANGE.fetch_ohlcv(request_symbol,TIMEFRAME,since=cur,limit=1000)
         if not batch: break
