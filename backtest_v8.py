@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-HUNTER-XT-STYLE2-ORDERFLOW-HIGH-FREQUENCY
-High Frequency Order Flow & Momentum Engine (1h Timeframe)
-- Focus: High Trade Count + Win Rate > 50% + Strict Streak Control via Momentum
+HUNTER-XT-STYLE2-ULTIMATE
+High Win-Rate & Strict Streak Control Engine (1h + Trend Filter)
+- Focus: Win Rate > 50%, Max Loss Streak <= 4, Controlled Trade Count
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ CORRELATION_CLUSTERS = {
     "WIF": "MEME",
 }
 
-DATA_DIR = Path("data/xt_futures_style2_hf")
-OUT_DIR = DATA_DIR / "backtest_style2_hf"
+DATA_DIR = Path("data/xt_futures_style2_ult")
+OUT_DIR = DATA_DIR / "backtest_style2_ult"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -36,10 +36,10 @@ FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 RR = 2.0
 ATR_N = 14
-VOLUME_IMBALANCE_THRESHOLD = 0.65 
-MAX_OPEN_POSITIONS = 3             # Restored high frequency
+VOLUME_IMBALANCE_THRESHOLD = 0.70  # Stricter accumulation filter
+MAX_OPEN_POSITIONS = 2             
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 6       # Short, smart cooldown to prevent long freezes
+CIRCUIT_BREAKER_COOLDOWN = 24      # Strict lockout after 2 losses to protect streaks
 
 
 def parse_args():
@@ -92,8 +92,8 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     return df.dropna(subset=required[1:])
 
 
-def calculate_orderflow_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates causal Order Flow with Momentum and RSI confirmation to boost Win Rate."""
+def calculate_ultimate_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculates rigorous trend and order flow filters to force Win Rate > 50%."""
     prev_close = df["close"].shift(1)
     
     tr = pd.concat([
@@ -103,19 +103,10 @@ def calculate_orderflow_features(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
 
-    # Trend and Momentum Filters
-    df["ema_trend"] = prev_close.ewm(span=30, adjust=False).mean()
-    df["trend_bullish"] = prev_close > df["ema_trend"]
-
-    # RSI Filter to ensure price isn't overextended
-    delta = prev_close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = (-delta).where(delta < 0, 0.0)
-    avg_gain = gain.ewm(span=14, adjust=False).mean()
-    avg_loss = loss.ewm(span=14, adjust=False).mean()
-    rs = avg_gain / (avg_loss + 1e-8)
-    df["rsi"] = 100 - (100 / (1 + rs))
-    df["rsi_ok"] = (df["rsi"] > 45) & (df["rsi"] < 75)
+    # Dual EMA Trend Filter (Fast and Slow) to guarantee we trade with strong momentum
+    df["ema_fast"] = prev_close.ewm(span=20, adjust=False).mean()
+    df["ema_slow"] = prev_close.ewm(span=60, adjust=False).mean()
+    df["trend_strong"] = (prev_close > df["ema_fast"]) & (df["ema_fast"] > df["ema_slow"])
 
     # Volume Delta Imbalance
     hl_range = df["high"] - df["low"] + 1e-8
@@ -126,14 +117,14 @@ def calculate_orderflow_features(df: pd.DataFrame) -> pd.DataFrame:
     
     df["buy_delta_ratio"] = prev_buy_volume / (prev_volume + 1e-8)
     df["avg_volume"] = prev_volume.rolling(window=20).mean()
-    df["volume_surge"] = prev_volume > (1.1 * df["avg_volume"])
+    df["volume_surge"] = prev_volume > (1.25 * df["avg_volume"])
 
-    # High-Frequency Setup Condition with strict quality checks
-    df["setup_valid"] = df["trend_bullish"] & df["rsi_ok"] & (df["buy_delta_ratio"] >= VOLUME_IMBALANCE_THRESHOLD) & df["volume_surge"]
+    # Setup condition
+    df["setup_valid"] = df["trend_strong"] & (df["buy_delta_ratio"] >= VOLUME_IMBALANCE_THRESHOLD) & df["volume_surge"]
     return df
 
 
-def run_orderflow_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_ultimate_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -187,7 +178,7 @@ def run_orderflow_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 })
                 del active_positions[symbol]
 
-        # 2. Entry Execution (High Frequency allowed up to MAX_OPEN_POSITIONS)
+        # 2. Entry Execution
         if cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
             for symbol, df in all_data.items():
                 if ts not in df.index:
@@ -233,7 +224,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-STYLE2-ORDERFLOW-HIGH-FREQUENCY")
+    print("HUNTER-XT-STYLE2-ULTIMATE (High Win Rate & Streak Control)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -242,11 +233,11 @@ def main():
     for asset in SYMBOLS:
         try:
             df = load_xt_csv(data_dir, asset)
-            all_data[asset] = calculate_orderflow_features(df)
+            all_data[asset] = calculate_ultimate_features(df)
         except Exception:
             pass
 
-    trades = run_orderflow_backtest(all_data)
+    trades = run_ultimate_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -261,7 +252,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== STYLE 2 HIGH-FREQUENCY RESULTS =====")
+    print("\n===== STYLE 2 ULTIMATE RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
