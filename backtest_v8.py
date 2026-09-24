@@ -860,8 +860,12 @@ def main():
     data_dir = Path(args.data_dir)
     out_dir = Path(args.out_dir)
 
-    if args.download:
-        ensure_xt_data(data_dir)
+    # The backtest must never assume that the GitHub Actions workspace
+    # contains the historical XT CSVs. Each Actions run starts from a fresh
+    # workspace, so ensure_xt_data() is mandatory before load_csv().
+    # --download is retained for backward CLI compatibility, but is no longer
+    # required to trigger the data bootstrap.
+    ensure_xt_data(data_dir)
 
     run_backtest(data_dir, out_dir)
 
