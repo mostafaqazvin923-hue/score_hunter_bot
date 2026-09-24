@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HUNTER-V129-AUDITED — XT USDT-M Futures / 15m / 365d
+HUNTER-MTF1 — XT USDT-M Futures / 1D→4H→1H / 365d
 
 Purpose
 -------
@@ -56,7 +56,7 @@ SYMBOLS = [
 ]
 
 DATA_DIR = Path("data/xt_futures_15m")
-OUT_DIR = DATA_DIR / "backtest_v129_audited"
+OUT_DIR = DATA_DIR / "backtest_mtf1"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -65,14 +65,17 @@ LEVERAGE = 50.0
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 
+# MTF-1 parameters. These are deliberately few and interpretable.
+EMA_FAST = 50
+EMA_SLOW = 200
+EMA_PULLBACK = 20
 ATR_N = 14
-BODY_N = 20
-
-SL_ATR = 1.5
-TP_ATR = 3.0
-BE_ATR = 1.5
-
-RR = TP_ATR / SL_ATR
+VOL_N = 20
+VOL_MULT = 1.05
+BODY_ATR_MIN = 0.50
+PULLBACK_LOOKBACK = 4
+STOP_BUFFER_ATR = 0.15
+RR = 2.0
 
 
 def parse_args():
@@ -448,652 +451,381 @@ def atr_wilder_like(df: pd.DataFrame, n: int = ATR_N) -> pd.Series:
     return tr.rolling(n, min_periods=n).mean()
 
 
-def prepare_htf(df15: pd.DataFrame):
-    """
-    Resampling is explicitly causal:
-    HTF bars are right-labelled and a 15m signal at time T may only use
-    HTF bars whose closing timestamp is STRICTLY before T.
-    """
+# ---------------------------------------------------------------------------
+# HUNTER-MTF1 STRATEGY
+# 1D = macro direction
+# 4H = trend state / controlled pullback context
+# 1H = setup + entry
+# ---------------------------------------------------------------------------
 
-    x = df15.copy()
+def wilder_atr(df: pd.DataFrame, n: int = ATR_N) -> pd.Series:
+    prev = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev).abs(),
+        (df["low"] - prev).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
 
-    x["atr15"] = atr_wilder_like(x, ATR_N)
-    x["body"] = (x["close"] - x["open"]).abs()
 
-    # Prior completed 20-bar average only.
-    x["avg_body"] = x["body"].shift(1).rolling(
-        BODY_N, min_periods=BODY_N
-    ).mean()
-
-    h1 = (
-        x.resample(
-            "1h",
-            label="right",
-            closed="right",
-            origin="epoch",
-        )
-        .agg(
-            open=("open", "first"),
-            high=("high", "max"),
-            low=("low", "min"),
-            close=("close", "last"),
-            volume=("volume", "sum"),
-        )
-        .dropna()
+def aggregate_htf(df15: pd.DataFrame):
+    """Build closed 1H/4H/1D bars from 15m data. No forward filling."""
+    agg = dict(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
     )
-
-    h4 = (
-        x.resample(
-            "4h",
-            label="right",
-            closed="right",
-            origin="epoch",
-        )
-        .agg(
-            open=("open", "first"),
-            high=("high", "max"),
-            low=("low", "min"),
-            close=("close", "last"),
-            volume=("volume", "sum"),
-        )
-        .dropna()
-    )
-
-    h4["ema50"] = h4["close"].ewm(
-        span=50, adjust=False, min_periods=50
-    ).mean()
-    h4["ema200"] = h4["close"].ewm(
-        span=200, adjust=False, min_periods=200
-    ).mean()
-
-    h4["bull"] = (
-        (h4["close"] > h4["ema200"])
-        & (h4["ema50"] > h4["ema200"])
-    )
-    h4["bear"] = (
-        (h4["close"] < h4["ema200"])
-        & (h4["ema50"] < h4["ema200"])
-    )
-
-    return x, h1, h4
+    h1 = df15.resample("1h", label="right", closed="left", origin="epoch").agg(**agg).dropna()
+    h4 = df15.resample("4h", label="right", closed="left", origin="epoch").agg(**agg).dropna()
+    d1 = df15.resample("1D", label="right", closed="left", origin="epoch").agg(**agg).dropna()
+    return h1, h4, d1
 
 
-def diagnose_segment(asset: str, df15: pd.DataFrame) -> dict:
-    """Diagnostic-only causal funnel for V129.
+def prepare_mtf(df15: pd.DataFrame):
+    h1, h4, d1 = aggregate_htf(df15)
+    for df in (h1, h4, d1):
+        df["atr"] = wilder_atr(df, ATR_N)
+        df["ema50"] = df["close"].ewm(span=EMA_FAST, adjust=False, min_periods=EMA_FAST).mean()
+        df["ema200"] = df["close"].ewm(span=EMA_SLOW, adjust=False, min_periods=EMA_SLOW).mean()
+        df["ema20"] = df["close"].ewm(span=EMA_PULLBACK, adjust=False, min_periods=EMA_PULLBACK).mean()
+        df["ema50_slope"] = df["ema50"].diff(3)
+        df["vol_avg"] = df["volume"].shift(1).rolling(VOL_N, min_periods=VOL_N).mean()
+    return h1, h4, d1
 
-    This function does NOT alter signal rules or create trades. It counts how
-    many completed candles survive each exact V129 condition so a zero-signal
-    result can be traced to the first restrictive stage.
-    """
-    x, h1, h4 = prepare_htf(df15)
-    d = {
-        "bars": len(x),
-        "loop_bars": 0,
-        "h1_available": 0,
-        "h4_available": 0,
-        "h4_ema200_ready": 0,
-        "bull_regime": 0,
-        "bear_regime": 0,
-        "sweep_low": 0,
-        "sweep_high": 0,
-        "displacement_up": 0,
-        "displacement_down": 0,
-        "long_sweep_and_displacement": 0,
-        "short_sweep_and_displacement": 0,
-        "long_final": 0,
-        "short_final": 0,
-        "atr_valid": 0,
-        "near_long_without_regime": 0,
-        "near_short_without_regime": 0,
-    }
 
-    start_i = max(250, BODY_N + 5)
-    for i in range(start_i, len(x) - 1):
-        d["loop_bars"] += 1
-        signal_ts = x.index[i]
-        h1_sub = h1[h1.index < signal_ts]
-        h4_sub = h4[h4.index < signal_ts]
-        if len(h1_sub) < 10:
-            continue
-        d["h1_available"] += 1
-        if len(h4_sub) < 1:
-            continue
-        d["h4_available"] += 1
+def regime_daily(row):
+    if not np.isfinite(row["ema200"]) or not np.isfinite(row["ema50_slope"]):
+        return "NEUTRAL"
+    if row["close"] > row["ema200"] and row["ema50"] > row["ema200"] and row["ema50_slope"] > 0:
+        return "BULL"
+    if row["close"] < row["ema200"] and row["ema50"] < row["ema200"] and row["ema50_slope"] < 0:
+        return "BEAR"
+    return "NEUTRAL"
 
-        regime = h4_sub.iloc[-1]
-        if pd.isna(regime["ema200"]):
-            continue
-        d["h4_ema200_ready"] += 1
-        if bool(regime["bull"]):
-            d["bull_regime"] += 1
-        if bool(regime["bear"]):
-            d["bear_regime"] += 1
 
-        lows = h1_sub["low"].iloc[-10:-2]
-        highs = h1_sub["high"].iloc[-10:-2]
-        if len(lows) == 0 or len(highs) == 0:
-            continue
-
-        support = float(lows.min())
-        resistance = float(highs.max())
-        prev = x.iloc[i - 1]
-        curr = x.iloc[i]
-
-        sweep_low = bool(prev["low"] < support and prev["close"] > support)
-        sweep_high = bool(prev["high"] > resistance and prev["close"] < resistance)
-        if sweep_low:
-            d["sweep_low"] += 1
-        if sweep_high:
-            d["sweep_high"] += 1
-
-        disp_up = bool(
-            curr["close"] > curr["open"]
-            and curr["body"] > 2.0 * curr["avg_body"]
-        )
-        disp_down = bool(
-            curr["close"] < curr["open"]
-            and curr["body"] > 2.0 * curr["avg_body"]
-        )
-        if disp_up:
-            d["displacement_up"] += 1
-        if disp_down:
-            d["displacement_down"] += 1
-
-        long_pair = sweep_low and disp_up
-        short_pair = sweep_high and disp_down
-        if long_pair:
-            d["long_sweep_and_displacement"] += 1
-            if not bool(regime["bull"]):
-                d["near_long_without_regime"] += 1
-        if short_pair:
-            d["short_sweep_and_displacement"] += 1
-            if not bool(regime["bear"]):
-                d["near_short_without_regime"] += 1
-
-        atr = float(curr["atr15"]) if pd.notna(curr["atr15"]) else np.nan
-        if np.isfinite(atr) and atr > 0:
-            d["atr_valid"] += 1
-
-        if bool(regime["bull"]) and long_pair:
-            d["long_final"] += 1
-        if bool(regime["bear"]) and short_pair:
-            d["short_final"] += 1
-
-    d["final_total"] = d["long_final"] + d["short_final"]
-    return d
+def context_4h(row, daily_regime):
+    """Allow trend continuation or a controlled pullback; reject opposite 4H trend."""
+    if not np.isfinite(row["ema200"]):
+        return "NEUTRAL"
+    if daily_regime == "BULL":
+        # Trend: price above 4H EMA50; pullback: price between EMA50 and EMA200.
+        if row["close"] > row["ema50"] and row["ema50"] > row["ema200"]:
+            return "BULL_TREND"
+        if row["close"] >= row["ema200"] and row["ema50"] > row["ema200"]:
+            return "BULL_PULLBACK"
+    if daily_regime == "BEAR":
+        if row["close"] < row["ema50"] and row["ema50"] < row["ema200"]:
+            return "BEAR_TREND"
+        if row["close"] <= row["ema200"] and row["ema50"] < row["ema200"]:
+            return "BEAR_PULLBACK"
+    return "NEUTRAL"
 
 
 def generate_candidates(asset: str, df15: pd.DataFrame) -> list[dict]:
-    """
-    Candidate timestamp = the COMPLETED displacement candle.
-    Actual entry occurs on the next 15m candle open.
-    """
-
-    x, h1, h4 = prepare_htf(df15)
+    h1, h4, d1 = prepare_mtf(df15)
     candidates = []
 
-    for i in range(max(250, BODY_N + 5), len(x) - 1):
-        signal_ts = x.index[i]
-        entry_i = i + 1
+    # We intentionally require completed 1H bars and enter on the next 1H open.
+    for i in range(max(EMA_SLOW + 10, PULLBACK_LOOKBACK + VOL_N + 5), len(h1) - 1):
+        signal_ts = h1.index[i]
+        entry_ts = h1.index[i + 1]
 
-        # Critical causal rule:
-        # HTF candles must have closed before the signal candle opened.
-        h1_sub = h1[h1.index < signal_ts]
-        h4_sub = h4[h4.index < signal_ts]
-
-        if len(h1_sub) < 10 or len(h4_sub) < 1:
+        # Strict causality: only HTF bars CLOSED before the completed 1H signal bar.
+        dsub = d1[d1.index < signal_ts]
+        h4sub = h4[h4.index < signal_ts]
+        if len(dsub) < EMA_SLOW or len(h4sub) < EMA_SLOW:
             continue
 
-        regime = h4_sub.iloc[-1]
-        if pd.isna(regime["ema200"]):
+        drow = dsub.iloc[-1]
+        h4row = h4sub.iloc[-1]
+        dreg = regime_daily(drow)
+        ctx = context_4h(h4row, dreg)
+        if dreg == "NEUTRAL" or ctx == "NEUTRAL":
             continue
 
-        recent_lows = h1_sub["low"].iloc[-10:-2]
-        recent_highs = h1_sub["high"].iloc[-10:-2]
-
-        if len(recent_lows) == 0 or len(recent_highs) == 0:
-            continue
-
-        support = float(recent_lows.min())
-        resistance = float(recent_highs.max())
-
-        # Sweep is the PREVIOUS completed 15m candle.
-        prev = x.iloc[i - 1]
-        curr = x.iloc[i]
-
-        sweep_low = (
-            prev["low"] < support
-            and prev["close"] > support
-        )
-        sweep_high = (
-            prev["high"] > resistance
-            and prev["close"] < resistance
-        )
-
-        # Displacement is the completed signal candle.
-        displacement_up = (
-            curr["close"] > curr["open"]
-            and curr["body"] > 2.0 * curr["avg_body"]
-        )
-        displacement_down = (
-            curr["close"] < curr["open"]
-            and curr["body"] > 2.0 * curr["avg_body"]
-        )
-
-        long_ok = bool(regime["bull"] and sweep_low and displacement_up)
-        short_ok = bool(regime["bear"] and sweep_high and displacement_down)
-
-        if not long_ok and not short_ok:
-            continue
-
-        side = "LONG" if long_ok else "SHORT"
-
-        entry_bar = x.iloc[entry_i]
-        raw_entry = float(entry_bar["open"])
-
-        if side == "LONG":
-            entry = raw_entry * (1.0 + SLIPPAGE)
-        else:
-            entry = raw_entry * (1.0 - SLIPPAGE)
-
-        atr = float(curr["atr15"])
+        prev = h1.iloc[i - 1]
+        cur = h1.iloc[i]
+        recent = h1.iloc[i - PULLBACK_LOOKBACK:i]
+        atr = float(cur["atr"])
         if not np.isfinite(atr) or atr <= 0:
             continue
 
-        if side == "LONG":
-            sl = entry - SL_ATR * atr
-            tp = entry + TP_ATR * atr
-            be_trigger = entry + BE_ATR * atr
-        else:
-            sl = entry + SL_ATR * atr
-            tp = entry - TP_ATR * atr
-            be_trigger = entry - BE_ATR * atr
+        rng = float(cur["high"] - cur["low"])
+        body = abs(float(cur["close"] - cur["open"]))
+        if rng <= 0 or body < BODY_ATR_MIN * atr:
+            continue
+        vol_avg = float(cur["vol_avg"])
+        if not np.isfinite(vol_avg) or vol_avg <= 0 or float(cur["volume"]) < VOL_MULT * vol_avg:
+            continue
 
-        candidates.append(
-            {
-                "asset": asset,
-                "signal_ts": signal_ts,
-                "entry_ts": x.index[entry_i],
-                "entry_i": entry_i,
-                "side": side,
-                "entry": entry,
-                "sl": sl,
-                "tp": tp,
-                "be_trigger": be_trigger,
-            }
+        # Pullback must have interacted with the 1H EMA20 or a recent local extreme.
+        pullback_long = bool(
+            (recent["low"] <= recent["ema20"]).any()
+            or float(recent["low"].min()) < float(h4row["close"])
+        )
+        pullback_short = bool(
+            (recent["high"] >= recent["ema20"]).any()
+            or float(recent["high"].max()) > float(h4row["close"])
         )
 
+        # Continuation trigger: completed 1H candle closes beyond previous candle.
+        close_top = (cur["close"] - cur["low"]) / rng
+        close_bottom = (cur["high"] - cur["close"]) / rng
+        long_trigger = bool(
+            cur["close"] > cur["open"]
+            and cur["close"] > prev["high"]
+            and close_top >= 0.70
+        )
+        short_trigger = bool(
+            cur["close"] < cur["open"]
+            and cur["close"] < prev["low"]
+            and close_bottom >= 0.70
+        )
+
+        long_ok = dreg == "BULL" and ctx in {"BULL_TREND", "BULL_PULLBACK"} and pullback_long and long_trigger
+        short_ok = dreg == "BEAR" and ctx in {"BEAR_TREND", "BEAR_PULLBACK"} and pullback_short and short_trigger
+        if not (long_ok or short_ok):
+            continue
+
+        side = "LONG" if long_ok else "SHORT"
+        raw_entry = float(h1.iloc[i + 1]["open"])
+        entry = raw_entry * (1 + SLIPPAGE) if side == "LONG" else raw_entry * (1 - SLIPPAGE)
+
+        if side == "LONG":
+            structural_sl = float(recent["low"].min()) - STOP_BUFFER_ATR * atr
+            risk = entry - structural_sl
+            if risk <= 0:
+                continue
+            sl, tp = structural_sl, entry + RR * risk
+        else:
+            structural_sl = float(recent["high"].max()) + STOP_BUFFER_ATR * atr
+            risk = structural_sl - entry
+            if risk <= 0:
+                continue
+            sl, tp = structural_sl, entry - RR * risk
+
+        candidates.append({
+            "asset": asset,
+            "signal_ts": signal_ts,
+            "entry_ts": entry_ts,
+            "side": side,
+            "entry": float(entry),
+            "sl": float(sl),
+            "tp": float(tp),
+            "risk": float(risk),
+            "dreg": dreg,
+            "context_4h": ctx,
+        })
     return candidates
 
 
 def simulate_candidate(candidate: dict, df15: pd.DataFrame) -> dict:
-    """Simulate until SL/TP or dataset end. No timeout."""
+    """Simulate from the 1H entry timestamp on raw 15m candles; no timeout."""
+    entry_ts = pd.Timestamp(candidate["entry_ts"])
+    segment_end = candidate.get("segment_end_ts")
+    future = df15[df15.index >= entry_ts]
+    if segment_end is not None:
+        future = future[future.index <= pd.Timestamp(segment_end)]
+    if future.empty:
+        return {**candidate, "outcome": "OPEN", "exit_ts": None, "exit_price": None, "pnl": 0.0}
 
-    i = candidate["entry_i"]
     side = candidate["side"]
     entry = candidate["entry"]
     sl = candidate["sl"]
     tp = candidate["tp"]
-    be_trigger = candidate["be_trigger"]
-
-    be_active = False
-    exit_i = None
-    outcome = "OPEN"
-    exit_price = np.nan
-
-    for j in range(i, len(df15)):
-        bar = df15.iloc[j]
-        high = float(bar["high"])
-        low = float(bar["low"])
-
-        if side == "LONG":
-            if not be_active and high >= be_trigger:
-                be_active = True
-                sl = entry
-
-            hit_sl = low <= sl
-            hit_tp = high >= tp
-
-            # Conservative priority: SL wins if both occur in one candle.
-            if hit_sl:
-                outcome = "BE" if be_active else "LOSS"
-                exit_price = entry if be_active else sl
-                exit_i = j
-                break
-
-            if hit_tp:
-                outcome = "WIN"
-                exit_price = tp
-                exit_i = j
-                break
-
-        else:
-            if not be_active and low <= be_trigger:
-                be_active = True
-                sl = entry
-
-            hit_sl = high >= sl
-            hit_tp = low <= tp
-
-            if hit_sl:
-                outcome = "BE" if be_active else "LOSS"
-                exit_price = entry if be_active else sl
-                exit_i = j
-                break
-
-            if hit_tp:
-                outcome = "WIN"
-                exit_price = tp
-                exit_i = j
-                break
-
     notional = TRADE_MARGIN * LEVERAGE
 
-    if outcome == "OPEN":
-        pnl = 0.0
-        exit_ts = pd.NaT
-    else:
+    for ts, bar in future.iterrows():
+        hi, lo = float(bar["high"]), float(bar["low"])
         if side == "LONG":
-            price_ret = (exit_price - entry) / entry
+            hit_sl, hit_tp = lo <= sl, hi >= tp
+            if hit_sl and hit_tp:
+                exit_price, outcome = sl, "LOSS"
+            elif hit_sl:
+                exit_price, outcome = sl, "LOSS"
+            elif hit_tp:
+                exit_price, outcome = tp, "WIN"
+            else:
+                continue
+            gross = (exit_price - entry) / entry * notional
         else:
-            price_ret = (entry - exit_price) / entry
+            hit_sl, hit_tp = hi >= sl, lo <= tp
+            if hit_sl and hit_tp:
+                exit_price, outcome = sl, "LOSS"
+            elif hit_sl:
+                exit_price, outcome = sl, "LOSS"
+            elif hit_tp:
+                exit_price, outcome = tp, "WIN"
+            else:
+                continue
+            gross = (entry - exit_price) / entry * notional
 
-        pnl = (
-            notional * price_ret
-            - notional * FEE_RATE * 2.0
-        )
-        exit_ts = df15.index[exit_i]
+        fees = notional * FEE_RATE * 2.0
+        pnl = gross - fees
+        return {**candidate, "outcome": outcome, "exit_ts": ts, "exit_price": exit_price, "pnl": float(pnl)}
 
-    result = dict(candidate)
-    result.update(
-        {
-            "exit_ts": exit_ts,
-            "exit_i": exit_i,
-            "outcome": outcome,
-            "exit_price": exit_price,
-            "pnl": float(pnl),
-            "be_used": bool(be_active),
-        }
-    )
-    return result
+    return {**candidate, "outcome": "OPEN", "exit_ts": None, "exit_price": None, "pnl": 0.0}
 
 
 def enforce_global_non_overlap(trades: list[dict]) -> list[dict]:
-    """
-    Portfolio-level lock.
-
-    Candidates are ordered by signal/entry time. Once a trade is accepted,
-    no later candidate may enter until the accepted trade has actually closed.
-    A candidate on the same candle as the previous exit is rejected.
-    """
-
     accepted = []
-    next_allowed_ts = None
-
-    for t in sorted(
-        trades,
-        key=lambda z: (z["entry_ts"], z["asset"]),
-    ):
-        if next_allowed_ts is not None:
-            if pd.isna(t["entry_ts"]):
-                continue
-            if t["entry_ts"] <= next_allowed_ts:
-                continue
-
+    last_exit = None
+    for t in sorted(trades, key=lambda z: (pd.Timestamp(z["entry_ts"]), z["asset"])):
+        if last_exit is not None and pd.Timestamp(t["entry_ts"]) <= pd.Timestamp(last_exit):
+            continue
         accepted.append(t)
-
-        if not pd.isna(t["exit_ts"]):
-            next_allowed_ts = t["exit_ts"]
+        if t["exit_ts"] is not None:
+            last_exit = t["exit_ts"]
         else:
-            # An OPEN-at-end trade blocks everything after it.
-            next_allowed_ts = pd.Timestamp.max.tz_localize("UTC")
-
+            last_exit = pd.Timestamp.max
     return accepted
 
 
 def loss_streaks(outcomes: list[str]) -> list[int]:
-    result = []
-    n = 0
-    for x in outcomes:
-        if x == "LOSS":
-            n += 1
+    streaks, cur = [], 0
+    for o in outcomes:
+        if o == "LOSS":
+            cur += 1
         else:
-            if n:
-                result.append(n)
-            n = 0
-    if n:
-        result.append(n)
-    return result
+            if cur:
+                streaks.append(cur)
+            cur = 0
+    if cur:
+        streaks.append(cur)
+    return streaks
 
 
 def build_report(trades: list[dict], reports: dict) -> dict:
-    df = pd.DataFrame(trades)
+    realized = [t for t in trades if t["outcome"] in {"WIN", "LOSS"}]
+    wins = [t for t in realized if t["outcome"] == "WIN"]
+    losses = [t for t in realized if t["outcome"] == "LOSS"]
+    pnl = sum(float(t["pnl"]) for t in realized)
+    gross_win = sum(max(0.0, float(t["pnl"])) for t in realized)
+    gross_loss = -sum(min(0.0, float(t["pnl"])) for t in realized)
+    pf = gross_win / gross_loss if gross_loss > 0 else 0.0
 
-    if df.empty:
-        return {
-            "strategy": "HUNTER-V129-AUDITED",
-            "trades": 0,
-            "realized_trades": 0,
-            "open_at_end": 0,
-            "win_rate": 0.0,
-            "profit_factor": 0.0,
-            "net_pnl": 0.0,
-            "max_drawdown": 0.0,
-            "max_loss_streak": 0,
-            "loss_streak_list": [],
-            "trades_per_day": 0.0,
-            "data_audit": reports,
-        }
+    eq = INITIAL_EQUITY
+    peak = eq
+    max_dd = 0.0
+    for t in sorted(realized, key=lambda z: pd.Timestamp(z["exit_ts"])):
+        eq += float(t["pnl"])
+        peak = max(peak, eq)
+        max_dd = min(max_dd, eq - peak)
 
-    df = df.sort_values("entry_ts").reset_index(drop=True)
-    realized = df[df["outcome"] != "OPEN"].copy()
-
-    wins = realized[realized["outcome"] == "WIN"]
-    losses = realized[realized["outcome"] == "LOSS"]
-
-    gross_profit = float(wins["pnl"].sum())
-    gross_loss = abs(float(losses["pnl"].sum()))
-    pf = gross_profit / gross_loss if gross_loss > 0 else math.inf
-
-    df["cum_pnl"] = df["pnl"].cumsum()
-    equity = INITIAL_EQUITY + df["cum_pnl"]
-    peak = equity.cummax()
-    dd = equity - peak
-
-    streaks = loss_streaks(realized["outcome"].tolist())
-
-    start = df["entry_ts"].min()
-    end = df["entry_ts"].max()
-    days = (
-        (end - start).total_seconds() / 86400.0
-        if pd.notna(start) and pd.notna(end) and end > start
-        else 0.0
-    )
+    streak_list = loss_streaks([t["outcome"] for t in sorted(realized, key=lambda z: pd.Timestamp(z["exit_ts"]))])
+    days = max(1.0, (max(pd.Timestamp(r["exit_ts"]) for r in realized) - min(pd.Timestamp(r["entry_ts"]) for r in realized)).total_seconds() / 86400.0) if realized else 365.0
 
     per_symbol = {}
     for asset in SYMBOLS:
-        q = realized[realized["asset"] == asset]
-        n = len(q)
-        w = int((q["outcome"] == "WIN").sum())
-        per_symbol[asset] = {
-            "trades": n,
-            "win_rate": (w / n * 100.0) if n else 0.0,
-            "pnl": float(q["pnl"].sum()) if n else 0.0,
-        }
+        rr = [t for t in realized if t["asset"] == asset]
+        if not rr:
+            per_symbol[asset] = {"trades": 0, "win_rate": 0.0, "pnl": 0.0}
+        else:
+            per_symbol[asset] = {
+                "trades": len(rr),
+                "win_rate": 100.0 * sum(t["outcome"] == "WIN" for t in rr) / len(rr),
+                "pnl": sum(float(t["pnl"]) for t in rr),
+            }
 
     return {
-        "strategy": "HUNTER-V129-AUDITED",
-        "rr_nominal": RR,
-        "initial_equity": INITIAL_EQUITY,
-        "margin": TRADE_MARGIN,
-        "leverage": LEVERAGE,
-        "trades_including_open": len(df),
-        "realized_trades": len(realized),
-        "open_at_end": int((df["outcome"] == "OPEN").sum()),
-        "wins": int(len(wins)),
-        "losses": int(len(losses)),
-        "break_even": int((realized["outcome"] == "BE").sum()),
-        "win_rate": (
-            len(wins) / len(realized) * 100.0
-            if len(realized) else 0.0
-        ),
+        "strategy": "HUNTER-MTF1",
+        "integrity": {
+            "causal": True,
+            "lookahead": False,
+            "entry": "next 1H open after completed 1H signal candle",
+            "trend": "1D",
+            "context": "4H",
+            "signal": "1H",
+            "timeout": False,
+            "global_non_overlap": True,
+            "same_candle_sl_tp": "LOSS",
+            "end_of_data": "OPEN, not LOSS",
+        },
+        "parameters": {
+            "initial_equity": INITIAL_EQUITY,
+            "trade_margin": TRADE_MARGIN,
+            "leverage": LEVERAGE,
+            "fee_rate": FEE_RATE,
+            "slippage": SLIPPAGE,
+            "RR": RR,
+            "daily_ema": [EMA_FAST, EMA_SLOW],
+            "4h_ema": [EMA_FAST, EMA_SLOW],
+            "1h_pullback_ema": EMA_PULLBACK,
+        },
+        "trades": len(realized),
+        "open_at_end": sum(t["outcome"] == "OPEN" for t in trades),
+        "win_rate": 100.0 * len(wins) / len(realized) if realized else 0.0,
         "profit_factor": pf,
-        "net_pnl": float(df["pnl"].sum()),
-        "final_equity": float(INITIAL_EQUITY + df["pnl"].sum()),
-        "max_drawdown": float(dd.min()),
-        "max_loss_streak": max(streaks) if streaks else 0,
-        "loss_streak_list": streaks,
-        "trades_per_day": (
-            len(realized) / days if days > 0 else 0.0
-        ),
-        "data_audit": reports,
+        "net_pnl": pnl,
+        "final_equity": INITIAL_EQUITY + pnl,
+        "max_drawdown": max_dd,
+        "max_consecutive_losses": max(streak_list) if streak_list else 0,
+        "loss_streaks": streak_list,
+        "trades_per_day": len(realized) / days,
         "per_symbol": per_symbol,
+        "data_audit": reports,
     }
 
 
 def main():
     args = parse_args()
-    data_dir = Path(args.data_dir)
-    out_dir = Path(args.out_dir)
+    data_dir, out_dir = Path(args.data_dir), Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # GitHub Actions runners are fresh; data must be prepared in the same run.
+    print("=" * 88)
+    print("HUNTER-MTF1 — 1D → 4H → 1H")
+    print("1D = macro direction | 4H = trend/pullback context | 1H = setup + entry")
+    print("RR=1:2 | NO LOOKAHEAD | NO TIMEOUT | GLOBAL NON-OVERLAP")
+    print("=" * 88)
+
     ensure_xt_data(data_dir)
-
-    print("=" * 88)
-    print("HUNTER-V129-AUDITED — XT USDT-M FUTURES")
-    print("=" * 88)
-    print("Integrity mode: CAUSAL / NO LOOKAHEAD / NO TIMEOUT / NO OVERLAP")
-    print("Entry: next 15m open after completed signal candle")
-    print("SL/TP: 1.5 ATR / 3.0 ATR  => nominal RR 1:2")
-    print("BE: preserved for audit isolation only")
-    print()
-
-    all_candidates = []
-    data_reports = {}
-
+    all_candidates, reports = [], {}
     for asset in SYMBOLS:
         df = load_csv(data_dir, asset)
-
-        diffs = df.index.to_series().diff().dropna()
-        gaps = diffs[diffs > pd.Timedelta(minutes=15)]
-
-        data_reports[asset] = {
-            "rows": int(len(df)),
+        segs = split_segments(df)
+        gap_count = int((df.index.to_series().diff() > pd.Timedelta(minutes=15)).sum())
+        reports[asset] = {
+            "rows": len(df),
+            "gaps": gap_count,
+            "segments": len(segs),
             "start": df.index[0].isoformat(),
             "end": df.index[-1].isoformat(),
-            "gaps": int(len(gaps)),
-            "max_gap_minutes": (
-                int(gaps.max().total_seconds() / 60.0)
-                if len(gaps) else 15
-            ),
         }
+        c = []
+        for seg in segs:
+            seg_candidates = generate_candidates(asset, seg)
+            for item in seg_candidates:
+                item["segment_end_ts"] = seg.index[-1]
+            c.extend(seg_candidates)
+        print(f"{asset:6s} rows={len(df):6d} segments={len(segs):2d} candidates={len(c):4d}")
+        all_candidates.extend(c)
 
-        print(
-            f"{asset:8s} rows={len(df):6d} "
-            f"gaps={data_reports[asset]['gaps']:3d}"
-        )
-
-        for seg in split_segments(df):
-            diag = diagnose_segment(asset, seg)
-            print(
-                f"  DIAG {asset:6s} bars={diag['bars']:5d} "
-                f"H1={diag['h1_available']:5d} H4={diag['h4_ema200_ready']:5d} "
-                f"bull={diag['bull_regime']:5d} bear={diag['bear_regime']:5d} "
-                f"sweepL={diag['sweep_low']:5d} sweepS={diag['sweep_high']:5d} "
-                f"dispL={diag['displacement_up']:5d} dispS={diag['displacement_down']:5d} "
-                f"pairL={diag['long_sweep_and_displacement']:4d} "
-                f"pairS={diag['short_sweep_and_displacement']:4d} "
-                f"FINAL_L={diag['long_final']:3d} FINAL_S={diag['short_final']:3d}"
-            )
-            all_candidates.extend(generate_candidates(asset, seg))
-
-    print()
-    print("DIAGNOSTIC INTERPRETATION:")
-    print("  sweep = previous 15m candle only")
-    print("  displacement = completed signal candle only")
-    print("  HTF = only candles closed strictly before signal timestamp")
-    print("  FINAL = exact unchanged V129 signal condition")
-    print()
     print(f"Raw candidates: {len(all_candidates)}")
-
     simulated = []
-    # Re-load by asset once for simulation.
-    frames = {asset: load_csv(data_dir, asset) for asset in SYMBOLS}
-
-    for c in all_candidates:
-        # Candidate simulation must stay inside its original contiguous segment.
-        # Build a segment ending at the candidate entry and extending to dataset end,
-        # but do not cross any data gap.
-        df = frames[c["asset"]]
-        pos = df.index.get_indexer([c["entry_ts"]])[0]
-        if pos < 0:
-            continue
-
-        # Find segment start by walking backwards across exact 15m intervals.
-        start = pos
-        while start > 0:
-            if df.index[start] - df.index[start - 1] != pd.Timedelta(minutes=15):
-                break
-            start -= 1
-
-        end = pos + 1
-        while end < len(df):
-            if df.index[end] - df.index[end - 1] != pd.Timedelta(minutes=15):
-                break
-            end += 1
-
-        seg = df.iloc[start:end]
-        local_i = seg.index.get_indexer([c["entry_ts"]])[0]
-        if local_i < 0:
-            continue
-
-        c2 = dict(c)
-        c2["entry_i"] = local_i
-        simulated.append(simulate_candidate(c2, seg))
-
+    for asset in SYMBOLS:
+        df = load_csv(data_dir, asset)
+        for c in [x for x in all_candidates if x["asset"] == asset]:
+            # Restrict simulation to the source segment by entry timestamp naturally through data.
+            simulated.append(simulate_candidate(c, df))
     print(f"Simulated candidates: {len(simulated)}")
 
     accepted = enforce_global_non_overlap(simulated)
-
     print(f"Accepted non-overlapping trades: {len(accepted)}")
 
-    report = build_report(accepted, data_reports)
+    report = build_report(accepted, reports)
+    print("\n===== HUNTER-MTF1 RESULT =====")
+    for k in ["trades", "open_at_end", "win_rate", "profit_factor", "net_pnl", "final_equity", "max_drawdown", "max_consecutive_losses", "trades_per_day"]:
+        print(f"{k:24s}: {report[k]}")
+    print("\nPer symbol:")
+    for asset, v in report["per_symbol"].items():
+        print(f"  {asset:6s} trades={v['trades']:4d} WR={v['win_rate']:6.2f}% PnL=${v['pnl']:10.2f}")
 
-    trade_df = pd.DataFrame(accepted)
-    trade_df.to_csv(out_dir / "TRADES.csv", index=False)
-
-    import json
-    (out_dir / "BACKTEST_REPORT.json").write_text(
-        json.dumps(report, indent=2, default=str),
-        encoding="utf-8",
-    )
-
-    print()
-    print("=" * 88)
-    print("===== HUNTER-V129-AUDITED RESULT =====")
-    print("=" * 88)
-    print(f"Realized trades:       {report['realized_trades']}")
-    print(f"Open at dataset end:   {report['open_at_end']}")
-    print(f"Win rate:              {report['win_rate']:.2f}%")
-    print(f"Profit factor:         {report['profit_factor']:.3f}")
-    print(f"Net PnL:               ${report['net_pnl']:,.2f}")
-    print(f"Final equity:          ${report['final_equity']:,.2f}")
-    print(f"Max drawdown:          ${report['max_drawdown']:,.2f}")
-    print(f"Max loss streak:       {report['max_loss_streak']}")
-    print(f"Trades / day:          {report['trades_per_day']:.2f}")
-    print(f"RR nominal:            {RR:.2f}")
-    print()
-    print("Per-symbol:")
-    for asset, r in report["per_symbol"].items():
-        print(
-            f"  {asset:8s} trades={r['trades']:4d} "
-            f"WR={r['win_rate']:6.2f}% "
-            f"PnL=${r['pnl']:10.2f}"
-        )
-
-    print()
-    print(f"Reports written to: {out_dir.resolve()}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(accepted).to_csv(out_dir / "TRADES.csv", index=False)
+    (out_dir / "BACKTEST_REPORT.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    print(f"\nOutputs: {out_dir}")
 
 
 if __name__ == "__main__":
