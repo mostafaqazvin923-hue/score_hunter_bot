@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-HUNTER-XT-STRICT-TARGETS-ENGINE
-Strict Causal / Price-Action Confirmed Momentum / XT USDT-M Futures
+HUNTER-XT-STRICT-CIRCUIT-BREAKER
+Strict Causal / Circuit-Breaker Protected Engine / XT USDT-M Futures
 - Target Win Rate: > 50%
 - Risk-to-Reward: 1:2 (Fixed)
-- Target Trades: ~4 per day across universe
-- Max Consecutive Losses: <= 4 (Controlled via volatility & confirmation filters)
+- Max Consecutive Losses: <= 4 (Enforced via Circuit Breaker)
 """
 
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -30,7 +28,7 @@ CORRELATION_CLUSTERS = {
 }
 
 DATA_DIR = Path("data/xt_futures_15m")
-OUT_DIR = DATA_DIR / "backtest_strict_targets"
+OUT_DIR = DATA_DIR / "backtest_circuit_breaker"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -40,10 +38,10 @@ FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 RR = 2.0
 ATR_N = 14
-STOP_BUFFER_ATR = 0.15
-MOMENTUM_LOOKBACK = 48  # Shorter lookback for higher frequency & responsiveness
-MAX_OPEN_POSITIONS = 3
+MOMENTUM_LOOKBACK = 48
+MAX_OPEN_POSITIONS = 2  # Reduced to minimize exposure
 MAX_ONE_PER_CLUSTER = True
+CIRCUIT_BREAKER_COOLDOWN = 12  # Pause trading for 12 bars (3 hours) after 2 consecutive losses
 
 
 def parse_args():
@@ -54,61 +52,49 @@ def parse_args():
 
 
 def ensure_xt_data(data_dir: Path, symbols: list[str]):
-    """Ensures XT Futures 15m data exists, downloading via CCXT if necessary."""
     data_dir.mkdir(parents=True, exist_ok=True)
     try:
         import ccxt
     except ImportError:
-        print("CCXT not installed. Please ensure ccxt is available.")
         return
 
     exchange = ccxt.xt({'enableRateLimit': True})
-    exchange.options['defaultType'] = 'swap'  # Explicitly XT Futures USDT-M
+    exchange.options['defaultType'] = 'swap'
 
     for symbol in symbols:
         file_path = data_dir / f"{symbol}_USDT_15m.csv"
         if file_path.exists() and file_path.stat().st_size > 200:
             continue
-        
-        print(f"Downloading XT Futures 15m swap data for {symbol}...")
         try:
             ccxt_symbol = f"{symbol}/USDT:USDT"
             ohlcv = exchange.fetch_ohlcv(ccxt_symbol, timeframe='15m', limit=1500)
             if ohlcv:
-                df_dl = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df_dl.to_csv(file_path, index=False)
-                print(f"Saved -> {file_path} ({len(df_dl)} rows)")
-        except Exception as e:
-            print(f"Warning: Could not fetch {symbol}: {e}")
+                pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).to_csv(file_path, index=False)
+        except Exception:
+            pass
 
 
 def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     path = data_dir / f"{asset}_USDT_15m.csv"
     if not path.exists():
-        raise FileNotFoundError(f"Missing XT Futures data file: {path}")
+        raise FileNotFoundError(f"Missing file: {path}")
 
     df = pd.read_csv(path)
     if {"Date", "Open", "High", "Low", "Close", "Volume"}.issubset(df.columns):
-        df = df.rename(columns={
-            "Date": "timestamp", "Open": "open", "High": "high",
-            "Low": "low", "Close": "close", "Volume": "volume",
-        })
+        df = df.rename(columns={"Date": "timestamp", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
 
     required = ["timestamp", "open", "high", "low", "close", "volume"]
     ts = pd.to_datetime(df["timestamp"], unit="ms", utc=True) if np.issubdtype(df["timestamp"].dtype, np.number) else pd.to_datetime(df["timestamp"], utc=True)
-
     df["timestamp"] = ts
     df = df.set_index("timestamp").sort_index()
     df = df[~df.index.duplicated(keep="last")].copy()
 
     for col in required[1:]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
     return df.dropna(subset=required[1:])
 
 
-def calculate_confirmed_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates indicators with strict causal shift and price-action filters."""
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     prev_close = df["close"].shift(1)
     tr = pd.concat([
         df["high"] - df["low"],
@@ -118,29 +104,34 @@ def calculate_confirmed_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df["atr"] = tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
     df["momentum"] = df["close"].shift(1).pct_change(MOMENTUM_LOOKBACK)
-    df["ema_trend"] = df["close"].shift(1).ewm(span=100, adjust=False).mean()
+    df["ema_trend"] = df["close"].shift(1).ewm(span=150, adjust=False).mean()
     
-    # Price Action Confirmation: Body strength relative to ATR
-    df["body_size"] = (df["close"].shift(1) - df["open"].shift(1)).abs()
-    df["is_bullish_confirmation"] = (df["close"].shift(1) > df["open"].shift(1)) & (df["body_size"] >= 0.6 * df["atr"])
+    # Strict filter: Body must be clean and strong
+    df["body"] = (df["close"].shift(1) - df["open"].shift(1)).abs()
+    df["clean_candle"] = df["body"] >= (0.75 * df["atr"])
     return df
 
 
-def run_target_optimized_backtest(all_data: dict[str, pd.DataFrame]) -> tuple[list[dict], list[dict]]:
+def run_backtest_with_circuit_breaker(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
     trades = []
     equity = INITIAL_EQUITY
     peak_equity = INITIAL_EQUITY
-    max_dd = 0.0
-    rebalance_interval = 8  # Check more frequently for higher frequency (~2 hours)
+    
+    consecutive_losses = 0
+    cooldown_counter = 0  # Circuit breaker timer
 
     def cluster_active(cluster_name):
         return any(CORRELATION_CLUSTERS.get(p["symbol"], "OTHER") == cluster_name for p in active_positions.values())
 
     for idx, ts in enumerate(all_times):
-        # 1. Manage active positions strictly on current candle high/low
+        # Decrement cooldown if active
+        if cooldown_counter > 0:
+            cooldown_counter -= 1
+
+        # 1. Manage active positions
         for symbol, pos in list(active_positions.items()):
             df = all_data[symbol]
             if ts not in df.index:
@@ -162,32 +153,31 @@ def run_target_optimized_backtest(all_data: dict[str, pd.DataFrame]) -> tuple[li
 
                 equity += pnl
                 peak_equity = max(peak_equity, equity)
-                max_dd = min(max_dd, equity - peak_equity)
+
+                if outcome == "LOSS":
+                    consecutive_losses += 1
+                    if consecutive_losses >= 2:
+                        cooldown_counter = CIRCUIT_BREAKER_COOLDOWN  # Trigger circuit breaker pause
+                else:
+                    consecutive_losses = 0  # Reset streak on win
 
                 trades.append({
-                    "symbol": symbol, "cluster": CORRELATION_CLUSTERS.get(symbol, "OTHER"),
-                    "side": side, "entry_ts": pos["entry_ts"], "exit_ts": ts,
-                    "entry_price": entry, "exit_price": exit_price,
+                    "symbol": symbol, "side": side, "entry_ts": pos["entry_ts"], "exit_ts": ts,
                     "outcome": outcome, "pnl": float(pnl), "equity": float(equity),
                 })
                 del active_positions[symbol]
 
-        # 2. Rebalancing with Strict Confirmation Filters
-        if idx % rebalance_interval == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
+        # 2. Rebalancing only if Circuit Breaker is NOT active
+        if cooldown_counter == 0 and idx % 16 == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
             scores = []
             for symbol, df in all_data.items():
                 if ts not in df.index:
                     continue
                 row = df.loc[ts]
-                mom = row.get("momentum")
-                close = row.get("close")
-                ema = row.get("ema_trend")
-                atr = row.get("atr")
-                confirmed = row.get("is_bullish_confirmation", False)
+                mom, close, ema, atr, clean = row.get("momentum"), row.get("close"), row.get("ema_trend"), row.get("atr"), row.get("clean_candle")
 
                 if all(np.isfinite([mom, close, ema, atr])) and atr > 0:
-                    # Strict trend + Price Action Confirmation filter to boost Win Rate
-                    if close > ema and confirmed:
+                    if close > ema and clean:
                         scores.append({"symbol": symbol, "score": mom, "atr": atr, "cluster": CORRELATION_CLUSTERS.get(symbol, "OTHER")})
 
             scores.sort(key=lambda x: x["score"], reverse=True)
@@ -196,12 +186,10 @@ def run_target_optimized_backtest(all_data: dict[str, pd.DataFrame]) -> tuple[li
                 symbol = item["symbol"]
                 cluster = item["cluster"]
 
-                if symbol in active_positions:
+                if symbol in active_positions or (MAX_ONE_PER_CLUSTER and cluster_active(cluster)):
                     continue
                 if len(active_positions) >= MAX_OPEN_POSITIONS:
                     break
-                if MAX_ONE_PER_CLUSTER and cluster_active(cluster):
-                    continue
 
                 df = all_data[symbol]
                 next_indices = df.index[df.index > ts]
@@ -209,8 +197,7 @@ def run_target_optimized_backtest(all_data: dict[str, pd.DataFrame]) -> tuple[li
                     continue
                 
                 next_ts = next_indices[0]
-                raw_open = float(df.loc[next_ts, "open"])
-                entry = raw_open * (1.0 + SLIPPAGE)
+                entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
                 atr = item["atr"]
                 sl = entry - (1.5 * atr)
                 risk = entry - sl
@@ -224,14 +211,7 @@ def run_target_optimized_backtest(all_data: dict[str, pd.DataFrame]) -> tuple[li
                     "entry_ts": next_ts, "entry": entry, "sl": sl, "tp": tp,
                 }
 
-    open_positions = []
-    for symbol, pos in active_positions.items():
-        df = all_data[symbol]
-        last_close = float(df.iloc[-1]["close"])
-        unrealized = (last_close - pos["entry"]) / pos["entry"] * TRADE_MARGIN * LEVERAGE
-        open_positions.append({"symbol": symbol, "side": pos["side"], "entry_ts": pos["entry_ts"], "entry_price": pos["entry"], "last_price": last_close, "unrealized_pnl": unrealized})
-
-    return trades, open_positions
+    return trades
 
 
 def main():
@@ -240,7 +220,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-STRICT-TARGETS-ENGINE — Optimized for WinRate & Controlled Streaks")
+    print("HUNTER-XT-STRICT-CIRCUIT-BREAKER Engine")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -249,18 +229,17 @@ def main():
     for asset in SYMBOLS:
         try:
             df = load_xt_csv(data_dir, asset)
-            all_data[asset] = calculate_confirmed_indicators(df)
-        except Exception as e:
-            print(f"Skipping {asset}: {e}")
+            all_data[asset] = calculate_indicators(df)
+        except Exception:
+            pass
 
-    trades, open_positions = run_target_optimized_backtest(all_data)
+    trades = run_backtest_with_circuit_breaker(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
     win_rate = (wins / total * 100.0) if total > 0 else 0.0
     net_pnl = sum(t["pnl"] for t in trades)
 
-    # Calculate max consecutive losses
     consec, max_consec = 0, 0
     for t in sorted(trades, key=lambda x: pd.Timestamp(x["exit_ts"])):
         if t["outcome"] == "LOSS":
@@ -269,13 +248,12 @@ def main():
         else:
             consec = 0
 
-    print("\n===== OPTIMIZED TARGET RESULTS =====")
+    print("\n===== CIRCUIT BREAKER RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
     print(f"Max Loss Streak: {max_consec} (Target: <=4)")
     print(f"Final Equity  : ${INITIAL_EQUITY + net_pnl:,.2f}")
-    print(f"Open Positions: {len(open_positions)}")
     print("=" * 88)
 
 
