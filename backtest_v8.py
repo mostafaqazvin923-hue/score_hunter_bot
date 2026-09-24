@@ -61,7 +61,7 @@ CLUSTERS = {
 }
 
 DATA_DIR = Path("data/xt_futures_15m")
-OUT_DIR = DATA_DIR / "backtest_v4b_r1_no_regime"
+OUT_DIR = DATA_DIR / "backtest_v4b_r2_trigger_opt"
 
 INITIAL_EQUITY = 1000.0
 MARGIN = 100.0
@@ -85,8 +85,8 @@ DISP_RANGE_MULT = 1.10
 DISP_RVOL_MIN = 1.05
 
 # 15m trigger.
-MICRO_LOOKBACK = 3
-TRIGGER_WINDOW_15M = 8       # after the 1H setup; signal remains valid for 2 hours
+MICRO_LOOKBACK = 2
+TRIGGER_WINDOW_15M = 16      # after the 1H setup; signal remains valid for 4 hours
 MIN_STOP_PCT = 0.001
 MAX_STOP_PCT = 0.04
 
@@ -783,7 +783,7 @@ def run_backtest(data_dir, out_dir):
     )
 
     print("=" * 90)
-    print("HUNTER-V4B-R1 — NO 4H HARD REGIME / XT USDT-M FUTURES / 15m / 365-DAY BACKTEST")
+    print("HUNTER-V4B-R2 — TRIGGER OPTIMIZATION / NO 4H HARD REGIME / XT USDT-M FUTURES / 15m / 365-DAY BACKTEST")
     print("=" * 90)
     print(f"Raw candidates          : {len(all_candidates)}")
     print(f"Simulated closed        : {len(all_closed)}")
@@ -848,7 +848,7 @@ def main():
     p.add_argument("--data-dir", default=str(DATA_DIR))
     p.add_argument("--out-dir", default=str(OUT_DIR))
     p.add_argument("--download", action="store_true",
-                   help="Download XT data when CSVs are missing.")
+                   help="Download XT data when CSVs are missing (kept for compatibility).")
     args = p.parse_args()
 
     data_dir = Path(args.data_dir)
