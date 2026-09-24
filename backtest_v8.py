@@ -758,7 +758,7 @@ def enforce_global_non_overlap(trades: list[dict]) -> list[dict]:
         if t["exit_ts"] is not None:
             last_exit = t["exit_ts"]
         else:
-            last_exit = pd.Timestamp.max
+            last_exit = pd.Timestamp.max.tz_localize("UTC")
     return accepted
 
 
