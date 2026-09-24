@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-HUNTER-XT-STYLE1-STAT-ARB
-Cross-Sectional Statistical Mean Reversion Engine (1h Timeframe)
-- Focus: High Win Rate via Relative Value / Z-Score Reversion
-- Risk Management: 1:2 RR, $100 Margin, 50x Leverage, Circuit Breaker
+HUNTER-XT-STYLE2-ORDERFLOW
+Order Flow & Volume Delta Imbalance Engine (1h Timeframe)
+- Focus: Trading with Institutional Aggressive Buying Pressure
+- Risk Management: 1:2 RR, $100 Margin, 50x Leverage, Strict Circuit Breaker
 """
 
 from __future__ import annotations
@@ -26,8 +26,8 @@ CORRELATION_CLUSTERS = {
     "WIF": "MEME",
 }
 
-DATA_DIR = Path("data/xt_futures_style1")
-OUT_DIR = DATA_DIR / "backtest_style1"
+DATA_DIR = Path("data/xt_futures_style2")
+OUT_DIR = DATA_DIR / "backtest_style2"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -37,11 +37,10 @@ FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 RR = 2.0
 ATR_N = 14
-LOOKBACK_RETURN = 24  # 24 hours lookback for cross-sectional return
-Z_ENTRY_THRESHOLD = -1.5  # Oversold threshold relative to peer group
-MAX_OPEN_POSITIONS = 3
+VOLUME_IMBALANCE_THRESHOLD = 0.68  # 68% of volume must be aggressive buying
+MAX_OPEN_POSITIONS = 2
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 12
+CIRCUIT_BREAKER_COOLDOWN = 16  # Pause after 2 consecutive losses to strictly control max streak
 
 
 def parse_args():
@@ -94,22 +93,42 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     return df.dropna(subset=required[1:])
 
 
-def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates causal indicators on 1h timeframe."""
+def calculate_orderflow_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculates causal Order Flow Volume Delta Imbalance and Trend Filter strictly using shift(1)."""
     prev_close = df["close"].shift(1)
+    
+    # ATR for stop loss sizing
     tr = pd.concat([
         df["high"] - df["low"],
         (df["high"] - prev_close).abs(),
         (df["low"] - prev_close).abs(),
     ], axis=1).max(axis=1)
-
     df["atr"] = tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
-    # Causal percentage return over lookback
-    df["return_period"] = prev_close.pct_change(LOOKBACK_RETURN)
+
+    # Macro Trend Filter: Price must be above 50 EMA
+    df["ema_trend"] = prev_close.ewm(span=50, adjust=False).mean()
+    df["trend_bullish"] = prev_close > df["ema_trend"]
+
+    # Volume Delta Imbalance Approximation (Buying Pressure inside the candle)
+    hl_range = df["high"] - df["low"] + 1e-8
+    buy_volume_proxy = df["volume"] * (df["close"] - df["low"]) / hl_range
+    
+    # Shifted to ensure zero lookahead
+    prev_volume = df["volume"].shift(1)
+    prev_buy_volume = buy_volume_proxy.shift(1)
+    
+    df["buy_delta_ratio"] = prev_buy_volume / (prev_volume + 1e-8)
+    
+    # Volume surge check (Volume must be higher than its 20-period average)
+    df["avg_volume"] = prev_volume.rolling(window=20).mean()
+    df["volume_surge"] = prev_volume > (1.2 * df["avg_volume"])
+
+    # Final Setup Condition
+    df["setup_valid"] = df["trend_bullish"] & (df["buy_delta_ratio"] >= VOLUME_IMBALANCE_THRESHOLD) & df["volume_surge"]
     return df
 
 
-def run_stat_arb_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_orderflow_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -127,7 +146,7 @@ def run_stat_arb_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
         if cooldown_counter > 0:
             cooldown_counter -= 1
 
-        # 1. Manage active positions on 1h high/low
+        # 1. Manage active positions strictly on 1h high/low
         for symbol, pos in list(active_positions.items()):
             df = all_data[symbol]
             if ts not in df.index:
@@ -163,62 +182,42 @@ def run_stat_arb_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 })
                 del active_positions[symbol]
 
-        # 2. Cross-Sectional Z-Score Calculation (Causal & Point-in-Time)
+        # 2. Entry Execution (No-Lookahead Order Flow Imbalance)
         if cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
-            cross_returns = {}
             for symbol, df in all_data.items():
-                if ts in df.index:
-                    val = df.loc[ts, "return_period"]
-                    if np.isfinite(val):
-                        cross_returns[symbol] = val
+                if ts not in df.index:
+                    continue
+                row = df.loc[ts]
+                if not row.get("setup_valid", False):
+                    continue
 
-            if len(cross_returns) >= 5:  # Need minimum breadth
-                ret_values = list(cross_returns.values())
-                mean_ret = np.mean(ret_values)
-                std_ret = np.std(ret_values)
+                cluster = CORRELATION_CLUSTERS.get(symbol, "OTHER")
+                if symbol in active_positions or (MAX_ONE_PER_CLUSTER and cluster_active(cluster)):
+                    continue
+                if len(active_positions) >= MAX_OPEN_POSITIONS:
+                    break
 
-                if std_ret > 0:
-                    scores = []
-                    for symbol, ret in cross_returns.items():
-                        z_score = (ret - mean_ret) / std_ret
-                        # If Z-score is deeply negative, asset is oversold relative to peers -> Mean Reversion Long
-                        if z_score <= Z_ENTRY_THRESHOLD:
-                            scores.append({"symbol": symbol, "z_score": z_score})
+                next_indices = df.index[df.index > ts]
+                if len(next_indices) == 0:
+                    continue
+                
+                next_ts = next_indices[0]
+                entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
+                atr = row["atr"]
+                if not np.isfinite(atr) or atr <= 0:
+                    continue
 
-                    # Sort by most oversold
-                    scores.sort(key=lambda x: x["z_score"])
+                sl = entry - (1.5 * atr)
+                risk = entry - sl
+                if risk <= 0:
+                    continue
+                
+                tp = entry + (RR * risk)
 
-                    for item in scores:
-                        symbol = item["symbol"]
-                        cluster = CORRELATION_CLUSTERS.get(symbol, "OTHER")
-
-                        if symbol in active_positions or (MAX_ONE_PER_CLUSTER and cluster_active(cluster)):
-                            continue
-                        if len(active_positions) >= MAX_OPEN_POSITIONS:
-                            break
-
-                        df = all_data[symbol]
-                        next_indices = df.index[df.index > ts]
-                        if len(next_indices) == 0:
-                            continue
-                        
-                        next_ts = next_indices[0]
-                        entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
-                        atr = float(df.loc[ts, "atr"])
-                        if not np.isfinite(atr) or atr <= 0:
-                            continue
-
-                        sl = entry - (1.5 * atr)
-                        risk = entry - sl
-                        if risk <= 0:
-                            continue
-                        
-                        tp = entry + (RR * risk)
-
-                        active_positions[symbol] = {
-                            "symbol": symbol, "side": "LONG",
-                            "entry_ts": next_ts, "entry": entry, "sl": sl, "tp": tp,
-                        }
+                active_positions[symbol] = {
+                    "symbol": symbol, "side": "LONG",
+                    "entry_ts": next_ts, "entry": entry, "sl": sl, "tp": tp,
+                }
 
     return trades
 
@@ -229,7 +228,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-STYLE1-STAT-ARB (Cross-Sectional Z-Score Mean Reversion - 1h)")
+    print("HUNTER-XT-STYLE2-ORDERFLOW (Volume Delta Imbalance Engine - 1h)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -238,11 +237,11 @@ def main():
     for asset in SYMBOLS:
         try:
             df = load_xt_csv(data_dir, asset)
-            all_data[asset] = calculate_features(df)
+            all_data[asset] = calculate_orderflow_features(df)
         except Exception:
             pass
 
-    trades = run_stat_arb_backtest(all_data)
+    trades = run_orderflow_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -257,7 +256,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== STYLE 1 STAT-ARB RESULTS =====")
+    print("\n===== STYLE 2 ORDER FLOW RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
@@ -266,5 +265,5 @@ def main():
     print("=" * 88)
 
 
-if __name__ == "__main__":
+if __name__ == "__main"></id>
     main()
