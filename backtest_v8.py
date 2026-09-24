@@ -29,6 +29,7 @@ import requests
 BASE = "https://fapi.xt.com"
 SYMBOL_LIST_URL = f"{BASE}/future/market/v1/public/symbol/list"
 KLINE_URL = f"{BASE}/future/market/v1/public/q/kline"
+BRACKET_URL = f"{BASE}/future/market/v1/public/leverage/bracket/list"
 
 INTERVAL = "15m"
 LIMIT = 1500
@@ -209,7 +210,7 @@ def fetch_batch(session, symbol, start_ms, end_ms):
     return normalize_rows(kline_rows(payload), symbol)
 
 
-def audit(df, symbol):
+def audit(df, symbol, start_dt=None, end_dt=None):
     if df.empty:
         raise RuntimeError(f"{symbol}: empty dataset")
 
@@ -222,19 +223,79 @@ def audit(df, symbol):
     if bad.any():
         raise RuntimeError(f"{symbol}: {int(bad.sum())} invalid OHLCV rows")
 
+    duplicates = int(df["Date"].duplicated().sum())
+    if duplicates:
+        raise RuntimeError(f"{symbol}: duplicate timestamps remain: {duplicates}")
+
     diffs = df["Date"].diff().dropna()
-    gaps = diffs[diffs > pd.Timedelta(minutes=15)]
     wrong = diffs[diffs != pd.Timedelta(minutes=15)]
+    gaps = diffs[diffs > pd.Timedelta(minutes=15)]
+
+    if len(wrong):
+        raise RuntimeError(
+            f"{symbol}: non-15m intervals remain: {len(wrong)}"
+        )
+
+    if start_dt is not None and df["Date"].iloc[0] > pd.Timestamp(start_dt) + pd.Timedelta(minutes=15):
+        raise RuntimeError(f"{symbol}: historical coverage starts too late: {df['Date'].iloc[0]}")
+
+    # The last row must be a completed 15m candle.
+    now = pd.Timestamp.now(tz="UTC")
+    if df["Date"].iloc[-1] + pd.Timedelta(minutes=15) > now:
+        raise RuntimeError(f"{symbol}: current/forming candle was not removed")
 
     return {
         "rows": int(len(df)),
         "start": df["Date"].iloc[0].isoformat(),
         "end": df["Date"].iloc[-1].isoformat(),
-        "duplicates": int(df["Date"].duplicated().sum()),
+        "duplicates": duplicates,
         "gaps": int(len(gaps)),
+        "missing_bars": int((diffs[diffs > pd.Timedelta(minutes=15)] / pd.Timedelta(minutes=15) - 1).sum()) if len(gaps) else 0,
         "max_gap_minutes": int(gaps.max().total_seconds() / 60) if len(gaps) else 15,
         "wrong_intervals": int(len(wrong)),
     }
+
+
+def fetch_brackets(session, symbol):
+    """Fetch current public leverage/risk brackets for one XT USDT-M symbol."""
+    payload = api_json(session, BRACKET_URL, {"symbol": symbol.strip().lower()})
+    result = payload.get("result")
+    if isinstance(result, dict):
+        result = result.get("leverageBrackets") or result.get("items") or []
+    if not isinstance(result, list):
+        raise RuntimeError(f"{symbol}: invalid leverage bracket response")
+
+    # XT may return either a flat bracket list or a symbol wrapper containing
+    # a `leverageBrackets` list. Normalize both shapes.
+    flat = []
+    for row in result:
+        if isinstance(row, dict) and isinstance(row.get("leverageBrackets"), list):
+            flat.extend(row["leverageBrackets"])
+        else:
+            flat.append(row)
+
+    brackets = []
+    for row in flat:
+        if not isinstance(row, dict):
+            continue
+        rate = row.get("maintMarginRate")
+        max_value = row.get("maxNominalValue")
+        min_lev = row.get("minLeverage")
+        max_lev = row.get("maxLeverage")
+        try:
+            brackets.append({
+                "bracket": int(row.get("bracket", len(brackets))),
+                "maintMarginRate": float(rate),
+                "maxNominalValue": float(max_value),
+                "minLeverage": float(min_lev) if min_lev is not None else None,
+                "maxLeverage": float(max_lev) if max_lev is not None else None,
+            })
+        except (TypeError, ValueError):
+            continue
+
+    if not brackets:
+        raise RuntimeError(f"{symbol}: no usable leverage brackets")
+    return sorted(brackets, key=lambda x: x["maxNominalValue"])
 
 
 def download_symbol(session, symbol, start_dt, end_dt):
@@ -319,7 +380,7 @@ def download_symbol(session, symbol, start_dt, end_dt):
     if not df.empty and df["Date"].iloc[-1] + pd.Timedelta(minutes=15) > current:
         df = df.iloc[:-1].copy()
 
-    report = audit(df, symbol)
+    report = audit(df, symbol, start_dt=start_dt, end_dt=end_dt)
     report["api_requests"] = calls
     return df, report
 
@@ -403,6 +464,11 @@ MIN_EXPANSION = 1.10
 # segments, so a gap cannot contaminate rolling windows across the gap.
 MAX_ALLOWED_GAP_BARS = 0
 
+# XT exposes leverage brackets publicly. The engine uses the first applicable
+# bracket for the fixed $5,000 notional. The bracket data is fetched at runtime
+# and stored in CONTRACT_META.json; it is NOT hard-coded.
+DEFAULT_MAINTENANCE_MARGIN_RATE = 0.005
+
 OUTPUT_DEFAULT = Path("data/xt_futures_15m/backtest_v3")
 
 
@@ -431,7 +497,6 @@ def load_csv(data_dir: Path, asset: str) -> pd.DataFrame:
         raise FileNotFoundError(f"Missing XT Futures data file: {path}")
 
     df = pd.read_csv(path)
-
     required = {"Timestamp", "Open", "High", "Low", "Close", "Volume"}
     missing = required.difference(df.columns)
     if missing:
@@ -442,9 +507,8 @@ def load_csv(data_dir: Path, asset: str) -> pd.DataFrame:
 
     df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
     df = df.dropna(subset=["Date", "Open", "High", "Low", "Close", "Volume"])
-    df = df[(df["Open"] > 0) & (df["Close"] > 0) & (df["High"] >= df["Low"])]
+    df = df[(df["Open"] > 0) & (df["High"] > 0) & (df["Low"] > 0) & (df["Close"] > 0)]
 
-    # Strong OHLC sanity checks.
     bad = (
         (df["High"] < df[["Open", "Close"]].max(axis=1))
         | (df["Low"] > df[["Open", "Close"]].min(axis=1))
@@ -453,106 +517,81 @@ def load_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     if bad.any():
         raise RuntimeError(f"{asset}: {int(bad.sum())} invalid OHLCV rows")
 
-    df = (
-        df.drop_duplicates(subset=["Timestamp"], keep="last")
-        .sort_values("Timestamp")
-        .reset_index(drop=True)
-    )
+    duplicates = int(df["Timestamp"].duplicated().sum())
+    if duplicates:
+        raise RuntimeError(f"{asset}: duplicate timestamps in CSV: {duplicates}")
 
+    df = df.sort_values("Timestamp").reset_index(drop=True)
     if len(df) < 1000:
         raise RuntimeError(f"{asset}: too few rows ({len(df)})")
 
     delta = df["Timestamp"].diff().dropna()
+    wrong = delta[delta != TIMEFRAME_MS]
+    if len(wrong):
+        non_gap_wrong = wrong[wrong < TIMEFRAME_MS]
+        if len(non_gap_wrong):
+            raise RuntimeError(f"{asset}: non-15m intervals/overlaps remain: {len(non_gap_wrong)}")
+
     gap_mask = delta > TIMEFRAME_MS
     gaps = int(gap_mask.sum())
-    max_gap_ms = int(delta.max()) if not delta.empty else 0
+    missing_bars = int(((delta[gap_mask] // TIMEFRAME_MS) - 1).sum()) if gaps else 0
+    max_gap_bars = int(((delta[gap_mask].max() // TIMEFRAME_MS) - 1)) if gaps else 0
 
-    # Gaps are allowed in the collected market history, but strategy
-    # calculations must not roll across them.
+    # New segment after every missing candle. No rolling indicator may cross it.
     df["_segment"] = gap_mask.cumsum().astype(int)
-
     df.attrs["gaps"] = gaps
-    df.attrs["max_gap_bars"] = max(0, math.ceil(max_gap_ms / TIMEFRAME_MS) - 1)
+    df.attrs["missing_bars"] = missing_bars
+    df.attrs["max_gap_bars"] = max_gap_bars
     df.attrs["path"] = str(path)
     return df
 
 
 def prepare_segment(seg: pd.DataFrame) -> pd.DataFrame:
-    """Prepare one contiguous 15m segment with causal HTF context."""
+    """Prepare one contiguous 15m segment with only completed 1H bars."""
     x = seg.copy().set_index("Date")
 
-    # Resample contiguous 15m candles to completed 1H candles.
     h = (
         x[["Open", "High", "Low", "Close", "Volume"]]
         .resample("1h", label="left", closed="left")
         .agg({
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum",
+            "Open": "first", "High": "max", "Low": "min",
+            "Close": "last", "Volume": "sum",
         })
-        .dropna()
     )
+    counts = x["Close"].resample("1h", label="left", closed="left").count()
+    h["count_15m"] = counts
+    # Never treat a partial hour as a completed HTF candle.
+    h = h[h["count_15m"] == 4].drop(columns=["count_15m"]).dropna()
 
     if len(h) < 25:
         return pd.DataFrame()
 
     h["bar_range"] = h["High"] - h["Low"]
     h["atr14"] = h["bar_range"].rolling(HOUR_ATR_PERIOD).mean()
-    h["range20"] = (
-        h["High"].rolling(HOUR_RANGE_PERIOD).max()
-        - h["Low"].rolling(HOUR_RANGE_PERIOD).min()
-    )
+    h["range20"] = h["High"].rolling(HOUR_RANGE_PERIOD).max() - h["Low"].rolling(HOUR_RANGE_PERIOD).min()
     h["atr20"] = h["bar_range"].rolling(HOUR_RANGE_PERIOD).mean()
-
     h["compressed"] = (
         (h["bar_range"] < 0.75 * h["atr20"])
         & (h["range20"] < 4.0 * h["atr14"])
     )
-
-    # Box built from the four completed hours BEFORE the reference hour.
     h["box_high"] = h["High"].rolling(BOX_PERIOD).max().shift(1)
     h["box_low"] = h["Low"].rolling(BOX_PERIOD).min().shift(1)
-
-    # Compression must have occurred in one of the two completed hours
-    # before the 15m signal context.
     h["comp_recent"] = (
-        h["compressed"]
-        .rolling(COMP_RECENT_PERIOD)
-        .max()
-        .shift(1)
-        .fillna(0)
-        .astype(bool)
+        h["compressed"].rolling(COMP_RECENT_PERIOD).max().shift(1).fillna(0).astype(bool)
     )
 
-    # Map hourly context to 15m. A 15m candle inside hour H must only see
-    # the last COMPLETED hour H-1, never the currently-forming H.
+    # Signal candle at 15m time T sees only the last completed hour T-1h.
     x["hour_key"] = x.index.floor("1h")
-    hctx = h[["box_high", "box_low", "comp_recent"]].copy()
-    hctx.index.name = "hour_key"
-    x = x.join(hctx, on="hour_key")
-
-    # For every 15m candle in H, the direct H row is not complete.
-    # Shift by one hour in the context mapping.
     x["context_hour"] = x["hour_key"] - pd.Timedelta(hours=1)
-    x = x.drop(columns=["box_high", "box_low", "comp_recent"])
-    x = x.join(
-        hctx.rename(columns={
-            "box_high": "box_high",
-            "box_low": "box_low",
-            "comp_recent": "comp_recent",
-        }),
-        on="context_hour",
-    )
+    hctx = h[["box_high", "box_low", "comp_recent"]].copy()
+    hctx.index.name = "context_hour"
+    x = x.join(hctx, on="context_hour")
 
     x["range"] = x["High"] - x["Low"]
     x["body"] = (x["Close"] - x["Open"]).abs()
     x["range20_mean"] = x["range"].rolling(RANGE_MEAN_PERIOD).mean()
     vol_mean = x["Volume"].rolling(RVOL_PERIOD).mean().replace(0, np.nan)
     x["rvol20"] = x["Volume"] / vol_mean
-
-    x = x.drop(columns=["hour_key", "context_hour"])
     return x.reset_index()
 
 
@@ -583,15 +622,16 @@ def adverse_exit_price(raw_exit: float, side: str) -> float:
     return raw_exit * (1.0 + SLIPPAGE)
 
 
-def build_trade(
-    asset: str,
-    side: str,
-    signal_idx: int,
-    entry_idx: int,
-    df: pd.DataFrame,
-    box_high: float,
-    box_low: float,
-):
+def applicable_bracket(brackets, notional):
+    ordered = sorted(brackets or [], key=lambda b: b.get("maxNominalValue", float("inf")))
+    for b in ordered:
+        cap = b.get("maxNominalValue")
+        if cap is None or notional <= float(cap):
+            return b
+    return ordered[-1] if ordered else {"maintMarginRate": DEFAULT_MAINTENANCE_MARGIN_RATE}
+
+
+def build_trade(asset, side, signal_idx, entry_idx, df, box_high, box_low, bracket):
     raw_entry = float(df.iloc[entry_idx]["Open"])
     entry = adverse_entry_price(raw_entry, side)
 
@@ -608,191 +648,142 @@ def build_trade(
             return None
         tp = entry - RR * risk
 
+    mmr = float(bracket.get("maintMarginRate", DEFAULT_MAINTENANCE_MARGIN_RATE))
+    # Approximate isolated liquidation threshold from the current XT risk tier.
+    # XT's actual liquidation engine uses mark price; our OHLCV has last-traded
+    # candles only, so we use this solely as a validity guard, not as a claim of
+    # exact historical liquidation execution.
+    if side == "LONG":
+        liq = entry * (1.0 - (1.0 / LEVERAGE) + mmr)
+    else:
+        liq = entry * (1.0 + (1.0 / LEVERAGE) - mmr)
+
+    if (side == "LONG" and sl <= liq) or (side == "SHORT" and sl >= liq):
+        return None
+
+    k = entry_idx
     exit_idx = None
     outcome = None
     raw_exit = None
-
-    k = entry_idx
     while k < len(df):
         c = df.iloc[k]
-        low = float(c["Low"])
-        high = float(c["High"])
-
+        low, high = float(c["Low"]), float(c["High"])
         hit_sl = low <= sl if side == "LONG" else high >= sl
         hit_tp = high >= tp if side == "LONG" else low <= tp
-
         if hit_sl and hit_tp:
-            outcome = "LOSS"
-            raw_exit = sl
+            outcome, raw_exit = "LOSS", sl
             exit_idx = k
             break
         if hit_sl:
-            outcome = "LOSS"
-            raw_exit = sl
+            outcome, raw_exit = "LOSS", sl
             exit_idx = k
             break
         if hit_tp:
-            outcome = "WIN"
-            raw_exit = tp
+            outcome, raw_exit = "WIN", tp
             exit_idx = k
             break
-
         k += 1
 
+    base = {
+        "asset": asset, "side": side, "signal_idx": signal_idx, "entry_idx": entry_idx,
+        "entry_time": df.iloc[entry_idx]["Date"], "entry": entry, "sl": sl, "tp": tp,
+        "risk": risk, "liq_price_approx": liq, "mmr": mmr, "cluster": CLUSTERS[asset],
+    }
     if exit_idx is None:
-        return {
-            "closed": False,
-            "asset": asset,
-            "side": side,
-            "signal_idx": signal_idx,
-            "entry_idx": entry_idx,
-            "entry_time": df.iloc[entry_idx]["Date"],
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "risk": risk,
-            "exit_idx": None,
-            "exit_time": pd.NaT,
-            "exit": np.nan,
-            "outcome": "OPEN_END",
-            "pnl": 0.0,
-            "cluster": CLUSTERS[asset],
-        }
+        base.update({"closed": False, "exit_idx": None, "exit_time": pd.NaT,
+                     "exit": np.nan, "outcome": "OPEN_END", "pnl": 0.0})
+        return base
 
     exit_price = adverse_exit_price(float(raw_exit), side)
     qty = NOTIONAL / entry
-
-    if side == "LONG":
-        gross = qty * (exit_price - entry)
-    else:
-        gross = qty * (entry - exit_price)
-
+    gross = qty * (exit_price - entry) if side == "LONG" else qty * (entry - exit_price)
     entry_fee = NOTIONAL * FEE_RATE
-    exit_notional = qty * exit_price
-    exit_fee = exit_notional * FEE_RATE
+    exit_fee = (qty * exit_price) * FEE_RATE
     pnl = gross - entry_fee - exit_fee
-
-    return {
-        "closed": True,
-        "asset": asset,
-        "side": side,
-        "signal_idx": signal_idx,
-        "entry_idx": entry_idx,
-        "entry_time": df.iloc[entry_idx]["Date"],
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "risk": risk,
-        "exit_idx": exit_idx,
-        "exit_time": df.iloc[exit_idx]["Date"],
-        "exit": exit_price,
-        "outcome": outcome,
-        "pnl": float(pnl),
-        "cluster": CLUSTERS[asset],
-    }
+    base.update({
+        "closed": True, "exit_idx": exit_idx, "exit_time": df.iloc[exit_idx]["Date"],
+        "exit": exit_price, "outcome": outcome, "pnl": float(pnl),
+    })
+    return base
 
 
-def run_symbol(asset: str, df: pd.DataFrame):
-    candidates = []
-    open_end = []
-
-    # Use an explicit while loop so that, after a position opens, the scanner
-    # jumps past the candle on which its result becomes known. This is a true
-    # no-overlap implementation, not merely a post-hoc filter.
-    i = 1
-    n = len(df)
-
-    while i < n - 1:
+def run_symbol(asset, df, bracket):
+    candidates, open_end = [], []
+    # Generate EVERY causal signal candidate. Do not skip future signals merely
+    # because a previous candidate would have remained open; portfolio selection
+    # is a separate stage and must be the only place that enforces overlap.
+    for i in range(1, len(df) - 1):
         r = df.iloc[i]
-
-        if not bool(r["comp_recent"]):
-            i += 1
+        if not bool(r.get("comp_recent", False)):
             continue
-
-        bh = r["box_high"]
-        bl = r["box_low"]
-        rm = r["range20_mean"]
-        rv = r["rvol20"]
-
-        if any(pd.isna(v) for v in [bh, bl, rm, rv]):
-            i += 1
+        vals = [r.get("box_high"), r.get("box_low"), r.get("range20_mean"), r.get("rvol20")]
+        if any(pd.isna(v) for v in vals):
             continue
+        bh, bl = float(r["box_high"]), float(r["box_low"])
         if bh <= bl:
-            i += 1
             continue
-
-        expansion = float(r["range"]) > MIN_EXPANSION * float(rm)
-        volume_ok = float(rv) >= MIN_RVOL
-        if not expansion or not volume_ok:
-            i += 1
+        if float(r["range"]) <= MIN_EXPANSION * float(r["range20_mean"]):
+            continue
+        if float(r["rvol20"]) < MIN_RVOL:
             continue
 
         side = None
-        if float(r["Close"]) > float(bh) and float(r["Open"]) <= float(bh):
+        if float(r["Close"]) > bh and float(r["Open"]) <= bh:
             side = "LONG"
-        elif float(r["Close"]) < float(bl) and float(r["Open"]) >= float(bl):
+        elif float(r["Close"]) < bl and float(r["Open"]) >= bl:
             side = "SHORT"
-
         if side is None:
-            i += 1
             continue
 
-        entry_idx = i + 1
-        trade = build_trade(
-            asset, side, i, entry_idx, df, float(bh), float(bl)
-        )
-
+        trade = build_trade(asset, side, i, i + 1, df, bh, bl, bracket)
         if trade is None:
-            i += 1
             continue
-
         if trade["closed"]:
             candidates.append(trade)
-            # Result becomes known on exit_idx. The next signal must be on a
-            # strictly later candle, never the same candle.
-            i = int(trade["exit_idx"]) + 1
         else:
             open_end.append(trade)
-            # No forced exit and no future data: no further signal can be
-            # evaluated safely after this open position.
-            break
-
     return candidates, open_end
 
 
 def portfolio_filter(candidates):
-    """Chronological portfolio simulation with strict no-same-close-candle."""
-    candidates = sorted(
-        candidates,
-        key=lambda t: (t["entry_time"], t["asset"], t["side"])
-    )
-
+    """Portfolio simulation with max positions, cluster lock, equity and no same-close reentry."""
+    candidates = sorted(candidates, key=lambda t: (t["entry_time"], t["asset"], t["side"], t["signal_idx"]))
     accepted = []
     active = []
+    realized_equity = INITIAL_CAPITAL
     close_times = set()
 
     for t in candidates:
         et = t["entry_time"]
+        # Realize positions that closed before this entry candle. Same-candle
+        # closes remain blocked by close_times below.
+        still = []
+        for p in active:
+            if p["exit_time"] < et:
+                realized_equity += float(p["pnl"])
+            else:
+                still.append(p)
+        active = still
 
-        # Remove positions that have already closed strictly BEFORE entry.
-        active = [p for p in active if p["exit_time"] >= et]
-
-        # Never enter on a candle where any accepted trade closes.
         if et in close_times:
             continue
-
         if len(active) >= MAX_POSITIONS:
             continue
-
-        if MAX_ONE_PER_CLUSTER and any(
-            p["cluster"] == t["cluster"] for p in active
-        ):
+        if MAX_ONE_PER_CLUSTER and any(p["cluster"] == t["cluster"] for p in active):
+            continue
+        # Fixed isolated margin: a new $100 margin position cannot be opened
+        # when realized equity is below the required margin.
+        reserved = len(active) * TRADE_MARGIN
+        if realized_equity - reserved < TRADE_MARGIN:
             continue
 
         accepted.append(t)
         active.append(t)
         close_times.add(t["exit_time"])
 
+    # Realize any remaining accepted trades so final equity is reproducible.
+    for p in active:
+        realized_equity += float(p["pnl"])
     return accepted
 
 
@@ -907,8 +898,9 @@ def summarize(trades: pd.DataFrame, raw_candidates: int, open_positions: int):
     }
 
 
-def backtest_main():
-    args = parse_args()
+def backtest_main(args=None):
+    if args is None:
+        args = parse_args()
     data_dir = Path(args.data_dir)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -923,31 +915,34 @@ def backtest_main():
 
     prepared = {}
     data_audit = []
+    meta_path = data_dir / "CONTRACT_META.json"
+    if not meta_path.exists():
+        raise RuntimeError(f"Missing {meta_path}; rerun collector so current XT leverage brackets are captured.")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    brackets_by_asset = meta.get("brackets", {})
 
     for asset in SYMBOLS:
         raw = load_csv(data_dir, asset)
         p = prepare(raw)
         if p.empty:
             raise RuntimeError(f"{asset}: no usable prepared data")
-
+        bracket = applicable_bracket(brackets_by_asset.get(asset, []), NOTIONAL)
         prepared[asset] = p
         data_audit.append({
-            "asset": asset,
-            "rows": len(raw),
-            "prepared_rows": len(p),
+            "asset": asset, "rows": len(raw), "prepared_rows": len(p),
             "gaps": int(raw.attrs.get("gaps", 0)),
+            "missing_bars": int(raw.attrs.get("missing_bars", 0)),
             "max_gap_bars": int(raw.attrs.get("max_gap_bars", 0)),
+            "maintenance_margin_rate": float(bracket.get("maintMarginRate", DEFAULT_MAINTENANCE_MARGIN_RATE)),
         })
-        print(
-            f"{asset:<7} rows={len(raw):,} prepared={len(p):,} "
-            f"gaps={raw.attrs.get('gaps', 0)}"
-        )
+        print(f"{asset:<7} rows={len(raw):,} prepared={len(p):,} gaps={raw.attrs.get('gaps', 0)} missing_bars={raw.attrs.get('missing_bars', 0)} mmr={float(bracket.get('maintMarginRate', DEFAULT_MAINTENANCE_MARGIN_RATE)):.4f}")
 
     candidates = []
     open_end = []
 
     for asset, df in prepared.items():
-        c, o = run_symbol(asset, df)
+        bracket = applicable_bracket(brackets_by_asset.get(asset, []), NOTIONAL)
+        c, o = run_symbol(asset, df, bracket)
         candidates.extend(c)
         open_end.extend(o)
         print(f"Signals {asset:<7}: closed={len(c):>5} open_end={len(o):>3}")
@@ -988,6 +983,7 @@ def backtest_main():
         "leverage": LEVERAGE,
         "fee_rate": FEE_RATE,
         "slippage": SLIPPAGE,
+        "liquidation_model": "current_XT_risk_bracket_guard_only",
         "max_positions": MAX_POSITIONS,
         "max_one_per_cluster": MAX_ONE_PER_CLUSTER,
         "no_timeout": True,
@@ -1018,110 +1014,89 @@ def backtest_main():
 
 
 def ensure_xt_data(data_dir: Path, days: int = 365):
-    """Download real XT Futures data into data_dir when files are absent.
-
-    This fixes the GitHub Actions failure mode where the collector and
-    backtest were separate runs/workspaces. The backtest is now self-contained:
-    if the CSVs are not present in the current runner workspace, it downloads
-    them first using the proven XT collector logic.
-    """
-    expected_files = [data_dir / f"{asset}_USDT_15m.csv" for asset in SYMBOLS]
-    missing = [p for p in expected_files if not p.exists()]
-    if not missing:
-        print("\nXT Futures CSVs found locally; collector download skipped.")
-        return
-
+    """Ensure one audited XT Futures dataset + current risk brackets exist."""
     data_dir.mkdir(parents=True, exist_ok=True)
-    print("\n=== XT FUTURES DATA NOT FOUND — DOWNLOADING NOW ===")
-    print(f"Missing files: {len(missing)}/{len(expected_files)}")
-    print(f"Output: {data_dir.resolve()}")
+    end_floor = pd.Timestamp.now(tz="UTC").floor("15min") - pd.Timedelta(minutes=15)
+    end_dt = end_floor.to_pydatetime()
+    start_dt = (end_floor - pd.Timedelta(days=days) + pd.Timedelta(minutes=15)).to_pydatetime()
+    expected = days * 24 * 4
 
-    end_dt = now_utc()
-    start_dt = end_dt - timedelta(days=days)
     session = requests.Session()
-    session.headers.update({"User-Agent": "HUNTER-XT-Futures-Backtest/1.0"})
-
+    session.headers.update({"User-Agent": "HUNTER-XT-Futures-Backtest/2.0"})
     discovered = discover_symbols(session)
-    print(f"XT Futures symbols discovered: {len(discovered)}")
-
     resolved = {}
-    unresolved = []
     for asset in SYMBOLS:
         actual = resolve_symbol(asset, discovered)
         if actual is None:
-            unresolved.append(asset)
-        else:
-            resolved[asset] = actual
+            raise RuntimeError(f"Unresolved XT Futures symbol: {asset}")
+        resolved[asset] = actual
 
-    print("\nRequested -> XT symbol")
+    # Current public risk brackets are fetched every run so the engine never
+    # silently relies on a hard-coded liquidation assumption.
+    brackets = {}
+    for asset, symbol in resolved.items():
+        brackets[asset] = fetch_brackets(session, symbol)
+
+    meta = {
+        "generated_at": now_utc().isoformat(),
+        "days": days, "interval": INTERVAL,
+        "requested_start": start_dt.isoformat(), "requested_end": end_dt.isoformat(),
+        "discovered_symbols": len(discovered), "resolved": resolved,
+        "brackets": brackets,
+    }
+    (data_dir / "CONTRACT_META.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    expected_files = [data_dir / f"{asset}_USDT_15m.csv" for asset in SYMBOLS]
+    missing = [p for p in expected_files if not p.exists()]
+    if not missing:
+        # Validate existing files instead of trusting their existence.
+        print("\nXT Futures CSVs found; validating existing dataset before backtest...")
+        for asset in SYMBOLS:
+            df = pd.read_csv(data_dir / f"{asset}_USDT_15m.csv")
+            df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
+            report = audit(df, asset, start_dt=start_dt, end_dt=end_dt)
+            if report["rows"] < int(expected * 0.995):
+                raise RuntimeError(f"{asset}: insufficient coverage {report['rows']}/{expected}")
+            print(f"  VALID {asset}: rows={report['rows']:,} gaps={report['gaps']} missing_bars={report['missing_bars']}")
+        return
+
+    print("\n=== XT FUTURES DATA MISSING — DOWNLOADING AUDITED DATA ===")
+    print(f"Missing files: {len(missing)}/{len(expected_files)}")
+    reports, failures = [], []
+
     for asset in SYMBOLS:
-        print(f"  {asset:8s} -> {resolved.get(asset, 'NOT FOUND')}")
-    if unresolved:
-        raise RuntimeError("Unresolved XT Futures symbols: " + ", ".join(unresolved))
-
-    reports = []
-    failures = []
-    expected = days * 24 * 4
-
-    # BTC first: fail closed if its one-year coverage is materially incomplete.
-    print("\n=== STAGE 1: BTC 15m 365-DAY VALIDATION ===")
-    btc_symbol = resolved["BTC"]
-    btc_df, btc_report = download_symbol(session, btc_symbol, start_dt, end_dt)
-    btc_report.update({"requested_asset": "BTC", "xt_symbol": btc_symbol})
-    print(
-        f"BTC RESULT: rows={btc_report['rows']:,} expected≈{expected:,} "
-        f"coverage={btc_report['start']} -> {btc_report['end']} gaps={btc_report['gaps']}"
-    )
-    if btc_report["rows"] < int(expected * 0.995):
-        raise RuntimeError(
-            f"BTC coverage incomplete: {btc_report['rows']:,}/{expected:,} rows"
-        )
-    btc_df.to_csv(data_dir / f"{btc_symbol}_15m.csv", index=False)
-    reports.append(btc_report)
-
-    print("\n=== STAGE 2: ALL REQUESTED SYMBOLS ===")
-    for asset in SYMBOLS:
-        if asset == "BTC":
-            continue
         symbol = resolved[asset]
         try:
             df, report = download_symbol(session, symbol, start_dt, end_dt)
+            if report["rows"] < int(expected * 0.995):
+                raise RuntimeError(f"coverage {report['rows']}/{expected} below 99.5%")
+            df.to_csv(data_dir / f"{asset}_USDT_15m.csv", index=False)
             report.update({"requested_asset": asset, "xt_symbol": symbol})
-            df.to_csv(data_dir / f"{symbol}_15m.csv", index=False)
             reports.append(report)
-            print(
-                f"  OK {asset}: rows={report['rows']:,} "
-                f"gaps={report['gaps']} requests={report['api_requests']}"
-            )
+            print(f"  OK {asset}: rows={report['rows']:,} gaps={report['gaps']} missing_bars={report['missing_bars']} requests={report['api_requests']}")
         except Exception as exc:
             failures.append({"asset": asset, "symbol": symbol, "error": str(exc)})
             print(f"  FAIL {asset}/{symbol}: {exc}")
 
     audit_report = {
-        "generated_at": now_utc().isoformat(),
-        "days": days,
-        "interval": INTERVAL,
-        "discovered_symbols": len(discovered),
-        "resolved": resolved,
-        "reports": reports,
-        "failures": failures,
+        "generated_at": now_utc().isoformat(), "days": days, "interval": INTERVAL,
+        "expected_rows": expected, "requested_start": start_dt.isoformat(),
+        "requested_end": end_dt.isoformat(), "resolved": resolved,
+        "reports": reports, "failures": failures,
     }
-    (data_dir / "AUDIT_REPORT.json").write_text(
-        json.dumps(audit_report, indent=2), encoding="utf-8"
-    )
-    print("\n=== DOWNLOAD AUDIT ===")
-    print(f"Resolved : {len(resolved)}/{len(SYMBOLS)}")
-    print(f"Loaded   : {len(reports)}/{len(SYMBOLS)}")
-    print(f"Failed   : {len(failures)}")
-    if failures:
+    (data_dir / "AUDIT_REPORT.json").write_text(json.dumps(audit_report, indent=2), encoding="utf-8")
+    if failures or len(reports) != len(SYMBOLS):
         raise RuntimeError("XT Futures download failed for one or more symbols")
+
+    print("\n=== DOWNLOAD AUDIT PASSED ===")
+    print(f"Loaded: {len(reports)}/{len(SYMBOLS)}")
 
 
 def main():
     args = parse_args()
     data_dir = Path(args.data_dir)
     ensure_xt_data(data_dir, days=365)
-    backtest_main()
+    backtest_main(args)
 
 
 if __name__ == "__main__":
