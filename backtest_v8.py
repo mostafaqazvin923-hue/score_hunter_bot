@@ -258,67 +258,118 @@ def add_cross_sectional(f):
             f[a].loc[ts,"mom_rank"]=rank/(n-1) if n>1 else .5
     return f
 
-def signals(f):
+def signals(f, params):
     sig=[]
-    for a,x in f.items():
+    for asset,x in f.items():
+        rvq=x["rv"].rolling(240,min_periods=120).rank(pct=True)
         for i in range(1,len(x)-1):
             r=x.iloc[i]; ts=x.index[i]
-            if not all(np.isfinite(r.get(k,np.nan)) for k in ["atr","ret24","ret72","mom_rank","vol_z","dev"]): continue
-            # A: relative-strength momentum continuation
-            longA=r.d1_regime==1 and r.h4_trend==1 and r.mom_rank>=.75 and r.ret24>0 and r.ret72>0 and r.close>r.ema20
-            shortA=r.d1_regime==-1 and r.h4_trend==-1 and r.mom_rank<=.25 and r.ret24<0 and r.ret72<0 and r.close<r.ema20
-            # B: controlled short-term reversal, only inside non-neutral daily regime
-            longB=r.d1_regime==1 and r.h4_trend>=0 and r.dev<=-1.5 and r.vol_z>-1.0
-            shortB=r.d1_regime==-1 and r.h4_trend<=0 and r.dev>=1.5 and r.vol_z>-1.0
-            # C: volatility regime switch; momentum when volatility expands, reversal when compressed
-            vol_q=x["rv"].rolling(240,min_periods=120).rank(pct=True).iloc[i]
-            longC=(r.d1_regime==1 and r.h4_trend==1 and vol_q>=.70 and r.ret24>0 and r.mom_rank>=.60) or (r.d1_regime==1 and vol_q<=.25 and r.dev<=-1.75)
-            shortC=(r.d1_regime==-1 and r.h4_trend==-1 and vol_q>=.70 and r.ret24<0 and r.mom_rank<=.40) or (r.d1_regime==-1 and vol_q<=.25 and r.dev>=1.75)
-            for fam,side in [("A_MOMENTUM", "LONG" if longA else "SHORT" if shortA else None),("B_REVERSAL","LONG" if longB else "SHORT" if shortB else None),("C_REGIME_SWITCH","LONG" if longC else "SHORT" if shortC else None)]:
-                if side: sig.append({"asset":a,"signal_ts":ts,"family":fam,"side":side,"atr":float(r.atr)})
+            keys=["atr","ret24","ret72","mom_rank","vol_z","dev","h4_trend","d1_regime"]
+            if not all(np.isfinite(r.get(k,np.nan)) for k in keys): continue
+            strict=params["h4_mode"]=="strict"
+            long_exp=(r.d1_regime==1 and ((r.h4_trend==1) if strict else (r.h4_trend>=0))
+                      and rvq.iloc[i]>=params["exp_q"] and r.ret24>=params["mom24"]
+                      and r.ret72>=params["mom72"] and r.mom_rank>=params["rank_long"]
+                      and r.close>r.ema20 and r.vol_z>=params["volz"])
+            short_exp=(r.d1_regime==-1 and ((r.h4_trend==-1) if strict else (r.h4_trend<=0))
+                       and rvq.iloc[i]>=params["exp_q"] and r.ret24<=-params["mom24"]
+                       and r.ret72<=-params["mom72"] and r.mom_rank<=params["rank_short"]
+                       and r.close<r.ema20 and r.vol_z>=params["volz"])
+            long_comp=(r.d1_regime==1 and ((r.h4_trend==1) if strict else (r.h4_trend>=0))
+                       and rvq.iloc[i]<=params["comp_q"] and r.dev<=-params["dev"]
+                       and r.vol_z>=params["volz"])
+            short_comp=(r.d1_regime==-1 and ((r.h4_trend==-1) if strict else (r.h4_trend<=0))
+                        and rvq.iloc[i]<=params["comp_q"] and r.dev>=params["dev"]
+                        and r.vol_z>=params["volz"])
+            if long_exp: sig.append({"asset":asset,"signal_ts":ts,"family":"C_EXPANSION","side":"LONG","atr":float(r.atr)})
+            if short_exp: sig.append({"asset":asset,"signal_ts":ts,"family":"C_EXPANSION","side":"SHORT","atr":float(r.atr)})
+            if long_comp: sig.append({"asset":asset,"signal_ts":ts,"family":"C_COMPRESSION","side":"LONG","atr":float(r.atr)})
+            if short_comp: sig.append({"asset":asset,"signal_ts":ts,"family":"C_COMPRESSION","side":"SHORT","atr":float(r.atr)})
     return sig
 
 def backtest(f, sig):
     byts={}
-    for s in sig: byts.setdefault(s["signal_ts"],[]).append(s)
+    for z in sig: byts.setdefault(z["signal_ts"],[]).append(z)
     all_ts=sorted(set().union(*(x.index for x in f.values())))
-    positions=[]; trades=[]; equity=INITIAL_EQUITY; peak=equity; last_close=pd.Timestamp.min.tz_localize("UTC")
+    positions=[]; trades=[]; last_close=pd.Timestamp.min.tz_localize("UTC")
     for ts in all_ts:
-        # close positions before considering new signal; no same-close/signal candle reuse
         for p in positions[:]:
             x=f[p["asset"]]
-            if ts not in x.index: continue
-            row=x.loc[ts]; hit_sl=(row.low<=p["sl"] if p["side"]=="LONG" else row.high>=p["sl"]); hit_tp=(row.high>=p["tp"] if p["side"]=="LONG" else row.low<=p["tp"])
+            if ts not in x.index or ts <= p["entry_ts"]: continue
+            row=x.loc[ts]
+            hit_sl=(row.low<=p["sl"] if p["side"]=="LONG" else row.high>=p["sl"])
+            hit_tp=(row.high>=p["tp"] if p["side"]=="LONG" else row.low<=p["tp"])
             if hit_sl or hit_tp:
-                outcome="LOSS" if hit_sl else "WIN"; ex=p["sl"] if hit_sl else p["tp"]
+                outcome="LOSS" if hit_sl else "WIN"
+                ex=p["sl"] if hit_sl else p["tp"]
                 gross=((ex-p["entry"])/p["entry"] if p["side"]=="LONG" else (p["entry"]-ex)/p["entry"])*TRADE_MARGIN*LEVERAGE
-                pnl=gross-(TRADE_MARGIN*LEVERAGE*FEE_RATE*2); equity+=pnl; peak=max(peak,equity)
-                trades.append({**p,"exit_ts":ts,"outcome":outcome,"pnl":pnl,"equity":equity}); positions.remove(p); last_close=ts
-        if ts<=last_close: continue
-        if len(positions)>=MAX_OPEN_POSITIONS: continue
-        # one best candidate per family/asset, rank by cross-sectional strength magnitude
-        for s in sorted(byts.get(ts,[]),key=lambda z:abs(z["atr"]),reverse=True):
-            if len(positions)>=MAX_OPEN_POSITIONS: break
-            if any(p["asset"]==s["asset"] for p in positions): continue
-            x=f[s["asset"]]; future=x.index[x.index>ts]
+                pnl=gross-(TRADE_MARGIN*LEVERAGE*FEE_RATE*2)
+                trades.append({**p,"exit_ts":ts,"outcome":outcome,"pnl":pnl})
+                positions.remove(p); last_close=ts
+        if ts<=last_close or len(positions)>=MAX_OPEN_POSITIONS: continue
+        used=set()
+        for z in sorted(byts.get(ts,[]),key=lambda q:abs(q["atr"]),reverse=True):
+            if len(positions)>=MAX_OPEN_POSITIONS or z["asset"] in used: continue
+            if any(p["asset"]==z["asset"] for p in positions): continue
+            x=f[z["asset"]]; future=x.index[x.index>ts]
             if len(future)==0: continue
-            ets=future[0]; entry=float(x.loc[ets,"open"])*(1+SLIPPAGE if s["side"]=="LONG" else 1-SLIPPAGE)
-            risk=1.5*s["atr"]; sl=entry-risk if s["side"]=="LONG" else entry+risk; tp=entry+RR*risk if s["side"]=="LONG" else entry-RR*risk
-            positions.append({"asset":s["asset"],"family":s["family"],"side":s["side"],"signal_ts":ts,"entry_ts":ets,"entry":entry,"sl":sl,"tp":tp})
-    # mark unresolved as OPEN; no forced loss
+            ets=future[0]
+            entry=float(x.loc[ets,"open"])*(1+SLIPPAGE if z["side"]=="LONG" else 1-SLIPPAGE)
+            risk=1.5*z["atr"]
+            sl=entry-risk if z["side"]=="LONG" else entry+risk
+            tp=entry+RR*risk if z["side"]=="LONG" else entry-RR*risk
+            positions.append({"asset":z["asset"],"family":z["family"],"side":z["side"],"signal_ts":ts,"entry_ts":ets,"entry":entry,"sl":sl,"tp":tp})
+            used.add(z["asset"])
     return trades,positions
 
+def metrics(trades):
+    wins=sum(z["outcome"]=="WIN" for z in trades)
+    gross_w=sum(z["pnl"] for z in trades if z["pnl"]>0)
+    gross_l=-sum(z["pnl"] for z in trades if z["pnl"]<0)
+    eq=INITIAL_EQUITY; peak=eq; dd=0.0; streak=mx=0
+    for z in sorted(trades,key=lambda q:q["exit_ts"]):
+        eq+=z["pnl"]; peak=max(peak,eq); dd=min(dd,eq-peak)
+        streak=streak+1 if z["outcome"]=="LOSS" else 0; mx=max(mx,streak)
+    return {"trades":len(trades),"wr":100*wins/len(trades) if trades else 0.0,
+            "pf":gross_w/gross_l if gross_l else 0.0,"pnl":sum(z["pnl"] for z in trades),
+            "dd":dd,"max_streak":mx}
+
+def score(m):
+    if m["trades"]<80: return -1e12
+    return m["pnl"]+500*m["pf"]-max(0,50-m["wr"])*100-max(0,m["max_streak"]-4)*150
+
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument("--days",type=int,default=DAYS); ap.add_argument("--data-dir",default=str(DATA_DIR)); args=ap.parse_args()
-    print("="*88); print("HUNTER-V144 — MTF FACTOR RESEARCH"); print("="*88)
-    all15=ensure_data(Path(args.data_dir),args.days); f=add_cross_sectional(features(all15)); print("\nRunning frozen factor families...")
-    sig=signals(f); trades,openp=backtest(f,sig)
-    for fam in ["A_MOMENTUM","B_REVERSAL","C_REGIME_SWITCH"]:
-        t=[z for z in trades if z["family"]==fam]; wins=sum(z["outcome"]=="WIN" for z in t); losses=len(t)-wins
-        grossw=sum(z["pnl"] for z in t if z["pnl"]>0); grossl=-sum(z["pnl"] for z in t if z["pnl"]<0)
-        eq=INITIAL_EQUITY; peak=eq; dd=0; streak=mx=0
-        for z in sorted(t,key=lambda q:q["exit_ts"]):
-            eq+=z["pnl"]; peak=max(peak,eq); dd=min(dd,eq-peak); streak=streak+1 if z["outcome"]=="LOSS" else 0; mx=max(mx,streak)
-        print(f"{fam}: Trades={len(t)} Open={sum(p['family']==fam for p in openp)} WR={(wins/len(t)*100 if t else 0):.2f}% PF={(grossw/grossl if grossl else 0):.3f} NetPnL=${sum(z['pnl'] for z in t):,.2f} DD=${dd:,.2f} MaxLossStreak={mx}")
-    print(f"Total signals={len(sig)} Realized={len(trades)} Open={len(openp)}")
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--days",type=int,default=DAYS)
+    ap.add_argument("--data-dir",default=str(DATA_DIR))
+    args=ap.parse_args()
+    print("="*88)
+    print("HUNTER-V145 — C REGIME-SWITCH OPTIMIZATION")
+    print("Signal=1H | Context=4H | Regime=1D | Raw source=15m")
+    print("="*88)
+    all15=ensure_data(Path(args.data_dir),args.days)
+    f=add_cross_sectional(features(all15))
+    grid=[]
+    for exp_q in [0.70,0.75,0.80,0.85]:
+      for comp_q in [0.15,0.20,0.25,0.30]:
+       for dev in [1.50,1.75,2.00]:
+        for volz in [-1.0,-0.5,0.0]:
+         grid.append({"exp_q":exp_q,"comp_q":comp_q,"mom24":0.0,"mom72":0.0,
+                      "dev":dev,"volz":volz,"rank_long":0.60,"rank_short":0.40,"h4_mode":"strict"})
+    results=[]
+    print(f"Testing {len(grid)} causal C-only parameter sets...")
+    for n,p in enumerate(grid,1):
+        sig=signals(f,p); trades,openp=backtest(f,sig); m=metrics(trades)
+        m.update({"open":len(openp),"signals":len(sig),"score":score(m)})
+        results.append((m,p))
+        if n%50==0: print(f"  tested {n}/{len(grid)}")
+    results.sort(key=lambda z:z[0]["score"],reverse=True)
+    print("\nTop 15 candidates:")
+    for i,(m,p) in enumerate(results[:15],1):
+        print(f"{i:>2} trades={m['trades']:>4} WR={m['wr']:>6.2f}% PF={m['pf']:.3f} PnL=${m['pnl']:,.2f} DD=${m['dd']:,.2f} streak={m['max_streak']:>2} | exp={p['exp_q']:.2f} comp={p['comp_q']:.2f} dev={p['dev']:.2f} volz={p['volz']:.1f}")
+    eligible=[z for z in results if z[0]["wr"]>=50 and z[0]["max_streak"]<=4 and z[0]["trades"]>=80]
+    print("\nELIGIBLE:", bool(eligible))
+    if eligible: print("Best eligible:",eligible[0])
+    else: print("No tested configuration reached WR>=50% AND max loss streak<=4.")
+
 if __name__=="__main__": main()
