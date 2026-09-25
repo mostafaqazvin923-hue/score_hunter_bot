@@ -157,8 +157,8 @@ def fetch_symbol(asset, xt_symbol, days):
     """
     now_ms = int(time.time() * 1000)
     interval_ms = 15 * 60 * 1000
-    end_ms = (now_ms // interval_ms) * interval_ms - 1
-    start_ms = now_ms - int((days + WARMUP_DAYS) * 86400 * 1000)
+    end_ms = (now_ms // interval_ms) * interval_ms - interval_ms
+    start_ms = ((now_ms - int((days + WARMUP_DAYS) * 86400 * 1000)) // interval_ms) * interval_ms
     chunk_ms = 90 * 86400 * 1000
     endpoint = f"{BASE}/future/market/v1/public/q/kline"
 
@@ -185,7 +185,7 @@ def fetch_symbol(asset, xt_symbol, days):
 
             while cursor <= chunk_end and guard < 100:
                 guard += 1
-                window_end = min(chunk_end, cursor + LIMIT * interval_ms - 1)
+                window_end = min(chunk_end, cursor + (LIMIT - 1) * interval_ms)
                 params = {
                     "symbol": api_symbol,
                     "interval": INTERVAL,
@@ -232,7 +232,7 @@ def fetch_symbol(asset, xt_symbol, days):
                     break
 
                 # Advance strictly beyond the newest returned candle.
-                cursor = mx + 1
+                cursor = mx + interval_ms
 
             if failed:
                 break
