@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-HUNTER-V146 — C STRUCTURAL REDESIGN
+HUNTER-V147 — BALANCED STRUCTURAL MOMENTUM
 1D regime + 4H context + 1H liquidity/structure trigger.
 Raw source: XT Futures 15m -> causal 1H/4H/1D.
 
 Purpose
 -------
-V145 showed that tuning volatility quantiles on the old C logic did not fix
-its weak edge. V146 therefore changes the C engine rather than continuing to
-optimize the same rule family.
+V145 showed that parameter tuning did not fix the old regime-switch edge.
+V146 then became too restrictive: its AND-gated sweep/reclaim/displacement
+logic produced too few trades. V147 keeps the causal MTF architecture but
+uses a weighted structural score so valid setups do not need every filter
+to fire simultaneously.
 
 Signal concept
 --------------
@@ -37,11 +39,11 @@ Integrity rules
 - Positions still open at dataset end remain OPEN.
 - Minimum trade count is used for research ranking, not to manufacture wins.
 
-V146 optimization
+V147 optimization
 ------------------
-A compact causal grid varies structural lookback, displacement, volume,
-ADX and extension filters. It is intentionally much smaller and faster than
-V145's 144 full re-runs.
+A compact causal grid varies the minimum score and a few structural
+thresholds. Features are computed once. The score is never used to alter
+outcomes; it only defines which causal setups are admitted.
 
 IMPORTANT: an in-sample winner is NOT considered validated. A qualifying
 candidate must be walk-forward/OOS tested before any live consideration.
@@ -331,6 +333,8 @@ def build_features(all15):
         x["ema20"] = x.close.ewm(span=20, adjust=False).mean()
         x["ema50"] = x.close.ewm(span=50, adjust=False).mean()
         x["ema20_slope"] = x.ema20.pct_change(3)
+        x["ret24"] = x.close.pct_change(24)
+        x["ret72"] = x.close.pct_change(72)
         x["vol_z"] = (x.volume - x.volume.rolling(48, min_periods=24).mean()) / x.volume.rolling(48, min_periods=24).std()
         # Liquidity levels use ONLY completed prior bars.
         x["prior_low_24"] = x.low.shift(1).rolling(24, min_periods=24).min()
@@ -383,19 +387,49 @@ def add_cross_sectional_rank(f):
 
 
 def signal_events(f, p):
-    """Return compact event list; all tests use only the current completed 1H candle."""
+    """Causal weighted structural score on completed 1H candles."""
     sig = []
     for asset, x in f.items():
         for i in range(max(250, p["lookback"]), len(x) - 1):
             r = x.iloc[i]
-            if not all(np.isfinite(r.get(k, np.nan)) for k in ["atr","body_atr","range_atr","close_pos","vol_z","h4_adx","h4_slope","mom_rank","d1_regime"]):
+            keys = ["atr","body_atr","range_atr","close_pos","vol_z","h4_adx",
+                    "h4_slope","mom_rank","d1_regime","ema20","ema50",
+                    "prior_low_24","prior_high_24","prior_low_48","prior_high_48",
+                    "prior_low_72","prior_high_72","ret24","ret72"]
+            if not all(np.isfinite(r.get(k, np.nan)) for k in keys):
                 continue
 
-            long_regime = r.d1_regime == 1 and r.h4_trend == 1 and r.h4_adx >= p["adx"] and r.h4_slope > 0
-            short_regime = r.d1_regime == -1 and r.h4_trend == -1 and r.h4_adx >= p["adx"] and r.h4_slope < 0
-            if not (long_regime or short_regime):
-                continue
+            long_score = 0.0
+            short_score = 0.0
 
+            # 1D regime: strongest directional context.
+            if r.d1_regime == 1: long_score += 2.0
+            if r.d1_regime == -1: short_score += 2.0
+
+            # 4H context: trend, slope, and ADX each contribute independently.
+            if r.h4_trend == 1: long_score += 1.5
+            if r.h4_trend == -1: short_score += 1.5
+            if r.h4_slope > 0: long_score += 0.75
+            if r.h4_slope < 0: short_score += 0.75
+            if r.h4_adx >= p["adx"]:
+                if r.h4_trend == 1: long_score += 0.75
+                if r.h4_trend == -1: short_score += 0.75
+
+            # 1H momentum/location.
+            if r.ret24 > p["mom24"]: long_score += 0.75
+            if r.ret24 < -p["mom24"]: short_score += 0.75
+            if r.ret72 > p["mom72"]: long_score += 0.75
+            if r.ret72 < -p["mom72"]: short_score += 0.75
+            if r.close > r.ema20: long_score += 0.50
+            if r.close < r.ema20: short_score += 0.50
+            if r.close > r.ema50: long_score += 0.50
+            if r.close < r.ema50: short_score += 0.50
+
+            # Cross-sectional momentum is confirmation, not a hard gate.
+            if r.mom_rank >= p["rank_long"]: long_score += 0.75
+            if r.mom_rank <= p["rank_short"]: short_score += 0.75
+
+            # Liquidity / breakout structure. Uses only prior completed bars.
             if p["lookback"] == 24:
                 pl, ph = r.prior_low_24, r.prior_high_24
             elif p["lookback"] == 48:
@@ -403,23 +437,35 @@ def signal_events(f, p):
             else:
                 pl, ph = r.prior_low_72, r.prior_high_72
 
-            # Liquidity sweep + reclaim. Level comes strictly from prior bars.
             long_sweep = r.low < pl and r.close > pl
             short_sweep = r.high > ph and r.close < ph
+            long_break = r.close > ph
+            short_break = r.close < pl
+            if long_sweep: long_score += 1.25
+            if short_sweep: short_score += 1.25
+            if long_break: long_score += 1.00
+            if short_break: short_score += 1.00
 
-            long_trigger = (long_sweep and r.close > r.open and r.body_atr >= p["body_atr"]
-                            and r.range_atr >= p["range_atr"] and r.close_pos >= p["close_pos"]
-                            and r.vol_z >= p["vol_z"] and r.mom_rank >= p["rank_long"]
-                            and r.close <= r.ema20 + p["max_ext"] * r.atr)
-            short_trigger = (short_sweep and r.close < r.open and r.body_atr >= p["body_atr"]
-                             and r.range_atr >= p["range_atr"] and r.close_pos <= 1-p["close_pos"]
-                             and r.vol_z >= p["vol_z"] and r.mom_rank <= p["rank_short"]
-                             and r.close >= r.ema20 - p["max_ext"] * r.atr)
+            # Candle quality: soft confirmation rather than mandatory filters.
+            if r.body_atr >= p["body_atr"] and r.close > r.open: long_score += 0.75
+            if r.body_atr >= p["body_atr"] and r.close < r.open: short_score += 0.75
+            if r.range_atr >= p["range_atr"]:
+                if r.close_pos >= 0.60: long_score += 0.50
+                if r.close_pos <= 0.40: short_score += 0.50
+            if r.vol_z >= p["vol_z"]:
+                if r.close > r.open: long_score += 0.50
+                if r.close < r.open: short_score += 0.50
 
-            if long_trigger:
-                sig.append({"asset":asset,"signal_ts":x.index[i],"side":"LONG","family":"SWEEP_RECLAIM","atr":float(r.atr)})
-            elif short_trigger:
-                sig.append({"asset":asset,"signal_ts":x.index[i],"side":"SHORT","family":"SWEEP_RECLAIM","atr":float(r.atr)})
+            # Avoid chasing extreme extensions.
+            long_location_ok = r.close <= r.ema20 + p["max_ext"] * r.atr
+            short_location_ok = r.close >= r.ema20 - p["max_ext"] * r.atr
+
+            if long_score >= p["min_score"] and long_location_ok and long_score > short_score:
+                sig.append({"asset":asset,"signal_ts":x.index[i],"side":"LONG",
+                            "family":"BALANCED_SCORE","atr":float(r.atr),"score":long_score})
+            elif short_score >= p["min_score"] and short_location_ok and short_score > long_score:
+                sig.append({"asset":asset,"signal_ts":x.index[i],"side":"SHORT",
+                            "family":"BALANCED_SCORE","atr":float(r.atr),"score":short_score})
     return sig
 
 
@@ -524,35 +570,35 @@ def main():
     args = ap.parse_args()
 
     print("=" * 96)
-    print("HUNTER-V146 — C STRUCTURAL REDESIGN")
+    print("HUNTER-V147 — BALANCED STRUCTURAL MOMENTUM")
     print("Signal=1H | Context=4H | Regime=1D | Raw source=15m")
-    print("Liquidity sweep + reclaim + displacement + volume confirmation")
+    print("1D regime + 4H context + weighted 1H structural/momentum score")
     print("=" * 96)
 
     all15 = ensure_data(Path(args.data_dir), args.days)
     f = add_cross_sectional_rank(build_features(all15))
 
-    # 3 x 3 x 2 x 2 x 2 x 2 = 144 would recreate the brute-force problem.
-    # Keep the structural search compact: 48 configs with precomputed features.
+    # 3 x 2 x 2 x 2 = 24 compact causal configurations.
     grid = []
     for lookback in [24, 48, 72]:
-        for body_atr in [0.55, 0.75]:
-            for range_atr in [1.00, 1.25]:
-                for adx in [18.0, 22.0]:
-                    for volz in [-0.5, 0.0]:
-                        grid.append({
-                            "lookback":lookback,
-                            "body_atr":body_atr,
-                            "range_atr":range_atr,
-                            "adx":adx,
-                            "vol_z":volz,
-                            "close_pos":0.65,
-                            "rank_long":0.55,
-                            "rank_short":0.45,
-                            "max_ext":1.25,
-                        })
+        for min_score in [5.25, 6.00]:
+            for adx in [16.0, 20.0]:
+                for max_ext in [1.50, 2.00]:
+                    grid.append({
+                        "lookback":lookback,
+                        "min_score":min_score,
+                        "adx":adx,
+                        "mom24":0.0,
+                        "mom72":0.0,
+                        "vol_z":-0.75,
+                        "body_atr":0.35,
+                        "range_atr":0.80,
+                        "rank_long":0.55,
+                        "rank_short":0.45,
+                        "max_ext":max_ext,
+                    })
 
-    print(f"Testing {len(grid)} causal C structural parameter sets...")
+    print(f"Testing {len(grid)} causal C balanced parameter sets...")
     results = []
     for n, p in enumerate(grid, 1):
         sig = signal_events(f, p)
@@ -568,8 +614,8 @@ def main():
     for i, (m, p) in enumerate(results[:15], 1):
         print(f"{i:>2} trades={m['trades']:>4} WR={m['wr']:>6.2f}% PF={m['pf']:.3f} "
               f"PnL=${m['pnl']:,.2f} DD=${m['dd']:,.2f} streak={m['max_streak']:>2} "
-              f"t/day={m['trades_day']:.2f} | lb={p['lookback']} body={p['body_atr']:.2f} "
-              f"range={p['range_atr']:.2f} adx={p['adx']:.0f} volz={p['vol_z']:.1f}")
+              f"t/day={m['trades_day']:.2f} | lb={p['lookback']} score={p['min_score']:.2f} "
+              f"adx={p['adx']:.0f} ext={p['max_ext']:.2f}")
 
     eligible = [z for z in results if z[0]["wr"] >= 50.0 and z[0]["max_streak"] <= 4 and z[0]["trades"] >= 100]
     print("\nELIGIBLE:", bool(eligible))
