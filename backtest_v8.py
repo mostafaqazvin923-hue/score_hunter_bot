@@ -1,8 +1,8 @@
 #!/usr/init/env python3
 """
-HUNTER-XT-STYLE4-STRUCTURAL-PRO
-Cross-Sectional Momentum with Structural Swing Stops & Fixed RR = 2.0 (1h Timeframe)
-- Focus: Win Rate > 50%, Max Loss Streak <= 4, Fixed RR 1:2
+HUNTER-XT-STYLE4-RSI-PRO
+Cross-Sectional Momentum with RSI Momentum Filter & Fixed RR = 2.0 (1h Timeframe)
+- Focus: Trade Count > 150, Win Rate > 50%, Max Loss Streak <= 4, Fixed RR 1:2
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ CORRELATION_CLUSTERS = {
     "WIF": "MEME",
 }
 
-DATA_DIR = Path("data/xt_futures_style4_structural")
-OUT_DIR = DATA_DIR / "backtest_style4_structural"
+DATA_DIR = Path("data/xt_futures_style4_rsi")
+OUT_DIR = DATA_DIR / "backtest_style4_rsi"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -35,9 +35,9 @@ LEVERAGE = 50.0
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 RR = 2.0                      # Fixed Risk-Reward 1:2 (TP = 2 * Risk)
-MAX_OPEN_POSITIONS = 3
+MAX_OPEN_POSITIONS = 2        # Strict exposure control to suppress streaks
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 4  # Local cooldown to keep streaks <= 4
+CIRCUIT_BREAKER_COOLDOWN = 6  # Hours of lockout after any loss to protect streaks
 
 
 def parse_args():
@@ -90,31 +90,45 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     return df.dropna(subset=required[1:])
 
 
-def calculate_structural_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates structural swing lows, EMAs, and momentum using shift(1)."""
+def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = (-1 * delta).clip(lower=0)
+    ma_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    ma_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    rs = ma_gain / ma_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def calculate_rsi_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculates structural lows, RSI momentum filter, and EMAs using shift(1)."""
     prev_close = df["close"].shift(1)
     
-    # Structural stop baseline: Lowest low of the past 3 bars (shifted)
+    # Structural swing low for stop loss
     df["swing_low"] = df["low"].shift(1).rolling(window=3).min()
 
-    # Trend alignment: EMA 20 & EMA 50
+    # RSI for momentum health (avoiding overbought extremes)
+    df["rsi"] = calculate_rsi(df["close"].shift(1), period=14)
+
+    # Trend alignment
     df["ema20"] = prev_close.ewm(span=20, adjust=False).mean()
     df["ema50"] = prev_close.ewm(span=50, adjust=False).mean()
-    df["trend_ok"] = (prev_close > df["ema20"]) & (df["ema20"] > df["ema50"])
+    df["trend_ok"] = (prev_close > df["ema20"])
 
-    # 24-period momentum ranking
+    # 24-period return ranking
     df["return_24h"] = prev_close.pct_change(24)
 
     # Volume confirmation
     prev_volume = df["volume"].shift(1)
     df["avg_volume"] = prev_volume.rolling(window=20).mean()
-    df["volume_ok"] = prev_volume > (0.85 * df["avg_volume"])
+    df["volume_ok"] = prev_volume > (0.8 * df["avg_volume"])
 
-    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["return_24h"] > 0.01)
+    # Setup valid: Healthy RSI (50-78), strong trend, positive momentum
+    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["return_24h"] > 0.003) & (df["rsi"] >= 50.0) & (df["rsi"] <= 78.0)
     return df
 
 
-def run_structural_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_rsi_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -163,8 +177,8 @@ def run_structural_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
 
                 if outcome == "LOSS":
                     consecutive_losses += 1
-                    if consecutive_losses >= 2:
-                        cooldown_counter = CIRCUIT_BREAKER_COOLDOWN
+                    # Immediate cooldown after any single loss to suppress streaks <= 4
+                    cooldown_counter = CIRCUIT_BREAKER_COOLDOWN
                 else:
                     consecutive_losses = 0
 
@@ -174,7 +188,7 @@ def run_structural_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 })
                 del active_positions[symbol]
 
-        # 2. Execution with Structural Swing Stop & Fixed RR = 2.0
+        # 2. Execution with RSI Filter & Fixed RR = 2.0
         if btc_bullish and cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
             candidates = []
             for symbol, df in all_data.items():
@@ -208,12 +222,12 @@ def run_structural_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
                 row = df.loc[ts]
                 
-                # Structural stop-loss (Swing low of past 3 bars) with safety buffer
+                # Structural stop-loss (Swing low of past 3 bars)
                 swing_low = row.get("swing_low", np.nan)
                 if not np.isfinite(swing_low) or swing_low >= entry:
-                    sl = entry * 0.985  # Fallback 1.5% stop if swing low is invalid
+                    sl = entry * 0.985
                 else:
-                    sl = swing_low * 0.998  # Tiny buffer below swing low
+                    sl = swing_low * 0.998
 
                 risk = entry - sl
                 if risk <= 0:
@@ -236,7 +250,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-STYLE4-STRUCTURAL-PRO (Structural Swing Stops + Fixed RR 1:2)")
+    print("HUNTER-XT-STYLE4-RSI-PRO (RSI Momentum Filter + Fixed RR 1:2)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -245,11 +259,11 @@ def main():
     for asset in SYMBOLS:
         try:
             df = load_xt_csv(data_dir, asset)
-            all_data[asset] = calculate_structural_features(df)
+            all_data[asset] = calculate_rsi_features(df)
         except Exception:
             pass
 
-    trades = run_structural_backtest(all_data)
+    trades = run_rsi_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -264,7 +278,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== STYLE 4 STRUCTURAL RESULTS =====")
+    print("\n===== STYLE 4 RSI RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
