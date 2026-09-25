@@ -1,8 +1,8 @@
 #!/usr/init/env python3
 """
-HUNTER-XT-STYLE4-RSI-PRO
-Cross-Sectional Momentum with RSI Momentum Filter & Fixed RR = 2.0 (1h Timeframe)
-- Focus: Trade Count > 150, Win Rate > 50%, Max Loss Streak <= 4, Fixed RR 1:2
+HUNTER-XT-STYLE4-ULTRA-STABLE
+Single-Position Breakout Momentum Engine with Fixed RR = 2.0 (1h Timeframe)
+- Focus: Win Rate > 50%, Max Loss Streak <= 4, Fixed RR 1:2, Zero Correlation Risk
 """
 
 from __future__ import annotations
@@ -17,16 +17,8 @@ SYMBOLS = [
     "BNB", "APT", "CRV", "ONDO", "PENDLE", "ICP", "WIF",
 ]
 
-CORRELATION_CLUSTERS = {
-    "BTC": "MAJOR", "ETH": "MAJOR",
-    "SOL": "L1", "SUI": "L1", "AVAX": "L1", "NEAR": "L1", "ADA": "L1", "BNB": "L1", "APT": "L1",
-    "CRV": "DEFI", "ONDO": "DEFI", "PENDLE": "DEFI",
-    "ICP": "OTHER",
-    "WIF": "MEME",
-}
-
-DATA_DIR = Path("data/xt_futures_style4_rsi")
-OUT_DIR = DATA_DIR / "backtest_style4_rsi"
+DATA_DIR = Path("data/xt_futures_style4_stable")
+OUT_DIR = DATA_DIR / "backtest_style4_stable"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -34,10 +26,9 @@ LEVERAGE = 50.0
 
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
-RR = 2.0                      # Fixed Risk-Reward 1:2 (TP = 2 * Risk)
-MAX_OPEN_POSITIONS = 2        # Strict exposure control to suppress streaks
-MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 6  # Hours of lockout after any loss to protect streaks
+RR = 2.0                      # Fixed Risk-Reward exactly 1:2
+MAX_OPEN_POSITIONS = 1        # CRITICAL: Single position eliminates correlated simultaneous streaks
+CIRCUIT_BREAKER_COOLDOWN = 3  # Cooldown hours after a loss
 
 
 def parse_args():
@@ -90,45 +81,32 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     return df.dropna(subset=required[1:])
 
 
-def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = (-1 * delta).clip(lower=0)
-    ma_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    ma_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    rs = ma_gain / ma_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def calculate_rsi_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates structural lows, RSI momentum filter, and EMAs using shift(1)."""
+def calculate_breakout_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculates breakout levels, structural lows, and volume using shift(1)."""
     prev_close = df["close"].shift(1)
     
-    # Structural swing low for stop loss
-    df["swing_low"] = df["low"].shift(1).rolling(window=3).min()
+    # Structural swing low for stop loss (past 5 bars)
+    df["swing_low"] = df["low"].shift(1).rolling(window=5).min()
 
-    # RSI for momentum health (avoiding overbought extremes)
-    df["rsi"] = calculate_rsi(df["close"].shift(1), period=14)
+    # Breakout filter: Price breaking above the highest high of the last 24 hours
+    df["high_24h"] = df["high"].shift(1).rolling(window=24).max()
+    df["breakout"] = prev_close >= df["high_24h"]
 
-    # Trend alignment
+    # Trend filter
     df["ema20"] = prev_close.ewm(span=20, adjust=False).mean()
     df["ema50"] = prev_close.ewm(span=50, adjust=False).mean()
-    df["trend_ok"] = (prev_close > df["ema20"])
-
-    # 24-period return ranking
-    df["return_24h"] = prev_close.pct_change(24)
+    df["trend_ok"] = (prev_close > df["ema20"]) & (df["ema20"] > df["ema50"])
 
     # Volume confirmation
     prev_volume = df["volume"].shift(1)
     df["avg_volume"] = prev_volume.rolling(window=20).mean()
-    df["volume_ok"] = prev_volume > (0.8 * df["avg_volume"])
+    df["volume_ok"] = prev_volume > (1.2 * df["avg_volume"])
 
-    # Setup valid: Healthy RSI (50-78), strong trend, positive momentum
-    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["return_24h"] > 0.003) & (df["rsi"] >= 50.0) & (df["rsi"] <= 78.0)
+    df["setup_valid"] = df["trend_ok"] & df["breakout"] & df["volume_ok"]
     return df
 
 
-def run_rsi_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_stable_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -136,13 +114,8 @@ def run_rsi_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     equity = INITIAL_EQUITY
     peak_equity = INITIAL_EQUITY
     
-    consecutive_losses = 0
     cooldown_counter = 0
-
     btc_df = all_data.get("BTC")
-
-    def cluster_active(cluster_name):
-        return any(CORRELATION_CLUSTERS.get(p["symbol"], "OTHER") == cluster_name for p in active_positions.values())
 
     for idx, ts in enumerate(all_times):
         if cooldown_counter > 0:
@@ -152,7 +125,7 @@ def run_rsi_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
         if btc_df is not None and ts in btc_df.index:
             btc_bullish = bool(btc_df.loc[ts, "trend_ok"])
 
-        # 1. Manage active positions
+        # 1. Manage active position (Only 1 active max)
         for symbol, pos in list(active_positions.items()):
             df = all_data[symbol]
             if ts not in df.index:
@@ -176,11 +149,7 @@ def run_rsi_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 peak_equity = max(peak_equity, equity)
 
                 if outcome == "LOSS":
-                    consecutive_losses += 1
-                    # Immediate cooldown after any single loss to suppress streaks <= 4
                     cooldown_counter = CIRCUIT_BREAKER_COOLDOWN
-                else:
-                    consecutive_losses = 0
 
                 trades.append({
                     "symbol": symbol, "side": side, "entry_ts": pos["entry_ts"], "exit_ts": ts,
@@ -188,7 +157,7 @@ def run_rsi_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 })
                 del active_positions[symbol]
 
-        # 2. Execution with RSI Filter & Fixed RR = 2.0
+        # 2. Execution (Strictly 1 position max, Breakout + Fixed RR 2.0)
         if btc_bullish and cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
             candidates = []
             for symbol, df in all_data.items():
@@ -199,47 +168,38 @@ def run_rsi_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                     continue
                 if symbol in active_positions:
                     continue
-                cluster = CORRELATION_CLUSTERS.get(symbol, "OTHER")
-                if MAX_ONE_PER_CLUSTER and cluster_active(cluster):
-                    continue
                 
-                ret_24h = row.get("return_24h", 0.0)
-                if np.isfinite(ret_24h):
-                    candidates.append((symbol, ret_24h))
+                # Use distance from EMA20 as quality ranking score
+                close_val = row.get("close", 0.0)
+                ema_val = row.get("ema20", 0.0)
+                score = (close_val - ema_val) / ema_val if ema_val > 0 else 0.0
+                candidates.append((symbol, score))
 
-            candidates.sort(key=lambda x: x[1], reverse=True)
-
-            for symbol, _ in candidates:
-                if len(active_positions) >= MAX_OPEN_POSITIONS:
-                    break
+            if candidates:
+                candidates.sort(key=lambda x: x[1], reverse=True)
+                symbol = candidates[0][0]
                 
                 df = all_data[symbol]
                 next_indices = df.index[df.index > ts]
-                if len(next_indices) == 0:
-                    continue
-                
-                next_ts = next_indices[0]
-                entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
-                row = df.loc[ts]
-                
-                # Structural stop-loss (Swing low of past 3 bars)
-                swing_low = row.get("swing_low", np.nan)
-                if not np.isfinite(swing_low) or swing_low >= entry:
-                    sl = entry * 0.985
-                else:
-                    sl = swing_low * 0.998
+                if len(next_indices) > 0:
+                    next_ts = next_indices[0]
+                    entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
+                    row = df.loc[ts]
+                    
+                    swing_low = row.get("swing_low", np.nan)
+                    if not np.isfinite(swing_low) or swing_low >= entry:
+                        sl = entry * 0.98
+                    else:
+                        sl = swing_low * 0.995
 
-                risk = entry - sl
-                if risk <= 0:
-                    continue
-                
-                # Fixed RR = 2.0 (TP is exactly 2x Risk distance)
-                tp = entry + (RR * risk)
+                    risk = entry - sl
+                    if risk > 0:
+                        tp = entry + (RR * risk)  # Fixed RR = 2.0
 
-                active_positions[symbol] = {
-                    "symbol": symbol, "side": "LONG",
-                    "entry_ts": next_ts, "entry": entry, "sl": sl, "tp": tp,
-                }
+                        active_positions[symbol] = {
+                            "symbol": symbol, "side": "LONG",
+                            "entry_ts": next_ts, "entry": entry, "sl": sl, "tp": tp,
+                        }
 
     return trades
 
@@ -250,7 +210,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-STYLE4-RSI-PRO (RSI Momentum Filter + Fixed RR 1:2)")
+    print("HUNTER-XT-STYLE4-ULTRA-STABLE (Single Position + Breakout Momentum + Fixed RR 1:2)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -259,11 +219,11 @@ def main():
     for asset in SYMBOLS:
         try:
             df = load_xt_csv(data_dir, asset)
-            all_data[asset] = calculate_rsi_features(df)
+            all_data[asset] = calculate_breakout_features(df)
         except Exception:
             pass
 
-    trades = run_rsi_backtest(all_data)
+    trades = run_stable_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -278,7 +238,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== STYLE 4 RSI RESULTS =====")
+    print("\n===== STYLE 4 ULTRA-STABLE RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
