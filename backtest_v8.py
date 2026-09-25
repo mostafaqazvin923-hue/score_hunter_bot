@@ -1,403 +1,200 @@
 #!/usr/bin/env python3
 """
-HUNTER-V140-RESEARCH-XT
-Fresh strategy research baseline. Previous V129/V2/V3/V4 logic is intentionally NOT used.
+HUNTER-V141 — MTF CRYPTO FACTOR RESEARCH
+1D regime + 4H context + 1H signal.
+Research-only, causal, no lookahead, no timeout, no overlap.
+Fixed RR 1:2. XT Futures 15m data -> 1H/4H/1D.
 
-Families tested in one causal engine:
-A) Volatility-compression -> Donchian breakout
-B) 1D/4H trend -> 1H momentum pullback continuation
-C) Regime-adaptive selector: A in expansion/breakout conditions, B in trend conditions
-
-Data:
-- XT USDT-M Futures
-- 15m raw candles, backward-paginated from XT public API
-- 365 days + 35 days warmup
-- 14 symbols
-
-Execution assumptions:
-- Initial equity $1,000
-- $100 margin, 50x leverage
-- RR 1:2
-- entry next 15m candle open after completed signal candle
-- no timeout
-- no overlapping positions
-- same-candle SL+TP => LOSS
-- unresolved position at dataset end => OPEN (not counted in WR/PF)
-
-This is a research engine, not a live trading bot.
+Families:
+A) Cross-sectional momentum + relative strength
+B) Short-term reversal + market/regime filter
+C) Volatility regime + momentum/reversal switch
+D) Funding/basis proxy is NOT fabricated: only enabled if historical XT funding/basis
+   data is explicitly supplied. OHLCV alone cannot honestly recreate it.
 """
 from __future__ import annotations
-
-import argparse
-import time
+import argparse, time, math
 from pathlib import Path
-import requests
 import numpy as np
 import pandas as pd
+import requests
 
-SYMBOLS = ["BTC","ETH","SOL","SUI","AVAX","NEAR","ADA","BNB","APT","CRV","ONDO","PENDLE","ICP","WIF"]
-BASE = "https://fapi.xt.com"
-LIST_URL = BASE + "/future/market/v1/public/symbol/list"
-KLINE_URL = BASE + "/future/market/v1/public/q/kline"
-TIMEFRAME = "15m"
-LIMIT = 1500
-DAYS = 365
-WARMUP_DAYS = 35
-REQUEST_TIMEOUT = 20
-RETRIES = 5
-SLEEP = 0.12
+SYMBOLS=["BTC","ETH","SOL","SUI","AVAX","NEAR","ADA","BNB","APT","CRV","ONDO","PENDLE","ICP","WIF"]
+DATA_DIR=Path("data/xt_futures_v141")
+OUT_DIR=DATA_DIR/"results"
+INITIAL_EQUITY=1000.0; TRADE_MARGIN=100.0; LEVERAGE=50.0
+FEE_RATE=0.0007; SLIPPAGE=0.0003; RR=2.0; MAX_OPEN_POSITIONS=3
 
-INITIAL_EQUITY = 1000.0
-TRADE_MARGIN = 100.0
-LEVERAGE = 50.0
-FEE_RATE = 0.0007
-SLIPPAGE = 0.0003
-RR = 2.0
-MAX_OPEN = 3
+BASE="https://fapi.xt.com"
+LIMIT=1500; INTERVAL="15m"; DAYS=365; WARMUP_DAYS=35
+S=requests.Session()
 
-# Signal parameters are deliberately frozen for the first research run.
-DONCHIAN_N = 96          # 24h on 15m
-ATR_N = 14
-ATR_EXP_N = 48
-VOL_N = 20
-BREAKOUT_ATR = 0.10
-SL_ATR = 1.5
+def resolve_symbols():
+    u=f"{BASE}/future/market/v1/public/symbol/list"
+    r=S.get(u,timeout=20); r.raise_for_status()
+    data=r.json().get("result",r.json())
+    rows=data.get("symbols",[]) if isinstance(data,dict) else data
+    out={}
+    for x in rows:
+        if not isinstance(x,dict): continue
+        raw=str(x.get("symbol",x.get("name",""))).upper()
+        compact=raw.replace("_","").replace("-","").replace("/","").replace(":","")
+        for a in SYMBOLS:
+            if compact.startswith(a+"USDT") or compact==a+"USDT":
+                out[a]=x.get("symbol") or x.get("name")
+    return out
 
-EMA_FAST_4H = 50
-EMA_SLOW_4H = 200
-EMA_FAST_1D = 50
-EMA_SLOW_1D = 200
-PULLBACK_EMA = 20
-MOM_LOOKBACK = 12         # 12h
-MOM_MIN_ATR = 0.75
+def fetch_symbol(asset, xt_symbol, days):
+    end=int(time.time()*1000); start=end-int((days+WARMUP_DAYS)*86400*1000)
+    rows=[]; cursor=end; guard=0
+    while cursor>start and guard<1000:
+        guard+=1
+        params={"symbol":xt_symbol,"interval":INTERVAL,"limit":LIMIT,"endTime":cursor}
+        r=S.get(f"{BASE}/future/market/v1/public/q/kline",params=params,timeout=20)
+        r.raise_for_status()
+        js=r.json(); raw=js.get("result",js)
+        arr=raw.get("data",raw) if isinstance(raw,dict) else raw
+        if not arr: break
+        batch=[]
+        for x in arr:
+            if isinstance(x,dict):
+                t=x.get("t",x.get("timestamp")); o=x.get("o",x.get("open")); h=x.get("h",x.get("high"))
+                l=x.get("l",x.get("low")); c=x.get("c",x.get("close")); v=x.get("a",x.get("volume",x.get("q",0)))
+            else:
+                if len(x)<6: continue
+                t,o,h,l,c,v=x[:6]
+            try: batch.append([int(t),float(o),float(h),float(l),float(c),float(v)])
+            except: continue
+        if not batch: break
+        rows.extend(batch)
+        mn=min(x[0] for x in batch)
+        if mn>=cursor: break
+        cursor=mn-1
+        time.sleep(.08)
+    df=pd.DataFrame(rows,columns=["timestamp","open","high","low","close","volume"])
+    if df.empty: raise RuntimeError(f"No XT data for {asset}")
+    df=df.drop_duplicates("timestamp").sort_values("timestamp")
+    df=df[df.timestamp>=start]
+    df["timestamp"]=pd.to_datetime(df.timestamp,unit="ms",utc=True)
+    df=df.set_index("timestamp")
+    return df.dropna()
 
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data-dir", default="data/xt_futures_v140")
-    p.add_argument("--days", type=int, default=DAYS)
-    return p.parse_args()
-
-
-def _get_json(url, params):
-    last = None
-    for attempt in range(RETRIES):
-        try:
-            r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last = e
-            time.sleep(0.5 * (attempt + 1))
-    raise RuntimeError(f"XT request failed: {last}")
-
-
-def extract_symbol_list(payload):
-    result = payload.get("result")
-    if isinstance(result, list):
-        return result
-    if isinstance(result, dict):
-        for key in ("items", "list", "data", "symbols"):
-            if isinstance(result.get(key), list):
-                return result[key]
-    raise RuntimeError(f"Could not find XT symbol list in response: {payload}")
-
-
-def resolve_xt_symbols(session):
-    payload = _get_json(LIST_URL, {})
-    items = extract_symbol_list(payload)
-    discovered = {}
-    for item in items:
-        if isinstance(item, str):
-            raw = item
-        elif isinstance(item, dict):
-            raw = item.get("symbol") or item.get("s") or item.get("name") or item.get("pair")
-        else:
-            continue
-        if raw:
-            discovered[str(raw).strip().upper()] = item
-
-    def norm(x):
-        return str(x).upper().replace("/", "_").replace("-", "_")
-
-    mapping = {}
-    for asset in SYMBOLS:
-        wanted = asset.upper()
-        candidates = [f"{wanted}_USDT", f"{wanted}/USDT", f"{wanted}-USDT", wanted]
-        actual = None
-        for candidate in candidates:
-            if candidate.upper() in discovered:
-                actual = candidate.upper()
-                break
-        if actual is None:
-            matches = [x for x in discovered if norm(x) == f"{wanted}_USDT"]
-            if len(matches) == 1:
-                actual = matches[0]
-        if actual is not None:
-            mapping[asset] = actual
-    return mapping
-
-
-def normalize_kline_rows(rows, symbol):
-    records = []
-    for row in rows:
-        if isinstance(row, dict):
-            # XT Futures public K-line fields: t,o,h,l,c,a (timestamp/open/high/low/close/amount)
-            keys = ("t", "o", "h", "l", "c", "a")
-            if not all(k in row for k in keys):
-                raise RuntimeError(f"{symbol}: malformed dict kline: {row}")
-            vals = [row[k] for k in keys]
-        elif isinstance(row, (list, tuple)):
-            if len(row) < 6:
-                raise RuntimeError(f"{symbol}: malformed array kline: {row}")
-            vals = list(row[:6])
-        else:
-            raise RuntimeError(f"{symbol}: unsupported kline row: {row!r}")
-        records.append([int(float(vals[0])), *[float(v) for v in vals[1:6]]])
-    return pd.DataFrame(records, columns=["timestamp","open","high","low","close","volume"])
-
-
-def fetch_batch(session, xt_symbol, start_ms, end_ms):
-    # XT's Futures API is case-sensitive for the market id.
-    params = {
-        "symbol": xt_symbol.strip().lower(),
-        "interval": TIMEFRAME,
-        "startTime": start_ms,
-        "endTime": end_ms,
-        "limit": LIMIT,
-    }
-    payload = _get_json(KLINE_URL, params)
-    result = payload.get("result")
-    if not isinstance(result, list):
-        raise RuntimeError(f"XT Kline result is not a list: {payload}")
-    return normalize_kline_rows(result, xt_symbol)
-
-
-def fetch_symbol_15m(asset, xt_symbol, days=DAYS):
-    end_dt = pd.Timestamp.now(tz="UTC")
-    start_dt = end_dt - pd.Timedelta(days=days + WARMUP_DAYS)
-    start_ms = int(start_dt.timestamp() * 1000)
-    cursor_end = int(end_dt.timestamp() * 1000)
-    interval_ms = 15 * 60 * 1000
-    batches = []
-    calls = 0
-
-    # XT returns the newest candles first for a wide interval; paginate backward.
-    while cursor_end >= start_ms:
-        batch = fetch_batch(None, xt_symbol, start_ms, cursor_end)
-        calls += 1
-        if batch.empty:
-            break
-        batch = batch.sort_values("timestamp").reset_index(drop=True)
-        first = int(batch["timestamp"].iloc[0])
-        last = int(batch["timestamp"].iloc[-1])
-        if first < start_ms:
-            batch = batch[batch["timestamp"] >= start_ms].copy()
-            if batch.empty:
-                break
-            first = int(batch["timestamp"].iloc[0])
-        if last > cursor_end:
-            raise RuntimeError(f"{asset}: XT returned candle beyond requested end")
-        batches.append(batch)
-        if first <= start_ms:
-            break
-        next_end = first - 1
-        if next_end >= cursor_end:
-            raise RuntimeError(f"{asset}: backward pagination made no progress")
-        cursor_end = next_end
-        if calls > 1000:
-            raise RuntimeError(f"{asset}: pagination safety stop")
-        time.sleep(SLEEP)
-
-    if not batches:
-        raise RuntimeError(f"No XT data for {asset}")
-
-    df = pd.concat(batches, ignore_index=True).drop_duplicates("timestamp").sort_values("timestamp")
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.set_index("timestamp")
-    current = pd.Timestamp.now(tz="UTC")
-    if not df.empty and df.index[-1] + pd.Timedelta(minutes=15) > current:
-        df = df.iloc[:-1]
-    df = df.astype(float).dropna()
-    return df
-
-
-def ensure_data(data_dir: Path, days: int):
-    data_dir.mkdir(parents=True, exist_ok=True)
-    session = requests.Session()
-    session.headers.update({"User-Agent": "HUNTER-XT-Futures-Research/1.0"})
-    mapping = resolve_xt_symbols(session)
-    if len(mapping) != len(SYMBOLS):
-        missing = [s for s in SYMBOLS if s not in mapping]
-        raise RuntimeError(f"XT symbol resolution incomplete: {missing}")
+def ensure_data(data_dir,days):
+    data_dir.mkdir(parents=True,exist_ok=True); mapping=resolve_symbols()
     print(f"Verified XT symbols: {len(mapping)} / {len(SYMBOLS)}")
-    for asset in SYMBOLS:
-        path = data_dir / f"{asset}_USDT_15m.csv"
-        df = fetch_symbol_15m(asset, mapping[asset], days)
-        df.reset_index().to_csv(path, index=False)
-        gaps = int(((df.index.to_series().diff().dropna() / pd.Timedelta(minutes=15)) > 1).sum())
-        print(f"{asset:<8} rows={len(df)} gaps={gaps}")
+    if len(mapping)!=len(SYMBOLS): raise RuntimeError("XT symbol mapping incomplete")
+    out={}
+    for a in SYMBOLS:
+        path=data_dir/f"{a}_USDT_15m.csv"
+        try:
+            df=fetch_symbol(a,mapping[a],days)
+            df.to_csv(path)
+            out[a]=df
+            gaps=int(df.index.to_series().diff().dt.total_seconds().div(900).sub(1).clip(lower=0).sum())
+            print(f"{a:<8} rows={len(df)} gaps={gaps}")
+        except Exception as e:
+            raise RuntimeError(f"XT download failed for {a}: {e}") from e
+    return out
 
-def load(path: Path):
-    df = pd.read_csv(path)
-    ts = pd.to_datetime(df["timestamp"], utc=True)
-    df["timestamp"] = ts
-    df = df.set_index("timestamp").sort_index().drop_duplicates()
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna(subset=["open","high","low","close","volume"])
+def resample(df,rule):
+    return df.resample(rule,label="right",closed="right").agg(
+        {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
 
+def features(all15):
+    out={}
+    h1={a:resample(df,"1h") for a,df in all15.items()}
+    h4={a:resample(df,"4h") for a,df in all15.items()}
+    d1={a:resample(df,"1D") for a,df in all15.items()}
+    for a in SYMBOLS:
+        x=h1[a].copy(); q=h4[a]; d=d1[a]
+        x["ret24"]=x.close.pct_change(24); x["ret72"]=x.close.pct_change(72)
+        x["atr"]=pd.concat([(x.high-x.low),(x.high-x.close.shift()).abs(),(x.low-x.close.shift()).abs()],axis=1).max(axis=1).ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+        x["rv"]=x.close.pct_change().rolling(24).std()
+        x["vol_z"]=(x.volume-x.volume.rolling(48).mean())/x.volume.rolling(48).std()
+        x["ema20"]=x.close.ewm(span=20,adjust=False).mean()
+        x["ema50"]=x.close.ewm(span=50,adjust=False).mean()
+        x["dev"]=(x.close-x.ema20)/x.atr
+        q["ema50"]=q.close.ewm(span=50,adjust=False).mean(); q["ema200"]=q.close.ewm(span=200,adjust=False).mean()
+        q["trend"]=np.where((q.close>q.ema200)&(q.ema50>q.ema200),1,np.where((q.close<q.ema200)&(q.ema50<q.ema200),-1,0))
+        d["ema50"]=d.close.ewm(span=50,adjust=False).mean(); d["ema200"]=d.close.ewm(span=200,adjust=False).mean()
+        d["regime"]=np.where((d.close>d.ema200)&(d.ema50>d.ema200),1,np.where((d.close<d.ema200)&(d.ema50<d.ema200),-1,0))
+        x["h4_trend"]=q["trend"].reindex(x.index,method="ffill")
+        x["d1_regime"]=d["regime"].reindex(x.index,method="ffill")
+        out[a]=x
+    return out
 
-def resample_ohlcv(df, rule):
-    out = df.resample(rule, label="right", closed="right").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
-    return out.dropna()
-
-
-def atr(df, n=14):
-    prev = df.close.shift(1)
-    tr = pd.concat([(df.high-df.low),(df.high-prev).abs(),(df.low-prev).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
-
-
-def build_features(df15):
-    h4 = resample_ohlcv(df15, "4h")
-    d1 = resample_ohlcv(df15, "1D")
-    h4["ema50"] = h4.close.ewm(span=EMA_FAST_4H, adjust=False, min_periods=EMA_FAST_4H).mean()
-    h4["ema200"] = h4.close.ewm(span=EMA_SLOW_4H, adjust=False, min_periods=EMA_SLOW_4H).mean()
-    h4["atr"] = atr(h4, ATR_N)
-    h4["trend_long"] = (h4.close > h4.ema50) & (h4.ema50 > h4.ema200)
-    h4["trend_short"] = (h4.close < h4.ema50) & (h4.ema50 < h4.ema200)
-
-    d1["ema50"] = d1.close.ewm(span=EMA_FAST_1D, adjust=False, min_periods=EMA_FAST_1D).mean()
-    d1["ema200"] = d1.close.ewm(span=EMA_SLOW_1D, adjust=False, min_periods=EMA_SLOW_1D).mean()
-    d1["bull"] = (d1.close > d1.ema200) & (d1.ema50 > d1.ema200)
-    d1["bear"] = (d1.close < d1.ema200) & (d1.ema50 < d1.ema200)
-
-    f = df15.copy()
-    f["atr"] = atr(f, ATR_N)
-    f["atr_mean"] = f["atr"].rolling(ATR_EXP_N, min_periods=ATR_EXP_N).mean()
-    f["vol_mean"] = f.volume.rolling(VOL_N, min_periods=VOL_N).mean()
-    f["dc_high"] = f.high.shift(1).rolling(DONCHIAN_N, min_periods=DONCHIAN_N).max()
-    f["dc_low"] = f.low.shift(1).rolling(DONCHIAN_N, min_periods=DONCHIAN_N).min()
-    f["range_pct"] = (f.high - f.low) / f.close.replace(0, np.nan)
-    f["body_pct"] = (f.close - f.open).abs() / f.close.replace(0, np.nan)
-    f["compression"] = f.atr < f.atr_mean * 0.85
-    f["expansion"] = f.atr > f.atr_mean * 1.10
-    f["break_long"] = f.close > f.dc_high + BREAKOUT_ATR * f.atr
-    f["break_short"] = f.close < f.dc_low - BREAKOUT_ATR * f.atr
-    f["vol_ok"] = f.volume > 1.20 * f.vol_mean
-
-    # 1H momentum pullback, all based only on completed 1H bars.
-    h1 = resample_ohlcv(df15, "1h")
-    h1["atr"] = atr(h1, ATR_N)
-    h1["ema20"] = h1.close.ewm(span=PULLBACK_EMA, adjust=False, min_periods=PULLBACK_EMA).mean()
-    h1["mom"] = h1.close.pct_change(MOM_LOOKBACK)
-    h1["impulse_long"] = (h1.mom > 0) & ((h1.close - h1.close.shift(MOM_LOOKBACK)).abs() > MOM_MIN_ATR * h1.atr)
-    h1["impulse_short"] = (h1.mom < 0) & ((h1.close - h1.close.shift(MOM_LOOKBACK)).abs() > MOM_MIN_ATR * h1.atr)
-    h1["pull_long"] = (h1.low <= h1.ema20) & (h1.close > h1.ema20) & (h1.close > h1.open)
-    h1["pull_short"] = (h1.high >= h1.ema20) & (h1.close < h1.ema20) & (h1.close < h1.open)
-    h1["long_sig"] = h1.impulse_long.shift(1) & h1.pull_long
-    h1["short_sig"] = h1.impulse_short.shift(1) & h1.pull_short
-
-    # Align higher-timeframe information to 15m using only completed bars.
-    f["d_bull"] = d1.bull.reindex(f.index, method="ffill")
-    f["d_bear"] = d1.bear.reindex(f.index, method="ffill")
-    f["h4_long"] = h4.trend_long.reindex(f.index, method="ffill")
-    f["h4_short"] = h4.trend_short.reindex(f.index, method="ffill")
-    f["h1_long"] = h1.long_sig.reindex(f.index, method="ffill").fillna(False)
-    f["h1_short"] = h1.short_sig.reindex(f.index, method="ffill").fillna(False)
-
-    # Family A: breakout after compression + expansion confirmation.
-    f["A_long"] = f.d_bull & f.h4_long & f.compression.shift(1).fillna(False) & f.expansion & f.break_long & f.vol_ok
-    f["A_short"] = f.d_bear & f.h4_short & f.compression.shift(1).fillna(False) & f.expansion & f.break_short & f.vol_ok
-
-    # Family B: MTF momentum continuation.
-    f["B_long"] = f.d_bull & f.h4_long & f.h1_long
-    f["B_short"] = f.d_bear & f.h4_short & f.h1_short
-
-    # Family C: regime adaptive union, but a signal keeps its family identity.
-    f["C_long"] = f.A_long | f.B_long
-    f["C_short"] = f.A_short | f.B_short
+def add_cross_sectional(f):
+    times=sorted(set().union(*(x.index for x in f.values())))
+    for ts in times:
+        vals=[]
+        for a,x in f.items():
+            if ts in x.index and np.isfinite(x.loc[ts,"ret24"]): vals.append((a,x.loc[ts,"ret24"]))
+        vals.sort(key=lambda z:z[1])
+        n=len(vals)
+        for rank,(a,_) in enumerate(vals):
+            f[a].loc[ts,"mom_rank"]=rank/(n-1) if n>1 else .5
     return f
 
+def signals(f):
+    sig=[]
+    for a,x in f.items():
+        for i in range(1,len(x)-1):
+            r=x.iloc[i]; ts=x.index[i]
+            if not all(np.isfinite(r.get(k,np.nan)) for k in ["atr","ret24","ret72","mom_rank","vol_z","dev"]): continue
+            # A: relative-strength momentum continuation
+            longA=r.d1_regime==1 and r.h4_trend==1 and r.mom_rank>=.75 and r.ret24>0 and r.ret72>0 and r.close>r.ema20
+            shortA=r.d1_regime==-1 and r.h4_trend==-1 and r.mom_rank<=.25 and r.ret24<0 and r.ret72<0 and r.close<r.ema20
+            # B: controlled short-term reversal, only inside non-neutral daily regime
+            longB=r.d1_regime==1 and r.h4_trend>=0 and r.dev<=-1.5 and r.vol_z>-1.0
+            shortB=r.d1_regime==-1 and r.h4_trend<=0 and r.dev>=1.5 and r.vol_z>-1.0
+            # C: volatility regime switch; momentum when volatility expands, reversal when compressed
+            vol_q=x["rv"].rolling(240,min_periods=120).rank(pct=True).iloc[i]
+            longC=(r.d1_regime==1 and r.h4_trend==1 and vol_q>=.70 and r.ret24>0 and r.mom_rank>=.60) or (r.d1_regime==1 and vol_q<=.25 and r.dev<=-1.75)
+            shortC=(r.d1_regime==-1 and r.h4_trend==-1 and vol_q>=.70 and r.ret24<0 and r.mom_rank<=.40) or (r.d1_regime==-1 and vol_q<=.25 and r.dev>=1.75)
+            for fam,side in [("A_MOMENTUM", "LONG" if longA else "SHORT" if shortA else None),("B_REVERSAL","LONG" if longB else "SHORT" if shortB else None),("C_REGIME_SWITCH","LONG" if longC else "SHORT" if shortC else None)]:
+                if side: sig.append({"asset":a,"signal_ts":ts,"family":fam,"side":side,"atr":float(r.atr)})
+    return sig
 
-def simulate(all_data, signal_col_long, signal_col_short):
-    times = sorted(set().union(*(df.index for df in all_data.values())))
-    active = {}
-    trades = []
-    equity = INITIAL_EQUITY
-    peak = equity
-    max_dd = 0.0
-    for ts in times:
-        # Manage first; no new signal on the candle that resolves an old position.
-        closed_this_bar = False
-        for sym, pos in list(active.items()):
-            df = all_data[sym]
-            if ts not in df.index:
-                continue
-            bar = df.loc[ts]
-            hit_sl = bar.low <= pos.sl if pos.side == "LONG" else bar.high >= pos.sl
-            hit_tp = bar.high >= pos.tp if pos.side == "LONG" else bar.low <= pos.tp
+def backtest(f, sig):
+    byts={}
+    for s in sig: byts.setdefault(s["signal_ts"],[]).append(s)
+    positions=[]; trades=[]; equity=INITIAL_EQUITY; peak=equity; last_close=pd.Timestamp.min.tz_localize("UTC")
+    for ts in sorted(byts):
+        # close positions before considering new signal; no same-close/signal candle reuse
+        for p in positions[:]:
+            x=f[p["asset"]]
+            if ts not in x.index: continue
+            row=x.loc[ts]; hit_sl=(row.low<=p["sl"] if p["side"]=="LONG" else row.high>=p["sl"]); hit_tp=(row.high>=p["tp"] if p["side"]=="LONG" else row.low<=p["tp"])
             if hit_sl or hit_tp:
-                closed_this_bar = True
-                outcome = "LOSS" if hit_sl else "WIN"
-                px = pos.sl if hit_sl else pos.tp
-                gross = ((px-pos.entry)/pos.entry if pos.side=="LONG" else (pos.entry-px)/pos.entry) * TRADE_MARGIN * LEVERAGE
-                pnl = gross - TRADE_MARGIN*LEVERAGE*FEE_RATE*2
-                equity += pnl
-                peak = max(peak, equity)
-                max_dd = min(max_dd, equity-peak)
-                trades.append({"symbol":sym,"side":pos.side,"entry_ts":pos.entry_ts,"exit_ts":ts,"outcome":outcome,"pnl":pnl})
-                del active[sym]
-        if closed_this_bar or len(active) >= MAX_OPEN:
-            continue
-        candidates=[]
-        for sym, df in all_data.items():
-            if sym in active or ts not in df.index: continue
-            row=df.loc[ts]
-            if bool(row.get(signal_col_long,False)):
-                candidates.append((sym,"LONG",float(row.atr)))
-            elif bool(row.get(signal_col_short,False)):
-                candidates.append((sym,"SHORT",float(row.atr)))
-        for sym, side, a in candidates:
-            if len(active)>=MAX_OPEN or not np.isfinite(a) or a<=0: break
-            df=all_data[sym]
-            nxt=df.index[df.index>ts]
-            if len(nxt)==0: continue
-            entry_ts=nxt[0]
-            entry=float(df.loc[entry_ts,"open"])*(1+SLIPPAGE if side=="LONG" else 1-SLIPPAGE)
-            sl=entry-SL_ATR*a if side=="LONG" else entry+SL_ATR*a
-            risk=abs(entry-sl)
-            tp=entry+RR*risk if side=="LONG" else entry-RR*risk
-            active[sym]=type("P",(),{"side":side,"entry":entry,"sl":sl,"tp":tp,"entry_ts":entry_ts})()
-    return trades, equity, max_dd, len(active)
-
-
-def report(name,trades,equity,max_dd,open_n):
-    closed=len(trades); wins=sum(t["outcome"]=="WIN" for t in trades); losses=closed-wins
-    wr=100*wins/closed if closed else 0
-    gross_win=sum(t["pnl"] for t in trades if t["pnl"]>0)
-    gross_loss=-sum(t["pnl"] for t in trades if t["pnl"]<0)
-    pf=gross_win/gross_loss if gross_loss else (float("inf") if gross_win else 0)
-    ordered=sorted(trades,key=lambda x:pd.Timestamp(x["exit_ts"]))
-    streak=maxst=0
-    for t in ordered:
-        streak=streak+1 if t["outcome"]=="LOSS" else 0; maxst=max(maxst,streak)
-    days=max(1,(pd.Timestamp.now(tz="UTC")-min([pd.Timestamp(t["entry_ts"]) for t in trades],default=pd.Timestamp.now(tz="UTC"))).days)
-    print(f"\n{name}")
-    print(f"Trades={closed} Open={open_n} WR={wr:.2f}% PF={pf:.3f} NetPnL=${equity-INITIAL_EQUITY:,.2f} DD=${max_dd:,.2f} MaxLossStreak={maxst} Trades/day={closed/days:.2f}")
-
+                outcome="LOSS" if hit_sl else "WIN"; ex=p["sl"] if hit_sl else p["tp"]
+                gross=((ex-p["entry"])/p["entry"] if p["side"]=="LONG" else (p["entry"]-ex)/p["entry"])*TRADE_MARGIN*LEVERAGE
+                pnl=gross-(TRADE_MARGIN*LEVERAGE*FEE_RATE*2); equity+=pnl; peak=max(peak,equity)
+                trades.append({**p,"exit_ts":ts,"outcome":outcome,"pnl":pnl,"equity":equity}); positions.remove(p); last_close=ts
+        if ts<=last_close: continue
+        if len(positions)>=MAX_OPEN_POSITIONS: continue
+        # one best candidate per family/asset, rank by cross-sectional strength magnitude
+        for s in sorted(byts[ts],key=lambda z:abs(z["atr"]),reverse=True):
+            if len(positions)>=MAX_OPEN_POSITIONS: break
+            if any(p["asset"]==s["asset"] for p in positions): continue
+            x=f[s["asset"]]; future=x.index[x.index>ts]
+            if len(future)==0: continue
+            ets=future[0]; entry=float(x.loc[ets,"open"])*(1+SLIPPAGE if s["side"]=="LONG" else 1-SLIPPAGE)
+            risk=1.5*s["atr"]; sl=entry-risk if s["side"]=="LONG" else entry+risk; tp=entry+RR*risk if s["side"]=="LONG" else entry-RR*risk
+            positions.append({"asset":s["asset"],"family":s["family"],"side":s["side"],"signal_ts":ts,"entry_ts":ets,"entry":entry,"sl":sl,"tp":tp})
+    # mark unresolved as OPEN; no forced loss
+    return trades,positions
 
 def main():
-    args=parse_args(); data_dir=Path(args.data_dir)
-    ensure_data(data_dir,args.days)
-    all_data={}
-    print("\nBuilding research features...")
-    for s in SYMBOLS:
-        all_data[s]=build_features(load(data_dir/f"{s}_USDT_15m.csv"))
-    print("\nRunning frozen families...")
-    for name,lcol,scol in [("A_BREAKOUT","A_long","A_short"),("B_MOMENTUM_PULLBACK","B_long","B_short"),("C_REGIME_ADAPTIVE","C_long","C_short")]:
-        trades,eq,dd,op=simulate(all_data,lcol,scol)
-        report(name,trades,eq,dd,op)
-
+    ap=argparse.ArgumentParser(); ap.add_argument("--days",type=int,default=DAYS); ap.add_argument("--data-dir",default=str(DATA_DIR)); args=ap.parse_args()
+    print("="*88); print("HUNTER-V141 — MTF FACTOR RESEARCH"); print("="*88)
+    all15=ensure_data(Path(args.data_dir),args.days); f=add_cross_sectional(features(all15)); print("\nRunning frozen factor families...")
+    sig=signals(f); trades,openp=backtest(f,sig)
+    for fam in ["A_MOMENTUM","B_REVERSAL","C_REGIME_SWITCH"]:
+        t=[z for z in trades if z["family"]==fam]; wins=sum(z["outcome"]=="WIN" for z in t); losses=len(t)-wins
+        grossw=sum(z["pnl"] for z in t if z["pnl"]>0); grossl=-sum(z["pnl"] for z in t if z["pnl"]<0)
+        eq=INITIAL_EQUITY; peak=eq; dd=0; streak=mx=0
+        for z in sorted(t,key=lambda q:q["exit_ts"]):
+            eq+=z["pnl"]; peak=max(peak,eq); dd=min(dd,eq-peak); streak=streak+1 if z["outcome"]=="LOSS" else 0; mx=max(mx,streak)
+        print(f"{fam}: Trades={len(t)} Open={sum(p['family']==fam for p in openp)} WR={(wins/len(t)*100 if t else 0):.2f}% PF={(grossw/grossl if grossl else 0):.3f} NetPnL=${sum(z['pnl'] for z in t):,.2f} DD=${dd:,.2f} MaxLossStreak={mx}")
+    print(f"Total signals={len(sig)} Realized={len(trades)} Open={len(openp)}")
 if __name__=="__main__": main()
