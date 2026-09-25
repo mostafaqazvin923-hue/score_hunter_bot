@@ -27,7 +27,10 @@ FEE_RATE=0.0007; SLIPPAGE=0.0003; RR=2.0; MAX_OPEN_POSITIONS=3
 
 BASE="https://fapi.xt.com"
 LIMIT=1500; INTERVAL="15m"; DAYS=365; WARMUP_DAYS=35
+MIN_ROWS=30000
+MAX_REQUEST_RETRIES=6
 S=requests.Session()
+S.headers.update({"User-Agent":"HUNTER-backtest/142"})
 
 def resolve_symbols():
     u=f"{BASE}/future/market/v1/public/symbol/list"
@@ -44,40 +47,95 @@ def resolve_symbols():
                 out[a]=x.get("symbol") or x.get("name")
     return out
 
+def _get_json(url, params):
+    last=None
+    for attempt in range(MAX_REQUEST_RETRIES):
+        try:
+            r=S.get(url,params=params,timeout=20)
+            r.raise_for_status()
+            js=r.json()
+            # XT can return an HTTP-200 API error/rate-limit payload.
+            if isinstance(js,dict):
+                code=js.get("code")
+                if code not in (None,0,"0",200,"200"):
+                    raise RuntimeError(f"XT API code={code}: {js.get('msg',js.get('message',''))}")
+            return js
+        except Exception as e:
+            last=e
+            time.sleep(min(2.0,0.25*(2**attempt)))
+    raise RuntimeError(f"XT request failed after {MAX_REQUEST_RETRIES} retries: {last}")
+
+def _parse_kline(js):
+    raw=js.get("result",js) if isinstance(js,dict) else js
+    if isinstance(raw,dict):
+        arr=raw.get("data",raw.get("rows",raw.get("list",[])))
+    else:
+        arr=raw
+    if not isinstance(arr,list):
+        return []
+    out=[]
+    for x in arr:
+        if isinstance(x,dict):
+            t=x.get("t",x.get("timestamp",x.get("time")))
+            o=x.get("o",x.get("open")); h=x.get("h",x.get("high"))
+            l=x.get("l",x.get("low")); c=x.get("c",x.get("close"))
+            v=x.get("a",x.get("volume",x.get("q",0)))
+        else:
+            if len(x)<6: continue
+            t,o,h,l,c,v=x[:6]
+        try:
+            out.append([int(t),float(o),float(h),float(l),float(c),float(v)])
+        except (TypeError,ValueError):
+            continue
+    return out
+
 def fetch_symbol(asset, xt_symbol, days):
     end=int(time.time()*1000); start=end-int((days+WARMUP_DAYS)*86400*1000)
-    rows=[]; cursor=end; guard=0
-    while cursor>start and guard<1000:
-        guard+=1
-        params={"symbol":xt_symbol,"interval":INTERVAL,"limit":LIMIT,"endTime":cursor}
-        r=S.get(f"{BASE}/future/market/v1/public/q/kline",params=params,timeout=20)
-        r.raise_for_status()
-        js=r.json(); raw=js.get("result",js)
-        arr=raw.get("data",raw) if isinstance(raw,dict) else raw
-        if not arr: break
-        batch=[]
-        for x in arr:
-            if isinstance(x,dict):
-                t=x.get("t",x.get("timestamp")); o=x.get("o",x.get("open")); h=x.get("h",x.get("high"))
-                l=x.get("l",x.get("low")); c=x.get("c",x.get("close")); v=x.get("a",x.get("volume",x.get("q",0)))
-            else:
-                if len(x)<6: continue
-                t,o,h,l,c,v=x[:6]
-            try: batch.append([int(t),float(o),float(h),float(l),float(c),float(v)])
-            except: continue
-        if not batch: break
-        rows.extend(batch)
-        mn=min(x[0] for x in batch)
-        if mn>=cursor: break
-        cursor=mn-1
-        time.sleep(.08)
-    df=pd.DataFrame(rows,columns=["timestamp","open","high","low","close","volume"])
-    if df.empty: raise RuntimeError(f"No XT data for {asset}")
-    df=df.drop_duplicates("timestamp").sort_values("timestamp")
-    df=df[df.timestamp>=start]
-    df["timestamp"]=pd.to_datetime(df.timestamp,unit="ms",utc=True)
-    df=df.set_index("timestamp")
-    return df.dropna()
+    best=[]
+    # Retry the whole symbol, not just individual HTTP calls. This prevents a
+    # transient/partial XT response (e.g. 14 candles) from being accepted.
+    for whole_try in range(4):
+        rows=[]; cursor=end; guard=0; failed=False
+        while cursor>start and guard<1000:
+            guard+=1
+            params={"symbol":xt_symbol,"interval":INTERVAL,"limit":LIMIT,"endTime":cursor}
+            try:
+                js=_get_json(f"{BASE}/future/market/v1/public/q/kline",params)
+                batch=_parse_kline(js)
+            except Exception:
+                failed=True
+                break
+            if not batch:
+                # Empty page can be transient; retry the page before aborting.
+                recovered=False
+                for _ in range(3):
+                    time.sleep(0.5)
+                    try:
+                        batch=_parse_kline(_get_json(f"{BASE}/future/market/v1/public/q/kline",params))
+                        if batch:
+                            recovered=True; break
+                    except Exception:
+                        pass
+                if not recovered:
+                    break
+            rows.extend(batch)
+            mn=min(x[0] for x in batch)
+            mx=max(x[0] for x in batch)
+            if mn>=cursor or mx<start:
+                break
+            cursor=mn-1
+            time.sleep(0.20)
+        if rows:
+            df=pd.DataFrame(rows,columns=["timestamp","open","high","low","close","volume"])
+            df=df.drop_duplicates("timestamp").sort_values("timestamp")
+            df=df[(df.timestamp>=start)&(df.timestamp<=end)]
+            if len(df)>len(best): best=df
+            if len(df)>=MIN_ROWS:
+                df["timestamp"]=pd.to_datetime(df.timestamp,unit="ms",utc=True)
+                return df.set_index("timestamp").dropna()
+        time.sleep(1.0*(whole_try+1))
+    got=len(best)
+    raise RuntimeError(f"Insufficient XT data for {asset}: got {got} rows; refusing to run a partial backtest")
 
 def ensure_data(data_dir,days):
     data_dir.mkdir(parents=True,exist_ok=True); mapping=resolve_symbols()
@@ -88,6 +146,8 @@ def ensure_data(data_dir,days):
         path=data_dir/f"{a}_USDT_15m.csv"
         try:
             df=fetch_symbol(a,mapping[a],days)
+            if len(df)<MIN_ROWS:
+                raise RuntimeError(f"Validation failed for {a}: only {len(df)} rows")
             df.to_csv(path)
             out[a]=df
             gaps=int(df.index.to_series().diff().dt.total_seconds().div(900).sub(1).clip(lower=0).sum())
@@ -158,8 +218,9 @@ def signals(f):
 def backtest(f, sig):
     byts={}
     for s in sig: byts.setdefault(s["signal_ts"],[]).append(s)
+    all_ts=sorted(set().union(*(x.index for x in f.values())))
     positions=[]; trades=[]; equity=INITIAL_EQUITY; peak=equity; last_close=pd.Timestamp.min.tz_localize("UTC")
-    for ts in sorted(byts):
+    for ts in all_ts:
         # close positions before considering new signal; no same-close/signal candle reuse
         for p in positions[:]:
             x=f[p["asset"]]
