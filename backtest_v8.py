@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-HUNTER-V147 — BALANCED STRUCTURAL MOMENTUM
-1D regime + 4H context + 1H liquidity/structure trigger.
+HUNTER-V148 — TREND PULLBACK RESEARCH
+1D regime + 4H trend context + 1H pullback/reclaim/momentum resumption.
 Raw source: XT Futures 15m -> causal 1H/4H/1D.
 
 Purpose
 -------
-V145 showed that parameter tuning did not fix the old regime-switch edge.
-V146 then became too restrictive: its AND-gated sweep/reclaim/displacement
-logic produced too few trades. V147 keeps the causal MTF architecture but
-uses a weighted structural score so valid setups do not need every filter
-to fire simultaneously.
+V145/V146/V148 showed that the old regime-switch and generic score families
+did not produce the required edge. V148 tests a different research family:
+trend continuation after a causal 1H pullback into EMA value, followed by
+reclaim and momentum resumption. Higher timeframes provide direction; 1H
+provides the trigger.
 
 Signal concept
 --------------
@@ -39,7 +39,7 @@ Integrity rules
 - Positions still open at dataset end remain OPEN.
 - Minimum trade count is used for research ranking, not to manufacture wins.
 
-V147 optimization
+V148 optimization
 ------------------
 A compact causal grid varies the minimum score and a few structural
 thresholds. Features are computed once. The score is never used to alter
@@ -79,7 +79,7 @@ MIN_ROWS = 30000
 MAX_REQUEST_RETRIES = 6
 
 S = requests.Session()
-S.headers.update({"User-Agent": "HUNTER-backtest/146"})
+S.headers.update({"User-Agent": "HUNTER-backtest/148"})
 
 
 def resolve_symbols():
@@ -151,140 +151,133 @@ def _parse_kline(js):
 
 
 def fetch_symbol(asset, xt_symbol, days):
-    """Fetch completed 15m XT futures candles with forward pagination.
-
-    IMPORTANT: XT's /q/kline endpoint has shown inconsistent behavior when both
-    startTime and endTime are supplied for historical windows. The proven-safe
-    approach is to paginate using startTime + limit only, then locally trim to
-    the requested end. This avoids the recurring "kline batch outside requested
-    range" failure seen in GitHub Actions.
     """
-    now_ms = int(time.time() * 1000)
-    interval_ms = 15 * 60 * 1000
-    last_closed_open = (now_ms // interval_ms) * interval_ms - interval_ms
-    end_ms = last_closed_open
-    start_ms = ((now_ms - int((days + WARMUP_DAYS) * 86400 * 1000)) // interval_ms) * interval_ms
+    Robust XT 15m collector.
 
-    endpoint = f"{BASE}/future/market/v1/public/q/kline"
-    candidates = []
-    for sym in (str(xt_symbol).strip(), str(xt_symbol).strip().lower()):
-        if sym and sym not in candidates:
-            candidates.append(sym)
+    Important: XT documents both startTime and endTime for /q/kline.  We
+    paginate FORWARD with startTime+endTime windows instead of relying on a
+    single moving endTime.  This avoids the partial-page behaviour that caused
+    the previous run to receive only 15 BTC candles.
+    """
+    now_ms=int(time.time()*1000)
+    start_ms=now_ms-int((days+WARMUP_DAYS)*86400*1000)
+    # Never use a still-forming candle.
+    interval_ms=15*60*1000
+    end_ms=(now_ms//interval_ms)*interval_ms-1
 
-    last_error = None
+    best=[]
+    endpoint=f"{BASE}/future/market/v1/public/q/kline"
 
-    for api_symbol in candidates:
-        all_rows = []
-        cursor = start_ms
-        guard = 0
-        failed = False
+    for whole_try in range(5):
+        rows=[]
+        cursor=start_ms
+        guard=0
+        failed=False
 
-        while cursor <= end_ms and guard < 1000:
+        while cursor < end_ms and guard < 2000:
             guard += 1
-            params = {
-                "symbol": api_symbol,
-                "interval": INTERVAL,
-                "startTime": int(cursor),
-                "limit": LIMIT,
+            # 1500 x 15m = 15.625 days. Keep a tiny overlap and dedupe later.
+            window_end=min(end_ms, cursor + LIMIT*interval_ms - 1)
+            params={
+                "symbol":xt_symbol,
+                "interval":INTERVAL,
+                "startTime":cursor,
+                "endTime":window_end,
+                "limit":LIMIT,
             }
 
-            batch = []
-            batch_error = None
-            for attempt in range(MAX_REQUEST_RETRIES):
+            batch=[]
+            last_err=None
+            for attempt in range(6):
                 try:
-                    batch = _parse_kline(_get_json(endpoint, params))
+                    batch=_parse_kline(_get_json(endpoint,params))
                     if batch:
                         break
-                    batch_error = RuntimeError(
-                        f"empty kline response for {api_symbol} at startTime={cursor}"
-                    )
-                except Exception as exc:
-                    batch_error = exc
-                time.sleep(min(2.0, 0.25 * (attempt + 1)))
+                except Exception as e:
+                    last_err=e
+                time.sleep(min(2.0,0.35*(attempt+1)))
 
             if not batch:
-                last_error = batch_error
-                failed = True
+                failed=True
                 break
 
-            # XT may return a few candles around the requested boundary. Keep
-            # only candles that belong to our requested historical interval.
-            batch = [x for x in batch if start_ms <= x[0] <= end_ms]
+            # Keep only valid candles inside the requested window.
+            batch=[x for x in batch if start_ms <= x[0] <= end_ms]
             if not batch:
-                # If the exchange returned only future/out-of-range rows, do not
-                # spin forever. Report the actual returned timestamp range.
-                raw_min = min(x[0] for x in _parse_kline(_get_json(endpoint, params)))
-                raw_max = max(x[0] for x in _parse_kline(_get_json(endpoint, params)))
-                last_error = RuntimeError(
-                    f"XT returned rows outside requested history for {api_symbol}: "
-                    f"requested_start={cursor}, returned={raw_min}->{raw_max}"
-                )
-                failed = True
+                failed=True
                 break
 
-            all_rows.extend(batch)
-            mx = max(x[0] for x in batch)
+            rows.extend(batch)
+            mn=min(x[0] for x in batch)
+            mx=max(x[0] for x in batch)
+
+            # Hard progress check. Never loop on the same XT page.
             if mx < cursor:
-                last_error = RuntimeError(
-                    f"XT pagination did not advance for {api_symbol}: {mx} < {cursor}"
-                )
-                failed = True
+                failed=True
                 break
 
-            next_cursor = mx + interval_ms
+            # Normal case: move just past the last candle received.
+            next_cursor=mx+1
             if next_cursor <= cursor:
-                last_error = RuntimeError(
-                    f"XT pagination stalled for {api_symbol}: cursor={cursor}, next={next_cursor}"
-                )
-                failed = True
+                failed=True
                 break
-            cursor = next_cursor
-            time.sleep(0.05)
+            cursor=next_cursor
 
-        if failed or not all_rows:
-            continue
+            # If XT returned fewer than LIMIT rows, the next forward request
+            # is still valid; do not treat a short page as a fatal error.
+            time.sleep(0.08)
 
-        df = pd.DataFrame(
-            all_rows,
-            columns=["timestamp", "open", "high", "low", "close", "volume"],
-        )
-        df = df.drop_duplicates("timestamp").sort_values("timestamp")
-        df = df[(df.timestamp >= start_ms) & (df.timestamp <= end_ms)]
+        if rows:
+            df=pd.DataFrame(
+                rows,
+                columns=["timestamp","open","high","low","close","volume"]
+            )
+            df=df.drop_duplicates("timestamp").sort_values("timestamp")
+            df=df[(df.timestamp>=start_ms)&(df.timestamp<=end_ms)]
 
-        if len(df) >= MIN_ROWS:
-            span = int(df.timestamp.max() - df.timestamp.min())
-            if span >= int(days * 86400 * 1000 * 0.90):
-                df["timestamp"] = pd.to_datetime(df.timestamp, unit="ms", utc=True)
-                return df.set_index("timestamp").dropna()
+            if len(df)>len(best):
+                best=df
 
-        last_error = RuntimeError(
-            f"short XT history for {api_symbol}: rows={len(df)}"
-        )
+            if len(df)>=MIN_ROWS:
+                # Require broad time coverage, not merely row count.
+                span=int(df.timestamp.max()-df.timestamp.min())
+                required_span=int(days*86400*1000*0.90)
+                if span >= required_span:
+                    df["timestamp"]=pd.to_datetime(df.timestamp,unit="ms",utc=True)
+                    return df.set_index("timestamp").dropna()
 
-    detail = f"; last_error={last_error}" if last_error else ""
+        time.sleep(1.0*(whole_try+1))
+
+    got=len(best)
+    if got:
+        first=pd.to_datetime(int(best.timestamp.min()),unit="ms",utc=True)
+        last=pd.to_datetime(int(best.timestamp.max()),unit="ms",utc=True)
+        detail=f"; range={first} -> {last}"
+    else:
+        detail=""
     raise RuntimeError(
-        f"Insufficient XT data for {asset}: got 0 rows{detail}; refusing partial backtest"
+        f"Insufficient XT data for {asset}: got {got} rows{detail}; "
+        f"refusing to run a partial backtest"
     )
 
-
-def ensure_data(data_dir, days):
-    data_dir.mkdir(parents=True, exist_ok=True)
-    mapping = resolve_symbols()
+def ensure_data(data_dir,days):
+    data_dir.mkdir(parents=True,exist_ok=True); mapping=resolve_symbols()
     print(f"Verified XT symbols: {len(mapping)} / {len(SYMBOLS)}")
-    if len(mapping) != len(SYMBOLS):
-        raise RuntimeError("XT symbol mapping incomplete")
-    out = {}
+    if len(mapping)!=len(SYMBOLS): raise RuntimeError("XT symbol mapping incomplete")
+    out={}
     for a in SYMBOLS:
-        path = data_dir / f"{a}_USDT_15m.csv"
-        df = fetch_symbol(a, mapping[a], days)
-        if len(df) < MIN_ROWS:
-            raise RuntimeError(f"Validation failed for {a}: only {len(df)} rows")
-        df.to_csv(path)
-        out[a] = df
-        gaps = int(df.index.to_series().diff().dt.total_seconds().div(900).sub(1).clip(lower=0).sum())
-        print(f"{a:<8} rows={len(df)} gaps={gaps}")
+        path=data_dir/f"{a}_USDT_15m.csv"
+        try:
+            df=fetch_symbol(a,mapping[a],days)
+            if len(df)<MIN_ROWS:
+                raise RuntimeError(f"Validation failed for {a}: only {len(df)} rows")
+            df.to_csv(path)
+            out[a]=df
+            gaps=int(df.index.to_series().diff().dt.total_seconds().div(900).sub(1).clip(lower=0).sum())
+            print(f"{a:<8} rows={len(df)} gaps={gaps}")
+        except Exception as e:
+            raise RuntimeError(f"XT download failed for {a}: {e}") from e
     return out
-
 
 def resample(df, rule):
     return df.resample(rule, label="right", closed="left").agg(
@@ -387,87 +380,73 @@ def add_cross_sectional_rank(f):
 
 
 def signal_events(f, p):
-    """Causal weighted structural score on completed 1H candles."""
+    """Causal 1H trend-pullback entries.
+
+    A setup is evaluated only on the completed 1H candle at t. Entry is on
+    the next 1H open. The trigger requires a pullback into EMA20/EMA50 value
+    and a reclaim/momentum-resumption candle; no future pivots are used.
+    """
     sig = []
     for asset, x in f.items():
         for i in range(max(250, p["lookback"]), len(x) - 1):
             r = x.iloc[i]
+            prev = x.iloc[i-1]
             keys = ["atr","body_atr","range_atr","close_pos","vol_z","h4_adx",
-                    "h4_slope","mom_rank","d1_regime","ema20","ema50",
-                    "prior_low_24","prior_high_24","prior_low_48","prior_high_48",
-                    "prior_low_72","prior_high_72","ret24","ret72"]
+                    "h4_slope","d1_regime","ema20","ema50","ret24","ret72"]
             if not all(np.isfinite(r.get(k, np.nan)) for k in keys):
                 continue
 
+            # Higher-TF directional context. 1D is primary; 4H must agree.
+            long_ctx = r.d1_regime == 1 and r.h4_trend == 1
+            short_ctx = r.d1_regime == -1 and r.h4_trend == -1
+            if not (long_ctx or short_ctx):
+                continue
+
+            # Pullback: candle trades into EMA20 or EMA50 without requiring a
+            # specific pivot. This is causal and adapts to trend volatility.
+            long_touch = r.low <= (r.ema20 + p["touch_atr"]*r.atr) and r.low >= (r.ema50 - p["deep_atr"]*r.atr)
+            short_touch = r.high >= (r.ema20 - p["touch_atr"]*r.atr) and r.high <= (r.ema50 + p["deep_atr"]*r.atr)
+
+            # Reclaim / resumption: close crosses back through EMA20 after the
+            # pullback, with directional candle quality.
+            long_reclaim = prev.close <= prev.ema20 and r.close > r.ema20
+            short_reclaim = prev.close >= prev.ema20 and r.close < r.ema20
+            long_momo = r.ret24 > p["ret24_min"] and r.ret72 > p["ret72_min"]
+            short_momo = r.ret24 < -p["ret24_min"] and r.ret72 < -p["ret72_min"]
+
             long_score = 0.0
             short_score = 0.0
+            if long_ctx:
+                long_score += 2.0
+                if r.h4_slope > 0: long_score += 0.75
+                if r.h4_adx >= p["adx"]: long_score += 0.75
+                if long_touch: long_score += 1.50
+                if long_reclaim: long_score += 1.50
+                if long_momo: long_score += 1.00
+                if r.close > r.open and r.body_atr >= p["body_atr"]: long_score += 0.75
+                if r.close_pos >= p["close_pos"]: long_score += 0.50
+                if r.vol_z >= p["vol_z"]: long_score += 0.50
+                if r.range_atr >= p["range_atr"]: long_score += 0.50
 
-            # 1D regime: strongest directional context.
-            if r.d1_regime == 1: long_score += 2.0
-            if r.d1_regime == -1: short_score += 2.0
+            if short_ctx:
+                short_score += 2.0
+                if r.h4_slope < 0: short_score += 0.75
+                if r.h4_adx >= p["adx"]: short_score += 0.75
+                if short_touch: short_score += 1.50
+                if short_reclaim: short_score += 1.50
+                if short_momo: short_score += 1.00
+                if r.close < r.open and r.body_atr >= p["body_atr"]: short_score += 0.75
+                if r.close_pos <= (1.0-p["close_pos"]): short_score += 0.50
+                if r.vol_z >= p["vol_z"]: short_score += 0.50
+                if r.range_atr >= p["range_atr"]: short_score += 0.50
 
-            # 4H context: trend, slope, and ADX each contribute independently.
-            if r.h4_trend == 1: long_score += 1.5
-            if r.h4_trend == -1: short_score += 1.5
-            if r.h4_slope > 0: long_score += 0.75
-            if r.h4_slope < 0: short_score += 0.75
-            if r.h4_adx >= p["adx"]:
-                if r.h4_trend == 1: long_score += 0.75
-                if r.h4_trend == -1: short_score += 0.75
-
-            # 1H momentum/location.
-            if r.ret24 > p["mom24"]: long_score += 0.75
-            if r.ret24 < -p["mom24"]: short_score += 0.75
-            if r.ret72 > p["mom72"]: long_score += 0.75
-            if r.ret72 < -p["mom72"]: short_score += 0.75
-            if r.close > r.ema20: long_score += 0.50
-            if r.close < r.ema20: short_score += 0.50
-            if r.close > r.ema50: long_score += 0.50
-            if r.close < r.ema50: short_score += 0.50
-
-            # Cross-sectional momentum is confirmation, not a hard gate.
-            if r.mom_rank >= p["rank_long"]: long_score += 0.75
-            if r.mom_rank <= p["rank_short"]: short_score += 0.75
-
-            # Liquidity / breakout structure. Uses only prior completed bars.
-            if p["lookback"] == 24:
-                pl, ph = r.prior_low_24, r.prior_high_24
-            elif p["lookback"] == 48:
-                pl, ph = r.prior_low_48, r.prior_high_48
-            else:
-                pl, ph = r.prior_low_72, r.prior_high_72
-
-            long_sweep = r.low < pl and r.close > pl
-            short_sweep = r.high > ph and r.close < ph
-            long_break = r.close > ph
-            short_break = r.close < pl
-            if long_sweep: long_score += 1.25
-            if short_sweep: short_score += 1.25
-            if long_break: long_score += 1.00
-            if short_break: short_score += 1.00
-
-            # Candle quality: soft confirmation rather than mandatory filters.
-            if r.body_atr >= p["body_atr"] and r.close > r.open: long_score += 0.75
-            if r.body_atr >= p["body_atr"] and r.close < r.open: short_score += 0.75
-            if r.range_atr >= p["range_atr"]:
-                if r.close_pos >= 0.60: long_score += 0.50
-                if r.close_pos <= 0.40: short_score += 0.50
-            if r.vol_z >= p["vol_z"]:
-                if r.close > r.open: long_score += 0.50
-                if r.close < r.open: short_score += 0.50
-
-            # Avoid chasing extreme extensions.
-            long_location_ok = r.close <= r.ema20 + p["max_ext"] * r.atr
-            short_location_ok = r.close >= r.ema20 - p["max_ext"] * r.atr
-
-            if long_score >= p["min_score"] and long_location_ok and long_score > short_score:
+            if long_score >= p["min_score"] and long_reclaim and long_score > short_score:
                 sig.append({"asset":asset,"signal_ts":x.index[i],"side":"LONG",
-                            "family":"BALANCED_SCORE","atr":float(r.atr),"score":long_score})
-            elif short_score >= p["min_score"] and short_location_ok and short_score > long_score:
+                            "family":"TREND_PULLBACK","atr":float(r.atr),"score":long_score})
+            elif short_score >= p["min_score"] and short_reclaim and short_score > long_score:
                 sig.append({"asset":asset,"signal_ts":x.index[i],"side":"SHORT",
-                            "family":"BALANCED_SCORE","atr":float(r.atr),"score":short_score})
+                            "family":"TREND_PULLBACK","atr":float(r.atr),"score":short_score})
     return sig
-
 
 def backtest(f, sig):
     byts = {}
@@ -570,9 +549,9 @@ def main():
     args = ap.parse_args()
 
     print("=" * 96)
-    print("HUNTER-V147 — BALANCED STRUCTURAL MOMENTUM")
+    print("HUNTER-V148 — TREND PULLBACK RESEARCH")
     print("Signal=1H | Context=4H | Regime=1D | Raw source=15m")
-    print("1D regime + 4H context + weighted 1H structural/momentum score")
+    print("1D regime + 4H trend + causal 1H trend-pullback trigger")
     print("=" * 96)
 
     all15 = ensure_data(Path(args.data_dir), args.days)
@@ -581,24 +560,24 @@ def main():
     # 3 x 2 x 2 x 2 = 24 compact causal configurations.
     grid = []
     for lookback in [24, 48, 72]:
-        for min_score in [5.25, 6.00]:
+        for min_score in [5.00, 5.75]:
             for adx in [16.0, 20.0]:
-                for max_ext in [1.50, 2.00]:
+                for touch_atr in [0.25, 0.50]:
                     grid.append({
-                        "lookback":lookback,
-                        "min_score":min_score,
-                        "adx":adx,
-                        "mom24":0.0,
-                        "mom72":0.0,
-                        "vol_z":-0.75,
-                        "body_atr":0.35,
-                        "range_atr":0.80,
-                        "rank_long":0.55,
-                        "rank_short":0.45,
-                        "max_ext":max_ext,
+                        "lookback": lookback,
+                        "min_score": min_score,
+                        "adx": adx,
+                        "touch_atr": touch_atr,
+                        "deep_atr": 0.75,
+                        "ret24_min": 0.002,
+                        "ret72_min": 0.004,
+                        "vol_z": -0.50,
+                        "body_atr": 0.25,
+                        "range_atr": 0.75,
+                        "close_pos": 0.55,
                     })
 
-    print(f"Testing {len(grid)} causal C balanced parameter sets...")
+    print(f"Testing {len(grid)} causal C trend-pullback parameter sets...")
     results = []
     for n, p in enumerate(grid, 1):
         sig = signal_events(f, p)
@@ -615,7 +594,7 @@ def main():
         print(f"{i:>2} trades={m['trades']:>4} WR={m['wr']:>6.2f}% PF={m['pf']:.3f} "
               f"PnL=${m['pnl']:,.2f} DD=${m['dd']:,.2f} streak={m['max_streak']:>2} "
               f"t/day={m['trades_day']:.2f} | lb={p['lookback']} score={p['min_score']:.2f} "
-              f"adx={p['adx']:.0f} ext={p['max_ext']:.2f}")
+              f"adx={p['adx']:.0f} touch={p['touch_atr']:.2f}")
 
     eligible = [z for z in results if z[0]["wr"] >= 50.0 and z[0]["max_streak"] <= 4 and z[0]["trades"] >= 100]
     print("\nELIGIBLE:", bool(eligible))
