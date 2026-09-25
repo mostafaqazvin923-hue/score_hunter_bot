@@ -309,7 +309,7 @@ def adx14(x):
 
 
 def build_features(all15):
-    """Build causal OHLCV flow/positioning proxies once."""
+    """Build causal 1H breakout/volatility features from 15m source."""
     f = {}
     h1 = {a: resample(df, "1h") for a, df in all15.items()}
     h4 = {a: resample(df, "4h") for a, df in all15.items()}
@@ -320,155 +320,97 @@ def build_features(all15):
         q = h4[a].copy()
         d = d1[a].copy()
 
-        # 1H price/volume pressure proxies. These are causal and use only the
-        # completed candle at t; no true whale/OI information is fabricated.
-        rng = (x.high - x.low).replace(0, np.nan)
-        clv = ((x.close - x.low) - (x.high - x.close)) / rng
-        body_frac = (x.close - x.open).abs() / rng
         x["atr"] = atr14(x)
+        rng = (x.high - x.low).replace(0, np.nan)
         x["range_atr"] = (x.high - x.low) / x.atr
         x["body_atr"] = (x.close - x.open).abs() / x.atr
         x["close_pos"] = (x.close - x.low) / rng
+        x["vol_z"] = (x.volume - x.volume.rolling(48, min_periods=24).mean()) / x.volume.rolling(48, min_periods=24).std()
         x["ema20"] = x.close.ewm(span=20, adjust=False).mean()
         x["ema50"] = x.close.ewm(span=50, adjust=False).mean()
-        x["ret6"] = x.close.pct_change(6)
         x["ret24"] = x.close.pct_change(24)
-        x["ret72"] = x.close.pct_change(72)
-        x["vol_z"] = (x.volume - x.volume.rolling(48, min_periods=24).mean()) / x.volume.rolling(48, min_periods=24).std()
-
-        # Signed-volume proxy: close location within the candle multiplied by
-        # volume. Positive = demand pressure, negative = supply pressure.
-        x["flow"] = clv * x.volume
-        x["flow_z"] = (x.flow - x.flow.rolling(48, min_periods=24).mean()) / x.flow.rolling(48, min_periods=24).std()
-        x["flow24"] = x.flow.rolling(24, min_periods=24).sum() / x.volume.rolling(24, min_periods=24).sum().replace(0, np.nan)
-        x["flow72"] = x.flow.rolling(72, min_periods=72).sum() / x.volume.rolling(72, min_periods=72).sum().replace(0, np.nan)
-
-        # Price/flow divergence: positive means price is rising with weaker
-        # buying pressure; negative means price is falling with weaker selling.
-        x["flow_div24"] = x.ret24 - x.flow24
-        x["flow_slope"] = x.flow24 - x.flow24.shift(6)
-
-        # Absorption proxy: unusually high volume but relatively small body,
-        # followed by directional pressure/expansion.
-        x["absorption"] = (x.vol_z >= 1.0) & (body_frac <= 0.35)
-        x["vol_ratio"] = x.volume / x.volume.rolling(24, min_periods=12).mean()
+        # Percentile rank of current ATR among roughly 10 days of 1H data.
         x["atr_pct"] = x.atr.rolling(240, min_periods=120).rank(pct=True)
 
-        # 4H context.
+        # 4H context: completed candle only.
         q["ema20"] = q.close.ewm(span=20, adjust=False).mean()
         q["ema50"] = q.close.ewm(span=50, adjust=False).mean()
         q["ema200"] = q.close.ewm(span=200, adjust=False).mean()
         q["adx"] = adx14(q)
         q["ema50_slope"] = q.ema50.pct_change(3)
-        q_rng = (q.high-q.low).replace(0,np.nan)
-        q_clv = ((q.close-q.low)-(q.high-q.close))/q_rng
-        q["flow"] = q_clv * q.volume
-        q["flow24"] = q.flow.rolling(6, min_periods=6).sum() / q.volume.rolling(6, min_periods=6).sum().replace(0,np.nan)
-        q["trend"] = np.where((q.close > q.ema20) & (q.ema20 > q.ema50) & (q.ema50 > q.ema200), 1,
-                      np.where((q.close < q.ema20) & (q.ema20 < q.ema50) & (q.ema50 < q.ema200), -1, 0))
+        q["trend"] = np.where(
+            (q.close > q.ema20) & (q.ema20 > q.ema50) & (q.ema50 > q.ema200), 1,
+            np.where((q.close < q.ema20) & (q.ema20 < q.ema50) & (q.ema50 < q.ema200), -1, 0)
+        )
 
         # 1D primary regime.
         d["ema50"] = d.close.ewm(span=50, adjust=False).mean()
         d["ema200"] = d.close.ewm(span=200, adjust=False).mean()
         d["ema50_slope"] = d.ema50.pct_change(5)
-        d["regime"] = np.where((d.close > d.ema50) & (d.ema50 > d.ema200) & (d.ema50_slope > 0), 1,
-                       np.where((d.close < d.ema50) & (d.ema50 < d.ema200) & (d.ema50_slope < 0), -1, 0))
+        d["regime"] = np.where(
+            (d.close > d.ema50) & (d.ema50 > d.ema200) & (d.ema50_slope > 0), 1,
+            np.where((d.close < d.ema50) & (d.ema50 < d.ema200) & (d.ema50_slope < 0), -1, 0)
+        )
 
         x["h4_trend"] = q.trend.reindex(x.index, method="ffill")
         x["h4_adx"] = q.adx.reindex(x.index, method="ffill")
         x["h4_slope"] = q.ema50_slope.reindex(x.index, method="ffill")
-        x["h4_flow"] = q.flow24.reindex(x.index, method="ffill")
         x["d1_regime"] = d.regime.reindex(x.index, method="ffill")
         x["d1_slope"] = d.ema50_slope.reindex(x.index, method="ffill")
         f[a] = x
     return f
 
 
-def add_cross_sectional_rank(f):
-    """Causal cross-sectional ranks from 24H return and 24H flow."""
-    times = sorted(set().union(*(x.index for x in f.values())))
-    for ts in times:
-        vals_r = [(a, f[a].ret24.get(ts, np.nan)) for a in SYMBOLS]
-        vals_f = [(a, f[a].flow24.get(ts, np.nan)) for a in SYMBOLS]
-        for vals, col in [(vals_r, "mom_rank"), (vals_f, "flow_rank")]:
-            vals = [(a, float(v)) for a, v in vals if np.isfinite(v)]
-            vals.sort(key=lambda z: z[1])
-            n = len(vals)
-            if n < 2:
-                continue
-            for rank, (a, _) in enumerate(vals):
-                f[a].loc[ts, col] = rank / (n - 1)
-    return f
-
-
 def signal_events(f, p):
-    """Causal flow/positioning-proxy trigger; entry is next 1H open."""
+    """Causal volatility-compression -> Donchian breakout events."""
     sig = []
     for asset, x in f.items():
-        for i in range(260, len(x)-1):
+        n = int(p["donchian"])
+        prior_high = x.high.rolling(n, min_periods=n).max().shift(1)
+        prior_low = x.low.rolling(n, min_periods=n).min().shift(1)
+        prior_compression = x.atr_pct.shift(1).rolling(
+            int(p["compression_bars"]), min_periods=int(p["compression_bars"])
+        ).mean()
+
+        for i in range(max(260, n + int(p["compression_bars"]) + 5), len(x)-1):
             r = x.iloc[i]
             prev = x.iloc[i-1]
-            keys = ["atr","range_atr","body_atr","close_pos","vol_z","flow_z","flow24",
-                    "flow72","flow_slope","h4_adx","h4_slope","h4_flow","d1_regime",
-                    "d1_slope","mom_rank","flow_rank"]
-            if not all(np.isfinite(r.get(k, np.nan)) for k in keys):
+            vals = [r.atr, r.range_atr, r.body_atr, r.close_pos, r.vol_z,
+                    r.atr_pct, r.h4_adx, r.h4_slope, r.d1_regime,
+                    r.d1_slope, prior_high.iloc[i], prior_low.iloc[i],
+                    prior_compression.iloc[i]]
+            if not all(np.isfinite(v) for v in vals):
                 continue
 
-            long_ctx = r.d1_regime == 1 and r.h4_trend == 1
-            short_ctx = r.d1_regime == -1 and r.h4_trend == -1
+            long_ctx = r.d1_regime == 1 and r.h4_trend == 1 and r.h4_slope > 0 and r.h4_adx >= p["adx"]
+            short_ctx = r.d1_regime == -1 and r.h4_trend == -1 and r.h4_slope < 0 and r.h4_adx >= p["adx"]
             if not (long_ctx or short_ctx):
                 continue
 
-            # Pressure event: flow is positive/negative, improving, and
-            # cross-sectional positioning agrees with the direction.
-            long_flow = (r.flow24 >= p["flow24_min"] and r.flow72 >= p["flow72_min"]
-                         and r.flow_slope >= p["flow_slope_min"] and r.flow_rank >= p["flow_rank_long"])
-            short_flow = (r.flow24 <= -p["flow24_min"] and r.flow72 <= -p["flow72_min"]
-                          and r.flow_slope <= -p["flow_slope_min"] and r.flow_rank <= p["flow_rank_short"])
+            compressed = prior_compression.iloc[i] <= p["compression_pct"]
+            expansion = r.range_atr >= p["expansion_range_atr"] and r.body_atr >= p["expansion_body_atr"]
+            volume_confirm = r.vol_z >= p["vol_z"]
 
-            # Avoid chasing an already exhausted move.
-            long_price = r.ret24 >= p["ret24_min"] and r.ret24 <= p["ret24_max"]
-            short_price = r.ret24 <= -p["ret24_min"] and r.ret24 >= -p["ret24_max"]
+            long_break = r.close > prior_high.iloc[i] + p["break_buffer_atr"] * r.atr
+            short_break = r.close < prior_low.iloc[i] - p["break_buffer_atr"] * r.atr
+            long_candle = r.close_pos >= p["close_pos"] and r.close > r.open
+            short_candle = r.close_pos <= (1.0-p["close_pos"]) and r.close < r.open
 
-            # Absorption then expansion: previous candle shows high-volume
-            # indecision, current candle resolves directionally.
-            prev_rng = max(float(prev.high-prev.low), 1e-12)
-            prev_absorb = float(prev.volume) >= p["abs_vol_mult"] * float(x.volume.rolling(24, min_periods=12).mean().iloc[i-1]) and ((abs(float(prev.close-prev.open))/prev_rng) <= p["abs_body_frac"])
-            long_expand = r.close > r.open and r.body_atr >= p["body_atr"] and r.close_pos >= p["close_pos"] and r.range_atr >= p["range_atr"]
-            short_expand = r.close < r.open and r.body_atr >= p["body_atr"] and r.close_pos <= (1-p["close_pos"]) and r.range_atr >= p["range_atr"]
+            # Require the breakout to be the first directional expansion after
+            # the compressed state; this avoids chasing an already-expanded bar.
+            prior_not_break = prev.close <= prior_high.iloc[i] if np.isfinite(prior_high.iloc[i]) else False
+            prior_not_break_s = prev.close >= prior_low.iloc[i] if np.isfinite(prior_low.iloc[i]) else False
 
-            ls = 0.0
-            ss = 0.0
-            if long_ctx:
-                ls += 2.0
-                if r.h4_slope > 0: ls += 0.75
-                if r.h4_adx >= p["adx"]: ls += 0.75
-                if long_flow: ls += 2.0
-                if long_price: ls += 0.75
-                if prev_absorb: ls += 1.0
-                if long_expand: ls += 1.25
-                if r.vol_z >= p["vol_z"]: ls += 0.50
-                if r.h4_flow >= p["h4_flow_min"]: ls += 0.50
-            if short_ctx:
-                ss += 2.0
-                if r.h4_slope < 0: ss += 0.75
-                if r.h4_adx >= p["adx"]: ss += 0.75
-                if short_flow: ss += 2.0
-                if short_price: ss += 0.75
-                if prev_absorb: ss += 1.0
-                if short_expand: ss += 1.25
-                if r.vol_z >= p["vol_z"]: ss += 0.50
-                if r.h4_flow <= -p["h4_flow_min"]: ss += 0.50
-
-            if ls >= p["min_score"] and long_expand and long_flow and ls > ss:
-                sig.append({"asset":asset,"signal_ts":x.index[i],"side":"LONG",
-                            "family":"FLOW_POSITIONING_PROXY","atr":float(r.atr),"score":ls})
-            elif ss >= p["min_score"] and short_expand and short_flow and ss > ls:
-                sig.append({"asset":asset,"signal_ts":x.index[i],"side":"SHORT",
-                            "family":"FLOW_POSITIONING_PROXY","atr":float(r.atr),"score":ss})
+            if long_ctx and compressed and expansion and volume_confirm and long_break and long_candle and prior_not_break:
+                sig.append({"asset":asset, "signal_ts":x.index[i], "side":"LONG",
+                            "family":"VOLATILITY_DONCHIAN_BREAKOUT", "atr":float(r.atr)})
+            elif short_ctx and compressed and expansion and volume_confirm and short_break and short_candle and prior_not_break_s:
+                sig.append({"asset":asset, "signal_ts":x.index[i], "side":"SHORT",
+                            "family":"VOLATILITY_DONCHIAN_BREAKOUT", "atr":float(r.atr)})
     return sig
 
-def backtest(f, sig):
+
+def backtest(f, sig, stop_atr):
     byts = {}
     for z in sig:
         byts.setdefault(z["signal_ts"], []).append(z)
@@ -478,7 +420,6 @@ def backtest(f, sig):
     last_close = pd.Timestamp.min.tz_localize("UTC")
 
     for ts in all_ts:
-        # Exit management is performed on EVERY 1H timestamp.
         for p in positions[:]:
             x = f[p["asset"]]
             if ts not in x.index or ts <= p["entry_ts"]:
@@ -487,7 +428,6 @@ def backtest(f, sig):
             hit_sl = row.low <= p["sl"] if p["side"] == "LONG" else row.high >= p["sl"]
             hit_tp = row.high >= p["tp"] if p["side"] == "LONG" else row.low <= p["tp"]
             if hit_sl or hit_tp:
-                # Conservative rule: if both are touched, SL wins.
                 outcome = "LOSS" if hit_sl else "WIN"
                 ex = p["sl"] if hit_sl else p["tp"]
                 gross = ((ex-p["entry"])/p["entry"] if p["side"] == "LONG" else (p["entry"]-ex)/p["entry"])
@@ -497,12 +437,11 @@ def backtest(f, sig):
                 positions.remove(p)
                 last_close = ts
 
-        # Never enter on the same timestamp a result becomes known.
         if ts <= last_close or len(positions) >= MAX_OPEN_POSITIONS:
             continue
 
         used = set()
-        for z in sorted(byts.get(ts, []), key=lambda q: abs(q["atr"]), reverse=True):
+        for z in byts.get(ts, []):
             if len(positions) >= MAX_OPEN_POSITIONS or z["asset"] in used:
                 continue
             if any(p["asset"] == z["asset"] for p in positions):
@@ -513,11 +452,11 @@ def backtest(f, sig):
                 continue
             ets = future[0]
             entry = float(x.loc[ets, "open"]) * (1 + SLIPPAGE if z["side"] == "LONG" else 1 - SLIPPAGE)
-            risk = 1.5 * z["atr"]
+            risk = stop_atr * z["atr"]
             sl = entry - risk if z["side"] == "LONG" else entry + risk
             tp = entry + RR * risk if z["side"] == "LONG" else entry - RR * risk
-            positions.append({"asset":z["asset"],"family":z["family"],"side":z["side"],
-                              "signal_ts":ts,"entry_ts":ets,"entry":entry,"sl":sl,"tp":tp})
+            positions.append({"asset":z["asset"], "family":z["family"], "side":z["side"],
+                              "signal_ts":ts, "entry_ts":ets, "entry":entry, "sl":sl, "tp":tp})
             used.add(z["asset"])
 
     return trades, positions
@@ -541,25 +480,9 @@ def metrics(trades):
     first = min((z["exit_ts"] for z in trades), default=None)
     last = max((z["exit_ts"] for z in trades), default=None)
     days = max(1.0, (last-first).total_seconds()/86400) if first is not None else 1.0
-    return {
-        "trades":len(trades),
-        "wr":100*wins/len(trades) if trades else 0.0,
-        "pf":gross_w/gross_l if gross_l else 0.0,
-        "pnl":sum(z["pnl"] for z in trades),
-        "dd":dd,
-        "max_streak":mx,
-        "trades_day":len(trades)/days,
-    }
-
-
-def score(m):
-    # Research ranking only; never alters trade outcomes.
-    if m["trades"] < 100:
-        return -1e12
-    wr_gap = max(0.0, 50.0 - m["wr"])
-    streak_gap = max(0, m["max_streak"] - 4)
-    dd_penalty = max(0.0, -m["dd"] - 1000.0) * 0.15
-    return m["pnl"] + 700*m["pf"] - 180*wr_gap - 180*streak_gap - dd_penalty
+    return {"trades":len(trades), "wr":100*wins/len(trades) if trades else 0.0,
+            "pf":gross_w/gross_l if gross_l else 0.0, "pnl":sum(z["pnl"] for z in trades),
+            "dd":dd, "max_streak":mx, "trades_day":len(trades)/days}
 
 
 def main():
@@ -569,60 +492,47 @@ def main():
     args = ap.parse_args()
 
     print("=" * 96)
-    print("HUNTER-V149 — FLOW / POSITIONING PROXY RESEARCH")
+    print("HUNTER-V150 — VOLATILITY COMPRESSION + DONCHIAN BREAKOUT BASE TEST")
     print("Signal=1H | Context=4H | Regime=1D | Raw source=15m")
-    print("OHLCV flow/positioning proxy: pressure + divergence + absorption + expansion")
+    print("Alpha: volatility compression -> range breakout -> expansion confirmation")
+    print("Small base test: 5 hand-designed causal configurations; no optimization grid")
     print("=" * 96)
 
     all15 = ensure_data(Path(args.data_dir), args.days)
-    f = add_cross_sectional_rank(build_features(all15))
+    f = build_features(all15)
 
-    # 3 x 2 x 2 x 2 = 24 causal configurations.
-    grid = []
-    for min_score in [5.75, 6.50, 7.25]:
-        for flow24_min in [0.10, 0.20]:
-            for flow_slope_min in [0.03, 0.06]:
-                for adx in [16.0, 20.0]:
-                    grid.append({
-                        "min_score": min_score, "flow24_min": flow24_min,
-                        "flow72_min": 0.05, "flow_slope_min": flow_slope_min,
-                        "flow_rank_long": 0.60, "flow_rank_short": 0.40,
-                        "ret24_min": -0.01, "ret24_max": 0.08,
-                        "adx": adx, "vol_z": -0.25, "body_atr": 0.35,
-                        "range_atr": 0.90, "close_pos": 0.60,
-                        "abs_vol_mult": 1.50, "abs_body_frac": 0.35,
-                        "h4_flow_min": 0.02,
-                    })
+    configs = [
+        {"name":"A_BALANCED_20", "donchian":20, "compression_bars":4, "compression_pct":0.25, "expansion_range_atr":1.20, "expansion_body_atr":0.35, "vol_z":0.50, "break_buffer_atr":0.05, "close_pos":0.70, "adx":16.0, "stop_atr":1.00},
+        {"name":"B_WIDE_COMPRESSION_20", "donchian":20, "compression_bars":4, "compression_pct":0.35, "expansion_range_atr":1.20, "expansion_body_atr":0.35, "vol_z":0.50, "break_buffer_atr":0.05, "close_pos":0.70, "adx":16.0, "stop_atr":1.00},
+        {"name":"C_LONGER_RANGE_40", "donchian":40, "compression_bars":4, "compression_pct":0.25, "expansion_range_atr":1.20, "expansion_body_atr":0.35, "vol_z":0.50, "break_buffer_atr":0.05, "close_pos":0.70, "adx":16.0, "stop_atr":1.00},
+        {"name":"D_STRONG_EXPANSION", "donchian":20, "compression_bars":4, "compression_pct":0.25, "expansion_range_atr":1.40, "expansion_body_atr":0.45, "vol_z":0.75, "break_buffer_atr":0.05, "close_pos":0.70, "adx":20.0, "stop_atr":1.00},
+        {"name":"E_WIDE_RANGE_TIGHT_STOP", "donchian":40, "compression_bars":6, "compression_pct":0.35, "expansion_range_atr":1.40, "expansion_body_atr":0.45, "vol_z":0.75, "break_buffer_atr":0.05, "close_pos":0.70, "adx":20.0, "stop_atr":1.25},
+    ]
 
-    print(f"Testing {len(grid)} causal flow/positioning parameter sets...")
+    print(f"Testing {len(configs)} causal base configurations...")
     results = []
-    for n, p in enumerate(grid, 1):
+    for i, p in enumerate(configs, 1):
         sig = signal_events(f, p)
-        trades, openp = backtest(f, sig)
+        trades, openp = backtest(f, sig, p["stop_atr"])
         m = metrics(trades)
-        m.update({"open":len(openp), "signals":len(sig), "score":score(m)})
+        m.update({"open":len(openp), "signals":len(sig)})
         results.append((m, p))
-        if n % 12 == 0:
-            print(f"  tested {n}/{len(grid)}")
+        print(f"  tested {i}/{len(configs)}: {p['name']} | signals={len(sig)} trades={m['trades']}")
 
-    results.sort(key=lambda z: z[0]["score"], reverse=True)
-    print("\nTop 15 candidates:")
-    for i, (m, p) in enumerate(results[:15], 1):
-        print(f"{i:>2} trades={m['trades']:>4} WR={m['wr']:>6.2f}% PF={m['pf']:.3f} "
+    print("\nBASE TEST RESULTS:")
+    for i, (m, p) in enumerate(results, 1):
+        print(f"{i}. {p['name']:<24} trades={m['trades']:>4} WR={m['wr']:>6.2f}% PF={m['pf']:.3f} "
               f"PnL=${m['pnl']:,.2f} DD=${m['dd']:,.2f} streak={m['max_streak']:>2} "
-              f"t/day={m['trades_day']:.2f} | score={p['min_score']:.2f} "
-              f"flow24={p['flow24_min']:.2f} slope={p['flow_slope_min']:.2f} adx={p['adx']:.0f}")
+              f"t/day={m['trades_day']:.2f} open={m['open']} signals={m['signals']}")
 
-    eligible = [z for z in results if z[0]["wr"] >= 50.0 and z[0]["max_streak"] <= 4 and z[0]["trades"] >= 100]
-    print("\nELIGIBLE:", bool(eligible))
-    if eligible:
-        m, p = eligible[0]
-        print("Best eligible:", m)
-        print("Parameters:", p)
-        print("NEXT: strict walk-forward/OOS validation before any live consideration.")
+    viable = [z for z in results if z[0]["trades"] >= 100 and z[0]["pf"] > 1.0]
+    print("\nMEASURABLE_EDGE_PRESENT:", bool(viable))
+    if viable:
+        print("At least one base configuration has PF>1.0 with >=100 realized trades.")
+        print("NEXT: only the strongest base candidate should receive a small, causal refinement test and then OOS validation.")
     else:
-        print("No tested configuration reached WR>=50% AND max loss streak<=4 with >=100 trades.")
-        print("NEXT: do not force the target; reject/iterate only if the family shows measurable edge.")
+        print("No base configuration showed PF>1.0 with >=100 realized trades.")
+        print("NEXT: reject this family; do not optimize parameters to force the target.")
 
 
 if __name__ == "__main__":
