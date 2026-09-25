@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-HUNTER-V101-ADX-REGIME-ENGINE
-Professional Trend-Following with ADX Strength Filter & Strict Streak Protection (1h Timeframe)
-- Focus: Win Rate > 50%, Max Loss Streak <= 4, Fixed RR 1:2
+HUNTER-V102-BALANCED-MOMENTUM
+Balanced ADX (Threshold 16) & High-Frequency Trend Rider with Fixed RR = 2.0 (1h Timeframe)
+- Focus: Trade Count 150-200+, Win Rate > 50%, Max Loss Streak <= 4, Fixed RR 1:2
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ CORRELATION_CLUSTERS = {
     "WIF": "MEME",
 }
 
-DATA_DIR = Path("data/xt_futures_v101")
-OUT_DIR = DATA_DIR / "backtest_v101"
+DATA_DIR = Path("data/xt_futures_v102")
+OUT_DIR = DATA_DIR / "backtest_v102"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -35,9 +35,9 @@ LEVERAGE = 50.0
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 RR = 2.0                      # Fixed Risk-Reward 1:2
-MAX_OPEN_POSITIONS = 2        # Conservative exposure
+MAX_OPEN_POSITIONS = 2        # Controlled exposure
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 12 # Extended lockout hours after losses to kill streaks
+CIRCUIT_BREAKER_COOLDOWN = 4  # Short local cooldown to suppress loss streaks
 
 
 def parse_args():
@@ -115,8 +115,8 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return adx
 
 
-def calculate_v101_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Features with ADX trend strength filtering using shift(1)."""
+def calculate_v102_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Balanced features with moderate ADX threshold (16.0) using shift(1)."""
     prev_close = df["close"].shift(1)
     
     tr = pd.concat([
@@ -126,7 +126,7 @@ def calculate_v101_features(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
 
-    # ADX filter for trend strength (must be > 25)
+    # Balanced ADX filter (must be > 16.0 to allow healthy trade volume)
     df["adx"] = calculate_adx(df, period=14).shift(1)
 
     # EMA Trend alignment
@@ -134,20 +134,20 @@ def calculate_v101_features(df: pd.DataFrame) -> pd.DataFrame:
     df["ema50"] = prev_close.ewm(span=50, adjust=False).mean()
     df["trend_ok"] = (prev_close > df["ema20"]) & (df["ema20"] > df["ema50"])
 
-    # Momentum ranking
-    df["return_24h"] = prev_close.pct_change(24)
+    # Faster 12-hour momentum ranking for higher frequency
+    df["return_12h"] = prev_close.pct_change(12)
 
     # Volume filter
     prev_volume = df["volume"].shift(1)
     df["avg_volume"] = prev_volume.rolling(window=20).mean()
-    df["volume_ok"] = prev_volume > (0.85 * df["avg_volume"])
+    df["volume_ok"] = prev_volume > (0.75 * df["avg_volume"])
 
-    # Setup valid: Strong trend (ADX > 25), EMA alignment, volume confirmation, positive momentum
-    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["adx"] > 25.0) & (df["return_24h"] > 0.005)
+    # Setup valid: Moderate trend (ADX > 16), EMA alignment, volume confirmation, positive 12h return
+    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["adx"] > 16.0) & (df["return_12h"] > 0.002)
     return df
 
 
-def run_v101_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_v102_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -169,7 +169,7 @@ def run_v101_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
 
         btc_bullish = True
         if btc_df is not None and ts in btc_df.index:
-            btc_bullish = bool(btc_df.loc[ts, "trend_ok"] and btc_df.loc[ts, "adx"] > 20.0)
+            btc_bullish = bool(btc_df.loc[ts, "trend_ok"])
 
         # 1. Manage active positions
         for symbol, pos in list(active_positions.items()):
@@ -207,7 +207,7 @@ def run_v101_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 })
                 del active_positions[symbol]
 
-        # 2. Execution with ADX Regime Control & Fixed RR = 2.0
+        # 2. Execution with Balanced ADX & Fixed RR = 2.0
         if btc_bullish and cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
             candidates = []
             for symbol, df in all_data.items():
@@ -222,11 +222,11 @@ def run_v101_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 if MAX_ONE_PER_CLUSTER and cluster_active(cluster):
                     continue
                 
-                adx_val = row.get("adx", 0.0)
-                if np.isfinite(adx_val):
-                    candidates.append((symbol, adx_val))
+                ret_12h = row.get("return_12h", 0.0)
+                if np.isfinite(ret_12h):
+                    candidates.append((symbol, ret_12h))
 
-            candidates.sort(key=lambda x: x[1], reverse=True) # Strongest trend (highest ADX) first
+            candidates.sort(key=lambda x: x[1], reverse=True)
 
             for symbol, _ in candidates:
                 if len(active_positions) >= MAX_OPEN_POSITIONS:
@@ -245,7 +245,7 @@ def run_v101_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 if not np.isfinite(atr) or atr <= 0:
                     sl = entry * 0.985
                 else:
-                    sl = entry - (1.5 * atr)
+                    sl = entry - (1.3 * atr)
 
                 risk = entry - sl
                 if risk <= 0:
@@ -267,7 +267,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-V101-ADX-REGIME-ENGINE (ADX > 25 Filter + Fixed RR 1:2 + Streak Control)")
+    print("HUNTER-V102-BALANCED-MOMENTUM (ADX > 16 + 12h Return + Fixed RR 1:2)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -276,11 +276,11 @@ def main():
     for asset in SYMBOLS:
         try:
             df = load_xt_csv(data_dir, asset)
-            all_data[asset] = calculate_v101_features(df)
+            all_data[asset] = calculate_v102_features(df)
         except Exception:
             pass
 
-    trades = run_v101_backtest(all_data)
+    trades = run_v102_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -295,7 +295,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== HUNTER-V101 RESULTS =====")
+    print("\n===== HUNTER-V102 RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
