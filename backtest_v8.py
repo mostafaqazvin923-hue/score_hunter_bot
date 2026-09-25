@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-HUNTER-XT-STYLE5-MULTI-FACTOR-ADAPTIVE
-Modern Multi-Factor Pullback & Trend Strategy with Fixed RR = 2.0 (1h Timeframe)
-- Focus: Trade Count > 150, Win Rate > 50%, Max Loss Streak <= 4, Fixed RR 1:2
+HUNTER-V100-HIGH-FREQUENCY-MOMENTUM
+High-Volume Momentum & Trend Rider with Strict Streak Control (1h Timeframe)
+- Focus: Trade Count > 200, Win Rate > 50%, Max Loss Streak <= 4, Fixed RR 1:2
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ CORRELATION_CLUSTERS = {
     "WIF": "MEME",
 }
 
-DATA_DIR = Path("data/xt_futures_style5_adaptive")
-OUT_DIR = DATA_DIR / "backtest_style5_adaptive"
+DATA_DIR = Path("data/xt_futures_v100")
+OUT_DIR = DATA_DIR / "backtest_v100"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -35,9 +35,9 @@ LEVERAGE = 50.0
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 RR = 2.0                      # Fixed Risk-Reward 1:2
-MAX_OPEN_POSITIONS = 2        # Balanced exposure
+MAX_OPEN_POSITIONS = 3        # High activity
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 4  # Cool down hours after a loss
+CIRCUIT_BREAKER_COOLDOWN = 3  # Local cooldown to suppress loss streaks
 
 
 def parse_args():
@@ -90,34 +90,36 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     return df.dropna(subset=required[1:])
 
 
-def calculate_adaptive_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates multi-factor signals using shift(1) to prevent look-ahead bias."""
+def calculate_v100_features(df: pd.DataFrame) -> pd.DataFrame:
+    """High-frequency momentum features using shift(1) to avoid look-ahead bias."""
     prev_close = df["close"].shift(1)
     
-    # Structural swing low for stop loss (past 4 bars)
-    df["swing_low"] = df["low"].shift(1).rolling(window=4).min()
+    # ATR for volatility-based stop loss
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
 
-    # Trend filter: EMA 20 & EMA 50
-    df["ema20"] = prev_close.ewm(span=20, adjust=False).mean()
-    df["ema50"] = prev_close.ewm(span=50, adjust=False).mean()
-    df["trend_ok"] = prev_close > df["ema50"]
+    # Fast EMA cross for high trade frequency
+    df["ema10"] = prev_close.ewm(span=10, adjust=False).mean()
+    df["ema30"] = prev_close.ewm(span=30, adjust=False).mean()
+    df["trend_ok"] = prev_close > df["ema30"]
 
-    # Pullback factor: Z-score of recent returns to buy minor dips inside uptrends
-    rolling_mean = prev_close.rolling(window=20).mean()
-    rolling_std = prev_close.rolling(window=20).std()
-    df["z_score"] = (prev_close - rolling_mean) / rolling_std.replace(0, np.nan)
+    # 12-period return for rapid momentum ranking
+    df["return_12h"] = prev_close.pct_change(12)
 
-    # Volume surge
+    # Volume filter
     prev_volume = df["volume"].shift(1)
     df["avg_volume"] = prev_volume.rolling(window=20).mean()
-    df["volume_ok"] = prev_volume > (0.9 * df["avg_volume"])
+    df["volume_ok"] = prev_volume > (0.7 * df["avg_volume"])
 
-    # Setup valid: Uptrend, buying the dip (-1.5 < z_score < 0.0), healthy volume
-    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["z_score"] > -1.5) & (df["z_score"] < 0.1)
+    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["return_12h"] > 0.002)
     return df
 
 
-def run_adaptive_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_v100_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -125,7 +127,9 @@ def run_adaptive_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     equity = INITIAL_EQUITY
     peak_equity = INITIAL_EQUITY
     
+    consecutive_losses = 0
     cooldown_counter = 0
+
     btc_df = all_data.get("BTC")
 
     def cluster_active(cluster_name):
@@ -163,7 +167,11 @@ def run_adaptive_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 peak_equity = max(peak_equity, equity)
 
                 if outcome == "LOSS":
-                    cooldown_counter = CIRCUIT_BREAKER_COOLDOWN
+                    consecutive_losses += 1
+                    if consecutive_losses >= 2:
+                        cooldown_counter = CIRCUIT_BREAKER_COOLDOWN
+                else:
+                    consecutive_losses = 0
 
                 trades.append({
                     "symbol": symbol, "side": side, "entry_ts": pos["entry_ts"], "exit_ts": ts,
@@ -171,7 +179,7 @@ def run_adaptive_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 })
                 del active_positions[symbol]
 
-        # 2. Execution with Multi-Factor Adaptive Logic & Fixed RR 2.0
+        # 2. Execution
         if btc_bullish and cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
             candidates = []
             for symbol, df in all_data.items():
@@ -186,41 +194,41 @@ def run_adaptive_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 if MAX_ONE_PER_CLUSTER and cluster_active(cluster):
                     continue
                 
-                # Rank by z_score depth (buying deeper healthy dips first)
-                z_val = row.get("z_score", 0.0)
-                if np.isfinite(z_val):
-                    candidates.append((symbol, z_val))
+                ret_12h = row.get("return_12h", 0.0)
+                if np.isfinite(ret_12h):
+                    candidates.append((symbol, ret_12h))
 
-            if candidates:
-                candidates.sort(key=lambda x: x[1]) # Lowest Z-score (best dip) first
+            candidates.sort(key=lambda x: x[1], reverse=True)
 
-                for symbol, _ in candidates:
-                    if len(active_positions) >= MAX_OPEN_POSITIONS:
-                        break
-                    
-                    df = all_data[symbol]
-                    next_indices = df.index[df.index > ts]
-                    if len(next_indices) == 0:
-                        continue
-                    
-                    next_ts = next_indices[0]
-                    entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
-                    row = df.loc[ts]
-                    
-                    swing_low = row.get("swing_low", np.nan)
-                    if not np.isfinite(swing_low) or swing_low >= entry:
-                        sl = entry * 0.985
-                    else:
-                        sl = swing_low * 0.998
+            for symbol, _ in candidates:
+                if len(active_positions) >= MAX_OPEN_POSITIONS:
+                    break
+                
+                df = all_data[symbol]
+                next_indices = df.index[df.index > ts]
+                if len(next_indices) == 0:
+                    continue
+                
+                next_ts = next_indices[0]
+                entry = float(df.loc[next_ts, "open"]) * (1.0 + SLIPPAGE)
+                row = df.loc[ts]
+                
+                atr = row.get("atr", np.nan)
+                if not np.isfinite(atr) or atr <= 0:
+                    sl = entry * 0.98
+                else:
+                    sl = entry - (1.2 * atr)
 
-                    risk = entry - sl
-                    if risk > 0:
-                        tp = entry + (RR * risk)  # Fixed RR = 2.0
+                risk = entry - sl
+                if risk <= 0:
+                    continue
+                
+                tp = entry + (RR * risk)  # Fixed RR = 2.0
 
-                        active_positions[symbol] = {
-                            "symbol": symbol, "side": "LONG",
-                            "entry_ts": next_ts, "entry": entry, "sl": sl, "tp": tp,
-                        }
+                active_positions[symbol] = {
+                    "symbol": symbol, "side": "LONG",
+                    "entry_ts": next_ts, "entry": entry, "sl": sl, "tp": tp,
+                }
 
     return trades
 
@@ -231,7 +239,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-XT-STYLE5-MULTI-FACTOR-ADAPTIVE (Z-Score Dip Buyer + Fixed RR 1:2)")
+    print("HUNTER-V100-HIGH-FREQUENCY-MOMENTUM (High Volume + Fixed RR 1:2)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -240,11 +248,11 @@ def main():
     for asset in SYMBOLS:
         try:
             df = load_xt_csv(data_dir, asset)
-            all_data[asset] = calculate_adaptive_features(df)
+            all_data[asset] = calculate_v100_features(df)
         except Exception:
             pass
 
-    trades = run_adaptive_backtest(all_data)
+    trades = run_v100_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -259,7 +267,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== STYLE 5 ADAPTIVE RESULTS =====")
+    print("\n===== HUNTER-V100 RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
