@@ -110,8 +110,11 @@ def _get_json(url, params):
             js = r.json()
             if isinstance(js, dict):
                 code = js.get("code")
+                return_code = js.get("returnCode")
                 if code not in (None, 0, "0", 200, "200"):
                     raise RuntimeError(f"XT API code={code}: {js.get('msg', js.get('message', ''))}")
+                if return_code not in (None, 0, "0", 200, "200"):
+                    raise RuntimeError(f"XT API returnCode={return_code}: {js.get('msgInfo', js.get('msg', js.get('message', '')))}")
             return js
         except Exception as e:
             last = e
@@ -161,7 +164,10 @@ def fetch_symbol(asset, xt_symbol, days):
         while cursor < end_ms and guard < 2000:
             guard += 1
             window_end = min(end_ms, cursor + LIMIT * interval_ms - 1)
-            params = {"symbol": xt_symbol, "interval": INTERVAL, "startTime": cursor,
+            # XT Futures Kline endpoint expects the market id in lowercase
+            # (e.g. btc_usdt). Symbol discovery may return BTC_USDT.
+            api_symbol = str(xt_symbol).strip().lower()
+            params = {"symbol": api_symbol, "interval": INTERVAL, "startTime": cursor,
                       "endTime": window_end, "limit": LIMIT}
             batch = []
             for attempt in range(6):
