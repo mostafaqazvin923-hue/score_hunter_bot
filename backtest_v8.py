@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-HUNTER-V100-HIGH-FREQUENCY-MOMENTUM
-High-Volume Momentum & Trend Rider with Strict Streak Control (1h Timeframe)
-- Focus: Trade Count > 200, Win Rate > 50%, Max Loss Streak <= 4, Fixed RR 1:2
+HUNTER-V101-ADX-REGIME-ENGINE
+Professional Trend-Following with ADX Strength Filter & Strict Streak Protection (1h Timeframe)
+- Focus: Win Rate > 50%, Max Loss Streak <= 4, Fixed RR 1:2
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ CORRELATION_CLUSTERS = {
     "WIF": "MEME",
 }
 
-DATA_DIR = Path("data/xt_futures_v100")
-OUT_DIR = DATA_DIR / "backtest_v100"
+DATA_DIR = Path("data/xt_futures_v101")
+OUT_DIR = DATA_DIR / "backtest_v101"
 
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
@@ -35,9 +35,9 @@ LEVERAGE = 50.0
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 RR = 2.0                      # Fixed Risk-Reward 1:2
-MAX_OPEN_POSITIONS = 3        # High activity
+MAX_OPEN_POSITIONS = 2        # Conservative exposure
 MAX_ONE_PER_CLUSTER = True
-CIRCUIT_BREAKER_COOLDOWN = 3  # Local cooldown to suppress loss streaks
+CIRCUIT_BREAKER_COOLDOWN = 12 # Extended lockout hours after losses to kill streaks
 
 
 def parse_args():
@@ -90,11 +90,35 @@ def load_xt_csv(data_dir: Path, asset: str) -> pd.DataFrame:
     return df.dropna(subset=required[1:])
 
 
-def calculate_v100_features(df: pd.DataFrame) -> pd.DataFrame:
-    """High-frequency momentum features using shift(1) to avoid look-ahead bias."""
+def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculates Wilder's ADX for trend strength measurement."""
+    high, low, close = df["high"], df["low"], df["close"]
+    
+    plus_dm = high.diff()
+    minus_dm = low.diff()
+    
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+    
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    
+    atr = tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr
+    
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    return adx
+
+
+def calculate_v101_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Features with ADX trend strength filtering using shift(1)."""
     prev_close = df["close"].shift(1)
     
-    # ATR for volatility-based stop loss
     tr = pd.concat([
         df["high"] - df["low"],
         (df["high"] - prev_close).abs(),
@@ -102,24 +126,28 @@ def calculate_v100_features(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
 
-    # Fast EMA cross for high trade frequency
-    df["ema10"] = prev_close.ewm(span=10, adjust=False).mean()
-    df["ema30"] = prev_close.ewm(span=30, adjust=False).mean()
-    df["trend_ok"] = prev_close > df["ema30"]
+    # ADX filter for trend strength (must be > 25)
+    df["adx"] = calculate_adx(df, period=14).shift(1)
 
-    # 12-period return for rapid momentum ranking
-    df["return_12h"] = prev_close.pct_change(12)
+    # EMA Trend alignment
+    df["ema20"] = prev_close.ewm(span=20, adjust=False).mean()
+    df["ema50"] = prev_close.ewm(span=50, adjust=False).mean()
+    df["trend_ok"] = (prev_close > df["ema20"]) & (df["ema20"] > df["ema50"])
+
+    # Momentum ranking
+    df["return_24h"] = prev_close.pct_change(24)
 
     # Volume filter
     prev_volume = df["volume"].shift(1)
     df["avg_volume"] = prev_volume.rolling(window=20).mean()
-    df["volume_ok"] = prev_volume > (0.7 * df["avg_volume"])
+    df["volume_ok"] = prev_volume > (0.85 * df["avg_volume"])
 
-    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["return_12h"] > 0.002)
+    # Setup valid: Strong trend (ADX > 25), EMA alignment, volume confirmation, positive momentum
+    df["setup_valid"] = df["trend_ok"] & df["volume_ok"] & (df["adx"] > 25.0) & (df["return_24h"] > 0.005)
     return df
 
 
-def run_v100_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
+def run_v101_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
     all_times = sorted(list(set().union(*(df.index for df in all_data.values()))))
     
     active_positions = {}
@@ -141,7 +169,7 @@ def run_v100_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
 
         btc_bullish = True
         if btc_df is not None and ts in btc_df.index:
-            btc_bullish = bool(btc_df.loc[ts, "trend_ok"])
+            btc_bullish = bool(btc_df.loc[ts, "trend_ok"] and btc_df.loc[ts, "adx"] > 20.0)
 
         # 1. Manage active positions
         for symbol, pos in list(active_positions.items()):
@@ -179,7 +207,7 @@ def run_v100_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 })
                 del active_positions[symbol]
 
-        # 2. Execution
+        # 2. Execution with ADX Regime Control & Fixed RR = 2.0
         if btc_bullish and cooldown_counter == 0 and len(active_positions) < MAX_OPEN_POSITIONS:
             candidates = []
             for symbol, df in all_data.items():
@@ -194,11 +222,11 @@ def run_v100_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 if MAX_ONE_PER_CLUSTER and cluster_active(cluster):
                     continue
                 
-                ret_12h = row.get("return_12h", 0.0)
-                if np.isfinite(ret_12h):
-                    candidates.append((symbol, ret_12h))
+                adx_val = row.get("adx", 0.0)
+                if np.isfinite(adx_val):
+                    candidates.append((symbol, adx_val))
 
-            candidates.sort(key=lambda x: x[1], reverse=True)
+            candidates.sort(key=lambda x: x[1], reverse=True) # Strongest trend (highest ADX) first
 
             for symbol, _ in candidates:
                 if len(active_positions) >= MAX_OPEN_POSITIONS:
@@ -215,9 +243,9 @@ def run_v100_backtest(all_data: dict[str, pd.DataFrame]) -> list[dict]:
                 
                 atr = row.get("atr", np.nan)
                 if not np.isfinite(atr) or atr <= 0:
-                    sl = entry * 0.98
+                    sl = entry * 0.985
                 else:
-                    sl = entry - (1.2 * atr)
+                    sl = entry - (1.5 * atr)
 
                 risk = entry - sl
                 if risk <= 0:
@@ -239,7 +267,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 88)
-    print("HUNTER-V100-HIGH-FREQUENCY-MOMENTUM (High Volume + Fixed RR 1:2)")
+    print("HUNTER-V101-ADX-REGIME-ENGINE (ADX > 25 Filter + Fixed RR 1:2 + Streak Control)")
     print("=" * 88)
 
     ensure_xt_data(data_dir, SYMBOLS)
@@ -248,11 +276,11 @@ def main():
     for asset in SYMBOLS:
         try:
             df = load_xt_csv(data_dir, asset)
-            all_data[asset] = calculate_v100_features(df)
+            all_data[asset] = calculate_v101_features(df)
         except Exception:
             pass
 
-    trades = run_v100_backtest(all_data)
+    trades = run_v101_backtest(all_data)
     
     total = len(trades)
     wins = sum(1 for t in trades if t["outcome"] == "WIN")
@@ -267,7 +295,7 @@ def main():
         else:
             consec = 0
 
-    print("\n===== HUNTER-V100 RESULTS =====")
+    print("\n===== HUNTER-V101 RESULTS =====")
     print(f"Closed Trades : {total}")
     print(f"Win Rate      : {win_rate:.2f}% (Target: >50%)")
     print(f"Net PnL       : ${net_pnl:,.2f}")
