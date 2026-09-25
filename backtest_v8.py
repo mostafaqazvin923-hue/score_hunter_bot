@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-HUNTER-V148 — TREND PULLBACK RESEARCH
+HUNTER-V149 — FLOW / POSITIONING PROXY RESEARCH
 1D regime + 4H trend context + 1H pullback/reclaim/momentum resumption.
 Raw source: XT Futures 15m -> causal 1H/4H/1D.
 
 Purpose
 -------
-V145/V146/V148 showed that the old regime-switch and generic score families
-did not produce the required edge. V148 tests a different research family:
-trend continuation after a causal 1H pullback into EMA value, followed by
-reclaim and momentum resumption. Higher timeframes provide direction; 1H
+V144-V148 did not produce the required edge. V149 therefore switches to a
+different research family: FLOW / POSITIONING PROXY. Because the XT kline
+history does not contain historical whale wallets or open-interest snapshots,
+this version does NOT pretend to reconstruct true smart-money positions.
+Instead it tests a causal market-participant-pressure proxy built from OHLCV:
+volume-weighted candle pressure, cumulative flow, price/flow divergence,
+absorption, and volatility expansion. Higher timeframes define regime; 1H
 provides the trigger.
 
 Signal concept
@@ -306,7 +309,7 @@ def adx14(x):
 
 
 def build_features(all15):
-    """Build all causal features once. No per-parameter recomputation."""
+    """Build causal OHLCV flow/positioning proxies once."""
     f = {}
     h1 = {a: resample(df, "1h") for a, df in all15.items()}
     h4 = {a: resample(df, "4h") for a, df in all15.items()}
@@ -317,25 +320,38 @@ def build_features(all15):
         q = h4[a].copy()
         d = d1[a].copy()
 
-        # 1H execution/signal features.
+        # 1H price/volume pressure proxies. These are causal and use only the
+        # completed candle at t; no true whale/OI information is fabricated.
+        rng = (x.high - x.low).replace(0, np.nan)
+        clv = ((x.close - x.low) - (x.high - x.close)) / rng
+        body_frac = (x.close - x.open).abs() / rng
         x["atr"] = atr14(x)
-        x["body"] = (x.close - x.open).abs()
-        x["body_atr"] = x.body / x.atr
         x["range_atr"] = (x.high - x.low) / x.atr
-        x["close_pos"] = (x.close - x.low) / (x.high - x.low).replace(0, np.nan)
+        x["body_atr"] = (x.close - x.open).abs() / x.atr
+        x["close_pos"] = (x.close - x.low) / rng
         x["ema20"] = x.close.ewm(span=20, adjust=False).mean()
         x["ema50"] = x.close.ewm(span=50, adjust=False).mean()
-        x["ema20_slope"] = x.ema20.pct_change(3)
+        x["ret6"] = x.close.pct_change(6)
         x["ret24"] = x.close.pct_change(24)
         x["ret72"] = x.close.pct_change(72)
         x["vol_z"] = (x.volume - x.volume.rolling(48, min_periods=24).mean()) / x.volume.rolling(48, min_periods=24).std()
-        # Liquidity levels use ONLY completed prior bars.
-        x["prior_low_24"] = x.low.shift(1).rolling(24, min_periods=24).min()
-        x["prior_high_24"] = x.high.shift(1).rolling(24, min_periods=24).max()
-        x["prior_low_48"] = x.low.shift(1).rolling(48, min_periods=48).min()
-        x["prior_high_48"] = x.high.shift(1).rolling(48, min_periods=48).max()
-        x["prior_low_72"] = x.low.shift(1).rolling(72, min_periods=72).min()
-        x["prior_high_72"] = x.high.shift(1).rolling(72, min_periods=72).max()
+
+        # Signed-volume proxy: close location within the candle multiplied by
+        # volume. Positive = demand pressure, negative = supply pressure.
+        x["flow"] = clv * x.volume
+        x["flow_z"] = (x.flow - x.flow.rolling(48, min_periods=24).mean()) / x.flow.rolling(48, min_periods=24).std()
+        x["flow24"] = x.flow.rolling(24, min_periods=24).sum() / x.volume.rolling(24, min_periods=24).sum().replace(0, np.nan)
+        x["flow72"] = x.flow.rolling(72, min_periods=72).sum() / x.volume.rolling(72, min_periods=72).sum().replace(0, np.nan)
+
+        # Price/flow divergence: positive means price is rising with weaker
+        # buying pressure; negative means price is falling with weaker selling.
+        x["flow_div24"] = x.ret24 - x.flow24
+        x["flow_slope"] = x.flow24 - x.flow24.shift(6)
+
+        # Absorption proxy: unusually high volume but relatively small body,
+        # followed by directional pressure/expansion.
+        x["absorption"] = (x.vol_z >= 1.0) & (body_frac <= 0.35)
+        x["vol_ratio"] = x.volume / x.volume.rolling(24, min_periods=12).mean()
         x["atr_pct"] = x.atr.rolling(240, min_periods=120).rank(pct=True)
 
         # 4H context.
@@ -344,6 +360,10 @@ def build_features(all15):
         q["ema200"] = q.close.ewm(span=200, adjust=False).mean()
         q["adx"] = adx14(q)
         q["ema50_slope"] = q.ema50.pct_change(3)
+        q_rng = (q.high-q.low).replace(0,np.nan)
+        q_clv = ((q.close-q.low)-(q.high-q.close))/q_rng
+        q["flow"] = q_clv * q.volume
+        q["flow24"] = q.flow.rolling(6, min_periods=6).sum() / q.volume.rolling(6, min_periods=6).sum().replace(0,np.nan)
         q["trend"] = np.where((q.close > q.ema20) & (q.ema20 > q.ema50) & (q.ema50 > q.ema200), 1,
                       np.where((q.close < q.ema20) & (q.ema20 < q.ema50) & (q.ema50 < q.ema200), -1, 0))
 
@@ -354,98 +374,98 @@ def build_features(all15):
         d["regime"] = np.where((d.close > d.ema50) & (d.ema50 > d.ema200) & (d.ema50_slope > 0), 1,
                        np.where((d.close < d.ema50) & (d.ema50 < d.ema200) & (d.ema50_slope < 0), -1, 0))
 
-        # Only completed higher-TF candles are available at each 1H timestamp.
         x["h4_trend"] = q.trend.reindex(x.index, method="ffill")
         x["h4_adx"] = q.adx.reindex(x.index, method="ffill")
         x["h4_slope"] = q.ema50_slope.reindex(x.index, method="ffill")
+        x["h4_flow"] = q.flow24.reindex(x.index, method="ffill")
         x["d1_regime"] = d.regime.reindex(x.index, method="ffill")
+        x["d1_slope"] = d.ema50_slope.reindex(x.index, method="ffill")
         f[a] = x
     return f
 
 
 def add_cross_sectional_rank(f):
-    """Causal rank of 24H return; value at t uses only data known at t close."""
-    ret = {a: x.close.pct_change(24) for a, x in f.items()}
+    """Causal cross-sectional ranks from 24H return and 24H flow."""
     times = sorted(set().union(*(x.index for x in f.values())))
     for ts in times:
-        vals = [(a, ret[a].get(ts, np.nan)) for a in SYMBOLS]
-        vals = [(a, float(v)) for a, v in vals if np.isfinite(v)]
-        vals.sort(key=lambda z: z[1])
-        n = len(vals)
-        if n < 2:
-            continue
-        for rank, (a, _) in enumerate(vals):
-            f[a].loc[ts, "mom_rank"] = rank / (n - 1)
+        vals_r = [(a, f[a].ret24.get(ts, np.nan)) for a in SYMBOLS]
+        vals_f = [(a, f[a].flow24.get(ts, np.nan)) for a in SYMBOLS]
+        for vals, col in [(vals_r, "mom_rank"), (vals_f, "flow_rank")]:
+            vals = [(a, float(v)) for a, v in vals if np.isfinite(v)]
+            vals.sort(key=lambda z: z[1])
+            n = len(vals)
+            if n < 2:
+                continue
+            for rank, (a, _) in enumerate(vals):
+                f[a].loc[ts, col] = rank / (n - 1)
     return f
 
 
 def signal_events(f, p):
-    """Causal 1H trend-pullback entries.
-
-    A setup is evaluated only on the completed 1H candle at t. Entry is on
-    the next 1H open. The trigger requires a pullback into EMA20/EMA50 value
-    and a reclaim/momentum-resumption candle; no future pivots are used.
-    """
+    """Causal flow/positioning-proxy trigger; entry is next 1H open."""
     sig = []
     for asset, x in f.items():
-        for i in range(max(250, p["lookback"]), len(x) - 1):
+        for i in range(260, len(x)-1):
             r = x.iloc[i]
             prev = x.iloc[i-1]
-            keys = ["atr","body_atr","range_atr","close_pos","vol_z","h4_adx",
-                    "h4_slope","d1_regime","ema20","ema50","ret24","ret72"]
+            keys = ["atr","range_atr","body_atr","close_pos","vol_z","flow_z","flow24",
+                    "flow72","flow_slope","h4_adx","h4_slope","h4_flow","d1_regime",
+                    "d1_slope","mom_rank","flow_rank"]
             if not all(np.isfinite(r.get(k, np.nan)) for k in keys):
                 continue
 
-            # Higher-TF directional context. 1D is primary; 4H must agree.
             long_ctx = r.d1_regime == 1 and r.h4_trend == 1
             short_ctx = r.d1_regime == -1 and r.h4_trend == -1
             if not (long_ctx or short_ctx):
                 continue
 
-            # Pullback: candle trades into EMA20 or EMA50 without requiring a
-            # specific pivot. This is causal and adapts to trend volatility.
-            long_touch = r.low <= (r.ema20 + p["touch_atr"]*r.atr) and r.low >= (r.ema50 - p["deep_atr"]*r.atr)
-            short_touch = r.high >= (r.ema20 - p["touch_atr"]*r.atr) and r.high <= (r.ema50 + p["deep_atr"]*r.atr)
+            # Pressure event: flow is positive/negative, improving, and
+            # cross-sectional positioning agrees with the direction.
+            long_flow = (r.flow24 >= p["flow24_min"] and r.flow72 >= p["flow72_min"]
+                         and r.flow_slope >= p["flow_slope_min"] and r.flow_rank >= p["flow_rank_long"])
+            short_flow = (r.flow24 <= -p["flow24_min"] and r.flow72 <= -p["flow72_min"]
+                          and r.flow_slope <= -p["flow_slope_min"] and r.flow_rank <= p["flow_rank_short"])
 
-            # Reclaim / resumption: close crosses back through EMA20 after the
-            # pullback, with directional candle quality.
-            long_reclaim = prev.close <= prev.ema20 and r.close > r.ema20
-            short_reclaim = prev.close >= prev.ema20 and r.close < r.ema20
-            long_momo = r.ret24 > p["ret24_min"] and r.ret72 > p["ret72_min"]
-            short_momo = r.ret24 < -p["ret24_min"] and r.ret72 < -p["ret72_min"]
+            # Avoid chasing an already exhausted move.
+            long_price = r.ret24 >= p["ret24_min"] and r.ret24 <= p["ret24_max"]
+            short_price = r.ret24 <= -p["ret24_min"] and r.ret24 >= -p["ret24_max"]
 
-            long_score = 0.0
-            short_score = 0.0
+            # Absorption then expansion: previous candle shows high-volume
+            # indecision, current candle resolves directionally.
+            prev_rng = max(float(prev.high-prev.low), 1e-12)
+            prev_absorb = float(prev.volume) >= p["abs_vol_mult"] * float(x.volume.rolling(24, min_periods=12).mean().iloc[i-1]) and ((abs(float(prev.close-prev.open))/prev_rng) <= p["abs_body_frac"])
+            long_expand = r.close > r.open and r.body_atr >= p["body_atr"] and r.close_pos >= p["close_pos"] and r.range_atr >= p["range_atr"]
+            short_expand = r.close < r.open and r.body_atr >= p["body_atr"] and r.close_pos <= (1-p["close_pos"]) and r.range_atr >= p["range_atr"]
+
+            ls = 0.0
+            ss = 0.0
             if long_ctx:
-                long_score += 2.0
-                if r.h4_slope > 0: long_score += 0.75
-                if r.h4_adx >= p["adx"]: long_score += 0.75
-                if long_touch: long_score += 1.50
-                if long_reclaim: long_score += 1.50
-                if long_momo: long_score += 1.00
-                if r.close > r.open and r.body_atr >= p["body_atr"]: long_score += 0.75
-                if r.close_pos >= p["close_pos"]: long_score += 0.50
-                if r.vol_z >= p["vol_z"]: long_score += 0.50
-                if r.range_atr >= p["range_atr"]: long_score += 0.50
-
+                ls += 2.0
+                if r.h4_slope > 0: ls += 0.75
+                if r.h4_adx >= p["adx"]: ls += 0.75
+                if long_flow: ls += 2.0
+                if long_price: ls += 0.75
+                if prev_absorb: ls += 1.0
+                if long_expand: ls += 1.25
+                if r.vol_z >= p["vol_z"]: ls += 0.50
+                if r.h4_flow >= p["h4_flow_min"]: ls += 0.50
             if short_ctx:
-                short_score += 2.0
-                if r.h4_slope < 0: short_score += 0.75
-                if r.h4_adx >= p["adx"]: short_score += 0.75
-                if short_touch: short_score += 1.50
-                if short_reclaim: short_score += 1.50
-                if short_momo: short_score += 1.00
-                if r.close < r.open and r.body_atr >= p["body_atr"]: short_score += 0.75
-                if r.close_pos <= (1.0-p["close_pos"]): short_score += 0.50
-                if r.vol_z >= p["vol_z"]: short_score += 0.50
-                if r.range_atr >= p["range_atr"]: short_score += 0.50
+                ss += 2.0
+                if r.h4_slope < 0: ss += 0.75
+                if r.h4_adx >= p["adx"]: ss += 0.75
+                if short_flow: ss += 2.0
+                if short_price: ss += 0.75
+                if prev_absorb: ss += 1.0
+                if short_expand: ss += 1.25
+                if r.vol_z >= p["vol_z"]: ss += 0.50
+                if r.h4_flow <= -p["h4_flow_min"]: ss += 0.50
 
-            if long_score >= p["min_score"] and long_reclaim and long_score > short_score:
+            if ls >= p["min_score"] and long_expand and long_flow and ls > ss:
                 sig.append({"asset":asset,"signal_ts":x.index[i],"side":"LONG",
-                            "family":"TREND_PULLBACK","atr":float(r.atr),"score":long_score})
-            elif short_score >= p["min_score"] and short_reclaim and short_score > long_score:
+                            "family":"FLOW_POSITIONING_PROXY","atr":float(r.atr),"score":ls})
+            elif ss >= p["min_score"] and short_expand and short_flow and ss > ls:
                 sig.append({"asset":asset,"signal_ts":x.index[i],"side":"SHORT",
-                            "family":"TREND_PULLBACK","atr":float(r.atr),"score":short_score})
+                            "family":"FLOW_POSITIONING_PROXY","atr":float(r.atr),"score":ss})
     return sig
 
 def backtest(f, sig):
@@ -549,35 +569,32 @@ def main():
     args = ap.parse_args()
 
     print("=" * 96)
-    print("HUNTER-V148 — TREND PULLBACK RESEARCH")
+    print("HUNTER-V149 — FLOW / POSITIONING PROXY RESEARCH")
     print("Signal=1H | Context=4H | Regime=1D | Raw source=15m")
-    print("1D regime + 4H trend + causal 1H trend-pullback trigger")
+    print("OHLCV flow/positioning proxy: pressure + divergence + absorption + expansion")
     print("=" * 96)
 
     all15 = ensure_data(Path(args.data_dir), args.days)
     f = add_cross_sectional_rank(build_features(all15))
 
-    # 3 x 2 x 2 x 2 = 24 compact causal configurations.
+    # 3 x 2 x 2 x 2 = 24 causal configurations.
     grid = []
-    for lookback in [24, 48, 72]:
-        for min_score in [5.00, 5.75]:
-            for adx in [16.0, 20.0]:
-                for touch_atr in [0.25, 0.50]:
+    for min_score in [5.75, 6.50, 7.25]:
+        for flow24_min in [0.10, 0.20]:
+            for flow_slope_min in [0.03, 0.06]:
+                for adx in [16.0, 20.0]:
                     grid.append({
-                        "lookback": lookback,
-                        "min_score": min_score,
-                        "adx": adx,
-                        "touch_atr": touch_atr,
-                        "deep_atr": 0.75,
-                        "ret24_min": 0.002,
-                        "ret72_min": 0.004,
-                        "vol_z": -0.50,
-                        "body_atr": 0.25,
-                        "range_atr": 0.75,
-                        "close_pos": 0.55,
+                        "min_score": min_score, "flow24_min": flow24_min,
+                        "flow72_min": 0.05, "flow_slope_min": flow_slope_min,
+                        "flow_rank_long": 0.60, "flow_rank_short": 0.40,
+                        "ret24_min": -0.01, "ret24_max": 0.08,
+                        "adx": adx, "vol_z": -0.25, "body_atr": 0.35,
+                        "range_atr": 0.90, "close_pos": 0.60,
+                        "abs_vol_mult": 1.50, "abs_body_frac": 0.35,
+                        "h4_flow_min": 0.02,
                     })
 
-    print(f"Testing {len(grid)} causal C trend-pullback parameter sets...")
+    print(f"Testing {len(grid)} causal flow/positioning parameter sets...")
     results = []
     for n, p in enumerate(grid, 1):
         sig = signal_events(f, p)
@@ -593,8 +610,8 @@ def main():
     for i, (m, p) in enumerate(results[:15], 1):
         print(f"{i:>2} trades={m['trades']:>4} WR={m['wr']:>6.2f}% PF={m['pf']:.3f} "
               f"PnL=${m['pnl']:,.2f} DD=${m['dd']:,.2f} streak={m['max_streak']:>2} "
-              f"t/day={m['trades_day']:.2f} | lb={p['lookback']} score={p['min_score']:.2f} "
-              f"adx={p['adx']:.0f} touch={p['touch_atr']:.2f}")
+              f"t/day={m['trades_day']:.2f} | score={p['min_score']:.2f} "
+              f"flow24={p['flow24_min']:.2f} slope={p['flow_slope_min']:.2f} adx={p['adx']:.0f}")
 
     eligible = [z for z in results if z[0]["wr"] >= 50.0 and z[0]["max_streak"] <= 4 and z[0]["trades"] >= 100]
     print("\nELIGIBLE:", bool(eligible))
@@ -602,10 +619,10 @@ def main():
         m, p = eligible[0]
         print("Best eligible:", m)
         print("Parameters:", p)
-        print("NEXT: validate this parameter set with a strict walk-forward/OOS split before any live use.")
+        print("NEXT: strict walk-forward/OOS validation before any live consideration.")
     else:
         print("No tested configuration reached WR>=50% AND max loss streak<=4 with >=100 trades.")
-        print("NEXT: do not force the target; inspect the structural family and move to the next research branch.")
+        print("NEXT: do not force the target; reject/iterate only if the family shows measurable edge.")
 
 
 if __name__ == "__main__":
