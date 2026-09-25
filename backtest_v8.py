@@ -92,78 +92,141 @@ def _get_json(url, params):
     raise RuntimeError(f"XT request failed: {last}")
 
 
-def resolve_xt_symbols():
-    data = _get_json(LIST_URL, {})
-    rows = data.get("result", data)
-    if isinstance(rows, dict):
-        rows = rows.get("data", rows.get("list", []))
-    mapping = {}
-    for row in rows or []:
-        if not isinstance(row, dict):
+def extract_symbol_list(payload):
+    result = payload.get("result")
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        for key in ("items", "list", "data", "symbols"):
+            if isinstance(result.get(key), list):
+                return result[key]
+    raise RuntimeError(f"Could not find XT symbol list in response: {payload}")
+
+
+def resolve_xt_symbols(session):
+    payload = _get_json(LIST_URL, {})
+    items = extract_symbol_list(payload)
+    discovered = {}
+    for item in items:
+        if isinstance(item, str):
+            raw = item
+        elif isinstance(item, dict):
+            raw = item.get("symbol") or item.get("s") or item.get("name") or item.get("pair")
+        else:
             continue
-        raw = str(row.get("symbol") or row.get("contractName") or row.get("pair") or "")
-        norm = raw.upper().replace("-", "_").replace("/", "_")
-        for asset in SYMBOLS:
-            if asset in norm and "USDT" in norm:
-                mapping[asset] = raw
+        if raw:
+            discovered[str(raw).strip().upper()] = item
+
+    def norm(x):
+        return str(x).upper().replace("/", "_").replace("-", "_")
+
+    mapping = {}
+    for asset in SYMBOLS:
+        wanted = asset.upper()
+        candidates = [f"{wanted}_USDT", f"{wanted}/USDT", f"{wanted}-USDT", wanted]
+        actual = None
+        for candidate in candidates:
+            if candidate.upper() in discovered:
+                actual = candidate.upper()
+                break
+        if actual is None:
+            matches = [x for x in discovered if norm(x) == f"{wanted}_USDT"]
+            if len(matches) == 1:
+                actual = matches[0]
+        if actual is not None:
+            mapping[asset] = actual
     return mapping
 
 
+def normalize_kline_rows(rows, symbol):
+    records = []
+    for row in rows:
+        if isinstance(row, dict):
+            # XT Futures public K-line fields: t,o,h,l,c,a (timestamp/open/high/low/close/amount)
+            keys = ("t", "o", "h", "l", "c", "a")
+            if not all(k in row for k in keys):
+                raise RuntimeError(f"{symbol}: malformed dict kline: {row}")
+            vals = [row[k] for k in keys]
+        elif isinstance(row, (list, tuple)):
+            if len(row) < 6:
+                raise RuntimeError(f"{symbol}: malformed array kline: {row}")
+            vals = list(row[:6])
+        else:
+            raise RuntimeError(f"{symbol}: unsupported kline row: {row!r}")
+        records.append([int(float(vals[0])), *[float(v) for v in vals[1:6]]])
+    return pd.DataFrame(records, columns=["timestamp","open","high","low","close","volume"])
+
+
+def fetch_batch(session, xt_symbol, start_ms, end_ms):
+    # XT's Futures API is case-sensitive for the market id.
+    params = {
+        "symbol": xt_symbol.strip().lower(),
+        "interval": TIMEFRAME,
+        "startTime": start_ms,
+        "endTime": end_ms,
+        "limit": LIMIT,
+    }
+    payload = _get_json(KLINE_URL, params)
+    result = payload.get("result")
+    if not isinstance(result, list):
+        raise RuntimeError(f"XT Kline result is not a list: {payload}")
+    return normalize_kline_rows(result, xt_symbol)
+
+
 def fetch_symbol_15m(asset, xt_symbol, days=DAYS):
-    now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
-    start_ms = now_ms - int((days + WARMUP_DAYS) * 86400 * 1000)
-    end_ms = now_ms
-    rows = []
-    cursor = end_ms
-    seen = set()
-    while cursor > start_ms:
-        params = {"symbol": xt_symbol, "interval": TIMEFRAME, "limit": LIMIT, "endTime": cursor}
-        payload = _get_json(KLINE_URL, params)
-        data = payload.get("result", payload)
-        if isinstance(data, dict):
-            data = data.get("data", data.get("list", []))
-        if not data:
+    end_dt = pd.Timestamp.now(tz="UTC")
+    start_dt = end_dt - pd.Timedelta(days=days + WARMUP_DAYS)
+    start_ms = int(start_dt.timestamp() * 1000)
+    cursor_end = int(end_dt.timestamp() * 1000)
+    interval_ms = 15 * 60 * 1000
+    batches = []
+    calls = 0
+
+    # XT returns the newest candles first for a wide interval; paginate backward.
+    while cursor_end >= start_ms:
+        batch = fetch_batch(None, xt_symbol, start_ms, cursor_end)
+        calls += 1
+        if batch.empty:
             break
-        batch = []
-        for x in data:
-            if isinstance(x, dict):
-                ts = x.get("timestamp", x.get("time", x.get("openTime")))
-                vals = [ts, x.get("open"), x.get("high"), x.get("low"), x.get("close"), x.get("volume")]
-            else:
-                vals = list(x[:6])
-            if vals[0] is None:
-                continue
-            try:
-                ts = int(float(vals[0]))
-                if ts < 10**12:
-                    ts *= 1000
-                if ts in seen:
-                    continue
-                seen.add(ts)
-                batch.append([ts] + [float(v) for v in vals[1:]])
-            except Exception:
-                continue
-        if not batch:
+        batch = batch.sort_values("timestamp").reset_index(drop=True)
+        first = int(batch["timestamp"].iloc[0])
+        last = int(batch["timestamp"].iloc[-1])
+        if first < start_ms:
+            batch = batch[batch["timestamp"] >= start_ms].copy()
+            if batch.empty:
+                break
+            first = int(batch["timestamp"].iloc[0])
+        if last > cursor_end:
+            raise RuntimeError(f"{asset}: XT returned candle beyond requested end")
+        batches.append(batch)
+        if first <= start_ms:
             break
-        rows.extend(batch)
-        oldest = min(x[0] for x in batch)
-        cursor = oldest - 1
-        if len(batch) < 2:
-            break
+        next_end = first - 1
+        if next_end >= cursor_end:
+            raise RuntimeError(f"{asset}: backward pagination made no progress")
+        cursor_end = next_end
+        if calls > 1000:
+            raise RuntimeError(f"{asset}: pagination safety stop")
         time.sleep(SLEEP)
-    if not rows:
+
+    if not batches:
         raise RuntimeError(f"No XT data for {asset}")
-    df = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume"])
+
+    df = pd.concat(batches, ignore_index=True).drop_duplicates("timestamp").sort_values("timestamp")
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.drop_duplicates("timestamp").sort_values("timestamp").set_index("timestamp")
-    df = df.loc[df.index >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days + WARMUP_DAYS + 2)]
+    df = df.set_index("timestamp")
+    current = pd.Timestamp.now(tz="UTC")
+    if not df.empty and df.index[-1] + pd.Timedelta(minutes=15) > current:
+        df = df.iloc[:-1]
     df = df.astype(float).dropna()
     return df
 
 
 def ensure_data(data_dir: Path, days: int):
     data_dir.mkdir(parents=True, exist_ok=True)
-    mapping = resolve_xt_symbols()
+    session = requests.Session()
+    session.headers.update({"User-Agent": "HUNTER-XT-Futures-Research/1.0"})
+    mapping = resolve_xt_symbols(session)
     if len(mapping) != len(SYMBOLS):
         missing = [s for s in SYMBOLS if s not in mapping]
         raise RuntimeError(f"XT symbol resolution incomplete: {missing}")
@@ -174,7 +237,6 @@ def ensure_data(data_dir: Path, days: int):
         df.reset_index().to_csv(path, index=False)
         gaps = int(((df.index.to_series().diff().dropna() / pd.Timedelta(minutes=15)) > 1).sum())
         print(f"{asset:<8} rows={len(df)} gaps={gaps}")
-
 
 def load(path: Path):
     df = pd.read_csv(path)
