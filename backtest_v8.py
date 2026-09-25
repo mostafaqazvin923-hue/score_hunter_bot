@@ -149,125 +149,119 @@ def _parse_kline(js):
 
 
 def fetch_symbol(asset, xt_symbol, days):
-    """Fetch ~days of 15m XT futures data using the proven forward-pagination pattern.
+    """Fetch completed 15m XT futures candles with forward pagination.
 
-    XT's historical kline endpoint is more reliable when the requested history is
-    split into bounded chronological chunks instead of asking for one ~400-day
-    window. Each chunk is then paginated forward with startTime/endTime.
+    IMPORTANT: XT's /q/kline endpoint has shown inconsistent behavior when both
+    startTime and endTime are supplied for historical windows. The proven-safe
+    approach is to paginate using startTime + limit only, then locally trim to
+    the requested end. This avoids the recurring "kline batch outside requested
+    range" failure seen in GitHub Actions.
     """
     now_ms = int(time.time() * 1000)
     interval_ms = 15 * 60 * 1000
-    end_ms = (now_ms // interval_ms) * interval_ms - interval_ms
+    last_closed_open = (now_ms // interval_ms) * interval_ms - interval_ms
+    end_ms = last_closed_open
     start_ms = ((now_ms - int((days + WARMUP_DAYS) * 86400 * 1000)) // interval_ms) * interval_ms
-    chunk_ms = 90 * 86400 * 1000
-    endpoint = f"{BASE}/future/market/v1/public/q/kline"
 
-    # Preserve the exact symbol returned by XT first; only then try lowercase.
-    # Different XT API deployments have differed in symbol casing.
+    endpoint = f"{BASE}/future/market/v1/public/q/kline"
     candidates = []
     for sym in (str(xt_symbol).strip(), str(xt_symbol).strip().lower()):
         if sym and sym not in candidates:
             candidates.append(sym)
 
-    best = []
     last_error = None
 
     for api_symbol in candidates:
         all_rows = []
+        cursor = start_ms
+        guard = 0
         failed = False
-        chunk_start = start_ms
 
-        while chunk_start < end_ms:
-            chunk_end = min(end_ms, chunk_start + chunk_ms - 1)
-            rows = []
-            cursor = chunk_start
-            guard = 0
+        while cursor <= end_ms and guard < 1000:
+            guard += 1
+            params = {
+                "symbol": api_symbol,
+                "interval": INTERVAL,
+                "startTime": int(cursor),
+                "limit": LIMIT,
+            }
 
-            while cursor <= chunk_end and guard < 100:
-                guard += 1
-                window_end = min(chunk_end, cursor + (LIMIT - 1) * interval_ms)
-                params = {
-                    "symbol": api_symbol,
-                    "interval": INTERVAL,
-                    "startTime": int(cursor),
-                    "endTime": int(window_end),
-                    "limit": LIMIT,
-                }
-
-                batch = []
-                batch_error = None
-                for attempt in range(MAX_REQUEST_RETRIES):
-                    try:
-                        batch = _parse_kline(_get_json(endpoint, params))
-                        if batch:
-                            break
-                        batch_error = RuntimeError(
-                            f"empty kline response for {api_symbol}"
-                        )
-                    except Exception as exc:
-                        batch_error = exc
-                    time.sleep(min(2.0, 0.25 * (attempt + 1)))
-
-                if not batch:
-                    last_error = batch_error
-                    failed = True
-                    break
-
-                batch = [x for x in batch if cursor <= x[0] <= window_end]
-                if not batch:
-                    last_error = RuntimeError(
-                        f"kline batch outside requested range for {api_symbol}: "
-                        f"{cursor}->{window_end}"
+            batch = []
+            batch_error = None
+            for attempt in range(MAX_REQUEST_RETRIES):
+                try:
+                    batch = _parse_kline(_get_json(endpoint, params))
+                    if batch:
+                        break
+                    batch_error = RuntimeError(
+                        f"empty kline response for {api_symbol} at startTime={cursor}"
                     )
-                    failed = True
-                    break
+                except Exception as exc:
+                    batch_error = exc
+                time.sleep(min(2.0, 0.25 * (attempt + 1)))
 
-                rows.extend(batch)
-                mx = max(x[0] for x in batch)
-                if mx < cursor:
-                    last_error = RuntimeError(
-                        f"XT pagination did not advance for {api_symbol}: {mx} < {cursor}"
-                    )
-                    failed = True
-                    break
-
-                # Advance strictly beyond the newest returned candle.
-                cursor = mx + interval_ms
-
-            if failed:
+            if not batch:
+                last_error = batch_error
+                failed = True
                 break
 
-            all_rows.extend(rows)
-            chunk_start = chunk_end + 1
+            # XT may return a few candles around the requested boundary. Keep
+            # only candles that belong to our requested historical interval.
+            batch = [x for x in batch if start_ms <= x[0] <= end_ms]
+            if not batch:
+                # If the exchange returned only future/out-of-range rows, do not
+                # spin forever. Report the actual returned timestamp range.
+                raw_min = min(x[0] for x in _parse_kline(_get_json(endpoint, params)))
+                raw_max = max(x[0] for x in _parse_kline(_get_json(endpoint, params)))
+                last_error = RuntimeError(
+                    f"XT returned rows outside requested history for {api_symbol}: "
+                    f"requested_start={cursor}, returned={raw_min}->{raw_max}"
+                )
+                failed = True
+                break
+
+            all_rows.extend(batch)
+            mx = max(x[0] for x in batch)
+            if mx < cursor:
+                last_error = RuntimeError(
+                    f"XT pagination did not advance for {api_symbol}: {mx} < {cursor}"
+                )
+                failed = True
+                break
+
+            next_cursor = mx + interval_ms
+            if next_cursor <= cursor:
+                last_error = RuntimeError(
+                    f"XT pagination stalled for {api_symbol}: cursor={cursor}, next={next_cursor}"
+                )
+                failed = True
+                break
+            cursor = next_cursor
             time.sleep(0.05)
 
-        if all_rows and not failed:
-            df = pd.DataFrame(
-                all_rows,
-                columns=["timestamp", "open", "high", "low", "close", "volume"],
-            )
-            df = df.drop_duplicates("timestamp").sort_values("timestamp")
-            df = df[(df.timestamp >= start_ms) & (df.timestamp <= end_ms)]
-            if len(df) > len(best):
-                best = df
+        if failed or not all_rows:
+            continue
 
-            if len(df) >= MIN_ROWS:
-                span = int(df.timestamp.max() - df.timestamp.min())
-                if span >= int(days * 86400 * 1000 * 0.90):
-                    df["timestamp"] = pd.to_datetime(df.timestamp, unit="ms", utc=True)
-                    return df.set_index("timestamp").dropna()
-
-    got = len(best)
-    detail = ""
-    if got:
-        detail = (
-            f"; range={pd.to_datetime(int(best.timestamp.min()), unit='ms', utc=True)}"
-            f" -> {pd.to_datetime(int(best.timestamp.max()), unit='ms', utc=True)}"
+        df = pd.DataFrame(
+            all_rows,
+            columns=["timestamp", "open", "high", "low", "close", "volume"],
         )
-    if last_error:
-        detail += f"; last_error={last_error}"
+        df = df.drop_duplicates("timestamp").sort_values("timestamp")
+        df = df[(df.timestamp >= start_ms) & (df.timestamp <= end_ms)]
+
+        if len(df) >= MIN_ROWS:
+            span = int(df.timestamp.max() - df.timestamp.min())
+            if span >= int(days * 86400 * 1000 * 0.90):
+                df["timestamp"] = pd.to_datetime(df.timestamp, unit="ms", utc=True)
+                return df.set_index("timestamp").dropna()
+
+        last_error = RuntimeError(
+            f"short XT history for {api_symbol}: rows={len(df)}"
+        )
+
+    detail = f"; last_error={last_error}" if last_error else ""
     raise RuntimeError(
-        f"Insufficient XT data for {asset}: got {got} rows{detail}; refusing partial backtest"
+        f"Insufficient XT data for {asset}: got 0 rows{detail}; refusing partial backtest"
     )
 
 
