@@ -773,6 +773,7 @@ def build_report(trades: list[dict], reports: dict) -> dict:
             "win_rate": 0.0,
             "profit_factor": 0.0,
             "net_pnl": 0.0,
+            "final_equity": float(INITIAL_EQUITY),
             "max_drawdown": 0.0,
             "max_loss_streak": 0,
             "loss_streak_list": [],
