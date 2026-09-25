@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HUNTER-V143 — MTF CRYPTO FACTOR RESEARCH
+HUNTER-V144 — MTF CRYPTO FACTOR RESEARCH
 1D regime + 4H context + 1H signal.
 Research-only, causal, no lookahead, no timeout, no overlap.
 Fixed RR 1:2. XT Futures 15m data -> 1H/4H/1D.
@@ -297,7 +297,7 @@ def backtest(f, sig):
         if ts<=last_close: continue
         if len(positions)>=MAX_OPEN_POSITIONS: continue
         # one best candidate per family/asset, rank by cross-sectional strength magnitude
-        for s in sorted(byts[ts],key=lambda z:abs(z["atr"]),reverse=True):
+        for s in sorted(byts.get(ts,[]),key=lambda z:abs(z["atr"]),reverse=True):
             if len(positions)>=MAX_OPEN_POSITIONS: break
             if any(p["asset"]==s["asset"] for p in positions): continue
             x=f[s["asset"]]; future=x.index[x.index>ts]
@@ -310,7 +310,7 @@ def backtest(f, sig):
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--days",type=int,default=DAYS); ap.add_argument("--data-dir",default=str(DATA_DIR)); args=ap.parse_args()
-    print("="*88); print("HUNTER-V141 — MTF FACTOR RESEARCH"); print("="*88)
+    print("="*88); print("HUNTER-V144 — MTF FACTOR RESEARCH"); print("="*88)
     all15=ensure_data(Path(args.data_dir),args.days); f=add_cross_sectional(features(all15)); print("\nRunning frozen factor families...")
     sig=signals(f); trades,openp=backtest(f,sig)
     for fam in ["A_MOMENTUM","B_REVERSAL","C_REGIME_SWITCH"]:
