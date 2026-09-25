@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HUNTER-V141 — MTF CRYPTO FACTOR RESEARCH
+HUNTER-V143 — MTF CRYPTO FACTOR RESEARCH
 1D regime + 4H context + 1H signal.
 Research-only, causal, no lookahead, no timeout, no overlap.
 Fixed RR 1:2. XT Futures 15m data -> 1H/4H/1D.
@@ -30,7 +30,7 @@ LIMIT=1500; INTERVAL="15m"; DAYS=365; WARMUP_DAYS=35
 MIN_ROWS=30000
 MAX_REQUEST_RETRIES=6
 S=requests.Session()
-S.headers.update({"User-Agent":"HUNTER-backtest/142"})
+S.headers.update({"User-Agent":"HUNTER-backtest/143"})
 
 def resolve_symbols():
     u=f"{BASE}/future/market/v1/public/symbol/list"
@@ -43,7 +43,8 @@ def resolve_symbols():
         raw=str(x.get("symbol",x.get("name",""))).upper()
         compact=raw.replace("_","").replace("-","").replace("/","").replace(":","")
         for a in SYMBOLS:
-            if compact.startswith(a+"USDT") or compact==a+"USDT":
+            aliases={a+"USDT", a+"_USDT", a+"/USDT", a+"/USDT:USDT"}
+            if compact in {z.replace("_","").replace("-","").replace("/","").replace(":","") for z in aliases}:
                 out[a]=x.get("symbol") or x.get("name")
     return out
 
@@ -90,52 +91,114 @@ def _parse_kline(js):
     return out
 
 def fetch_symbol(asset, xt_symbol, days):
-    end=int(time.time()*1000); start=end-int((days+WARMUP_DAYS)*86400*1000)
+    """
+    Robust XT 15m collector.
+
+    Important: XT documents both startTime and endTime for /q/kline.  We
+    paginate FORWARD with startTime+endTime windows instead of relying on a
+    single moving endTime.  This avoids the partial-page behaviour that caused
+    the previous run to receive only 15 BTC candles.
+    """
+    now_ms=int(time.time()*1000)
+    start_ms=now_ms-int((days+WARMUP_DAYS)*86400*1000)
+    # Never use a still-forming candle.
+    interval_ms=15*60*1000
+    end_ms=(now_ms//interval_ms)*interval_ms-1
+
     best=[]
-    # Retry the whole symbol, not just individual HTTP calls. This prevents a
-    # transient/partial XT response (e.g. 14 candles) from being accepted.
-    for whole_try in range(4):
-        rows=[]; cursor=end; guard=0; failed=False
-        while cursor>start and guard<1000:
-            guard+=1
-            params={"symbol":xt_symbol,"interval":INTERVAL,"limit":LIMIT,"endTime":cursor}
-            try:
-                js=_get_json(f"{BASE}/future/market/v1/public/q/kline",params)
-                batch=_parse_kline(js)
-            except Exception:
+    endpoint=f"{BASE}/future/market/v1/public/q/kline"
+
+    for whole_try in range(5):
+        rows=[]
+        cursor=start_ms
+        guard=0
+        failed=False
+
+        while cursor < end_ms and guard < 2000:
+            guard += 1
+            # 1500 x 15m = 15.625 days. Keep a tiny overlap and dedupe later.
+            window_end=min(end_ms, cursor + LIMIT*interval_ms - 1)
+            params={
+                "symbol":xt_symbol,
+                "interval":INTERVAL,
+                "startTime":cursor,
+                "endTime":window_end,
+                "limit":LIMIT,
+            }
+
+            batch=[]
+            last_err=None
+            for attempt in range(6):
+                try:
+                    batch=_parse_kline(_get_json(endpoint,params))
+                    if batch:
+                        break
+                except Exception as e:
+                    last_err=e
+                time.sleep(min(2.0,0.35*(attempt+1)))
+
+            if not batch:
                 failed=True
                 break
+
+            # Keep only valid candles inside the requested window.
+            batch=[x for x in batch if start_ms <= x[0] <= end_ms]
             if not batch:
-                # Empty page can be transient; retry the page before aborting.
-                recovered=False
-                for _ in range(3):
-                    time.sleep(0.5)
-                    try:
-                        batch=_parse_kline(_get_json(f"{BASE}/future/market/v1/public/q/kline",params))
-                        if batch:
-                            recovered=True; break
-                    except Exception:
-                        pass
-                if not recovered:
-                    break
+                failed=True
+                break
+
             rows.extend(batch)
             mn=min(x[0] for x in batch)
             mx=max(x[0] for x in batch)
-            if mn>=cursor or mx<start:
+
+            # Hard progress check. Never loop on the same XT page.
+            if mx < cursor:
+                failed=True
                 break
-            cursor=mn-1
-            time.sleep(0.20)
+
+            # Normal case: move just past the last candle received.
+            next_cursor=mx+1
+            if next_cursor <= cursor:
+                failed=True
+                break
+            cursor=next_cursor
+
+            # If XT returned fewer than LIMIT rows, the next forward request
+            # is still valid; do not treat a short page as a fatal error.
+            time.sleep(0.08)
+
         if rows:
-            df=pd.DataFrame(rows,columns=["timestamp","open","high","low","close","volume"])
+            df=pd.DataFrame(
+                rows,
+                columns=["timestamp","open","high","low","close","volume"]
+            )
             df=df.drop_duplicates("timestamp").sort_values("timestamp")
-            df=df[(df.timestamp>=start)&(df.timestamp<=end)]
-            if len(df)>len(best): best=df
+            df=df[(df.timestamp>=start_ms)&(df.timestamp<=end_ms)]
+
+            if len(df)>len(best):
+                best=df
+
             if len(df)>=MIN_ROWS:
-                df["timestamp"]=pd.to_datetime(df.timestamp,unit="ms",utc=True)
-                return df.set_index("timestamp").dropna()
+                # Require broad time coverage, not merely row count.
+                span=int(df.timestamp.max()-df.timestamp.min())
+                required_span=int(days*86400*1000*0.90)
+                if span >= required_span:
+                    df["timestamp"]=pd.to_datetime(df.timestamp,unit="ms",utc=True)
+                    return df.set_index("timestamp").dropna()
+
         time.sleep(1.0*(whole_try+1))
+
     got=len(best)
-    raise RuntimeError(f"Insufficient XT data for {asset}: got {got} rows; refusing to run a partial backtest")
+    if got:
+        first=pd.to_datetime(int(best.timestamp.min()),unit="ms",utc=True)
+        last=pd.to_datetime(int(best.timestamp.max()),unit="ms",utc=True)
+        detail=f"; range={first} -> {last}"
+    else:
+        detail=""
+    raise RuntimeError(
+        f"Insufficient XT data for {asset}: got {got} rows{detail}; "
+        f"refusing to run a partial backtest"
+    )
 
 def ensure_data(data_dir,days):
     data_dir.mkdir(parents=True,exist_ok=True); mapping=resolve_symbols()
