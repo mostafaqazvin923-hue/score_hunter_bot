@@ -103,7 +103,7 @@ def fetch_futures(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         guard += 1
         if guard > 1000:
             raise RuntimeError(f"futures pagination guard tripped for {symbol}")
-        window_end = min(end_ms, cursor + LIMIT * INTERVAL_MS - 1)
+        window_end = end_ms
         params = {
             "symbol": f"{symbol.lower()}_usdt",
             "interval": "15m",
@@ -114,10 +114,25 @@ def fetch_futures(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         batch = extract_list(request_json(f"{BASE_FUT}/future/market/v1/public/q/kline", params))
         if not batch:
             break
-        rows.extend(batch)
-        mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in batch)
-        if mx < cursor:
-            raise RuntimeError(f"futures pagination moved backwards for {symbol}")
+        # XT may return the page in descending order or include rows outside the
+        # requested lower bound. Keep only rows inside the requested interval
+        # before advancing the cursor. Pagination advances by the newest valid
+        # timestamp; if the endpoint returns no valid rows, fail explicitly.
+        valid_batch = []
+        for x in batch:
+            try:
+                ts = int(x.get("t")) if isinstance(x, dict) else int(x[0])
+                if cursor <= ts <= end_ms:
+                    valid_batch.append(x)
+            except Exception:
+                continue
+        if not valid_batch:
+            raise RuntimeError(
+                f"futures API returned no in-range candles for {symbol}; "
+                f"cursor={cursor} end={end_ms} raw_rows={len(batch)}"
+            )
+        rows.extend(valid_batch)
+        mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in valid_batch)
         cursor = mx + 1
         if len(batch) < LIMIT and window_end >= end_ms:
             break
@@ -136,7 +151,7 @@ def fetch_spot(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         guard += 1
         if guard > 1000:
             raise RuntimeError(f"spot pagination guard tripped for {symbol}")
-        window_end = min(end_ms, cursor + LIMIT * INTERVAL_MS - 1)
+        window_end = end_ms
         params = {
             "symbol": f"{symbol.lower()}_usdt",
             "interval": "15m",
@@ -147,10 +162,21 @@ def fetch_spot(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         batch = extract_list(request_json(f"{BASE_SPOT}/v4/public/kline", params))
         if not batch:
             break
-        rows.extend(batch)
-        mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in batch)
-        if mx < cursor:
-            raise RuntimeError(f"spot pagination moved backwards for {symbol}")
+        valid_batch = []
+        for x in batch:
+            try:
+                ts = int(x.get("t")) if isinstance(x, dict) else int(x[0])
+                if cursor <= ts <= end_ms:
+                    valid_batch.append(x)
+            except Exception:
+                continue
+        if not valid_batch:
+            raise RuntimeError(
+                f"spot API returned no in-range candles for {symbol}; "
+                f"cursor={cursor} end={end_ms} raw_rows={len(batch)}"
+            )
+        rows.extend(valid_batch)
+        mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in valid_batch)
         cursor = mx + 1
         if len(batch) < LIMIT and window_end >= end_ms:
             break
