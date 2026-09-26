@@ -1,121 +1,157 @@
-name: XT Funding Pagination Diagnostic
+name: XT BTC Funding 365D Test
 
 on:
   workflow_dispatch:
 
 jobs:
-  pagination:
+  funding:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
 
     steps:
-      - name: Inspect XT funding pagination
+      - name: Download BTC funding history for 365 days
         shell: bash
         run: |
           python - <<'PY'
           import requests
-          import json
           import time
           from datetime import datetime, timezone
 
           BASE = "https://fapi.xt.com"
           URL = f"{BASE}/future/market/v1/public/q/funding-rate-record"
           SYMBOL = "btc_usdt"
-          TIMEOUT = 10
+          LIMIT = 100
+          DAYS = 365
+          MAX_PAGES = 20
+          GLOBAL_TIMEOUT = 90
+          REQUEST_TIMEOUT = 10
 
-          def ts(v):
-              try:
-                  return datetime.fromtimestamp(int(v)/1000, tz=timezone.utc).isoformat()
-              except Exception:
-                  return str(v)
+          started = time.monotonic()
+          session = requests.Session()
 
-          def get(params):
-              r = requests.get(URL, params=params, timeout=TIMEOUT)
-              print("HTTP:", r.status_code, "params:", params)
+          now_ms = int(time.time() * 1000)
+          target_ms = now_ms - DAYS * 86400 * 1000
+
+          rows = []
+          seen_ids = set()
+
+          def dt(ms):
+              return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).isoformat()
+
+          def fetch(params):
+              if time.monotonic() - started >= GLOBAL_TIMEOUT:
+                  raise TimeoutError("Global timeout exceeded")
+              r = session.get(URL, params=params, timeout=REQUEST_TIMEOUT)
+              print("HTTP:", r.status_code, "time:", f"{r.elapsed.total_seconds():.2f}s")
               r.raise_for_status()
               return r.json()
 
-          print("=== XT FUNDING PAGINATION INSPECTOR ===")
+          print("=== XT BTC FUNDING 365D TEST ===")
 
-          first = get({
+          # Page 1 establishes the cursor.
+          data = fetch({
               "symbol": SYMBOL,
-              "limit": 100,
-              "direction": "PREV"
+              "limit": LIMIT,
+              "direction": "PREV",
           })
 
-          result = first.get("result", {})
-          items = result.get("items", []) if isinstance(result, dict) else []
-
-          print("\nRESULT KEYS:", list(result.keys()) if isinstance(result, dict) else type(result))
-          print("ITEM COUNT:", len(items))
-          print("PAGE FLAGS:", {
-              k: result.get(k)
-              for k in ("hasPrev", "hasNext", "nextId", "prevId", "next", "prev", "cursor")
-              if isinstance(result, dict) and k in result
-          })
+          result = data.get("result", {})
+          items = result.get("items", [])
 
           if not items:
-              raise RuntimeError("First page returned no items")
+              raise RuntimeError("Page 1 returned no funding records")
 
-          print("\nFIRST ITEM:")
-          print(json.dumps(items[0], indent=2)[:3000])
+          for item in items:
+              item_id = str(item.get("id", ""))
+              if item_id and item_id not in seen_ids:
+                  seen_ids.add(item_id)
+                  rows.append(item)
 
-          print("\nLAST ITEM:")
-          print(json.dumps(items[-1], indent=2)[:3000])
+          print("PAGE 1:", len(items), "records")
+          print("FIRST ID:", items[0].get("id"))
+          print("LAST ID:", items[-1].get("id"))
 
-          ids = [str(x.get("id")) for x in items if x.get("id") is not None]
-          times = [int(x["createdTime"]) for x in items if x.get("createdTime") is not None]
+          # Diagnostic #3 proved that NEXT + FIRST_ID moves backward in time.
+          cursor = str(items[0].get("id"))
 
-          print("\nFIRST ID:", ids[0] if ids else None)
-          print("LAST ID:", ids[-1] if ids else None)
+          for page in range(2, MAX_PAGES + 1):
+              if time.monotonic() - started >= GLOBAL_TIMEOUT:
+                  raise TimeoutError("Global timeout exceeded")
 
-          if times:
-              print("NEWEST:", ts(max(times)))
-              print("OLDEST:", ts(min(times)))
-
-          # Test the two plausible PREV cursor directions using actual IDs.
-          candidates = []
-          if ids:
-              candidates.append(("PREV_WITH_FIRST_ID", "PREV", ids[0]))
-              candidates.append(("PREV_WITH_LAST_ID", "PREV", ids[-1]))
-
-          # Also test NEXT using both IDs. We do NOT use these for the backtest;
-          # this run only discovers which pagination semantics XT actually implements.
-          if ids:
-              candidates.append(("NEXT_WITH_FIRST_ID", "NEXT", ids[0]))
-              candidates.append(("NEXT_WITH_LAST_ID", "NEXT", ids[-1]))
-
-          print("\n=== CURSOR EXPERIMENTS ===")
-
-          for name, direction, cursor in candidates:
-              data = get({
+              data = fetch({
                   "symbol": SYMBOL,
-                  "limit": 100,
-                  "direction": direction,
+                  "limit": LIMIT,
+                  "direction": "NEXT",
                   "id": cursor,
               })
 
-              res = data.get("result", {})
-              its = res.get("items", []) if isinstance(res, dict) else []
+              result = data.get("result", {})
+              items = result.get("items", [])
 
-              new_ids = [str(x.get("id")) for x in its if x.get("id") is not None]
-              new_times = [int(x["createdTime"]) for x in its if x.get("createdTime") is not None]
+              if not items:
+                  print("No more items.")
+                  break
 
-              overlap = len(set(ids) & set(new_ids))
+              new_count = 0
+              for item in items:
+                  item_id = str(item.get("id", ""))
+                  if item_id and item_id not in seen_ids:
+                      seen_ids.add(item_id)
+                      rows.append(item)
+                      new_count += 1
 
-              print(f"\n{name}")
-              print("returned:", len(its))
-              print("overlap_with_page1:", overlap)
-              print("hasPrev:", res.get("hasPrev") if isinstance(res, dict) else None)
-              print("hasNext:", res.get("hasNext") if isinstance(res, dict) else None)
-              print("first_id:", new_ids[0] if new_ids else None)
-              print("last_id:", new_ids[-1] if new_ids else None)
-              print("newest:", ts(max(new_times)) if new_times else None)
-              print("oldest:", ts(min(new_times)) if new_times else None)
+              times = [
+                  int(x["createdTime"])
+                  for x in rows
+                  if x.get("createdTime") is not None
+              ]
 
-          print("\n================================")
-          print("DIAGNOSTIC COMPLETE")
-          print("Use this output to select the exact XT cursor semantics.")
-          print("NO 365-DAY DOWNLOAD WAS ATTEMPTED.")
+              oldest = min(times) if times else None
+
+              print(
+                  f"PAGE {page}: returned={len(items)} "
+                  f"new={new_count} total={len(rows)} "
+                  f"oldest={dt(oldest) if oldest else 'N/A'}"
+              )
+
+              if oldest is not None and oldest <= target_ms:
+                  print("365-DAY TARGET REACHED.")
+                  break
+
+              next_cursor = str(items[0].get("id", ""))
+
+              if not next_cursor or next_cursor == cursor:
+                  raise RuntimeError("Pagination cursor did not advance")
+
+              cursor = next_cursor
+
+          times = [
+              int(x["createdTime"])
+              for x in rows
+              if x.get("createdTime") is not None
+          ]
+
+          if not times:
+              raise RuntimeError("No valid funding timestamps collected")
+
+          oldest = min(times)
+          newest = max(times)
+          coverage_days = (newest - oldest) / 86400000
+          elapsed = time.monotonic() - started
+
+          print()
           print("================================")
+          print("RESULT")
+          print("Unique records:", len(rows))
+          print("Coverage days:", f"{coverage_days:.1f}")
+          print("Oldest:", dt(oldest))
+          print("Newest:", dt(newest))
+          print("Elapsed:", f"{elapsed:.2f}s")
+          print("Target reached:", oldest <= target_ms)
+          print("================================")
+
+          if oldest > target_ms:
+              raise RuntimeError("365-day target NOT reached within page limit")
+
+          print("XT BTC FUNDING 365D TEST: PASSED")
           PY
