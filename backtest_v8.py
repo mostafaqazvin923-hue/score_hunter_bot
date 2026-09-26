@@ -96,146 +96,132 @@ def normalize_kline(rows: list) -> pd.DataFrame:
     return df
 
 
-def fetch_futures(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+def _row_ts(x) -> int | None:
+    try:
+        return int(x.get("t")) if isinstance(x, dict) else int(x[0])
+    except Exception:
+        return None
+
+
+def _valid_rows(rows: list, lo: int, hi: int) -> list:
+    out = []
+    for x in rows:
+        ts = _row_ts(x)
+        if ts is not None and lo <= ts <= hi:
+            out.append(x)
+    return out
+
+
+def _fetch_page(url: str, params: dict, lo: int, hi: int, label: str) -> tuple[list, list]:
+    """Fetch one XT page and return (raw_rows, in_range_rows).
+
+    XT's public kline endpoints can occasionally return a page that does not
+    honor a very narrow startTime/endTime window near the live edge. We never
+    advance the cursor from such a page. A bounded endTime-only retry is used
+    as a compatibility fallback.
+    """
+    raw = extract_list(request_json(url, params))
+    valid = _valid_rows(raw, lo, hi)
+    if valid:
+        return raw, valid
+
+    # Compatibility fallback: some XT responses behave better when only the
+    # upper bound is supplied. The returned page is still strictly filtered.
+    fallback = dict(params)
+    fallback.pop("startTime", None)
+    fallback["endTime"] = hi
+    raw2 = extract_list(request_json(url, fallback))
+    valid2 = _valid_rows(raw2, lo, hi)
+    if valid2:
+        return raw2, valid2
+
+    return raw, []
+
+
+def _fetch_klines(symbol: str, start_ms: int, end_ms: int, *,
+                  url: str, limit: int, label: str) -> pd.DataFrame:
     rows: List = []
     cursor = start_ms
     guard = 0
     while cursor <= end_ms:
         guard += 1
         if guard > 1000:
-            raise RuntimeError(f"futures pagination guard tripped for {symbol}")
-        window_end = min(end_ms, cursor + LIMIT_FUT * INTERVAL_MS - 1)
+            raise RuntimeError(f"{label} pagination guard tripped for {symbol}")
+
+        window_end = min(end_ms, cursor + limit * INTERVAL_MS - 1)
         params = {
             "symbol": f"{symbol.lower()}_usdt",
             "interval": "15m",
             "startTime": cursor,
             "endTime": window_end,
-            "limit": LIMIT_FUT,
+            "limit": limit,
         }
-        batch = extract_list(request_json(f"{BASE_FUT}/future/market/v1/public/q/kline", params))
-        if not batch:
-            break
-        # XT may return the page in descending order or include rows outside the
-        # requested lower bound. Keep only rows inside the requested interval
-        # before advancing the cursor. Pagination advances by the newest valid
-        # timestamp; if the endpoint returns no valid rows, fail explicitly.
-        valid_batch = []
-        for x in batch:
-            try:
-                ts = int(x.get("t")) if isinstance(x, dict) else int(x[0])
-                if cursor <= ts <= end_ms:
-                    valid_batch.append(x)
-            except Exception:
-                continue
-        if not valid_batch:
-            # XT can occasionally return a stale/shifted page. Retry the same
-            # cursor once with a half-size window instead of corrupting pagination.
-            retry_end = min(window_end, cursor + (LIMIT_FUT // 2) * INTERVAL_MS - 1)
-            if retry_end > cursor and retry_end < window_end:
-                params["endTime"] = retry_end
-                batch2 = extract_list(request_json(f"{BASE_FUT}/future/market/v1/public/q/kline", params))
-                valid_batch = []
-                for x in batch2:
-                    try:
-                        ts = int(x.get("t")) if isinstance(x, dict) else int(x[0])
-                        if cursor <= ts <= retry_end:
-                            valid_batch.append(x)
-                    except Exception:
-                        continue
-                if valid_batch:
-                    batch = batch2
-                    window_end = retry_end
-            if not valid_batch:
-                # Near the live edge XT may return a page containing only newer
-                # / not-yet-available candles even though the requested window
-                # ends at the latest completed 15m boundary. Treat this as normal
-                # end-of-history only when the cursor is within one 15m candle of
-                # the requested end; never hide an earlier pagination failure.
-                if cursor >= end_ms - INTERVAL_MS:
-                    break
-                raise RuntimeError(
-                    f"futures API returned no in-range candles for {symbol}; "
-                    f"cursor={cursor} window_end={window_end} raw_rows={len(batch)}"
-                )
-        rows.extend(valid_batch)
-        mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in valid_batch)
-        cursor = mx + 1
-        if len(batch) < LIMIT_FUT and window_end >= end_ms:
-            break
+        raw, valid = _fetch_page(url, params, cursor, window_end, label)
+
+        if not valid:
+            # A zero-row response is only acceptable at the deliberately
+            # buffered live edge. Earlier failures indicate a broken history
+            # fetch and must never be silently converted into partial data.
+            if cursor >= end_ms - 2 * INTERVAL_MS:
+                break
+            raise RuntimeError(
+                f"{label} API returned no in-range candles for {symbol}; "
+                f"cursor={cursor} window_end={window_end} raw_rows={len(raw)}"
+            )
+
+        rows.extend(valid)
+        timestamps = [_row_ts(x) for x in valid]
+        timestamps = [t for t in timestamps if t is not None]
+        if not timestamps:
+            raise RuntimeError(f"{label} returned no parseable timestamps for {symbol}")
+        mx = max(timestamps)
+
+        # Advance to the next 15m boundary, not merely mx+1ms. This prevents
+        # narrow windows such as 13:45:00.001 from being sent back to XT.
+        next_cursor = ((mx // INTERVAL_MS) + 1) * INTERVAL_MS
+        if next_cursor <= cursor:
+            raise RuntimeError(
+                f"{label} pagination made no progress for {symbol}; "
+                f"cursor={cursor} max_ts={mx}"
+            )
+        cursor = next_cursor
         time.sleep(0.03)
+
     df = normalize_kline(rows)
+    if df.empty:
+        return df
     return df[(df.ts >= start_ms) & (df.ts <= end_ms)].copy()
+
+
+def fetch_futures(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    return _fetch_klines(
+        symbol, start_ms, end_ms,
+        url=f"{BASE_FUT}/future/market/v1/public/q/kline",
+        limit=LIMIT_FUT,
+        label="futures",
+    )
 
 
 def fetch_spot(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    # XT spot public API is served from sapi.xt.com. The current v4 public kline
-    # endpoint accepts startTime/endTime/limit and returns t,o,h,l,c,q/v style fields.
-    rows: List = []
-    cursor = start_ms
-    guard = 0
-    while cursor <= end_ms:
-        guard += 1
-        if guard > 1000:
-            raise RuntimeError(f"spot pagination guard tripped for {symbol}")
-        window_end = min(end_ms, cursor + LIMIT_SPOT * INTERVAL_MS - 1)
-        params = {
-            "symbol": f"{symbol.lower()}_usdt",
-            "interval": "15m",
-            "startTime": cursor,
-            "endTime": window_end,
-            "limit": LIMIT_SPOT,
-        }
-        batch = extract_list(request_json(f"{BASE_SPOT}/v4/public/kline", params))
-        if not batch:
-            break
-        valid_batch = []
-        for x in batch:
-            try:
-                ts = int(x.get("t")) if isinstance(x, dict) else int(x[0])
-                if cursor <= ts <= end_ms:
-                    valid_batch.append(x)
-            except Exception:
-                continue
-        if not valid_batch:
-            retry_end = min(window_end, cursor + (LIMIT_SPOT // 2) * INTERVAL_MS - 1)
-            if retry_end > cursor and retry_end < window_end:
-                params["endTime"] = retry_end
-                batch2 = extract_list(request_json(f"{BASE_SPOT}/v4/public/kline", params))
-                valid_batch = []
-                for x in batch2:
-                    try:
-                        ts = int(x.get("t")) if isinstance(x, dict) else int(x[0])
-                        if cursor <= ts <= retry_end:
-                            valid_batch.append(x)
-                    except Exception:
-                        continue
-                if valid_batch:
-                    batch = batch2
-                    window_end = retry_end
-            if not valid_batch:
-                if cursor >= end_ms - INTERVAL_MS:
-                    break
-                raise RuntimeError(
-                    f"spot API returned no in-range candles for {symbol}; "
-                    f"cursor={cursor} window_end={window_end} raw_rows={len(batch)}"
-                )
-        rows.extend(valid_batch)
-        mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in valid_batch)
-        cursor = mx + 1
-        if len(batch) < LIMIT_SPOT and window_end >= end_ms:
-            break
-        time.sleep(0.03)
-    df = normalize_kline(rows)
-    return df[(df.ts >= start_ms) & (df.ts <= end_ms)].copy()
-
+    return _fetch_klines(
+        symbol, start_ms, end_ms,
+        url=f"{BASE_SPOT}/v4/public/kline",
+        limit=LIMIT_SPOT,
+        label="spot",
+    )
 
 def aggregate_1h(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     x = df.set_index("dt")
     out = x.resample("1h", label="left", closed="left").agg({
-        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
+        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
+        "ts": "count",
     }).dropna().reset_index()
+    # Only use complete 1h bars. A partial hour caused by a missing 15m
+    # candle must not become synthetic data in the factor audit.
+    out = out[out["ts"] == 4].copy()
+    out["ts"] = (out["dt"].astype("int64") // 10**6).astype("int64")
     out["ts"] = (out["dt"].astype("int64") // 10**6).astype("int64")
     return out
 
@@ -331,8 +317,12 @@ def main() -> None:
     print("=" * 96)
 
     now = utc_now_ms()
-    start_ms = now - int((DAYS + WARMUP_DAYS) * 86400 * 1000)
-    interval_end = (now // INTERVAL_MS) * INTERVAL_MS - 1
+    raw_start_ms = now - int((DAYS + WARMUP_DAYS) * 86400 * 1000)
+    start_ms = (raw_start_ms // INTERVAL_MS) * INTERVAL_MS
+    # Leave a small live-edge buffer. XT can lag/return shifted pages around
+    # the newest candle; the audit also needs future 24h outcomes, so these
+    # last few candles cannot contribute to the final factor tests anyway.
+    interval_end = (now // INTERVAL_MS) * INTERVAL_MS - 2 * INTERVAL_MS - 1
 
     futures: Dict[str, pd.DataFrame] = {}
     spots: Dict[str, pd.DataFrame] = {}
