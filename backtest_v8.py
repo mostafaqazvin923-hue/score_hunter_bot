@@ -223,8 +223,10 @@ def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
                 f"requested=[{current_start},{window_end}]"
             )
 
-        # De-duplicate inside the page and advance strictly by the newest
-        # valid timestamp returned for this requested window.
+        # XT may return the boundary candle even when startTime is a few
+        # milliseconds after that candle. Advance by one full 15m interval,
+        # never by +1ms, otherwise the final boundary can produce a tiny
+        # sub-candle window and the API may return only the already-seen row.
         page_df = pd.DataFrame(
             parsed_batch,
             columns=["timestamp", "open", "high", "low", "close", "volume"],
@@ -242,7 +244,7 @@ def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
         all_klines.extend(parsed_batch)
 
         max_timestamp = int(page_df["timestamp"].max())
-        next_start = max_timestamp + 1
+        next_start = max_timestamp + interval_ms
         if next_start <= current_start:
             raise RuntimeError(
                 f"Pagination stalled for {symbol}: "
