@@ -49,7 +49,7 @@ import requests
 SYMBOLS=["BTC","ETH","SOL","SUI","AVAX","NEAR","ADA","BNB","APT","CRV","ONDO","PENDLE","ICP","WIF"]
 BASE="https://fapi.xt.com"
 DATA_DIR=Path("data/xt_futures_v151")
-LIMIT=1500; INTERVAL="15m"; DAYS=365; WARMUP_DAYS=35; MIN_ROWS=30000; MAX_RETRIES=6
+LIMIT=1500; INTERVAL="15m"; DAYS=365; WARMUP_DAYS=35; MIN_ROWS=30000; MAX_RETRIES=3
 INITIAL_EQUITY=1000.0; TRADE_MARGIN=100.0; LEVERAGE=50.0; FEE_RATE=0.0007; SLIPPAGE=0.0003; RR=2.0; MAX_OPEN_POSITIONS=3
 S=requests.Session(); S.headers.update({"User-Agent":"HUNTER-backtest/151"})
 
@@ -70,7 +70,7 @@ def get_json(url,params):
     last=None
     for i in range(MAX_RETRIES):
         try:
-            r=S.get(url,params=params,timeout=20); r.raise_for_status(); js=r.json()
+            r=S.get(url,params=params,timeout=10); r.raise_for_status(); js=r.json()
             if isinstance(js,dict):
                 for k in ("code","returnCode"):
                     v=js.get(k)
@@ -131,30 +131,52 @@ def ensure_data(data_dir,days):
 
 
 def fetch_funding_history(xt_symbol,days):
-    """Fetch backward through XT public funding-rate-record using id pagination."""
+    """Fetch XT funding history with a hard, bounded pagination budget.
+
+    XT documents this endpoint as id-cursor pagination with PREV/NEXT and
+    a hasPrev/hasNext flag. Funding is normally settled every few hours, so
+    one year requires only a small number of pages at limit=1000. The old
+    implementation could loop for 200 pages when the cursor was ignored by
+    an API response; this version stops immediately on a non-advancing cursor
+    and never retries a page for minutes.
+    """
     endpoint=f"{BASE}/future/market/v1/public/q/funding-rate-record"
     target_ms=int(time.time()*1000)-int((days+WARMUP_DAYS)*86400*1000)
-    rows=[]; last_id=None
-    for page in range(200):
+    rows=[]; last_id=None; seen_ids=set(); max_pages=8
+    for page in range(max_pages):
         params={"symbol":xt_symbol,"limit":1000,"direction":"PREV"}
-        if last_id is not None: params["id"]=last_id
-        js=get_json(endpoint,params); result=js.get("result",{}) if isinstance(js,dict) else {}
+        if last_id is not None:
+            params["id"]=last_id
+        js=get_json(endpoint,params)
+        result=js.get("result",{}) if isinstance(js,dict) else {}
         items=result.get("items",[]) if isinstance(result,dict) else []
-        if not items: break
+        if not items:
+            break
         clean=[]
         for z in items:
-            try: clean.append({"id":int(z["id"]),"timestamp":int(z["createdTime"]),"funding":float(z["fundingRate"])})
-            except Exception: pass
-        if not clean: break
+            try:
+                zid=int(z["id"]); ts=int(z["createdTime"]); rate=float(z["fundingRate"])
+                if zid not in seen_ids:
+                    clean.append({"id":zid,"timestamp":ts,"funding":rate}); seen_ids.add(zid)
+            except Exception:
+                continue
+        if not clean:
+            break
         rows.extend(clean)
-        min_ts=min(z["timestamp"] for z in clean); new_id=min(z["id"] for z in clean)
-        if min_ts<=target_ms: break
-        if last_id==new_id: break
-        last_id=new_id; time.sleep(.12)
-    if not rows: raise RuntimeError(f"No funding history returned for {xt_symbol}")
+        min_ts=min(z["timestamp"] for z in clean)
+        new_id=min(z["id"] for z in clean)
+        has_prev=bool(result.get("hasPrev",False)) if isinstance(result,dict) else False
+        if min_ts<=target_ms or not has_prev or last_id==new_id:
+            break
+        last_id=new_id
+        if page>=max_pages-1:
+            break
+    if not rows:
+        raise RuntimeError(f"No funding history returned for {xt_symbol}")
     df=pd.DataFrame(rows).drop_duplicates("id").sort_values("timestamp")
     df=df[df.timestamp>=target_ms]
-    if len(df)<100: raise RuntimeError(f"Funding history too short for {xt_symbol}: {len(df)} records")
+    if len(df)<100:
+        raise RuntimeError(f"Funding history too short for {xt_symbol}: {len(df)} records")
     df.timestamp=pd.to_datetime(df.timestamp,unit="ms",utc=True)
     return df.set_index("timestamp")
 
