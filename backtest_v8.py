@@ -19,7 +19,8 @@ BASE_SPOT = "https://sapi.xt.com"
 DAYS = 365
 WARMUP_DAYS = 30
 INTERVAL_MS = 15 * 60 * 1000
-LIMIT = 1500
+LIMIT_FUT = 1500
+LIMIT_SPOT = 1000
 REQUEST_TIMEOUT = 20
 RETRIES = 4
 
@@ -45,6 +46,8 @@ def request_json(url: str, params: dict) -> dict:
             obj = r.json()
             if not isinstance(obj, dict):
                 raise RuntimeError("non-dict JSON response")
+            if obj.get("rc") not in (None, 0, "0"):
+                raise RuntimeError(f"XT API error rc={obj.get('rc')} mc={obj.get('mc')} ma={obj.get('ma')}")
             return obj
         except Exception as exc:
             last = exc
@@ -108,13 +111,13 @@ def fetch_futures(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         guard += 1
         if guard > 1000:
             raise RuntimeError(f"futures pagination guard tripped for {symbol}")
-        window_end = min(end_ms, cursor + LIMIT * INTERVAL_MS - 1)
+        window_end = min(end_ms, cursor + LIMIT_FUT * INTERVAL_MS - 1)
         params = {
             "symbol": f"{symbol.lower()}_usdt",
             "interval": "15m",
             "startTime": cursor,
             "endTime": window_end,
-            "limit": LIMIT,
+            "limit": LIMIT_FUT,
         }
         batch = extract_list(request_json(f"{BASE_FUT}/future/market/v1/public/q/kline", params))
         if not batch:
@@ -155,13 +158,13 @@ def fetch_spot(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         guard += 1
         if guard > 1000:
             raise RuntimeError(f"spot pagination guard tripped for {symbol}")
-        window_end = min(end_ms, cursor + LIMIT * INTERVAL_MS - 1)
+        window_end = min(end_ms, cursor + LIMIT_SPOT * INTERVAL_MS - 1)
         params = {
             "symbol": f"{symbol.lower()}_usdt",
             "interval": "15m",
             "startTime": cursor,
             "endTime": window_end,
-            "limit": LIMIT,
+            "limit": LIMIT_SPOT,
         }
         batch = extract_list(request_json(f"{BASE_SPOT}/v4/public/kline", params))
         if not batch:
