@@ -81,7 +81,10 @@ def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
     interval_ms = 15 * 60 * 1000
     limit = 1500
 
-    final_end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    # Only request completed 15m candles. This avoids ever depending on the
+    # still-forming live candle and makes the historical boundary deterministic.
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    final_end_ms = (now_ms // interval_ms) * interval_ms - 1
     start_ms = final_end_ms - int(
         (TOTAL_DAYS + WARMUP_DAYS) * 86400 * 1000
     )
@@ -90,124 +93,164 @@ def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
     all_klines = []
     page = 0
 
-    while current_start < final_end_ms:
+    def parse_xt_kline_row(row):
+        """Parse XT Futures kline rows in both official compact forms."""
+        if isinstance(row, (list, tuple)):
+            if len(row) < 6:
+                return None
+            vals = row[:6]
+        elif isinstance(row, dict):
+            # XT Futures compact public kline fields are t,o,h,l,c,a.
+            # Also accept verbose aliases defensively.
+            vals = (
+                row.get("t", row.get("time", row.get("timestamp"))),
+                row.get("o", row.get("open")),
+                row.get("h", row.get("high")),
+                row.get("l", row.get("low")),
+                row.get("c", row.get("close")),
+                row.get("a", row.get("volume", row.get("q"))),
+            )
+        else:
+            return None
+
+        if any(v is None for v in vals):
+            return None
+
+        try:
+            return [
+                int(vals[0]),
+                float(vals[1]),
+                float(vals[2]),
+                float(vals[3]),
+                float(vals[4]),
+                float(vals[5]),
+            ]
+        except (TypeError, ValueError):
+            return None
+
+    while current_start <= final_end_ms:
         page += 1
+        if page > 1000:
+            raise RuntimeError(f"Pagination safety stop for {symbol}")
+
         window_end = min(
             final_end_ms,
             current_start + limit * interval_ms - 1
         )
 
         params = {
-            "symbol": symbol,
+            "symbol": symbol.lower(),
             "interval": "15m",
             "startTime": current_start,
             "endTime": window_end,
-            "limit": limit
+            "limit": limit,
         }
 
-        success = False
-        data = None
-
-        for attempt in range(3):
+        raw_data = None
+        last_error = None
+        for attempt in range(1, 4):
             try:
                 response = requests.get(
                     url,
                     params=params,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=15
+                    headers={"User-Agent": "HUNTER-V4-XT-Futures/1.0"},
+                    timeout=20,
                 )
-
-                if response.status_code == 200:
-                    res_json = response.json()
-                    data = res_json.get(
-                        "result",
-                        res_json.get("data", res_json)
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise RuntimeError(
+                        f"unexpected XT response type: {type(payload).__name__}"
                     )
-                    if isinstance(data, list):
-                        success = True
-                        break
 
-            except Exception:
-                pass
+                rc = payload.get("returnCode")
+                if rc not in (None, 0, "0"):
+                    raise RuntimeError(
+                        f"XT API error returnCode={rc}: "
+                        f"{payload.get('error') or payload.get('msgInfo') or payload}"
+                    )
 
-            time.sleep(1 * (attempt + 1))
+                result = payload.get("result")
+                if isinstance(result, list):
+                    raw_data = result
+                elif isinstance(result, dict):
+                    for key in ("items", "data", "list", "rows"):
+                        if isinstance(result.get(key), list):
+                            raw_data = result[key]
+                            break
+                if raw_data is None:
+                    data_fallback = payload.get("data")
+                    if isinstance(data_fallback, list):
+                        raw_data = data_fallback
 
-        if not success or data is None:
+                if raw_data is None:
+                    raise RuntimeError(
+                        "XT response did not contain a kline list"
+                    )
+                break
+            except Exception as exc:
+                last_error = exc
+                raw_data = None
+                if attempt < 3:
+                    time.sleep(attempt)
+
+        if raw_data is None:
             raise RuntimeError(
-                f"API request failed after 3 retries for {symbol} at page {page}"
+                f"API request failed after 3 retries for {symbol} page {page}: {last_error}"
             )
 
-        if not data:
+        if not raw_data:
             raise RuntimeError(
-                f"Empty API page before reaching final range for "
-                f"{symbol} at page {page}"
+                f"Empty XT API page before reaching requested end for "
+                f"{symbol} page {page}; start={current_start} end={window_end}"
             )
 
         parsed_batch = []
-
-        # XT K-line responses may use compact dict keys (t/o/h/l/c/a)
-        # or verbose keys, and may also be returned as arrays. Support all
-        # of these forms without silently discarding a valid page.
-        for k in data:
-            try:
-                if isinstance(k, (list, tuple)):
-                    if len(k) < 6:
-                        continue
-                    ts, o, h, l, c, v = k[:6]
-
-                elif isinstance(k, dict):
-                    ts = k.get("t", k.get("time", k.get("timestamp")))
-                    o = k.get("o", k.get("open"))
-                    h = k.get("h", k.get("high"))
-                    l = k.get("l", k.get("low"))
-                    c = k.get("c", k.get("close"))
-                    v = k.get("a", k.get("v", k.get("volume", k.get("amount"))))
-                else:
-                    continue
-
-                if any(x is None for x in (ts, o, h, l, c, v)):
-                    continue
-
-                ts = int(float(ts))
-                o, h, l, c, v = map(float, (o, h, l, c, v))
-
-                if ts <= 0:
-                    continue
-                if not all(np.isfinite([o, h, l, c, v])):
-                    continue
-                if min(o, h, l, c) <= 0:
-                    continue
-                if h < max(o, c, l) or l > min(o, c, h):
-                    continue
-
-                parsed_batch.append([ts, o, h, l, c, v])
-
-            except (TypeError, ValueError, OverflowError):
+        for row in raw_data:
+            parsed = parse_xt_kline_row(row)
+            if parsed is None:
                 continue
+            ts = parsed[0]
+            # Never let an out-of-window XT record advance pagination.
+            if current_start <= ts <= window_end:
+                parsed_batch.append(parsed)
 
         if not parsed_batch:
-            sample = data[0] if isinstance(data, list) and data else None
+            sample = raw_data[0] if raw_data else None
             raise RuntimeError(
-                f"Parsed batch is empty for {symbol} at page {page}. "
-                f"First raw record: {repr(sample)[:500]}"
+                f"Parsed batch is empty for {symbol} page {page}; "
+                f"raw_rows={len(raw_data)}, sample={sample!r}, "
+                f"requested=[{current_start},{window_end}]"
             )
 
+        # De-duplicate inside the page and advance strictly by the newest
+        # valid timestamp returned for this requested window.
+        page_df = pd.DataFrame(
+            parsed_batch,
+            columns=["timestamp", "open", "high", "low", "close", "volume"],
+        )
+        page_df = page_df.drop_duplicates("timestamp").sort_values("timestamp")
+        parsed_batch = page_df.values.tolist()
+
         row_count_page = len(parsed_batch)
-        print(f"{symbol.upper()} page={page} rows={row_count_page}")
+        print(
+            f"{symbol.upper()} page={page} rows={row_count_page} "
+            f"{pd.to_datetime(int(page_df.timestamp.iloc[0]), unit='ms', utc=True)} -> "
+            f"{pd.to_datetime(int(page_df.timestamp.iloc[-1]), unit='ms', utc=True)}"
+        )
 
         all_klines.extend(parsed_batch)
 
-        max_timestamp = max(item[0] for item in parsed_batch)
+        max_timestamp = int(page_df["timestamp"].max())
         next_start = max_timestamp + 1
-
         if next_start <= current_start:
             raise RuntimeError(
                 f"Pagination stalled for {symbol}: "
-                f"next_start ({next_start}) <= current_start ({current_start})"
+                f"next_start={next_start} <= current_start={current_start}"
             )
 
         current_start = next_start
-        time.sleep(0.1)
+        time.sleep(0.10)
 
     if not all_klines:
         raise RuntimeError(f"No klines fetched for {symbol}")
