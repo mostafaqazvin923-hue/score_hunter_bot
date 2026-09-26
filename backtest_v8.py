@@ -96,6 +96,11 @@ def normalize_kline(rows: list) -> pd.DataFrame:
 
 
 def fetch_futures(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Forward-paginate XT futures using the known-good V143/V144 pattern.
+
+    XT can occasionally return records outside the requested page window.  Never use
+    those records to advance the cursor; filter to the current window first.
+    """
     rows: List = []
     cursor = start_ms
     guard = 0
@@ -113,22 +118,36 @@ def fetch_futures(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         }
         batch = extract_list(request_json(f"{BASE_FUT}/future/market/v1/public/q/kline", params))
         if not batch:
-            break
-        rows.extend(batch)
-        mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in batch)
-        if mx < cursor:
-            raise RuntimeError(f"futures pagination moved backwards for {symbol}")
-        cursor = mx + 1
-        if len(batch) < LIMIT and window_end >= end_ms:
-            break
+            cursor = window_end + 1
+            continue
+
+        # XT may return an occasional record outside the requested window.
+        # Only in-window timestamps are allowed to contribute to the cursor.
+        in_window = []
+        for x in batch:
+            try:
+                ts = int(x.get("t")) if isinstance(x, dict) else int(x[0])
+            except Exception:
+                continue
+            if cursor <= ts <= window_end:
+                in_window.append(x)
+
+        if in_window:
+            rows.extend(in_window)
+            mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in in_window)
+            cursor = mx + 1
+        else:
+            # No usable record in this requested window: move to the next page
+            # boundary rather than treating an out-of-window response as progress.
+            cursor = window_end + 1
+
         time.sleep(0.03)
+
     df = normalize_kline(rows)
     return df[(df.ts >= start_ms) & (df.ts <= end_ms)].copy()
 
-
 def fetch_spot(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    # XT spot public API is served from sapi.xt.com. The current v4 public kline
-    # endpoint accepts startTime/endTime/limit and returns t,o,h,l,c,q/v style fields.
+    """Forward-paginate XT spot with the same guarded window semantics."""
     rows: List = []
     cursor = start_ms
     guard = 0
@@ -146,18 +165,29 @@ def fetch_spot(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         }
         batch = extract_list(request_json(f"{BASE_SPOT}/v4/public/kline", params))
         if not batch:
-            break
-        rows.extend(batch)
-        mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in batch)
-        if mx < cursor:
-            raise RuntimeError(f"spot pagination moved backwards for {symbol}")
-        cursor = mx + 1
-        if len(batch) < LIMIT and window_end >= end_ms:
-            break
+            cursor = window_end + 1
+            continue
+
+        in_window = []
+        for x in batch:
+            try:
+                ts = int(x.get("t")) if isinstance(x, dict) else int(x[0])
+            except Exception:
+                continue
+            if cursor <= ts <= window_end:
+                in_window.append(x)
+
+        if in_window:
+            rows.extend(in_window)
+            mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in in_window)
+            cursor = mx + 1
+        else:
+            cursor = window_end + 1
+
         time.sleep(0.03)
+
     df = normalize_kline(rows)
     return df[(df.ts >= start_ms) & (df.ts <= end_ms)].copy()
-
 
 def aggregate_1h(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
