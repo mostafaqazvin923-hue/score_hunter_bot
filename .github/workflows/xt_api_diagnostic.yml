@@ -1,15 +1,15 @@
-name: XT Funding Time-Range Diagnostic
+name: XT Funding Cursor Diagnostic
 
 on:
   workflow_dispatch:
 
 jobs:
-  funding-range:
+  funding-cursor:
     runs-on: ubuntu-latest
     timeout-minutes: 2
 
     steps:
-      - name: Test XT funding with time ranges
+      - name: Test XT funding cursor exactly like CCXT
         shell: bash
         run: |
           python - <<'PY'
@@ -19,117 +19,131 @@ jobs:
 
           URL = "https://fapi.xt.com/future/market/v1/public/q/funding-rate-record"
           SYMBOL = "btc_usdt"
-          LIMIT = 1000
+          LIMIT = 200
+          MAX_PAGES = 10
+          TARGET_DAYS = 365
           REQUEST_TIMEOUT = 10
           GLOBAL_TIMEOUT = 60
 
           started = time.monotonic()
           session = requests.Session()
-          now_ms = int(time.time() * 1000)
+          target_ms = int(time.time() * 1000) - TARGET_DAYS * 86400000
 
           def fmt(ms):
               return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
 
-          def test_range(name, start_ms, end_ms):
+          all_items = []
+          seen_ids = set()
+          cursor_id = None
+
+          print("=== XT FUNDING CURSOR DIAGNOSTIC ===")
+          print("Method: NEXT + (previous last_id + 1)")
+          print("This matches the current CCXT XT cursor-pagination implementation.")
+
+          for page in range(1, MAX_PAGES + 1):
               if time.monotonic() - started >= GLOBAL_TIMEOUT:
                   raise TimeoutError("Global timeout")
 
               params = {
                   "symbol": SYMBOL,
                   "limit": LIMIT,
-                  "since": start_ms,
-                  "endTime": end_ms,
+                  "direction": "NEXT",
               }
 
-              print(f"\n=== {name} ===")
-              print("since:", fmt(start_ms))
-              print("endTime:", fmt(end_ms))
+              if cursor_id is not None:
+                  params["id"] = cursor_id
 
               t0 = time.monotonic()
               r = session.get(URL, params=params, timeout=REQUEST_TIMEOUT)
               elapsed = time.monotonic() - t0
-
-              print("HTTP:", r.status_code)
-              print("request_time:", f"{elapsed:.2f}s")
-              print("url:", r.url)
               r.raise_for_status()
 
               js = r.json()
               result = js.get("result", {})
               items = result.get("items", []) if isinstance(result, dict) else []
 
-              print("items:", len(items))
               print(
-                  "result keys:",
-                  list(result.keys()) if isinstance(result, dict) else []
+                  f"\nPage {page}: returned={len(items)} "
+                  f"request={elapsed:.2f}s "
+                  f"hasNext={result.get('hasNext')} "
+                  f"hasPrev={result.get('hasPrev')}"
               )
 
               if not items:
-                  print("EMPTY RANGE")
-                  return []
+                  print("No more records.")
+                  break
 
-              times = [
-                  int(x["createdTime"])
-                  for x in items
-                  if x.get("createdTime") is not None
-              ]
-
-              if times:
-                  print("oldest:", fmt(min(times)))
-                  print("newest:", fmt(max(times)))
-
-              print("hasPrev:", result.get("hasPrev"))
-              print("hasNext:", result.get("hasNext"))
-
-              return items
-
-          print("=== XT FUNDING TIME-RANGE DIAGNOSTIC ===")
-          print("BTC funding endpoint; no ID pagination is used.")
-
-          ranges = [
-              ("RECENT_30D", now_ms - 30 * 86400000, now_ms),
-              (
-                  "DAYS_31_60",
-                  now_ms - 60 * 86400000,
-                  now_ms - 30 * 86400000 - 1,
-              ),
-              (
-                  "DAYS_61_90",
-                  now_ms - 90 * 86400000,
-                  now_ms - 60 * 86400000 - 1,
-              ),
-          ]
-
-          all_ids = set()
-          all_times = []
-
-          for name, start_ms, end_ms in ranges:
-              items = test_range(name, start_ms, end_ms)
+              page_ids = []
+              page_times = []
 
               for item in items:
-                  item_id = str(item.get("id", ""))
-                  if item_id:
-                      all_ids.add(item_id)
+                  iid = str(item.get("id", ""))
+                  if iid:
+                      page_ids.append(iid)
+                      if iid not in seen_ids:
+                          seen_ids.add(iid)
+                          all_items.append(item)
 
                   if item.get("createdTime") is not None:
-                      all_times.append(int(item["createdTime"]))
+                      page_times.append(int(item["createdTime"]))
+
+              if page_times:
+                  print(
+                      "  page oldest:", fmt(min(page_times)),
+                      "page newest:", fmt(max(page_times))
+                  )
+
+              print(
+                  "  unique_total:", len(seen_ids),
+                  "overlap:", len(items) - len(set(page_ids))
+              )
+
+              # CCXT cursor helper:
+              # cursorReceived='id', cursorSent='id', cursorIncrement=1
+              # => take the last response item's id, then add 1.
+              last_id = int(page_ids[-1])
+              cursor_id = str(last_id + 1)
+
+              if min(page_times) <= target_ms:
+                  print("Target 365-day boundary reached.")
+                  break
+
+              if result.get("hasNext") is False:
+                  print("API reports hasNext=False.")
+                  break
+
+          times = [
+              int(x["createdTime"])
+              for x in all_items
+              if x.get("createdTime") is not None
+          ]
 
           print("\n================================")
           print("RESULT")
-          print("Unique IDs:", len(all_ids))
-          print("Total timestamps:", len(all_times))
+          print("Pages:", page)
+          print("Unique records:", len(seen_ids))
 
-          if all_times:
-              print("Overall oldest:", fmt(min(all_times)))
-              print("Overall newest:", fmt(max(all_times)))
+          if times:
+              oldest = min(times)
+              newest = max(times)
+              coverage_days = (newest - oldest) / 86400000
+              print("Oldest:", fmt(oldest))
+              print("Newest:", fmt(newest))
+              print("Coverage days:", f"{coverage_days:.1f}")
+              print("365-day target reached:", oldest <= target_ms)
 
           print("Elapsed:", f"{time.monotonic() - started:.2f}s")
           print("================================")
 
-          if not all_times:
+          if len(seen_ids) < 300:
               raise RuntimeError(
-                  "Timestamp-range requests returned no funding records"
+                  "Cursor test returned too few unique records; pagination is not solved."
               )
 
-          print("XT FUNDING TIME-RANGE DIAGNOSTIC: PASSED")
+          if not times or min(times) > target_ms:
+              raise RuntimeError(
+                  "Cursor pagination did not reach the 365-day boundary."
+              )
+
+          print("XT FUNDING CURSOR DIAGNOSTIC: PASSED")
           PY
