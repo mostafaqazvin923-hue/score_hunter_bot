@@ -1,160 +1,195 @@
-name: XT API Diagnostic
+name: XT Funding History Diagnostic
 
 on:
   workflow_dispatch:
 
 jobs:
-  diagnostic:
+  funding-history:
     runs-on: ubuntu-latest
     timeout-minutes: 2
 
     steps:
-      - name: Test XT API
+      - name: Test BTC 365-day funding pagination
         shell: bash
         run: |
           python - <<'PY'
           import requests
           import time
           import sys
+          from datetime import datetime, timezone
 
           BASE = "https://fapi.xt.com"
-          TIMEOUT = 10
+          ENDPOINT = f"{BASE}/future/market/v1/public/q/funding-rate-record"
+
+          SYMBOL = "btc_usdt"
+          PAGE_SIZE = 100
+          MAX_PAGES = 15
+          GLOBAL_TIMEOUT = 60
+          REQUEST_TIMEOUT = 10
+          DAYS = 365
+
           started = time.monotonic()
+          session = requests.Session()
 
-          def check_time():
-              if time.monotonic() - started > 60:
-                  raise TimeoutError("GLOBAL TIMEOUT: diagnostic exceeded 60 seconds")
+          now_ms = int(time.time() * 1000)
+          target_ms = now_ms - DAYS * 86400 * 1000
 
-          def request(name, url, params=None):
-              check_time()
-              print(f"\n=== {name} ===")
-              print("URL:", url)
-              print("PARAMS:", params)
+          rows = []
+          seen_ids = set()
+          cursor_id = None
 
-              t = time.monotonic()
-              r = requests.get(url, params=params, timeout=TIMEOUT)
-              elapsed = time.monotonic() - t
+          print("=== XT FUNDING HISTORY DIAGNOSTIC ===")
+          print("Symbol:", SYMBOL)
+          print("Target history:", DAYS, "days")
+          print("Max pages:", MAX_PAGES)
+          print()
+
+          for page in range(1, MAX_PAGES + 1):
+              elapsed = time.monotonic() - started
+              if elapsed >= GLOBAL_TIMEOUT:
+                  raise TimeoutError("GLOBAL TIMEOUT after 60 seconds")
+
+              params = {
+                  "symbol": SYMBOL,
+                  "limit": PAGE_SIZE,
+                  "direction": "PREV",
+              }
+
+              if cursor_id is not None:
+                  params["id"] = cursor_id
+
+              print(f"--- PAGE {page} ---")
+              print("cursor:", cursor_id)
+
+              t0 = time.monotonic()
+              r = session.get(
+                  ENDPOINT,
+                  params=params,
+                  timeout=min(REQUEST_TIMEOUT, max(1, GLOBAL_TIMEOUT - int(elapsed)))
+              )
+              request_time = time.monotonic() - t0
 
               print("HTTP:", r.status_code)
-              print("TIME:", f"{elapsed:.2f}s")
+              print("Request time:", f"{request_time:.2f}s")
 
               r.raise_for_status()
-              data = r.json()
+              js = r.json()
 
-              print("RESPONSE TYPE:", type(data).__name__)
-              return data
+              if js.get("returnCode") not in (0, "0", None):
+                  raise RuntimeError(
+                      f"XT returnCode={js.get('returnCode')} msg={js.get('msgInfo')}"
+                  )
 
-          try:
-              # 1) Symbol list
-              data = request(
-                  "SYMBOL LIST",
-                  f"{BASE}/future/market/v1/public/symbol/list"
+              result = js.get("result", {})
+              items = result.get("items", []) if isinstance(result, dict) else []
+
+              print("Items returned:", len(items))
+              print("hasPrev:", result.get("hasPrev"))
+              print("hasNext:", result.get("hasNext"))
+
+              if not items:
+                  raise RuntimeError(f"Empty funding page at page {page}")
+
+              page_ids = []
+              page_times = []
+
+              for item in items:
+                  if not isinstance(item, dict):
+                      continue
+
+                  symbol = str(item.get("symbol", "")).lower()
+                  item_id = str(item.get("id", ""))
+                  created = item.get("createdTime")
+
+                  if symbol != SYMBOL:
+                      continue
+                  if not item_id or created is None:
+                      continue
+                  if item_id in seen_ids:
+                      continue
+
+                  seen_ids.add(item_id)
+                  rows.append(item)
+                  page_ids.append(item_id)
+                  page_times.append(int(created))
+
+              print("Matching new BTC rows:", len(page_ids))
+
+              if page_times:
+                  print(
+                      "Page time range:",
+                      datetime.fromtimestamp(min(page_times) / 1000, tz=timezone.utc).isoformat(),
+                      "->",
+                      datetime.fromtimestamp(max(page_times) / 1000, tz=timezone.utc).isoformat()
+                  )
+
+              min_created = min(
+                  int(x["createdTime"]) for x in rows
+                  if x.get("createdTime") is not None
               )
 
-              result = data.get("result", data)
-
-              symbols = []
-              if isinstance(result, list):
-                  symbols = result
-              elif isinstance(result, dict):
-                  items = result.get("items", [])
-                  if isinstance(items, list):
-                      symbols = items
-
-              print("SYMBOL COUNT:", len(symbols))
-
-              if not symbols:
-                  raise RuntimeError("Symbol list returned no symbols")
-
-              # Find BTC/USDT
-              btc = None
-
-              for item in symbols:
-                  if isinstance(item, dict):
-                      s = str(
-                          item.get("symbol")
-                          or item.get("name")
-                          or ""
-                      ).lower()
-
-                      if s in ("btc_usdt", "btc/usdt", "btcusdt"):
-                          btc = s
-                          break
-
-              if btc is None:
-                  # Fallback to known XT symbol format
-                  btc = "btc_usdt"
-
-              print("BTC SYMBOL:", btc)
-
-              # 2) 15m Kline — approximately last 24 hours
-              now_ms = int(time.time() * 1000)
-              start_ms = now_ms - 24 * 60 * 60 * 1000
-
-              kline = request(
-                  "BTC 15M KLINE",
-                  f"{BASE}/future/market/v1/public/q/kline",
-                  {
-                      "symbol": btc,
-                      "interval": "15m",
-                      "startTime": start_ms,
-                      "endTime": now_ms,
-                      "limit": 1500,
-                  }
+              print(
+                  "Oldest collected:",
+                  datetime.fromtimestamp(min_created / 1000, tz=timezone.utc).isoformat()
               )
+              print("Total unique BTC rows:", len(rows))
 
-              kresult = kline.get("result", kline)
+              if min_created <= target_ms:
+                  print("365-day target reached.")
+                  break
 
-              if isinstance(kresult, dict):
-                  kitems = kresult.get("items", [])
-              elif isinstance(kresult, list):
-                  kitems = kresult
+              if not page_ids:
+                  raise RuntimeError(
+                      "No new BTC funding IDs were collected; pagination cannot progress."
+                  )
+
+              # PREV pagination: continue from the oldest record returned.
+              numeric_ids = []
+              for x in page_ids:
+                  try:
+                      numeric_ids.append((int(x), x))
+                  except ValueError:
+                      pass
+
+              if numeric_ids:
+                  next_cursor = min(numeric_ids)[1]
               else:
-                  kitems = []
+                  next_cursor = sorted(page_ids)[0]
 
-              print("KLINE ROWS:", len(kitems))
+              if next_cursor == cursor_id:
+                  raise RuntimeError("Pagination cursor did not advance.")
 
-              if len(kitems) == 0:
-                  raise RuntimeError("Kline API returned 0 rows")
+              cursor_id = next_cursor
 
-              # 3) One Funding History request only
-              funding = request(
-                  "BTC FUNDING HISTORY - ONE PAGE ONLY",
-                  f"{BASE}/future/market/v1/public/q/funding-rate-record",
-                  {
-                      "symbol": btc,
-                      "limit": 100,
-                      "direction": "PREV",
-                  }
+          else:
+              raise RuntimeError(
+                  f"365-day history was not reached within {MAX_PAGES} pages."
               )
 
-              fresult = funding.get("result", funding)
+          elapsed_total = time.monotonic() - started
 
-              if isinstance(fresult, dict):
-                  fitems = fresult.get("items", [])
-              elif isinstance(fresult, list):
-                  fitems = fresult
-              else:
-                  fitems = []
+          if not rows:
+              raise RuntimeError("No BTC funding records collected.")
 
-              print("FUNDING ROWS:", len(fitems))
+          oldest = min(int(x["createdTime"]) for x in rows)
+          newest = max(int(x["createdTime"]) for x in rows)
 
-              if len(fitems) == 0:
-                  raise RuntimeError("Funding API returned 0 rows")
+          coverage_days = (newest - oldest) / 86400000
 
-              elapsed_total = time.monotonic() - started
-
-              print("\n================================")
-              print("XT API DIAGNOSTIC: PASSED")
-              print("KLINE ROWS:", len(kitems))
-              print("FUNDING ROWS:", len(fitems))
-              print("TOTAL TIME:", f"{elapsed_total:.2f}s")
-              print("================================")
-
-          except Exception as e:
-              print("\n================================")
-              print("XT API DIAGNOSTIC: FAILED")
-              print("ERROR:", repr(e))
-              print("================================")
-              sys.exit(1)
+          print()
+          print("================================")
+          print("XT FUNDING HISTORY DIAGNOSTIC")
+          print("RESULT: PASSED")
+          print("Total unique BTC rows:", len(rows))
+          print("Coverage days:", f"{coverage_days:.1f}")
+          print(
+              "Oldest:",
+              datetime.fromtimestamp(oldest / 1000, tz=timezone.utc).isoformat()
+          )
+          print(
+              "Newest:",
+              datetime.fromtimestamp(newest / 1000, tz=timezone.utc).isoformat()
+          )
+          print("Total time:", f"{elapsed_total:.2f}s")
+          print("================================")
           PY
