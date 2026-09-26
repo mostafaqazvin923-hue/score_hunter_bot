@@ -41,6 +41,7 @@ Execution / integrity
 """
 from __future__ import annotations
 import argparse, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -50,6 +51,7 @@ SYMBOLS=["BTC","ETH","SOL","SUI","AVAX","NEAR","ADA","BNB","APT","CRV","ONDO","P
 BASE="https://fapi.xt.com"
 DATA_DIR=Path("data/xt_futures_v151")
 LIMIT=1500; INTERVAL="15m"; DAYS=365; WARMUP_DAYS=35; MIN_ROWS=30000; MAX_RETRIES=3
+FUNDING_MAX_PAGES=12; FUNDING_REQUEST_TIMEOUT=5; FUNDING_MAX_SECONDS=30; FUNDING_WORKERS=7
 INITIAL_EQUITY=1000.0; TRADE_MARGIN=100.0; LEVERAGE=50.0; FEE_RATE=0.0007; SLIPPAGE=0.0003; RR=2.0; MAX_OPEN_POSITIONS=3
 S=requests.Session(); S.headers.update({"User-Agent":"HUNTER-backtest/151"})
 
@@ -131,46 +133,55 @@ def ensure_data(data_dir,days):
 
 
 def fetch_funding_history(xt_symbol,days):
-    """Fetch XT funding history with a hard, bounded pagination budget.
+    """Fetch funding history with a strict wall-clock and pagination budget.
 
-    XT documents this endpoint as id-cursor pagination with PREV/NEXT and
-    a hasPrev/hasNext flag. Funding is normally settled every few hours, so
-    one year requires only a small number of pages at limit=1000. The old
-    implementation could loop for 200 pages when the cursor was ignored by
-    an API response; this version stops immediately on a non-advancing cursor
-    and never retries a page for minutes.
+    XT documents this endpoint with id-cursor pagination and PREV/NEXT.
+    Funding is normally periodic, so the collector requests large pages and
+    stops as soon as the required historical timestamp is reached.
+
+    IMPORTANT: this function never performs unbounded retries. A single symbol
+    gets at most FUNDING_MAX_SECONDS total wall-clock time.
     """
     endpoint=f"{BASE}/future/market/v1/public/q/funding-rate-record"
     target_ms=int(time.time()*1000)-int((days+WARMUP_DAYS)*86400*1000)
-    rows=[]; last_id=None; seen_ids=set(); max_pages=8
-    for page in range(max_pages):
+    rows=[]; last_id=None; seen_ids=set()
+    deadline=time.monotonic()+FUNDING_MAX_SECONDS
+
+    for page in range(FUNDING_MAX_PAGES):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Funding timeout for {xt_symbol} after {FUNDING_MAX_SECONDS}s")
         params={"symbol":xt_symbol,"limit":1000,"direction":"PREV"}
         if last_id is not None:
             params["id"]=last_id
-        js=get_json(endpoint,params)
+        try:
+            r=S.get(endpoint,params=params,timeout=min(FUNDING_REQUEST_TIMEOUT,max(1,deadline-time.monotonic())))
+            r.raise_for_status(); js=r.json()
+        except Exception as e:
+            raise RuntimeError(f"Funding request failed for {xt_symbol} page={page+1}: {e}") from e
         result=js.get("result",{}) if isinstance(js,dict) else {}
         items=result.get("items",[]) if isinstance(result,dict) else []
         if not items:
             break
-        clean=[]
+        new_items=0
+        min_ts=None; new_id=None
         for z in items:
             try:
                 zid=int(z["id"]); ts=int(z["createdTime"]); rate=float(z["fundingRate"])
-                if zid not in seen_ids:
-                    clean.append({"id":zid,"timestamp":ts,"funding":rate}); seen_ids.add(zid)
             except Exception:
                 continue
-        if not clean:
+            if zid not in seen_ids:
+                rows.append({"id":zid,"timestamp":ts,"funding":rate}); seen_ids.add(zid); new_items+=1
+            min_ts=ts if min_ts is None else min(min_ts,ts)
+            new_id=zid if new_id is None else min(new_id,zid)
+        if new_items==0 or new_id is None:
             break
-        rows.extend(clean)
-        min_ts=min(z["timestamp"] for z in clean)
-        new_id=min(z["id"] for z in clean)
         has_prev=bool(result.get("hasPrev",False)) if isinstance(result,dict) else False
-        if min_ts<=target_ms or not has_prev or last_id==new_id:
+        if min_ts is not None and min_ts<=target_ms:
+            break
+        if not has_prev or last_id==new_id:
             break
         last_id=new_id
-        if page>=max_pages-1:
-            break
+
     if not rows:
         raise RuntimeError(f"No funding history returned for {xt_symbol}")
     df=pd.DataFrame(rows).drop_duplicates("id").sort_values("timestamp")
@@ -280,9 +291,15 @@ def main():
     print("Signal=1H | Context=4H | Regime=1D | Raw source=15m | Positioning=funding history")
     print("NOTE: XT public API exposes current OI, but not historical OI series; no synthetic OI is used.")
     all15=ensure_data(Path(args.data_dir),args.days); mp=resolve_symbols(); funding={}
-    print("Fetching historical XT funding records...")
-    for a in SYMBOLS:
-        funding[a]=fetch_funding_history(mp[a],args.days); print(f"{a:<8} funding_records={len(funding[a])}")
+    print("Fetching historical XT funding records (parallel, bounded)...")
+    with ThreadPoolExecutor(max_workers=FUNDING_WORKERS) as ex:
+        futures={ex.submit(fetch_funding_history,mp[a],args.days):a for a in SYMBOLS}
+        for fut in as_completed(futures):
+            a=futures[fut]
+            try:
+                funding[a]=fut.result(); print(f"{a:<8} funding_records={len(funding[a])}",flush=True)
+            except Exception as e:
+                raise RuntimeError(f"Funding collection failed for {a}: {e}") from e
     f=build_features(all15,funding)
     # Four deliberately different hypotheses, not a large optimization grid.
     configs=[
