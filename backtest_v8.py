@@ -1,40 +1,95 @@
-# HUNTER-FACTOR-AUDIT-1
-# Perpetual dislocation research audit: FUTURES vs SPOT basis + price/volume factors.
-# No strategy, no parameter sweep, no OOS tuning. This file only measures whether factors
-# have forward information before a trading setup is designed.
+#!/usr/bin/env python3
+"""
+HUNTER-V1 — TREND PULLBACK + LIQUIDITY RECLAIM
+
+Project goal
+------------
+Build a simple, causal XT USDT-M Futures strategy around:
+    1D regime -> 4H trend -> 1H pullback/sweep/reclaim -> next 1H open entry.
+
+Hard rules
+----------
+- Raw source: XT Futures 15m only.
+- Signals are built on completed 1H candles.
+- 4H and 1D context use only completed candles available at the signal close.
+- Entry: next 1H candle OPEN, with adverse slippage.
+- Fixed RR 1:2.
+- Structural stop: beyond the signal candle's liquidity-sweep extreme.
+- No timeout, no break-even, no trailing.
+- No lookahead / repaint / future pivot confirmation.
+- One portfolio position at a time (strict non-overlap).
+- A candle that closes a trade cannot create a new trade.
+- Same-candle SL + TP => LOSS.
+- Positions still open at dataset end remain OPEN.
+- Fixed $100 margin and 50x leverage.
+
+This is a research/backtest engine, not an execution bot.
+It intentionally avoids parameter optimization in the first test.
+"""
 
 from __future__ import annotations
 
+import argparse
 import math
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 
-BASE_FUT = "https://fapi.xt.com"
-BASE_SPOT = "https://sapi.xt.com"
-DAYS = 365
-WARMUP_DAYS = 30
-INTERVAL_MS = 15 * 60 * 1000
-LIMIT_FUT = 1500
-LIMIT_SPOT = 1000
-REQUEST_TIMEOUT = 20
-RETRIES = 4
-
+# -----------------------------
+# Project configuration
+# -----------------------------
 SYMBOLS = [
     "BTC", "ETH", "SOL", "SUI", "AVAX", "NEAR", "ADA", "BNB",
     "APT", "CRV", "ONDO", "PENDLE", "ICP", "WIF",
 ]
 
+BASE_FUT = "https://fapi.xt.com"
+KLINE_URL = f"{BASE_FUT}/future/market/v1/public/q/kline"
+SYMBOL_URL = f"{BASE_FUT}/future/market/v1/public/symbol/list"
+
+DAYS = 365
+WARMUP_DAYS = 35
+INTERVAL = "15m"
+INTERVAL_MS = 15 * 60 * 1000
+LIMIT = 1500
+REQUEST_TIMEOUT = 20
+RETRIES = 5
+MIN_ROWS = 30000
+
+INITIAL_EQUITY = 1000.0
+MARGIN = 100.0
+LEVERAGE = 50.0
+FEE_RATE = 0.0007
+SLIPPAGE = 0.0003
+RR = 2.0
+
+# Strategy: deliberately small and interpretable.
+EMA_FAST_4H = 50
+EMA_SLOW_4H = 200
+EMA_PULLBACK_1H = 20
+ATR_PERIOD_1H = 14
+SWEEP_LOOKBACK = 20
+BODY_LOOKBACK = 20
+MIN_BODY_ATR = 0.45
+MIN_CLOSE_LOCATION = 0.65
+MIN_STOP_PCT = 0.0010
+MAX_STOP_PCT = 0.0300
+SWEEP_BUFFER_ATR = 0.08
+
+# Regime/trend structure must be established, not merely touched.
+MIN_4H_EMA_GAP_ATR = 0.05
+MIN_1D_EMA_GAP_PCT = 0.0020
+
+DATA_DIR = Path("data/xt_hunter_v1")
+OUT_DIR = DATA_DIR / "results"
+
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "HUNTER-FACTOR-AUDIT/1.0"})
-
-
-def utc_now_ms() -> int:
-    return int(time.time() * 1000)
+SESSION.headers.update({"User-Agent": "HUNTER-V1-XT/1.0"})
 
 
 def request_json(url: str, params: dict) -> dict:
@@ -50,8 +105,8 @@ def request_json(url: str, params: dict) -> dict:
         except Exception as exc:
             last = exc
             if attempt < RETRIES:
-                time.sleep(0.6 * attempt)
-    raise RuntimeError(f"request failed after {RETRIES} attempts: {url} params={params} err={last}")
+                time.sleep(min(2.0, 0.4 * attempt))
+    raise RuntimeError(f"XT request failed: {url} {params} :: {last}")
 
 
 def extract_list(obj: dict) -> list:
@@ -60,338 +115,526 @@ def extract_list(obj: dict) -> list:
         return result
     if isinstance(result, dict):
         for key in ("items", "data", "list", "rows"):
-            val = result.get(key)
-            if isinstance(val, list):
-                return val
+            value = result.get(key)
+            if isinstance(value, list):
+                return value
     for key in ("data", "list", "rows"):
-        val = obj.get(key)
-        if isinstance(val, list):
-            return val
+        value = obj.get(key)
+        if isinstance(value, list):
+            return value
     return []
 
 
-def normalize_kline(rows: list) -> pd.DataFrame:
+def parse_kline(rows: list) -> list:
     out = []
     for x in rows:
-        if isinstance(x, dict):
-            t = x.get("t")
-            o = x.get("o")
-            h = x.get("h")
-            l = x.get("l")
-            c = x.get("c")
-            v = x.get("a", x.get("q", x.get("volume")))
-        elif isinstance(x, (list, tuple)) and len(x) >= 6:
-            t, o, h, l, c, v = x[:6]
-        else:
-            continue
         try:
+            if isinstance(x, dict):
+                t = x.get("t")
+                o = x.get("o", x.get("open"))
+                h = x.get("h", x.get("high"))
+                l = x.get("l", x.get("low"))
+                c = x.get("c", x.get("close"))
+                v = x.get("a", x.get("q", x.get("volume", 0)))
+            elif isinstance(x, (list, tuple)) and len(x) >= 6:
+                t, o, h, l, c, v = x[:6]
+            else:
+                continue
             out.append((int(t), float(o), float(h), float(l), float(c), float(v)))
-        except Exception:
+        except (TypeError, ValueError):
             continue
-    df = pd.DataFrame(out, columns=["ts", "open", "high", "low", "close", "volume"])
-    if df.empty:
-        return df
-    df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
-    df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    return df
-
-
-def _row_ts(x) -> int | None:
-    try:
-        return int(x.get("t")) if isinstance(x, dict) else int(x[0])
-    except Exception:
-        return None
-
-
-def _valid_rows(rows: list, lo: int, hi: int) -> list:
-    out = []
-    for x in rows:
-        ts = _row_ts(x)
-        if ts is not None and lo <= ts <= hi:
-            out.append(x)
     return out
 
 
-def _fetch_page(url: str, params: dict, lo: int, hi: int, label: str) -> tuple[list, list]:
-    """Fetch one XT page and return (raw_rows, in_range_rows).
-
-    XT's public kline endpoints can occasionally return a page that does not
-    honor a very narrow startTime/endTime window near the live edge. We never
-    advance the cursor from such a page. A bounded endTime-only retry is used
-    as a compatibility fallback.
-    """
-    raw = extract_list(request_json(url, params))
-    valid = _valid_rows(raw, lo, hi)
-    if valid:
-        return raw, valid
-
-    # Compatibility fallback: some XT responses behave better when only the
-    # upper bound is supplied. The returned page is still strictly filtered.
-    fallback = dict(params)
-    fallback.pop("startTime", None)
-    fallback["endTime"] = hi
-    raw2 = extract_list(request_json(url, fallback))
-    valid2 = _valid_rows(raw2, lo, hi)
-    if valid2:
-        return raw2, valid2
-
-    return raw, []
+def resolve_symbol(asset: str, discovered: list) -> str:
+    wanted = {asset.lower(), f"{asset.lower()}_usdt", f"{asset.lower()}/usdt"}
+    for item in discovered:
+        if isinstance(item, str):
+            s = item
+        elif isinstance(item, dict):
+            s = item.get("symbol") or item.get("contract") or item.get("name") or ""
+        else:
+            continue
+        s = str(s)
+        if s.lower() in wanted:
+            return s
+    # Known XT USDT-M convention used by the validated collector.
+    return f"{asset.lower()}_usdt"
 
 
-def _fetch_klines(symbol: str, start_ms: int, end_ms: int, *,
-                  url: str, limit: int, label: str) -> pd.DataFrame:
-    rows: List = []
+def fetch_symbol(asset: str, xt_symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Known-good forward pagination with strict in-window cursor progress."""
+    rows: List[Tuple[int, float, float, float, float, float]] = []
     cursor = start_ms
     guard = 0
+
     while cursor <= end_ms:
         guard += 1
         if guard > 1000:
-            raise RuntimeError(f"{label} pagination guard tripped for {symbol}")
+            raise RuntimeError(f"{asset}: pagination guard tripped")
 
-        window_end = min(end_ms, cursor + limit * INTERVAL_MS - 1)
+        window_end = min(end_ms, cursor + LIMIT * INTERVAL_MS - 1)
         params = {
-            "symbol": f"{symbol.lower()}_usdt",
-            "interval": "15m",
+            "symbol": xt_symbol,
+            "interval": INTERVAL,
             "startTime": cursor,
             "endTime": window_end,
-            "limit": limit,
+            "limit": LIMIT,
         }
-        raw, valid = _fetch_page(url, params, cursor, window_end, label)
 
-        if not valid:
-            # A zero-row response is only acceptable at the deliberately
-            # buffered live edge. Earlier failures indicate a broken history
-            # fetch and must never be silently converted into partial data.
-            if cursor >= end_ms - 2 * INTERVAL_MS:
-                break
-            raise RuntimeError(
-                f"{label} API returned no in-range candles for {symbol}; "
-                f"cursor={cursor} window_end={window_end} raw_rows={len(raw)}"
-            )
+        batch: list = []
+        for attempt in range(RETRIES):
+            try:
+                batch = parse_kline(extract_list(request_json(KLINE_URL, params)))
+                if batch:
+                    break
+            except Exception:
+                if attempt == RETRIES - 1:
+                    raise
+                time.sleep(min(2.0, 0.4 * (attempt + 1)))
 
-        rows.extend(valid)
-        timestamps = [_row_ts(x) for x in valid]
-        timestamps = [t for t in timestamps if t is not None]
-        if not timestamps:
-            raise RuntimeError(f"{label} returned no parseable timestamps for {symbol}")
-        mx = max(timestamps)
+        in_window = [x for x in batch if cursor <= x[0] <= window_end]
+        if not in_window:
+            cursor = window_end + 1
+            continue
 
-        # Advance to the next 15m boundary, not merely mx+1ms. This prevents
-        # narrow windows such as 13:45:00.001 from being sent back to XT.
-        next_cursor = ((mx // INTERVAL_MS) + 1) * INTERVAL_MS
+        rows.extend(in_window)
+        mx = max(x[0] for x in in_window)
+        next_cursor = mx + 1
         if next_cursor <= cursor:
-            raise RuntimeError(
-                f"{label} pagination made no progress for {symbol}; "
-                f"cursor={cursor} max_ts={mx}"
-            )
+            raise RuntimeError(f"{asset}: pagination failed to advance")
         cursor = next_cursor
         time.sleep(0.03)
 
-    df = normalize_kline(rows)
-    if df.empty:
-        return df
-    return df[(df.ts >= start_ms) & (df.ts <= end_ms)].copy()
+    if not rows:
+        raise RuntimeError(f"{asset}: zero XT candles")
+
+    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+    df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
+    df = df[(df.ts >= start_ms) & (df.ts <= end_ms)].copy()
+    if len(df) < MIN_ROWS:
+        raise RuntimeError(f"{asset}: only {len(df):,} rows; refusing partial data")
+
+    span = int(df.ts.iloc[-1] - df.ts.iloc[0])
+    required = int(DAYS * 86400 * 1000 * 0.90)
+    if span < required:
+        raise RuntimeError(f"{asset}: insufficient time coverage {span/86400000:.1f}d")
+
+    df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df = df.set_index("dt").drop(columns=["ts"])
+    return df
 
 
-def fetch_futures(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    return _fetch_klines(
-        symbol, start_ms, end_ms,
-        url=f"{BASE_FUT}/future/market/v1/public/q/kline",
-        limit=LIMIT_FUT,
-        label="futures",
-    )
+def ensure_data(data_dir: Path) -> Dict[str, pd.DataFrame]:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - int((DAYS + WARMUP_DAYS) * 86400 * 1000)
+    end_ms = (now_ms // INTERVAL_MS) * INTERVAL_MS - 1
 
+    discovered = extract_list(request_json(SYMBOL_URL, {}))
+    result: Dict[str, pd.DataFrame] = {}
 
-def fetch_spot(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    return _fetch_klines(
-        symbol, start_ms, end_ms,
-        url=f"{BASE_SPOT}/v4/public/kline",
-        limit=LIMIT_SPOT,
-        label="spot",
-    )
-
-def aggregate_1h(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    x = df.set_index("dt")
-    out = x.resample("1h", label="left", closed="left").agg({
-        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
-        "ts": "count",
-    }).dropna().reset_index()
-    # Only use complete 1h bars. A partial hour caused by a missing 15m
-    # candle must not become synthetic data in the factor audit.
-    out = out[out["ts"] == 4].copy()
-    out["ts"] = (out["dt"].astype("int64") // 10**6).astype("int64")
-    out["ts"] = (out["dt"].astype("int64") // 10**6).astype("int64")
-    return out
-
-
-def zscore(s: pd.Series, n: int) -> pd.Series:
-    mu = s.rolling(n, min_periods=n).mean().shift(1)
-    sd = s.rolling(n, min_periods=n).std(ddof=0).shift(1)
-    return (s - mu) / sd.replace(0, np.nan)
-
-
-def add_features(fut: pd.DataFrame, spot: pd.DataFrame, btc_fut: pd.DataFrame) -> pd.DataFrame:
-    f = aggregate_1h(fut).rename(columns={c: f"f_{c}" for c in ["open","high","low","close","volume"]})
-    s = aggregate_1h(spot).rename(columns={c: f"s_{c}" for c in ["open","high","low","close","volume"]})
-    x = f.merge(s[["dt","s_close","s_volume"]], on="dt", how="inner").sort_values("dt").reset_index(drop=True)
-    x["basis"] = np.log(x.f_close / x.s_close)
-    x["basis_pct"] = x.f_close / x.s_close - 1.0
-    x["basis_z96"] = zscore(x["basis"], 96)
-    x["basis_z192"] = zscore(x["basis"], 192)
-    x["basis_ch4"] = x["basis"].diff(4)
-    x["basis_ch24"] = x["basis"].diff(24)
-
-    x["ret1"] = x.f_close.pct_change(1)
-    x["ret4"] = x.f_close.pct_change(4)
-    x["ret8"] = x.f_close.pct_change(8)
-    x["ret24"] = x.f_close.pct_change(24)
-    x["vol_z24"] = zscore(np.log1p(x.f_volume), 24)
-    x["spot_vol_z24"] = zscore(np.log1p(x.s_volume), 24)
-    x["volume_ratio"] = x.f_volume / x.s_volume.replace(0, np.nan)
-    x["vol_ratio_z96"] = zscore(np.log(x["volume_ratio"].replace(0, np.nan).abs()), 96)
-
-    # Price-volume factor: contemporaneous signed return times standardized volume,
-    # then lagged by one hour for the predictive test so the feature is fully closed.
-    x["pv_factor"] = x["ret4"] * x["vol_z24"]
-    x["pv_factor_z96"] = zscore(x["pv_factor"], 96)
-
-    b = aggregate_1h(btc_fut)[["dt", "close"]].rename(columns={"close": "btc_close"})
-    x = x.merge(b, on="dt", how="left")
-    x["rs24"] = x.f_close.pct_change(24) - x.btc_close.pct_change(24)
-    x["rs72"] = x.f_close.pct_change(72) - x.btc_close.pct_change(72)
-
-    # Forward outcomes; every factor row uses information available at the row's close.
-    for h in (1, 4, 8, 24):
-        x[f"fwd_ret_{h}h"] = x.f_close.shift(-h) / x.f_close - 1.0
-        x[f"fwd_absret_{h}h"] = x[f"fwd_ret_{h}h"].abs()
-
-    return x
-
-
-def quantile_report(df: pd.DataFrame, factor: str, outcome: str, q: int = 5) -> pd.DataFrame:
-    z = df[[factor, outcome]].replace([np.inf, -np.inf], np.nan).dropna().copy()
-    if len(z) < 200:
-        return pd.DataFrame()
-    try:
-        z["q"] = pd.qcut(z[factor], q=q, labels=False, duplicates="drop") + 1
-    except Exception:
-        return pd.DataFrame()
-    g = z.groupby("q", observed=True)
-    r = g[outcome].agg(["count", "mean", "median"])
-    r["hit_rate"] = g[outcome].apply(lambda s: (s > 0).mean())
-    r = r.reset_index().rename(columns={"q":"quantile"})
-    r.insert(0, "factor", factor)
-    r.insert(1, "outcome", outcome)
-    return r
-
-
-def summarize(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    factors = [
-        "basis", "basis_pct", "basis_z96", "basis_z192", "basis_ch4", "basis_ch24",
-        "vol_z24", "spot_vol_z24", "volume_ratio", "vol_ratio_z96",
-        "pv_factor", "pv_factor_z96", "rs24", "rs72",
-    ]
-    outcomes = ["fwd_ret_1h", "fwd_ret_4h", "fwd_ret_8h", "fwd_ret_24h", "fwd_absret_8h", "fwd_absret_24h"]
-    qrows = []
-    corr_rows = []
-    for f in factors:
-        for o in outcomes:
-            sub = df[[f,o]].replace([np.inf,-np.inf],np.nan).dropna()
-            if len(sub) < 200:
+    for i, asset in enumerate(SYMBOLS, 1):
+        path = data_dir / f"{asset}_15m.csv"
+        if path.exists():
+            df = pd.read_csv(path, parse_dates=["dt"])
+            df["dt"] = pd.to_datetime(df["dt"], utc=True)
+            df = df.set_index("dt")
+            if len(df) >= MIN_ROWS:
+                result[asset] = df
+                print(f"DATA {i:02d}/{len(SYMBOLS)} {asset:<7} cached rows={len(df):,}")
                 continue
-            pearson = sub[f].corr(sub[o], method="pearson")
-            spearman = sub[f].rank(method="average").corr(sub[o].rank(method="average"), method="pearson")
-            corr_rows.append({"factor":f,"outcome":o,"n":len(sub),"pearson":pearson,"spearman":spearman})
-            qr = quantile_report(df, f, o)
-            if not qr.empty:
-                qrows.append(qr)
-    return pd.DataFrame(corr_rows), pd.concat(qrows, ignore_index=True) if qrows else pd.DataFrame()
+
+        actual = resolve_symbol(asset, discovered)
+        print(f"DATA {i:02d}/{len(SYMBOLS)} {asset:<7} downloading {actual}")
+        df = fetch_symbol(asset, actual, start_ms, end_ms)
+        df.to_csv(path, index_label="dt")
+        result[asset] = df
+        print(f"       rows={len(df):,} {df.index[0]} -> {df.index[-1]}")
+
+    return result
+
+
+def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    x = df[["open", "high", "low", "close", "volume"]].resample(rule, label="right", closed="right").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    )
+    return x.dropna(subset=["open", "high", "low", "close"])
+
+
+def atr(df: pd.DataFrame, period: int) -> pd.Series:
+    prev = df.close.shift(1)
+    tr = pd.concat([
+        df.high - df.low,
+        (df.high - prev).abs(),
+        (df.low - prev).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(period, min_periods=period).mean()
+
+
+def build_features(raw: pd.DataFrame) -> pd.DataFrame:
+    """Create the causal 1H signal frame from completed 15m candles."""
+    h1 = resample_ohlcv(raw, "1h")
+    h4 = resample_ohlcv(raw, "4h")
+    d1 = resample_ohlcv(raw, "1D")
+    h1.index.name = "dt"
+    h4.index.name = "dt"
+    d1.index.name = "dt"
+
+    # HTF values are shifted one completed candle so the 1H signal can only use
+    # a fully completed 4H/1D candle that existed before the signal candle.
+    h4["ema50"] = h4.close.ewm(span=EMA_FAST_4H, adjust=False, min_periods=EMA_FAST_4H).mean()
+    h4["ema200"] = h4.close.ewm(span=EMA_SLOW_4H, adjust=False, min_periods=EMA_SLOW_4H).mean()
+    h4["atr"] = atr(h4, ATR_PERIOD_1H)
+    h4["gap_atr"] = (h4.ema50 - h4.ema200).abs() / h4.atr.replace(0, np.nan)
+    h4["trend_long"] = (h4.ema50 > h4.ema200) & (h4.close > h4.ema50) & (h4.gap_atr >= MIN_4H_EMA_GAP_ATR)
+    h4["trend_short"] = (h4.ema50 < h4.ema200) & (h4.close < h4.ema50) & (h4.gap_atr >= MIN_4H_EMA_GAP_ATR)
+
+    d1["ema50"] = d1.close.ewm(span=50, adjust=False, min_periods=50).mean()
+    d1["ema200"] = d1.close.ewm(span=200, adjust=False, min_periods=200).mean()
+    d1["gap_pct"] = (d1.ema50 - d1.ema200).abs() / d1.close.replace(0, np.nan)
+    d1["regime_long"] = (d1.ema50 > d1.ema200) & (d1.close > d1.ema50) & (d1.gap_pct >= MIN_1D_EMA_GAP_PCT)
+    d1["regime_short"] = (d1.ema50 < d1.ema200) & (d1.close < d1.ema50) & (d1.gap_pct >= MIN_1D_EMA_GAP_PCT)
+
+    # Shift HTF state by one completed candle before joining to 1H.
+    h4_state = h4[["trend_long", "trend_short"]].shift(1)
+    d1_state = d1[["regime_long", "regime_short"]].shift(1)
+
+    h1["atr"] = atr(h1, ATR_PERIOD_1H)
+    h1["ema20"] = h1.close.ewm(span=EMA_PULLBACK_1H, adjust=False, min_periods=EMA_PULLBACK_1H).mean()
+    h1["prior_low"] = h1.low.shift(1).rolling(SWEEP_LOOKBACK, min_periods=SWEEP_LOOKBACK).min()
+    h1["prior_high"] = h1.high.shift(1).rolling(SWEEP_LOOKBACK, min_periods=SWEEP_LOOKBACK).max()
+    h1["body"] = (h1.close - h1.open).abs()
+    h1["avg_body"] = h1.body.shift(1).rolling(BODY_LOOKBACK, min_periods=BODY_LOOKBACK).mean()
+    h1["range"] = h1.high - h1.low
+    h1["close_loc"] = (h1.close - h1.low) / h1.range.replace(0, np.nan)
+
+    h1 = pd.merge_asof(
+        h1.sort_index().reset_index(),
+        h4_state.sort_index().reset_index(),
+        on="dt", direction="backward", allow_exact_matches=True,
+    ).set_index("dt")
+    h1 = pd.merge_asof(
+        h1.sort_index().reset_index(),
+        d1_state.sort_index().reset_index(),
+        on="dt", direction="backward", allow_exact_matches=True,
+    ).set_index("dt")
+
+    h1["long_signal"] = (
+        h1.trend_long.astype("boolean").fillna(False)
+        & h1.regime_long.astype("boolean").fillna(False)
+        & (h1.low < h1.prior_low)
+        & (h1.close > h1.prior_low)
+        & (h1.close > h1.ema20)
+        & (h1.body >= MIN_BODY_ATR * h1.atr)
+        & (h1.close_loc >= MIN_CLOSE_LOCATION)
+    )
+    h1["short_signal"] = (
+        h1.trend_short.astype("boolean").fillna(False)
+        & h1.regime_short.astype("boolean").fillna(False)
+        & (h1.high > h1.prior_high)
+        & (h1.close < h1.prior_high)
+        & (h1.close < h1.ema20)
+        & (h1.body >= MIN_BODY_ATR * h1.atr)
+        & (h1.close_loc <= (1.0 - MIN_CLOSE_LOCATION))
+    )
+    return h1.dropna(subset=["atr", "ema20", "prior_low", "prior_high"])
+
+
+def adverse_entry(open_price: float, side: str) -> float:
+    return open_price * (1.0 + SLIPPAGE) if side == "LONG" else open_price * (1.0 - SLIPPAGE)
+
+
+def net_pnl(entry: float, exit_price: float, side: str) -> float:
+    notional = MARGIN * LEVERAGE
+    gross = notional * ((exit_price / entry) - 1.0) * (1.0 if side == "LONG" else -1.0)
+    fees = notional * FEE_RATE * 2.0
+    return gross - fees
+
+
+def backtest_symbol(asset: str, h1: pd.DataFrame, cutoff: pd.Timestamp) -> Tuple[List[dict], Optional[dict]]:
+    trades: List[dict] = []
+    open_pos: Optional[dict] = None
+
+    x = h1[h1.index >= cutoff].copy()
+    if len(x) < 10:
+        return trades, None
+
+    for i in range(1, len(x)):
+        bar = x.iloc[i]
+        ts = x.index[i]
+        prev = x.iloc[i - 1]
+
+        # Existing trade is managed before considering any new signal. If it closes
+        # on this candle, this same candle is permanently ineligible for a new entry.
+        if open_pos is not None:
+            side = open_pos["side"]
+            hit_sl = bar.low <= open_pos["sl"] if side == "LONG" else bar.high >= open_pos["sl"]
+            hit_tp = bar.high >= open_pos["tp"] if side == "LONG" else bar.low <= open_pos["tp"]
+            if hit_sl or hit_tp:
+                # Conservative rule: if both are touched, SL wins.
+                outcome = "LOSS" if hit_sl else "WIN"
+                exit_price = open_pos["sl"] if hit_sl else open_pos["tp"]
+                pnl = net_pnl(open_pos["entry"], exit_price, side)
+                trades.append({**open_pos, "exit_time": ts, "exit": exit_price, "outcome": outcome, "pnl": pnl})
+                open_pos = None
+                continue
+
+        if open_pos is not None:
+            continue
+
+        # Signal was confirmed on prev 1H close; entry is current 1H OPEN.
+        side = None
+        if bool(prev.long_signal):
+            side = "LONG"
+            sweep_extreme = float(prev.low)
+            entry = adverse_entry(float(bar.open), side)
+            sl = sweep_extreme - float(prev.atr) * SWEEP_BUFFER_ATR
+            risk = entry - sl
+            if risk <= 0:
+                continue
+            tp = entry + RR * risk
+        elif bool(prev.short_signal):
+            side = "SHORT"
+            sweep_extreme = float(prev.high)
+            entry = adverse_entry(float(bar.open), side)
+            sl = sweep_extreme + float(prev.atr) * SWEEP_BUFFER_ATR
+            risk = sl - entry
+            if risk <= 0:
+                continue
+            tp = entry - RR * risk
+        else:
+            continue
+
+        stop_pct = risk / entry
+        if not (MIN_STOP_PCT <= stop_pct <= MAX_STOP_PCT):
+            continue
+
+        # Entry is at current open. An impossible same-candle pre-entry touch is ignored;
+        # only movement after the entry is represented by this candle's OHLC. Conservative
+        # handling treats any SL touch and TP touch on the entry candle as SL first.
+        hit_sl = bar.low <= sl if side == "LONG" else bar.high >= sl
+        hit_tp = bar.high >= tp if side == "LONG" else bar.low <= tp
+        if hit_sl or hit_tp:
+            outcome = "LOSS" if hit_sl else "WIN"
+            exit_price = sl if hit_sl else tp
+            pnl = net_pnl(entry, exit_price, side)
+            trades.append({
+                "asset": asset, "side": side, "signal_time": prev.name,
+                "entry_time": ts, "entry": entry, "sl": sl, "tp": tp,
+                "exit_time": ts, "exit": exit_price, "outcome": outcome, "pnl": pnl,
+            })
+        else:
+            open_pos = {
+                "asset": asset, "side": side, "signal_time": prev.name,
+                "entry_time": ts, "entry": entry, "sl": sl, "tp": tp,
+            }
+
+    return trades, open_pos
+
+
+def portfolio_backtest(features: Dict[str, pd.DataFrame], cutoff: pd.Timestamp) -> Tuple[pd.DataFrame, List[dict]]:
+    """Strict global non-overlap: one position total across all symbols."""
+    events = []
+    for asset, frame in features.items():
+        for ts, row in frame[frame.index >= cutoff].iterrows():
+            if bool(row.long_signal) or bool(row.short_signal):
+                events.append((ts, asset))
+    events.sort()
+
+    # Build per-symbol signal/entry logic on demand while enforcing a global lock.
+    states = {asset: None for asset in features}
+    trades: List[dict] = []
+    global_pos = None
+    event_idx = 0
+
+    # Iterate chronologically over all 1H bars. Every bar manages the open trade first.
+    all_times = sorted(set().union(*[set(f.index[f.index >= cutoff]) for f in features.values()]))
+    for ts in all_times:
+        closed_this_bar = False
+
+        if global_pos is not None:
+            asset = global_pos["asset"]
+            frame = features[asset]
+            if ts in frame.index:
+                bar = frame.loc[ts]
+                side = global_pos["side"]
+                hit_sl = bar.low <= global_pos["sl"] if side == "LONG" else bar.high >= global_pos["sl"]
+                hit_tp = bar.high >= global_pos["tp"] if side == "LONG" else bar.low <= global_pos["tp"]
+                if hit_sl or hit_tp:
+                    outcome = "LOSS" if hit_sl else "WIN"
+                    exit_price = global_pos["sl"] if hit_sl else global_pos["tp"]
+                    pnl = net_pnl(global_pos["entry"], exit_price, side)
+                    trades.append({**global_pos, "exit_time": ts, "exit": exit_price, "outcome": outcome, "pnl": pnl})
+                    global_pos = None
+                    closed_this_bar = True
+
+        if global_pos is not None or closed_this_bar:
+            continue
+
+        # A signal is acted upon on the next 1H bar. Find all signals whose next bar is ts.
+        candidates = []
+        for asset, frame in features.items():
+            if ts not in frame.index:
+                continue
+            loc = frame.index.get_loc(ts)
+            if loc == 0:
+                continue
+            prev = frame.iloc[loc - 1]
+            if bool(prev.long_signal):
+                candidates.append((asset, "LONG", prev))
+            elif bool(prev.short_signal):
+                candidates.append((asset, "SHORT", prev))
+
+        if not candidates:
+            continue
+
+        # Deterministic selection only; no ranking/optimization. Prefer the first symbol
+        # in the fixed universe order to avoid introducing a hidden cross-sectional optimizer.
+        candidates.sort(key=lambda z: SYMBOLS.index(z[0]))
+        asset, side, prev = candidates[0]
+        bar = features[asset].loc[ts]
+        entry = adverse_entry(float(bar.open), side)
+        if side == "LONG":
+            sl = float(prev.low) - float(prev.atr) * SWEEP_BUFFER_ATR
+            risk = entry - sl
+            tp = entry + RR * risk
+        else:
+            sl = float(prev.high) + float(prev.atr) * SWEEP_BUFFER_ATR
+            risk = sl - entry
+            tp = entry - RR * risk
+        if risk <= 0:
+            continue
+        stop_pct = risk / entry
+        if not (MIN_STOP_PCT <= stop_pct <= MAX_STOP_PCT):
+            continue
+
+        hit_sl = bar.low <= sl if side == "LONG" else bar.high >= sl
+        hit_tp = bar.high >= tp if side == "LONG" else bar.low <= tp
+        base = {
+            "asset": asset, "side": side, "signal_time": prev.name,
+            "entry_time": ts, "entry": entry, "sl": sl, "tp": tp,
+        }
+        if hit_sl or hit_tp:
+            outcome = "LOSS" if hit_sl else "WIN"
+            exit_price = sl if hit_sl else tp
+            trades.append({**base, "exit_time": ts, "exit": exit_price, "outcome": outcome, "pnl": net_pnl(entry, exit_price, side)})
+        else:
+            global_pos = base
+
+    opens = [global_pos] if global_pos is not None else []
+    return pd.DataFrame(trades), opens
+
+
+def max_loss_streak(df: pd.DataFrame) -> int:
+    streak = best = 0
+    for outcome in df.outcome.tolist():
+        if outcome == "LOSS":
+            streak += 1
+            best = max(best, streak)
+        else:
+            streak = 0
+    return best
+
+
+def summarize(trades: pd.DataFrame, cutoff: pd.Timestamp) -> dict:
+    if trades.empty:
+        return {
+            "trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
+            "profit_factor": 0.0, "net_pnl": 0.0, "max_dd": 0.0,
+            "max_loss_streak": 0, "trades_per_day": 0.0,
+        }
+    wins = trades[trades.outcome == "WIN"].pnl.sum()
+    losses = -trades[trades.outcome == "LOSS"].pnl.sum()
+    pf = wins / losses if losses > 0 else math.inf
+    equity = INITIAL_EQUITY + trades.sort_values("exit_time").pnl.cumsum()
+    dd = equity - equity.cummax()
+    span_days = max((trades.exit_time.max() - cutoff).total_seconds() / 86400.0, 1.0)
+    return {
+        "trades": int(len(trades)),
+        "wins": int((trades.outcome == "WIN").sum()),
+        "losses": int((trades.outcome == "LOSS").sum()),
+        "win_rate": float((trades.outcome == "WIN").mean() * 100.0),
+        "profit_factor": float(pf),
+        "net_pnl": float(trades.pnl.sum()),
+        "max_dd": float(dd.min()),
+        "max_loss_streak": int(max_loss_streak(trades.sort_values("exit_time"))),
+        "trades_per_day": float(len(trades) / span_days),
+    }
 
 
 def main() -> None:
-    print("=" * 96)
-    print("HUNTER-FACTOR-AUDIT-1 — PERPETUAL BASIS + PRICE/VOLUME FACTOR AUDIT")
-    print("15m XT FUTURES + XT SPOT -> 1H | NO TRADING STRATEGY / NO PARAMETER OPTIMIZATION")
-    print("=" * 96)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default=str(DATA_DIR))
+    parser.add_argument("--out-dir", default=str(OUT_DIR))
+    parser.add_argument("--no-download", action="store_true")
+    args = parser.parse_args()
 
-    now = utc_now_ms()
-    raw_start_ms = now - int((DAYS + WARMUP_DAYS) * 86400 * 1000)
-    start_ms = (raw_start_ms // INTERVAL_MS) * INTERVAL_MS
-    # Leave a small live-edge buffer. XT can lag/return shifted pages around
-    # the newest candle; the audit also needs future 24h outcomes, so these
-    # last few candles cannot contribute to the final factor tests anyway.
-    interval_end = (now // INTERVAL_MS) * INTERVAL_MS - 2 * INTERVAL_MS - 1
+    data_dir = Path(args.data_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    futures: Dict[str, pd.DataFrame] = {}
-    spots: Dict[str, pd.DataFrame] = {}
-    for i, sym in enumerate(SYMBOLS, 1):
-        f = fetch_futures(sym, start_ms, interval_end)
-        s = fetch_spot(sym, start_ms, interval_end)
-        if len(f) < 30000:
-            raise RuntimeError(f"Futures coverage too short for {sym}: {len(f)} rows")
-        if len(s) < 25000:
-            raise RuntimeError(f"Spot coverage too short for {sym}: {len(s)} rows")
-        futures[sym] = f
-        spots[sym] = s
-        print(f"{i:02d}/{len(SYMBOLS)} {sym:<7} futures={len(f):>6} spot={len(s):>6} "
-              f"f_start={f.dt.min()} f_end={f.dt.max()} s_start={s.dt.min()} s_end={s.dt.max()}")
+    if args.no_download:
+        raw = {}
+        for asset in SYMBOLS:
+            path = data_dir / f"{asset}_15m.csv"
+            if not path.exists():
+                raise RuntimeError(f"Missing {path}; remove --no-download to fetch XT data")
+            df = pd.read_csv(path, parse_dates=["dt"])
+            df["dt"] = pd.to_datetime(df["dt"], utc=True)
+            raw[asset] = df.set_index("dt")
+    else:
+        raw = ensure_data(data_dir)
 
-    btc = futures["BTC"]
-    all_corr = []
-    all_quant = []
-    for sym in SYMBOLS:
-        feat = add_features(futures[sym], spots[sym], btc)
-        # Drop the warmup tail only after features are calculated; retain the complete 365d audit window.
-        cutoff = pd.Timestamp(datetime.now(timezone.utc) - timedelta(days=DAYS))
-        feat = feat[feat.dt >= cutoff].copy()
-        corr, quant = summarize(feat)
-        if not corr.empty:
-            corr.insert(0, "symbol", sym)
-            all_corr.append(corr)
-        if not quant.empty:
-            quant.insert(0, "symbol", sym)
-            all_quant.append(quant)
-        print(f"AUDIT {sym:<7} 1H rows={len(feat):>5} factors={len(corr):>3} correlation tests")
+    features: Dict[str, pd.DataFrame] = {}
+    for i, asset in enumerate(SYMBOLS, 1):
+        features[asset] = build_features(raw[asset])
+        print(f"FEATURE {i:02d}/{len(SYMBOLS)} {asset:<7} 1H rows={len(features[asset]):,}")
 
-    corr_all = pd.concat(all_corr, ignore_index=True) if all_corr else pd.DataFrame()
-    quant_all = pd.concat(all_quant, ignore_index=True) if all_quant else pd.DataFrame()
+    cutoff = pd.Timestamp(datetime.now(timezone.utc) - timedelta(days=DAYS))
+    trades, opens = portfolio_backtest(features, cutoff)
 
-    if corr_all.empty:
-        raise RuntimeError("No factor audit rows produced")
+    if not trades.empty:
+        trades = trades.sort_values("exit_time").reset_index(drop=True)
+        trades.to_csv(out_dir / "trades.csv", index=False)
+    else:
+        pd.DataFrame(columns=["asset","side","signal_time","entry_time","entry","sl","tp","exit_time","exit","outcome","pnl"]).to_csv(out_dir / "trades.csv", index=False)
 
-    # Aggregate only descriptive evidence: median cross-sectional rank of |Spearman| and sign consistency.
-    score_rows = []
-    for factor, g in corr_all.groupby("factor"):
-        pred = g[g.outcome.str.startswith("fwd_ret_")].copy()
-        vol = g[g.outcome.str.startswith("fwd_absret_")].copy()
-        for frame, kind in ((pred, "direction"), (vol, "volatility")):
-            if frame.empty:
-                continue
-            score_rows.append({
-                "factor": factor,
-                "test_type": kind,
-                "median_abs_spearman": float(frame.spearman.abs().median()),
-                "median_spearman": float(frame.spearman.median()),
-                "positive_sign_fraction": float((frame.spearman > 0).mean()),
-                "tests": int(len(frame)),
-            })
-    score = pd.DataFrame(score_rows).sort_values(["test_type","median_abs_spearman"], ascending=[True,False])
+    overall = summarize(trades, cutoff)
+    per_symbol = []
+    if not trades.empty:
+        for asset in SYMBOLS:
+            g = trades[trades.asset == asset]
+            s = summarize(g, cutoff)
+            s["asset"] = asset
+            per_symbol.append(s)
+    per_symbol_df = pd.DataFrame(per_symbol)
+    per_symbol_df.to_csv(out_dir / "per_symbol.csv", index=False)
 
-    corr_all.to_csv("factor_audit_correlations.csv", index=False)
-    quant_all.to_csv("factor_audit_quantiles.csv", index=False)
-    score.to_csv("factor_audit_summary.csv", index=False)
+    report = {
+        "strategy": "HUNTER-V1 Trend Pullback + Liquidity Reclaim",
+        "data_days": DAYS,
+        "symbols": len(SYMBOLS),
+        "initial_equity": INITIAL_EQUITY,
+        "margin": MARGIN,
+        "leverage": LEVERAGE,
+        "rr": RR,
+        "fee_rate": FEE_RATE,
+        "slippage": SLIPPAGE,
+        "open_positions_at_end": len(opens),
+        **overall,
+    }
+    pd.DataFrame([report]).to_csv(out_dir / "summary.csv", index=False)
 
-    print("\n" + "=" * 96)
-    print("FACTOR AUDIT SUMMARY — DESCRIPTIVE ONLY")
-    print("=" * 96)
-    pd.set_option("display.max_rows", 100)
-    pd.set_option("display.width", 180)
-    print(score.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
-    print("\nFiles written: factor_audit_correlations.csv, factor_audit_quantiles.csv, factor_audit_summary.csv")
-    print("No trading setup was selected from these results; no OOS tuning was performed.")
-    print("Research basis: recent perpetual-futures literature identifies basis and price-volume as important systematic drivers; this run tests whether the relationship appears in XT data before strategy construction.")
+    print("\n" + "=" * 88)
+    print("HUNTER-V1 — FINAL BACKTEST")
+    print("=" * 88)
+    for k, v in report.items():
+        print(f"{k:24s}: {v}")
+    print("\nPer-symbol:")
+    if not per_symbol_df.empty:
+        print(per_symbol_df[["asset","trades","win_rate","profit_factor","net_pnl","max_dd","max_loss_streak","trades_per_day"]].to_string(index=False, float_format=lambda z: f"{z:.3f}"))
+    print(f"\nResults: {out_dir}")
 
 
 if __name__ == "__main__":
