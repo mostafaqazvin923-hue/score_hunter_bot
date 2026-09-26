@@ -145,36 +145,51 @@ def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
 
         parsed_batch = []
 
+        # XT K-line responses may use compact dict keys (t/o/h/l/c/a)
+        # or verbose keys, and may also be returned as arrays. Support all
+        # of these forms without silently discarding a valid page.
         for k in data:
             try:
-                ts = int(
-                    k[0] if isinstance(k, list)
-                    else k.get("time", k.get("timestamp"))
-                )
-                o = float(
-                    k[1] if isinstance(k, list) else k.get("open")
-                )
-                h = float(
-                    k[2] if isinstance(k, list) else k.get("high")
-                )
-                l = float(
-                    k[3] if isinstance(k, list) else k.get("low")
-                )
-                c = float(
-                    k[4] if isinstance(k, list) else k.get("close")
-                )
-                v = float(
-                    k[5] if isinstance(k, list) else k.get("volume")
-                )
+                if isinstance(k, (list, tuple)):
+                    if len(k) < 6:
+                        continue
+                    ts, o, h, l, c, v = k[:6]
+
+                elif isinstance(k, dict):
+                    ts = k.get("t", k.get("time", k.get("timestamp")))
+                    o = k.get("o", k.get("open"))
+                    h = k.get("h", k.get("high"))
+                    l = k.get("l", k.get("low"))
+                    c = k.get("c", k.get("close"))
+                    v = k.get("a", k.get("v", k.get("volume", k.get("amount"))))
+                else:
+                    continue
+
+                if any(x is None for x in (ts, o, h, l, c, v)):
+                    continue
+
+                ts = int(float(ts))
+                o, h, l, c, v = map(float, (o, h, l, c, v))
+
+                if ts <= 0:
+                    continue
+                if not all(np.isfinite([o, h, l, c, v])):
+                    continue
+                if min(o, h, l, c) <= 0:
+                    continue
+                if h < max(o, c, l) or l > min(o, c, h):
+                    continue
 
                 parsed_batch.append([ts, o, h, l, c, v])
 
-            except Exception:
+            except (TypeError, ValueError, OverflowError):
                 continue
 
         if not parsed_batch:
+            sample = data[0] if isinstance(data, list) and data else None
             raise RuntimeError(
-                f"Parsed batch is empty for {symbol} at page {page}"
+                f"Parsed batch is empty for {symbol} at page {page}. "
+                f"First raw record: {repr(sample)[:500]}"
             )
 
         row_count_page = len(parsed_batch)
