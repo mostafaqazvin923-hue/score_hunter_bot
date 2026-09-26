@@ -1,15 +1,15 @@
-name: XT BTC Funding 365D Test
+name: XT Funding Time-Range Diagnostic
 
 on:
   workflow_dispatch:
 
 jobs:
-  funding:
+  funding-range:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 2
 
     steps:
-      - name: Download BTC funding history for 365 days
+      - name: Test XT funding with time ranges
         shell: bash
         run: |
           python - <<'PY'
@@ -17,141 +17,119 @@ jobs:
           import time
           from datetime import datetime, timezone
 
-          BASE = "https://fapi.xt.com"
-          URL = f"{BASE}/future/market/v1/public/q/funding-rate-record"
+          URL = "https://fapi.xt.com/future/market/v1/public/q/funding-rate-record"
           SYMBOL = "btc_usdt"
-          LIMIT = 100
-          DAYS = 365
-          MAX_PAGES = 20
-          GLOBAL_TIMEOUT = 90
+          LIMIT = 1000
           REQUEST_TIMEOUT = 10
+          GLOBAL_TIMEOUT = 60
 
           started = time.monotonic()
           session = requests.Session()
-
           now_ms = int(time.time() * 1000)
-          target_ms = now_ms - DAYS * 86400 * 1000
 
-          rows = []
-          seen_ids = set()
+          def fmt(ms):
+              return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
 
-          def dt(ms):
-              return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).isoformat()
-
-          def fetch(params):
+          def test_range(name, start_ms, end_ms):
               if time.monotonic() - started >= GLOBAL_TIMEOUT:
-                  raise TimeoutError("Global timeout exceeded")
-              r = session.get(URL, params=params, timeout=REQUEST_TIMEOUT)
-              print("HTTP:", r.status_code, "time:", f"{r.elapsed.total_seconds():.2f}s")
-              r.raise_for_status()
-              return r.json()
+                  raise TimeoutError("Global timeout")
 
-          print("=== XT BTC FUNDING 365D TEST ===")
-
-          # Page 1 establishes the cursor.
-          data = fetch({
-              "symbol": SYMBOL,
-              "limit": LIMIT,
-              "direction": "PREV",
-          })
-
-          result = data.get("result", {})
-          items = result.get("items", [])
-
-          if not items:
-              raise RuntimeError("Page 1 returned no funding records")
-
-          for item in items:
-              item_id = str(item.get("id", ""))
-              if item_id and item_id not in seen_ids:
-                  seen_ids.add(item_id)
-                  rows.append(item)
-
-          print("PAGE 1:", len(items), "records")
-          print("FIRST ID:", items[0].get("id"))
-          print("LAST ID:", items[-1].get("id"))
-
-          # Diagnostic #3 proved that NEXT + FIRST_ID moves backward in time.
-          cursor = str(items[0].get("id"))
-
-          for page in range(2, MAX_PAGES + 1):
-              if time.monotonic() - started >= GLOBAL_TIMEOUT:
-                  raise TimeoutError("Global timeout exceeded")
-
-              data = fetch({
+              params = {
                   "symbol": SYMBOL,
                   "limit": LIMIT,
-                  "direction": "NEXT",
-                  "id": cursor,
-              })
+                  "since": start_ms,
+                  "endTime": end_ms,
+              }
 
-              result = data.get("result", {})
-              items = result.get("items", [])
+              print(f"\n=== {name} ===")
+              print("since:", fmt(start_ms))
+              print("endTime:", fmt(end_ms))
+
+              t0 = time.monotonic()
+              r = session.get(URL, params=params, timeout=REQUEST_TIMEOUT)
+              elapsed = time.monotonic() - t0
+
+              print("HTTP:", r.status_code)
+              print("request_time:", f"{elapsed:.2f}s")
+              print("url:", r.url)
+              r.raise_for_status()
+
+              js = r.json()
+              result = js.get("result", {})
+              items = result.get("items", []) if isinstance(result, dict) else []
+
+              print("items:", len(items))
+              print(
+                  "result keys:",
+                  list(result.keys()) if isinstance(result, dict) else []
+              )
 
               if not items:
-                  print("No more items.")
-                  break
-
-              new_count = 0
-              for item in items:
-                  item_id = str(item.get("id", ""))
-                  if item_id and item_id not in seen_ids:
-                      seen_ids.add(item_id)
-                      rows.append(item)
-                      new_count += 1
+                  print("EMPTY RANGE")
+                  return []
 
               times = [
                   int(x["createdTime"])
-                  for x in rows
+                  for x in items
                   if x.get("createdTime") is not None
               ]
 
-              oldest = min(times) if times else None
+              if times:
+                  print("oldest:", fmt(min(times)))
+                  print("newest:", fmt(max(times)))
 
-              print(
-                  f"PAGE {page}: returned={len(items)} "
-                  f"new={new_count} total={len(rows)} "
-                  f"oldest={dt(oldest) if oldest else 'N/A'}"
-              )
+              print("hasPrev:", result.get("hasPrev"))
+              print("hasNext:", result.get("hasNext"))
 
-              if oldest is not None and oldest <= target_ms:
-                  print("365-DAY TARGET REACHED.")
-                  break
+              return items
 
-              next_cursor = str(items[0].get("id", ""))
+          print("=== XT FUNDING TIME-RANGE DIAGNOSTIC ===")
+          print("BTC funding endpoint; no ID pagination is used.")
 
-              if not next_cursor or next_cursor == cursor:
-                  raise RuntimeError("Pagination cursor did not advance")
-
-              cursor = next_cursor
-
-          times = [
-              int(x["createdTime"])
-              for x in rows
-              if x.get("createdTime") is not None
+          ranges = [
+              ("RECENT_30D", now_ms - 30 * 86400000, now_ms),
+              (
+                  "DAYS_31_60",
+                  now_ms - 60 * 86400000,
+                  now_ms - 30 * 86400000 - 1,
+              ),
+              (
+                  "DAYS_61_90",
+                  now_ms - 90 * 86400000,
+                  now_ms - 60 * 86400000 - 1,
+              ),
           ]
 
-          if not times:
-              raise RuntimeError("No valid funding timestamps collected")
+          all_ids = set()
+          all_times = []
 
-          oldest = min(times)
-          newest = max(times)
-          coverage_days = (newest - oldest) / 86400000
-          elapsed = time.monotonic() - started
+          for name, start_ms, end_ms in ranges:
+              items = test_range(name, start_ms, end_ms)
 
-          print()
-          print("================================")
+              for item in items:
+                  item_id = str(item.get("id", ""))
+                  if item_id:
+                      all_ids.add(item_id)
+
+                  if item.get("createdTime") is not None:
+                      all_times.append(int(item["createdTime"]))
+
+          print("\n================================")
           print("RESULT")
-          print("Unique records:", len(rows))
-          print("Coverage days:", f"{coverage_days:.1f}")
-          print("Oldest:", dt(oldest))
-          print("Newest:", dt(newest))
-          print("Elapsed:", f"{elapsed:.2f}s")
-          print("Target reached:", oldest <= target_ms)
+          print("Unique IDs:", len(all_ids))
+          print("Total timestamps:", len(all_times))
+
+          if all_times:
+              print("Overall oldest:", fmt(min(all_times)))
+              print("Overall newest:", fmt(max(all_times)))
+
+          print("Elapsed:", f"{time.monotonic() - started:.2f}s")
           print("================================")
 
-          if oldest > target_ms:
-              raise RuntimeError("365-day target NOT reached within page limit")
+          if not all_times:
+              raise RuntimeError(
+                  "Timestamp-range requests returned no funding records"
+              )
 
-          print("XT BTC FUNDING 365D TEST: PASSED")
+          print("XT FUNDING TIME-RANGE DIAGNOSTIC: PASSED")
           PY
