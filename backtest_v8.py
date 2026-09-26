@@ -291,8 +291,8 @@ def build_features(all15):
         d = d1[asset].copy()
 
         x["atr"] = atr_wilder(x, 14)
-        x["ema20"] = x.close.ewm(span=20, adjust=False).mean()
-        x["ema50"] = x.close.ewm(span=50, adjust=False).mean()
+        x["ret6"] = x.close.pct_change(6)
+        x["ret12"] = x.close.pct_change(12)
         x["ret24"] = x.close.pct_change(24)
         x["ret72"] = x.close.pct_change(72)
         x["rv24"] = x.close.pct_change().rolling(24).std()
@@ -302,15 +302,20 @@ def build_features(all15):
         x["body_atr"] = (x.close - x.open).abs() / x.atr
         x["range_atr"] = (x.high - x.low) / x.atr
         x["close_pos"] = (x.close - x.low) / (x.high - x.low).replace(0, np.nan)
-        x["dev20"] = (x.close - x.ema20) / x.atr
+        x["ema20"] = x.close.ewm(span=20, adjust=False).mean()
+        x["ema50"] = x.close.ewm(span=50, adjust=False).mean()
         x["ema20_slope"] = (x.ema20 - x.ema20.shift(6)) / x.atr
-        x["break_high_24"] = x.high.rolling(24).max().shift(1)
-        x["break_low_24"] = x.low.rolling(24).min().shift(1)
+        # All breakout levels are shifted: the signal candle never sees itself.
+        x["high12"] = x.high.rolling(12).max().shift(1)
+        x["low12"] = x.low.rolling(12).min().shift(1)
+        x["high24"] = x.high.rolling(24).max().shift(1)
+        x["low24"] = x.low.rolling(24).min().shift(1)
 
+        q["atr"] = atr_wilder(q, 14)
         q["ema50"] = q.close.ewm(span=50, adjust=False).mean()
         q["ema200"] = q.close.ewm(span=200, adjust=False).mean()
         q["adx"] = adx_wilder(q, 14)
-        q["slope"] = (q.ema50 - q.ema50.shift(6)) / atr_wilder(q, 14)
+        q["slope"] = (q.ema50 - q.ema50.shift(6)) / q.atr
         q["trend"] = np.where(
             (q.close > q.ema200) & (q.ema50 > q.ema200), 1,
             np.where((q.close < q.ema200) & (q.ema50 < q.ema200), -1, 0),
@@ -339,9 +344,9 @@ def add_cross_sectional_ranks(f):
         vals = []
         for asset, x in f.items():
             if ts in x.index:
-                v = x.loc[ts, "ret24"]
-                if np.isfinite(v):
-                    vals.append((asset, float(v)))
+                r = x.loc[ts, "ret24"]
+                if np.isfinite(r):
+                    vals.append((asset, float(r)))
         vals.sort(key=lambda z: z[1])
         n = len(vals)
         for rank, (asset, _) in enumerate(vals):
@@ -355,114 +360,74 @@ def finite_row(r, keys):
 
 def make_signals(f, cfg):
     (
-        name, trend_score_min, rev_score_min, pullback_atr,
-        reclaim_atr, mom24_min, mom72_min, rev_dev, rev_range_mult, _atr_mult,
+        name, lookback, rank_long, rank_short, adx_min, rv_min,
+        body_min, volz_min, close_pos_long, close_pos_short, atr_mult,
     ) = cfg
     signals = []
+    common = [
+        "atr", "ret6", "ret12", "ret24", "ret72", "rv_ratio", "vol_z",
+        "body_atr", "range_atr", "close_pos", "ema20_slope",
+        "h4_trend", "h4_adx", "h4_slope", "d1_regime", "d1_slope",
+        "mom_rank",
+    ]
 
     for asset, x in f.items():
-        # i-1 is deliberately used for previous-bar confirmation; entry is i+1 open.
         for i in range(250, len(x) - 1):
             ts = x.index[i]
             r = x.iloc[i]
             p = x.iloc[i - 1]
-
-            common = [
-                "atr", "ema20", "ema50", "ret24", "ret72", "vol_z",
-                "body_atr", "range_atr", "close_pos", "dev20", "ema20_slope",
-                "h4_trend", "h4_adx", "h4_slope", "d1_regime", "d1_slope",
-                "mom_rank",
-            ]
-            if not finite_row(r, common) or not finite_row(p, ["close", "ema20", "dev20"]):
+            if not finite_row(r, common):
+                continue
+            high_key = "high12" if lookback == 12 else "high24"
+            low_key = "low12" if lookback == 12 else "low24"
+            if not np.isfinite(r.get(high_key, np.nan)) or not np.isfinite(r.get(low_key, np.nan)):
                 continue
 
-            long_ctx = r.d1_regime == 1 and r.h4_trend == 1 and r.h4_adx >= 18
-            short_ctx = r.d1_regime == -1 and r.h4_trend == -1 and r.h4_adx >= 18
-
-            # -----------------------------
-            # 1) TREND CONTINUATION
-            # -----------------------------
-            long_touch = r.low <= r.ema20 + pullback_atr * r.atr and r.low >= r.ema50 - 0.90 * r.atr
-            short_touch = r.high >= r.ema20 - pullback_atr * r.atr and r.high <= r.ema50 + 0.90 * r.atr
-            long_reclaim = p.close <= p.ema20 + reclaim_atr * p.atr and r.close > r.ema20
-            short_reclaim = p.close >= p.ema20 - reclaim_atr * p.atr and r.close < r.ema20
-            long_candle = r.close_pos >= 0.62 and r.body_atr >= 0.25 and r.close > r.open
-            short_candle = r.close_pos <= 0.38 and r.body_atr >= 0.25 and r.close < r.open
-            long_mom = r.ret24 >= mom24_min and r.ret72 >= mom72_min and r.mom_rank >= 0.60
-            short_mom = r.ret24 <= -mom24_min and r.ret72 <= -mom72_min and r.mom_rank <= 0.40
-            long_flow = r.vol_z >= -0.25
-            short_flow = r.vol_z >= -0.25
-            long_slope = r.h4_slope > 0 and r.d1_slope > 0
-            short_slope = r.h4_slope < 0 and r.d1_slope < 0
-            long_expansion = r.rv_ratio >= 0.90
-            short_expansion = r.rv_ratio >= 0.90
-
-            long_trend_score = (
-                2.0 * long_ctx + 1.0 * long_slope + 1.0 * long_touch +
-                1.0 * long_reclaim + 1.0 * long_mom + 0.75 * long_candle +
-                0.50 * long_flow + 0.50 * long_expansion
+            long_ctx = (
+                r.d1_regime == 1 and r.h4_trend == 1 and
+                r.h4_adx >= adx_min and r.h4_slope > 0 and r.d1_slope > 0
             )
-            short_trend_score = (
-                2.0 * short_ctx + 1.0 * short_slope + 1.0 * short_touch +
-                1.0 * short_reclaim + 1.0 * short_mom + 0.75 * short_candle +
-                0.50 * short_flow + 0.50 * short_expansion
+            short_ctx = (
+                r.d1_regime == -1 and r.h4_trend == -1 and
+                r.h4_adx >= adx_min and r.h4_slope < 0 and r.d1_slope < 0
             )
 
-            if long_trend_score >= trend_score_min and long_reclaim and long_ctx and long_trend_score > short_trend_score:
+            # Breakout is confirmed only by the signal candle close.
+            long_break = r.close > r[high_key] and p.close <= p[high_key]
+            short_break = r.close < r[low_key] and p.close >= p[low_key]
+            long_quality = (
+                r.mom_rank >= rank_long and r.ret6 > 0 and r.ret12 > 0 and
+                r.ret24 > 0 and r.ret72 > 0 and r.body_atr >= body_min and
+                r.close_pos >= close_pos_long and r.vol_z >= volz_min and
+                r.rv_ratio >= rv_min
+            )
+            short_quality = (
+                r.mom_rank <= rank_short and r.ret6 < 0 and r.ret12 < 0 and
+                r.ret24 < 0 and r.ret72 < 0 and r.body_atr >= body_min and
+                r.close_pos <= close_pos_short and r.vol_z >= volz_min and
+                r.rv_ratio >= rv_min
+            )
+
+            # A single score is used only to require breadth of confirmation;
+            # it is not used to manufacture a target win rate.
+            long_score = (
+                2.0 * long_ctx + 2.0 * long_break + 1.5 * long_quality +
+                0.5 * (r.range_atr >= 1.0) + 0.5 * (r.ema20_slope > 0)
+            )
+            short_score = (
+                2.0 * short_ctx + 2.0 * short_break + 1.5 * short_quality +
+                0.5 * (r.range_atr >= 1.0) + 0.5 * (r.ema20_slope < 0)
+            )
+
+            if long_ctx and long_break and long_quality and long_score > short_score:
                 signals.append({
-                    "asset": asset, "signal_ts": ts, "family": "TREND_CONTINUATION",
-                    "side": "LONG", "score": float(long_trend_score), "atr": float(r.atr),
+                    "asset": asset, "signal_ts": ts, "family": "RELATIVE_BREAKOUT",
+                    "side": "LONG", "score": float(long_score), "atr": float(r.atr),
                 })
-            elif short_trend_score >= trend_score_min and short_reclaim and short_ctx and short_trend_score > long_trend_score:
+            elif short_ctx and short_break and short_quality and short_score > long_score:
                 signals.append({
-                    "asset": asset, "signal_ts": ts, "family": "TREND_CONTINUATION",
-                    "side": "SHORT", "score": float(short_trend_score), "atr": float(r.atr),
-                })
-
-            # -----------------------------
-            # 2) EXHAUSTION REVERSAL
-            # -----------------------------
-            # Reversal is not allowed against a strong daily regime. It is a
-            # controlled counter-move only when 4H loses momentum and the 1H
-            # candle rejects an extreme.
-            long_extreme = r.dev20 <= -rev_dev
-            short_extreme = r.dev20 >= rev_dev
-            long_failed = p.close < p.ema20 and r.close > p.close and r.close > r.open
-            short_failed = p.close > p.ema20 and r.close < p.close and r.close < r.open
-            long_reject = r.close_pos >= 0.68 and r.range_atr >= rev_range_mult
-            short_reject = r.close_pos <= 0.32 and r.range_atr >= rev_range_mult
-            weak_h4_long = r.h4_adx < 24 or r.h4_slope >= -0.10
-            weak_h4_short = r.h4_adx < 24 or r.h4_slope <= 0.10
-            reversal_volume = r.vol_z >= -0.50
-
-            long_rev_score = (
-                2.0 * (r.d1_regime == 1) +
-                1.0 * (r.h4_trend >= 0) +
-                1.25 * long_extreme +
-                1.25 * long_failed +
-                1.0 * long_reject +
-                0.75 * weak_h4_long +
-                0.50 * reversal_volume
-            )
-            short_rev_score = (
-                2.0 * (r.d1_regime == -1) +
-                1.0 * (r.h4_trend <= 0) +
-                1.25 * short_extreme +
-                1.25 * short_failed +
-                1.0 * short_reject +
-                0.75 * weak_h4_short +
-                0.50 * reversal_volume
-            )
-
-            if long_rev_score >= rev_score_min and long_failed and long_reject and r.d1_regime == 1 and long_rev_score > short_rev_score:
-                signals.append({
-                    "asset": asset, "signal_ts": ts, "family": "EXHAUSTION_REVERSAL",
-                    "side": "LONG", "score": float(long_rev_score), "atr": float(r.atr),
-                })
-            elif short_rev_score >= rev_score_min and short_failed and short_reject and r.d1_regime == -1 and short_rev_score > long_rev_score:
-                signals.append({
-                    "asset": asset, "signal_ts": ts, "family": "EXHAUSTION_REVERSAL",
-                    "side": "SHORT", "score": float(short_rev_score), "atr": float(r.atr),
+                    "asset": asset, "signal_ts": ts, "family": "RELATIVE_BREAKOUT",
+                    "side": "SHORT", "score": float(short_score), "atr": float(r.atr),
                 })
 
     return signals
@@ -479,12 +444,9 @@ def execute_backtest(f, signals, atr_mult):
     equity = INITIAL_EQUITY
     peak = equity
     max_dd = 0.0
-    last_close_ts = None
 
     for ts in all_ts:
         closed_any = False
-
-        # Manage exits on EVERY 1H candle, not only signal candles.
         for p in positions[:]:
             x = f[p["asset"]]
             if ts not in x.index or ts < p["entry_ts"]:
@@ -492,26 +454,19 @@ def execute_backtest(f, signals, atr_mult):
             row = x.loc[ts]
             hit_sl = row.low <= p["sl"] if p["side"] == "LONG" else row.high >= p["sl"]
             hit_tp = row.high >= p["tp"] if p["side"] == "LONG" else row.low <= p["tp"]
-
             if not (hit_sl or hit_tp):
                 continue
-
-            # Conservative same-candle handling: if both levels are touched,
-            # LOSS wins regardless of direction or level ordering.
             if hit_sl and hit_tp:
-                outcome = "LOSS"
-                exit_price = p["sl"]
+                outcome, exit_price = "LOSS", p["sl"]
             elif hit_sl:
-                outcome = "LOSS"
-                exit_price = p["sl"]
+                outcome, exit_price = "LOSS", p["sl"]
             else:
-                outcome = "WIN"
-                exit_price = p["tp"]
+                outcome, exit_price = "WIN", p["tp"]
 
             price_ret = (
                 (exit_price - p["entry"]) / p["entry"]
-                if p["side"] == "LONG"
-                else (p["entry"] - exit_price) / p["entry"]
+                if p["side"] == "LONG" else
+                (p["entry"] - exit_price) / p["entry"]
             )
             gross = price_ret * TRADE_MARGIN * LEVERAGE
             fees = TRADE_MARGIN * LEVERAGE * FEE_RATE * 2.0
@@ -519,33 +474,15 @@ def execute_backtest(f, signals, atr_mult):
             equity += pnl
             peak = max(peak, equity)
             max_dd = min(max_dd, equity - peak)
-
-            trades.append({
-                **p,
-                "exit_ts": ts,
-                "outcome": outcome,
-                "pnl": pnl,
-                "equity": equity,
-            })
+            trades.append({**p, "exit_ts": ts, "outcome": outcome, "pnl": pnl, "equity": equity})
             positions.remove(p)
             closed_any = True
 
         if closed_any:
-            last_close_ts = ts
-            # Explicit rule: no new signal on the same candle where a prior
-            # position result became known.
             continue
-
         if len(positions) >= MAX_OPEN_POSITIONS:
             continue
-
-        candidates = by_ts.get(ts, [])
-        if not candidates:
-            continue
-
-        # Highest-quality setup first. One position per asset.
-        candidates = sorted(candidates, key=lambda z: (z["score"], abs(z["atr"])), reverse=True)
-
+        candidates = sorted(by_ts.get(ts, []), key=lambda z: (z["score"], abs(z["atr"])), reverse=True)
         for s in candidates:
             if len(positions) >= MAX_OPEN_POSITIONS:
                 break
@@ -562,22 +499,13 @@ def execute_backtest(f, signals, atr_mult):
             if not np.isfinite(risk) or risk <= 0 or risk / entry > 0.08:
                 continue
             if s["side"] == "LONG":
-                sl = entry - risk
-                tp = entry + RR * risk
+                sl, tp = entry - risk, entry + RR * risk
             else:
-                sl = entry + risk
-                tp = entry - RR * risk
-
+                sl, tp = entry + risk, entry - RR * risk
             positions.append({
-                "asset": s["asset"],
-                "family": s["family"],
-                "side": s["side"],
-                "signal_ts": ts,
-                "entry_ts": entry_ts,
-                "entry": entry,
-                "sl": sl,
-                "tp": tp,
-                "score": s["score"],
+                "asset": s["asset"], "family": s["family"], "side": s["side"],
+                "signal_ts": ts, "entry_ts": entry_ts, "entry": entry,
+                "sl": sl, "tp": tp, "score": s["score"],
             })
 
     return trades, positions, max_dd
@@ -586,46 +514,36 @@ def execute_backtest(f, signals, atr_mult):
 def summarize(trades, open_positions, max_dd, days):
     n = len(trades)
     wins = sum(t["outcome"] == "WIN" for t in trades)
-    losses = sum(t["outcome"] == "LOSS" for t in trades)
     gross_win = sum(t["pnl"] for t in trades if t["pnl"] > 0)
     gross_loss = -sum(t["pnl"] for t in trades if t["pnl"] < 0)
     eq = INITIAL_EQUITY
     peak = eq
     dd = 0.0
-    streak = 0
-    max_streak = 0
+    streak = max_streak = 0
     for t in sorted(trades, key=lambda z: z["exit_ts"]):
         eq += t["pnl"]
         peak = max(peak, eq)
         dd = min(dd, eq - peak)
         streak = streak + 1 if t["outcome"] == "LOSS" else 0
         max_streak = max(max_streak, streak)
-    net = sum(t["pnl"] for t in trades)
     return {
-        "trades": n,
-        "open": len(open_positions),
-        "wins": wins,
-        "losses": losses,
-        "wr": 100.0 * wins / n if n else 0.0,
+        "trades": n, "open": len(open_positions), "wins": wins,
+        "losses": n - wins, "wr": 100.0 * wins / n if n else 0.0,
         "pf": gross_win / gross_loss if gross_loss else (math.inf if gross_win else 0.0),
-        "pnl": net,
-        "dd": min(dd, max_dd),
-        "streak": max_streak,
-        "trades_day": n / days if days else 0.0,
+        "pnl": sum(t["pnl"] for t in trades), "dd": min(dd, max_dd),
+        "streak": max_streak, "trades_day": n / days if days else 0.0,
     }
 
 
 def score_result(s):
-    # Research ranking only. It never changes the simulated trades.
-    # Reward WR/PF while penalizing large loss clusters and very small samples.
     if s["trades"] < 100:
         return -1e9 + s["trades"]
-    score = 0.0
-    score += (s["wr"] - 45.0) * 5.0
-    score += max(-2.0, min(2.0, s["pf"] - 1.0)) * 25.0
-    score -= max(0, s["streak"] - 4) * 7.5
-    score += max(-5.0, min(5.0, s["pnl"] / 1000.0)) * 3.0
-    return score
+    return (
+        (s["wr"] - 40.0) * 4.0 +
+        max(-3.0, min(3.0, s["pf"] - 1.0)) * 30.0 -
+        max(0, s["streak"] - 4) * 5.0 +
+        max(-5.0, min(5.0, s["pnl"] / 1000.0)) * 2.0
+    )
 
 
 def main():
@@ -635,41 +553,40 @@ def main():
     args = ap.parse_args()
 
     print("=" * 96)
-    print("HUNTER-V152 — C2 REGIME-CONDITIONED ENTRY ENGINE")
-    print("15m raw -> 1H trigger / 4H context / 1D regime | no funding")
+    print("HUNTER-V153 — VOLATILITY-ADAPTIVE RELATIVE BREAKOUT")
+    print("15m raw -> 1H breakout / 4H trend context / 1D regime | no funding")
     print("=" * 96)
 
     all15 = ensure_data(Path(args.data_dir), args.days)
     f = add_cross_sectional_ranks(build_features(all15))
 
-    print(f"\nTesting {len(CONFIGS)} causal C2 configurations...")
+    configs = [
+        ("V153_BALANCED", 12, 0.65, 0.35, 18, 0.90, 0.30, -0.25, 0.62, 0.38, 1.40),
+        ("V153_STRICT_LEADERS", 12, 0.75, 0.25, 20, 0.90, 0.35, -0.10, 0.65, 0.35, 1.40),
+        ("V153_WIDE_WINDOW", 24, 0.65, 0.35, 18, 0.90, 0.30, -0.25, 0.62, 0.38, 1.40),
+        ("V153_HIGH_ADX", 12, 0.65, 0.35, 24, 0.90, 0.30, -0.25, 0.62, 0.38, 1.50),
+        ("V153_EXPANSION", 12, 0.70, 0.30, 20, 1.05, 0.35, 0.00, 0.65, 0.35, 1.50),
+        ("V153_TIGHT_RISK", 12, 0.70, 0.30, 20, 0.95, 0.35, -0.10, 0.65, 0.35, 1.20),
+    ]
+
+    print(f"\nTesting {len(configs)} causal V153 configurations...")
     results = []
-    for cfg in CONFIGS:
-        name = cfg[0]
+    for cfg in configs:
         signals = make_signals(f, cfg)
         trades, open_positions, max_dd = execute_backtest(f, signals, cfg[-1])
-        summary = summarize(trades, open_positions, max_dd, args.days)
-        summary["name"] = name
-        summary["signals"] = len(signals)
-        summary["score"] = score_result(summary)
-        summary["eligible"] = (
-            summary["trades"] >= 100
-            and summary["wr"] >= 50.0
-            and summary["streak"] <= 4
-            and summary["pf"] > 1.0
-            and summary["pnl"] > 0
+        s = summarize(trades, open_positions, max_dd, args.days)
+        s["name"] = cfg[0]
+        s["signals"] = len(signals)
+        s["score"] = score_result(s)
+        s["eligible"] = (
+            s["trades"] >= 100 and s["wr"] >= 50.0 and s["streak"] <= 4 and
+            s["pf"] > 1.0 and s["pnl"] > 0
         )
-        trend = sum(t["family"] == "TREND_CONTINUATION" for t in trades)
-        rev = sum(t["family"] == "EXHAUSTION_REVERSAL" for t in trades)
-        summary["trend_trades"] = trend
-        summary["reversal_trades"] = rev
-        results.append(summary)
+        results.append(s)
         print(
-            f"{name:<22} trades={summary['trades']:4d} WR={summary['wr']:6.2f}% "
-            f"PF={summary['pf']:6.3f} PnL=${summary['pnl']:>9,.2f} "
-            f"DD=${summary['dd']:>9,.2f} streak={summary['streak']:2d} "
-            f"t/day={summary['trades_day']:.2f} trend={trend:3d} rev={rev:3d} "
-            f"eligible={summary['eligible']}"
+            f"{cfg[0]:<22} trades={s['trades']:4d} WR={s['wr']:6.2f}% "
+            f"PF={s['pf']:6.3f} PnL=${s['pnl']:>9,.2f} DD=${s['dd']:>9,.2f} "
+            f"streak={s['streak']:2d} t/day={s['trades_day']:.2f} eligible={s['eligible']}"
         )
 
     ranked = sorted(results, key=lambda z: z["score"], reverse=True)
@@ -677,18 +594,16 @@ def main():
     for i, s in enumerate(ranked[:5], 1):
         print(
             f"{i}. {s['name']} | trades={s['trades']} WR={s['wr']:.2f}% "
-            f"PF={s['pf']:.3f} PnL=${s['pnl']:,.2f} DD=${s['dd']:,.2f} "
-            f"streak={s['streak']} eligible={s['eligible']}"
+            f"PF={s['pf']:.3f} PnL=${s['pnl']:,.2f} DD=${s['dd']:,.2f} streak={s['streak']}"
         )
 
-    eligible = [s for s in results if s["eligible"]]
+    edge = any(s["eligible"] for s in results)
     print("\n" + "=" * 96)
-    if eligible:
-        print("MEASURABLE_EDGE_PRESENT: True")
-        print("At least one causal configuration met all predeclared target gates.")
+    print(f"MEASURABLE_EDGE_PRESENT: {edge}")
+    if not edge:
+        print("No tested V153 configuration reached WR>=50%, max loss streak<=4, PF>1, positive PnL and >=100 trades.")
     else:
-        print("MEASURABLE_EDGE_PRESENT: False")
-        print("No tested C2 configuration reached WR>=50%, max loss streak<=4, PF>1, positive PnL and >=100 trades.")
+        print("At least one tested V153 configuration met all hard eligibility conditions.")
     print("=" * 96)
 
 
