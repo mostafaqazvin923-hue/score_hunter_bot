@@ -205,22 +205,53 @@ def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
                 f"{symbol} page {page}; start={current_start} end={window_end}"
             )
 
-        parsed_batch = []
+        # XT can return its latest available page even when our requested
+        # startTime is slightly ahead of the exchange's current historical
+        # watermark.  This is common near the live-data boundary.  Detect
+        # that case BEFORE filtering by the requested window; otherwise a
+        # perfectly valid final historical page is reported as "parsed empty".
+        parsed_all = []
         for row in raw_data:
             parsed = parse_xt_kline_row(row)
-            if parsed is None:
-                continue
-            ts = parsed[0]
-            # Never let an out-of-window XT record advance pagination.
-            if current_start <= ts <= window_end:
-                parsed_batch.append(parsed)
+            if parsed is not None:
+                parsed_all.append(parsed)
 
-        if not parsed_batch:
+        if not parsed_all:
             sample = raw_data[0] if raw_data else None
             raise RuntimeError(
-                f"Parsed batch is empty for {symbol} page {page}; "
-                f"raw_rows={len(raw_data)}, sample={sample!r}, "
-                f"requested=[{current_start},{window_end}]"
+                f"XT returned rows but none were parseable for {symbol} page {page}; "
+                f"raw_rows={len(raw_data)}, sample={sample!r}"
+            )
+
+        raw_max_ts = max(int(x[0]) for x in parsed_all)
+        raw_min_ts = min(int(x[0]) for x in parsed_all)
+
+        # If XT's latest available candle is already before our requested
+        # window, we have reached the exchange's data frontier.  Stop cleanly
+        # and let the full-dataset validation below decide whether coverage
+        # is sufficient.  Do NOT treat this as a parser failure.
+        if raw_max_ts < current_start:
+            print(
+                f"{symbol.upper()} page={page} reached XT data frontier: "
+                f"latest={pd.to_datetime(raw_max_ts, unit='ms', utc=True)} "
+                f"< requested_start={pd.to_datetime(current_start, unit='ms', utc=True)}"
+            )
+            break
+
+        parsed_batch = [
+            parsed for parsed in parsed_all
+            if current_start <= int(parsed[0]) <= window_end
+        ]
+
+        if not parsed_batch:
+            # A valid page may contain a few boundary records outside our
+            # exact window.  If it overlaps the requested range, fail loudly
+            # because that indicates an actual API/pagination inconsistency.
+            sample = raw_data[0] if raw_data else None
+            raise RuntimeError(
+                f"Parsed batch empty inside requested window for {symbol} page {page}; "
+                f"raw_rows={len(raw_data)}, raw_range=[{raw_min_ts},{raw_max_ts}], "
+                f"requested=[{current_start},{window_end}], sample={sample!r}"
             )
 
         # XT may return the boundary candle even when startTime is a few
