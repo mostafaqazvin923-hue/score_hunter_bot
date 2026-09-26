@@ -146,6 +146,13 @@ def fetch_futures(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
                     batch = batch2
                     window_end = retry_end
             if not valid_batch:
+                # Near the live edge XT may return a page containing only newer
+                # / not-yet-available candles even though the requested window
+                # ends at the latest completed 15m boundary. Treat this as normal
+                # end-of-history only when the cursor is within one 15m candle of
+                # the requested end; never hide an earlier pagination failure.
+                if cursor >= end_ms - INTERVAL_MS:
+                    break
                 raise RuntimeError(
                     f"futures API returned no in-range candles for {symbol}; "
                     f"cursor={cursor} window_end={window_end} raw_rows={len(batch)}"
@@ -206,6 +213,8 @@ def fetch_spot(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
                     batch = batch2
                     window_end = retry_end
             if not valid_batch:
+                if cursor >= end_ms - INTERVAL_MS:
+                    break
                 raise RuntimeError(
                     f"spot API returned no in-range candles for {symbol}; "
                     f"cursor={cursor} window_end={window_end} raw_rows={len(batch)}"
