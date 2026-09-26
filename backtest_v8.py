@@ -1,606 +1,363 @@
 #!/usr/bin/env python3
 """
-HUNTER-V2 — CROSS-SECTIONAL EXHAUSTION / REVERSION
-
-Research backtest for XT USDT-M Futures.
-
-Idea (deliberately different from HUNTER-V1):
-    1D + 4H market regime -> cross-sectional 1H relative-strength extreme
-    -> exhaustion/reversal confirmation -> next 1H open entry.
-
-There is no liquidity sweep, pivot logic, breakout, trailing, BE or timeout.
-The signal is based on relative performance across the portfolio, not a
-single-symbol structural pattern.
-
-Hard rules:
-- Raw XT Futures source: 15m.
-- Signals only on completed 1H candles.
-- 4H/1D context uses completed candles only.
-- Entry at next 1H open with adverse slippage.
-- Fixed RR 1:2.
-- Fixed $100 margin, 50x leverage.
-- Maximum 3 simultaneous positions.
-- No same-symbol overlap.
-- No timeout / forced exit at dataset end.
-- Same-candle SL+TP is LOSS.
-- Positions open at dataset end remain OPEN.
-- No lookahead / repaint / future leak.
-
-This is a research engine, not an execution bot.
+HUNTER-V3: Trend Continuation After Compression Engine
+- Data: XT Futures 15m resampled causally to 1H, 4H, 1D.
+- Core: Daily Trend + 4H Confirmation + 1H Compression + Trigger Confirmation.
+- Execution: Fixed RR 1:2, Strict No Lookahead, No Repainting, Detailed Metrics.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
-import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 import pandas as pd
-import requests
 
-# -----------------------------
-# Project configuration
-# -----------------------------
 SYMBOLS = [
-    "BTC", "ETH", "SOL", "SUI", "AVAX", "NEAR", "ADA", "BNB",
-    "APT", "CRV", "ONDO", "PENDLE", "ICP", "WIF",
+    "BTC", "ETH", "SOL", "SUI", "AVAX", "NEAR", "ADA",
+    "BNB", "APT", "CRV", "ONDO", "PENDLE", "ICP", "WIF",
 ]
 
-BASE_FUT = "https://fapi.xt.com"
-KLINE_URL = f"{BASE_FUT}/future/market/v1/public/q/kline"
-SYMBOL_URL = f"{BASE_FUT}/future/market/v1/public/symbol/list"
+DATA_DIR = Path("data/xt_futures_v3")
+OUT_DIR = DATA_DIR / "backtest_v3"
 
-DAYS = 365
-WARMUP_DAYS = 35
-INTERVAL = "15m"
-INTERVAL_MS = 15 * 60 * 1000
-LIMIT = 1500
-REQUEST_TIMEOUT = 20
-RETRIES = 5
-MIN_ROWS = 30000
-
-INITIAL_EQUITY = 1000.0
-MARGIN = 100.0
+INITIAL_CAPITAL = 1000.0
+MARGIN_PER_TRADE = 100.0
 LEVERAGE = 50.0
-FEE_RATE = 0.0007
-SLIPPAGE = 0.0003
 RR = 2.0
-MAX_OPEN_POSITIONS = 3
 
-# Cross-sectional signal parameters. No optimization in this first run.
-RETURN_LOOKBACK_H = 24
-CROSS_SECTION_Z_MIN = 1.00
-REVERSAL_RETURN_H = 2
-MIN_REVERSAL_ATR = 0.15
-ATR_PERIOD = 14
-ATR_STOP_MULT = 1.20
-MIN_STOP_PCT = 0.0020
-MAX_STOP_PCT = 0.0350
+FEE_RATE = 0.0007   # Configurable
+SLIPPAGE = 0.0003  # Configurable
 
-DATA_DIR = Path("data/xt_hunter_v2")
-OUT_DIR = DATA_DIR / "results"
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "HUNTER-V2-XT/1.0"})
-
-
-def request_json(url: str, params: dict) -> dict:
-    last = None
-    for attempt in range(1, RETRIES + 1):
-        try:
-            r = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            r.raise_for_status()
-            obj = r.json()
-            if not isinstance(obj, dict):
-                raise RuntimeError("non-dict JSON response")
-            return obj
-        except Exception as exc:
-            last = exc
-            if attempt < RETRIES:
-                time.sleep(min(2.0, 0.4 * attempt))
-    raise RuntimeError(f"XT request failed: {url} {params} :: {last}")
-
-
-def extract_list(obj: dict) -> list:
-    result = obj.get("result")
-    if isinstance(result, list):
-        return result
-    if isinstance(result, dict):
-        for key in ("items", "data", "list", "rows"):
-            value = result.get(key)
-            if isinstance(value, list):
-                return value
-    for key in ("data", "list", "rows"):
-        value = obj.get(key)
-        if isinstance(value, list):
-            return value
-    return []
-
-
-def parse_kline(rows: list) -> list:
-    out = []
-    for x in rows:
-        try:
-            if isinstance(x, dict):
-                t = x.get("t")
-                o = x.get("o", x.get("open"))
-                h = x.get("h", x.get("high"))
-                l = x.get("l", x.get("low"))
-                c = x.get("c", x.get("close"))
-                v = x.get("a", x.get("q", x.get("volume", 0)))
-            elif isinstance(x, (list, tuple)) and len(x) >= 6:
-                t, o, h, l, c, v = x[:6]
-            else:
-                continue
-            out.append((int(t), float(o), float(h), float(l), float(c), float(v)))
-        except (TypeError, ValueError):
-            continue
-    return out
-
-
-def resolve_symbol(asset: str, discovered: list) -> str:
-    wanted = {asset.lower(), f"{asset.lower()}_usdt", f"{asset.lower()}/usdt"}
-    for item in discovered:
-        if isinstance(item, str):
-            s = item
-        elif isinstance(item, dict):
-            s = item.get("symbol") or item.get("contract") or item.get("name") or ""
-        else:
-            continue
-        s = str(s)
-        if s.lower() in wanted:
-            return s
-    return f"{asset.lower()}_usdt"
-
-
-def fetch_symbol(asset: str, xt_symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    rows: List[Tuple[int, float, float, float, float, float]] = []
-    cursor = start_ms
-    guard = 0
-
-    while cursor <= end_ms:
-        guard += 1
-        if guard > 1000:
-            raise RuntimeError(f"{asset}: pagination guard tripped")
-
-        window_end = min(end_ms, cursor + LIMIT * INTERVAL_MS - 1)
-        params = {
-            "symbol": xt_symbol,
-            "interval": INTERVAL,
-            "startTime": cursor,
-            "endTime": window_end,
-            "limit": LIMIT,
-        }
-
-        batch: list = []
-        for attempt in range(RETRIES):
-            try:
-                batch = parse_kline(extract_list(request_json(KLINE_URL, params)))
-                if batch:
-                    break
-            except Exception:
-                if attempt == RETRIES - 1:
-                    raise
-                time.sleep(min(2.0, 0.4 * (attempt + 1)))
-
-        in_window = [x for x in batch if cursor <= x[0] <= window_end]
-        if not in_window:
-            cursor = window_end + 1
-            continue
-
-        rows.extend(in_window)
-        mx = max(x[0] for x in in_window)
-        next_cursor = mx + 1
-        if next_cursor <= cursor:
-            raise RuntimeError(f"{asset}: pagination failed to advance")
-        cursor = next_cursor
-        time.sleep(0.03)
-
-    if not rows:
-        raise RuntimeError(f"{asset}: zero XT candles")
-
-    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
-    df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
-    df = df[(df.ts >= start_ms) & (df.ts <= end_ms)].copy()
-    if len(df) < MIN_ROWS:
-        raise RuntimeError(f"{asset}: only {len(df):,} rows; refusing partial data")
-
-    span = int(df.ts.iloc[-1] - df.ts.iloc[0])
-    required = int(DAYS * 86400 * 1000 * 0.90)
-    if span < required:
-        raise RuntimeError(f"{asset}: coverage too short ({span / 86400000:.1f} days)")
-
-    gaps = np.diff(df.ts.to_numpy(dtype=np.int64))
-    if len(gaps) and int(gaps.max()) > int(INTERVAL_MS * 1.5):
-        raise RuntimeError(f"{asset}: 15m data gap detected")
-
-    df["datetime"] = pd.to_datetime(df.ts, unit="ms", utc=True)
-    return df
-
-
-def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    x = df.set_index("datetime")[
-        ["open", "high", "low", "close", "volume"]
-    ].resample(rule, label="left", closed="left").agg(
-        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    )
-    x = x.dropna(subset=["open", "high", "low", "close"]).copy()
-    return x
-
-
-def atr(df: pd.DataFrame, period: int) -> pd.Series:
-    prev = df["close"].shift(1)
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - prev).abs(),
-            (df["low"] - prev).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.rolling(period, min_periods=period).mean()
-
-
-def add_context(df: pd.DataFrame) -> pd.DataFrame:
-    x = df.copy()
-    x["atr"] = atr(x, ATR_PERIOD)
-    x["ret_24h"] = x["close"].pct_change(RETURN_LOOKBACK_H)
-    x["ret_2h"] = x["close"].pct_change(REVERSAL_RETURN_H)
-    x["range"] = x["high"] - x["low"]
-    x["body"] = (x["close"] - x["open"]).abs()
-    x["body_atr"] = x["body"] / x["atr"].replace(0, np.nan)
-    x["ema20"] = x["close"].ewm(span=20, adjust=False, min_periods=20).mean()
-    x["ema50"] = x["close"].ewm(span=50, adjust=False, min_periods=50).mean()
-    return x
-
-
-def prepare_symbol(asset: str, raw: pd.DataFrame) -> dict:
-    h1 = resample_ohlcv(raw, "1h")
-    h4 = resample_ohlcv(raw, "4h")
-    d1 = resample_ohlcv(raw, "1D")
-
-    h1 = add_context(h1)
-
-    h4["ema50"] = h4["close"].ewm(span=50, adjust=False, min_periods=50).mean()
-    h4["ema200"] = h4["close"].ewm(span=200, adjust=False, min_periods=200).mean()
-    d1["ema50"] = d1["close"].ewm(span=50, adjust=False, min_periods=50).mean()
-    d1["ema200"] = d1["close"].ewm(span=200, adjust=False, min_periods=200).mean()
-
-    # Shift context by one completed higher-timeframe candle relative to the
-    # 1H signal. This makes the causal boundary explicit.
-    h4_ctx = h4[["close", "ema50", "ema200"]].rename(
-        columns={"close": "h4_close", "ema50": "h4_ema50", "ema200": "h4_ema200"}
-    ).shift(1)
-    d1_ctx = d1[["close", "ema50", "ema200"]].rename(
-        columns={"close": "d1_close", "ema50": "d1_ema50", "ema200": "d1_ema200"}
-    ).shift(1)
-
-    h1 = h1.join(h4_ctx.reindex(h1.index, method="ffill"))
-    h1 = h1.join(d1_ctx.reindex(h1.index, method="ffill"))
-    h1["asset"] = asset
-    return h1
-
-
-def build_panel(prepared: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    parts = []
-    for asset, df in prepared.items():
-        x = df.copy()
-        x["cross_z"] = np.nan
-        parts.append(x)
-
-    # Cross-sectional z-score is calculated only among assets available at the
-    # same completed 1H timestamp.
-    panel = pd.concat(parts, keys=prepared.keys(), names=["asset", "datetime"])
-    panel = panel.reset_index()
-    panel["cross_mean"] = panel.groupby("datetime")["ret_24h"].transform("mean")
-    panel["cross_std"] = panel.groupby("datetime")["ret_24h"].transform("std", ddof=0)
-    panel["cross_z"] = (
-        (panel["ret_24h"] - panel["cross_mean"])
-        / panel["cross_std"].replace(0, np.nan)
-    )
-    panel = panel.set_index(["asset", "datetime"]).sort_index()
-    return panel
-
-
-def regime(row: pd.Series) -> int:
-    d1_ok = pd.notna(row.get("d1_ema50")) and pd.notna(row.get("d1_ema200"))
-    h4_ok = pd.notna(row.get("h4_ema50")) and pd.notna(row.get("h4_ema200"))
-    if not (d1_ok and h4_ok):
-        return 0
-    if row["d1_ema50"] > row["d1_ema200"] and row["h4_ema50"] > row["h4_ema200"]:
-        return 1
-    if row["d1_ema50"] < row["d1_ema200"] and row["h4_ema50"] < row["h4_ema200"]:
-        return -1
-    return 0
-
-
-def make_signal(row: pd.Series) -> int:
-    """Return +1 long, -1 short, 0 no signal."""
-    z = row.get("cross_z")
-    atr_v = row.get("atr")
-    if not np.isfinite(z) or not np.isfinite(atr_v) or atr_v <= 0:
-        return 0
-
-    reg = regime(row)
-    if reg == 0:
-        return 0
-
-    # Extreme relative underperformance in a bullish market -> long reversal.
-    # Extreme relative outperformance in a bearish market -> short reversal.
-    if reg == 1 and z <= -CROSS_SECTION_Z_MIN:
-        if row["close"] > row["open"] and row["ret_2h"] > 0:
-            if row["body_atr"] >= MIN_REVERSAL_ATR:
-                return 1
-
-    if reg == -1 and z >= CROSS_SECTION_Z_MIN:
-        if row["close"] < row["open"] and row["ret_2h"] < 0:
-            if row["body_atr"] >= MIN_REVERSAL_ATR:
-                return -1
-
-    return 0
-
-
-class Position:
-    def __init__(self, asset: str, side: int, entry_time, entry: float, stop: float, tp: float):
-        self.asset = asset
-        self.side = side
-        self.entry_time = entry_time
-        self.entry = entry
-        self.stop = stop
-        self.tp = tp
-
-
-def execute_exit(pos: Position, bar: pd.Series) -> Optional[Tuple[str, float]]:
-    if pos.side == 1:
-        hit_sl = bar["low"] <= pos.stop
-        hit_tp = bar["high"] >= pos.tp
-    else:
-        hit_sl = bar["high"] >= pos.stop
-        hit_tp = bar["low"] <= pos.tp
-
-    if not hit_sl and not hit_tp:
-        return None
-    if hit_sl and hit_tp:
-        return "LOSS", pos.stop
-    if hit_sl:
-        return "LOSS", pos.stop
-    return "WIN", pos.tp
-
-
-def trade_pnl(pos: Position, exit_price: float) -> float:
-    notional = MARGIN * LEVERAGE
-    gross = notional * ((exit_price - pos.entry) / pos.entry) * pos.side
-    fees = notional * FEE_RATE * 2.0
-    return gross - fees
-
-
-def build_positions(panel: pd.DataFrame) -> Tuple[List[dict], List[Position]]:
-    """Causal portfolio simulation using globally chronological 1H candles."""
-    times = sorted(panel.index.get_level_values("datetime").unique())
-    by_time = {t: panel.xs(t, level="datetime") for t in times}
-
-    open_pos: Dict[str, Position] = {}
-    trades: List[dict] = []
-    equity = INITIAL_EQUITY
-    peak = equity
-    max_dd = 0.0
-    last_close_time = None
-    loss_streak = 0
-    max_loss_streak = 0
-
-    # Signals from candle t enter at candle t+1 open.
-    pending: Dict[pd.Timestamp, List[Tuple[str, int, float, float]]] = {}
-
-    for idx, t in enumerate(times[:-1]):
-        next_t = times[idx + 1]
-        frame = by_time[t]
-        next_frame = by_time.get(next_t)
-        if next_frame is None:
-            continue
-
-        # 1) Resolve exits on completed candle t before creating new signals.
-        for asset in list(open_pos):
-            pos = open_pos[asset]
-            row = frame.loc[asset]
-            result = execute_exit(pos, row)
-            if result is None:
-                continue
-            outcome, exit_price = result
-            pnl = trade_pnl(pos, exit_price)
-            equity += pnl
-            trades.append(
-                {
-                    "asset": asset,
-                    "side": "LONG" if pos.side == 1 else "SHORT",
-                    "entry_time": pos.entry_time,
-                    "exit_time": t,
-                    "entry": pos.entry,
-                    "exit": exit_price,
-                    "stop": pos.stop,
-                    "tp": pos.tp,
-                    "outcome": outcome,
-                    "pnl": pnl,
-                }
-            )
-            if outcome == "LOSS":
-                loss_streak += 1
-                max_loss_streak = max(max_loss_streak, loss_streak)
-            else:
-                loss_streak = 0
-            del open_pos[asset]
-            last_close_time = t
-            peak = max(peak, equity)
-            max_dd = min(max_dd, equity - peak)
-
-        # 2) Execute entries scheduled from the previous completed candle.
-        entries = pending.pop(t, [])
-        # Deterministic ranking: strongest absolute cross-sectional extreme first.
-        entries.sort(key=lambda x: (-abs(x[2]), x[0]))
-        for asset, side, stop_distance, _z in entries:
-            if len(open_pos) >= MAX_OPEN_POSITIONS:
-                break
-            if asset in open_pos:
-                continue
-            if last_close_time == t:
-                # Explicitly forbid a new entry on the candle that closed a trade.
-                continue
-            if asset not in next_frame.index and asset not in frame.index:
-                continue
-            if asset not in frame.index:
-                continue
-            entry_row = frame.loc[asset]
-            raw_entry = float(entry_row["open"] if t in by_time and asset in frame.index else np.nan)
-            if not np.isfinite(raw_entry) or raw_entry <= 0:
-                continue
-            entry = raw_entry * (1.0 + SLIPPAGE * side)
-            if side == 1:
-                stop = entry - stop_distance
-                tp = entry + RR * stop_distance
-            else:
-                stop = entry + stop_distance
-                tp = entry - RR * stop_distance
-            if stop <= 0 or tp <= 0:
-                continue
-            open_pos[asset] = Position(asset, side, t, entry, stop, tp)
-
-        # 3) Generate signals from completed candle t for next candle entry.
-        # No signal is allowed on a candle that just closed any trade.
-        if last_close_time == t:
-            continue
-        candidates: List[Tuple[str, int, float, float]] = []
-        for asset, row in frame.iterrows():
-            if asset in open_pos:
-                continue
-            side = make_signal(row)
-            if side == 0:
-                continue
-            atr_v = float(row["atr"])
-            stop_distance = max(ATR_STOP_MULT * atr_v, MIN_STOP_PCT * float(row["close"]))
-            stop_pct = stop_distance / float(row["close"])
-            if stop_pct > MAX_STOP_PCT:
-                continue
-            candidates.append((asset, side, stop_distance, float(abs(row["cross_z"]))))
-        candidates.sort(key=lambda x: (-x[3], x[0]))
-        capacity = max(0, MAX_OPEN_POSITIONS - len(open_pos))
-        for asset, side, stop_distance, zabs in candidates[:capacity]:
-            pending.setdefault(next_t, []).append((asset, side, stop_distance, zabs))
-
-    return trades, list(open_pos.values())
-
-
-def summarize(trades: List[dict], open_positions: List[Position], start_dt, end_dt) -> dict:
-    wins = [t["pnl"] for t in trades if t["outcome"] == "WIN"]
-    losses = [t["pnl"] for t in trades if t["outcome"] == "LOSS"]
-    total = len(trades)
-    wr = 100.0 * len(wins) / total if total else 0.0
-    gross_win = sum(wins)
-    gross_loss = abs(sum(losses))
-    pf = gross_win / gross_loss if gross_loss > 0 else (math.inf if gross_win > 0 else 0.0)
-
-    equity = INITIAL_EQUITY
-    peak = equity
-    max_dd = 0.0
-    for t in trades:
-        equity += t["pnl"]
-        peak = max(peak, equity)
-        max_dd = min(max_dd, equity - peak)
-
-    streak = 0
-    max_streak = 0
-    for t in trades:
-        if t["outcome"] == "LOSS":
-            streak += 1
-            max_streak = max(max_streak, streak)
-        else:
-            streak = 0
-
-    days = max((end_dt - start_dt).total_seconds() / 86400.0, 1.0)
-    return {
-        "initial_equity": INITIAL_EQUITY,
-        "final_equity": equity,
-        "net_pnl": equity - INITIAL_EQUITY,
-        "trades": total,
-        "wins": len(wins),
-        "losses": len(losses),
-        "win_rate_pct": wr,
-        "profit_factor": pf,
-        "max_drawdown": max_dd,
-        "max_loss_streak": max_streak,
-        "trades_per_day": total / days,
-        "open_positions_at_end": len(open_positions),
-    }
-
-
-def print_report(summary: dict, trades: List[dict]) -> None:
-    print("\nHUNTER-V2 — FINAL BACKTEST")
-    for k, v in summary.items():
-        if isinstance(v, float):
-            print(f"{k} {v:.6f}")
-        else:
-            print(f"{k} {v}")
-
-    if trades:
-        df = pd.DataFrame(trades)
-        print("\nPER-SYMBOL")
-        for asset, g in df.groupby("asset", sort=True):
-            wins = int((g.outcome == "WIN").sum())
-            n = len(g)
-            wr = 100.0 * wins / n if n else 0.0
-            gw = g.loc[g.outcome == "WIN", "pnl"].sum()
-            gl = -g.loc[g.outcome == "LOSS", "pnl"].sum()
-            pf = gw / gl if gl > 0 else (math.inf if gw > 0 else 0.0)
-            print(f"{asset:8s} trades={n:4d} WR={wr:6.2f}% PF={pf:7.3f} NetPnL={g.pnl.sum():10.2f}")
-
-
-def parse_args() -> argparse.Namespace:
+def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--days", type=int, default=DAYS)
+    p.add_argument("--data-dir", default=str(DATA_DIR))
+    p.add_argument("--out-dir", default=str(OUT_DIR))
     return p.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    days = int(args.days)
-    if days < 30:
-        raise ValueError("--days must be >= 30")
-
-    end_ms = (int(time.time() * 1000) // INTERVAL_MS) * INTERVAL_MS - 1
-    start_ms = end_ms - int((days + WARMUP_DAYS) * 86400 * 1000)
-
-    print("HUNTER-V2 — CROSS-SECTIONAL EXHAUSTION / REVERSION")
-    print(f"days={days} symbols={len(SYMBOLS)} timeframe=15m->1h")
-    print("Fetching XT Futures data...")
-
-    discovered = []
+def ensure_xt_data(data_dir: Path, symbols: list[str]):
+    data_dir.mkdir(parents=True, exist_ok=True)
     try:
-        discovered = extract_list(request_json(SYMBOL_URL, {}))
-    except Exception as exc:
-        print(f"symbol-list warning: {exc}; using default XT symbols")
+        import ccxt
+    except ImportError:
+        return
 
-    prepared: Dict[str, pd.DataFrame] = {}
-    for i, asset in enumerate(SYMBOLS, 1):
-        xt_symbol = resolve_symbol(asset, discovered)
-        print(f"[{i}/{len(SYMBOLS)}] {asset} -> {xt_symbol}")
-        raw = fetch_symbol(asset, xt_symbol, start_ms, end_ms)
-        prepared[asset] = prepare_symbol(asset, raw)
-        print(f"    15m rows={len(raw):,} 1h rows={len(prepared[asset]):,}")
+    exchange = ccxt.xt({'enableRateLimit': True})
+    exchange.options['defaultType'] = 'swap'
 
-    panel = build_panel(prepared)
-    trades, open_positions = build_positions(panel)
+    for symbol in symbols:
+        file_path = data_dir / f"{symbol}_USDT_15m.csv"
+        if file_path.exists() and file_path.stat().st_size > 200:
+            continue
+        try:
+            ccxt_symbol = f"{symbol}/USDT:USDT"
+            ohlcv = exchange.fetch_ohlcv(ccxt_symbol, timeframe='15m', limit=1500)
+            if ohlcv:
+                pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).to_csv(file_path, index=False)
+        except Exception:
+            pass
 
-    start_dt = pd.to_datetime(start_ms, unit="ms", utc=True).to_pydatetime()
-    end_dt = pd.to_datetime(end_ms, unit="ms", utc=True).to_pydatetime()
-    summary = summarize(trades, open_positions, start_dt, end_dt)
-    print_report(summary, trades)
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(trades).to_csv(OUT_DIR / "trades.csv", index=False)
-    pd.DataFrame([summary]).to_csv(OUT_DIR / "summary.csv", index=False)
-    print(f"\nSaved: {OUT_DIR / 'summary.csv'}")
-    print(f"Saved: {OUT_DIR / 'trades.csv'}")
+def load_and_resample_data(data_dir: Path, symbol: str) -> dict[str, pd.DataFrame]:
+    path = data_dir / f"{symbol}_USDT_15m.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing 15m file for {symbol}: {path}")
+
+    df = pd.read_csv(path)
+    if {"Date", "Open", "High", "Low", "Close", "Volume"}.issubset(df.columns):
+        df = df.rename(columns={"Date": "timestamp", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+
+    ts = pd.to_datetime(df["timestamp"], unit="ms", utc=True) if np.issubdtype(df["timestamp"].dtype, np.number) else pd.to_datetime(df["timestamp"], utc=True)
+    df["timestamp"] = ts
+    df = df.set_index("timestamp").sort_index()
+    df = df[~df.index.duplicated(keep="last")].copy()
+
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close", "volume"])
+
+    # Causal resampling to higher timeframes (using closed bars via label='right', closed='right' or standard aggregation)
+    df_1h = df.resample('1h').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
+    df_4h = df.resample('4h').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
+    df_1d = df.resample('1d').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
+
+    return {"15m": df, "1h": df_1h, "4h": df_4h, "1d": df_1d}
+
+
+def calculate_indicators(dfs: dict[str, pd.DataFrame]):
+    # --- 1D Indicators ---
+    d1 = dfs["1d"]
+    prev_close_1d = d1["close"].shift(1)
+    d1["ema200"] = prev_close_1d.ewm(span=200, adjust=False, min_periods=200).mean()
+    d1["ema50"] = prev_close_1d.ewm(span=50, adjust=False, min_periods=50).mean()
+    d1["ema50_slope"] = d1["ema50"].diff()
+
+    # --- 4H Indicators ---
+    h4 = dfs["4h"]
+    prev_close_4h = h4["close"].shift(1)
+    h4["ema50"] = prev_close_4h.ewm(span=50, adjust=False, min_periods=50).mean()
+    h4["ema200"] = prev_close_4h.ewm(span=200, adjust=False, min_periods=200).mean()
+
+    # --- 1H Indicators ---
+    h1 = dfs["1h"]
+    prev_close_1h = h1["close"].shift(1)
+    tr = pd.concat([
+        h1["high"] - h1["low"],
+        (h1["high"] - prev_close_1h).abs(),
+        (h1["low"] - prev_close_1h).abs(),
+    ], axis=1).max(axis=1)
+    h1["atr14"] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    h1["atr_sma48"] = h1["atr14"].shift(1).rolling(window=48).mean()
+    
+    h1["candle_range"] = h1["high"] - h1["low"]
+    h1["avg_range_20"] = h1["candle_range"].shift(1).rolling(window=20).mean()
+    
+    h1["ema20"] = prev_close_1h.ewm(span=20, adjust=False, min_periods=20).mean()
+    h1["vol_sma20"] = h1["volume"].shift(1).rolling(window=20).mean()
+    h1["body"] = (h1["close"] - h1["open"]).abs()
+
+
+def run_backtest(all_symbol_data: dict[str, dict[str, pd.DataFrame]]) -> list[dict]:
+    # Collect all unique 1H timestamps across all symbols in chronological order
+    all_1h_times = sorted(list(set().union(*(dfs["1h"].index for dfs in all_symbol_data.values()))))
+
+    active_positions = {}
+    trades = []
+    symbol_cooldown = {sym: 0 for sym in all_symbol_data.keys()}
+
+    for ts in all_1h_times:
+        # 1. Update cooldowns
+        for sym in symbol_cooldown:
+            if symbol_cooldown[sym] > 0:
+                symbol_cooldown[sym] -= 1
+
+        # 2. Manage active positions (Check SL/TP on current 1H bar)
+        for symbol, pos in list(active_positions.items()):
+            h1_df = all_symbol_data[symbol]["1h"]
+            if ts not in h1_df.index:
+                continue
+            bar = h1_df.loc[ts]
+            hi, lo = float(bar["high"]), float(bar["low"])
+            side, sl, tp, entry = pos["side"], pos["sl"], pos["tp"], pos["entry"]
+            notional = MARGIN_PER_TRADE * LEVERAGE
+
+            hit_sl = lo <= sl if side == "LONG" else hi >= sl
+            hit_tp = hi >= tp if side == "LONG" else lo <= tp
+
+            if hit_sl or hit_tp:
+                if hit_sl and hit_tp:
+                    outcome = "LOSS"  # Conservative rule: both hit = LOSS
+                    exit_price = sl
+                elif hit_sl:
+                    outcome = "LOSS"
+                    exit_price = sl
+                else:
+                    outcome = "WIN"
+                    exit_price = tp
+
+                gross = (exit_price - entry) / entry * notional if side == "LONG" else (entry - exit_price) / entry * notional
+                fees = notional * FEE_RATE * 2.0
+                pnl = gross - fees
+
+                trades.append({
+                    "symbol": symbol, "side": side, "entry_ts": pos["entry_ts"], "exit_ts": ts,
+                    "outcome": outcome, "pnl": float(pnl), "entry": entry, "exit": exit_price,
+                })
+                symbol_cooldown[symbol] = 4  # Wait 4 completed 1H candles
+                del active_positions[symbol]
+
+        # 3. Look for new entries if portfolio capacity allows (< 3 open positions)
+        if len(active_positions) < 3:
+            candidates = []
+            for symbol, dfs in all_symbol_data.items():
+                if symbol in active_positions:
+                    continue
+                if symbol_cooldown[symbol] > 0:
+                    continue
+
+                h1_df, h4_df, d1_df = dfs["1h"], dfs["4h"], dfs["1d"]
+
+                # Align timestamps causally (get latest available completed bar up to current ts)
+                d1_subset = d1_df[d1_df.index <= ts]
+                h4_subset = h4_df[h4_df.index <= ts]
+                h1_subset = h1_df[h1_df.index < ts] # strictly completed 1H candles for trigger
+
+                if d1_subset.empty or h4_subset.empty or len(h1_subset) < 3:
+                    continue
+
+                d1_row = d1_subset.iloc[-1]
+                h4_row = h4_subset.iloc[-1]
+                
+                # Check Daily Trend
+                d1_close = d1_row["close"]
+                d1_ema200 = d1_row.get("ema200", np.nan)
+                d1_ema50 = d1_row.get("ema50", np.nan)
+                d1_slope = d1_row.get("ema50_slope", np.nan)
+
+                if not (np.isfinite(d1_ema200) and np.isfinite(d1_ema50) and np.isfinite(d1_slope)):
+                    continue
+
+                daily_long = (d1_close > d1_ema200) and (d1_ema50 > d1_ema200) and (d1_slope > 0)
+                daily_short = (d1_close < d1_ema200) and (d1_ema50 < d1_ema200) and (d1_slope < 0)
+
+                if not (daily_long or daily_short):
+                    continue
+
+                # Check 4H Confirmation
+                h4_close = h4_row["close"]
+                h4_ema50 = h4_row.get("ema50", np.nan)
+                h4_ema200 = h4_row.get("ema200", np.nan)
+                if not (np.isfinite(h4_ema50) and np.isfinite(h4_ema200)):
+                    continue
+
+                h4_last_3 = h4_df[h4_df.index <= ts].tail(3)
+                if len(h4_last_3) < 3:
+                    continue
+
+                if daily_long:
+                    h4_ok = (h4_ema50 > h4_ema200) and (h4_close > h4_ema50) and any(h4_last_3["close"] > h4_last_3["ema50"])
+                    side = "LONG"
+                else:
+                    h4_ok = (h4_ema50 < h4_ema200) and (h4_close < h4_ema50) and any(h4_last_3["close"] < h4_last_3["ema50"])
+                    side = "SHORT"
+
+                if not h4_ok:
+                    continue
+
+                # Check 1H Compression & Trigger on the most recently completed 1H candle
+                completed_1h = h1_df[h1_df.index <= ts]
+                if len(completed_1h) < 25:
+                    continue
+
+                prev_bar = completed_1h.iloc[-2] # Completed trigger candle
+                curr_bar = completed_1h.iloc[-1] # Candle where entry occurs at OPEN
+
+                atr = prev_bar.get("atr14", np.nan)
+                atr_sma = prev_bar.get("atr_sma48", np.nan)
+                candle_rng = prev_bar.get("candle_range", np.nan)
+                avg_rng = prev_bar.get("avg_range_20", np.nan)
+                ema20 = prev_bar.get("ema20", np.nan)
+                vol_sma = prev_bar.get("vol_sma20", np.nan)
+
+                if not all(np.isfinite([atr, atr_sma, candle_rng, avg_rng, ema20, vol_sma])):
+                    continue
+
+                compression_ok = (atr < atr_sma) and (candle_rng < avg_rng)
+                if not compression_ok:
+                    continue
+
+                # Trigger checks on prev_bar (completed 1H)
+                p_close = prev_bar["close"]
+                p_open = prev_bar["open"]
+                p_high = prev_bar["high"]
+                p_low = prev_bar["low"]
+                p_vol = prev_bar["volume"]
+                p_body = prev_bar["body"]
+
+                prev_to_prev_high = completed_1h.iloc[-3]["high"] if len(completed_1h) >= 3 else p_high
+                prev_to_prev_low = completed_1h.iloc[-3]["low"] if len(completed_1h) >= 3 else p_low
+
+                if side == "LONG":
+                    is_bullish = p_close > p_open
+                    cond_trigger = is_bullish and (p_close > prev_to_prev_high) and (p_body >= 0.5 * candle_rng) and (p_vol >= 1.2 * vol_sma)
+                    not_too_far = p_low >= (ema20 - 2.0 * atr)  # Price not too far below EMA20
+                    if not (cond_trigger and not_too_far):
+                        continue
+                    sl = p_low
+                else:
+                    is_bearish = p_close < p_open
+                    cond_trigger = is_bearish and (p_close < prev_to_prev_low) and (p_body >= 0.5 * candle_rng) and (p_vol >= 1.2 * vol_sma)
+                    not_too_far = p_high <= (ema20 + 2.0 * atr)
+                    if not (cond_trigger and not_too_far):
+                        continue
+                    sl = p_high
+
+                candidates.append((symbol, side, prev_bar.name, sl))
+
+            # Open trades based on candidates (max portfolio limit = 3)
+            for symbol, side, trigger_ts, sl in candidates:
+                if len(active_positions) >= 3:
+                    break
+                if symbol in active_positions:
+                    continue
+
+                h1_df = all_symbol_data[symbol]["1h"]
+                next_indices = h1_df.index[h1_df.index > trigger_ts]
+                if len(next_indices) == 0:
+                    continue
+
+                entry_ts = next_indices[0]
+                raw_open = float(h1_df.loc[entry_ts, "open"])
+                entry = raw_open * (1.0 + SLIPPLACE) if side == "LONG" else raw_open * (1.0 - SLIPPLACE)
+
+                risk = (entry - sl) if side == "LONG" else (sl - entry)
+                atr_val = h1_df.loc[trigger_ts].get("atr14", risk)
+
+                # SL distance validation: 0.5 ATR <= risk <= 2 ATR
+                if not (0.5 * atr_val <= risk <= 2.0 * atr_val):
+                    continue
+
+                tp = entry + (RR * risk) if side == "LONG" else entry - (RR * risk)
+
+                active_positions[symbol] = {
+                    "symbol": symbol, "side": side,
+                    "entry_ts": entry_ts, "entry": entry, "sl": sl, "tp": tp,
+                }
+
+    return trades
+
+
+def main():
+    args = parse_args()
+    data_dir, out_dir = Path(args.data_dir), Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 88)
+    print("HUNTER-V3: Trend Continuation After Compression Engine")
+    print("=" * 88)
+
+    ensure_xt_data(data_dir, SYMBOLS)
+
+    all_symbol_data = {}
+    for sym in SYMBOLS:
+        try:
+            dfs = load_and_resample_data(data_dir, sym)
+            calculate_indicators(dfs)
+            all_symbol_data[sym] = dfs
+        except Exception as e:
+            print(f"Skipping {sym}: {e}")
+
+    trades = run_backtest(all_symbol_data)
+
+    total = len(trades)
+    wins = sum(1 for t in trades if t["outcome"] == "WIN")
+    losses = total - wins
+    win_rate = (wins / total * 100.0) if total > 0 else 0.0
+    net_pnl = sum(t["pnl"] for t in trades)
+
+    gross_profit = sum(t["pnl"] for t in trades if t["pnl"] > 0)
+    gross_loss = abs(sum(t["pnl"] for t in trades if t["pnl"] < 0))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float('inf') if gross_profit > 0 else 0.0)
+
+    consec, max_consec = 0, 0
+    for t in sorted(trades, key=lambda x: pd.Timestamp(x["exit_ts"])):
+        if t["outcome"] == "LOSS":
+            consec += 1
+            max_consec = max(max_consec, consec)
+        else:
+            consec = 0
+
+    print("\n" + "=" * 40 + " OVERALL RESULTS " + "=" * 40)
+    print(f"Total Trades        : {total}")
+    print(f"Wins                : {wins}")
+    print(f"Losses              : {losses}")
+    print(f"Win Rate            : {win_rate:.2f}%")
+    print(f"Profit Factor       : {profit_factor:.2f}")
+    print(f"Net PnL             : ${net_pnl:,.2f}")
+    print(f"Max Consecutive Loss: {max_consec}")
+    print("=" * 97)
 
 
 if __name__ == "__main__":
