@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-HUNTER-V4: FAILED AUCTION + VWAP RECLAIM BACKTEST ENGINE
-- Market: XT USDT-M Futures
+HUNTER-V4: 1-YEAR FAILED AUCTION + VWAP RECLAIM BACKTEST ENGINE
+- Market: XT USDT-M Futures (Perpetual Swap)
 - Timeframe Architecture: 15m raw -> 1H, 4H, 1D causal construction
 - Zero Lookahead, Zero Leakage, Zero Repainting
 """
@@ -12,7 +12,7 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 import time
-import requests
+import ccxt
 import numpy as np
 import pandas as pd
 
@@ -24,7 +24,7 @@ SYMBOLS = [
 
 DATA_DIR = Path("data/xt_futures_v4")
 WARMUP_DAYS = 60
-TOTAL_DAYS = 365
+TOTAL_DAYS = 365  # بازه دقیق یک‌ساله فیوچرز
 
 INITIAL_CAPITAL = 1000.0
 MARGIN_PER_TRADE = 100.0
@@ -43,11 +43,7 @@ def parse_args():
 
 def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
     file_path = data_dir / f"{symbol}_15m.csv"
-    now_ms = int(time.time() * 1000)
-    start_ms = now_ms - int((TOTAL_DAYS + WARMUP_DAYS) * 86400 * 1000)
-    interval_ms = 15 * 60 * 1000
-    end_ms = (now_ms // interval_ms) * interval_ms - 1
-
+    
     if file_path.exists() and file_path.stat().st_size > 1000:
         df_cached = pd.read_csv(file_path)
         if len(df_cached) > 20000:
@@ -55,67 +51,42 @@ def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
             df_cached = df_cached.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
             span_days = (df_cached["timestamp"].iloc[-1] - df_cached["timestamp"].iloc[0]).days
             if span_days >= 300:
-                print(f"Using valid cached data for {symbol} (Rows: {len(df_cached)})")
+                print(f"Using valid cached futures data for {symbol} (Rows: {len(df_cached)})")
                 return df_cached
 
     data_dir.mkdir(parents=True, exist_ok=True)
-    url = "https://fapi.xt.com/future/market/v1/public/q/kline"
-    cursor = start_ms
-    all_rows = []
+    print(f"Downloading 1-year XT Futures (Swap) data for {symbol} via CCXT...")
 
-    print(f"Downloading XT Futures data for {symbol}...")
-    while cursor < end_ms:
-        window_end = min(end_ms, cursor + 1500 * interval_ms - 1)
-        params = {
-            "symbol": symbol.lower(),
-            "interval": "15m",
-            "startTime": cursor,
-            "endTime": window_end,
-            "limit": 1500
+    # تنظیم دقیق صرافی روی حالت فیوچرز سواپ
+    exchange = ccxt.xt({
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'swap',
         }
-        
-        success = False
-        rows = []
-        for attempt in range(3):
-            try:
-                resp = requests.get(url, params=params, timeout=15)
-                if resp.status_code == 200:
-                    res_json = resp.json()
-                    if res_json.get("rc") == 0 or res_json.get("success") == True or "result" in res_json:
-                        rows = res_json.get("result", res_json.get("data", []))
-                        if rows:
-                            all_rows.extend(rows)
-                            success = True
-                            break
-                time.sleep(1)
-            except Exception:
-                time.sleep(2)
+    })
 
-        if not success or not rows:
-            break
+    since = exchange.milliseconds() - int((TOTAL_DAYS + WARMUP_DAYS) * 86400 * 1000)
+    all_ohlcv = []
 
-        max_ts = max(r.get("T", r.get("time", cursor)) for r in rows)
-        next_cursor = max_ts + 1
-        if next_cursor <= cursor:
-            break
-        cursor = next_cursor
-        time.sleep(0.2)
+    try:
+        while True:
+            # در CCXT برای بخش سواپ XT فرمت نماد ممکن است به صورت BTC/USDT:USDT باشد که خود ccxt مدیریت می‌کند
+            market_symbol = symbol.replace("_", "/")
+            ohlcv = exchange.fetch_ohlcv(market_symbol, timeframe='15m', since=since, limit=1500)
+            if not ohlcv:
+                break
+            since = ohlcv[-1][0] + 1
+            all_ohlcv.extend(ohlcv)
+            if len(ohlcv) < 1500:
+                break
+            time.sleep(0.2)
+    except Exception as e:
+        print(f"CCXT Futures Error for {symbol}: {e}")
 
-    if not all_rows:
-        raise RuntimeError(f"Failed to fetch data for {symbol} from XT Futures API.")
+    if not all_ohlcv:
+        raise RuntimeError(f"Failed to fetch futures data for {symbol} from XT.")
 
-    parsed = []
-    for r in all_rows:
-        ts = r.get("T", r.get("time"))
-        o = r.get("o", r.get("open"))
-        h = r.get("h", r.get("high"))
-        l = r.get("l", r.get("low"))
-        c = r.get("c", r.get("close"))
-        v = r.get("v", r.get("volume"))
-        if ts and o and h and l and c:
-            parsed.append([int(ts), float(o), float(h), float(l), float(c), float(v or 0)])
-
-    df = pd.DataFrame(parsed, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(all_ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
     df.to_csv(file_path, index=False)
     return df
@@ -131,15 +102,10 @@ def validate_and_print_dataset(df: pd.DataFrame, symbol: str):
     time_diffs = df["timestamp_dt"].diff().dt.total_seconds().dropna()
     gaps = int((time_diffs > 900).sum())
 
-    print(f"SYMBOL: {symbol}")
-    print(f"ROW COUNT: {row_count}")
-    print(f"FIRST UTC TIMESTAMP: {first_ts.strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"LAST UTC TIMESTAMP: {last_ts.strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"APPROXIMATE DAYS: {days:.1f}")
-    print(f"GAP COUNT: {gaps}\n")
+    print(f"FUTURES SYMBOL: {symbol} | Rows: {row_count} | Days: {days:.1f} | Gaps: {gaps}")
 
-    if row_count < 20000 or days < 250:
-        raise RuntimeError(f"Dataset for {symbol} is severely incomplete.")
+    if row_count < 20000 or days < 300:
+        raise RuntimeError(f"Futures dataset for {symbol} is incomplete.")
 
 
 def load_and_resample(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -147,7 +113,6 @@ def load_and_resample(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     df = df.set_index("timestamp_dt").sort_index()
     df = df[~df.index.duplicated(keep="last")].copy()
 
-    # Causal Resampling
     df_1h = df.resample('1h').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
     df_4h = df.resample('4h', closed='right', label='right').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
     df_1d = df.resample('1d', closed='right', label='right').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
@@ -156,14 +121,12 @@ def load_and_resample(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
 
 def calculate_indicators(dfs: dict[str, pd.DataFrame]):
-    # 1D Regime Indicators
     d1 = dfs["1d"]
     prev_close_1d = d1["close"].shift(1)
     d1["ema50"] = prev_close_1d.ewm(span=50, adjust=False, min_periods=50).mean()
     d1["ema200"] = prev_close_1d.ewm(span=200, adjust=False, min_periods=200).mean()
     d1["ema50_slope"] = d1["ema50"].diff()
 
-    # 4H Confirmed Swing Pivots (Causal 2-bar confirmation lag)
     h4 = dfs["4h"]
     highs = h4["high"].values
     lows = h4["low"].values
@@ -183,7 +146,6 @@ def calculate_indicators(dfs: dict[str, pd.DataFrame]):
     h4["confirmed_sh"] = swing_highs
     h4["confirmed_sl"] = swing_lows
 
-    # 1H Indicators
     h1 = dfs["1h"]
     prev_close_1h = h1["close"].shift(1)
     tr = pd.concat([
@@ -197,7 +159,6 @@ def calculate_indicators(dfs: dict[str, pd.DataFrame]):
     h1["low24"] = h1["low"].shift(1).rolling(window=24).min()
     h1["vol_sma20"] = h1["volume"].shift(1).rolling(window=20).mean()
 
-    # Session VWAP (Resets daily UTC)
     tp = (h1["high"] + h1["low"] + h1["close"]) / 3.0
     dates = h1.index.date
     h1["date"] = dates
@@ -232,7 +193,6 @@ def run_backtest(all_symbol_data: dict[str, dict[str, pd.DataFrame]]) -> list[di
             if cooldowns[sym] > 0:
                 cooldowns[sym] -= 1
 
-        # 1. Manage active position
         if active_position is not None:
             sym = active_position["symbol"]
             h1_df = symbol_arrays[sym]["h1_df"]
@@ -267,7 +227,6 @@ def run_backtest(all_symbol_data: dict[str, dict[str, pd.DataFrame]]) -> list[di
                     cooldowns[sym] = 3
                     active_position = None
 
-        # 2. Look for new entry if portfolio is free
         if active_position is None:
             candidates = []
             for symbol, data in symbol_arrays.items():
@@ -294,7 +253,6 @@ def run_backtest(all_symbol_data: dict[str, dict[str, pd.DataFrame]]) -> list[di
 
                 h4_row = h4_sub.iloc[-1]
 
-                # Daily Regime
                 d1_close = d1_row["close"]
                 ema50, ema200, slope = d1_row.get("ema50", np.nan), d1_row.get("ema200", np.nan), d1_row.get("ema50_slope", np.nan)
                 if not all(np.isfinite([ema50, ema200, slope])):
@@ -306,7 +264,6 @@ def run_backtest(all_symbol_data: dict[str, dict[str, pd.DataFrame]]) -> list[di
                 if not (daily_long or daily_short):
                     continue
 
-                # 4H Structure
                 c_sh, c_sl, h4_close = h4_row.get("confirmed_sh", np.nan), h4_row.get("confirmed_sl", np.nan), h4_row["close"]
                 if not all(np.isfinite([c_sh, c_sl])):
                     continue
@@ -322,7 +279,6 @@ def run_backtest(all_symbol_data: dict[str, dict[str, pd.DataFrame]]) -> list[di
                 if not h4_ok:
                     continue
 
-                # 1H Failed Auction & VWAP Reclaim
                 prev_bar = h1_sub.iloc[-1]
                 prev_prev_bar = h1_sub.iloc[-2]
 
@@ -388,7 +344,7 @@ def main():
     data_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print("HUNTER-V4: FAILED AUCTION + VWAP RECLAIM BACKTEST ENGINE")
+    print("HUNTER-V4: 1-YEAR FUTURES FAILED AUCTION + VWAP RECLAIM BACKTEST")
     print("=" * 70)
 
     all_symbol_data = {}
@@ -400,10 +356,10 @@ def main():
             calculate_indicators(dfs)
             all_symbol_data[sym] = dfs
         except Exception as e:
-            print(f"Error loading {sym}: {e}")
+            print(f"Error loading futures for {sym}: {e}")
 
     if not all_symbol_data:
-        print("No valid symbol data loaded. Aborting.")
+        print("No valid futures symbol data loaded. Aborting.")
         return
 
     trades = run_backtest(all_symbol_data)
@@ -426,7 +382,7 @@ def main():
         else:
             consec = 0
 
-    print("\n" + "=" * 40 + " OVERALL RESULTS " + "=" * 40)
+    print("\n" + "=" * 40 + " 1-YEAR FUTURES RESULTS " + "=" * 40)
     print(f"Total Trades        : {total}")
     print(f"Wins                : {wins}")
     print(f"Losses              : {losses}")
@@ -434,7 +390,7 @@ def main():
     print(f"Profit Factor       : {profit_factor:.2f}")
     print(f"Net PnL             : ${net_pnl:,.2f}")
     print(f"Max Consecutive Loss: {max_consec}")
-    print("=" * 57)
+    print("=" * 61)
 
 
 if __name__ == "__main__":
