@@ -153,7 +153,7 @@ def fetch_futures(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         rows.extend(valid_batch)
         mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in valid_batch)
         cursor = mx + 1
-        if len(batch) < LIMIT and window_end >= end_ms:
+        if len(batch) < LIMIT_FUT and window_end >= end_ms:
             break
         time.sleep(0.03)
     df = normalize_kline(rows)
@@ -213,7 +213,7 @@ def fetch_spot(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         rows.extend(valid_batch)
         mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in valid_batch)
         cursor = mx + 1
-        if len(batch) < LIMIT and window_end >= end_ms:
+        if len(batch) < LIMIT_SPOT and window_end >= end_ms:
             break
         time.sleep(0.03)
     df = normalize_kline(rows)
