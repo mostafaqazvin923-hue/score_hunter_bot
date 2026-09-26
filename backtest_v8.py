@@ -1,39 +1,43 @@
 #!/usr/bin/env python3
 """
-HUNTER-V152 — C2 REGIME-CONDITIONED ENTRY ENGINE
+HUNTER-V154 — TRIPLE-BARRIER META-LABEL ENGINE
 
-Purpose
--------
-Causal continuation/reversal redesign of V144 C_REGIME_SWITCH.
+Research objective
+------------------
+Stop inventing another indicator setup.  V154 treats the 1H event as a
+candidate and learns, causally, whether that candidate historically reached
++2R before -1R.  Model selection is time-split: train -> validation -> OOS.
+The OOS period is never used to choose features, coefficients, or threshold.
 
 Architecture
 ------------
-15m raw XT Futures data -> 1H signal frame + 4H context + 1D regime.
+15m raw XT -> 1H features / 4H context / 1D regime.
+Candidate events are deliberately broad (trend continuation OR exhaustion /
+reclaim).  A small logistic meta-label model selects only candidates whose
+estimated probability of +2R-before-1R clears a threshold chosen on the
+validation period.
 
-Two independent entry families inside C2:
-  1) TREND_CONTINUATION: higher-timeframe alignment + 1H pullback/reclaim
-     + momentum resumption.
-  2) EXHAUSTION_REVERSAL: higher-timeframe regime + 1H extreme deviation
-     + failed continuation + reversal candle.
-
-Hard rules
-----------
-- 365-day XT 15m history (plus 35-day warmup).
-- Fixed $100 margin, 50x leverage, RR 1:2.
-- Entry at the NEXT 1H candle open after the signal candle closes.
-- No lookahead, no repaint, no future data in signal construction.
-- No overlapping positions; max 3 open positions portfolio-wide.
-- No timeout, no break-even, no trailing stop.
+Hard execution rules
+--------------------
+- 365-day XT 15m history + 35-day warmup.
+- $100 margin, 50x leverage, fixed RR 1:2.
+- Signal on closed 1H candle; entry at NEXT 1H open.
+- No lookahead / repaint / future leakage.
+- No overlapping positions; max 3 portfolio positions.
+- No timeout, BE, or trailing stop.
 - Same-candle SL+TP => LOSS.
-- Positions still open at dataset end remain OPEN.
-- A candle on which any prior position closes cannot also create a new entry.
-- Funding is deliberately NOT used: XT public funding history is not 365-day.
+- Open positions at dataset end remain OPEN.
+- A candle that closes a prior trade cannot create a new entry.
+- Funding is not used because XT public funding history is not 365-day.
 
-This is a research/backtest file, not an order-execution bot.
+Important
+---------
+The meta-label training label is not an execution timeout.  A training
+example is used only when its +2R or -1R barrier is actually resolved before
+the relevant time cutoff.  Unresolved examples are excluded from training.
 """
 from __future__ import annotations
 
-import argparse
 import math
 import time
 from pathlib import Path
@@ -47,9 +51,7 @@ SYMBOLS = [
     "APT", "CRV", "ONDO", "PENDLE", "ICP", "WIF",
 ]
 
-DATA_DIR = Path("data/xt_futures_v152")
-OUT_DIR = DATA_DIR / "results"
-
+DATA_DIR = Path("data/xt_futures_v154")
 INITIAL_EQUITY = 1000.0
 TRADE_MARGIN = 100.0
 LEVERAGE = 50.0
@@ -66,22 +68,13 @@ WARMUP_DAYS = 35
 MIN_ROWS = 30000
 MAX_REQUEST_RETRIES = 6
 
-S = requests.Session()
-S.headers.update({"User-Agent": "HUNTER-V152/1.0"})
+# Time split on the 365-day research window.
+TRAIN_DAYS = 180
+VALID_DAYS = 90
+# Remaining 95 days are OOS.
 
-# Deliberately small, interpretable causal research grid.
-CONFIGS = [
-    # name, trend_score, rev_score, trend_pullback_atr, trend_reclaim_atr,
-    # trend_mom24, trend_mom72, rev_dev, rev_range_mult, atr_mult
-    ("C2_BALANCED", 5.00, 5.00, 0.35, 0.10, 0.0020, 0.0040, 1.75, 0.80, 1.50),
-    ("C2_STRICT_TREND", 5.75, 5.00, 0.25, 0.05, 0.0025, 0.0050, 1.75, 0.80, 1.50),
-    ("C2_STRICT_REV", 5.00, 5.75, 0.35, 0.10, 0.0020, 0.0040, 2.00, 0.90, 1.50),
-    ("C2_TIGHT_BOTH", 5.75, 5.75, 0.25, 0.05, 0.0025, 0.0050, 2.00, 0.90, 1.50),
-    ("C2_WIDE_PULLBACK", 5.00, 5.00, 0.50, 0.10, 0.0020, 0.0040, 1.75, 0.80, 1.50),
-    ("C2_DEEP_REVERSAL", 5.00, 5.50, 0.35, 0.10, 0.0020, 0.0040, 2.25, 0.90, 1.50),
-    ("C2_FAST_MOMENTUM", 5.25, 5.00, 0.35, 0.10, 0.0035, 0.0060, 1.75, 0.80, 1.50),
-    ("C2_LOW_RISK_ATR", 5.25, 5.25, 0.35, 0.10, 0.0025, 0.0050, 2.00, 0.90, 1.25),
-]
+S = requests.Session()
+S.headers.update({"User-Agent": "HUNTER-V154/1.0"})
 
 
 def resolve_symbols():
@@ -98,14 +91,8 @@ def resolve_symbols():
         raw = str(item.get("symbol", item.get("name", ""))).upper()
         compact = raw.replace("_", "").replace("-", "").replace("/", "").replace(":", "")
         for asset in SYMBOLS:
-            wanted = {
-                asset + "USDT",
-                asset + "_USDT",
-                asset + "/USDT",
-                asset + "/USDT:USDT",
-            }
-            wanted = {x.replace("_", "").replace("-", "").replace("/", "").replace(":", "") for x in wanted}
-            if compact in wanted:
+            wanted = asset + "USDT"
+            if compact == wanted:
                 out[asset] = item.get("symbol") or item.get("name")
     return out
 
@@ -157,14 +144,12 @@ def _parse_kline(js):
 
 
 def fetch_symbol(asset, xt_symbol, days):
-    """Exact V144-style forward XT 15m collector with strict validation."""
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - int((days + WARMUP_DAYS) * 86400 * 1000)
     interval_ms = 15 * 60 * 1000
     end_ms = (now_ms // interval_ms) * interval_ms - 1
     endpoint = f"{BASE}/future/market/v1/public/q/kline"
     best = []
-
     for whole_try in range(5):
         rows = []
         cursor = start_ms
@@ -172,13 +157,8 @@ def fetch_symbol(asset, xt_symbol, days):
         while cursor < end_ms and guard < 2000:
             guard += 1
             window_end = min(end_ms, cursor + LIMIT * interval_ms - 1)
-            params = {
-                "symbol": xt_symbol,
-                "interval": INTERVAL,
-                "startTime": cursor,
-                "endTime": window_end,
-                "limit": LIMIT,
-            }
+            params = {"symbol": xt_symbol, "interval": INTERVAL,
+                      "startTime": cursor, "endTime": window_end, "limit": LIMIT}
             batch = []
             for attempt in range(6):
                 try:
@@ -197,12 +177,8 @@ def fetch_symbol(asset, xt_symbol, days):
             mx = max(x[0] for x in batch)
             if mx < cursor:
                 break
-            next_cursor = mx + 1
-            if next_cursor <= cursor:
-                break
-            cursor = next_cursor
+            cursor = mx + 1
             time.sleep(0.08)
-
         if rows:
             df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
             df = df.drop_duplicates("timestamp").sort_values("timestamp")
@@ -216,14 +192,7 @@ def fetch_symbol(asset, xt_symbol, days):
                     df["timestamp"] = pd.to_datetime(df.timestamp, unit="ms", utc=True)
                     return df.set_index("timestamp").dropna()
         time.sleep(float(whole_try + 1))
-
-    if best:
-        first = pd.to_datetime(int(best.timestamp.min()), unit="ms", utc=True)
-        last = pd.to_datetime(int(best.timestamp.max()), unit="ms", utc=True)
-        detail = f"; range={first} -> {last}"
-    else:
-        detail = ""
-    raise RuntimeError(f"Insufficient XT data for {asset}: got {len(best)} rows{detail}; refusing partial backtest")
+    raise RuntimeError(f"Insufficient XT data for {asset}: got {len(best)} rows; refusing partial backtest")
 
 
 def ensure_data(data_dir, days):
@@ -239,11 +208,11 @@ def ensure_data(data_dir, days):
         if len(df) < MIN_ROWS:
             raise RuntimeError(f"Validation failed for {asset}: only {len(df)} rows")
         df.to_csv(path)
-        out[asset] = df
         gaps = int(df.index.to_series().diff().dt.total_seconds().div(900).sub(1).clip(lower=0).sum())
         print(f"{asset:<8} rows={len(df)} gaps={gaps}")
         if gaps != 0:
             raise RuntimeError(f"Unexpected 15m gaps for {asset}: {gaps}")
+        out[asset] = df
     return out
 
 
@@ -284,16 +253,11 @@ def build_features(all15):
     h4 = {a: resample(df, "4h") for a, df in all15.items()}
     d1 = {a: resample(df, "1D") for a, df in all15.items()}
     out = {}
-
     for asset in SYMBOLS:
-        x = h1[asset].copy()
-        q = h4[asset].copy()
-        d = d1[asset].copy()
-
+        x = h1[asset].copy(); q = h4[asset].copy(); d = d1[asset].copy()
         x["atr"] = atr_wilder(x, 14)
-        x["ret6"] = x.close.pct_change(6)
-        x["ret12"] = x.close.pct_change(12)
-        x["ret24"] = x.close.pct_change(24)
+        x["ret3"] = x.close.pct_change(3); x["ret6"] = x.close.pct_change(6)
+        x["ret12"] = x.close.pct_change(12); x["ret24"] = x.close.pct_change(24)
         x["ret72"] = x.close.pct_change(72)
         x["rv24"] = x.close.pct_change().rolling(24).std()
         x["rv120"] = x.close.pct_change().rolling(120).std()
@@ -304,31 +268,28 @@ def build_features(all15):
         x["close_pos"] = (x.close - x.low) / (x.high - x.low).replace(0, np.nan)
         x["ema20"] = x.close.ewm(span=20, adjust=False).mean()
         x["ema50"] = x.close.ewm(span=50, adjust=False).mean()
+        x["ema20_dist"] = (x.close - x.ema20) / x.atr
+        x["ema50_dist"] = (x.close - x.ema50) / x.atr
         x["ema20_slope"] = (x.ema20 - x.ema20.shift(6)) / x.atr
-        # All breakout levels are shifted: the signal candle never sees itself.
         x["high12"] = x.high.rolling(12).max().shift(1)
         x["low12"] = x.low.rolling(12).min().shift(1)
         x["high24"] = x.high.rolling(24).max().shift(1)
         x["low24"] = x.low.rolling(24).min().shift(1)
+        x["dist_high24"] = (x.high24 - x.close) / x.atr
+        x["dist_low24"] = (x.close - x.low24) / x.atr
 
         q["atr"] = atr_wilder(q, 14)
         q["ema50"] = q.close.ewm(span=50, adjust=False).mean()
         q["ema200"] = q.close.ewm(span=200, adjust=False).mean()
         q["adx"] = adx_wilder(q, 14)
         q["slope"] = (q.ema50 - q.ema50.shift(6)) / q.atr
-        q["trend"] = np.where(
-            (q.close > q.ema200) & (q.ema50 > q.ema200), 1,
-            np.where((q.close < q.ema200) & (q.ema50 < q.ema200), -1, 0),
-        )
-
+        q["trend"] = np.where((q.close > q.ema200) & (q.ema50 > q.ema200), 1,
+                       np.where((q.close < q.ema200) & (q.ema50 < q.ema200), -1, 0))
         d["ema50"] = d.close.ewm(span=50, adjust=False).mean()
         d["ema200"] = d.close.ewm(span=200, adjust=False).mean()
         d["slope"] = d.ema50.pct_change(5)
-        d["regime"] = np.where(
-            (d.close > d.ema200) & (d.ema50 > d.ema200), 1,
-            np.where((d.close < d.ema200) & (d.ema50 < d.ema200), -1, 0),
-        )
-
+        d["regime"] = np.where((d.close > d.ema200) & (d.ema50 > d.ema200), 1,
+                       np.where((d.close < d.ema200) & (d.ema50 < d.ema200), -1, 0))
         x["h4_trend"] = q.trend.reindex(x.index, method="ffill")
         x["h4_adx"] = q.adx.reindex(x.index, method="ffill")
         x["h4_slope"] = q.slope.reindex(x.index, method="ffill")
@@ -339,271 +300,274 @@ def build_features(all15):
 
 
 def add_cross_sectional_ranks(f):
-    all_times = sorted(set().union(*(x.index for x in f.values())))
-    for ts in all_times:
+    for ts in sorted(set().union(*(x.index for x in f.values()))):
         vals = []
         for asset, x in f.items():
-            if ts in x.index:
-                r = x.loc[ts, "ret24"]
-                if np.isfinite(r):
-                    vals.append((asset, float(r)))
-        vals.sort(key=lambda z: z[1])
-        n = len(vals)
+            if ts in x.index and np.isfinite(x.loc[ts, "ret24"]):
+                vals.append((asset, float(x.loc[ts, "ret24"])))
+        vals.sort(key=lambda z: z[1]); n = len(vals)
         for rank, (asset, _) in enumerate(vals):
             f[asset].loc[ts, "mom_rank"] = rank / (n - 1) if n > 1 else 0.5
     return f
 
+FEATURES = [
+    "ret3", "ret6", "ret12", "ret24", "ret72", "rv_ratio", "vol_z",
+    "body_atr", "range_atr", "close_pos", "ema20_dist", "ema50_dist",
+    "ema20_slope", "h4_adx", "h4_slope", "d1_slope", "mom_rank",
+    "dist_high24", "dist_low24",
+]
 
-def finite_row(r, keys):
-    return all(np.isfinite(r.get(k, np.nan)) for k in keys)
 
-
-def make_signals(f, cfg):
-    (
-        name, lookback, rank_long, rank_short, adx_min, rv_min,
-        body_min, volz_min, close_pos_long, close_pos_short, atr_mult,
-    ) = cfg
-    signals = []
-    common = [
-        "atr", "ret6", "ret12", "ret24", "ret72", "rv_ratio", "vol_z",
-        "body_atr", "range_atr", "close_pos", "ema20_slope",
-        "h4_trend", "h4_adx", "h4_slope", "d1_regime", "d1_slope",
-        "mom_rank",
-    ]
-
+def candidate_events(f):
+    """Broad, causal event set.  No target outcome is consulted here."""
+    events = []
     for asset, x in f.items():
-        for i in range(250, len(x) - 1):
-            ts = x.index[i]
-            r = x.iloc[i]
-            p = x.iloc[i - 1]
-            if not finite_row(r, common):
+        for i in range(300, len(x) - 1):
+            r = x.iloc[i]; p = x.iloc[i - 1]
+            if not all(np.isfinite(r.get(k, np.nan)) for k in FEATURES + ["atr", "h4_trend", "d1_regime"]):
                 continue
-            high_key = "high12" if lookback == 12 else "high24"
-            low_key = "low12" if lookback == 12 else "low24"
-            if not np.isfinite(r.get(high_key, np.nan)) or not np.isfinite(r.get(low_key, np.nan)):
-                continue
-
-            long_ctx = (
-                r.d1_regime == 1 and r.h4_trend == 1 and
-                r.h4_adx >= adx_min and r.h4_slope > 0 and r.d1_slope > 0
-            )
-            short_ctx = (
-                r.d1_regime == -1 and r.h4_trend == -1 and
-                r.h4_adx >= adx_min and r.h4_slope < 0 and r.d1_slope < 0
-            )
-
-            # Breakout is confirmed only by the signal candle close.
-            long_break = r.close > r[high_key] and p.close <= p[high_key]
-            short_break = r.close < r[low_key] and p.close >= p[low_key]
-            long_quality = (
-                r.mom_rank >= rank_long and r.ret6 > 0 and r.ret12 > 0 and
-                r.ret24 > 0 and r.ret72 > 0 and r.body_atr >= body_min and
-                r.close_pos >= close_pos_long and r.vol_z >= volz_min and
-                r.rv_ratio >= rv_min
-            )
-            short_quality = (
-                r.mom_rank <= rank_short and r.ret6 < 0 and r.ret12 < 0 and
-                r.ret24 < 0 and r.ret72 < 0 and r.body_atr >= body_min and
-                r.close_pos <= close_pos_short and r.vol_z >= volz_min and
-                r.rv_ratio >= rv_min
-            )
-
-            # A single score is used only to require breadth of confirmation;
-            # it is not used to manufacture a target win rate.
-            long_score = (
-                2.0 * long_ctx + 2.0 * long_break + 1.5 * long_quality +
-                0.5 * (r.range_atr >= 1.0) + 0.5 * (r.ema20_slope > 0)
-            )
-            short_score = (
-                2.0 * short_ctx + 2.0 * short_break + 1.5 * short_quality +
-                0.5 * (r.range_atr >= 1.0) + 0.5 * (r.ema20_slope < 0)
-            )
-
-            if long_ctx and long_break and long_quality and long_score > short_score:
-                signals.append({
-                    "asset": asset, "signal_ts": ts, "family": "RELATIVE_BREAKOUT",
-                    "side": "LONG", "score": float(long_score), "atr": float(r.atr),
-                })
-            elif short_ctx and short_break and short_quality and short_score > long_score:
-                signals.append({
-                    "asset": asset, "signal_ts": ts, "family": "RELATIVE_BREAKOUT",
-                    "side": "SHORT", "score": float(short_score), "atr": float(r.atr),
-                })
-
-    return signals
+            long_trend = r.d1_regime == 1 and r.h4_trend == 1
+            short_trend = r.d1_regime == -1 and r.h4_trend == -1
+            long_break = r.close > r.high24 and p.close <= p.high24
+            short_break = r.close < r.low24 and p.close >= p.low24
+            long_reclaim = p.close <= p.ema20 and r.close > r.ema20 and p.low <= p.ema20
+            short_reclaim = p.close >= p.ema20 and r.close < r.ema20 and p.high >= p.ema20
+            long_exhaust = r.ema20_dist <= -1.5 and r.close_pos >= 0.60
+            short_exhaust = r.ema20_dist >= 1.5 and r.close_pos <= 0.40
+            long_event = (long_trend and (long_break or long_reclaim)) or (long_exhaust and r.d1_regime >= 0)
+            short_event = (short_trend and (short_break or short_reclaim)) or (short_exhaust and r.d1_regime <= 0)
+            if long_event and not short_event:
+                events.append({"asset": asset, "ts": x.index[i], "side": "LONG", "atr": float(r.atr)})
+            elif short_event and not long_event:
+                events.append({"asset": asset, "ts": x.index[i], "side": "SHORT", "atr": float(r.atr)})
+    return events
 
 
-def execute_backtest(f, signals, atr_mult):
+def event_features(f, ev):
+    r = f[ev["asset"]].loc[ev["ts"]]
+    side = 1.0 if ev["side"] == "LONG" else -1.0
+    vals = []
+    for k in FEATURES:
+        v = float(r[k])
+        if k in ("ret3", "ret6", "ret12", "ret24", "ret72", "ema20_dist", "ema50_dist", "ema20_slope", "h4_slope", "d1_slope", "dist_high24", "dist_low24"):
+            v *= side
+        vals.append(v)
+    return np.asarray(vals, dtype=float)
+
+
+def resolve_label(f, ev, cutoff=None, atr_mult=1.50):
+    """Return (label, resolution_ts) only when a barrier is actually resolved."""
+    x = f[ev["asset"]]; idx = x.index; pos = idx.get_loc(ev["ts"])
+    if pos >= len(idx) - 1:
+        return None, None
+    entry_ts = idx[pos + 1]
+    entry = float(x.iloc[pos + 1].open)
+    if not np.isfinite(entry) or entry <= 0:
+        return None, None
+    risk = atr_mult * ev["atr"]
+    if not np.isfinite(risk) or risk <= 0 or risk / entry > 0.08:
+        return None, None
+    if ev["side"] == "LONG":
+        entry *= (1 + SLIPPAGE); sl = entry - risk; tp = entry + RR * risk
+    else:
+        entry *= (1 - SLIPPAGE); sl = entry + risk; tp = entry - RR * risk
+    for j in range(pos + 1, len(idx)):
+        ts = idx[j]; row = x.iloc[j]
+        hit_sl = row.low <= sl if ev["side"] == "LONG" else row.high >= sl
+        hit_tp = row.high >= tp if ev["side"] == "LONG" else row.low <= tp
+        if hit_sl or hit_tp:
+            # Conservative same-candle rule: loss.
+            label = 0 if hit_sl else 1
+            if cutoff is not None and ts > cutoff:
+                return None, None
+            return label, ts
+    return None, None
+
+
+def zfit(X):
+    mu = np.nanmedian(X, axis=0); scale = np.nanmedian(np.abs(X - mu), axis=0) * 1.4826
+    scale[~np.isfinite(scale) | (scale < 1e-8)] = 1.0
+    Xz = np.clip((X - mu) / scale, -8, 8)
+    return Xz, mu, scale
+
+
+def zapply(X, mu, scale):
+    return np.clip((X - mu) / scale, -8, 8)
+
+
+def sigmoid(z):
+    z = np.clip(z, -30, 30)
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def fit_logistic(X, y, l2=1.0, steps=500, lr=0.05):
+    # Pure NumPy logistic regression: no extra package dependency in Actions.
+    Xz, mu, scale = zfit(X)
+    w = np.zeros(Xz.shape[1], dtype=float); b = 0.0
+    pos = max(1, int(y.sum())); neg = max(1, len(y) - pos)
+    wp = len(y) / (2 * pos); wn = len(y) / (2 * neg)
+    sample_w = np.where(y == 1, wp, wn)
+    for _ in range(steps):
+        p = sigmoid(Xz @ w + b)
+        err = (p - y) * sample_w
+        gw = (Xz.T @ err) / len(y) + l2 * w / len(y)
+        gb = float(err.mean())
+        w -= lr * gw; b -= lr * gb
+    return {"w": w, "b": b, "mu": mu, "scale": scale}
+
+
+def predict(model, X):
+    return sigmoid(zapply(X, model["mu"], model["scale"]) @ model["w"] + model["b"])
+
+
+def build_label_dataset(f, events, cutoff):
+    X=[]; y=[]; meta=[]
+    for ev in events:
+        if ev["ts"] >= cutoff:
+            continue
+        label, resolved = resolve_label(f, ev, cutoff=cutoff)
+        if label is None:
+            continue
+        X.append(event_features(f, ev)); y.append(label); meta.append((ev, resolved))
+    if not X:
+        return np.empty((0, len(FEATURES))), np.empty(0), []
+    return np.asarray(X), np.asarray(y, dtype=float), meta
+
+
+def threshold_score(y, p, thresholds):
+    best = None
+    for th in thresholds:
+        take = p >= th
+        if take.sum() < 50:
+            continue
+        wr = 100.0 * y[take].mean()
+        # Approximate expectancy under exact 1:2 before fees.
+        exp_r = (wr / 100.0) * 2.0 - (1.0 - wr / 100.0)
+        key = (exp_r, int(take.sum()))
+        if best is None or key > best[0]:
+            best = (key, float(th), int(take.sum()), wr)
+    return best
+
+
+def portfolio_backtest(f, events, models_by_fold, threshold, oos_start):
     by_ts = {}
-    for s in signals:
-        by_ts.setdefault(s["signal_ts"], []).append(s)
-
+    for ev in events:
+        if ev["ts"] >= oos_start:
+            by_ts.setdefault(ev["ts"], []).append(ev)
     all_ts = sorted(set().union(*(x.index for x in f.values())))
-    positions = []
-    trades = []
-    equity = INITIAL_EQUITY
-    peak = equity
-    max_dd = 0.0
-
+    positions=[]; trades=[]; equity=INITIAL_EQUITY; peak=equity; max_dd=0.0
+    closed_dates = {}
     for ts in all_ts:
-        closed_any = False
+        # Select model based only on the time block already trained.
+        model = None
+        for start, end, m in models_by_fold:
+            if start <= ts < end:
+                model = m; break
+        closed_any=False
         for p in positions[:]:
-            x = f[p["asset"]]
-            if ts not in x.index or ts < p["entry_ts"]:
-                continue
-            row = x.loc[ts]
-            hit_sl = row.low <= p["sl"] if p["side"] == "LONG" else row.high >= p["sl"]
-            hit_tp = row.high >= p["tp"] if p["side"] == "LONG" else row.low <= p["tp"]
-            if not (hit_sl or hit_tp):
-                continue
-            if hit_sl and hit_tp:
-                outcome, exit_price = "LOSS", p["sl"]
-            elif hit_sl:
-                outcome, exit_price = "LOSS", p["sl"]
-            else:
-                outcome, exit_price = "WIN", p["tp"]
-
-            price_ret = (
-                (exit_price - p["entry"]) / p["entry"]
-                if p["side"] == "LONG" else
-                (p["entry"] - exit_price) / p["entry"]
-            )
-            gross = price_ret * TRADE_MARGIN * LEVERAGE
-            fees = TRADE_MARGIN * LEVERAGE * FEE_RATE * 2.0
-            pnl = gross - fees
-            equity += pnl
-            peak = max(peak, equity)
-            max_dd = min(max_dd, equity - peak)
-            trades.append({**p, "exit_ts": ts, "outcome": outcome, "pnl": pnl, "equity": equity})
-            positions.remove(p)
-            closed_any = True
-
-        if closed_any:
-            continue
-        if len(positions) >= MAX_OPEN_POSITIONS:
-            continue
-        candidates = sorted(by_ts.get(ts, []), key=lambda z: (z["score"], abs(z["atr"])), reverse=True)
-        for s in candidates:
-            if len(positions) >= MAX_OPEN_POSITIONS:
-                break
-            if any(p["asset"] == s["asset"] for p in positions):
-                continue
-            x = f[s["asset"]]
-            future = x.index[x.index > ts]
-            if len(future) == 0:
-                continue
-            entry_ts = future[0]
-            entry_open = float(x.loc[entry_ts, "open"])
-            entry = entry_open * (1 + SLIPPAGE if s["side"] == "LONG" else 1 - SLIPPAGE)
-            risk = atr_mult * s["atr"]
-            if not np.isfinite(risk) or risk <= 0 or risk / entry > 0.08:
-                continue
-            if s["side"] == "LONG":
-                sl, tp = entry - risk, entry + RR * risk
-            else:
-                sl, tp = entry + risk, entry - RR * risk
-            positions.append({
-                "asset": s["asset"], "family": s["family"], "side": s["side"],
-                "signal_ts": ts, "entry_ts": entry_ts, "entry": entry,
-                "sl": sl, "tp": tp, "score": s["score"],
-            })
-
-    return trades, positions, max_dd
-
-
-def summarize(trades, open_positions, max_dd, days):
-    n = len(trades)
-    wins = sum(t["outcome"] == "WIN" for t in trades)
-    gross_win = sum(t["pnl"] for t in trades if t["pnl"] > 0)
-    gross_loss = -sum(t["pnl"] for t in trades if t["pnl"] < 0)
-    eq = INITIAL_EQUITY
-    peak = eq
-    dd = 0.0
-    streak = max_streak = 0
-    for t in sorted(trades, key=lambda z: z["exit_ts"]):
-        eq += t["pnl"]
-        peak = max(peak, eq)
-        dd = min(dd, eq - peak)
-        streak = streak + 1 if t["outcome"] == "LOSS" else 0
-        max_streak = max(max_streak, streak)
-    return {
-        "trades": n, "open": len(open_positions), "wins": wins,
-        "losses": n - wins, "wr": 100.0 * wins / n if n else 0.0,
-        "pf": gross_win / gross_loss if gross_loss else (math.inf if gross_win else 0.0),
-        "pnl": sum(t["pnl"] for t in trades), "dd": min(dd, max_dd),
-        "streak": max_streak, "trades_day": n / days if days else 0.0,
-    }
-
-
-def score_result(s):
-    if s["trades"] < 100:
-        return -1e9 + s["trades"]
-    return (
-        (s["wr"] - 40.0) * 4.0 +
-        max(-3.0, min(3.0, s["pf"] - 1.0)) * 30.0 -
-        max(0, s["streak"] - 4) * 5.0 +
-        max(-5.0, min(5.0, s["pnl"] / 1000.0)) * 2.0
-    )
+            x=f[p["asset"]]
+            if ts not in x.index or ts < p["entry_ts"]: continue
+            row=x.loc[ts]
+            hit_sl = row.low <= p["sl"] if p["side"]=="LONG" else row.high >= p["sl"]
+            hit_tp = row.high >= p["tp"] if p["side"]=="LONG" else row.low <= p["tp"]
+            if not (hit_sl or hit_tp): continue
+            outcome="LOSS" if hit_sl else "WIN"
+            exit_price=p["sl"] if hit_sl else p["tp"]
+            price_ret=((exit_price-p["entry"])/p["entry"] if p["side"]=="LONG" else (p["entry"]-exit_price)/p["entry"])
+            gross=price_ret*TRADE_MARGIN*LEVERAGE; fees=TRADE_MARGIN*LEVERAGE*FEE_RATE*2
+            pnl=gross-fees; equity+=pnl; peak=max(peak,equity); max_dd=min(max_dd,equity-peak)
+            trades.append({**p,"exit_ts":ts,"outcome":outcome,"pnl":pnl}); positions.remove(p); closed_any=True
+        if closed_any: continue
+        if model is None or len(positions)>=MAX_OPEN_POSITIONS: continue
+        cand=[]
+        for ev in by_ts.get(ts,[]):
+            if any(p["asset"]==ev["asset"] for p in positions): continue
+            prob=float(predict(model, event_features(f,ev)[None,:])[0])
+            if prob>=threshold: cand.append((prob,ev))
+        cand.sort(key=lambda z:z[0],reverse=True)
+        for prob,ev in cand:
+            if len(positions)>=MAX_OPEN_POSITIONS: break
+            if any(p["asset"]==ev["asset"] for p in positions): continue
+            x=f[ev["asset"]]; idx=x.index; pos=idx.get_loc(ts)
+            if pos>=len(idx)-1: continue
+            entry=float(x.iloc[pos+1].open)*(1+SLIPPAGE if ev["side"]=="LONG" else 1-SLIPPAGE)
+            risk=1.50*ev["atr"]
+            if not np.isfinite(risk) or risk<=0 or risk/entry>0.08: continue
+            sl,tp=(entry-risk,entry+RR*risk) if ev["side"]=="LONG" else (entry+risk,entry-RR*risk)
+            positions.append({"asset":ev["asset"],"side":ev["side"],"signal_ts":ts,"entry_ts":idx[pos+1],"entry":entry,"sl":sl,"tp":tp,"prob":prob})
+    wins=sum(t["outcome"]=="WIN" for t in trades); losses=len(trades)-wins
+    eq=INITIAL_EQUITY; peak=eq; dd=0; streak=mx=0
+    for t in sorted(trades,key=lambda z:z["exit_ts"]):
+        eq+=t["pnl"]; peak=max(peak,eq); dd=min(dd,eq-peak); streak=streak+1 if t["outcome"]=="LOSS" else 0; mx=max(mx,streak)
+    gw=sum(t["pnl"] for t in trades if t["pnl"]>0); gl=-sum(t["pnl"] for t in trades if t["pnl"]<0)
+    return {"trades":len(trades),"open":len(positions),"wr":100*wins/len(trades) if trades else 0,"pf":gw/gl if gl else 0,"pnl":sum(t["pnl"] for t in trades),"dd":min(dd,max_dd),"streak":mx,"tday":len(trades)/DAYS}, trades
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--days", type=int, default=DAYS)
-    ap.add_argument("--data-dir", default=str(DATA_DIR))
-    args = ap.parse_args()
+    print("="*96); print("HUNTER-V154 — TRIPLE-BARRIER META-LABEL ENGINE"); print("15m raw -> 1H candidates / 4H context / 1D regime | causal train/validation/OOS"); print("="*96)
+    all15=ensure_data(DATA_DIR,DAYS)
+    f=add_cross_sectional_ranks(build_features(all15))
+    events=candidate_events(f)
+    print(f"Candidate events: {len(events)}")
+    # Use the actual common research window derived from the 1H data.
+    min_ts=max(x.index.min() for x in f.values()) + pd.Timedelta(days=WARMUP_DAYS)
+    max_ts=min(x.index.max() for x in f.values())
+    total=max_ts-min_ts
+    train_end=min_ts+pd.Timedelta(days=TRAIN_DAYS)
+    valid_end=train_end+pd.Timedelta(days=VALID_DAYS)
+    print(f"Split: train < {train_end} | validation < {valid_end} | OOS >= {valid_end}")
 
-    print("=" * 96)
-    print("HUNTER-V153 — VOLATILITY-ADAPTIVE RELATIVE BREAKOUT")
-    print("15m raw -> 1H breakout / 4H trend context / 1D regime | no funding")
-    print("=" * 96)
+    # Training labels are resolved strictly before the cutoff.
+    Xtr,ytr,_=build_label_dataset(f,events,train_end)
+    print(f"Resolved TRAIN labels: {len(ytr)} | win labels={int(ytr.sum()) if len(ytr) else 0} | WR={100*ytr.mean() if len(ytr) else 0:.2f}%")
+    if len(ytr)<500 or ytr.mean()<0.20 or ytr.mean()>0.80:
+        raise RuntimeError("Insufficient or degenerate training labels; refusing to run a meaningless model.")
+    model=fit_logistic(Xtr,ytr,l2=1.0,steps=700,lr=0.04)
 
-    all15 = ensure_data(Path(args.data_dir), args.days)
-    f = add_cross_sectional_ranks(build_features(all15))
+    # Validation labels are also resolved before valid_end, but model never sees them.
+    Xv,yv,_=build_label_dataset(f,[e for e in events if train_end<=e["ts"]<valid_end],valid_end)
+    if len(yv)<200:
+        raise RuntimeError(f"Insufficient validation labels: {len(yv)}")
+    pv=predict(model,Xv)
+    choice=threshold_score(yv,pv,np.arange(0.45,0.81,0.025))
+    if choice is None:
+        raise RuntimeError("No validation threshold produced >=50 candidates; refusing to overfit OOS.")
+    _,threshold,nv,wrv=choice
+    print(f"Validation: labels={len(yv)} selected={nv} WR={wrv:.2f}% threshold={threshold:.3f}")
 
-    configs = [
-        ("V153_BALANCED", 12, 0.65, 0.35, 18, 0.90, 0.30, -0.25, 0.62, 0.38, 1.40),
-        ("V153_STRICT_LEADERS", 12, 0.75, 0.25, 20, 0.90, 0.35, -0.10, 0.65, 0.35, 1.40),
-        ("V153_WIDE_WINDOW", 24, 0.65, 0.35, 18, 0.90, 0.30, -0.25, 0.62, 0.38, 1.40),
-        ("V153_HIGH_ADX", 12, 0.65, 0.35, 24, 0.90, 0.30, -0.25, 0.62, 0.38, 1.50),
-        ("V153_EXPANSION", 12, 0.70, 0.30, 20, 1.05, 0.35, 0.00, 0.65, 0.35, 1.50),
-        ("V153_TIGHT_RISK", 12, 0.70, 0.30, 20, 0.95, 0.35, -0.10, 0.65, 0.35, 1.20),
-    ]
+    # OOS is evaluated once, untouched by threshold selection.
+    # Retrain once using train+validation labels resolved strictly before OOS.
+    pre_oos_events = [e for e in events if e["ts"] < valid_end]
+    Xtv, ytv, _ = build_label_dataset(f, pre_oos_events, valid_end)
+    print(f"Resolved TRAIN+VALID labels for final pre-OOS fit: {len(ytv)} | WR={100*ytv.mean() if len(ytv) else 0:.2f}%")
+    if len(ytv) < 800:
+        raise RuntimeError(f"Insufficient pre-OOS labels for final fit: {len(ytv)}")
+    final_model = fit_logistic(Xtv, ytv, l2=1.0, steps=700, lr=0.04)
 
-    print(f"\nTesting {len(configs)} causal V153 configurations...")
-    results = []
-    for cfg in configs:
-        signals = make_signals(f, cfg)
-        trades, open_positions, max_dd = execute_backtest(f, signals, cfg[-1])
-        s = summarize(trades, open_positions, max_dd, args.days)
-        s["name"] = cfg[0]
-        s["signals"] = len(signals)
-        s["score"] = score_result(s)
-        s["eligible"] = (
-            s["trades"] >= 100 and s["wr"] >= 50.0 and s["streak"] <= 4 and
-            s["pf"] > 1.0 and s["pnl"] > 0
-        )
-        results.append(s)
-        print(
-            f"{cfg[0]:<22} trades={s['trades']:4d} WR={s['wr']:6.2f}% "
-            f"PF={s['pf']:6.3f} PnL=${s['pnl']:>9,.2f} DD=${s['dd']:>9,.2f} "
-            f"streak={s['streak']:2d} t/day={s['trades_day']:.2f} eligible={s['eligible']}"
-        )
+    oos_events = [e for e in events if e["ts"] >= valid_end]
+    oos_start = valid_end
+    result, trades = portfolio_backtest(
+        f, oos_events, [(oos_start, max_ts + pd.Timedelta(hours=1), final_model)],
+        threshold, oos_start
+    )
 
-    ranked = sorted(results, key=lambda z: z["score"], reverse=True)
-    print("\nTOP CONFIGURATIONS")
-    for i, s in enumerate(ranked[:5], 1):
-        print(
-            f"{i}. {s['name']} | trades={s['trades']} WR={s['wr']:.2f}% "
-            f"PF={s['pf']:.3f} PnL=${s['pnl']:,.2f} DD=${s['dd']:,.2f} streak={s['streak']}"
-        )
-
-    edge = any(s["eligible"] for s in results)
+    print("\nOOS RESULT — single untouched final evaluation")
+    print(
+        f"trades={result['trades']} open={result['open']} WR={result['wr']:.2f}% "
+        f"PF={result['pf']:.3f} PnL=${result['pnl']:,.2f} DD=${result['dd']:,.2f} "
+        f"streak={result['streak']} t/day={result['tday']:.2f}"
+    )
+    eligible = (
+        result["trades"] >= 100 and result["wr"] >= 50.0 and
+        result["streak"] <= 4 and result["pf"] > 1.0 and result["pnl"] > 0
+    )
+    print(f"OOS_ELIGIBLE: {eligible}")
     print("\n" + "=" * 96)
-    print(f"MEASURABLE_EDGE_PRESENT: {edge}")
-    if not edge:
-        print("No tested V153 configuration reached WR>=50%, max loss streak<=4, PF>1, positive PnL and >=100 trades.")
+    print("MEASURABLE_EDGE_PRESENT: " + str(eligible))
+    if not eligible:
+        print("V154 does not meet the hard OOS target; no parameter tuning is performed on OOS.")
     else:
-        print("At least one tested V153 configuration met all hard eligibility conditions.")
+        print("V154 met all hard OOS conditions on the untouched final period.")
     print("=" * 96)
 
 
