@@ -19,7 +19,8 @@ BASE_SPOT = "https://sapi.xt.com"
 DAYS = 365
 WARMUP_DAYS = 30
 INTERVAL_MS = 15 * 60 * 1000
-LIMIT = 1500
+LIMIT_FUT = 1500
+LIMIT_SPOT = 1000
 REQUEST_TIMEOUT = 20
 RETRIES = 4
 
@@ -103,13 +104,13 @@ def fetch_futures(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         guard += 1
         if guard > 1000:
             raise RuntimeError(f"futures pagination guard tripped for {symbol}")
-        window_end = end_ms
+        window_end = min(end_ms, cursor + LIMIT_FUT * INTERVAL_MS - 1)
         params = {
             "symbol": f"{symbol.lower()}_usdt",
             "interval": "15m",
             "startTime": cursor,
             "endTime": window_end,
-            "limit": LIMIT,
+            "limit": LIMIT_FUT,
         }
         batch = extract_list(request_json(f"{BASE_FUT}/future/market/v1/public/q/kline", params))
         if not batch:
@@ -127,10 +128,28 @@ def fetch_futures(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
             except Exception:
                 continue
         if not valid_batch:
-            raise RuntimeError(
-                f"futures API returned no in-range candles for {symbol}; "
-                f"cursor={cursor} end={end_ms} raw_rows={len(batch)}"
-            )
+            # XT can occasionally return a stale/shifted page. Retry the same
+            # cursor once with a half-size window instead of corrupting pagination.
+            retry_end = min(window_end, cursor + (LIMIT_FUT // 2) * INTERVAL_MS - 1)
+            if retry_end > cursor and retry_end < window_end:
+                params["endTime"] = retry_end
+                batch2 = extract_list(request_json(f"{BASE_FUT}/future/market/v1/public/q/kline", params))
+                valid_batch = []
+                for x in batch2:
+                    try:
+                        ts = int(x.get("t")) if isinstance(x, dict) else int(x[0])
+                        if cursor <= ts <= retry_end:
+                            valid_batch.append(x)
+                    except Exception:
+                        continue
+                if valid_batch:
+                    batch = batch2
+                    window_end = retry_end
+            if not valid_batch:
+                raise RuntimeError(
+                    f"futures API returned no in-range candles for {symbol}; "
+                    f"cursor={cursor} window_end={window_end} raw_rows={len(batch)}"
+                )
         rows.extend(valid_batch)
         mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in valid_batch)
         cursor = mx + 1
@@ -151,13 +170,13 @@ def fetch_spot(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         guard += 1
         if guard > 1000:
             raise RuntimeError(f"spot pagination guard tripped for {symbol}")
-        window_end = end_ms
+        window_end = min(end_ms, cursor + LIMIT_SPOT * INTERVAL_MS - 1)
         params = {
             "symbol": f"{symbol.lower()}_usdt",
             "interval": "15m",
             "startTime": cursor,
             "endTime": window_end,
-            "limit": LIMIT,
+            "limit": LIMIT_SPOT,
         }
         batch = extract_list(request_json(f"{BASE_SPOT}/v4/public/kline", params))
         if not batch:
@@ -171,10 +190,26 @@ def fetch_spot(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
             except Exception:
                 continue
         if not valid_batch:
-            raise RuntimeError(
-                f"spot API returned no in-range candles for {symbol}; "
-                f"cursor={cursor} end={end_ms} raw_rows={len(batch)}"
-            )
+            retry_end = min(window_end, cursor + (LIMIT_SPOT // 2) * INTERVAL_MS - 1)
+            if retry_end > cursor and retry_end < window_end:
+                params["endTime"] = retry_end
+                batch2 = extract_list(request_json(f"{BASE_SPOT}/v4/public/kline", params))
+                valid_batch = []
+                for x in batch2:
+                    try:
+                        ts = int(x.get("t")) if isinstance(x, dict) else int(x[0])
+                        if cursor <= ts <= retry_end:
+                            valid_batch.append(x)
+                    except Exception:
+                        continue
+                if valid_batch:
+                    batch = batch2
+                    window_end = retry_end
+            if not valid_batch:
+                raise RuntimeError(
+                    f"spot API returned no in-range candles for {symbol}; "
+                    f"cursor={cursor} window_end={window_end} raw_rows={len(batch)}"
+                )
         rows.extend(valid_batch)
         mx = max(int(x.get("t")) if isinstance(x, dict) else int(x[0]) for x in valid_batch)
         cursor = mx + 1
