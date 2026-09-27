@@ -162,7 +162,7 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
 
     if cache_path.exists() and not refresh:
         df = pd.read_csv(cache_path)
-        return validate(df, symbol, start_ms, end_ms)
+        return validate(df, symbol, start_ms, end_ms, base_url)
 
     s = requests.Session()
     cursor = start_ms
@@ -223,25 +223,31 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
         if mx >= end_ms:
             break
 
-    rows = repair_gaps(symbol, base_url, rows, start_ms, end_ms)
+    # Spot history is an auxiliary feature source. Do not hard-fail the entire backtest
+    # because XT Spot has isolated historical missing candles. Futures remains strict.
+    if base_url == FUTURES_URL:
+        rows = repair_gaps(symbol, base_url, rows, start_ms, end_ms)
+    else:
+        print(f"[SPOT] {symbol}: skipping synthetic gap repair; missing candles will be handled as unavailable auxiliary data")
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df.pop("ts"), unit="ms", utc=True)
     df = df.set_index("timestamp").sort_index()
     df = df[~df.index.duplicated(keep="last")]
     df = df[df.index < pd.Timestamp.now(tz="UTC").floor("15min")]
-    out = validate(df.reset_index(), symbol, start_ms, end_ms)
+    out = validate(df.reset_index(), symbol, start_ms, end_ms, base_url)
     out.to_csv(cache_path, index=False)
     return out
 
 
 
 def repair_gaps(symbol, base_url, rows, start_ms, end_ms):
-    """Re-fetch missing 15m candles from XT; never synthesize OHLCV."""
+    """Repair missing Futures candles only; never synthesize OHLCV."""
+    if base_url != FUTURES_URL:
+        return rows
     by_ts = {int(r[0]): r for r in rows}
     ts_sorted = sorted(by_ts)
     if not ts_sorted:
         return rows
-
     missing = []
     for a, b in zip(ts_sorted, ts_sorted[1:]):
         if b - a > INTERVAL_MS:
@@ -249,56 +255,40 @@ def repair_gaps(symbol, base_url, rows, start_ms, end_ms):
     missing = sorted(set(t for t in missing if start_ms <= t <= end_ms))
     if not missing:
         return rows
-
-    print(f"[REPAIR] {symbol} missing={len(missing)}")
+    print(f"[REPAIR] {symbol} Futures missing={len(missing)}")
     session = requests.Session()
-    page_limit = SPOT_LIMIT if base_url == SPOT_URL else FUTURES_LIMIT
-    endpoint = (
-        base_url
-        if base_url == SPOT_URL
-        else f"{base_url}/future/market/v1/public/q/kline"
-    )
-
     for target in missing:
         ok = False
         last_error = None
         for attempt in range(1, 4):
             try:
                 r = session.get(
-                    endpoint,
+                    FUTURES_URL,
                     params={
-                        "symbol": symbol,
-                        "interval": "15m",
+                        "symbol": symbol, "interval": "15m",
                         "startTime": max(start_ms, target - 2 * INTERVAL_MS),
                         "endTime": min(end_ms, target + 2 * INTERVAL_MS),
-                        "limit": page_limit,
-                    },
-                    timeout=20,
+                        "limit": FUTURES_LIMIT,
+                    }, timeout=20,
                 )
                 r.raise_for_status()
                 payload = payload_rows(r.json())
                 if payload is None:
-                    raise RuntimeError("XT response has no kline list")
-                parsed = [
-                    x for x in (
-                        parse_row(z, is_spot=(base_url == SPOT_URL))
-                        for z in payload
-                    ) if x is not None
-                ]
+                    raise RuntimeError("XT Futures response has no kline list")
+                parsed = [x for x in (parse_row(z, is_spot=False) for z in payload) if x is not None]
                 for x in parsed:
                     by_ts[int(x[0])] = x
                 if target in by_ts:
-                    ok = True
-                    break
+                    ok = True; break
             except Exception as e:
                 last_error = e
             time.sleep(0.5 * attempt)
         if not ok:
-            print(f"[REPAIR-FAIL] {symbol} {pd.to_datetime(target, unit='ms', utc=True)} {last_error}")
-
+            raise RuntimeError(f"{symbol}: Futures gap could not be repaired at {pd.to_datetime(target, unit='ms', utc=True)}: {last_error}")
     return [by_ts[t] for t in sorted(by_ts)]
 
-def validate(df, symbol, start_ms, end_ms):
+
+def validate(df, symbol, start_ms, end_ms, base_url):
     required = {"timestamp", "open", "high", "low", "close", "volume"}
     if not required.issubset(df.columns):
         raise RuntimeError(f"{symbol}: missing {required - set(df.columns)}")
