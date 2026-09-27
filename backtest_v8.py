@@ -94,6 +94,10 @@ def resample(df,rule,n):
  return y[y.n==n].drop(columns='n').dropna()
 
 def build(df):
+ raw=df.copy()
+ raw.index=pd.to_datetime(raw.pop('timestamp'),unit='ms',utc=True)
+ raw=raw.sort_index()
+ raw=raw[~raw.index.duplicated(keep='last')]
  h1=resample(df,'1h',4); h4=resample(df,'4h',16); d1=resample(df,'1d',96)
  prev=h1.close.shift(1); tr=pd.concat([h1.high-h1.low,(h1.high-prev).abs(),(h1.low-prev).abs()],axis=1).max(axis=1)
  h1['atr']=tr.ewm(alpha=1/14,adjust=False,min_periods=14).mean(); rng=(h1.high-h1.low).replace(0,np.nan); clv=((h1.close-h1.low)-(h1.high-h1.close))/rng; h1['svp']=clv.fillna(0)*h1.volume; h1['svp4']=h1.svp.shift(1).rolling(4,min_periods=4).sum(); h1['high24']=h1.high.shift(1).rolling(24,min_periods=24).max(); h1['low24']=h1.low.shift(1).rolling(24,min_periods=24).min(); med=h1.volume.shift(1).rolling(24,min_periods=24).median(); h1['volshock']=h1.volume.shift(1)/med.replace(0,np.nan)
@@ -102,7 +106,7 @@ def build(df):
  for i in range(PIVOT_LEFT,len(h4)-PIVOT_RIGHT):
   if hi[i]>hi[i-PIVOT_LEFT:i].max() and hi[i]>=hi[i+1:i+1+PIVOT_RIGHT].max(): ph[i+PIVOT_RIGHT]=hi[i]
   if lo[i]<lo[i-PIVOT_LEFT:i].min() and lo[i]<=lo[i+1:i+1+PIVOT_RIGHT].min(): pl[i+PIVOT_RIGHT]=lo[i]
- h4['last_ph']=pd.Series(ph,index=h4.index).ffill(); h4['last_pl']=pd.Series(pl,index=h4.index).ffill(); return {'15m':df,'1h':h1,'4h':h4,'1d':d1}
+ h4['last_ph']=pd.Series(ph,index=h4.index).ffill(); h4['last_pl']=pd.Series(pl,index=h4.index).ffill(); return {'15m':raw,'1h':h1,'4h':h4,'1d':d1}
 
 def daily_at(d1,ts):
  i=d1.index.searchsorted(ts,side='right')-1; return None if i<0 else d1.iloc[i]
@@ -151,7 +155,7 @@ def main():
  for s in SYMBOLS:
   try: all_data[s]=build(fetch(s,data_dir,sess))
   except Exception as e: print(f'[ABORT] {s.upper()}: {e}'); sys.exit(1)
- common_end=min(d['15m'].index.max() for d in all_data.values()); test_start=common_end-pd.Timedelta(days=TOTAL_DAYS); print(f'[TIMELINE] common_end={common_end}; test_start={test_start}; warmup=all prior data')
+ common_end=min(d['1h'].index.max() for d in all_data.values()); test_start=common_end-pd.Timedelta(days=TOTAL_DAYS); print(f'[TIMELINE] common_1h_end={common_end}; test_start={test_start}; warmup=all prior data')
  trades,openp=backtest(all_data,test_start); r=stats(trades); print('\n'+'='*30+' PER-SYMBOL '+'='*30)
  for s in SYMBOLS:
   q=stats([x for x in trades if x['symbol']==s]); print(f'{s.upper():<12} trades={q["n"]:<4} WR={q["wr"]:6.2f}% PF={q["pf"]:5.2f} PnL=${q["net"]:9.2f}')
