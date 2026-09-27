@@ -288,7 +288,7 @@ def repair_gaps(symbol, base_url, rows, start_ms, end_ms):
     return [by_ts[t] for t in sorted(by_ts)]
 
 
-def validate(df, symbol, start_ms, end_ms, base_url):
+def validate(df, symbol, start_ms, end_ms, allow_gaps=False):
     required = {"timestamp", "open", "high", "low", "close", "volume"}
     if not required.issubset(df.columns):
         raise RuntimeError(f"{symbol}: missing {required - set(df.columns)}")
