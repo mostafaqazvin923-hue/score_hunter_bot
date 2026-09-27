@@ -69,7 +69,8 @@ SPOT_DIR = DATA_DIR / "spot"
 DAYS = 365
 WARMUP_DAYS = 90
 INTERVAL_MS = 15 * 60 * 1000
-LIMIT = 1500
+FUTURES_LIMIT = 1500
+SPOT_LIMIT = 1000
 
 INITIAL_CAPITAL = 1000.0
 MARGIN = 100.0
@@ -162,10 +163,11 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
     cursor = start_ms
     rows = []
     page = 0
+    page_limit = SPOT_LIMIT if base_url.startswith("https://sapi.xt.com") else FUTURES_LIMIT
 
     while cursor <= end_ms:
         page += 1
-        window_end = min(end_ms, cursor + LIMIT * INTERVAL_MS - 1)
+        window_end = min(end_ms, cursor + page_limit * INTERVAL_MS - 1)
         params = {
             "symbol": symbol,
             "interval": "15m",
@@ -179,9 +181,13 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
             try:
                 r = s.get(base_url, params=params, timeout=30)
                 r.raise_for_status()
-                payload = payload_rows(r.json())
+                raw_json = r.json()
+                payload = payload_rows(raw_json)
                 if payload is None:
-                    raise RuntimeError("XT response has no kline list")
+                    raise RuntimeError(
+                        f"XT response has no kline list; response_keys={list(raw_json.keys())[:12] if isinstance(raw_json, dict) else type(raw_json).__name__}; "
+                        f"response={str(raw_json)[:500]}"
+                    )
                 break
             except Exception as exc:
                 last_error = exc
