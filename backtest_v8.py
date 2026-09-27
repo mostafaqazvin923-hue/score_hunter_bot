@@ -162,7 +162,7 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
 
     if cache_path.exists() and not refresh:
         df = pd.read_csv(cache_path)
-        return validate(df, symbol, start_ms, end_ms, base_url)
+        return validate(df, symbol, start_ms, end_ms, allow_gaps=(base_url == SPOT_URL))
 
     s = requests.Session()
     cursor = start_ms
@@ -223,31 +223,37 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
         if mx >= end_ms:
             break
 
-    # Spot history is an auxiliary feature source. Do not hard-fail the entire backtest
-    # because XT Spot has isolated historical missing candles. Futures remains strict.
-    if base_url == FUTURES_URL:
-        rows = repair_gaps(symbol, base_url, rows, start_ms, end_ms)
+    # Futures must be gap-free. Spot is auxiliary only: XT Spot has a small
+    # number of historical holes, so never synthesize or hard-fail on them.
+    # Missing Spot candles simply make the affected 1H auxiliary features
+    # unavailable; complete_resample() drops incomplete 1H bars causally.
+    if base_url == SPOT_URL:
+        ts0 = sorted(int(x[0]) for x in rows)
+        missing_count = 0
+        if len(ts0) > 1:
+            missing_count = sum(max(0, (b-a)//INTERVAL_MS - 1) for a,b in zip(ts0, ts0[1:]))
+        if missing_count:
+            print(f"[SPOT] {symbol}: {missing_count} historical 15m gaps retained as unavailable auxiliary data")
     else:
-        print(f"[SPOT] {symbol}: skipping synthetic gap repair; missing candles will be handled as unavailable auxiliary data")
+        rows = repair_gaps(symbol, base_url, rows, start_ms, end_ms)
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df.pop("ts"), unit="ms", utc=True)
     df = df.set_index("timestamp").sort_index()
     df = df[~df.index.duplicated(keep="last")]
     df = df[df.index < pd.Timestamp.now(tz="UTC").floor("15min")]
-    out = validate(df.reset_index(), symbol, start_ms, end_ms, base_url)
+    out = validate(df.reset_index(), symbol, start_ms, end_ms)
     out.to_csv(cache_path, index=False)
     return out
 
 
 
 def repair_gaps(symbol, base_url, rows, start_ms, end_ms):
-    """Repair missing Futures candles only; never synthesize OHLCV."""
-    if base_url != FUTURES_URL:
-        return rows
+    """Re-fetch missing 15m candles from XT; never synthesize OHLCV."""
     by_ts = {int(r[0]): r for r in rows}
     ts_sorted = sorted(by_ts)
     if not ts_sorted:
         return rows
+
     missing = []
     for a, b in zip(ts_sorted, ts_sorted[1:]):
         if b - a > INTERVAL_MS:
@@ -255,40 +261,52 @@ def repair_gaps(symbol, base_url, rows, start_ms, end_ms):
     missing = sorted(set(t for t in missing if start_ms <= t <= end_ms))
     if not missing:
         return rows
-    print(f"[REPAIR] {symbol} Futures missing={len(missing)}")
+
+    print(f"[REPAIR] {symbol} missing={len(missing)}")
     session = requests.Session()
+    page_limit = SPOT_LIMIT if base_url == SPOT_URL else FUTURES_LIMIT
+    endpoint = base_url
+
     for target in missing:
         ok = False
         last_error = None
         for attempt in range(1, 4):
             try:
                 r = session.get(
-                    FUTURES_URL,
+                    endpoint,
                     params={
-                        "symbol": symbol, "interval": "15m",
+                        "symbol": symbol,
+                        "interval": "15m",
                         "startTime": max(start_ms, target - 2 * INTERVAL_MS),
                         "endTime": min(end_ms, target + 2 * INTERVAL_MS),
-                        "limit": FUTURES_LIMIT,
-                    }, timeout=20,
+                        "limit": page_limit,
+                    },
+                    timeout=20,
                 )
                 r.raise_for_status()
                 payload = payload_rows(r.json())
                 if payload is None:
-                    raise RuntimeError("XT Futures response has no kline list")
-                parsed = [x for x in (parse_row(z, is_spot=False) for z in payload) if x is not None]
+                    raise RuntimeError("XT response has no kline list")
+                parsed = [
+                    x for x in (
+                        parse_row(z, is_spot=(base_url == SPOT_URL))
+                        for z in payload
+                    ) if x is not None
+                ]
                 for x in parsed:
                     by_ts[int(x[0])] = x
                 if target in by_ts:
-                    ok = True; break
+                    ok = True
+                    break
             except Exception as e:
                 last_error = e
             time.sleep(0.5 * attempt)
         if not ok:
-            raise RuntimeError(f"{symbol}: Futures gap could not be repaired at {pd.to_datetime(target, unit='ms', utc=True)}: {last_error}")
+            print(f"[REPAIR-FAIL] {symbol} {pd.to_datetime(target, unit='ms', utc=True)} {last_error}")
+
     return [by_ts[t] for t in sorted(by_ts)]
 
-
-def validate(df, symbol, start_ms, end_ms, base_url):
+def validate(df, symbol, start_ms, end_ms, allow_gaps=False):
     required = {"timestamp", "open", "high", "low", "close", "volume"}
     if not required.issubset(df.columns):
         raise RuntimeError(f"{symbol}: missing {required - set(df.columns)}")
@@ -310,8 +328,10 @@ def validate(df, symbol, start_ms, end_ms, base_url):
         raise RuntimeError(f"{symbol}: only {len(df)} rows")
     diffs = df["timestamp"].diff().dropna().dt.total_seconds() / 60.0
     gaps = int((diffs > MAX_GAP_MINUTES + 1e-9).sum())
-    if gaps:
+    if gaps and not allow_gaps:
         raise RuntimeError(f"{symbol}: {gaps} unrepaired gaps")
+    if gaps and allow_gaps:
+        print(f"[VALIDATE] {symbol}: auxiliary Spot gaps={gaps} (allowed; no synthetic candles)")
     span = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds() / 86400
     if span < 420:
         raise RuntimeError(f"{symbol}: span only {span:.1f} days")
