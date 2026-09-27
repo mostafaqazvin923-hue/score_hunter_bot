@@ -173,7 +173,7 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
             "interval": "15m",
             "startTime": cursor,
             "endTime": window_end,
-            "limit": LIMIT,
+            "limit": page_limit,
         }
         last_error = None
         payload = None
