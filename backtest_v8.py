@@ -192,6 +192,12 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
         parsed = [x for x in (parse_row(z) for z in payload) if x is not None]
         in_window = [x for x in parsed if cursor <= x[0] <= window_end]
         if not in_window:
+            # XT may return an empty terminal page after the requested
+            # historical window has already been collected.
+            if rows:
+                last_seen = max(int(x[0]) for x in rows)
+                if last_seen >= end_ms - 2 * INTERVAL_MS:
+                    break
             raise RuntimeError(f"{symbol}: page {page} produced no rows in requested window")
 
         rows.extend(in_window)
