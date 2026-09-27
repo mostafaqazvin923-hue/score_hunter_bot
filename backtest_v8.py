@@ -223,6 +223,7 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
         if mx >= end_ms:
             break
 
+    rows = repair_gaps(symbol, base_url, rows, start_ms, end_ms)
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df.pop("ts"), unit="ms", utc=True)
     df = df.set_index("timestamp").sort_index()
@@ -232,6 +233,70 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
     out.to_csv(cache_path, index=False)
     return out
 
+
+
+def repair_gaps(symbol, base_url, rows, start_ms, end_ms):
+    """Re-fetch missing 15m candles from XT; never synthesize OHLCV."""
+    by_ts = {int(r[0]): r for r in rows}
+    ts_sorted = sorted(by_ts)
+    if not ts_sorted:
+        return rows
+
+    missing = []
+    for a, b in zip(ts_sorted, ts_sorted[1:]):
+        if b - a > INTERVAL_MS:
+            missing.extend(range(a + INTERVAL_MS, b, INTERVAL_MS))
+    missing = sorted(set(t for t in missing if start_ms <= t <= end_ms))
+    if not missing:
+        return rows
+
+    print(f"[REPAIR] {symbol} missing={len(missing)}")
+    session = requests.Session()
+    page_limit = SPOT_LIMIT if base_url == SPOT_URL else FUTURES_LIMIT
+    endpoint = (
+        f"{base_url}/v4/public/kline"
+        if base_url == SPOT_URL
+        else f"{base_url}/future/market/v1/public/q/kline"
+    )
+
+    for target in missing:
+        ok = False
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                r = session.get(
+                    endpoint,
+                    params={
+                        "symbol": symbol,
+                        "interval": "15m",
+                        "startTime": max(start_ms, target - 2 * INTERVAL_MS),
+                        "endTime": min(end_ms, target + 2 * INTERVAL_MS),
+                        "limit": page_limit,
+                    },
+                    timeout=20,
+                )
+                r.raise_for_status()
+                payload = payload_rows(r.json())
+                if payload is None:
+                    raise RuntimeError("XT response has no kline list")
+                parsed = [
+                    x for x in (
+                        parse_row(z, is_spot=(base_url == SPOT_URL))
+                        for z in payload
+                    ) if x is not None
+                ]
+                for x in parsed:
+                    by_ts[int(x[0])] = x
+                if target in by_ts:
+                    ok = True
+                    break
+            except Exception as e:
+                last_error = e
+            time.sleep(0.5 * attempt)
+        if not ok:
+            print(f"[REPAIR-FAIL] {symbol} {pd.to_datetime(target, unit='ms', utc=True)} {last_error}")
+
+    return [by_ts[t] for t in sorted(by_ts)]
 
 def validate(df, symbol, start_ms, end_ms):
     required = {"timestamp", "open", "high", "low", "close", "volume"}
@@ -256,7 +321,7 @@ def validate(df, symbol, start_ms, end_ms):
     diffs = df["timestamp"].diff().dropna().dt.total_seconds() / 60.0
     gaps = int((diffs > MAX_GAP_MINUTES + 1e-9).sum())
     if gaps:
-        raise RuntimeError(f"{symbol}: {gaps} gaps")
+        raise RuntimeError(f"{symbol}: {gaps} unrepaired gaps")
     span = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds() / 86400
     if span < 420:
         raise RuntimeError(f"{symbol}: span only {span:.1f} days")
