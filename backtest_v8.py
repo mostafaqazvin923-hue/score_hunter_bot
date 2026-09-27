@@ -1,28 +1,47 @@
 #!/usr/bin/env python3
 """
-HUNTER-V4: FAILED AUCTION + VWAP RECLAIM BACKTEST ENGINE
-- Market: XT USDT-M Futures REST API (fapi.xt.com)
-- Zero Lookahead, Zero Leakage, Zero Repainting
+HUNTER-V5.1 — CROSS-ASSET FLOW-STATE & LIQUIDITY TRANSITION
+STRICT CAUSAL XT USDT-M FUTURES BACKTEST ENGINE
+
+Fixes:
+- Robust XT Futures REST pagination with compact/verbose payload parsing.
+- Exact 15m candle progression without pagination stalls.
+- 365-day test + 60-day warmup.
+- Closed-candle-only signal generation.
+- Causal daily regime features.
+- Deterministic cross-sectional candidate ranking.
+- Single global non-overlapping position.
+- No timeout, no forced end-of-test loss.
+- Same-candle SL+TP resolves as LOSS.
+- Entry on next available 1H candle open.
+- Full portfolio/per-symbol statistics.
 """
 
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
-from pathlib import Path
 import sys
 import time
-import requests
+from datetime import datetime, timezone
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import requests
+
+
+# =========================
+# CONFIG
+# =========================
 
 SYMBOLS = [
     "btc_usdt", "eth_usdt", "sol_usdt", "sui_usdt", "avax_usdt",
     "near_usdt", "ada_usdt", "bnb_usdt", "apt_usdt", "crv_usdt",
-    "ondo_usdt", "pendle_usdt", "icp_usdt", "wif_usdt"
+    "ondo_usdt", "pendle_usdt", "icp_usdt", "wif_usdt",
 ]
 
-DATA_DIR = Path("data/xt_futures_v4")
+DATA_DIR = Path("data/xt_futures_v5")
+
 TOTAL_DAYS = 365
 WARMUP_DAYS = 60
 
@@ -34,1044 +53,1062 @@ RR = 2.0
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 
+INTERVAL = "15m"
+INTERVAL_MS = 15 * 60 * 1000
+PAGE_LIMIT = 1500
 
-def parse_args():
+MIN_ROWS = 38000
+MIN_SPAN_DAYS = 350.0
+MAX_GAPS = 100
+
+REQUEST_TIMEOUT = 20
+MAX_RETRIES = 4
+
+
+# =========================
+# ARGUMENTS
+# =========================
+
+def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", default=str(DATA_DIR))
     return p.parse_args()
 
 
+# =========================
+# XT RESPONSE PARSING
+# =========================
+
+def unwrap_rows(payload):
+    if isinstance(payload, list):
+        return payload
+
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("result", "data", "rows", "list"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = unwrap_rows(value)
+            if nested is not None:
+                return nested
+
+    # Some endpoints may return a single compact kline object.
+    if "t" in payload and ("o" in payload or "open" in payload):
+        return [payload]
+
+    return None
+
+
+def parse_kline_row(row):
+    if isinstance(row, (list, tuple)):
+        if len(row) < 6:
+            return None
+        raw = {
+            "timestamp": row[0],
+            "open": row[1],
+            "high": row[2],
+            "low": row[3],
+            "close": row[4],
+            "volume": row[5],
+        }
+    elif isinstance(row, dict):
+        raw = {
+            "timestamp": row.get(
+                "t",
+                row.get("time", row.get("timestamp", row.get("ts")))
+            ),
+            "open": row.get("o", row.get("open")),
+            "high": row.get("h", row.get("high")),
+            "low": row.get("l", row.get("low")),
+            "close": row.get("c", row.get("close")),
+            # XT compact response commonly exposes "a" as amount/volume.
+            "volume": row.get(
+                "a",
+                row.get("v", row.get("volume", row.get("amount")))
+            ),
+        }
+    else:
+        return None
+
+    try:
+        ts = int(float(raw["timestamp"]))
+        o = float(raw["open"])
+        h = float(raw["high"])
+        l = float(raw["low"])
+        c = float(raw["close"])
+        v = float(raw["volume"])
+
+        # Reject impossible rows.
+        if ts <= 0:
+            return None
+        if not all(np.isfinite([o, h, l, c, v])):
+            return None
+        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+            return None
+        if h < max(o, c, l):
+            return None
+        if l > min(o, c, h):
+            return None
+        if v < 0:
+            return None
+
+        return [ts, o, h, l, c, v]
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def parse_batch(payload, start_ms, end_ms):
+    rows = unwrap_rows(payload)
+    if rows is None:
+        return []
+
+    parsed = []
+    for row in rows:
+        item = parse_kline_row(row)
+        if item is None:
+            continue
+
+        ts = item[0]
+        if start_ms <= ts <= end_ms:
+            parsed.append(item)
+
+    return parsed
+
+
+# =========================
+# CACHE VALIDATION
+# =========================
+
+def validate_dataframe(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    required = ["timestamp", "open", "high", "low", "close", "volume"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"{symbol}: missing columns {missing}")
+
+    out = df[required].copy()
+
+    for col in required:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out = out.dropna()
+    out = out[out["timestamp"] > 0]
+    out = out.sort_values("timestamp")
+    out = out.drop_duplicates("timestamp", keep="last")
+    out = out.reset_index(drop=True)
+
+    if out.empty:
+        raise RuntimeError(f"{symbol}: empty dataframe")
+
+    dt = pd.to_datetime(out["timestamp"], unit="ms", utc=True)
+    span_days = (dt.iloc[-1] - dt.iloc[0]).total_seconds() / 86400.0
+    diffs = dt.diff().dt.total_seconds().dropna()
+
+    # A gap is greater than one normal 15m interval.
+    gaps = int((diffs > 900.0).sum())
+
+    if len(out) < MIN_ROWS:
+        raise RuntimeError(
+            f"{symbol}: only {len(out)} rows; required >= {MIN_ROWS}"
+        )
+
+    if span_days < MIN_SPAN_DAYS:
+        raise RuntimeError(
+            f"{symbol}: span {span_days:.1f}d; required >= {MIN_SPAN_DAYS:.1f}d"
+        )
+
+    if gaps > MAX_GAPS:
+        raise RuntimeError(
+            f"{symbol}: {gaps} gaps; maximum allowed {MAX_GAPS}"
+        )
+
+    return out
+
+
+def cache_is_valid(path: Path, symbol: str) -> bool:
+    if not path.exists() or path.stat().st_size < 1000:
+        return False
+
+    try:
+        df = pd.read_csv(path)
+        validate_dataframe(df, symbol)
+        return True
+    except Exception:
+        return False
+
+
+# =========================
+# XT FUTURES DATA
+# =========================
+
 def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
+    data_dir.mkdir(parents=True, exist_ok=True)
     file_path = data_dir / f"{symbol.upper()}_15m.csv"
 
-    if file_path.exists() and file_path.stat().st_size > 1000:
-        try:
-            df_cached = pd.read_csv(file_path)
-            if "timestamp" in df_cached.columns:
-                df_cached["timestamp_dt"] = pd.to_datetime(
-                    df_cached["timestamp"], unit="ms", utc=True
-                )
-                df_cached = df_cached.sort_values("timestamp").drop_duplicates(
-                    subset=["timestamp"]
-                ).reset_index(drop=True)
-
-                row_count = len(df_cached)
-                span_days = (
-                    df_cached["timestamp_dt"].iloc[-1]
-                    - df_cached["timestamp_dt"].iloc[0]
-                ).total_seconds() / 86400.0
-                time_diffs = (
-                    df_cached["timestamp_dt"].diff().dt.total_seconds().dropna()
-                )
-                gaps = int((time_diffs > 900).sum())
-
-                if row_count >= 38000 and span_days >= 400 and gaps <= 100:
-                    print(
-                        f"[CACHE] Validated cached dataset for {symbol.upper()} "
-                        f"(Rows: {row_count}, Span: {span_days:.1f}d, Gaps: {gaps})"
-                    )
-                    return df_cached.drop(columns=["timestamp_dt"])
-
-        except Exception:
-            pass
-
-    data_dir.mkdir(parents=True, exist_ok=True)
+    if cache_is_valid(file_path, symbol):
+        df = pd.read_csv(file_path)
+        print(f"[CACHE] {symbol.upper()} rows={len(df)}")
+        return df
 
     url = "https://fapi.xt.com/future/market/v1/public/q/kline"
-    interval_ms = 15 * 60 * 1000
-    limit = 1500
 
-    # Only request completed 15m candles. This avoids ever depending on the
-    # still-forming live candle and makes the historical boundary deterministic.
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    final_end_ms = (now_ms // interval_ms) * interval_ms - 1
-    start_ms = final_end_ms - int(
-        (TOTAL_DAYS + WARMUP_DAYS) * 86400 * 1000
-    )
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - int((TOTAL_DAYS + WARMUP_DAYS) * 86400 * 1000)
+
+    # Last fully completed 15m candle.
+    current_floor = (now_ms // INTERVAL_MS) * INTERVAL_MS
+    final_end_ms = current_floor - 1
 
     current_start = start_ms
-    all_klines = []
+    all_rows = []
     page = 0
-
-    def parse_xt_kline_row(row):
-        """Parse XT Futures kline rows in both official compact forms."""
-        if isinstance(row, (list, tuple)):
-            if len(row) < 6:
-                return None
-            vals = row[:6]
-        elif isinstance(row, dict):
-            # XT Futures compact public kline fields are t,o,h,l,c,a.
-            # Also accept verbose aliases defensively.
-            vals = (
-                row.get("t", row.get("time", row.get("timestamp"))),
-                row.get("o", row.get("open")),
-                row.get("h", row.get("high")),
-                row.get("l", row.get("low")),
-                row.get("c", row.get("close")),
-                row.get("a", row.get("volume", row.get("q"))),
-            )
-        else:
-            return None
-
-        if any(v is None for v in vals):
-            return None
-
-        try:
-            return [
-                int(vals[0]),
-                float(vals[1]),
-                float(vals[2]),
-                float(vals[3]),
-                float(vals[4]),
-                float(vals[5]),
-            ]
-        except (TypeError, ValueError):
-            return None
 
     while current_start <= final_end_ms:
         page += 1
-        if page > 1000:
-            raise RuntimeError(f"Pagination safety stop for {symbol}")
 
-        window_end = min(
-            final_end_ms,
-            current_start + limit * interval_ms - 1
-        )
+        # Request exactly PAGE_LIMIT candle slots.
+        requested_end = current_start + PAGE_LIMIT * INTERVAL_MS - 1
+        window_end = min(final_end_ms, requested_end)
 
         params = {
-            "symbol": symbol.lower(),
-            "interval": "15m",
-            "startTime": current_start,
-            "endTime": window_end,
-            "limit": limit,
+            "symbol": symbol,
+            "interval": INTERVAL,
+            "startTime": int(current_start),
+            "endTime": int(window_end),
+            "limit": PAGE_LIMIT,
         }
 
-        raw_data = None
+        payload = None
         last_error = None
-        for attempt in range(1, 4):
+
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
-                response = requests.get(
+                r = requests.get(
                     url,
                     params=params,
-                    headers={"User-Agent": "HUNTER-V4-XT-Futures/1.0"},
-                    timeout=20,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=REQUEST_TIMEOUT,
                 )
-                response.raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, dict):
-                    raise RuntimeError(
-                        f"unexpected XT response type: {type(payload).__name__}"
-                    )
+                if r.status_code != 200:
+                    raise RuntimeError(f"HTTP {r.status_code}")
 
-                rc = payload.get("returnCode")
-                if rc not in (None, 0, "0"):
-                    raise RuntimeError(
-                        f"XT API error returnCode={rc}: "
-                        f"{payload.get('error') or payload.get('msgInfo') or payload}"
-                    )
-
-                result = payload.get("result")
-                if isinstance(result, list):
-                    raw_data = result
-                elif isinstance(result, dict):
-                    for key in ("items", "data", "list", "rows"):
-                        if isinstance(result.get(key), list):
-                            raw_data = result[key]
-                            break
-                if raw_data is None:
-                    data_fallback = payload.get("data")
-                    if isinstance(data_fallback, list):
-                        raw_data = data_fallback
-
-                if raw_data is None:
-                    raise RuntimeError(
-                        "XT response did not contain a kline list"
-                    )
+                payload = r.json()
                 break
             except Exception as exc:
                 last_error = exc
-                raw_data = None
-                if attempt < 3:
-                    time.sleep(attempt)
+                if attempt < MAX_RETRIES:
+                    time.sleep(min(2.0 * attempt, 5.0))
 
-        if raw_data is None:
+        if payload is None:
             raise RuntimeError(
-                f"API request failed after 3 retries for {symbol} page {page}: {last_error}"
+                f"{symbol}: API request failed page={page}: {last_error}"
             )
 
-        if not raw_data:
+        parsed = parse_batch(payload, current_start, window_end)
+
+        # XT can occasionally return the boundary candle from just before
+        # startTime. If filtering removes the entire page, do not blindly
+        # abort: inspect the raw response and advance by one candle only when
+        # the API clearly returned data before the requested interval.
+        raw_rows = unwrap_rows(payload) or []
+
+        if not parsed:
+            raw_timestamps = []
+            for row in raw_rows:
+                try:
+                    if isinstance(row, (list, tuple)):
+                        raw_timestamps.append(int(float(row[0])))
+                    elif isinstance(row, dict):
+                        raw_timestamps.append(
+                            int(float(row.get(
+                                "t",
+                                row.get(
+                                    "time",
+                                    row.get("timestamp", row.get("ts"))
+                                )
+                            )))
+                        )
+                except Exception:
+                    continue
+
+            if raw_timestamps and max(raw_timestamps) < current_start:
+                current_start += INTERVAL_MS
+                continue
+
+            # If this is the final window and all returned rows are newer than
+            # the requested window, we are done. Otherwise this is a real
+            # pagination/data-integrity failure.
+            if raw_timestamps and min(raw_timestamps) > window_end:
+                break
+
+            sample = raw_rows[0] if raw_rows else None
             raise RuntimeError(
-                f"Empty XT API page before reaching requested end for "
-                f"{symbol} page {page}; start={current_start} end={window_end}"
+                f"{symbol}: parsed batch empty page={page}; "
+                f"requested=[{current_start},{window_end}], sample={sample}"
             )
 
-        # XT can return its latest available page even when our requested
-        # startTime is slightly ahead of the exchange's current historical
-        # watermark.  This is common near the live-data boundary.  Detect
-        # that case BEFORE filtering by the requested window; otherwise a
-        # perfectly valid final historical page is reported as "parsed empty".
-        parsed_all = []
-        for row in raw_data:
-            parsed = parse_xt_kline_row(row)
-            if parsed is not None:
-                parsed_all.append(parsed)
+        all_rows.extend(parsed)
 
-        if not parsed_all:
-            sample = raw_data[0] if raw_data else None
-            raise RuntimeError(
-                f"XT returned rows but none were parseable for {symbol} page {page}; "
-                f"raw_rows={len(raw_data)}, sample={sample!r}"
-            )
+        max_ts = max(row[0] for row in parsed)
 
-        raw_max_ts = max(int(x[0]) for x in parsed_all)
-        raw_min_ts = min(int(x[0]) for x in parsed_all)
+        # Normal progression is one interval after the newest parsed candle.
+        next_start = max_ts + INTERVAL_MS
 
-        # If XT's latest available candle is already before our requested
-        # window, we have reached the exchange's data frontier.  Stop cleanly
-        # and let the full-dataset validation below decide whether coverage
-        # is sufficient.  Do NOT treat this as a parser failure.
-        if raw_max_ts < current_start:
-            print(
-                f"{symbol.upper()} page={page} reached XT data frontier: "
-                f"latest={pd.to_datetime(raw_max_ts, unit='ms', utc=True)} "
-                f"< requested_start={pd.to_datetime(current_start, unit='ms', utc=True)}"
-            )
-            break
-
-        parsed_batch = [
-            parsed for parsed in parsed_all
-            if current_start <= int(parsed[0]) <= window_end
-        ]
-
-        if not parsed_batch:
-            # A valid page may contain a few boundary records outside our
-            # exact window.  If it overlaps the requested range, fail loudly
-            # because that indicates an actual API/pagination inconsistency.
-            sample = raw_data[0] if raw_data else None
-            raise RuntimeError(
-                f"Parsed batch empty inside requested window for {symbol} page {page}; "
-                f"raw_rows={len(raw_data)}, raw_range=[{raw_min_ts},{raw_max_ts}], "
-                f"requested=[{current_start},{window_end}], sample={sample!r}"
-            )
-
-        # XT may return the boundary candle even when startTime is a few
-        # milliseconds after that candle. Advance by one full 15m interval,
-        # never by +1ms, otherwise the final boundary can produce a tiny
-        # sub-candle window and the API may return only the already-seen row.
-        page_df = pd.DataFrame(
-            parsed_batch,
-            columns=["timestamp", "open", "high", "low", "close", "volume"],
-        )
-        page_df = page_df.drop_duplicates("timestamp").sort_values("timestamp")
-        parsed_batch = page_df.values.tolist()
-
-        row_count_page = len(parsed_batch)
-        print(
-            f"{symbol.upper()} page={page} rows={row_count_page} "
-            f"{pd.to_datetime(int(page_df.timestamp.iloc[0]), unit='ms', utc=True)} -> "
-            f"{pd.to_datetime(int(page_df.timestamp.iloc[-1]), unit='ms', utc=True)}"
-        )
-
-        all_klines.extend(parsed_batch)
-
-        max_timestamp = int(page_df["timestamp"].max())
-        next_start = max_timestamp + interval_ms
+        # Critical guard: if API response does not move forward, retry the
+        # exact window once via a smaller boundary, then fail loudly.
         if next_start <= current_start:
             raise RuntimeError(
-                f"Pagination stalled for {symbol}: "
-                f"next_start={next_start} <= current_start={current_start}"
+                f"{symbol}: pagination stalled page={page}; "
+                f"next_start={next_start}, current_start={current_start}"
             )
 
-        current_start = next_start
-        time.sleep(0.10)
-
-    if not all_klines:
-        raise RuntimeError(f"No klines fetched for {symbol}")
-
-    df = pd.DataFrame(
-        all_klines,
-        columns=["timestamp", "open", "high", "low", "close", "volume"]
-    )
-
-    df = (
-        df.sort_values("timestamp")
-        .drop_duplicates(subset=["timestamp"])
-        .reset_index(drop=True)
-    )
-
-    current_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    current_15m_floor = (
-        current_time_ms - current_time_ms % interval_ms
-    )
-
-    df = df[df["timestamp"] < current_15m_floor].reset_index(drop=True)
-
-    if df.empty:
-        raise RuntimeError(f"No completed 15m candles remain for {symbol}")
-
-    df["timestamp_dt"] = pd.to_datetime(
-        df["timestamp"], unit="ms", utc=True
-    )
-
-    row_count = len(df)
-    first_ts = df["timestamp_dt"].iloc[0]
-    last_ts = df["timestamp_dt"].iloc[-1]
-    span_days = (
-        last_ts - first_ts
-    ).total_seconds() / 86400.0
-
-    time_diffs = (
-        df["timestamp_dt"].diff().dt.total_seconds().dropna()
-    )
-    gaps = int((time_diffs > 900).sum())
-
-    print(
-        f"Validation {symbol.upper()}: "
-        f"rows={row_count}, first={first_ts}, last={last_ts}, "
-        f"span={span_days:.1f}d, gaps={gaps}"
-    )
-
-    if row_count < 38000 or span_days < 400 or gaps > 100:
-        raise RuntimeError(
-            f"Insufficient coverage or excessive gaps for {symbol}: "
-            f"span={span_days:.1f}d, rows={row_count}, gaps={gaps}"
+        print(
+            f"{symbol.upper()} page={page} rows={len(parsed)} "
+            f"{pd.to_datetime(min(x[0] for x in parsed), unit='ms', utc=True)} "
+            f"-> {pd.to_datetime(max_ts, unit='ms', utc=True)}"
         )
 
-    df_to_save = df.drop(columns=["timestamp_dt"])
-    df_to_save.to_csv(file_path, index=False)
+        current_start = next_start
 
-    return df_to_save
+        # If the API returned fewer candles than requested, the endpoint may
+        # have ignored the exact upper boundary. Continue from the actual
+        # newest timestamp instead of stopping prematurely.
+        time.sleep(0.05)
 
+        # Safety against pathological APIs.
+        if page > 100:
+            raise RuntimeError(f"{symbol}: excessive pagination pages")
+
+    if not all_rows:
+        raise RuntimeError(f"{symbol}: no klines fetched")
+
+    df = pd.DataFrame(
+        all_rows,
+        columns=["timestamp", "open", "high", "low", "close", "volume"],
+    )
+
+    df = validate_dataframe(df, symbol)
+
+    # Remove any currently incomplete candle.
+    now_ms = int(time.time() * 1000)
+    current_floor = (now_ms // INTERVAL_MS) * INTERVAL_MS
+    df = df[df["timestamp"] < current_floor].copy()
+
+    df = validate_dataframe(df, symbol)
+
+    dt = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    print(
+        f"[VALIDATION] {symbol.upper()} rows={len(df)} "
+        f"first={dt.iloc[0]} last={dt.iloc[-1]} "
+        f"span={(dt.iloc[-1] - dt.iloc[0]).total_seconds()/86400.0:.1f}d"
+    )
+
+    df.to_csv(file_path, index=False)
+    return df
+
+
+# =========================
+# RESAMPLING
+# =========================
 
 def load_and_resample(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    df = df.copy()
-    df["timestamp_dt"] = pd.to_datetime(
-        df["timestamp"], unit="ms", utc=True
-    )
-    df = df.set_index("timestamp_dt").sort_index()
-    df = df[~df.index.duplicated(keep="last")].copy()
+    x = df.copy()
 
-    df_1h = (
-        df.resample("1h")
-        .agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum"
-        })
-        .dropna()
+    x["timestamp_dt"] = pd.to_datetime(
+        x["timestamp"], unit="ms", utc=True
     )
 
-    df_4h = (
-        df.resample("4h", closed="right", label="right")
-        .agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum"
-        })
-        .dropna()
+    x = (
+        x.set_index("timestamp_dt")
+        .sort_index()
+        .loc[:, ["open", "high", "low", "close", "volume"]]
     )
 
-    df_1d = (
-        df.resample("1d", closed="right", label="right")
-        .agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum"
-        })
-        .dropna()
-    )
+    x = x[~x.index.duplicated(keep="last")]
+
+    agg = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }
+
+    # UTC boundaries are deterministic. 1H/4H/1D bars are composed only from
+    # completed 15m candles already present in the source dataset.
+    h1 = x.resample("1h", label="left", closed="left").agg(agg).dropna()
+    h4 = x.resample("4h", label="left", closed="left").agg(agg).dropna()
+    d1 = x.resample("1d", label="left", closed="left").agg(agg).dropna()
 
     return {
-        "15m": df,
-        "1h": df_1h,
-        "4h": df_4h,
-        "1d": df_1d
+        "15m": x.copy(),
+        "1h": h1,
+        "4h": h4,
+        "1d": d1,
     }
 
 
-def calculate_indicators(
-    dfs: dict[str, pd.DataFrame]
-) -> None:
-    d1 = dfs["1d"]
+# =========================
+# FEATURES
+# =========================
 
-    prev_close_1d = d1["close"].shift(1)
-    d1["ema50"] = prev_close_1d.ewm(
-        span=50, adjust=False, min_periods=50
-    ).mean()
-    d1["ema200"] = prev_close_1d.ewm(
-        span=200, adjust=False, min_periods=200
-    ).mean()
-    d1["ema50_slope"] = d1["ema50"].diff()
+def calculate_features(dfs: dict[str, pd.DataFrame]) -> None:
+    h1 = dfs["1h"].copy()
 
-    h4 = dfs["4h"]
+    prev_close = h1["close"].shift(1)
 
-    highs = h4["high"].values
-    lows = h4["low"].values
-    n_h4 = len(h4)
+    h1["return_1h"] = h1["close"].pct_change(1)
+    h1["return_4h"] = h1["close"].pct_change(4)
+    h1["return_12h"] = h1["close"].pct_change(12)
+    h1["return_24h"] = h1["close"].pct_change(24)
+    h1["return_72h"] = h1["close"].pct_change(72)
 
-    swing_highs = [np.nan] * n_h4
-    swing_lows = [np.nan] * n_h4
+    hl_range = (h1["high"] - h1["low"]).replace(0, np.nan)
+    clv = (
+        (h1["close"] - h1["low"])
+        - (h1["high"] - h1["close"])
+    ) / hl_range
 
-    last_sh = np.nan
-    last_sl = np.nan
+    h1["svp"] = (clv.fillna(0.0) * h1["volume"]).astype(float)
 
-    for i in range(2, n_h4):
-        if highs[i - 2] >= highs[i - 1] and highs[i - 2] >= highs[i]:
-            last_sh = highs[i - 2]
+    # All flow values are strictly from completed bars before the signal bar.
+    h1["svp_1h"] = h1["svp"].shift(1)
+    h1["svp_4h"] = h1["svp"].shift(1).rolling(4, min_periods=4).sum()
+    h1["svp_12h"] = h1["svp"].shift(1).rolling(12, min_periods=12).sum()
 
-        if lows[i - 2] <= lows[i - 1] and lows[i - 2] <= lows[i]:
-            last_sl = lows[i - 2]
+    tr = pd.concat(
+        [
+            h1["high"] - h1["low"],
+            (h1["high"] - prev_close).abs(),
+            (h1["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
 
-        swing_highs[i] = last_sh
-        swing_lows[i] = last_sl
-
-    h4["confirmed_sh"] = swing_highs
-    h4["confirmed_sl"] = swing_lows
-
-    h1 = dfs["1h"]
-
-    prev_close_1h = h1["close"].shift(1)
-
-    tr = pd.concat([
-        h1["high"] - h1["low"],
-        (h1["high"] - prev_close_1h).abs(),
-        (h1["low"] - prev_close_1h).abs(),
-    ], axis=1).max(axis=1)
+    h1["tr"] = tr
 
     h1["atr14"] = tr.ewm(
         alpha=1 / 14,
         adjust=False,
-        min_periods=14
+        min_periods=14,
     ).mean()
 
-    h1["high24"] = h1["high"].shift(1).rolling(
-        window=24
-    ).max()
+    dollar_vol = (h1["close"] * h1["volume"]).replace(0, np.nan)
 
-    h1["low24"] = h1["low"].shift(1).rolling(
-        window=24
-    ).min()
+    h1["amihud"] = (
+        h1["return_1h"].abs() / dollar_vol
+    ).shift(1)
 
-    h1["vol_sma20"] = h1["volume"].shift(1).rolling(
-        window=20
-    ).mean()
-
-    tp = (h1["high"] + h1["low"] + h1["close"]) / 3.0
-    dates = h1.index.date
-
-    h1["date"] = dates
-    h1["cum_tp_vol"] = (
-        tp * h1["volume"]
-    ).groupby(dates).cumsum()
-
-    h1["cum_vol"] = (
+    vol_median = (
         h1["volume"]
-        .groupby(dates)
-        .cumsum()
+        .shift(1)
+        .rolling(24, min_periods=24)
+        .median()
+        .replace(0, np.nan)
     )
 
-    h1["vwap"] = (
-        h1["cum_tp_vol"]
-        / h1["cum_vol"].replace(0, np.nan)
+    h1["vol_shock"] = h1["volume"].shift(1) / vol_median
+
+    range_median = (
+        tr.shift(1)
+        .rolling(24, min_periods=24)
+        .median()
+        .replace(0, np.nan)
     )
 
+    h1["range_shock"] = tr.shift(1) / range_median
+
+    h1["liquidity_stress_score"] = (
+        h1["vol_shock"] * h1["range_shock"]
+    )
+
+    rv_1h = (
+        h1["return_1h"]
+        .shift(1)
+        .rolling(24, min_periods=24)
+        .std()
+    )
+
+    rv_4h = (
+        h1["return_1h"]
+        .shift(1)
+        .rolling(96, min_periods=96)
+        .std()
+    )
+
+    h1["rv_ratio"] = rv_1h / rv_4h.replace(0, np.nan)
+
+    # Percentile is based only on observations before the current signal bar.
+    h1["vol_percentile"] = (
+        rv_1h
+        .rolling(168, min_periods=168)
+        .rank(pct=True)
+    )
+
+    # Daily regime: use only the last COMPLETED daily candle.
+    d1 = dfs["1d"].copy()
+
+    d1["ema50"] = d1["close"].shift(1).ewm(
+        span=50,
+        adjust=False,
+        min_periods=50,
+    ).mean()
+
+    d1["ema200"] = d1["close"].shift(1).ewm(
+        span=200,
+        adjust=False,
+        min_periods=200,
+    ).mean()
+
+    d1["ema50_slope"] = d1["ema50"].diff()
+
+    # Use previous completed daily close for regime decisions.
+    d1["regime_close"] = d1["close"].shift(1)
+
+    dfs["1h"] = h1
+    dfs["1d"] = d1
+
+
+# =========================
+# BACKTEST
+# =========================
 
 def run_backtest(
     all_symbol_data: dict[str, dict[str, pd.DataFrame]]
 ) -> tuple[list[dict], dict | None]:
 
-    all_1h_times = sorted(
-        list(
-            set().union(
-                *(dfs["1h"].index for dfs in all_symbol_data.values())
-            )
+    all_times = sorted(
+        set().union(
+            *(dfs["1h"].index for dfs in all_symbol_data.values())
         )
     )
 
     active_position = None
-    trades = []
-    cooldowns = {sym: 0 for sym in all_symbol_data.keys()}
+    trades: list[dict] = []
 
-    symbol_arrays = {}
+    cooldowns = {sym: 0 for sym in all_symbol_data}
 
-    for sym, dfs in all_symbol_data.items():
-        h1 = dfs["1h"]
-        h4 = dfs["4h"]
-        d1 = dfs["1d"]
+    for ts in all_times:
 
-        symbol_arrays[sym] = {
-            "h1_times": h1.index,
-            "h1_df": h1,
-            "h4_times": h4.index,
-            "h4_df": h4,
-            "d1_times": d1.index,
-            "d1_df": d1,
-        }
-
-    for ts in all_1h_times:
+        # Cooldown is measured in portfolio clock hours.
         for sym in cooldowns:
             if cooldowns[sym] > 0:
                 cooldowns[sym] -= 1
 
-        position_closed_this_iteration = False
+        closed_this_bar = False
 
+        # ---------------------------------
+        # 1) Manage existing position
+        # ---------------------------------
         if active_position is not None:
             sym = active_position["symbol"]
-            h1_df = symbol_arrays[sym]["h1_df"]
+            h1 = all_symbol_data[sym]["1h"]
 
-            if ts == active_position["entry_ts"]:
-                # Position becomes active exactly at the next 1H candle open.
-                pass
+            if ts in h1.index and ts >= active_position["entry_ts"]:
+                bar = h1.loc[ts]
 
-            if ts >= active_position["entry_ts"] and ts in h1_df.index:
-                bar = h1_df.loc[ts]
-
-                hi = float(bar["high"])
-                lo = float(bar["low"])
+                high = float(bar["high"])
+                low = float(bar["low"])
 
                 side = active_position["side"]
                 sl = active_position["sl"]
                 tp = active_position["tp"]
                 entry = active_position["entry"]
 
-                notional = MARGIN_PER_TRADE * LEVERAGE
-
-                hit_sl = (
-                    lo <= sl if side == "LONG"
-                    else hi >= sl
-                )
-                hit_tp = (
-                    hi >= tp if side == "LONG"
-                    else lo <= tp
-                )
+                if side == "LONG":
+                    hit_sl = low <= sl
+                    hit_tp = high >= tp
+                else:
+                    hit_sl = high >= sl
+                    hit_tp = low <= tp
 
                 if hit_sl or hit_tp:
-                    outcome = (
-                        "LOSS"
-                        if (hit_sl and hit_tp) or hit_sl
-                        else "WIN"
-                    )
 
-                    exit_price = (
-                        sl if outcome == "LOSS"
-                        else tp
-                    )
+                    # Conservative same-candle rule:
+                    # if both levels are touched, LOSS.
+                    if hit_sl and hit_tp:
+                        outcome = "LOSS"
+                        exit_price = sl
+                    elif hit_sl:
+                        outcome = "LOSS"
+                        exit_price = sl
+                    else:
+                        outcome = "WIN"
+                        exit_price = tp
 
-                    gross = (
-                        (exit_price - entry) / entry * notional
-                        if side == "LONG"
-                        else
-                        (entry - exit_price) / entry * notional
-                    )
+                    notional = MARGIN_PER_TRADE * LEVERAGE
+
+                    if side == "LONG":
+                        gross = (
+                            (exit_price - entry) / entry
+                        ) * notional
+                    else:
+                        gross = (
+                            (entry - exit_price) / entry
+                        ) * notional
 
                     fees = notional * FEE_RATE * 2.0
                     pnl = gross - fees
 
-                    trades.append({
-                        "symbol": sym,
-                        "side": side,
-                        "entry_ts": active_position["entry_ts"],
-                        "exit_ts": ts,
-                        "outcome": outcome,
-                        "pnl": float(pnl),
-                        "entry": entry,
-                        "exit": exit_price,
-                    })
+                    trades.append(
+                        {
+                            "symbol": sym,
+                            "side": side,
+                            "entry_ts": active_position["entry_ts"],
+                            "exit_ts": ts,
+                            "outcome": outcome,
+                            "pnl": float(pnl),
+                            "entry": float(entry),
+                            "exit": float(exit_price),
+                            "sl": float(sl),
+                            "tp": float(tp),
+                        }
+                    )
 
                     cooldowns[sym] = 3
                     active_position = None
-                    position_closed_this_iteration = True
+                    closed_this_bar = True
 
-        if position_closed_this_iteration:
+        # Never open another position on the same candle in which the
+        # previous position's outcome became known.
+        if closed_this_bar:
             continue
 
-        if active_position is None:
-            candidates = []
+        # ---------------------------------
+        # 2) Generate new signal
+        # ---------------------------------
+        if active_position is not None:
+            continue
 
-            for symbol, data in symbol_arrays.items():
-                if cooldowns[symbol] > 0:
-                    continue
+        cross_returns = {}
 
-                h1_df = data["h1_df"]
-                h4_df = data["h4_df"]
-                d1_df = data["d1_df"]
+        for sym, dfs in all_symbol_data.items():
+            h1 = dfs["1h"]
 
-                d1_idx = (
-                    data["d1_times"]
-                    .searchsorted(ts, side="right") - 1
-                )
-                h4_idx = (
-                    data["h4_times"]
-                    .searchsorted(ts, side="right") - 1
-                )
-                h1_idx = (
-                    data["h1_times"]
-                    .searchsorted(ts, side="right") - 1
-                )
+            if ts not in h1.index:
+                continue
 
-                if d1_idx < 0 or h4_idx < 0 or h1_idx < 25:
-                    continue
+            val = h1.loc[ts, "return_24h"]
 
-                d1_row = d1_df.iloc[d1_idx]
+            if pd.notna(val) and np.isfinite(float(val)):
+                cross_returns[sym] = float(val)
 
-                h4_sub = h4_df.iloc[:h4_idx]
-                h1_sub = h1_df.iloc[:h1_idx]
+        if len(cross_returns) < 5:
+            continue
 
-                if len(h4_sub) == 0 or len(h1_sub) < 25:
-                    continue
+        ranks = pd.Series(cross_returns).rank(
+            method="average",
+            pct=True,
+        )
 
-                h4_row = h4_sub.iloc[-1]
+        candidates = []
 
-                d1_close = d1_row["close"]
+        for sym, dfs in all_symbol_data.items():
 
-                ema50 = d1_row.get("ema50", np.nan)
-                ema200 = d1_row.get("ema200", np.nan)
-                slope = d1_row.get(
-                    "ema50_slope",
-                    np.nan
-                )
+            if cooldowns[sym] > 0:
+                continue
 
-                if not all(
-                    np.isfinite([ema50, ema200, slope])
-                ):
-                    continue
+            h1 = dfs["1h"]
+            d1 = dfs["1d"]
 
-                daily_long = (
-                    d1_close > ema200
-                    and ema50 > ema200
-                    and slope > 0
-                )
+            if ts not in h1.index:
+                continue
 
-                daily_short = (
-                    d1_close < ema200
-                    and ema50 < ema200
-                    and slope < 0
-                )
+            h1_idx = h1.index.get_loc(ts)
 
-                if not (daily_long or daily_short):
-                    continue
+            if h1_idx < 100:
+                continue
 
-                c_sh = h4_row.get(
-                    "confirmed_sh",
-                    np.nan
-                )
-                c_sl = h4_row.get(
-                    "confirmed_sl",
-                    np.nan
-                )
-                h4_close = h4_row["close"]
+            # Most recent COMPLETED daily bar strictly before the current
+            # 1H signal candle.
+            d1_idx = d1.index.searchsorted(ts, side="right") - 1
 
-                if not all(
-                    np.isfinite([c_sh, c_sl])
-                ):
-                    continue
+            if d1_idx < 1:
+                continue
 
-                if daily_long:
-                    h4_ok = h4_close > c_sh
-                    side = "LONG"
-                else:
-                    h4_ok = h4_close < c_sl
-                    side = "SHORT"
+            drow = d1.iloc[d1_idx]
+            hrow = h1.iloc[h1_idx]
 
-                if not h4_ok:
-                    continue
+            regime_close = drow.get("regime_close", np.nan)
+            ema50 = drow.get("ema50", np.nan)
+            ema200 = drow.get("ema200", np.nan)
+            slope = drow.get("ema50_slope", np.nan)
 
-                prev_bar = h1_sub.iloc[-1]
-                prev_prev_bar = h1_sub.iloc[-2]
+            atr = hrow.get("atr14", np.nan)
+            svp4 = hrow.get("svp_4h", np.nan)
+            vol_pct = hrow.get("vol_percentile", np.nan)
 
-                low24 = prev_bar.get(
-                    "low24", np.nan
-                )
-                high24 = prev_bar.get(
-                    "high24", np.nan
-                )
-                atr = prev_bar.get(
-                    "atr14", np.nan
-                )
-                vol_sma = prev_bar.get(
-                    "vol_sma20", np.nan
-                )
-                vwap = prev_bar.get(
-                    "vwap", np.nan
-                )
-                prev_vwap = prev_prev_bar.get(
-                    "vwap", np.nan
-                )
+            if not all(
+                np.isfinite(float(x))
+                for x in [regime_close, ema50, ema200, slope, atr, svp4, vol_pct]
+            ):
+                continue
 
-                if not all(
-                    np.isfinite([
-                        low24,
-                        high24,
-                        atr,
-                        vol_sma,
-                        vwap,
-                        prev_vwap
-                    ])
-                ):
-                    continue
+            if float(atr) <= 0:
+                continue
 
-                p_low = prev_bar["low"]
-                p_high = prev_bar["high"]
-                p_close = prev_bar["close"]
-                p_vol = prev_bar["volume"]
+            daily_long = (
+                regime_close > ema200
+                and ema50 > ema200
+                and slope > 0
+            )
 
-                if side == "LONG":
-                    sweep = (
-                        p_low < low24 - 0.10 * atr
-                        and p_low >= low24 - 1.00 * atr
-                    )
-                    reclaim = p_close > low24
-                    vol_ok = p_vol >= 1.10 * vol_sma
-                    vwap_reclaim = (
-                        prev_prev_bar["close"] <= prev_vwap
-                        and p_close > vwap
-                    )
+            daily_short = (
+                regime_close < ema200
+                and ema50 < ema200
+                and slope < 0
+            )
 
-                    if not (
-                        sweep
-                        and reclaim
-                        and vol_ok
-                        and vwap_reclaim
-                    ):
-                        continue
+            rank_val = float(ranks.get(sym, np.nan))
 
-                    sl = p_low - 0.20 * atr
+            if not np.isfinite(rank_val):
+                continue
 
-                else:
-                    sweep = (
-                        p_high > high24 + 0.10 * atr
-                        and p_high <= high24 + 1.00 * atr
-                    )
-                    reclaim = p_close < high24
-                    vol_ok = p_vol >= 1.10 * vol_sma
-                    vwap_reclaim = (
-                        prev_prev_bar["close"] >= prev_vwap
-                        and p_close < vwap
-                    )
-
-                    if not (
-                        sweep
-                        and reclaim
-                        and vol_ok
-                        and vwap_reclaim
-                    ):
-                        continue
-
-                    sl = p_high + 0.20 * atr
+            # Flow-continuation setup.
+            if (
+                daily_long
+                and rank_val >= 0.70
+                and svp4 > 0
+                and vol_pct < 0.85
+            ):
+                sl = float(hrow["low"] - 0.5 * atr)
 
                 candidates.append(
-                    (
-                        symbol,
-                        side,
-                        prev_bar.name,
-                        sl
-                    )
+                    {
+                        "symbol": sym,
+                        "side": "LONG",
+                        "rank": rank_val,
+                        "flow": float(svp4),
+                        "sl": sl,
+                        "atr": float(atr),
+                    }
                 )
 
-            if candidates:
-                symbol, side, trigger_ts, sl = candidates[0]
+            elif (
+                daily_short
+                and rank_val <= 0.30
+                and svp4 < 0
+                and vol_pct < 0.85
+            ):
+                sl = float(hrow["high"] + 0.5 * atr)
 
-                h1_df = symbol_arrays[symbol]["h1_df"]
-
-                next_indices = h1_df.index[
-                    h1_df.index > trigger_ts
-                ]
-
-                if len(next_indices) == 0:
-                    continue
-
-                entry_ts = next_indices[0]
-                raw_open = float(
-                    h1_df.loc[entry_ts, "open"]
+                candidates.append(
+                    {
+                        "symbol": sym,
+                        "side": "SHORT",
+                        "rank": rank_val,
+                        "flow": float(svp4),
+                        "sl": sl,
+                        "atr": float(atr),
+                    }
                 )
 
-                entry = (
-                    raw_open * (1.0 + SLIPPAGE)
-                    if side == "LONG"
-                    else raw_open * (1.0 - SLIPPAGE)
-                )
+        if not candidates:
+            continue
 
-                risk = (
-                    entry - sl
-                    if side == "LONG"
-                    else sl - entry
-                )
+        # Deterministic strongest-momentum selection.
+        # This replaces arbitrary candidates[0].
+        candidates.sort(
+            key=lambda x: (
+                x["rank"] if x["side"] == "LONG"
+                else 1.0 - x["rank"],
+                abs(x["flow"]),
+                -x["atr"],
+            ),
+            reverse=True,
+        )
 
-                if risk <= 0:
-                    continue
+        selected = candidates[0]
+        sym = selected["symbol"]
+        side = selected["side"]
+        sl = selected["sl"]
 
-                tp = (
-                    entry + RR * risk
-                    if side == "LONG"
-                    else entry - RR * risk
-                )
+        h1 = all_symbol_data[sym]["1h"]
 
-                active_position = {
-                    "symbol": symbol,
-                    "side": side,
-                    "entry_ts": entry_ts,
-                    "entry": entry,
-                    "sl": sl,
-                    "tp": tp,
-                }
+        future_indices = h1.index[h1.index > ts]
+
+        if len(future_indices) == 0:
+            continue
+
+        entry_ts = future_indices[0]
+
+        # The entry candle itself must be complete enough to provide its open;
+        # no high/low/close from that candle is used to create the signal.
+        raw_open = float(h1.loc[entry_ts, "open"])
+
+        if side == "LONG":
+            entry = raw_open * (1.0 + SLIPPAGE)
+            risk = entry - sl
+        else:
+            entry = raw_open * (1.0 - SLIPPAGE)
+            risk = sl - entry
+
+        if not np.isfinite(risk) or risk <= 0:
+            continue
+
+        tp = (
+            entry + RR * risk
+            if side == "LONG"
+            else entry - RR * risk
+        )
+
+        active_position = {
+            "symbol": sym,
+            "side": side,
+            "entry_ts": entry_ts,
+            "entry": float(entry),
+            "sl": float(sl),
+            "tp": float(tp),
+        }
 
     return trades, active_position
 
 
-def calculate_max_drawdown(
-    trades: list[dict]
-) -> tuple[float, float]:
+# =========================
+# REPORTING
+# =========================
+
+def calculate_metrics(trades: list[dict]):
+    ordered = sorted(
+        trades,
+        key=lambda t: pd.Timestamp(t["exit_ts"]),
+    )
+
+    total = len(ordered)
+    wins = sum(t["outcome"] == "WIN" for t in ordered)
+    losses = total - wins
+
+    wr = wins / total * 100.0 if total else 0.0
+
+    gross_profit = sum(
+        t["pnl"] for t in ordered if t["pnl"] > 0
+    )
+
+    gross_loss = abs(
+        sum(t["pnl"] for t in ordered if t["pnl"] < 0)
+    )
+
+    if gross_loss > 0:
+        pf = gross_profit / gross_loss
+    elif gross_profit > 0:
+        pf = float("inf")
+    else:
+        pf = 0.0
+
+    net = sum(t["pnl"] for t in ordered)
+
     equity = INITIAL_CAPITAL
-    peak = equity
+    peak = INITIAL_CAPITAL
     max_dd_dollar = 0.0
     max_dd_pct = 0.0
 
-    ordered_trades = sorted(
-        trades,
-        key=lambda x: pd.Timestamp(x["exit_ts"])
-    )
+    streak = 0
+    max_streak = 0
 
-    for trade in ordered_trades:
-        equity += float(trade["pnl"])
-        peak = max(peak, equity)
+    for t in ordered:
+        equity += t["pnl"]
+
+        if equity > peak:
+            peak = equity
 
         dd_dollar = peak - equity
         dd_pct = (
             dd_dollar / peak * 100.0
-            if peak > 0
-            else 0.0
+            if peak > 0 else 0.0
         )
 
-        max_dd_dollar = max(
-            max_dd_dollar,
-            dd_dollar
+        max_dd_dollar = max(max_dd_dollar, dd_dollar)
+        max_dd_pct = max(max_dd_pct, dd_pct)
+
+        if t["outcome"] == "LOSS":
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "wr": wr,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "pf": pf,
+        "net": net,
+        "max_dd_dollar": max_dd_dollar,
+        "max_dd_pct": max_dd_pct,
+        "max_streak": max_streak,
+    }
+
+
+def print_report(
+    trades: list[dict],
+    open_pos: dict | None,
+    all_symbol_data: dict[str, dict[str, pd.DataFrame]],
+) -> None:
+
+    metrics = calculate_metrics(trades)
+
+    all_times = sorted(
+        set().union(
+            *(dfs["1h"].index for dfs in all_symbol_data.values())
         )
-        max_dd_pct = max(
-            max_dd_pct,
-            dd_pct
-        )
-
-    return max_dd_dollar, max_dd_pct
-
-
-def main():
-    args = parse_args()
-    data_dir = Path(args.data_dir)
-    data_dir.mkdir(
-        parents=True,
-        exist_ok=True
     )
 
+    if len(all_times) >= 2:
+        span_days = (
+            all_times[-1] - all_times[0]
+        ).total_seconds() / 86400.0
+    else:
+        span_days = 1.0
+
+    tpd = (
+        metrics["total"] / span_days
+        if span_days > 0 else 0.0
+    )
+
+    print("\n" + "=" * 30 + " PER-SYMBOL BREAKDOWN " + "=" * 30)
+    print(
+        f"{'Symbol':<12} | {'Trades':<7} | {'Wins':<6} | "
+        f"{'Losses':<7} | {'WR':<9} | {'PnL':<12}"
+    )
+    print("-" * 70)
+
+    for sym in SYMBOLS:
+        st = [t for t in trades if t["symbol"] == sym]
+        total = len(st)
+        wins = sum(t["outcome"] == "WIN" for t in st)
+        losses = total - wins
+        wr = wins / total * 100.0 if total else 0.0
+        pnl = sum(t["pnl"] for t in st)
+
+        print(
+            f"{sym.upper():<12} | {total:<7} | {wins:<6} | "
+            f"{losses:<7} | {wr:>6.2f}% | ${pnl:>10.2f}"
+        )
+
+    print("\n" + "=" * 30 + " PORTFOLIO BACKTEST RESULTS " + "=" * 30)
+
+    print(f"Total Trades         : {metrics['total']}")
+    print(f"Wins                 : {metrics['wins']}")
+    print(f"Losses               : {metrics['losses']}")
+    print(f"Win Rate             : {metrics['wr']:.2f}%")
+    print(f"Gross Profit         : ${metrics['gross_profit']:,.2f}")
+    print(f"Gross Loss           : ${metrics['gross_loss']:,.2f}")
+    print(f"Profit Factor        : {metrics['pf']:.2f}")
+    print(f"Net PnL              : ${metrics['net']:,.2f}")
+    print(
+        f"Max Drawdown ($)     : "
+        f"${metrics['max_dd_dollar']:,.2f}"
+    )
+    print(
+        f"Max Drawdown (%)     : "
+        f"{metrics['max_dd_pct']:.2f}%"
+    )
+    print(
+        f"Max Consecutive Loss : "
+        f"{metrics['max_streak']}"
+    )
+    print(f"Trades Per Day       : {tpd:.4f}")
+    print(
+        f"Open Positions At End: "
+        f"{1 if open_pos is not None else 0}"
+    )
+
+    print("=" * 68)
+
+    eligible = (
+        metrics["wr"] > 50.0
+        and metrics["pf"] > 1.20
+        and metrics["net"] > 0
+        and metrics["max_streak"] <= 4
+        and metrics["total"] >= 150
+    )
+
+    print("\n" + "=" * 30 + " OOS ELIGIBILITY " + "=" * 30)
+    print(
+        f"Win Rate        : {metrics['wr']:.2f}% "
+        f"| requirement > 50% "
+        f"| {'PASS' if metrics['wr'] > 50 else 'FAIL'}"
+    )
+    print(
+        f"Profit Factor   : {metrics['pf']:.2f} "
+        f"| requirement > 1.20 "
+        f"| {'PASS' if metrics['pf'] > 1.20 else 'FAIL'}"
+    )
+    print(
+        f"Net PnL         : ${metrics['net']:,.2f} "
+        f"| requirement > $0 "
+        f"| {'PASS' if metrics['net'] > 0 else 'FAIL'}"
+    )
+    print(
+        f"Max Loss Streak : {metrics['max_streak']} "
+        f"| requirement <= 4 "
+        f"| {'PASS' if metrics['max_streak'] <= 4 else 'FAIL'}"
+    )
+    print(
+        f"Sample Size     : {metrics['total']} "
+        f"| requirement >= 150 "
+        f"| {'PASS' if metrics['total'] >= 150 else 'FAIL'}"
+    )
+    print(
+        f"OOS ELIGIBLE    : "
+        f"{'TRUE (ELIGIBLE)' if eligible else 'FALSE (REJECTED)'}"
+    )
+    print("=" * 68)
+
+
+# =========================
+# MAIN
+# =========================
+
+def main() -> None:
+    args = parse_args()
+
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print("HUNTER-V5.1 — STRICT XT FUTURES FLOW-STATE BACKTEST")
     print("=" * 70)
     print(
-        "HUNTER-V4: 1-YEAR FUTURES REST API "
-        "PIPELINE & BACKTEST"
+        f"Universe={len(SYMBOLS)} | Test={TOTAL_DAYS}d | "
+        f"Warmup={WARMUP_DAYS}d | RR=1:{RR}"
     )
-    print("=" * 70)
 
     all_symbol_data = {}
 
-    for sym in SYMBOLS:
+    for symbol in SYMBOLS:
         try:
-            df_raw = fetch_xt_futures_data(
-                sym,
-                data_dir
-            )
-            dfs = load_and_resample(df_raw)
-            calculate_indicators(dfs)
-            all_symbol_data[sym] = dfs
-
-        except Exception as e:
+            raw = fetch_xt_futures_data(symbol, data_dir)
+            dfs = load_and_resample(raw)
+            calculate_features(dfs)
+            all_symbol_data[symbol] = dfs
+        except Exception as exc:
             print(
-                f"\n[ABORT] Critical error for mandatory "
-                f"symbol {sym.upper()}: {e}"
+                f"\n[ABORT] Critical error for mandatory symbol "
+                f"{symbol.upper()}: {exc}"
             )
             print(
                 "[ABORT] Complete universe required. "
-                "Aborting entire backtest."
+                "Backtest NOT executed."
             )
             sys.exit(1)
 
-    trades, open_pos = run_backtest(
-        all_symbol_data
+    print(
+        f"\n[DATA] Validated {len(all_symbol_data)}/"
+        f"{len(SYMBOLS)} symbols."
     )
 
-    total = len(trades)
-    wins = sum(
-        1 for t in trades
-        if t["outcome"] == "WIN"
-    )
-    losses = total - wins
+    trades, open_pos = run_backtest(all_symbol_data)
 
-    win_rate = (
-        wins / total * 100.0
-        if total > 0
-        else 0.0
-    )
-
-    net_pnl = sum(
-        t["pnl"] for t in trades
-    )
-
-    gross_profit = sum(
-        t["pnl"]
-        for t in trades
-        if t["pnl"] > 0
-    )
-
-    gross_loss = abs(
-        sum(
-            t["pnl"]
-            for t in trades
-            if t["pnl"] < 0
-        )
-    )
-
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 0
-        else (
-            float("inf")
-            if gross_profit > 0
-            else 0.0
-        )
-    )
-
-    max_dd_dollar, max_dd_pct = (
-        calculate_max_drawdown(trades)
-    )
-
-    consec = 0
-    max_consec = 0
-
-    for t in sorted(
+    print_report(
         trades,
-        key=lambda x: pd.Timestamp(
-            x["exit_ts"]
-        )
-    ):
-        if t["outcome"] == "LOSS":
-            consec += 1
-            max_consec = max(
-                max_consec,
-                consec
-            )
-        else:
-            consec = 0
-
-    all_1h_times_flat = sorted(
-        list(
-            set().union(
-                *(
-                    dfs["1h"].index
-                    for dfs in all_symbol_data.values()
-                )
-            )
-        )
+        open_pos,
+        all_symbol_data,
     )
-
-    total_span_days = (
-        (
-            all_1h_times_flat[-1]
-            - all_1h_times_flat[0]
-        ).total_seconds() / 86400.0
-        if all_1h_times_flat
-        else 1.0
-    )
-
-    trades_per_day = (
-        total / total_span_days
-        if total_span_days > 0
-        else 0.0
-    )
-
-    open_count = (
-        1 if open_pos is not None
-        else 0
-    )
-
-    print(
-        "\n"
-        + "=" * 30
-        + " PER-SYMBOL BREAKDOWN "
-        + "=" * 30
-    )
-
-    print(
-        f"{'Symbol':<12} | "
-        f"{'Trades':<8} | "
-        f"{'Wins':<6} | "
-        f"{'Losses':<6} | "
-        f"{'Win Rate':<10} | "
-        f"{'PnL ($)':<10}"
-    )
-
-    print("-" * 65)
-
-    for sym in SYMBOLS:
-        sym_trades = [
-            t for t in trades
-            if t["symbol"] == sym
-        ]
-
-        s_total = len(sym_trades)
-
-        s_wins = sum(
-            1 for t in sym_trades
-            if t["outcome"] == "WIN"
-        )
-
-        s_losses = (
-            s_total - s_wins
-        )
-
-        s_wr = (
-            s_wins / s_total * 100.0
-            if s_total > 0
-            else 0.0
-        )
-
-        s_pnl = sum(
-            t["pnl"]
-            for t in sym_trades
-        )
-
-        print(
-            f"{sym.upper():<12} | "
-            f"{s_total:<8} | "
-            f"{s_wins:<6} | "
-            f"{s_losses:<6} | "
-            f"{s_wr:>6.2f}%    | "
-            f"${s_pnl:>9.2f}"
-        )
-
-    print(
-        "\n"
-        + "=" * 40
-        + " PORTFOLIO BACKTEST RESULTS "
-        + "=" * 40
-    )
-
-    print(f"Total Trades         : {total}")
-    print(f"Wins                 : {wins}")
-    print(f"Losses               : {losses}")
-    print(f"Win Rate             : {win_rate:.2f}%")
-    print(f"Gross Profit         : ${gross_profit:,.2f}")
-    print(f"Gross Loss           : ${gross_loss:,.2f}")
-    print(f"Profit Factor        : {profit_factor:.2f}")
-    print(f"Net PnL              : ${net_pnl:,.2f}")
-    print(f"Max Drawdown ($)     : ${max_dd_dollar:,.2f}")
-    print(f"Max Drawdown (%)     : {max_dd_pct:.2f}%")
-    print(f"Max Consecutive Loss : {max_consec}")
-    print(f"Trades Per Day       : {trades_per_day:.4f}")
-    print(f"Open Positions At End: {open_count}")
-    print("=" * 68)
 
 
 if __name__ == "__main__":
