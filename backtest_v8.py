@@ -1,37 +1,39 @@
 #!/usr/bin/env python3
 """
-HUNTER-V9.1 — AUDITED DERIVATIVES REGIME / MICROSTRUCTURE ENGINE
+HUNTER-V10 — RESEARCH-FIRST FUTURES EDGE ENGINE
 
-Purpose:
-- XT USDT-M Futures 15m data
-- strict causal feature construction
-- futures/spot basis + volume-ratio diagnostics
-- factor discovery on TRAIN only
-- strategy selection on TRAIN/VALIDATION only
-- untouched OOS evaluation
-- fixed RR 1:2
-- no timeout / no BE / no trailing
-- no overlapping positions
-- same-candle SL+TP = LOSS
-- unresolved position at dataset end = OPEN
+XT USDT-M Futures / 15m -> 1H / 4H / 1D
+Research-first, causal, no lookahead, no repainting.
 
-Important:
-This version does NOT pretend that a simple technical setup is a
-"microstructure edge". It first measures the available causal factors.
-If the discovered factors do not support a robust rule, the final
-acceptance gate remains FALSE.
+Design:
+- Real XT Futures history only; no fabricated OI/funding/liquidation.
+- Exact 15m pagination + hard validation.
+- Complete 1H/4H/1D bars only.
+- 1D regime + 4H structure + 1H event/entry.
+- Predeclared strategy families and small parameter grid.
+- TRAIN -> VALIDATION selection; untouched OOS.
+- Manual Spearman calculation (no scipy dependency).
+- One global position, no overlap.
+- Entry on next 1H open.
+- Fixed RR 1:2.
+- No timeout, no BE, no trailing.
+- Same-candle SL+TP = LOSS.
+- Position still open at dataset end = OPEN.
+- Entry and exit slippage modeled adversely.
+- Fixed $100 margin, 50x leverage, $5,000 notional.
+- If stop loss exceeds isolated margin, the loss is capped at margin
+  (conservative liquidation proxy) and reported as LIQUIDATED.
+  This prevents impossible equity below the available isolated margin.
 """
 
 from __future__ import annotations
 
 import argparse
 import math
-import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import timezone
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -45,44 +47,36 @@ SYMBOLS = [
 ]
 
 FUTURES_URL = "https://fapi.xt.com/future/market/v1/public/q/kline"
+DATA_DIR = Path("data/xt_futures_v10")
 
-DATA_DIR = Path("data/xt_futures_v9_1")
-TOTAL_DAYS = 365
-WARMUP_DAYS = 60
+DAYS = 365
+WARMUP_DAYS = 90
 INTERVAL_MS = 15 * 60 * 1000
-KLINE_LIMIT = 1500
+LIMIT = 1500
 
 INITIAL_CAPITAL = 1000.0
-MARGIN_PER_TRADE = 100.0
+MARGIN = 100.0
 LEVERAGE = 50.0
+NOTIONAL = MARGIN * LEVERAGE
 RR = 2.0
 
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 
-MIN_DATA_ROWS = 38000
+MIN_ROWS = 38000
 MAX_GAP_MINUTES = 15.0
 
-# Factor-discovery horizons on 1H data.
-HORIZONS = (1, 4, 8, 24)
-
-# OOS is never used to choose parameters.
 TRAIN_FRAC = 0.60
 VAL_FRAC = 0.20
 
-# The strategy family is deliberately small and predeclared.
-# No post-OOS threshold hunting is permitted.
-TOP_RS = 3
-MIN_COMMON_SYMBOLS_FRAC = 0.70
-BB_LOOKBACK = 20
-BB_PERCENTILE_LOOKBACK = 96
-ATR_PERIOD = 14
+MIN_VALIDATION_TRADES = 30
+MIN_TRAIN_TRADES = 50
 
-# Acceptance requirements.
 MIN_OOS_TRADES = 150
 MIN_OOS_WR = 50.0
 MIN_OOS_PF = 1.20
-MAX_OOS_LOSS_STREAK = 4
+MAX_OOS_STREAK = 4
+MAX_OOS_DD_PCT = 50.0
 
 
 @dataclass(frozen=True)
@@ -93,899 +87,756 @@ class Split:
     end: pd.Timestamp
 
 
-def parse_args() -> argparse.Namespace:
+@dataclass(frozen=True)
+class Config:
+    name: str
+    family: str
+    regime: str
+    threshold: float
+    atr_mult: float
+    lookback: int
+
+
+def args():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", default=str(DATA_DIR))
     p.add_argument("--refresh", action="store_true")
     return p.parse_args()
 
 
-def _extract_payload(obj):
+def payload_rows(obj):
     if isinstance(obj, list):
         return obj
     if isinstance(obj, dict):
-        for key in ("result", "data", "rows", "items", "list"):
-            if key in obj:
-                found = _extract_payload(obj[key])
-                if found is not None:
-                    return found
+        for k in ("result", "data", "rows", "items", "list"):
+            if k in obj:
+                x = payload_rows(obj[k])
+                if x is not None:
+                    return x
     return None
 
 
-def _parse_kline_row(row):
-    if isinstance(row, (list, tuple)):
-        if len(row) < 6:
+def parse_row(r):
+    if isinstance(r, (list, tuple)):
+        if len(r) < 6:
             return None
-        ts, o, h, l, c, v = row[:6]
-    elif isinstance(row, dict):
-        def pick(*keys):
-            for k in keys:
-                if k in row and row[k] is not None:
-                    return row[k]
-            raise KeyError(keys)
-
-        ts = pick("t", "time", "timestamp")
-        o = pick("o", "open")
-        h = pick("h", "high")
-        l = pick("l", "low")
-        c = pick("c", "close")
-        # XT responses seen in prior validated runs used compact volume keys.
-        # Prefer v, then volume, then a. Never silently invent volume.
-        v = pick("v", "volume", "a")
-    else:
-        return None
-
-    ts = int(float(ts))
-    vals = [float(o), float(h), float(l), float(c), float(v)]
-    if not all(np.isfinite(x) for x in vals):
-        return None
-    if vals[1] < vals[2] or vals[1] < max(vals[0], vals[3]) or vals[2] > min(vals[0], vals[3]):
-        return None
-    if ts <= 0:
-        return None
-    return [ts, *vals]
-
-
-def _validate_15m(df: pd.DataFrame, target_start_ms: int, final_end_ms: int, symbol: str):
-    required = ["timestamp", "open", "high", "low", "close", "volume"]
-    if any(c not in df.columns for c in required):
-        raise RuntimeError(f"{symbol}: missing required columns")
-
-    df = df[required].copy()
-    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
-    for c in required[1:]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna().copy()
-
-    df["timestamp"] = df["timestamp"].astype(np.int64)
-    df = df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
-
-    # Only complete candles inside the requested historical range.
-    df = df[(df["timestamp"] >= target_start_ms) & (df["timestamp"] <= final_end_ms)].copy()
-    if df.empty:
-        raise RuntimeError(f"{symbol}: no rows in requested range")
-
-    current_floor = (int(datetime.now(timezone.utc).timestamp() * 1000) // INTERVAL_MS) * INTERVAL_MS
-    df = df[df["timestamp"] < current_floor].copy()
-
-    if df.empty:
-        raise RuntimeError(f"{symbol}: all rows are incomplete/current")
-
-    diffs = df["timestamp"].diff().dropna()
-    gap_count = int((diffs > INTERVAL_MS).sum())
-    duplicate_count = int(df["timestamp"].duplicated().sum())
-    monotonic = bool(df["timestamp"].is_monotonic_increasing)
-
-    first_ts = int(df["timestamp"].iloc[0])
-    last_ts = int(df["timestamp"].iloc[-1])
-    span_days = (last_ts - first_ts) / 86400000.0
-
-    # Allow only a small edge truncation caused by request alignment.
-    start_tolerance = 2 * 3600000
-    end_tolerance = 2 * 3600000
-
-    print(
-        f"[VALIDATE] {symbol.upper()} rows={len(df)} "
-        f"first={pd.to_datetime(first_ts, unit='ms', utc=True)} "
-        f"last={pd.to_datetime(last_ts, unit='ms', utc=True)} "
-        f"span={span_days:.1f}d gaps={gap_count} "
-        f"duplicates={duplicate_count} monotonic={monotonic}"
-    )
-
-    if len(df) < MIN_DATA_ROWS:
-        raise RuntimeError(f"{symbol}: too few rows: {len(df)}")
-    if span_days < TOTAL_DAYS + WARMUP_DAYS - 5:
-        raise RuntimeError(f"{symbol}: insufficient span: {span_days:.1f}d")
-    if gap_count > 0:
-        raise RuntimeError(f"{symbol}: data gaps detected: {gap_count}")
-    if duplicate_count != 0 or not monotonic:
-        raise RuntimeError(f"{symbol}: duplicate/non-monotonic timestamps")
-    if first_ts > target_start_ms + start_tolerance:
-        raise RuntimeError(f"{symbol}: starts too late")
-    if last_ts < final_end_ms - end_tolerance:
-        raise RuntimeError(f"{symbol}: ends too early")
-
-    return df.reset_index(drop=True)
-
-
-def fetch_xt_futures_data(symbol: str, data_dir: Path, refresh: bool = False) -> pd.DataFrame:
-    file_path = data_dir / f"{symbol.upper()}_15m.csv"
-
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    target_start_ms = now_ms - int((TOTAL_DAYS + WARMUP_DAYS) * 86400 * 1000)
-    final_end_ms = (now_ms // INTERVAL_MS) * INTERVAL_MS - 1
-
-    if file_path.exists() and file_path.stat().st_size > 1000 and not refresh:
+        vals = r[:6]
         try:
-            cached = pd.read_csv(file_path)
-            validated = _validate_15m(cached, target_start_ms, final_end_ms, symbol)
-            print(f"[CACHE] {symbol.upper()} accepted")
-            return validated
-        except Exception as exc:
-            print(f"[CACHE] {symbol.upper()} invalid; refetching: {exc}")
+            return [int(float(vals[0])), *[float(x) for x in vals[1:6]]]
+        except Exception:
+            return None
 
+    if not isinstance(r, dict):
+        return None
+
+    def pick(*keys):
+        for k in keys:
+            if k in r and r[k] is not None:
+                return r[k]
+        return None
+
+    ts = pick("t", "time", "timestamp", "T")
+    o = pick("o", "open")
+    h = pick("h", "high")
+    l = pick("l", "low")
+    c = pick("c", "close")
+    v = pick("v", "volume", "vol", "a")
+
+    if any(x is None for x in (ts, o, h, l, c, v)):
+        return None
+
+    try:
+        return [int(float(ts)), float(o), float(h), float(l), float(c), float(v)]
+    except Exception:
+        return None
+
+
+def fetch_symbol(symbol: str, data_dir: Path, refresh=False):
     data_dir.mkdir(parents=True, exist_ok=True)
-    cursor = target_start_ms
+    path = data_dir / f"{symbol}.csv"
+
+    now = int(time.time() * 1000)
+    target_start = now - int((DAYS + WARMUP_DAYS) * 86400 * 1000)
+    final_end = (now // INTERVAL_MS) * INTERVAL_MS - 1
+
+    if path.exists() and not refresh:
+        df = pd.read_csv(path)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        return validate(df, symbol, target_start, final_end)
+
+    s = requests.Session()
+    cursor = target_start
     all_rows = []
     page = 0
-    session = requests.Session()
-    session.headers.update({"User-Agent": "HUNTER-V9.1/1.0"})
 
-    while cursor <= final_end_ms:
+    while cursor <= final_end:
         page += 1
-        window_end = min(final_end_ms, cursor + KLINE_LIMIT * INTERVAL_MS - 1)
+        window_end = min(final_end, cursor + LIMIT * INTERVAL_MS - 1)
         params = {
             "symbol": symbol,
             "interval": "15m",
             "startTime": cursor,
             "endTime": window_end,
-            "limit": KLINE_LIMIT,
+            "limit": LIMIT,
         }
 
-        payload = None
         last_error = None
-        for attempt in range(3):
+        data = None
+        for attempt in range(4):
             try:
-                r = session.get(FUTURES_URL, params=params, timeout=20)
+                r = s.get(FUTURES_URL, params=params, timeout=30)
                 r.raise_for_status()
-                payload = _extract_payload(r.json())
-                if payload is None:
-                    raise RuntimeError("API payload has no list")
+                data = payload_rows(r.json())
+                if data is None:
+                    raise RuntimeError("XT response did not contain a kline list")
                 break
-            except Exception as exc:
-                last_error = exc
+            except Exception as e:
+                last_error = e
                 time.sleep(1.0 + attempt)
 
-        if payload is None:
+        if data is None:
             raise RuntimeError(f"{symbol}: page {page} failed: {last_error}")
 
-        parsed = []
-        for row in payload:
-            try:
-                parsed_row = _parse_kline_row(row)
-                if parsed_row is not None:
-                    ts = parsed_row[0]
-                    if cursor <= ts <= window_end:
-                        parsed.append(parsed_row)
-            except Exception:
-                continue
+        parsed = [x for x in (parse_row(z) for z in data) if x is not None]
+        in_window = [x for x in parsed if cursor <= x[0] <= window_end]
 
-        if parsed:
-            all_rows.extend(parsed)
-            max_ts = max(x[0] for x in parsed)
-            next_cursor = max_ts + INTERVAL_MS
-        else:
-            # A page can contain stale/out-of-window rows near the API's
-            # historical boundary. Do not treat that as a valid page.
-            returned_ts = []
-            for row in payload:
-                try:
-                    pr = _parse_kline_row(row)
-                    if pr is not None:
-                        returned_ts.append(pr[0])
-                except Exception:
-                    pass
-
-            if returned_ts and max(returned_ts) < cursor:
+        if not in_window:
+            timestamps = [x[0] for x in parsed]
+            if timestamps and max(timestamps) < cursor:
                 break
+            if not parsed:
+                raise RuntimeError(f"{symbol}: page {page} returned no parseable rows")
             raise RuntimeError(
-                f"{symbol}: page {page} produced no rows in requested window "
-                f"[{cursor}, {window_end}]"
+                f"{symbol}: page {page} returned rows but none in requested window"
             )
 
+        all_rows.extend(in_window)
+        mx = max(x[0] for x in in_window)
+
+        if mx < cursor:
+            raise RuntimeError(f"{symbol}: pagination moved backwards")
+        next_cursor = mx + INTERVAL_MS
         if next_cursor <= cursor:
-            raise RuntimeError(f"{symbol}: pagination stalled at page {page}")
+            raise RuntimeError(f"{symbol}: pagination made no progress")
 
         cursor = next_cursor
-        if page % 10 == 0:
-            print(f"[FETCH] {symbol.upper()} page={page} rows={len(all_rows)}")
-        time.sleep(0.05)
 
-        if cursor > final_end_ms:
+        if page % 10 == 0:
+            print(f"[FETCH] {symbol} page={page} rows={len(all_rows)}")
+
+        if mx >= final_end:
             break
 
     if not all_rows:
-        raise RuntimeError(f"{symbol}: no klines fetched")
+        raise RuntimeError(f"{symbol}: no data collected")
 
-    raw = pd.DataFrame(
-        all_rows,
-        columns=["timestamp", "open", "high", "low", "close", "volume"],
-    )
-    validated = _validate_15m(raw, target_start_ms, final_end_ms, symbol)
-    validated.to_csv(file_path, index=False)
-    return validated
+    df = pd.DataFrame(all_rows, columns=["ts", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df.pop("ts"), unit="ms", utc=True)
+    df = df.set_index("timestamp").sort_index()
+    df = df[~df.index.duplicated(keep="last")]
 
+    # Never trade the currently incomplete 15m candle.
+    cutoff = pd.Timestamp.now(tz="UTC").floor("15min")
+    df = df[df.index < cutoff]
 
-def resample_complete(df: pd.DataFrame, rule: str, expected_bars: int) -> pd.DataFrame:
-    x = df.copy()
-    x["timestamp_dt"] = pd.to_datetime(x["timestamp"], unit="ms", utc=True)
-    x = x.set_index("timestamp_dt").sort_index()
-    x = x[~x.index.duplicated(keep="last")]
-
-    # Left-closed, right-labelled intervals:
-    # [10:00,11:00) is labelled 11:00 and is fully known at 11:00.
-    out = x.resample(rule, closed="left", label="right").agg(
-        open=("open", "first"),
-        high=("high", "max"),
-        low=("low", "min"),
-        close=("close", "last"),
-        volume=("volume", "sum"),
-        count=("close", "count"),
-    )
-
-    out = out[out["count"] == expected_bars].drop(columns="count")
+    out = validate(df.reset_index(), symbol, target_start, final_end)
+    out.to_csv(path, index=False)
     return out
 
 
-def load_and_resample(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    x = df.copy()
-    x["timestamp_dt"] = pd.to_datetime(x["timestamp"], unit="ms", utc=True)
-    x = x.set_index("timestamp_dt").sort_index()
-    x = x[~x.index.duplicated(keep="last")]
+def validate(df, symbol, target_start, final_end):
+    required = {"timestamp", "open", "high", "low", "close", "volume"}
+    if not required.issubset(df.columns):
+        raise RuntimeError(f"{symbol}: missing required columns")
 
-    h1 = resample_complete(df, "1h", 4)
-    h4 = resample_complete(df, "4h", 16)
-    d1 = resample_complete(df, "1d", 96)
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df = df.sort_values("timestamp")
+    df = df.drop_duplicates("timestamp", keep="last")
 
-    return {"15m": x, "1h": h1, "4h": h4, "1d": d1}
+    start = pd.to_datetime(target_start, unit="ms", utc=True)
+    end = pd.to_datetime(final_end, unit="ms", utc=True)
+    df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)]
+
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if df[["open", "high", "low", "close", "volume"]].isna().any().any():
+        raise RuntimeError(f"{symbol}: NaN in OHLCV")
+    if (df[["open", "high", "low", "close"]] <= 0).any().any():
+        raise RuntimeError(f"{symbol}: non-positive price")
+    if (df["volume"] < 0).any():
+        raise RuntimeError(f"{symbol}: negative volume")
+
+    if len(df) < MIN_ROWS:
+        raise RuntimeError(f"{symbol}: only {len(df)} rows; history incomplete")
+
+    diffs = df["timestamp"].diff().dropna().dt.total_seconds() / 60.0
+    gaps = int((diffs > MAX_GAP_MINUTES + 1e-9).sum())
+    if gaps:
+        raise RuntimeError(f"{symbol}: {gaps} gaps detected")
+
+    span = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds() / 86400
+    if span < 420:
+        raise RuntimeError(f"{symbol}: span only {span:.1f}d")
+
+    print(
+        f"[VALIDATE] {symbol} rows={len(df)} first={df['timestamp'].iloc[0]} "
+        f"last={df['timestamp'].iloc[-1]} span={span:.1f}d gaps={gaps}"
+    )
+    return df
 
 
-def add_features(dfs: dict[str, pd.DataFrame]):
-    h1 = dfs["1h"].copy()
-    h4 = dfs["4h"].copy()
-    d1 = dfs["1d"].copy()
+def complete_resample(df15, rule, expected):
+    x = df15.copy().set_index("timestamp").sort_index()
+    o = x["open"].resample(rule, closed="left", label="right").first()
+    h = x["high"].resample(rule, closed="left", label="right").max()
+    l = x["low"].resample(rule, closed="left", label="right").min()
+    c = x["close"].resample(rule, closed="left", label="right").last()
+    v = x["volume"].resample(rule, closed="left", label="right").sum()
+    n = x["close"].resample(rule, closed="left", label="right").count()
 
-    # 1H causal features. At timestamp t, all values refer to the
-    # completed bar ending at t. Entry, however, occurs at t+1H.
-    prev_close = h1["close"].shift(1)
+    out = pd.concat([o, h, l, c, v, n], axis=1)
+    out.columns = ["open", "high", "low", "close", "volume", "count"]
+    out = out[out["count"] == expected].drop(columns="count")
+    return out.dropna()
+
+
+def build_frames(raw):
+    h1 = complete_resample(raw, "1h", 4)
+    h4 = complete_resample(raw, "4h", 16)
+    d1 = complete_resample(raw, "1d", 96)
+    return h1, h4, d1
+
+
+def atr(df, n=14):
+    prev = df["close"].shift(1)
     tr = pd.concat(
         [
-            h1["high"] - h1["low"],
-            (h1["high"] - prev_close).abs(),
-            (h1["low"] - prev_close).abs(),
+            df["high"] - df["low"],
+            (df["high"] - prev).abs(),
+            (df["low"] - prev).abs(),
         ],
         axis=1,
     ).max(axis=1)
-    h1["tr"] = tr
-    h1["atr14"] = tr.ewm(alpha=1 / ATR_PERIOD, adjust=False, min_periods=ATR_PERIOD).mean()
+    return tr.rolling(n, min_periods=n).mean()
 
-    h1["ret_1h"] = h1["close"].pct_change(1)
-    h1["ret_4h"] = h1["close"].pct_change(4)
-    h1["ret_8h"] = h1["close"].pct_change(8)
-    h1["ret_24h"] = h1["close"].pct_change(24)
 
-    atr_mean = h1["atr14"].rolling(24, min_periods=24).mean()
-    h1["norm_ret_24h"] = (
-        (h1["close"] - h1["close"].shift(24))
-        / atr_mean.replace(0, np.nan)
+def add_features(h1, h4, d1):
+    a = h1.copy()
+    a["atr"] = atr(a, 14)
+    a["ret_6"] = a["close"].pct_change(6)
+    a["ret_24"] = a["close"].pct_change(24)
+    a["ret_72"] = a["close"].pct_change(72)
+    a["range_atr"] = (a["high"] - a["low"]) / a["atr"]
+
+    body = (a["close"] - a["open"]).abs()
+    a["body_atr"] = body / a["atr"]
+    a["close_location"] = ((a["close"] - a["low"]) / (a["high"] - a["low"]).replace(0, np.nan))
+    a["efficiency_12"] = (
+        (a["close"] - a["close"].shift(12)).abs()
+        / a["close"].diff().abs().rolling(12).sum()
+    )
+    a["vol_z"] = (
+        (a["volume"] - a["volume"].rolling(48).mean())
+        / a["volume"].rolling(48).std()
     )
 
-    # Previous completed closes avoid using the current bar in the
-    # compression statistic itself.
-    pc = h1["close"].shift(1)
-    std20 = pc.rolling(BB_LOOKBACK, min_periods=BB_LOOKBACK).std()
-    sma20 = pc.rolling(BB_LOOKBACK, min_periods=BB_LOOKBACK).mean()
-    bb_width = 4.0 * std20 / sma20.replace(0, np.nan)
-
-    def last_rank_pct(x):
-        if len(x) == 0:
-            return np.nan
-        return pd.Series(x).rank(pct=True).iloc[-1]
-
-    h1["bb_width_pct"] = bb_width.rolling(
-        BB_PERCENTILE_LOOKBACK,
-        min_periods=BB_PERCENTILE_LOOKBACK,
-    ).apply(last_rank_pct, raw=False)
-
-    h1["vol_expansion"] = tr / h1["atr14"].replace(0, np.nan)
-
-    # Volume shock is a causal proxy; no historical OI is fabricated.
-    vol_med = h1["volume"].rolling(24, min_periods=24).median().shift(1)
-    h1["volume_shock"] = h1["volume"] / vol_med.replace(0, np.nan)
-
-    # Confirmed 4H pivots. Candidate pivot is t-2 and requires bars
-    # t-4,t-3,t-1,t to confirm. Thus the value first appears at t.
-    hh = h4["high"]
-    ll = h4["low"]
-    h4["pivot_high"] = h4["high"].shift(2).where(
-        (hh.shift(2) > hh.shift(4))
-        & (hh.shift(2) > hh.shift(3))
-        & (hh.shift(2) > hh.shift(1))
-        & (hh.shift(2) > hh)
+    # Compression is measured from prior completed bars only.
+    width = (
+        2.0 * a["close"].rolling(20).std()
+        / a["close"].rolling(20).mean()
     )
-    h4["pivot_low"] = h4["low"].shift(2).where(
-        (ll.shift(2) < ll.shift(4))
-        & (ll.shift(2) < ll.shift(3))
-        & (ll.shift(2) < ll.shift(1))
-        & (ll.shift(2) < ll)
+    a["bb_width"] = width
+    a["bb_rank"] = width.shift(1).rolling(96).rank(pct=True)
+
+    # Prior-bar liquidity reference.
+    a["hh_24"] = a["high"].shift(1).rolling(24).max()
+    a["ll_24"] = a["low"].shift(1).rolling(24).min()
+
+    # 4H structure.
+    b = h4.copy()
+    b["atr"] = atr(b, 14)
+    b["ema20"] = b["close"].ewm(span=20, adjust=False).mean()
+    b["ema50"] = b["close"].ewm(span=50, adjust=False).mean()
+    b["trend"] = np.where(b["ema20"] > b["ema50"], 1, -1)
+    b["swing_hi"] = b["high"].shift(2).rolling(5).max()
+    b["swing_lo"] = b["low"].shift(2).rolling(5).min()
+
+    # 1D regime. EMA is computed from prior daily close, so a signal
+    # during the current day can only see the last completed daily bar.
+    d = d1.copy()
+    d["ema50"] = d["close"].shift(1).ewm(span=50, adjust=False).mean()
+    d["ema200"] = d["close"].shift(1).ewm(span=200, adjust=False).mean()
+    d["slope20"] = d["ema50"].pct_change(5)
+    d["regime"] = np.where(
+        (d["close"].shift(1) > d["ema200"]) & (d["slope20"] > 0), 1,
+        np.where((d["close"].shift(1) < d["ema200"]) & (d["slope20"] < 0), -1, 0)
     )
-    h4["swing_high"] = h4["pivot_high"].ffill()
-    h4["swing_low"] = h4["pivot_low"].ffill()
-
-    h4["atr4"] = (
-        pd.concat(
-            [
-                h4["high"] - h4["low"],
-                (h4["high"] - h4["close"].shift(1)).abs(),
-                (h4["low"] - h4["close"].shift(1)).abs(),
-            ],
-            axis=1,
-        )
-        .max(axis=1)
-        .ewm(alpha=1 / 14, adjust=False, min_periods=14)
-        .mean()
-    )
-
-    # Daily regime is explicitly based on prior completed daily close.
-    # At a daily timestamp t, the EMA describes the history through t-1.
-    prior_dclose = d1["close"].shift(1)
-    d1["ema50"] = prior_dclose.ewm(span=50, adjust=False, min_periods=50).mean()
-    d1["ema200"] = prior_dclose.ewm(span=200, adjust=False, min_periods=200).mean()
-    d1["ema50_slope"] = d1["ema50"].diff()
-
-    # Store back.
-    dfs["1h"] = h1
-    dfs["4h"] = h4
-    dfs["1d"] = d1
+    return a, b, d
 
 
-def align_asof_row(df: pd.DataFrame, ts: pd.Timestamp):
-    # DataFrame indices are completion timestamps. right search means
-    # the bar ending exactly at ts is eligible.
+def asof(df, ts):
     if df.empty:
         return None
-    idx = df.index.searchsorted(ts, side="right") - 1
-    if idx < 0:
+    i = df.index.searchsorted(ts, side="right") - 1
+    if i < 0:
         return None
-    return df.iloc[idx]
+    return df.iloc[i]
 
 
-def build_basis_features(
-    futures: dict[str, dict[str, pd.DataFrame]],
-    data_dir: Path,
-) -> None:
-    """
-    Optional futures/spot basis research.
-
-    XT spot history is not used as the primary signal. If a valid spot
-    collector is unavailable, basis is explicitly marked unavailable.
-    This function intentionally does not manufacture spot/OI/funding data.
-    """
-    # The current XT public futures collector is mandatory. Historical
-    # spot endpoint availability is exchange/API-version dependent.
-    # We therefore leave basis unavailable unless a validated spot file
-    # already exists in data_dir/spot.
-    spot_dir = data_dir / "spot"
-    if not spot_dir.exists():
-        print("[FACTOR] Spot history directory not present; basis factors unavailable.")
-        return
-
-    for sym in SYMBOLS:
-        spot_file = spot_dir / f"{sym.upper()}_15m.csv"
-        if not spot_file.exists():
-            continue
-
-        try:
-            spot = pd.read_csv(spot_file)
-            required = {"timestamp", "close", "volume"}
-            if not required.issubset(spot.columns):
-                print(f"[FACTOR] Spot file incomplete: {spot_file}")
-                continue
-
-            spot["timestamp_dt"] = pd.to_datetime(spot["timestamp"], unit="ms", utc=True)
-            spot = spot.set_index("timestamp_dt").sort_index()
-            fut = futures[sym]["15m"].copy()
-
-            # Align exact 15m timestamps only.
-            f = fut[["close", "volume"]].rename(
-                columns={"close": "fut_close", "volume": "fut_volume"}
-            )
-            s = spot[["close", "volume"]].rename(
-                columns={"close": "spot_close", "volume": "spot_volume"}
-            )
-            z = f.join(s, how="inner")
-            z["basis_pct"] = z["fut_close"] / z["spot_close"] - 1.0
-            z["volume_ratio"] = z["fut_volume"] / z["spot_volume"].replace(0, np.nan)
-
-            h1 = z.resample("1h", closed="left", label="right").agg(
-                fut_close=("fut_close", "last"),
-                spot_close=("spot_close", "last"),
-                basis_pct=("basis_pct", "last"),
-                volume_ratio=("volume_ratio", "mean"),
-            )
-            h1.to_csv(spot_dir / f"{sym.upper()}_basis_1h.csv")
-            print(f"[FACTOR] Basis prepared: {sym.upper()} rows={len(h1)}")
-        except Exception as exc:
-            print(f"[FACTOR] Basis failed for {sym.upper()}: {exc}")
+def make_panel(symbol_frames):
+    times = sorted(set().union(*[set(x[0].index) for x in symbol_frames.values()]))
+    return pd.DatetimeIndex(times)
 
 
-def future_return_series(h1: pd.DataFrame, horizon: int) -> pd.Series:
-    # At completion timestamp t, this is the close-to-close return
-    # from t to t+horizon. It is NEVER used as an input feature.
-    return h1["close"].shift(-horizon) / h1["close"] - 1.0
+def split_timeline(common_times):
+    common_times = pd.DatetimeIndex(common_times).sort_values()
+    if len(common_times) < 300:
+        raise RuntimeError("Not enough common 1H timestamps")
+    start = common_times[0]
+    end = common_times[-1]
+    span = end - start
+    train_end = start + span * TRAIN_FRAC
+    val_end = start + span * (TRAIN_FRAC + VAL_FRAC)
+    return Split(start, train_end, val_end, end)
 
 
-def spearman_ic(x: pd.Series, y: pd.Series) -> tuple[float, int]:
-    z = pd.concat([x, y], axis=1).replace([np.inf, -np.inf], np.nan).dropna()
+def rank_spearman(x, y):
+    z = pd.concat([x, y], axis=1).dropna()
     if len(z) < 30:
-        return np.nan, len(z)
-    return float(z.iloc[:, 0].corr(z.iloc[:, 1], method="spearman")), len(z)
-
-
-def factor_discovery(
-    all_symbol_data: dict[str, dict[str, pd.DataFrame]],
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-):
-    """
-    Factor audit only.
-
-    It computes forward returns after the factor is known. It does not
-    feed future returns back into the strategy.
-    """
-    records = []
-
-    feature_names = [
-        "ret_1h",
-        "ret_4h",
-        "ret_8h",
-        "ret_24h",
-        "norm_ret_24h",
-        "bb_width_pct",
-        "vol_expansion",
-        "volume_shock",
-    ]
-
-    for sym, dfs in all_symbol_data.items():
-        h1 = dfs["1h"].loc[start:end].copy()
-        for h in HORIZONS:
-            y = future_return_series(dfs["1h"], h).loc[start:end]
-            for feature in feature_names:
-                ic, n = spearman_ic(h1[feature], y)
-                if np.isfinite(ic):
-                    records.append(
-                        {
-                            "symbol": sym,
-                            "horizon_h": h,
-                            "feature": feature,
-                            "spearman_ic": ic,
-                            "abs_ic": abs(ic),
-                            "n": n,
-                        }
-                    )
-
-    audit = pd.DataFrame(records)
-    if audit.empty:
-        print("[FACTOR] No valid factor observations.")
-        return audit
-
-    summary = (
-        audit.groupby(["feature", "horizon_h"], as_index=False)
-        .agg(
-            median_ic=("spearman_ic", "median"),
-            median_abs_ic=("abs_ic", "median"),
-            mean_ic=("spearman_ic", "mean"),
-            symbols=("symbol", "nunique"),
-            observations=("n", "sum"),
-        )
-        .sort_values(["median_abs_ic", "observations"], ascending=[False, False])
+        return np.nan
+    return z.iloc[:, 0].rank(method="average").corr(
+        z.iloc[:, 1].rank(method="average")
     )
 
-    print("\n================ FACTOR DISCOVERY (TRAIN) ================")
-    print(summary.to_string(index=False, float_format=lambda x: f"{x:.5f}"))
-    print("==========================================================")
-    return audit
+
+def factor_audit(frames, split):
+    rows = []
+    for sym, (h1, _, _) in frames.items():
+        train = h1.loc[split.start:split.train_end].copy()
+        for col in ["ret_6", "ret_24", "ret_72", "range_atr",
+                    "body_atr", "close_location", "efficiency_12",
+                    "vol_z", "bb_rank"]:
+            if col not in train:
+                continue
+            for horizon in [1, 4, 8, 24]:
+                fwd = train["close"].shift(-horizon) / train["close"] - 1
+                ic = rank_spearman(train[col], fwd)
+                rows.append((sym, col, horizon, ic))
+    if not rows:
+        return
+    out = pd.DataFrame(rows, columns=["symbol", "factor", "horizon", "spearman"])
+    summary = (
+        out.groupby("factor")["spearman"]
+        .agg(["count", "mean"])
+        .assign(abs_mean=lambda z: z["mean"].abs())
+        .sort_values("abs_mean", ascending=False)
+    )
+    print("\n================ TRAIN FACTOR AUDIT ================")
+    print(summary.to_string(float_format=lambda x: f"{x:.4f}"))
+    print("=====================================================\n")
 
 
-def _regime_and_signal(
-    symbol: str,
-    ts: pd.Timestamp,
-    data: dict[str, pd.DataFrame],
-    rs_map: dict[str, float],
-):
-    h1 = data["1h"]
-    h4 = data["4h"]
-    d1 = data["1d"]
-
-    if ts not in h1.index:
+def candidate_from_features(ts, sym, f, h4, d1, cfg):
+    if ts not in f.index:
         return None
-
-    h1_row = h1.loc[ts]
-    h4_row = align_asof_row(h4, ts)
-    d1_row = align_asof_row(d1, ts)
-
-    if h4_row is None or d1_row is None:
+    row = f.loc[ts]
+    r4 = asof(h4, ts)
+    rd = asof(d1, ts)
+    if r4 is None or rd is None:
         return None
 
     vals = [
-        h1_row.get("atr14", np.nan),
-        h1_row.get("bb_width_pct", np.nan),
-        h1_row.get("vol_expansion", np.nan),
-        h1_row.get("norm_ret_24h", np.nan),
-        d1_row.get("ema50", np.nan),
-        d1_row.get("ema200", np.nan),
-        d1_row.get("ema50_slope", np.nan),
-        h4_row.get("swing_high", np.nan),
-        h4_row.get("swing_low", np.nan),
+        row["atr"], row["ret_24"], row["ret_72"], row["bb_rank"],
+        row["range_atr"], row["body_atr"], row["close_location"],
+        row["efficiency_12"], row["vol_z"], r4["ema20"], r4["ema50"],
+        rd["ema200"], rd["regime"]
     ]
-    if not all(np.isfinite(v) for v in vals):
+    if any(pd.isna(x) for x in vals):
         return None
 
-    daily_long = (
-        d1_row["close"] > d1_row["ema200"]
-        and d1_row["ema50"] > d1_row["ema200"]
-        and d1_row["ema50_slope"] > 0
-    )
-    daily_short = (
-        d1_row["close"] < d1_row["ema200"]
-        and d1_row["ema50"] < d1_row["ema200"]
-        and d1_row["ema50_slope"] < 0
-    )
+    long_score = 0.0
+    short_score = 0.0
 
-    # This is a predeclared compression/expansion state, not an
-    # optimized-after-OOS threshold.
-    compression = h1_row["bb_width_pct"] <= 0.30
-    expansion = h1_row["vol_expansion"] >= 1.05
+    trend = int(r4["trend"])
+    regime = int(rd["regime"])
+    ret24 = float(row["ret_24"])
+    ret72 = float(row["ret_72"])
+    br = float(row["bb_rank"])
+    rng = float(row["range_atr"])
+    body = float(row["body_atr"])
+    loc = float(row["close_location"])
+    eff = float(row["efficiency_12"])
+    vz = float(row["vol_z"])
 
-    if not (compression and expansion):
-        return None
+    # Family A: continuation after compression + displacement.
+    if cfg.family == "CONT":
+        long_score = (
+            1.0 * (trend == 1)
+            + 1.0 * (regime == 1)
+            + 1.0 * (br <= cfg.threshold)
+            + 1.0 * (ret24 > 0)
+            + 1.0 * (ret72 > 0)
+            + 1.0 * (loc >= 0.65)
+            + 1.0 * (body >= cfg.atr_mult)
+            + 0.5 * (vz > 0)
+        )
+        short_score = (
+            1.0 * (trend == -1)
+            + 1.0 * (regime == -1)
+            + 1.0 * (br <= cfg.threshold)
+            + 1.0 * (ret24 < 0)
+            + 1.0 * (ret72 < 0)
+            + 1.0 * (loc <= 0.35)
+            + 1.0 * (body >= cfg.atr_mult)
+            + 0.5 * (vz > 0)
+        )
 
-    rs = rs_map.get(symbol, np.nan)
-    if not np.isfinite(rs):
-        return None
+    # Family B: failed auction / mean reversion after extreme displacement.
+    elif cfg.family == "FADE":
+        extreme = max(abs(ret24), abs(ret72))
+        long_score = (
+            1.0 * (trend == -1 or regime == -1)
+            + 1.0 * (br >= cfg.threshold)
+            + 1.0 * (loc <= 0.25)
+            + 1.0 * (body >= cfg.atr_mult)
+            + 1.0 * (ret24 < 0)
+            + 0.5 * (eff < 0.45)
+            + 0.5 * (extreme > 0)
+        )
+        short_score = (
+            1.0 * (trend == 1 or regime == 1)
+            + 1.0 * (br >= cfg.threshold)
+            + 1.0 * (loc >= 0.75)
+            + 1.0 * (body >= cfg.atr_mult)
+            + 1.0 * (ret24 > 0)
+            + 0.5 * (eff < 0.45)
+            + 0.5 * (extreme > 0)
+        )
 
-    close = float(h1_row["close"])
-    low = float(h1_row["low"])
-    high = float(h1_row["high"])
-    atr = float(h1_row["atr14"])
+    # Family C: volatility expansion with directional confirmation.
+    elif cfg.family == "EXP":
+        long_score = (
+            1.0 * (trend == 1)
+            + 1.0 * (regime == 1)
+            + 1.0 * (rng >= cfg.atr_mult)
+            + 1.0 * (loc >= 0.60)
+            + 1.0 * (ret24 > 0)
+            + 1.0 * (ret72 > 0)
+            + 0.5 * (eff >= 0.50)
+        )
+        short_score = (
+            1.0 * (trend == -1)
+            + 1.0 * (regime == -1)
+            + 1.0 * (rng >= cfg.atr_mult)
+            + 1.0 * (loc <= 0.40)
+            + 1.0 * (ret24 < 0)
+            + 1.0 * (ret72 < 0)
+            + 0.5 * (eff >= 0.50)
+        )
 
-    sh = float(h4_row["swing_high"])
-    slw = float(h4_row["swing_low"])
-
-    candidates = []
-
-    if daily_long and symbol in rs_map["top"]:
-        breakout = close > sh + 0.10 * atr
-        retest = low <= sh + 0.20 * atr and close >= sh - 0.20 * atr
-        if breakout or retest:
-            stop = slw - 0.20 * atr if np.isfinite(slw) else low - 1.5 * atr
-            candidates.append(("LONG", stop, abs(rs) + float(h1_row["vol_expansion"])))
-
-    if daily_short and symbol in rs_map["bottom"]:
-        breakout = close < slw - 0.10 * atr
-        retest = high >= slw - 0.20 * atr and close <= slw + 0.20 * atr
-        if breakout or retest:
-            stop = sh + 0.20 * atr if np.isfinite(sh) else high + 1.5 * atr
-            candidates.append(("SHORT", stop, abs(rs) + float(h1_row["vol_expansion"])))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: (-x[2], x[0]))
-    return candidates[0]
+    min_score = 6.0
+    if long_score >= min_score and long_score > short_score:
+        return {"symbol": sym, "side": 1, "score": long_score, "atr": float(row["atr"])}
+    if short_score >= min_score and short_score > long_score:
+        return {"symbol": sym, "side": -1, "score": short_score, "atr": float(row["atr"])}
+    return None
 
 
-def _next_timestamp(index: pd.DatetimeIndex, ts: pd.Timestamp):
-    pos = index.searchsorted(ts, side="right")
-    if pos >= len(index):
-        return None
-    return index[pos]
+def apply_entry_slippage(price, side):
+    return price * (1 + SLIPPAGE * side)
 
 
-def run_backtest(
-    all_symbol_data: dict[str, dict[str, pd.DataFrame]],
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-):
-    # Global 1H event clock.
-    common = sorted(
-        set().union(*(set(d["1h"].index) for d in all_symbol_data.values()))
-    )
-    times = [t for t in common if start <= t <= end]
+def apply_exit_slippage(price, side):
+    # Adverse slippage: long exits lower, short exits higher.
+    return price * (1 - SLIPPAGE * side)
+
+
+def pnl_for_exit(side, entry, exit_price):
+    gross = (exit_price - entry) / entry * NOTIONAL * side
+    fees = NOTIONAL * FEE_RATE * 2.0
+    return gross - fees
+
+
+def run_backtest(frames, split, cfg, start, end, label):
+    # Common timestamps are required for cross-sectional selection.
+    common = None
+    for h1, _, _ in frames.values():
+        t = h1.loc[start:end].index
+        common = set(t) if common is None else common.intersection(set(t))
+    times = pd.DatetimeIndex(sorted(common))
 
     active = None
     trades = []
-    cooldown_until = {s: pd.Timestamp.min.tz_localize("UTC") for s in all_symbol_data}
+    equity = INITIAL_CAPITAL
+    peak = equity
+    max_dd = 0.0
+    cooldown_until = None
 
     for ts in times:
-        # Manage the active trade only after its actual entry timestamp.
+        # Manage only after the actual next-bar entry.
         if active is not None and ts >= active["entry_ts"]:
-            sym = active["symbol"]
-            h1 = all_symbol_data[sym]["1h"]
+            h1 = frames[active["symbol"]][0]
             if ts in h1.index:
                 bar = h1.loc[ts]
-                hi = float(bar["high"])
-                lo = float(bar["low"])
+                side = active["side"]
 
-                if active["side"] == "LONG":
-                    hit_sl = lo <= active["sl"]
-                    hit_tp = hi >= active["tp"]
-                else:
-                    hit_sl = hi >= active["sl"]
-                    hit_tp = lo <= active["tp"]
+                stop_hit = (
+                    bar["low"] <= active["sl"] if side == 1
+                    else bar["high"] >= active["sl"]
+                )
+                tp_hit = (
+                    bar["high"] >= active["tp"] if side == 1
+                    else bar["low"] <= active["tp"]
+                )
 
-                if hit_sl or hit_tp:
-                    # Conservative rule: if both are touched in one bar,
-                    # the stop is assumed to have occurred first.
-                    outcome = "LOSS" if hit_sl else "WIN"
-                    exit_price = active["sl"] if hit_sl else active["tp"]
+                if stop_hit or tp_hit:
+                    # Conservative same-candle resolution.
+                    outcome = "LOSS" if stop_hit else "WIN"
+                    raw_exit = active["sl"] if stop_hit else active["tp"]
+                    exit_price = apply_exit_slippage(raw_exit, side)
+                    pnl = pnl_for_exit(side, active["entry"], exit_price)
 
-                    notional = MARGIN_PER_TRADE * LEVERAGE
-                    if active["side"] == "LONG":
-                        gross = (exit_price - active["entry"]) / active["entry"] * notional
-                    else:
-                        gross = (active["entry"] - exit_price) / active["entry"] * notional
+                    # Isolated-margin cap / liquidation proxy.
+                    if pnl < -MARGIN:
+                        pnl = -MARGIN
+                        outcome = "LIQUIDATED"
 
-                    fees = notional * FEE_RATE * 2.0
-                    pnl = gross - fees
-
-                    trades.append(
-                        {
-                            "symbol": sym,
-                            "side": active["side"],
-                            "entry_ts": active["entry_ts"],
-                            "exit_ts": ts,
-                            "outcome": outcome,
-                            "pnl": float(pnl),
-                            "entry": float(active["entry"]),
-                            "exit": float(exit_price),
-                        }
-                    )
-
-                    cooldown_until[sym] = ts + pd.Timedelta(hours=3)
+                    equity += pnl
+                    trades.append({
+                        "time": ts, "symbol": active["symbol"],
+                        "side": side, "pnl": pnl, "outcome": outcome
+                    })
+                    peak = max(peak, equity)
+                    max_dd = max(max_dd, peak - equity)
                     active = None
-                    # No same-candle re-entry.
+                    cooldown_until = ts + pd.Timedelta(hours=1)
+                    # Never re-enter on the candle that reveals the result.
                     continue
 
         if active is not None:
             continue
-
-        # Cross-sectional rank at the SAME completed 1H timestamp.
-        rs_values = {}
-        for sym, data in all_symbol_data.items():
-            h1 = data["1h"]
-            if ts in h1.index:
-                v = h1.loc[ts].get("norm_ret_24h", np.nan)
-                if np.isfinite(v):
-                    rs_values[sym] = float(v)
-
-        if len(rs_values) < max(2, int(math.ceil(len(SYMBOLS) * MIN_COMMON_SYMBOLS_FRAC))):
+        if cooldown_until is not None and ts < cooldown_until:
             continue
 
-        ranked = sorted(rs_values.items(), key=lambda kv: (kv[1], kv[0]))
-        top = {s for s, _ in ranked[-TOP_RS:]}
-        bottom = {s for s, _ in ranked[:TOP_RS]}
-
-        rs_context = dict(rs_values)
-        rs_context["top"] = top
-        rs_context["bottom"] = bottom
-
         candidates = []
-        for sym, data in all_symbol_data.items():
-            if ts < cooldown_until[sym]:
+        for sym, (h1, h4, d1) in frames.items():
+            if ts < start or ts > end or ts not in h1.index:
                 continue
+            c = candidate_from_features(ts, sym, h1, h4, d1, cfg)
+            if c is not None:
+                candidates.append(c)
 
-            signal = _regime_and_signal(sym, ts, data, rs_context)
-            if signal is None:
-                continue
+        if not candidates:
+            continue
 
-            side, stop, score = signal
-            entry_ts = _next_timestamp(data["1h"].index, ts)
-            if entry_ts is None or entry_ts > end:
-                continue
+        candidates.sort(key=lambda x: (-x["score"], x["symbol"], -x["side"]))
+        c = candidates[0]
+        sym = c["symbol"]
+        h1 = frames[sym][0]
 
-            raw_open = float(data["1h"].loc[entry_ts, "open"])
-            entry = raw_open * (1.0 + SLIPPAGE if side == "LONG" else 1.0 - SLIPPAGE)
+        # Signal at completed 1H close; entry at the next completed 1H open.
+        pos = h1.index.searchsorted(ts, side="right")
+        if pos >= len(h1.index):
+            continue
+        entry_ts = h1.index[pos]
+        if entry_ts > end:
+            continue
 
-            risk = entry - stop if side == "LONG" else stop - entry
-            if not np.isfinite(risk) or risk <= 0:
-                continue
+        raw_entry = float(h1.iloc[pos]["open"])
+        side = int(c["side"])
+        entry = apply_entry_slippage(raw_entry, side)
+        stop_dist = float(c["atr"]) * 1.5
+        sl = entry - stop_dist * side
+        tp = entry + stop_dist * RR * side
 
-            tp = entry + RR * risk if side == "LONG" else entry - RR * risk
-
-            candidates.append(
-                {
-                    "symbol": sym,
-                    "side": side,
-                    "score": float(score),
-                    "trigger_ts": ts,
-                    "entry_ts": entry_ts,
-                    "entry": entry,
-                    "sl": float(stop),
-                    "tp": float(tp),
-                }
-            )
-
-        if candidates:
-            candidates.sort(
-                key=lambda c: (
-                    -c["score"],
-                    c["symbol"],
-                    c["side"],
-                )
-            )
-            active = candidates[0]
-
-    return trades, active
-
-
-def calculate_stats(trades: list[dict]):
-    if not trades:
-        return {
-            "trades": 0, "wins": 0, "losses": 0, "wr": 0.0,
-            "gross_profit": 0.0, "gross_loss": 0.0, "pf": 0.0,
-            "net": 0.0, "max_dd": 0.0, "max_dd_pct": 0.0,
-            "max_streak": 0, "trades_day": 0.0,
+        active = {
+            "symbol": sym,
+            "side": side,
+            "signal_ts": ts,
+            "entry_ts": entry_ts,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
         }
 
-    ordered = sorted(trades, key=lambda t: pd.Timestamp(t["exit_ts"]))
-    pnls = np.array([t["pnl"] for t in ordered], dtype=float)
-    wins = int(sum(t["outcome"] == "WIN" for t in ordered))
-    losses = int(sum(t["outcome"] == "LOSS" for t in ordered))
-    gross_profit = float(pnls[pnls > 0].sum())
-    gross_loss = float(-pnls[pnls < 0].sum())
-    pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    vals = pd.Series([x["pnl"] for x in trades], dtype=float)
+    wins = int((vals > 0).sum())
+    losses = int((vals <= 0).sum())
+    gross_profit = float(vals[vals > 0].sum()) if wins else 0.0
+    gross_loss = float(-vals[vals <= 0].sum()) if losses else 0.0
+    pf = gross_profit / gross_loss if gross_loss > 0 else math.inf
+    wr = 100.0 * wins / len(vals) if len(vals) else 0.0
 
-    equity = INITIAL_CAPITAL + np.cumsum(pnls)
-    peaks = np.maximum.accumulate(np.r_[INITIAL_CAPITAL, equity])[1:]
-    dd = peaks - equity
-    max_dd = float(dd.max()) if len(dd) else 0.0
-    max_dd_pct = float((dd / np.maximum(peaks, 1e-9)).max() * 100.0) if len(dd) else 0.0
-
-    streak = max_streak = 0
-    for t in ordered:
-        if t["outcome"] == "LOSS":
+    streak = 0
+    max_streak = 0
+    for x in vals:
+        if x <= 0:
             streak += 1
             max_streak = max(max_streak, streak)
         else:
             streak = 0
 
-    first = pd.Timestamp(ordered[0]["entry_ts"])
-    last = pd.Timestamp(ordered[-1]["exit_ts"])
-    days = max((last - first).total_seconds() / 86400.0, 1e-9)
+    days = max((end - start).total_seconds() / 86400, 1e-9)
+    dd_pct = 100.0 * max_dd / INITIAL_CAPITAL
 
     return {
-        "trades": len(ordered),
+        "label": label,
+        "config": cfg.name,
+        "trades": len(vals),
         "wins": wins,
         "losses": losses,
-        "wr": wins / len(ordered) * 100.0,
-        "gross_profit": gross_profit,
-        "gross_loss": gross_loss,
+        "wr": wr,
         "pf": pf,
-        "net": float(pnls.sum()),
-        "max_dd": max_dd,
-        "max_dd_pct": max_dd_pct,
-        "max_streak": max_streak,
-        "trades_day": len(ordered) / days,
+        "pnl": float(vals.sum()) if len(vals) else 0.0,
+        "dd": max_dd,
+        "dd_pct": dd_pct,
+        "streak": max_streak,
+        "tday": len(vals) / days,
+        "open": active is not None,
         "avg_win": gross_profit / wins if wins else 0.0,
         "avg_loss": -gross_loss / losses if losses else 0.0,
-        "expectancy": float(pnls.mean()),
-        "median": float(np.median(pnls)),
+        "expectancy": float(vals.mean()) if len(vals) else 0.0,
+        "median": float(vals.median()) if len(vals) else 0.0,
     }
 
 
-def print_report(name: str, stats: dict):
-    print(f"\n================ {name} ================")
-    print(f"Trades              : {stats['trades']}")
-    print(f"Wins                : {stats['wins']}")
-    print(f"Losses              : {stats['losses']}")
-    print(f"Win Rate            : {stats['wr']:.2f}%")
-    print(f"Gross Profit        : ${stats['gross_profit']:,.2f}")
-    print(f"Gross Loss          : ${stats['gross_loss']:,.2f}")
-    print(f"Profit Factor       : {stats['pf']:.3f}")
-    print(f"Net PnL             : ${stats['net']:,.2f}")
-    print(f"Max Drawdown        : ${stats['max_dd']:,.2f}")
-    print(f"Max Drawdown %      : {stats['max_dd_pct']:.2f}%")
-    print(f"Max Loss Streak     : {stats['max_streak']}")
-    print(f"Trades / Day        : {stats['trades_day']:.4f}")
-    print(f"Average Win         : ${stats.get('avg_win', 0):,.2f}")
-    print(f"Average Loss        : ${stats.get('avg_loss', 0):,.2f}")
-    print(f"Expectancy / Trade  : ${stats.get('expectancy', 0):,.2f}")
-    print(f"Median Trade PnL    : ${stats.get('median', 0):,.2f}")
+def score_config(train, val):
+    # Predeclared selection rule. No OOS information is used.
+    if train["trades"] < MIN_TRAIN_TRADES or val["trades"] < MIN_VALIDATION_TRADES:
+        return -1e9
+
+    if not np.isfinite(train["pf"]) or not np.isfinite(val["pf"]):
+        return -1e9
+
+    # Reward consistency, sample size and risk-adjusted profitability.
+    if train["pnl"] <= 0 or val["pnl"] <= 0:
+        return -1e8 + min(train["pnl"], val["pnl"])
+
+    wr_gap = abs(train["wr"] - val["wr"])
+    pf_gap = abs(train["pf"] - val["pf"])
+
+    return (
+        min(train["pf"], val["pf"]) * 10.0
+        + min(train["wr"], val["wr"]) * 0.15
+        + math.log1p(min(train["trades"], val["trades"]))
+        - wr_gap * 0.10
+        - pf_gap * 1.0
+        - max(train["dd_pct"], val["dd_pct"]) * 0.05
+    )
+
+
+def report(r, title):
+    print(f"\n================ {title} ================")
+    print(f"Trades              : {r['trades']}")
+    print(f"Wins                : {r['wins']}")
+    print(f"Losses              : {r['losses']}")
+    print(f"Win Rate            : {r['wr']:.2f}%")
+    print(f"Profit Factor       : {r['pf']:.3f}" if np.isfinite(r["pf"]) else "Profit Factor       : inf")
+    print(f"Net PnL             : ${r['pnl']:.2f}")
+    print(f"Max Drawdown        : ${r['dd']:.2f}")
+    print(f"Max Drawdown %      : {r['dd_pct']:.2f}%")
+    print(f"Max Loss Streak     : {r['streak']}")
+    print(f"Trades / Day        : {r['tday']:.4f}")
+    print(f"Average Win         : ${r['avg_win']:.2f}")
+    print(f"Average Loss        : ${r['avg_loss']:.2f}")
+    print(f"Expectancy / Trade  : ${r['expectancy']:.2f}")
+    print(f"Median Trade PnL    : ${r['median']:.2f}")
     print("=" * 50)
 
 
-def split_timeline(all_symbol_data) -> Split:
-    first = max(d["1h"].index[0] for d in all_symbol_data.values())
-    last = min(d["1h"].index[-1] for d in all_symbol_data.values())
-    span = last - first
-
-    train_end = first + span * TRAIN_FRAC
-    val_end = first + span * (TRAIN_FRAC + VAL_FRAC)
-
-    return Split(first, train_end, val_end, last)
-
-
 def main():
-    args = parse_args()
-    data_dir = Path(args.data_dir)
-    data_dir.mkdir(parents=True, exist_ok=True)
+    a = args()
+    data_dir = Path(a.data_dir)
 
-    print("=" * 78)
-    print("HUNTER-V9.1 — AUDITED DERIVATIVES REGIME / MICROSTRUCTURE ENGINE")
-    print("=" * 78)
+    raw = {}
+    frames = {}
 
-    all_symbol_data = {}
+    print("[DATA] Collecting XT Futures history...")
     for sym in SYMBOLS:
-        try:
-            raw = fetch_xt_futures_data(sym, data_dir, refresh=args.refresh)
-            dfs = load_and_resample(raw)
-            add_features(dfs)
-            all_symbol_data[sym] = dfs
-        except Exception as exc:
-            print(f"[ABORT] {sym.upper()}: {exc}")
-            sys.exit(1)
+        df = fetch_symbol(sym, data_dir, a.refresh)
+        raw[sym] = df
+        h1, h4, d1 = build_frames(df)
+        h1, h4, d1 = add_features(h1, h4, d1)
+        frames[sym] = (h1, h4, d1)
 
-    split = split_timeline(all_symbol_data)
+    common = None
+    for h1, _, _ in frames.values():
+        t = set(h1.index)
+        common = t if common is None else common.intersection(t)
+
+    split = split_timeline(pd.DatetimeIndex(sorted(common)))
     print(f"[TIMELINE] Train: {split.start} -> {split.train_end}")
     print(f"[TIMELINE] Validation: {split.train_end} -> {split.val_end}")
     print(f"[TIMELINE] OOS: {split.val_end} -> {split.end}")
 
-    # Factor discovery is diagnostic and TRAIN-only.
-    factor_discovery(all_symbol_data, split.start, split.train_end)
+    factor_audit(frames, split)
 
-    # Optional basis research from already validated spot files.
-    build_basis_features(all_symbol_data, data_dir)
+    configs = []
+    for family in ["CONT", "FADE", "EXP"]:
+        for threshold in ([0.25, 0.35] if family == "CONT" else [0.65, 0.75] if family == "FADE" else [0.70, 0.85]):
+            for mult in [0.60, 0.80, 1.00]:
+                name = f"{family}_thr{threshold:.2f}_m{mult:.2f}"
+                configs.append(Config(name, family, "REGIME", threshold, mult, 24))
 
-    # The strategy parameters are frozen before OOS.
-    # We intentionally do NOT tune them on OOS.
-    print("\n[BACKTEST] Validation run")
-    val_trades, val_open = run_backtest(
-        all_symbol_data, split.train_end, split.val_end
-    )
-    val_stats = calculate_stats(val_trades)
-    print_report("VALIDATION", val_stats)
-    print(f"Validation open position: {'YES' if val_open else 'NO'}")
+    print(f"[RESEARCH] Predeclared configs: {len(configs)}")
 
-    print("\n[BACKTEST] Untouched OOS run")
-    oos_trades, oos_open = run_backtest(
-        all_symbol_data, split.val_end, split.end
-    )
-    oos_stats = calculate_stats(oos_trades)
-    print_report("OOS PERFORMANCE", oos_stats)
-    print(f"OOS open position at end: {'YES' if oos_open else 'NO'}")
+    selected = []
+    for cfg in configs:
+        tr = run_backtest(frames, split, cfg, split.start, split.train_end, "TRAIN")
+        va = run_backtest(frames, split, cfg, split.train_end, split.val_end, "VAL")
+        score = score_config(tr, va)
+        selected.append((score, cfg, tr, va))
+
+    selected.sort(key=lambda x: (-x[0], x[1].name))
+    print("\n================ MODEL SELECTION ================")
+    for score, cfg, tr, va in selected[:10]:
+        print(
+            f"{cfg.name:24s} score={score:8.3f} "
+            f"TRAIN n={tr['trades']:4d} WR={tr['wr']:5.1f} PF={tr['pf']:5.2f} "
+            f"VAL n={va['trades']:4d} WR={va['wr']:5.1f} PF={va['pf']:5.2f}"
+        )
+    print("==================================================")
+
+    eligible = [x for x in selected if x[0] > -1e8]
+    if not eligible:
+        print("[DECISION] REJECTED — no configuration passed pre-OOS research.")
+        return
+
+    _, cfg, tr, va = eligible[0]
+    print(f"\n[SELECTED] {cfg.name}")
+    report(tr, "SELECTED TRAIN")
+    report(va, "SELECTED VALIDATION")
+
+    oos = run_backtest(frames, split, cfg, split.val_end, split.end, "OOS")
+    report(oos, "UNTOUCHED OOS")
 
     accepted = (
-        oos_stats["trades"] >= MIN_OOS_TRADES
-        and oos_stats["wr"] > MIN_OOS_WR
-        and oos_stats["pf"] > MIN_OOS_PF
-        and oos_stats["net"] > 0
-        and oos_stats["max_streak"] <= MAX_OOS_LOSS_STREAK
-        and oos_stats["max_dd_pct"] < 50.0
+        oos["trades"] >= MIN_OOS_TRADES
+        and oos["wr"] > MIN_OOS_WR
+        and oos["pf"] > MIN_OOS_PF
+        and oos["pnl"] > 0
+        and oos["streak"] <= MAX_OOS_STREAK
+        and oos["dd_pct"] < MAX_OOS_DD_PCT
+        and not oos["open"]
     )
 
     print("\n================ ACCEPTANCE GATE ================")
-    print(f"OOS trades >= {MIN_OOS_TRADES}       : {'PASS' if oos_stats['trades'] >= MIN_OOS_TRADES else 'FAIL'}")
-    print(f"OOS WR > {MIN_OOS_WR:.1f}%              : {'PASS' if oos_stats['wr'] > MIN_OOS_WR else 'FAIL'}")
-    print(f"OOS PF > {MIN_OOS_PF:.2f}              : {'PASS' if oos_stats['pf'] > MIN_OOS_PF else 'FAIL'}")
-    print(f"OOS Net PnL > $0                  : {'PASS' if oos_stats['net'] > 0 else 'FAIL'}")
-    print(f"OOS Max loss streak <= {MAX_OOS_LOSS_STREAK}: {'PASS' if oos_stats['max_streak'] <= MAX_OOS_LOSS_STREAK else 'FAIL'}")
-    print(f"OOS Max DD < 50%                   : {'PASS' if oos_stats['max_dd_pct'] < 50.0 else 'FAIL'}")
-    print(f"ACCEPTED                           : {accepted}")
+    print(f"OOS trades >= {MIN_OOS_TRADES}       : {'PASS' if oos['trades'] >= MIN_OOS_TRADES else 'FAIL'}")
+    print(f"OOS WR > {MIN_OOS_WR:.1f}%              : {'PASS' if oos['wr'] > MIN_OOS_WR else 'FAIL'}")
+    print(f"OOS PF > {MIN_OOS_PF:.2f}              : {'PASS' if oos['pf'] > MIN_OOS_PF else 'FAIL'}")
+    print(f"OOS Net PnL > $0                 : {'PASS' if oos['pnl'] > 0 else 'FAIL'}")
+    print(f"OOS Max loss streak <= {MAX_OOS_STREAK}: {'PASS' if oos['streak'] <= MAX_OOS_STREAK else 'FAIL'}")
+    print(f"OOS Max DD < {MAX_OOS_DD_PCT:.0f}%              : {'PASS' if oos['dd_pct'] < MAX_OOS_DD_PCT else 'FAIL'}")
+    print(f"OOS closed at end                : {'PASS' if not oos['open'] else 'FAIL'}")
+    print(f"ACCEPTED                          : {accepted}")
     print("==================================================")
 
-    if not accepted:
-        print("\n[DECISION] REJECTED — no claim of robust edge.")
+    if accepted:
+        print("[DECISION] ACCEPTED — candidate survived untouched OOS.")
+    else:
+        print("[DECISION] REJECTED — no claim of robust edge.")
 
 
 if __name__ == "__main__":
