@@ -130,7 +130,7 @@ def payload_rows(obj):
     return None
 
 
-def parse_row(r):
+def parse_row(r, is_spot=False):
     try:
         if isinstance(r, dict):
             ts = r.get("t", r.get("timestamp"))
@@ -138,7 +138,11 @@ def parse_row(r):
             h = r.get("h", r.get("high"))
             l = r.get("l", r.get("low"))
             c = r.get("c", r.get("close"))
-            v = r.get("a", r.get("volume"))
+            # XT Spot kline: q = base/quote volume field used by CCXT.
+            # XT Futures kline: a = volume field.
+            v = r.get("q") if is_spot else r.get("a")
+            if v is None:
+                v = r.get("volume")
             if ts is None:
                 return None
             return int(ts), float(o), float(h), float(l), float(c), float(v)
@@ -152,7 +156,8 @@ def parse_row(r):
 def fetch_kline(symbol, base_url, cache_path, refresh=False):
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     now = int(time.time() * 1000)
-    start_ms = now - int((DAYS + WARMUP_DAYS) * 86400 * 1000)
+    raw_start_ms = now - int((DAYS + WARMUP_DAYS) * 86400 * 1000)
+    start_ms = ((raw_start_ms + INTERVAL_MS - 1) // INTERVAL_MS) * INTERVAL_MS
     end_ms = (now // INTERVAL_MS) * INTERVAL_MS - 1
 
     if cache_path.exists() and not refresh:
@@ -195,7 +200,7 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
         if payload is None:
             raise RuntimeError(f"{symbol}: page {page} failed: {last_error}")
 
-        parsed = [x for x in (parse_row(z) for z in payload) if x is not None]
+        parsed = [x for x in (parse_row(z, is_spot=(base_url == SPOT_URL)) for z in payload) if x is not None]
         in_window = [x for x in parsed if cursor <= x[0] <= window_end]
         if not in_window:
             # XT may return an empty terminal page after the requested
