@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HUNTER-V11 — LIQUIDITY / FLOW / REPRICING ENGINE
+HUNTER-V12 — STATE / FLOW / LIQUIDITY / REPRICING RESEARCH ENGINE
 
 XT USDT-M PERPETUAL FUTURES
 15m raw -> causal 1H / 4H / 1D
@@ -62,7 +62,7 @@ SYMBOLS = [
 FUTURES_URL = "https://fapi.xt.com/future/market/v1/public/q/kline"
 SPOT_URL = "https://sapi.xt.com/v4/public/kline"
 
-DATA_DIR = Path("data/xt_v11")
+DATA_DIR = Path("data/xt_v12")
 FUT_DIR = DATA_DIR / "futures"
 SPOT_DIR = DATA_DIR / "spot"
 
@@ -162,7 +162,7 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
 
     if cache_path.exists() and not refresh:
         df = pd.read_csv(cache_path)
-        return validate(df, symbol, start_ms, end_ms, allow_gaps=(base_url == SPOT_URL))
+        return validate(df, symbol, start_ms, end_ms)
 
     s = requests.Session()
     cursor = start_ms
@@ -223,72 +223,17 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
         if mx >= end_ms:
             break
 
-    # Spot history is an auxiliary feature source. Do not hard-fail the entire backtest
-    # because XT Spot has isolated historical missing candles. Futures remains strict.
-    if base_url == FUTURES_URL:
-        rows = repair_gaps(symbol, base_url, rows, start_ms, end_ms)
-    else:
-        print(f"[SPOT] {symbol}: skipping synthetic gap repair; missing candles will be handled as unavailable auxiliary data")
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df.pop("ts"), unit="ms", utc=True)
     df = df.set_index("timestamp").sort_index()
     df = df[~df.index.duplicated(keep="last")]
     df = df[df.index < pd.Timestamp.now(tz="UTC").floor("15min")]
-    out = validate(df.reset_index(), symbol, start_ms, end_ms, allow_gaps=(base_url == SPOT_URL))
+    out = validate(df.reset_index(), symbol, start_ms, end_ms)
     out.to_csv(cache_path, index=False)
     return out
 
 
-
-def repair_gaps(symbol, base_url, rows, start_ms, end_ms):
-    """Repair missing Futures candles only; never synthesize OHLCV."""
-    if base_url != FUTURES_URL:
-        return rows
-    by_ts = {int(r[0]): r for r in rows}
-    ts_sorted = sorted(by_ts)
-    if not ts_sorted:
-        return rows
-    missing = []
-    for a, b in zip(ts_sorted, ts_sorted[1:]):
-        if b - a > INTERVAL_MS:
-            missing.extend(range(a + INTERVAL_MS, b, INTERVAL_MS))
-    missing = sorted(set(t for t in missing if start_ms <= t <= end_ms))
-    if not missing:
-        return rows
-    print(f"[REPAIR] {symbol} Futures missing={len(missing)}")
-    session = requests.Session()
-    for target in missing:
-        ok = False
-        last_error = None
-        for attempt in range(1, 4):
-            try:
-                r = session.get(
-                    FUTURES_URL,
-                    params={
-                        "symbol": symbol, "interval": "15m",
-                        "startTime": max(start_ms, target - 2 * INTERVAL_MS),
-                        "endTime": min(end_ms, target + 2 * INTERVAL_MS),
-                        "limit": FUTURES_LIMIT,
-                    }, timeout=20,
-                )
-                r.raise_for_status()
-                payload = payload_rows(r.json())
-                if payload is None:
-                    raise RuntimeError("XT Futures response has no kline list")
-                parsed = [x for x in (parse_row(z, is_spot=False) for z in payload) if x is not None]
-                for x in parsed:
-                    by_ts[int(x[0])] = x
-                if target in by_ts:
-                    ok = True; break
-            except Exception as e:
-                last_error = e
-            time.sleep(0.5 * attempt)
-        if not ok:
-            raise RuntimeError(f"{symbol}: Futures gap could not be repaired at {pd.to_datetime(target, unit='ms', utc=True)}: {last_error}")
-    return [by_ts[t] for t in sorted(by_ts)]
-
-
-def validate(df, symbol, start_ms, end_ms, allow_gaps=False):
+def validate(df, symbol, start_ms, end_ms):
     required = {"timestamp", "open", "high", "low", "close", "volume"}
     if not required.issubset(df.columns):
         raise RuntimeError(f"{symbol}: missing {required - set(df.columns)}")
@@ -309,11 +254,25 @@ def validate(df, symbol, start_ms, end_ms, allow_gaps=False):
     if len(df) < MIN_ROWS:
         raise RuntimeError(f"{symbol}: only {len(df)} rows")
     diffs = df["timestamp"].diff().dropna().dt.total_seconds() / 60.0
-    gaps = int((diffs > MAX_GAP_MINUTES + 1e-9).sum())
-    if gaps and not allow_gaps:
-        raise RuntimeError(f"{symbol}: {gaps} unrepaired gaps")
-    if gaps and allow_gaps:
-        print(f"[VALIDATE] {symbol}: auxiliary Spot gaps={gaps} (allowed; no synthetic candles)")
+    bad = diffs > MAX_GAP_MINUTES + 1e-9
+    gaps = int(bad.sum())
+    if gaps:
+        # Never fabricate OHLCV. Isolated one-candle holes can occur in
+        # historical Spot data; those timestamps are naturally removed by
+        # complete_resample()/cross-sectional timestamp intersection.
+        missing_counts = [
+            max(1, int(round(d / 15.0)) - 1)
+            for d in diffs[bad].tolist()
+        ]
+        if any(m > 1 for m in missing_counts):
+            raise RuntimeError(
+                f"{symbol}: {gaps} gaps, including a multi-candle gap; "
+                "refusing to fabricate OHLCV"
+            )
+        print(
+            f"[VALIDATE] {symbol}: {gaps} isolated 15m gaps; "
+            "no OHLCV fabricated; affected higher-timeframe buckets will be excluded"
+        )
     span = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds() / 86400
     if span < 420:
         raise RuntimeError(f"{symbol}: span only {span:.1f} days")
@@ -576,9 +535,10 @@ def run_backtest(frames, cfg, start, end, label):
                     outcome = "LOSS" if sl_hit else "WIN"
                     raw = active["sl"] if sl_hit else active["tp"]
                     pnl = trade_pnl(side, active["entry"], exit_price(raw, side))
-                    if pnl < -MARGIN:
-                        pnl = -MARGIN
-                        outcome = "LIQUIDATED_PROXY"
+                    # Fixed-margin accounting: the strategy cannot lose more than the
+                    # isolated margin on one trade, but we do not fabricate a liquidation
+                    # event. The stop outcome itself determines the loss.
+                    pnl = max(-MARGIN, pnl)
                     equity = max(0.0, equity + pnl)
                     trades.append({"ts": ts, "symbol": active["symbol"], "side": side, "pnl": pnl, "outcome": outcome})
                     peak = max(peak, equity)
@@ -649,6 +609,18 @@ def run_backtest(frames, cfg, start, end, label):
     }
 
 
+
+def symbol_report(frames, cfg, start, end, label):
+    rows = []
+    for sym in frames:
+        r = run_backtest({sym: frames[sym]}, cfg, start, end, label)
+        rows.append((sym, r["trades"], r["wr"], r["pf"], r["pnl"], r["streak"], r["dd_pct"]))
+    print(f"\n================ {label} PER-SYMBOL ================")
+    print("symbol       trades     WR       PF        PnL       streak   DD%")
+    for sym, n, wr, pf, pnl, streak, dd in rows:
+        print(f"{sym:10s} {n:7d}  {wr:6.2f}%  {pf:7.3f}  ${pnl:9.2f}  {streak:6d}  {dd:6.2f}%")
+    print("=====================================================")
+
 def score(train, val):
     if train["trades"] < MIN_TRAIN_TRADES or val["trades"] < MIN_VALIDATION_TRADES:
         return -1e9
@@ -689,7 +661,7 @@ def report(r, title):
 
 def main():
     refresh = env_refresh()
-    print("HUNTER-V11 — LIQUIDITY / FLOW / REPRICING")
+    print("HUNTER-V12 — STATE / FLOW / LIQUIDITY / REPRICING")
     print("XT Futures + XT Spot | 15m -> 1H/4H/1D | causal")
     print(f"Capital=${INITIAL_CAPITAL:.0f} Margin=${MARGIN:.0f} Leverage={LEVERAGE:.0f}x RR=1:{RR:.0f}")
 
@@ -710,11 +682,14 @@ def main():
     factor_audit(frames, split)
 
     grid = []
-    for sweep in (20, 24, 32):
-        for vz in (0.0, 0.5, 1.0):
-            for bz in (1.0, 1.5, 2.0):
-                for flow in (0.25, 0.50, 0.75):
-                    for reclaim in (0.15, 0.30, 0.50):
+    # Small, predeclared research grid. It is intentionally not large enough to
+    # brute-force the OOS period. Parameters describe market-state tolerances,
+    # not outcome-fitting knobs.
+    for sweep in (20, 32):
+        for vz in (0.0, 0.75):
+            for bz in (1.0, 2.0):
+                for flow in (0.50, 0.75):
+                    for reclaim in (0.15, 0.30):
                         grid.append(Config(f"L{sweep}_V{vz}_B{bz}_F{flow}_R{reclaim}", sweep, vz, bz, flow, reclaim, 1.5))
 
     results = []
@@ -736,6 +711,7 @@ def main():
 
     oos = run_backtest(frames, cfg, split.val_end, split.end, "OOS")
     report(oos, "UNTOUCHED OOS")
+    symbol_report(frames, cfg, split.val_end, split.end, "OOS")
 
     accepted = (
         oos["trades"] >= MIN_OOS_TRADES
