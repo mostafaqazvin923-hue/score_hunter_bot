@@ -1,38 +1,51 @@
 #!/usr/bin/env python3
 """
-HUNTER-V10 — RESEARCH-FIRST FUTURES EDGE ENGINE
+HUNTER-V11 — LIQUIDITY / FLOW / REPRICING ENGINE
 
-XT USDT-M Futures / 15m -> 1H / 4H / 1D
-Research-first, causal, no lookahead, no repainting.
+XT USDT-M PERPETUAL FUTURES
+15m raw -> causal 1H / 4H / 1D
 
-Design:
-- Real XT Futures history only; no fabricated OI/funding/liquidation.
-- Exact 15m pagination + hard validation.
-- Complete 1H/4H/1D bars only.
-- 1D regime + 4H structure + 1H event/entry.
-- Predeclared strategy families and small parameter grid.
-- TRAIN -> VALIDATION selection; untouched OOS.
-- Manual Spearman calculation (no scipy dependency).
-- One global position, no overlap.
-- Entry on next 1H open.
-- Fixed RR 1:2.
-- No timeout, no BE, no trailing.
-- Same-candle SL+TP = LOSS.
-- Position still open at dataset end = OPEN.
-- Entry and exit slippage modeled adversely.
-- Fixed $100 margin, 50x leverage, $5,000 notional.
-- If stop loss exceeds isolated margin, the loss is capped at margin
-  (conservative liquidation proxy) and reported as LIQUIDATED.
-  This prevents impossible equity below the available isolated margin.
+Research-first. No lookahead. No repainting. No fabricated OI/liquidations.
+
+Core thesis:
+    Liquidity sweep -> failed auction / absorption -> repricing
+    confirmed by futures-vs-spot basis, volume participation and BTC-relative strength.
+
+Important data-policy:
+- Futures and spot OHLCV are downloaded from XT directly.
+- Historical order-book snapshots and historical trade-by-trade aggressor flow are NOT
+  assumed to exist for the full 365-day window. Therefore this engine does NOT fabricate
+  CVD/OI/liquidation history from candles.
+- `flow_pressure` below is explicitly a BAR-AGGREGATED PARTICIPATION PROXY, not true CVD.
+  It is built from candle body/range * volume and is audited separately.
+- Funding/OI are diagnostics only when an external historical file is supplied; they are
+  never silently substituted with current values.
+
+Execution:
+- Initial equity $1000
+- Isolated margin $100
+- 50x leverage => $5000 notional
+- RR 1:2
+- no timeout
+- no BE / trailing
+- no overlapping trades
+- no same-candle re-entry after a close
+- same-candle SL+TP => LOSS
+- position still open at dataset end => OPEN, not forced loss
+- capital-aware: no new $100-margin trade if equity < $100
+
+Selection:
+- Train factor audit
+- Predeclared small config grid
+- Train -> validation selection
+- untouched OOS
+- no parameter changes based on OOS
 """
 
-from __future__ import annotations
-
-import argparse
 import math
+import os
 import time
 from dataclasses import dataclass
-from datetime import timezone
 from pathlib import Path
 
 import numpy as np
@@ -47,7 +60,11 @@ SYMBOLS = [
 ]
 
 FUTURES_URL = "https://fapi.xt.com/future/market/v1/public/q/kline"
-DATA_DIR = Path("data/xt_futures_v10")
+SPOT_URL = "https://sapi.xt.com/v4/public/kline"
+
+DATA_DIR = Path("data/xt_v11")
+FUT_DIR = DATA_DIR / "futures"
+SPOT_DIR = DATA_DIR / "spot"
 
 DAYS = 365
 WARMUP_DAYS = 90
@@ -59,7 +76,6 @@ MARGIN = 100.0
 LEVERAGE = 50.0
 NOTIONAL = MARGIN * LEVERAGE
 RR = 2.0
-
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 
@@ -69,9 +85,8 @@ MAX_GAP_MINUTES = 15.0
 TRAIN_FRAC = 0.60
 VAL_FRAC = 0.20
 
-MIN_VALIDATION_TRADES = 30
-MIN_TRAIN_TRADES = 50
-
+MIN_TRAIN_TRADES = 40
+MIN_VALIDATION_TRADES = 25
 MIN_OOS_TRADES = 150
 MIN_OOS_WR = 50.0
 MIN_OOS_PF = 1.20
@@ -90,88 +105,67 @@ class Split:
 @dataclass(frozen=True)
 class Config:
     name: str
-    family: str
-    regime: str
-    threshold: float
-    atr_mult: float
-    lookback: int
+    sweep_lookback: int
+    vol_z_min: float
+    basis_z_max: float
+    flow_min: float
+    reclaim_min: float
+    rr_atr: float
 
 
-def args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data-dir", default=str(DATA_DIR))
-    p.add_argument("--refresh", action="store_true")
-    return p.parse_args()
+def env_refresh():
+    return os.getenv("XT_REFRESH", "0") == "1"
 
 
 def payload_rows(obj):
     if isinstance(obj, list):
         return obj
-    if isinstance(obj, dict):
-        for k in ("result", "data", "rows", "items", "list"):
-            if k in obj:
-                x = payload_rows(obj[k])
-                if x is not None:
-                    return x
+    if not isinstance(obj, dict):
+        return None
+    for k in ("result", "data", "rows", "list"):
+        v = obj.get(k)
+        if isinstance(v, list):
+            return v
     return None
 
 
 def parse_row(r):
-    if isinstance(r, (list, tuple)):
-        if len(r) < 6:
-            return None
-        vals = r[:6]
-        try:
-            return [int(float(vals[0])), *[float(x) for x in vals[1:6]]]
-        except Exception:
-            return None
-
-    if not isinstance(r, dict):
-        return None
-
-    def pick(*keys):
-        for k in keys:
-            if k in r and r[k] is not None:
-                return r[k]
-        return None
-
-    ts = pick("t", "time", "timestamp", "T")
-    o = pick("o", "open")
-    h = pick("h", "high")
-    l = pick("l", "low")
-    c = pick("c", "close")
-    v = pick("v", "volume", "vol", "a")
-
-    if any(x is None for x in (ts, o, h, l, c, v)):
-        return None
-
     try:
-        return [int(float(ts)), float(o), float(h), float(l), float(c), float(v)]
+        if isinstance(r, dict):
+            ts = r.get("t", r.get("timestamp"))
+            o = r.get("o", r.get("open"))
+            h = r.get("h", r.get("high"))
+            l = r.get("l", r.get("low"))
+            c = r.get("c", r.get("close"))
+            v = r.get("a", r.get("volume"))
+            if ts is None:
+                return None
+            return int(ts), float(o), float(h), float(l), float(c), float(v)
+        if isinstance(r, (list, tuple)) and len(r) >= 6:
+            return int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])
     except Exception:
         return None
+    return None
 
 
-def fetch_symbol(symbol: str, data_dir: Path, refresh=False):
-    data_dir.mkdir(parents=True, exist_ok=True)
-    path = data_dir / f"{symbol}.csv"
-
+def fetch_kline(symbol, base_url, cache_path, refresh=False):
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
     now = int(time.time() * 1000)
-    target_start = now - int((DAYS + WARMUP_DAYS) * 86400 * 1000)
-    final_end = (now // INTERVAL_MS) * INTERVAL_MS - 1
+    start_ms = now - int((DAYS + WARMUP_DAYS) * 86400 * 1000)
+    end_ms = (now // INTERVAL_MS) * INTERVAL_MS - 1
 
-    if path.exists() and not refresh:
-        df = pd.read_csv(path)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        return validate(df, symbol, target_start, final_end)
+    if cache_path.exists() and not refresh:
+        df = pd.read_csv(cache_path)
+        return validate(df, symbol, start_ms, end_ms)
 
     s = requests.Session()
-    cursor = target_start
-    all_rows = []
+    cursor = start_ms
+    rows = []
     page = 0
 
-    while cursor <= final_end:
+    while cursor <= end_ms:
         page += 1
-        window_end = min(final_end, cursor + LIMIT * INTERVAL_MS - 1)
+        window_end = min(end_ms, cursor + LIMIT * INTERVAL_MS - 1)
         params = {
             "symbol": symbol,
             "interval": "15m",
@@ -179,644 +173,494 @@ def fetch_symbol(symbol: str, data_dir: Path, refresh=False):
             "endTime": window_end,
             "limit": LIMIT,
         }
-
         last_error = None
-        data = None
+        payload = None
         for attempt in range(4):
             try:
-                r = s.get(FUTURES_URL, params=params, timeout=30)
+                r = s.get(base_url, params=params, timeout=30)
                 r.raise_for_status()
-                data = payload_rows(r.json())
-                if data is None:
-                    raise RuntimeError("XT response did not contain a kline list")
+                payload = payload_rows(r.json())
+                if payload is None:
+                    raise RuntimeError("XT response has no kline list")
                 break
-            except Exception as e:
-                last_error = e
+            except Exception as exc:
+                last_error = exc
                 time.sleep(1.0 + attempt)
-
-        if data is None:
+        if payload is None:
             raise RuntimeError(f"{symbol}: page {page} failed: {last_error}")
 
-        parsed = [x for x in (parse_row(z) for z in data) if x is not None]
+        parsed = [x for x in (parse_row(z) for z in payload) if x is not None]
         in_window = [x for x in parsed if cursor <= x[0] <= window_end]
-
         if not in_window:
-            timestamps = [x[0] for x in parsed]
-            if timestamps and max(timestamps) < cursor:
-                break
-            if not parsed:
-                raise RuntimeError(f"{symbol}: page {page} returned no parseable rows")
-            raise RuntimeError(
-                f"{symbol}: page {page} returned rows but none in requested window"
-            )
+            raise RuntimeError(f"{symbol}: page {page} produced no rows in requested window")
 
-        all_rows.extend(in_window)
+        rows.extend(in_window)
         mx = max(x[0] for x in in_window)
-
-        if mx < cursor:
-            raise RuntimeError(f"{symbol}: pagination moved backwards")
         next_cursor = mx + INTERVAL_MS
         if next_cursor <= cursor:
             raise RuntimeError(f"{symbol}: pagination made no progress")
-
         cursor = next_cursor
 
         if page % 10 == 0:
-            print(f"[FETCH] {symbol} page={page} rows={len(all_rows)}")
-
-        if mx >= final_end:
+            print(f"[FETCH] {symbol} {page=} rows={len(rows)}")
+        if mx >= end_ms:
             break
 
-    if not all_rows:
-        raise RuntimeError(f"{symbol}: no data collected")
-
-    df = pd.DataFrame(all_rows, columns=["ts", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df.pop("ts"), unit="ms", utc=True)
     df = df.set_index("timestamp").sort_index()
     df = df[~df.index.duplicated(keep="last")]
-
-    # Never trade the currently incomplete 15m candle.
-    cutoff = pd.Timestamp.now(tz="UTC").floor("15min")
-    df = df[df.index < cutoff]
-
-    out = validate(df.reset_index(), symbol, target_start, final_end)
-    out.to_csv(path, index=False)
+    df = df[df.index < pd.Timestamp.now(tz="UTC").floor("15min")]
+    out = validate(df.reset_index(), symbol, start_ms, end_ms)
+    out.to_csv(cache_path, index=False)
     return out
 
 
-def validate(df, symbol, target_start, final_end):
+def validate(df, symbol, start_ms, end_ms):
     required = {"timestamp", "open", "high", "low", "close", "volume"}
     if not required.issubset(df.columns):
-        raise RuntimeError(f"{symbol}: missing required columns")
-
+        raise RuntimeError(f"{symbol}: missing {required - set(df.columns)}")
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df = df.sort_values("timestamp")
-    df = df.drop_duplicates("timestamp", keep="last")
-
-    start = pd.to_datetime(target_start, unit="ms", utc=True)
-    end = pd.to_datetime(final_end, unit="ms", utc=True)
+    df = df.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    start = pd.to_datetime(start_ms, unit="ms", utc=True)
+    end = pd.to_datetime(end_ms, unit="ms", utc=True)
     df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)]
-
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-
     if df[["open", "high", "low", "close", "volume"]].isna().any().any():
         raise RuntimeError(f"{symbol}: NaN in OHLCV")
     if (df[["open", "high", "low", "close"]] <= 0).any().any():
-        raise RuntimeError(f"{symbol}: non-positive price")
+        raise RuntimeError(f"{symbol}: non-positive prices")
     if (df["volume"] < 0).any():
         raise RuntimeError(f"{symbol}: negative volume")
-
     if len(df) < MIN_ROWS:
-        raise RuntimeError(f"{symbol}: only {len(df)} rows; history incomplete")
-
+        raise RuntimeError(f"{symbol}: only {len(df)} rows")
     diffs = df["timestamp"].diff().dropna().dt.total_seconds() / 60.0
     gaps = int((diffs > MAX_GAP_MINUTES + 1e-9).sum())
     if gaps:
-        raise RuntimeError(f"{symbol}: {gaps} gaps detected")
-
+        raise RuntimeError(f"{symbol}: {gaps} gaps")
     span = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds() / 86400
     if span < 420:
-        raise RuntimeError(f"{symbol}: span only {span:.1f}d")
-
-    print(
-        f"[VALIDATE] {symbol} rows={len(df)} first={df['timestamp'].iloc[0]} "
-        f"last={df['timestamp'].iloc[-1]} span={span:.1f}d gaps={gaps}"
-    )
+        raise RuntimeError(f"{symbol}: span only {span:.1f} days")
+    print(f"[VALIDATE] {symbol} rows={len(df)} first={df['timestamp'].iloc[0]} last={df['timestamp'].iloc[-1]} span={span:.1f}d gaps={gaps}")
     return df
 
 
 def complete_resample(df15, rule, expected):
     x = df15.copy().set_index("timestamp").sort_index()
-    o = x["open"].resample(rule, closed="left", label="right").first()
-    h = x["high"].resample(rule, closed="left", label="right").max()
-    l = x["low"].resample(rule, closed="left", label="right").min()
-    c = x["close"].resample(rule, closed="left", label="right").last()
-    v = x["volume"].resample(rule, closed="left", label="right").sum()
-    n = x["close"].resample(rule, closed="left", label="right").count()
-
-    out = pd.concat([o, h, l, c, v, n], axis=1)
-    out.columns = ["open", "high", "low", "close", "volume", "count"]
+    out = pd.DataFrame({
+        "open": x["open"].resample(rule).first(),
+        "high": x["high"].resample(rule).max(),
+        "low": x["low"].resample(rule).min(),
+        "close": x["close"].resample(rule).last(),
+        "volume": x["volume"].resample(rule).sum(),
+        "count": x["close"].resample(rule).count(),
+    })
     out = out[out["count"] == expected].drop(columns="count")
-    return out.dropna()
-
-
-def build_frames(raw):
-    h1 = complete_resample(raw, "1h", 4)
-    h4 = complete_resample(raw, "4h", 16)
-    d1 = complete_resample(raw, "1d", 96)
-    return h1, h4, d1
+    return out
 
 
 def atr(df, n=14):
     prev = df["close"].shift(1)
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - prev).abs(),
-            (df["low"] - prev).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev).abs(),
+        (df["low"] - prev).abs(),
+    ], axis=1).max(axis=1)
     return tr.rolling(n, min_periods=n).mean()
 
 
-def add_features(h1, h4, d1):
-    a = h1.copy()
+def safe_z(s, n):
+    mu = s.rolling(n).mean()
+    sd = s.rolling(n).std()
+    return (s - mu) / sd.replace(0, np.nan)
+
+
+def build_asset_features(f15, spot15, btc_h1=None):
+    f = complete_resample(f15, "1h", 4)
+    h4 = complete_resample(f15, "4h", 16)
+    d1 = complete_resample(f15, "1d", 96)
+    s = complete_resample(spot15, "1h", 4)
+
+    a = f.copy()
     a["atr"] = atr(a, 14)
+    rng = (a["high"] - a["low"]).replace(0, np.nan)
+    body = a["close"] - a["open"]
+    a["body_frac"] = body.abs() / rng
+    a["close_loc"] = (a["close"] - a["low"]) / rng
     a["ret_6"] = a["close"].pct_change(6)
     a["ret_24"] = a["close"].pct_change(24)
     a["ret_72"] = a["close"].pct_change(72)
-    a["range_atr"] = (a["high"] - a["low"]) / a["atr"]
+    a["vol_z"] = safe_z(a["volume"], 96)
+    a["atr_z"] = safe_z(a["atr"], 96)
+    a["eff_12"] = (a["close"] - a["close"].shift(12)).abs() / a["close"].diff().abs().rolling(12).sum()
 
-    body = (a["close"] - a["open"]).abs()
-    a["body_atr"] = body / a["atr"]
-    a["close_location"] = ((a["close"] - a["low"]) / (a["high"] - a["low"]).replace(0, np.nan))
-    a["efficiency_12"] = (
-        (a["close"] - a["close"].shift(12)).abs()
-        / a["close"].diff().abs().rolling(12).sum()
-    )
-    a["vol_z"] = (
-        (a["volume"] - a["volume"].rolling(48).mean())
-        / a["volume"].rolling(48).std()
-    )
+    # Liquidity references use only completed prior bars.
+    for n in (20, 24, 32):
+        a[f"prior_hi_{n}"] = a["high"].shift(1).rolling(n).max()
+        a[f"prior_lo_{n}"] = a["low"].shift(1).rolling(n).min()
 
-    # Compression is measured from prior completed bars only.
-    width = (
-        2.0 * a["close"].rolling(20).std()
-        / a["close"].rolling(20).mean()
-    )
-    a["bb_width"] = width
-    a["bb_rank"] = width.shift(1).rolling(96).rank(pct=True)
+    # Bar-aggregated participation proxy. Explicitly NOT CVD.
+    a["flow_pressure"] = (body / rng) * a["volume"]
+    a["flow_z"] = safe_z(a["flow_pressure"], 96)
+    a["flow_6"] = a["flow_pressure"].rolling(6).sum()
 
-    # Prior-bar liquidity reference.
-    a["hh_24"] = a["high"].shift(1).rolling(24).max()
-    a["ll_24"] = a["low"].shift(1).rolling(24).min()
+    # Futures-vs-spot basis and volume participation.
+    s = s.reindex(a.index)
+    a["spot_close"] = s["close"]
+    a["basis"] = a["close"] / a["spot_close"] - 1.0
+    a["basis_z"] = safe_z(a["basis"], 192)
+    a["spot_ret_24"] = s["close"].pct_change(24)
+    a["fut_spot_ret_gap"] = a["ret_24"] - a["spot_ret_24"]
+    a["volume_ratio"] = a["volume"] / s["volume"].replace(0, np.nan)
+    a["volume_ratio_z"] = safe_z(np.log(a["volume_ratio"].clip(lower=1e-12)), 96)
 
-    # 4H structure.
-    b = h4.copy()
-    b["atr"] = atr(b, 14)
-    b["ema20"] = b["close"].ewm(span=20, adjust=False).mean()
-    b["ema50"] = b["close"].ewm(span=50, adjust=False).mean()
-    b["trend"] = np.where(b["ema20"] > b["ema50"], 1, -1)
-    b["swing_hi"] = b["high"].shift(2).rolling(5).max()
-    b["swing_lo"] = b["low"].shift(2).rolling(5).min()
+    if btc_h1 is not None:
+        btc = btc_h1["close"].reindex(a.index).ffill()
+        a["btc_ret_24"] = btc.pct_change(24)
+        a["rs24"] = a["ret_24"] - a["btc_ret_24"]
+        a["rs_z"] = safe_z(a["rs24"], 96)
+    else:
+        a["rs24"] = np.nan
+        a["rs_z"] = np.nan
 
-    # 1D regime. EMA is computed from prior daily close, so a signal
-    # during the current day can only see the last completed daily bar.
-    d = d1.copy()
-    d["ema50"] = d["close"].shift(1).ewm(span=50, adjust=False).mean()
-    d["ema200"] = d["close"].shift(1).ewm(span=200, adjust=False).mean()
-    d["slope20"] = d["ema50"].pct_change(5)
-    d["regime"] = np.where(
-        (d["close"].shift(1) > d["ema200"]) & (d["slope20"] > 0), 1,
-        np.where((d["close"].shift(1) < d["ema200"]) & (d["slope20"] < 0), -1, 0)
-    )
-    return a, b, d
+    # Higher-timeframe structure.
+    h4["atr"] = atr(h4, 14)
+    h4["ema20"] = h4["close"].ewm(span=20, adjust=False).mean()
+    h4["ema50"] = h4["close"].ewm(span=50, adjust=False).mean()
+    h4["trend"] = np.where(h4["ema20"] > h4["ema50"], 1, -1)
+    h4["slope"] = h4["ema20"].pct_change(5)
 
+    d1["ema50"] = d1["close"].ewm(span=50, adjust=False).mean()
+    d1["ema200"] = d1["close"].ewm(span=200, adjust=False).mean()
+    d1["slope50"] = d1["ema50"].pct_change(5)
+    d1["regime"] = np.where((d1["close"] > d1["ema200"]) & (d1["slope50"] > 0), 1,
+                    np.where((d1["close"] < d1["ema200"]) & (d1["slope50"] < 0), -1, 0))
 
-def asof(df, ts):
-    if df.empty:
-        return None
-    i = df.index.searchsorted(ts, side="right") - 1
-    if i < 0:
-        return None
-    return df.iloc[i]
-
-
-def make_panel(symbol_frames):
-    times = sorted(set().union(*[set(x[0].index) for x in symbol_frames.values()]))
-    return pd.DatetimeIndex(times)
+    # Critical causal alignment: signal at 1H timestamp sees the last COMPLETED
+    # 4H/1D bar strictly before that 1H close.
+    h4a = h4.shift(1).reindex(a.index, method="ffill")
+    d1a = d1.shift(1).reindex(a.index, method="ffill")
+    for col in ["atr", "ema20", "ema50", "trend", "slope"]:
+        a["h4_" + col] = h4a[col]
+    for col in ["ema50", "ema200", "slope50", "regime"]:
+        a["d1_" + col] = d1a[col]
+    return a, h4, d1
 
 
-def split_timeline(common_times):
-    common_times = pd.DatetimeIndex(common_times).sort_values()
-    if len(common_times) < 300:
-        raise RuntimeError("Not enough common 1H timestamps")
-    start = common_times[0]
-    end = common_times[-1]
+def split_timeline(frames):
+    common = None
+    for h1, _, _ in frames.values():
+        idx = set(h1.index)
+        common = idx if common is None else common.intersection(idx)
+    times = pd.DatetimeIndex(sorted(common))
+    if len(times) < 300:
+        raise RuntimeError("Insufficient common timestamps")
+    start, end = times[0], times[-1]
     span = end - start
     train_end = start + span * TRAIN_FRAC
     val_end = start + span * (TRAIN_FRAC + VAL_FRAC)
     return Split(start, train_end, val_end, end)
 
 
-def rank_spearman(x, y):
+def spearman(x, y):
     z = pd.concat([x, y], axis=1).dropna()
-    if len(z) < 30:
+    if len(z) < 50:
         return np.nan
-    return z.iloc[:, 0].rank(method="average").corr(
-        z.iloc[:, 1].rank(method="average")
-    )
+    return z.iloc[:, 0].rank().corr(z.iloc[:, 1].rank())
 
 
 def factor_audit(frames, split):
+    factors = [
+        "basis_z", "volume_ratio_z", "flow_z", "flow_6", "rs_z",
+        "fut_spot_ret_gap", "vol_z", "atr_z", "eff_12",
+    ]
     rows = []
     for sym, (h1, _, _) in frames.items():
-        train = h1.loc[split.start:split.train_end].copy()
-        for col in ["ret_6", "ret_24", "ret_72", "range_atr",
-                    "body_atr", "close_location", "efficiency_12",
-                    "vol_z", "bb_rank"]:
-            if col not in train:
+        x = h1.loc[split.start:split.train_end]
+        for fac in factors:
+            if fac not in x:
                 continue
-            for horizon in [1, 4, 8, 24]:
-                fwd = train["close"].shift(-horizon) / train["close"] - 1
-                ic = rank_spearman(train[col], fwd)
-                rows.append((sym, col, horizon, ic))
-    if not rows:
-        return
+            for horizon in (1, 4, 8, 24):
+                y = x["close"].shift(-horizon) / x["close"] - 1
+                rows.append((sym, fac, horizon, spearman(x[fac], y)))
     out = pd.DataFrame(rows, columns=["symbol", "factor", "horizon", "spearman"])
-    summary = (
-        out.groupby("factor")["spearman"]
-        .agg(["count", "mean"])
-        .assign(abs_mean=lambda z: z["mean"].abs())
-        .sort_values("abs_mean", ascending=False)
-    )
+    if out.empty:
+        return
+    summ = out.groupby("factor")["spearman"].agg(["count", "mean", "median"]).sort_values("mean")
     print("\n================ TRAIN FACTOR AUDIT ================")
-    print(summary.to_string(float_format=lambda x: f"{x:.4f}"))
+    print(summ.to_string(float_format=lambda x: f"{x:.4f}"))
     print("=====================================================\n")
 
 
-def candidate_from_features(ts, sym, f, h4, d1, cfg):
+def asof_strict(df, ts):
+    # Return last row strictly before ts.
+    i = df.index.searchsorted(ts, side="left") - 1
+    return None if i < 0 else df.iloc[i]
+
+
+def candidate(ts, sym, f, cfg):
     if ts not in f.index:
         return None
-    row = f.loc[ts]
-    r4 = asof(h4, ts)
-    rd = asof(d1, ts)
-    if r4 is None or rd is None:
+    r = f.loc[ts]
+    n = cfg.sweep_lookback
+    hi_col = f"prior_hi_{n}"
+    lo_col = f"prior_lo_{n}"
+    need = ["atr", hi_col, lo_col, "basis_z", "volume_ratio_z", "flow_z",
+            "rs_z", "h4_trend", "d1_regime", "close_loc", "vol_z", "eff_12"]
+    if any(pd.isna(r.get(k)) for k in need):
         return None
 
-    vals = [
-        row["atr"], row["ret_24"], row["ret_72"], row["bb_rank"],
-        row["range_atr"], row["body_atr"], row["close_location"],
-        row["efficiency_12"], row["vol_z"], r4["ema20"], r4["ema50"],
-        rd["ema200"], rd["regime"]
-    ]
-    if any(pd.isna(x) for x in vals):
+    # Liquidity event must be a completed-bar event.
+    prior_hi = r[hi_col]
+    prior_lo = r[lo_col]
+    long_sweep = bool(r["low"] < prior_lo and r["close"] > prior_lo)
+    short_sweep = bool(r["high"] > prior_hi and r["close"] < prior_hi)
+    if not (long_sweep or short_sweep):
         return None
 
+    # Absorption/repricing logic:
+    # Long: downside sweep, strong close back above liquidity, flow pressure
+    # less bearish than the extreme sell impulse, spot confirms, futures basis
+    # is not in a stretched premium.
     long_score = 0.0
     short_score = 0.0
 
-    trend = int(r4["trend"])
-    regime = int(rd["regime"])
-    ret24 = float(row["ret_24"])
-    ret72 = float(row["ret_72"])
-    br = float(row["bb_rank"])
-    rng = float(row["range_atr"])
-    body = float(row["body_atr"])
-    loc = float(row["close_location"])
-    eff = float(row["efficiency_12"])
-    vz = float(row["vol_z"])
+    long_score += 2.0 * long_sweep
+    reclaim_long = (r["close"] - prior_lo) / r["atr"]
+    reclaim_short = (prior_hi - r["close"]) / r["atr"]
+    long_score += 1.0 * (reclaim_long >= cfg.reclaim_min)
+    long_score += 1.0 * (r["flow_z"] > cfg.flow_min)
+    long_score += 1.0 * (r["volume_ratio_z"] > 0)
+    long_score += 1.0 * (r["basis_z"] <= cfg.basis_z_max)
+    long_score += 1.0 * (r["rs_z"] > -0.5)
+    long_score += 0.75 * (r["close_loc"] >= 0.60)
+    long_score += 0.75 * (r["eff_12"] < 0.55)
+    long_score += 0.5 * (r["vol_z"] > cfg.vol_z_min)
+    long_score += 0.5 * (r["h4_trend"] >= 0)
+    long_score += 0.5 * (r["d1_regime"] >= 0)
 
-    # Family A: continuation after compression + displacement.
-    if cfg.family == "CONT":
-        long_score = (
-            1.0 * (trend == 1)
-            + 1.0 * (regime == 1)
-            + 1.0 * (br <= cfg.threshold)
-            + 1.0 * (ret24 > 0)
-            + 1.0 * (ret72 > 0)
-            + 1.0 * (loc >= 0.65)
-            + 1.0 * (body >= cfg.atr_mult)
-            + 0.5 * (vz > 0)
-        )
-        short_score = (
-            1.0 * (trend == -1)
-            + 1.0 * (regime == -1)
-            + 1.0 * (br <= cfg.threshold)
-            + 1.0 * (ret24 < 0)
-            + 1.0 * (ret72 < 0)
-            + 1.0 * (loc <= 0.35)
-            + 1.0 * (body >= cfg.atr_mult)
-            + 0.5 * (vz > 0)
-        )
+    short_score += 2.0 * short_sweep
+    short_score += 1.0 * (reclaim_short >= cfg.reclaim_min)
+    short_score += 1.0 * (r["flow_z"] < -cfg.flow_min)
+    short_score += 1.0 * (r["volume_ratio_z"] > 0)
+    short_score += 1.0 * (r["basis_z"] >= -cfg.basis_z_max)
+    short_score += 1.0 * (r["rs_z"] < 0.5)
+    short_score += 0.75 * (r["close_loc"] <= 0.40)
+    short_score += 0.75 * (r["eff_12"] < 0.55)
+    short_score += 0.5 * (r["vol_z"] > cfg.vol_z_min)
+    short_score += 0.5 * (r["h4_trend"] <= 0)
+    short_score += 0.5 * (r["d1_regime"] <= 0)
 
-    # Family B: failed auction / mean reversion after extreme displacement.
-    elif cfg.family == "FADE":
-        extreme = max(abs(ret24), abs(ret72))
-        long_score = (
-            1.0 * (trend == -1 or regime == -1)
-            + 1.0 * (br >= cfg.threshold)
-            + 1.0 * (loc <= 0.25)
-            + 1.0 * (body >= cfg.atr_mult)
-            + 1.0 * (ret24 < 0)
-            + 0.5 * (eff < 0.45)
-            + 0.5 * (extreme > 0)
-        )
-        short_score = (
-            1.0 * (trend == 1 or regime == 1)
-            + 1.0 * (br >= cfg.threshold)
-            + 1.0 * (loc >= 0.75)
-            + 1.0 * (body >= cfg.atr_mult)
-            + 1.0 * (ret24 > 0)
-            + 0.5 * (eff < 0.45)
-            + 0.5 * (extreme > 0)
-        )
-
-    # Family C: volatility expansion with directional confirmation.
-    elif cfg.family == "EXP":
-        long_score = (
-            1.0 * (trend == 1)
-            + 1.0 * (regime == 1)
-            + 1.0 * (rng >= cfg.atr_mult)
-            + 1.0 * (loc >= 0.60)
-            + 1.0 * (ret24 > 0)
-            + 1.0 * (ret72 > 0)
-            + 0.5 * (eff >= 0.50)
-        )
-        short_score = (
-            1.0 * (trend == -1)
-            + 1.0 * (regime == -1)
-            + 1.0 * (rng >= cfg.atr_mult)
-            + 1.0 * (loc <= 0.40)
-            + 1.0 * (ret24 < 0)
-            + 1.0 * (ret72 < 0)
-            + 0.5 * (eff >= 0.50)
-        )
-
-    min_score = 6.0
-    if long_score >= min_score and long_score > short_score:
-        return {"symbol": sym, "side": 1, "score": long_score, "atr": float(row["atr"])}
-    if short_score >= min_score and short_score > long_score:
-        return {"symbol": sym, "side": -1, "score": short_score, "atr": float(row["atr"])}
+    if long_score >= 6.0 and long_score > short_score:
+        return {"symbol": sym, "side": 1, "score": long_score, "atr": float(r["atr"])}
+    if short_score >= 6.0 and short_score > long_score:
+        return {"symbol": sym, "side": -1, "score": short_score, "atr": float(r["atr"])}
     return None
 
 
-def apply_entry_slippage(price, side):
-    return price * (1 + SLIPPAGE * side)
+def entry_price(p, side):
+    return p * (1 + SLIPPAGE * side)
 
 
-def apply_exit_slippage(price, side):
-    # Adverse slippage: long exits lower, short exits higher.
-    return price * (1 - SLIPPAGE * side)
+def exit_price(p, side):
+    return p * (1 - SLIPPAGE * side)
 
 
-def pnl_for_exit(side, entry, exit_price):
-    gross = (exit_price - entry) / entry * NOTIONAL * side
+def trade_pnl(side, entry, exitp):
+    gross = (exitp - entry) / entry * NOTIONAL * side
     fees = NOTIONAL * FEE_RATE * 2.0
     return gross - fees
 
 
-def run_backtest(frames, split, cfg, start, end, label):
-    # Common timestamps are required for cross-sectional selection.
+def run_backtest(frames, cfg, start, end, label):
     common = None
     for h1, _, _ in frames.values():
-        t = h1.loc[start:end].index
-        common = set(t) if common is None else common.intersection(set(t))
+        idx = set(h1.loc[start:end].index)
+        common = idx if common is None else common.intersection(idx)
     times = pd.DatetimeIndex(sorted(common))
 
-    active = None
-    trades = []
     equity = INITIAL_CAPITAL
     peak = equity
     max_dd = 0.0
+    active = None
+    trades = []
     cooldown_until = None
     capital_blocked = False
 
     for ts in times:
-        # Manage only after the actual next-bar entry.
+        # Manage existing position first. No new entry on the close-reveal candle.
         if active is not None and ts >= active["entry_ts"]:
             h1 = frames[active["symbol"]][0]
             if ts in h1.index:
-                bar = h1.loc[ts]
+                b = h1.loc[ts]
                 side = active["side"]
-
-                stop_hit = (
-                    bar["low"] <= active["sl"] if side == 1
-                    else bar["high"] >= active["sl"]
-                )
-                tp_hit = (
-                    bar["high"] >= active["tp"] if side == 1
-                    else bar["low"] <= active["tp"]
-                )
-
-                if stop_hit or tp_hit:
-                    # Conservative same-candle resolution.
-                    outcome = "LOSS" if stop_hit else "WIN"
-                    raw_exit = active["sl"] if stop_hit else active["tp"]
-                    exit_price = apply_exit_slippage(raw_exit, side)
-                    pnl = pnl_for_exit(side, active["entry"], exit_price)
-
-                    # Isolated-margin cap / liquidation proxy.
+                sl_hit = b["low"] <= active["sl"] if side == 1 else b["high"] >= active["sl"]
+                tp_hit = b["high"] >= active["tp"] if side == 1 else b["low"] <= active["tp"]
+                if sl_hit or tp_hit:
+                    outcome = "LOSS" if sl_hit else "WIN"
+                    raw = active["sl"] if sl_hit else active["tp"]
+                    pnl = trade_pnl(side, active["entry"], exit_price(raw, side))
                     if pnl < -MARGIN:
                         pnl = -MARGIN
-                        outcome = "LIQUIDATED"
-
+                        outcome = "LIQUIDATED_PROXY"
                     equity = max(0.0, equity + pnl)
-                    trades.append({
-                        "time": ts, "symbol": active["symbol"],
-                        "side": side, "pnl": pnl, "outcome": outcome
-                    })
+                    trades.append({"ts": ts, "symbol": active["symbol"], "side": side, "pnl": pnl, "outcome": outcome})
                     peak = max(peak, equity)
                     max_dd = max(max_dd, peak - equity)
                     active = None
                     cooldown_until = ts + pd.Timedelta(hours=1)
-                    # Never re-enter on the candle that reveals the result.
                     continue
 
         if active is not None:
             continue
         if cooldown_until is not None and ts < cooldown_until:
             continue
-
-        # A new isolated-margin position requires at least $100 available equity.
         if equity < MARGIN:
             capital_blocked = True
             continue
 
         candidates = []
-        for sym, (h1, h4, d1) in frames.items():
-            if ts < start or ts > end or ts not in h1.index:
+        for sym, (h1, _, _) in frames.items():
+            if ts not in h1.index:
                 continue
-            c = candidate_from_features(ts, sym, h1, h4, d1, cfg)
+            c = candidate(ts, sym, h1, cfg)
             if c is not None:
                 candidates.append(c)
-
         if not candidates:
             continue
-
-        candidates.sort(key=lambda x: (-x["score"], x["symbol"], -x["side"]))
+        candidates.sort(key=lambda x: (-x["score"], x["symbol"]))
         c = candidates[0]
-        sym = c["symbol"]
+        sym, side = c["symbol"], int(c["side"])
         h1 = frames[sym][0]
-
-        # Signal at completed 1H close; entry at the next completed 1H open.
         pos = h1.index.searchsorted(ts, side="right")
-        if pos >= len(h1.index):
+        if pos >= len(h1):
             continue
         entry_ts = h1.index[pos]
         if entry_ts > end:
             continue
-
-        raw_entry = float(h1.iloc[pos]["open"])
-        side = int(c["side"])
-        entry = apply_entry_slippage(raw_entry, side)
-        stop_dist = float(c["atr"]) * 1.5
-        sl = entry - stop_dist * side
-        tp = entry + stop_dist * RR * side
-
-        active = {
-            "symbol": sym,
-            "side": side,
-            "signal_ts": ts,
-            "entry_ts": entry_ts,
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-        }
+        ep = entry_price(float(h1.iloc[pos]["open"]), side)
+        dist = float(c["atr"]) * cfg.rr_atr
+        if not np.isfinite(dist) or dist <= 0:
+            continue
+        sl = ep - dist * side
+        tp = ep + dist * RR * side
+        active = {"symbol": sym, "side": side, "signal_ts": ts, "entry_ts": entry_ts, "entry": ep, "sl": sl, "tp": tp}
 
     vals = pd.Series([x["pnl"] for x in trades], dtype=float)
     wins = int((vals > 0).sum())
     losses = int((vals <= 0).sum())
-    gross_profit = float(vals[vals > 0].sum()) if wins else 0.0
-    gross_loss = float(-vals[vals <= 0].sum()) if losses else 0.0
-    pf = gross_profit / gross_loss if gross_loss > 0 else math.inf
-    wr = 100.0 * wins / len(vals) if len(vals) else 0.0
-
-    streak = 0
-    max_streak = 0
-    for x in vals:
-        if x <= 0:
+    gp = float(vals[vals > 0].sum()) if wins else 0.0
+    gl = float(-vals[vals <= 0].sum()) if losses else 0.0
+    pf = gp / gl if gl > 0 else math.inf
+    wr = 100 * wins / len(vals) if len(vals) else 0.0
+    streak = max_streak = 0
+    for v in vals:
+        if v <= 0:
             streak += 1
             max_streak = max(max_streak, streak)
         else:
             streak = 0
-
     days = max((end - start).total_seconds() / 86400, 1e-9)
-    dd_pct = 100.0 * max_dd / INITIAL_CAPITAL
-
+    dd_pct = 100 * max_dd / INITIAL_CAPITAL
     return {
-        "label": label,
-        "config": cfg.name,
-        "trades": len(vals),
-        "wins": wins,
-        "losses": losses,
-        "wr": wr,
-        "pf": pf,
-        "pnl": float(vals.sum()) if len(vals) else 0.0,
-        "dd": max_dd,
-        "dd_pct": dd_pct,
-        "streak": max_streak,
-        "tday": len(vals) / days,
-        "open": active is not None,
-        "capital_blocked": capital_blocked,
-        "avg_win": gross_profit / wins if wins else 0.0,
-        "avg_loss": -gross_loss / losses if losses else 0.0,
-        "expectancy": float(vals.mean()) if len(vals) else 0.0,
+        "label": label, "config": cfg.name, "trades": len(vals), "wins": wins,
+        "losses": losses, "wr": wr, "pf": pf, "pnl": float(vals.sum()) if len(vals) else 0.0,
+        "dd": max_dd, "dd_pct": min(dd_pct, 100.0), "streak": max_streak,
+        "tday": len(vals) / days, "open": active is not None,
+        "capital_blocked": capital_blocked, "avg_win": gp / wins if wins else 0.0,
+        "avg_loss": -gl / losses if losses else 0.0, "expectancy": float(vals.mean()) if len(vals) else 0.0,
         "median": float(vals.median()) if len(vals) else 0.0,
     }
 
 
-def score_config(train, val):
-    # Predeclared selection rule. No OOS information is used.
+def score(train, val):
     if train["trades"] < MIN_TRAIN_TRADES or val["trades"] < MIN_VALIDATION_TRADES:
         return -1e9
-
-    if not np.isfinite(train["pf"]) or not np.isfinite(val["pf"]):
-        return -1e9
-
-    # Reward consistency, sample size and risk-adjusted profitability.
     if train["pnl"] <= 0 or val["pnl"] <= 0:
-        return -1e8 + min(train["pnl"], val["pnl"])
-
-    wr_gap = abs(train["wr"] - val["wr"])
-    pf_gap = abs(train["pf"] - val["pf"])
-
+        return -1e8 + min(train["pnl"], 0) + min(val["pnl"], 0)
+    # Reward stability and economic quality; do not optimize for OOS.
     return (
-        min(train["pf"], val["pf"]) * 10.0
-        + min(train["wr"], val["wr"]) * 0.15
-        + math.log1p(min(train["trades"], val["trades"]))
-        - wr_gap * 0.10
-        - pf_gap * 1.0
-        - max(train["dd_pct"], val["dd_pct"]) * 0.05
+        2.0 * val["pf"]
+        + 0.02 * val["wr"]
+        + 0.001 * val["pnl"]
+        - 0.01 * val["streak"]
+        - 0.01 * val["dd_pct"]
+        + 0.5 * train["pf"]
     )
 
 
 def report(r, title):
     print(f"\n================ {title} ================")
-    print(f"Trades              : {r['trades']}")
-    print(f"Wins                : {r['wins']}")
-    print(f"Losses              : {r['losses']}")
-    print(f"Win Rate            : {r['wr']:.2f}%")
-    print(f"Profit Factor       : {r['pf']:.3f}" if np.isfinite(r["pf"]) else "Profit Factor       : inf")
-    print(f"Net PnL             : ${r['pnl']:.2f}")
-    print(f"Max Drawdown        : ${r['dd']:.2f}")
-    print(f"Max Drawdown %      : {r['dd_pct']:.2f}%")
-    print(f"Max Loss Streak     : {r['streak']}")
-    print(f"Trades / Day        : {r['tday']:.4f}")
-    print(f"Average Win         : ${r['avg_win']:.2f}")
-    print(f"Average Loss        : ${r['avg_loss']:.2f}")
-    print(f"Expectancy / Trade  : ${r['expectancy']:.2f}")
-    print(f"Median Trade PnL    : ${r['median']:.2f}")
-    print("=" * 50)
+    for k, lab in [
+        ("trades", "Trades"), ("wins", "Wins"), ("losses", "Losses"),
+        ("wr", "Win Rate"), ("pf", "Profit Factor"), ("pnl", "Net PnL"),
+        ("dd", "Max Drawdown"), ("dd_pct", "Max Drawdown %"),
+        ("streak", "Max Loss Streak"), ("tday", "Trades / Day"),
+        ("avg_win", "Average Win"), ("avg_loss", "Average Loss"),
+        ("expectancy", "Expectancy / Trade"), ("median", "Median Trade PnL"),
+    ]:
+        v = r[k]
+        if k in {"wr", "dd_pct"}:
+            print(f"{lab:24}: {v:.2f}%")
+        elif k in {"pf", "tday"}:
+            print(f"{lab:24}: {v:.4f}")
+        elif k == "trades" or k == "wins" or k == "losses" or k == "streak":
+            print(f"{lab:24}: {int(v)}")
+        else:
+            print(f"{lab:24}: ${v:,.2f}")
+    print("==================================================")
 
 
 def main():
-    a = args()
-    data_dir = Path(a.data_dir)
+    refresh = env_refresh()
+    print("HUNTER-V11 — LIQUIDITY / FLOW / REPRICING")
+    print("XT Futures + XT Spot | 15m -> 1H/4H/1D | causal")
+    print(f"Capital=${INITIAL_CAPITAL:.0f} Margin=${MARGIN:.0f} Leverage={LEVERAGE:.0f}x RR=1:{RR:.0f}")
 
-    raw = {}
-    frames = {}
-
-    print("[DATA] Collecting XT Futures history...")
+    raw_f = {}
+    raw_s = {}
     for sym in SYMBOLS:
-        df = fetch_symbol(sym, data_dir, a.refresh)
-        raw[sym] = df
-        h1, h4, d1 = build_frames(df)
-        h1, h4, d1 = add_features(h1, h4, d1)
-        frames[sym] = (h1, h4, d1)
+        raw_f[sym] = fetch_kline(sym, FUTURES_URL, FUT_DIR / f"{sym}.csv", refresh)
+        raw_s[sym] = fetch_kline(sym, SPOT_URL, SPOT_DIR / f"{sym}.csv", refresh)
 
-    common = None
-    for h1, _, _ in frames.values():
-        t = set(h1.index)
-        common = t if common is None else common.intersection(t)
+    # BTC is the cross-sectional benchmark.
+    btc_h1 = complete_resample(raw_f["btc_usdt"], "1h", 4)
+    frames = {}
+    for sym in SYMBOLS:
+        frames[sym] = build_asset_features(raw_f[sym], raw_s[sym], btc_h1)
 
-    split = split_timeline(pd.DatetimeIndex(sorted(common)))
-    print(f"[TIMELINE] Train: {split.start} -> {split.train_end}")
-    print(f"[TIMELINE] Validation: {split.train_end} -> {split.val_end}")
-    print(f"[TIMELINE] OOS: {split.val_end} -> {split.end}")
-
+    split = split_timeline(frames)
+    print(f"\nSPLIT: train={split.start}..{split.train_end} | val={split.train_end}..{split.val_end} | OOS={split.val_end}..{split.end}")
     factor_audit(frames, split)
 
-    configs = []
-    for family in ["CONT", "FADE", "EXP"]:
-        for threshold in ([0.25, 0.35] if family == "CONT" else [0.65, 0.75] if family == "FADE" else [0.70, 0.85]):
-            for mult in [0.60, 0.80, 1.00]:
-                name = f"{family}_thr{threshold:.2f}_m{mult:.2f}"
-                configs.append(Config(name, family, "REGIME", threshold, mult, 24))
+    grid = []
+    for sweep in (20, 24, 32):
+        for vz in (0.0, 0.5, 1.0):
+            for bz in (1.0, 1.5, 2.0):
+                for flow in (0.25, 0.50, 0.75):
+                    for reclaim in (0.15, 0.30, 0.50):
+                        grid.append(Config(f"L{sweep}_V{vz}_B{bz}_F{flow}_R{reclaim}", sweep, vz, bz, flow, reclaim, 1.5))
 
-    print(f"[RESEARCH] Predeclared configs: {len(configs)}")
+    results = []
+    for cfg in grid:
+        tr = run_backtest(frames, cfg, split.start, split.train_end, "TRAIN")
+        va = run_backtest(frames, cfg, split.train_end, split.val_end, "VALIDATION")
+        sc = score(tr, va)
+        results.append((sc, cfg, tr, va))
 
-    selected = []
-    for cfg in configs:
-        tr = run_backtest(frames, split, cfg, split.start, split.train_end, "TRAIN")
-        va = run_backtest(frames, split, cfg, split.train_end, split.val_end, "VAL")
-        score = score_config(tr, va)
-        selected.append((score, cfg, tr, va))
-
-    selected.sort(key=lambda x: (-x[0], x[1].name))
-    print("\n================ MODEL SELECTION ================")
-    for score, cfg, tr, va in selected[:10]:
-        print(
-            f"{cfg.name:24s} score={score:8.3f} "
-            f"TRAIN n={tr['trades']:4d} WR={tr['wr']:5.1f} PF={tr['pf']:5.2f} "
-            f"VAL n={va['trades']:4d} WR={va['wr']:5.1f} PF={va['pf']:5.2f}"
-        )
-    print("==================================================")
-
-    eligible = [x for x in selected if x[0] > -1e8]
+    results.sort(key=lambda x: x[0], reverse=True)
+    eligible = [x for x in results if x[0] > -1e8]
     if not eligible:
-        print("[DECISION] REJECTED — no configuration passed pre-OOS research.")
-        return
+        raise RuntimeError("No train/validation-eligible configuration. Strategy has no validated edge.")
 
     _, cfg, tr, va = eligible[0]
     print(f"\n[SELECTED] {cfg.name}")
     report(tr, "SELECTED TRAIN")
     report(va, "SELECTED VALIDATION")
 
-    oos = run_backtest(frames, split, cfg, split.val_end, split.end, "OOS")
+    oos = run_backtest(frames, cfg, split.val_end, split.end, "OOS")
     report(oos, "UNTOUCHED OOS")
 
     accepted = (
@@ -827,23 +671,18 @@ def main():
         and oos["streak"] <= MAX_OOS_STREAK
         and oos["dd_pct"] < MAX_OOS_DD_PCT
     )
-
     print("\n================ ACCEPTANCE GATE ================")
-    print(f"OOS trades >= {MIN_OOS_TRADES}       : {'PASS' if oos['trades'] >= MIN_OOS_TRADES else 'FAIL'}")
-    print(f"OOS WR > {MIN_OOS_WR:.1f}%              : {'PASS' if oos['wr'] > MIN_OOS_WR else 'FAIL'}")
-    print(f"OOS PF > {MIN_OOS_PF:.2f}              : {'PASS' if oos['pf'] > MIN_OOS_PF else 'FAIL'}")
-    print(f"OOS Net PnL > $0                 : {'PASS' if oos['pnl'] > 0 else 'FAIL'}")
+    print(f"OOS trades >= {MIN_OOS_TRADES:<3}     : {'PASS' if oos['trades'] >= MIN_OOS_TRADES else 'FAIL'}")
+    print(f"OOS WR > {MIN_OOS_WR:.1f}%           : {'PASS' if oos['wr'] > MIN_OOS_WR else 'FAIL'}")
+    print(f"OOS PF > {MIN_OOS_PF:.2f}             : {'PASS' if oos['pf'] > MIN_OOS_PF else 'FAIL'}")
+    print(f"OOS Net PnL > $0              : {'PASS' if oos['pnl'] > 0 else 'FAIL'}")
     print(f"OOS Max loss streak <= {MAX_OOS_STREAK}: {'PASS' if oos['streak'] <= MAX_OOS_STREAK else 'FAIL'}")
-    print(f"OOS Max DD < {MAX_OOS_DD_PCT:.0f}%              : {'PASS' if oos['dd_pct'] < MAX_OOS_DD_PCT else 'FAIL'}")
-    print(f"OOS open position at end          : {'YES' if oos['open'] else 'NO'} (informational)")
-    print(f"Capital blocked (< ${MARGIN:.0f})   : {'YES' if oos['capital_blocked'] else 'NO'} (informational)")
-    print(f"ACCEPTED                          : {accepted}")
+    print(f"OOS Max DD < {MAX_OOS_DD_PCT:.0f}%           : {'PASS' if oos['dd_pct'] < MAX_OOS_DD_PCT else 'FAIL'}")
+    print(f"OOS open position at end      : {'YES' if oos['open'] else 'NO'} (informational)")
+    print(f"Capital blocked (< ${MARGIN:.0f}) : {'YES' if oos['capital_blocked'] else 'NO'} (informational)")
+    print(f"ACCEPTED                      : {accepted}")
     print("==================================================")
-
-    if accepted:
-        print("[DECISION] ACCEPTED — candidate survived untouched OOS.")
-    else:
-        print("[DECISION] REJECTED — no claim of robust edge.")
+    print("[DECISION] ACCEPTED — robust edge criteria passed." if accepted else "[DECISION] REJECTED — no claim of robust edge.")
 
 
 if __name__ == "__main__":
