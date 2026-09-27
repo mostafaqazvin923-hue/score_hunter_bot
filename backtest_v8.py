@@ -254,7 +254,7 @@ def repair_gaps(symbol, base_url, rows, start_ms, end_ms):
     session = requests.Session()
     page_limit = SPOT_LIMIT if base_url == SPOT_URL else FUTURES_LIMIT
     endpoint = (
-        f"{base_url}/v4/public/kline"
+        base_url
         if base_url == SPOT_URL
         else f"{base_url}/future/market/v1/public/q/kline"
     )
