@@ -228,12 +228,12 @@ def fetch_kline(symbol, base_url, cache_path, refresh=False):
     df = df.set_index("timestamp").sort_index()
     df = df[~df.index.duplicated(keep="last")]
     df = df[df.index < pd.Timestamp.now(tz="UTC").floor("15min")]
-    out = validate(df.reset_index(), symbol, start_ms, end_ms)
+    out = validate(df.reset_index(), symbol, start_ms, end_ms, allow_gaps=base_url.startswith("https://sapi.xt.com"))
     out.to_csv(cache_path, index=False)
     return out
 
 
-def validate(df, symbol, start_ms, end_ms):
+def validate(df, symbol, start_ms, end_ms, allow_gaps=False):
     required = {"timestamp", "open", "high", "low", "close", "volume"}
     if not required.issubset(df.columns):
         raise RuntimeError(f"{symbol}: missing {required - set(df.columns)}")
@@ -264,15 +264,21 @@ def validate(df, symbol, start_ms, end_ms):
             max(1, int(round(d / 15.0)) - 1)
             for d in diffs[bad].tolist()
         ]
-        if any(m > 1 for m in missing_counts):
+        if any(m > 1 for m in missing_counts) and not allow_gaps:
             raise RuntimeError(
                 f"{symbol}: {gaps} gaps, including a multi-candle gap; "
                 "refusing to fabricate OHLCV"
             )
-        print(
-            f"[VALIDATE] {symbol}: {gaps} isolated 15m gaps; "
-            "no OHLCV fabricated; affected higher-timeframe buckets will be excluded"
-        )
+        if allow_gaps:
+            print(
+                f"[VALIDATE] {symbol}: {gaps} historical Spot gaps; "
+                "no OHLCV fabricated; incomplete higher-timeframe buckets will be excluded"
+            )
+        else:
+            print(
+                f"[VALIDATE] {symbol}: {gaps} isolated 15m gaps; "
+                "no OHLCV fabricated; affected higher-timeframe buckets will be excluded"
+            )
     span = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds() / 86400
     if span < 420:
         raise RuntimeError(f"{symbol}: span only {span:.1f} days")
