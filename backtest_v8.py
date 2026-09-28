@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HUNTER-V14 — FORENSIC / CAUSAL / SPLIT-ISOLATED BACKTEST ENGINE
+HUNTER-V15 — FORENSIC / CAUSAL / SPLIT-ISOLATED BACKTEST ENGINE
 XT USDT-M PERPETUAL FUTURES
 15m raw -> causal 1H / 4H / 1D
 
@@ -85,6 +85,8 @@ class Config:
     stop_atr: float
     rank_floor: float
     vol_floor: float
+    side_mode: str
+    allow_bear_short: bool
 
 
 def payload_rows(obj):
@@ -361,6 +363,13 @@ def candidate(ts, sym, x, cfg):
                   + 0.8*(r.flow_z<0) + 0.8*(r.vol_z>cfg.vol_floor)
                   + 0.8*(r.eff<0.55) + 0.8*(r.rs_z<0) + 0.6*short_ok
                   + 0.4*(r.basis_z>-2.5 if pd.notna(r.basis_z) else False))
+    if cfg.side_mode == "LONG_ONLY":
+        base_short = -np.inf
+    elif cfg.side_mode == "SHORT_ONLY":
+        base_long = -np.inf
+    if not cfg.allow_bear_short and r.d1_regime < 0:
+        base_short = -np.inf
+
     score=max(base_long,base_short)
     if score < cfg.min_score:
         return None
@@ -632,10 +641,10 @@ def forensic_report(trades, outdir):
 
 def main():
     refresh=os.getenv("XT_REFRESH","0")=="1"
-    root=Path("data/xt_v14")
-    outdir=Path("reports/xt_v14")
+    root=Path("data/xt_v15")
+    outdir=Path("reports/xt_v15")
 
-    print("HUNTER-V14 — FORENSIC / SPLIT-ISOLATED / CAUSAL")
+    print("HUNTER-V15 — FORENSIC / SPLIT-ISOLATED / CAUSAL")
     print("XT Futures + auxiliary Spot | 15m -> 1H/4H/1D")
     print(f"Capital=${INITIAL_CAPITAL:.0f} Margin=${MARGIN:.0f} Leverage={LEVERAGE:.0f}x RR=1:{RR:.0f}")
     print("One global position; no overlap; no timeout; no BE/trailing.")
@@ -653,9 +662,19 @@ def main():
     factor_audit(frames,split)
 
     # Same small predeclared grid as V13. No OOS metrics enter selection.
-    grid=[Config(f"S{s}_Q{q}_A{a}_R{r}_V{v}",s,q,a,r,v)
-          for s in (20,32,48) for q in (5.8,6.4,7.0) for a in (1.25,1.50)
-          for r in (0.50,0.75) for v in (0.0,0.5)]
+    # V15 hypothesis grid. These are predeclared structural variants, selected
+    # only on Train/Validation. The prior V14 OOS is NOT used for selection.
+    grid=[]
+    for s in (20,32,48):
+        for q in (6.5,7.0,7.5):
+            for a in (1.25,1.50):
+                for r in (0.50,0.75):
+                    for v in (0.0,0.5):
+                        for mode in ("BOTH","LONG_ONLY"):
+                            for bear_short in (True,False):
+                                grid.append(Config(
+                                    f"S{s}_Q{q}_A{a}_R{r}_V{v}_{mode}_BS{int(bear_short)}",
+                                    s,q,a,r,v,mode,bear_short))
 
     results=[]
     for cfg in grid:
@@ -669,7 +688,7 @@ def main():
 
     _,cfg,tr,va=eligible[0]
     print(f"\n[SELECTED] {cfg.name}")
-    print(f"[SELECTED PARAMS] sweep={cfg.sweep} min_score={cfg.min_score} stop_atr={cfg.stop_atr} rank_floor={cfg.rank_floor} vol_floor={cfg.vol_floor}")
+    print(f"[SELECTED PARAMS] sweep={cfg.sweep} min_score={cfg.min_score} stop_atr={cfg.stop_atr} rank_floor={cfg.rank_floor} vol_floor={cfg.vol_floor} side_mode={cfg.side_mode} allow_bear_short={cfg.allow_bear_short}")
     report(tr,"SELECTED TRAIN")
     report(va,"SELECTED VALIDATION")
 
