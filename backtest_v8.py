@@ -200,57 +200,138 @@ def fetch_xt(symbol, refresh=False):
         inside = [p for p in parsed if cursor <= p[0] <= window_end]
 
         if not inside:
-            # XT can occasionally return an empty/stale page for a large
-            # requested window even though later candles exist. Do NOT
-            # fabricate candles and do NOT silently skip the interval.
-            # Retry the exact cursor with progressively smaller windows.
+            # XT may occasionally return an empty result for a bounded
+            # startTime+endTime window even though the same cursor is
+            # queryable through the endpoint's other supported forms.
+            # Recovery is allowed only when returned candles are actually
+            # inside the requested causal interval. Never fabricate or skip.
             recovered = None
-            for divisor in (2, 4, 8):
-                retry_end = min(
-                    end_ms,
-                    cursor + max(1, LIMIT // divisor) * INTERVAL_MS - 1,
-                )
-                if retry_end < cursor:
-                    continue
 
-                retry_params = dict(params)
-                retry_params["endTime"] = retry_end
+            # Recovery A: keep startTime, omit endTime. We still require the
+            # returned sequence to begin at/after the exact cursor; a later
+            # first timestamp is treated as a real data gap, not skipped.
+            for attempt in range(3):
+                try:
+                    alt_params = {
+                        "symbol": symbol,
+                        "interval": "1h",
+                        "startTime": cursor,
+                        "limit": LIMIT,
+                    }
+                    response = session.get(
+                        FUTURES_URL,
+                        params=alt_params,
+                        timeout=30,
+                    )
+                    response.raise_for_status()
+                    alt_payload = payload_rows(response.json())
+                    if alt_payload is None:
+                        raise RuntimeError("XT start-only response contains no kline list")
 
+                    alt_parsed = sorted(
+                        [p for p in (parse_row(r) for r in alt_payload) if p is not None],
+                        key=lambda p: p[0],
+                    )
+                    alt_inside = [
+                        p for p in alt_parsed
+                        if cursor <= p[0] <= end_ms
+                    ]
+
+                    if alt_inside and min(p[0] for p in alt_inside) == cursor:
+                        recovered = (alt_inside, end_ms)
+                        break
+                except Exception:
+                    pass
+                time.sleep(1.0 + attempt)
+
+            # Recovery B: exact-candle probe. This distinguishes an API
+            # pagination/window glitch from a genuine missing historical bar.
+            if recovered is None:
+                probe_end = min(end_ms, cursor + INTERVAL_MS - 1)
+                probe_params = {
+                    "symbol": symbol,
+                    "interval": "1h",
+                    "startTime": cursor,
+                    "endTime": probe_end,
+                    "limit": 2,
+                }
                 for attempt in range(3):
                     try:
                         response = session.get(
                             FUTURES_URL,
-                            params=retry_params,
+                            params=probe_params,
                             timeout=30,
                         )
                         response.raise_for_status()
-                        retry_payload = payload_rows(response.json())
-                        if retry_payload is None:
-                            raise RuntimeError("XT retry response contains no kline list")
+                        probe_payload = payload_rows(response.json())
+                        if probe_payload is None:
+                            raise RuntimeError("XT probe response contains no kline list")
 
-                        retry_parsed = [
-                            p for p in (parse_row(r) for r in retry_payload)
+                        probe_parsed = [
+                            p for p in (parse_row(r) for r in probe_payload)
                             if p is not None
                         ]
-                        retry_inside = [
-                            p for p in retry_parsed
-                            if cursor <= p[0] <= retry_end
+                        probe_inside = [
+                            p for p in probe_parsed
+                            if cursor <= p[0] <= probe_end
                         ]
-
-                        if retry_inside:
-                            recovered = (retry_inside, retry_end)
+                        if probe_inside:
+                            # The exact candle exists, so fetch a smaller
+                            # forward window and require exact cursor coverage.
+                            for small_limit in (256, 128, 64, 32):
+                                small_end = min(
+                                    end_ms,
+                                    cursor + small_limit * INTERVAL_MS - 1,
+                                )
+                                small_params = {
+                                    "symbol": symbol,
+                                    "interval": "1h",
+                                    "startTime": cursor,
+                                    "endTime": small_end,
+                                    "limit": small_limit,
+                                }
+                                try:
+                                    small_response = session.get(
+                                        FUTURES_URL,
+                                        params=small_params,
+                                        timeout=30,
+                                    )
+                                    small_response.raise_for_status()
+                                    small_payload = payload_rows(
+                                        small_response.json()
+                                    )
+                                    if small_payload is None:
+                                        continue
+                                    small_parsed = sorted(
+                                        [
+                                            p for p in (
+                                                parse_row(r)
+                                                for r in small_payload
+                                            )
+                                            if p is not None
+                                        ],
+                                        key=lambda p: p[0],
+                                    )
+                                    small_inside = [
+                                        p for p in small_parsed
+                                        if cursor <= p[0] <= small_end
+                                    ]
+                                    if small_inside and min(
+                                        p[0] for p in small_inside
+                                    ) == cursor:
+                                        recovered = (small_inside, small_end)
+                                        break
+                                except Exception:
+                                    continue
                             break
                     except Exception:
                         pass
                     time.sleep(1.0 + attempt)
 
-                if recovered is not None:
-                    break
-
             if recovered is None:
                 raise RuntimeError(
-                    f"{symbol}: page {page} returned no valid rows after "
-                    "pagination retries; refusing to skip/fabricate data"
+                    f"{symbol}: page {page} cursor={cursor} returned no valid "
+                    "rows; XT API recovery failed without skipping/fabricating data"
                 )
 
             inside, window_end = recovered
