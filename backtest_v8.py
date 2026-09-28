@@ -260,18 +260,18 @@ def build_features(f15, s15, btc_h1):
     spot = complete_resample(s15, "1h", 4)
 
     a = h1.copy()
-    a.atr = atr(a)
+    a["atr"] = atr(a)
     rng = (a.high-a.low).replace(0, np.nan)
-    a.body_frac = (a.close-a.open).abs()/rng
-    a.close_loc = (a.close-a.low)/rng
-    a.ret_12 = a.close.pct_change(12)
-    a.ret_24 = a.close.pct_change(24)
-    a.ret_72 = a.close.pct_change(72)
-    a.vol_z = zscore(np.log1p(a.volume), 96)
-    a.vol_ratio = a.volume/a.volume.rolling(24).median()
-    a.flow = ((a.close-a.open)/rng)*a.volume
-    a.flow_z = zscore(a.flow, 96)
-    a.eff = (a.close-a.close.shift(12)).abs()/a.close.diff().abs().rolling(12).sum()
+    a["body_frac"] = (a.close-a.open).abs()/rng
+    a["close_loc"] = (a.close-a.low)/rng
+    a["ret_12"] = a.close.pct_change(12, fill_method=None)
+    a["ret_24"] = a.close.pct_change(24, fill_method=None)
+    a["ret_72"] = a.close.pct_change(72, fill_method=None)
+    a["vol_z"] = zscore(np.log1p(a.volume), 96)
+    a["vol_ratio"] = a.volume/a.volume.rolling(24).median()
+    a["flow"] = ((a.close-a.open)/rng)*a.volume
+    a["flow_z"] = zscore(a["flow"], 96)
+    a["eff"] = (a.close-a.close.shift(12)).abs()/a.close.diff().abs().rolling(12).sum()
     for n in (20, 32, 48):
         a[f"hi_{n}"] = a.high.shift(1).rolling(n).max()
         a[f"lo_{n}"] = a.low.shift(1).rolling(n).min()
