@@ -1,24 +1,46 @@
 #!/usr/bin/env python3
 """
-HUNTER-V15 — FORENSIC / CAUSAL / SPLIT-ISOLATED BACKTEST ENGINE
+HUNTER-V16 — NEW STRATEGY / WALK-FORWARD VALIDATION ENGINE
 XT USDT-M PERPETUAL FUTURES
 15m raw -> causal 1H / 4H / 1D
 
-V14 purpose:
-  - Preserve V13 signal architecture.
-  - Make Train / Validation / OOS intervals half-open and isolated.
-  - Never allow a signal whose NEXT-1H entry lies outside the current segment.
-  - Keep OOS untouched by parameter selection.
-  - Record a forensic trade log for diagnosis.
-  - Produce OOS breakdowns by side, symbol, regime, score bucket,
-    exit reason, and month.
-  - Remove the fake rank_floor behavior: rank_floor is now a real
-    cross-sectional percentile threshold.
+Strategy family:
+  AUCTION-DISPLACEMENT / RETEST
 
-No lookahead, repainting, fabricated OHLCV, OI, CVD, or liquidation data.
-No timeout, BE, or trailing. Fixed RR 1:2.
-Same-candle SL+TP => LOSS.
-Open position at segment end is not realized and is not carried into the next segment.
+This is a deliberate break from HUNTER-V13..V15's liquidity-sweep/reclaim
+family.  V16 does not use the old sweep score or its directional scoring.
+The hypothesis is:
+  1) price compresses inside a prior range,
+  2) a decisive displacement candle closes outside that range with
+     participation and directional efficiency,
+  3) the next completed 1H bars provide a causal retest/hold of the broken
+     level,
+  4) entry occurs on the NEXT 1H open after the retest is confirmed.
+
+Validation protocol:
+  - expanding walk-forward folds;
+  - each fold selects parameters using only its TRAIN + VALIDATION windows;
+  - the following OOS window is then evaluated once;
+  - a final latest holdout is reserved and is never used for selection;
+  - no OOS metric is used to choose a parameter.
+
+Execution / integrity:
+  - strict no-lookahead / no-repaint;
+  - one global non-overlapping position;
+  - next 1H open entry;
+  - no same-candle re-entry;
+  - same-candle SL+TP => LOSS;
+  - fixed RR 1:2;
+  - no timeout, break-even or trailing;
+  - incomplete futures candles removed;
+  - futures gaps are fatal; spot gaps are never fabricated and affected
+    buckets are excluded;
+  - open position at a segment end is not realized and is not carried over.
+
+Important:
+  This script is an evaluation engine, not a claim that V16 has an edge.
+  It should be judged by the aggregated walk-forward OOS and the final
+  untouched holdout, not by train performance.
 """
 
 import math
@@ -54,39 +76,53 @@ RR = 2.0
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 
-TRAIN_FRAC = 0.60
-VAL_FRAC = 0.20
+# Expanding walk-forward schedule in common 1H timestamps.
+# Multiple historical OOS folds are used for robustness; the latest 45 days are
+# reserved as a final untouched holdout after the walk-forward process.
+FOLD_TRAIN_DAYS = 150
+FOLD_VAL_DAYS = 30
+FOLD_OOS_DAYS = 30
+FINAL_HOLDOUT_DAYS = 45
 
-MIN_ROWS = 38000
-MIN_TRAIN_TRADES = 30
-MIN_VAL_TRADES = 15
+MIN_TRAIN_TRADES = 25
+MIN_VAL_TRADES = 10
+MIN_FOLD_OOS_TRADES = 12
 
-# These are reporting/acceptance gates only. They do not alter OOS selection.
-MIN_OOS_TRADES = 100
-MIN_OOS_WR = 50.0
-MIN_OOS_PF = 1.20
-MAX_OOS_STREAK = 4
-MAX_OOS_DD_PCT = 50.0
-
-
-@dataclass(frozen=True)
-class Split:
-    start: pd.Timestamp
-    train_end: pd.Timestamp
-    val_end: pd.Timestamp
-    end: pd.Timestamp
+# Acceptance is deliberately about robustness, not a single WR threshold.
+MIN_AGG_OOS_TRADES = 50
+MIN_AGG_OOS_PF = 1.15
+MAX_AGG_OOS_DD_PCT = 50.0
+MAX_AGG_OOS_STREAK = 7
+MIN_POSITIVE_OOS_FOLDS = 2
 
 
 @dataclass(frozen=True)
 class Config:
     name: str
-    sweep: int
-    min_score: float
+    range_n: int
+    displacement_atr: float
+    body_frac: float
+    volume_z: float
+    retest_atr: float
     stop_atr: float
     rank_floor: float
-    vol_floor: float
-    side_mode: str
-    allow_bear_short: bool
+
+
+@dataclass(frozen=True)
+class Window:
+    start: pd.Timestamp
+    train_end: pd.Timestamp
+    val_end: pd.Timestamp
+    oos_end: pd.Timestamp
+
+
+@dataclass(frozen=True)
+class Fold:
+    number: int
+    train_start: pd.Timestamp
+    train_end: pd.Timestamp
+    val_end: pd.Timestamp
+    oos_end: pd.Timestamp
 
 
 def payload_rows(obj):
@@ -138,8 +174,8 @@ def validate(df, symbol, start_ms, end_ms, *, futures=True):
         raise RuntimeError(f"{symbol}: non-positive price")
     if (x.volume < 0).any():
         raise RuntimeError(f"{symbol}: negative volume")
-    if len(x) < MIN_ROWS:
-        raise RuntimeError(f"{symbol}: only {len(x)} rows; expected at least {MIN_ROWS}")
+    if len(x) < 38000:
+        raise RuntimeError(f"{symbol}: only {len(x)} rows; expected at least 38000")
     diffs = x.timestamp.diff().dropna().dt.total_seconds().div(900.0)
     gaps = diffs[diffs > 1.0 + 1e-9]
     if futures and len(gaps):
@@ -247,20 +283,32 @@ def build_features(f15, s15, btc_h1):
 
     a = h1.copy()
     a["atr"] = atr(a)
+    a["atr_pct"] = a.atr / a.close
     rng = (a.high-a.low).replace(0, np.nan)
     a["body_frac"] = (a.close-a.open).abs()/rng
     a["close_loc"] = (a.close-a.low)/rng
+    a["ret_6"] = a.close.pct_change(6, fill_method=None)
     a["ret_12"] = a.close.pct_change(12, fill_method=None)
     a["ret_24"] = a.close.pct_change(24, fill_method=None)
-    a["ret_72"] = a.close.pct_change(72, fill_method=None)
     a["vol_z"] = zscore(np.log1p(a.volume), 96)
     a["vol_ratio"] = a.volume/a.volume.rolling(24).median()
     a["flow"] = ((a.close-a.open)/rng)*a.volume
     a["flow_z"] = zscore(a["flow"], 96)
     a["eff"] = (a.close-a.close.shift(12)).abs()/a.close.diff().abs().rolling(12).sum()
-    for n in (20, 32, 48):
-        a[f"hi_{n}"] = a.high.shift(1).rolling(n).max()
-        a[f"lo_{n}"] = a.low.shift(1).rolling(n).min()
+
+    # Structure levels are strictly prior to the current 1H candle.
+    for n in (12, 20, 32, 48):
+        a[f"hi_{n}"] = a.high.shift(2).rolling(n).max()
+        a[f"lo_{n}"] = a.low.shift(2).rolling(n).min()
+
+    # Prior-hour body/range features for displacement detection.
+    a["prev_range"] = (a.high.shift(1)-a.low.shift(1))
+    a["prev_body"] = (a.close.shift(1)-a.open.shift(1)).abs()
+    a["prev_body_frac"] = a.prev_body/a.prev_range.replace(0,np.nan)
+    a["prev_close_loc"] = (a.close.shift(1)-a.low.shift(1))/a.prev_range.replace(0,np.nan)
+    a["prev_atr"] = a.atr.shift(1)
+    a["prev_vol_z"] = a.vol_z.shift(1)
+    a["prev_eff"] = a.eff.shift(1)
 
     spot = spot.reindex(a.index)
     a["spot_close"] = spot.close
@@ -280,12 +328,13 @@ def build_features(f15, s15, btc_h1):
     h4["atr"] = atr(h4)
     h4["trend"] = np.where(h4.ema20 > h4.ema50, 1, -1)
     h4["slope"] = h4.ema20.pct_change(5)
+
     d1["ema50"] = d1.close.ewm(span=50, adjust=False).mean()
     d1["ema200"] = d1.close.ewm(span=200, adjust=False).mean()
     d1["slope50"] = d1.ema50.pct_change(5)
     d1["regime"] = np.where((d1.close>d1.ema200)&(d1.slope50>0),1,np.where((d1.close<d1.ema200)&(d1.slope50<0),-1,0))
 
-    # Shift the completed higher-timeframe bar before mapping it onto 1H.
+    # Completed higher-timeframe bars only.
     h4a = h4.shift(1).reindex(a.index, method="ffill")
     d1a = d1.shift(1).reindex(a.index, method="ffill")
     a["h4_trend"] = h4a.trend
@@ -296,97 +345,130 @@ def build_features(f15, s15, btc_h1):
     return a
 
 
-def split_timeline(frames):
+def common_index(frames):
     common = None
     for x in frames.values():
-        common = set(x.index) if common is None else common.intersection(x.index)
-    t = pd.DatetimeIndex(sorted(common))
-    if len(t) < 500:
-        raise RuntimeError("Insufficient common 1H timestamps")
-    span = t[-1]-t[0]
-    return Split(t[0], t[0]+span*TRAIN_FRAC, t[0]+span*(TRAIN_FRAC+VAL_FRAC), t[-1])
+        s = set(x.index)
+        common = s if common is None else common.intersection(s)
+    return pd.DatetimeIndex(sorted(common))
 
 
-def spearman(x, y):
-    z = pd.concat([x,y],axis=1).dropna()
-    if len(z)<50:
-        return np.nan
-    return z.iloc[:,0].rank().corr(z.iloc[:,1].rank())
+def make_folds(frames):
+    t = common_index(frames)
+    if len(t) < 700:
+        raise RuntimeError("Insufficient common 1H timestamps for walk-forward")
+    start = t[0]
+    step = pd.Timedelta(days=FOLD_OOS_DAYS)
+    train_end = start + pd.Timedelta(days=FOLD_TRAIN_DAYS)
+    val_end = train_end + pd.Timedelta(days=FOLD_VAL_DAYS)
+    folds=[]
+    n=1
+    final_start = t[-1] - pd.Timedelta(days=FINAL_HOLDOUT_DAYS)
+    while val_end + pd.Timedelta(days=FOLD_OOS_DAYS) <= final_start:
+        folds.append(Fold(n,start,train_end,val_end,val_end+pd.Timedelta(days=FOLD_OOS_DAYS)))
+        n += 1
+        train_end = val_end
+        val_end = train_end + pd.Timedelta(days=FOLD_VAL_DAYS)
+    if not folds:
+        raise RuntimeError("No valid walk-forward folds")
+    return folds, t
 
 
-def factor_audit(frames, split):
-    facs = ["rs_z","flow_z","vol_z","basis_z","fut_spot_gap","eff","ret_24"]
+def factor_audit(frames, fold):
+    facs=["rs_z","flow_z","vol_z","basis_z","fut_spot_gap","eff","ret_24"]
     rows=[]
     for sym,x in frames.items():
-        tr=x[(x.index >= split.start) & (x.index < split.train_end)]
+        tr=x[(x.index>=fold.train_start)&(x.index<fold.train_end)]
         for fac in facs:
-            for h in (1,4,8,24):
-                rows.append((sym,fac,h,spearman(tr[fac],tr.close.shift(-h)/tr.close-1)))
-    q=pd.DataFrame(rows,columns=["symbol","factor","horizon","spearman"])
-    print("\n================ TRAIN FACTOR AUDIT ================")
-    print(q.groupby("factor").spearman.agg(["count","mean","median","max","min"]).round(4).to_string())
-    print("=====================================================\n")
-
-
-def asset_profile(sym, row):
-    if sym in {"btc_usdt","eth_usdt","bnb_usdt"}:
-        return 1.00
-    if sym in {"sol_usdt","avax_usdt","sui_usdt","near_usdt","icp_usdt"}:
-        return 1.05
-    return 1.10
+            z=pd.concat([tr[fac],tr.close.pct_change(8,fill_method=None).shift(-8)],axis=1).dropna()
+            if len(z)>=50:
+                rows.append((sym,fac,z.iloc[:,0].rank().corr(z.iloc[:,1].rank())))
+    q=pd.DataFrame(rows,columns=["symbol","factor","spearman"])
+    print("\n================ FIRST-FOLD TRAIN FACTOR AUDIT ================")
+    if q.empty:
+        print("No sufficient factor observations.")
+    else:
+        print(q.groupby("factor").spearman.agg(["count","mean","median","max","min"]).round(4).to_string())
+    print("===============================================================\n")
 
 
 def candidate(ts, sym, x, cfg):
     if ts not in x.index:
         return None
     r=x.loc[ts]
-    n=cfg.sweep
-    req=[f"hi_{n}",f"lo_{n}","atr","h4_trend","d1_regime","vol_z","flow_z","rs_z","eff","close_loc","ret_24"]
+    n=cfg.range_n
+    req=[f"hi_{n}",f"lo_{n}","atr","atr_pct","prev_atr","prev_body_frac","prev_close_loc",
+         "prev_vol_z","prev_eff","h4_trend","d1_regime","rs_z","basis_z","eff"]
     if any(pd.isna(r.get(k)) for k in req):
         return None
-    hi,lo=float(r[f"hi_{n}"]),float(r[f"lo_{n}"])
+
+    upper=float(r[f"hi_{n}"])
+    lower=float(r[f"lo_{n}"])
     atrv=float(r.atr)
-    long_sweep=r.low<lo and r.close>lo
-    short_sweep=r.high>hi and r.close<hi
-    if not (long_sweep or short_sweep):
+    prev_atr=float(r.prev_atr)
+    prev_range=float(r.prev_range)
+    if atrv<=0 or prev_atr<=0 or prev_range<=0:
         return None
 
-    long_ok = r.d1_regime >= 0 and r.h4_trend >= 0
-    short_ok = r.d1_regime <= 0 and r.h4_trend <= 0
-    lr=(r.close-lo)/atrv
-    sr=(hi-r.close)/atrv
-    base_long = (2.0*long_sweep + 1.0*(lr>=0.15) + 1.0*(r.close_loc>=0.62)
-                 + 0.8*(r.flow_z>0) + 0.8*(r.vol_z>cfg.vol_floor)
-                 + 0.8*(r.eff<0.55) + 0.8*(r.rs_z>0) + 0.6*long_ok
-                 + 0.4*(r.basis_z<2.5 if pd.notna(r.basis_z) else False))
-    base_short = (2.0*short_sweep + 1.0*(sr>=0.15) + 1.0*(r.close_loc<=0.38)
-                  + 0.8*(r.flow_z<0) + 0.8*(r.vol_z>cfg.vol_floor)
-                  + 0.8*(r.eff<0.55) + 0.8*(r.rs_z<0) + 0.6*short_ok
-                  + 0.4*(r.basis_z>-2.5 if pd.notna(r.basis_z) else False))
-    if cfg.side_mode == "LONG_ONLY":
-        base_short = -np.inf
-    elif cfg.side_mode == "SHORT_ONLY":
-        base_long = -np.inf
-    if not cfg.allow_bear_short and r.d1_regime < 0:
-        base_short = -np.inf
+    # Displacement happened on the immediately completed 1H candle.
+    # The actual prior candle is read directly from the causal shifted position.
+    prev_close=float(x.close.shift(1).loc[ts])
+    prev_open=float(x.open.shift(1).loc[ts])
+    prev_high=float(x.high.shift(1).loc[ts])
+    prev_low=float(x.low.shift(1).loc[ts])
 
-    score=max(base_long,base_short)
-    if score < cfg.min_score:
+    long_break = prev_close > upper
+    short_break = prev_close < lower
+    long_disp = (
+        long_break
+        and (prev_close-prev_open) > cfg.displacement_atr*prev_atr
+        and float(r.prev_body_frac) >= cfg.body_frac
+        and float(r.prev_vol_z) >= cfg.volume_z
+        and float(r.prev_eff) >= 0.35
+        and float(r.prev_close_loc) >= 0.70
+    )
+    short_disp = (
+        short_break
+        and (prev_open-prev_close) > cfg.displacement_atr*prev_atr
+        and float(r.prev_body_frac) >= cfg.body_frac
+        and float(r.prev_vol_z) >= cfg.volume_z
+        and float(r.prev_eff) >= 0.35
+        and float(r.prev_close_loc) <= 0.30
+    )
+    if not (long_disp or short_disp):
         return None
-    side=1 if base_long>base_short else -1
-    if side==1 and not long_sweep:
+
+    # Current 1H candle is the causal retest/hold candle. It may wick through
+    # the broken level, but must close back on the correct side.
+    long_retest = r.low <= upper + cfg.retest_atr*atrv and r.close > upper and r.close > r.open
+    short_retest = r.high >= lower - cfg.retest_atr*atrv and r.close < lower and r.close < r.open
+
+    # Context is a directional filter, not a score. Neutral daily regime is
+    # allowed; opposite daily regime is rejected. This prevents the old
+    # additive-score failure mode where weak factors could outvote structure.
+    long_context = int(r.h4_trend) >= 0 and int(r.d1_regime) >= 0 and float(r.rs_z) > -1.5
+    short_context = int(r.h4_trend) <= 0 and int(r.d1_regime) <= 0 and float(r.rs_z) < 1.5
+
+    long_ok = long_disp and long_retest and long_context
+    short_ok = short_disp and short_retest and short_context
+    if not (long_ok or short_ok):
         return None
-    if side==-1 and not short_sweep:
-        return None
-    if not np.isfinite(atrv) or atrv<=0:
-        return None
+
+    # If both directions somehow qualify, prefer the side with the stronger
+    # displacement normalized by its prior ATR. This is deterministic and uses
+    # only completed information.
+    long_strength=((prev_close-prev_open)/prev_atr) if long_ok else -np.inf
+    short_strength=((prev_open-prev_close)/prev_atr) if short_ok else -np.inf
+    side=1 if long_strength>=short_strength else -1
+    score=float(max(long_strength,short_strength))
+
     return {
-        "symbol":sym, "side":side, "score":float(score), "atr":atrv,
-        "profile":asset_profile(sym,r), "d1_regime":int(r.d1_regime),
-        "h4_trend":int(r.h4_trend), "vol_z":float(r.vol_z),
-        "flow_z":float(r.flow_z), "rs_z":float(r.rs_z), "eff":float(r.eff),
-        "basis_z":float(r.basis_z) if pd.notna(r.basis_z) else np.nan,
-        "close_loc":float(r.close_loc), "ret_24":float(r.ret_24),
+        "symbol":sym,"side":side,"score":score,"atr":atrv,
+        "d1_regime":int(r.d1_regime),"h4_trend":int(r.h4_trend),
+        "vol_z":float(r.prev_vol_z),"rs_z":float(r.rs_z),"eff":float(r.prev_eff),
+        "basis_z":float(r.basis_z),"body_frac":float(r.prev_body_frac),
+        "close_loc":float(r.prev_close_loc),"ret_24":float(r.ret_24),
+        "range_n":n,
     }
 
 
@@ -405,15 +487,7 @@ def pnl_for(side, entry, exitp):
 
 
 def run_backtest(frames,cfg,start,end,label,collect_trades=False):
-    # Half-open segment [start, end). This prevents boundary candles from being
-    # shared between Train/Validation/OOS. A signal is eligible only if its NEXT
-    # 1H entry is also strictly inside this segment.
-    common=None
-    for x in frames.values():
-        idx=set(x.index[(x.index >= start) & (x.index < end)])
-        common=idx if common is None else common.intersection(idx)
-    times=pd.DatetimeIndex(sorted(common))
-
+    times=common_index({k:v[(v.index>=start)&(v.index<end)] for k,v in frames.items()})
     equity=INITIAL_CAPITAL
     peak=equity
     max_dd=0.0
@@ -423,7 +497,6 @@ def run_backtest(frames,cfg,start,end,label,collect_trades=False):
     last_close_ts=None
 
     for ts in times:
-        # First process an already-open position on the current candle.
         if active is not None:
             x=frames[active["symbol"]]
             if ts>=active["entry_ts"] and ts in x.index:
@@ -436,24 +509,15 @@ def run_backtest(frames,cfg,start,end,label,collect_trades=False):
                     exit_reason="SL" if sl else "TP"
                     raw=active["sl"] if sl else active["tp"]
                     xp=exit_price(raw,side)
-                    p=pnl_for(side,active["entry"],xp)
-                    p=max(-MARGIN,p)
+                    p=max(-MARGIN,pnl_for(side,active["entry"],xp))
                     equity=max(0.0,equity+p)
                     peak=max(peak,equity)
                     max_dd=max(max_dd,peak-equity)
-                    trades.append({
-                        **active,
-                        "exit_ts":ts,
-                        "exit_price":xp,
-                        "exit_reason":exit_reason,
-                        "outcome":outcome,
-                        "pnl":p,
-                        "equity_after":equity,
-                    })
+                    trades.append({**active,"exit_ts":ts,"exit_price":xp,"exit_reason":exit_reason,
+                                   "outcome":outcome,"pnl":p,"equity_after":equity})
                     active=None
                     last_close_ts=ts
                     continue
-
         if active is not None:
             continue
         if last_close_ts is not None and ts<=last_close_ts:
@@ -463,58 +527,46 @@ def run_backtest(frames,cfg,start,end,label,collect_trades=False):
             continue
 
         cand=[]
-        cross_scores=[]
+        scores=[]
         for sym,x in frames.items():
             c=candidate(ts,sym,x,cfg)
             if c is None:
-                cross_scores.append(0.0)
+                scores.append(0.0)
             else:
-                cand.append(c)
-                cross_scores.append(float(c["score"]))
+                cand.append(c); scores.append(float(c["score"]))
         if not cand:
             continue
 
-        # Cross-sectional percentile is measured against the WHOLE universe,
-        # assigning score=0 to symbols with no candidate at this timestamp.
-        # This makes rank_floor materially active instead of always being 1.0
-        # for the top candidate. Percentile uses <= so ties receive the same
-        # percentile and cannot manufacture an advantage from sort order.
-        cand.sort(key=lambda c:(c["score"], c["symbol"]), reverse=True)
+        cand.sort(key=lambda c:(c["score"],c["symbol"]),reverse=True)
         top=cand[0]
-        top_score=float(top["score"])
-        rank_pct=float(np.mean(np.asarray(cross_scores) <= top_score))
+        rank_pct=float(np.mean(np.asarray(scores)<top["score"]))
         if rank_pct < cfg.rank_floor:
             continue
 
-        sym=top["symbol"]
-        side=top["side"]
-        x=frames[sym]
+        sym=top["symbol"]; side=top["side"]; x=frames[sym]
         i=x.index.searchsorted(ts,side="right")
         if i>=len(x):
             continue
         entry_ts=x.index[i]
-        # Crucial split-isolation rule: no signal can create a position outside
-        # the current segment.
-        if entry_ts < start or entry_ts >= end:
+        if entry_ts<start or entry_ts>=end:
             continue
         ep=entry_price(float(x.iloc[i].open),side)
-        dist=float(top["atr"])*cfg.stop_atr*float(top["profile"])
+        dist=float(top["atr"])*cfg.stop_atr
         if not np.isfinite(dist) or dist<=0:
             continue
         active={
             "symbol":sym,"side":side,"signal_ts":ts,"entry_ts":entry_ts,
             "entry":ep,"sl":ep-dist*side,"tp":ep+dist*RR*side,
             "signal_score":top["score"],"atr":top["atr"],
-            "profile":top["profile"],"d1_regime":top["d1_regime"],
-            "h4_trend":top["h4_trend"],"vol_z":top["vol_z"],
-            "flow_z":top["flow_z"],"rs_z":top["rs_z"],"eff":top["eff"],
-            "basis_z":top["basis_z"],"close_loc":top["close_loc"],
-            "ret_24":top["ret_24"],"candidate_count":len(cand),
+            "d1_regime":top["d1_regime"],"h4_trend":top["h4_trend"],
+            "vol_z":top["vol_z"],"rs_z":top["rs_z"],"eff":top["eff"],
+            "basis_z":top["basis_z"],"body_frac":top["body_frac"],
+            "close_loc":top["close_loc"],"ret_24":top["ret_24"],
+            "candidate_count":len(cand),"rank_pct":rank_pct,
         }
 
     vals=pd.Series([t["pnl"] for t in trades],dtype=float)
-    wins=int((vals>0).sum())
-    losses=int((vals<=0).sum())
+    wins=int((vals>0).sum()); losses=int((vals<=0).sum())
     gp=float(vals[vals>0].sum()) if wins else 0.0
     gl=float(-vals[vals<=0].sum()) if losses else 0.0
     pf=gp/gl if gl else (math.inf if wins else 0.0)
@@ -522,34 +574,32 @@ def run_backtest(frames,cfg,start,end,label,collect_trades=False):
     streak=cur=0
     for v in vals:
         if v<=0:
-            cur+=1
-            streak=max(streak,cur)
+            cur+=1; streak=max(streak,cur)
         else:
             cur=0
     days=max((end-start).total_seconds()/86400.0,1e-9)
-    result={
+    return {
         "label":label,"config":cfg.name,"trades":len(vals),"wins":wins,"losses":losses,
         "wr":wr,"pf":pf,"pnl":float(vals.sum()) if len(vals) else 0.0,"dd":max_dd,
         "dd_pct":100*max_dd/peak if peak>0 else 100.0,"streak":streak,
         "tday":len(vals)/days,"open":active is not None,"blocked":blocked,
         "avg_win":gp/wins if wins else 0.0,"avg_loss":-gl/losses if losses else 0.0,
         "expectancy":float(vals.mean()) if len(vals) else 0.0,
-        "median":float(vals.median()) if len(vals) else 0.0,
-        "final_equity":equity,
+        "median":float(vals.median()) if len(vals) else 0.0,"final_equity":equity,
         "trades_log":trades if collect_trades else None,
     }
-    return result
 
 
-def score(train,val):
+def select_score(train,val):
     if train["trades"]<MIN_TRAIN_TRADES or val["trades"]<MIN_VAL_TRADES:
         return -1e9
     if train["pnl"]<=0 or val["pnl"]<=0:
         return -1e8
-    if train["streak"]>10 or val["streak"]>8:
+    if train["pf"]<1.05 or val["pf"]<1.05:
         return -1e7
-    return (2.5*val["pf"] + 0.03*val["wr"] + 0.001*val["pnl"]
-            -0.02*val["streak"] -0.015*val["dd_pct"] +0.75*train["pf"])
+    # Reward validation quality, but penalize instability and drawdown.
+    return (3.0*val["pf"] + 0.02*val["wr"] + 0.001*val["pnl"]
+            + 0.75*train["pf"] - 0.03*val["streak"] - 0.02*val["dd_pct"])
 
 
 def report(r,title):
@@ -561,94 +611,75 @@ def report(r,title):
     print(f"Net PnL                : ${r['pnl']:,.2f}")
     print(f"Final Realized Equity  : ${r['final_equity']:,.2f}")
     print(f"Max Drawdown           : ${r['dd']:,.2f}")
-    print(f"Max Drawdown %         : {r['dd_pct']:.2f}% (DD / peak equity)")
+    print(f"Max Drawdown %         : {r['dd_pct']:.2f}%")
     print(f"Max Loss Streak        : {r['streak']}")
     print(f"Trades / Day           : {r['tday']:.4f}")
     print(f"Average Win            : ${r['avg_win']:,.2f}")
     print(f"Average Loss           : ${r['avg_loss']:,.2f}")
     print(f"Expectancy / Trade     : ${r['expectancy']:,.2f}")
     print(f"Median Trade PnL       : ${r['median']:,.2f}")
-    print(f"Capital-blocked checks : {r['blocked']} (informational)")
-    print(f"Open position at end   : {r['open']} (informational)")
+    print(f"Capital-blocked checks : {r['blocked']}")
+    print(f"Open position at end   : {r['open']}")
     print("==================================================")
 
 
-def print_group_report(df, group_col, title):
+def aggregate_trade_stats(trades, start, end):
+    vals=pd.Series([t["pnl"] for t in trades],dtype=float)
+    wins=int((vals>0).sum()); losses=int((vals<=0).sum())
+    gp=float(vals[vals>0].sum()) if wins else 0.0
+    gl=float(-vals[vals<=0].sum()) if losses else 0.0
+    pf=gp/gl if gl else (math.inf if wins else 0.0)
+    streak=cur=0
+    equity=INITIAL_CAPITAL; peak=equity; dd=0.0
+    for v in vals:
+        equity=max(0.0,equity+float(v)); peak=max(peak,equity); dd=max(dd,peak-equity)
+        if v<=0:
+            cur+=1; streak=max(streak,cur)
+        else: cur=0
+    return {
+        "trades":len(vals),"wins":wins,"losses":losses,"wr":100*wins/len(vals) if len(vals) else 0.0,
+        "pf":pf,"pnl":float(vals.sum()) if len(vals) else 0.0,"dd":dd,
+        "dd_pct":100*dd/peak if peak else 100.0,"streak":streak,
+        "expectancy":float(vals.mean()) if len(vals) else 0.0,"final_equity":equity,
+    }
+
+
+def print_side_report(trades,title):
+    df=pd.DataFrame(trades)
     print(f"\n================ {title} ================")
     if df.empty:
-        print("No realized trades.")
-        print("==================================================")
-        return
+        print("No trades."); print("=================================================="); return
+    df["side_name"]=df.side.map({1:"LONG",-1:"SHORT"})
     rows=[]
-    for key,g in df.groupby(group_col, dropna=False):
-        wins=(g.pnl>0).sum()
-        losses=(g.pnl<=0).sum()
-        gp=g.loc[g.pnl>0,"pnl"].sum()
-        gl=-g.loc[g.pnl<=0,"pnl"].sum()
-        pf=gp/gl if gl else (math.inf if wins else 0.0)
-        rows.append((str(key),len(g),100*wins/len(g),pf,g.pnl.sum(),g.pnl.mean()))
-    out=pd.DataFrame(rows,columns=[group_col,"trades","WR","PF","PnL","Expectancy"])
-    print(out.sort_values("PnL",ascending=False).to_string(index=False,formatters={
-        "WR":"{:.2f}".format,"PF":"{:.3f}".format,
-        "PnL":"{:.2f}".format,"Expectancy":"{:.2f}".format}))
+    for key,g in df.groupby("side_name"):
+        vals=g.pnl.astype(float); wins=(vals>0).sum(); gp=vals[vals>0].sum(); gl=-vals[vals<=0].sum()
+        rows.append((key,len(g),100*wins/len(g),gp/gl if gl else math.inf,g.pnl.sum(),g.pnl.mean()))
+    out=pd.DataFrame(rows,columns=["side","trades","WR","PF","PnL","Expectancy"])
+    print(out.to_string(index=False,formatters={"WR":"{:.2f}".format,"PF":"{:.3f}".format,"PnL":"{:.2f}".format,"Expectancy":"{:.2f}".format}))
     print("==================================================")
 
 
-def forensic_report(trades, outdir):
-    outdir.mkdir(parents=True, exist_ok=True)
+def save_forensic(trades,outdir):
+    outdir.mkdir(parents=True,exist_ok=True)
     if not trades:
-        print("\n[FORENSIC] No realized OOS trades.")
         return
     df=pd.DataFrame(trades)
-    df["signal_ts"]=pd.to_datetime(df["signal_ts"],utc=True)
-    df["entry_ts"]=pd.to_datetime(df["entry_ts"],utc=True)
-    df["exit_ts"]=pd.to_datetime(df["exit_ts"],utc=True)
+    for c in ("signal_ts","entry_ts","exit_ts"):
+        df[c]=pd.to_datetime(df[c],utc=True)
     df["month"]=df.exit_ts.dt.to_period("M").astype(str)
     df["side_name"]=df.side.map({1:"LONG",-1:"SHORT"})
     df["regime_name"]=df.d1_regime.map({1:"BULL",0:"NEUTRAL",-1:"BEAR"})
-    df["trend_name"]=df.h4_trend.map({1:"UP",-1:"DOWN"})
-    df["score_bucket"]=pd.cut(df.signal_score,
-                               bins=[-np.inf,6.0,6.5,7.0,7.5,np.inf],
-                               labels=["<6.0","6.0-6.5","6.5-7.0","7.0-7.5",">=7.5"],
-                               right=False)
-    path=outdir/"oos_trade_log.csv"
-    df.to_csv(path,index=False)
-    print(f"\n[FORENSIC] Full OOS trade log: {path}")
-    for col,title in [
-        ("side_name","OOS BY SIDE"),
-        ("symbol","OOS BY SYMBOL"),
-        ("regime_name","OOS BY 1D REGIME"),
-        ("trend_name","OOS BY 4H TREND"),
-        ("score_bucket","OOS BY SCORE BUCKET"),
-        ("exit_reason","OOS BY EXIT REASON"),
-        ("month","OOS BY MONTH"),
-    ]:
-        print_group_report(df,col,title)
-
-    # Long/short x symbol is useful for identifying concentrated directional failure.
-    pivot=[]
-    for (sym,side),g in df.groupby(["symbol","side_name"]):
-        wins=(g.pnl>0).sum(); losses=(g.pnl<=0).sum()
-        gp=g.loc[g.pnl>0,"pnl"].sum(); gl=-g.loc[g.pnl<=0,"pnl"].sum()
-        pf=gp/gl if gl else (math.inf if wins else 0.0)
-        pivot.append((sym,side,len(g),100*wins/len(g),pf,g.pnl.sum()))
-    px=pd.DataFrame(pivot,columns=["symbol","side","trades","WR","PF","PnL"])
-    print("\n================ OOS BY SYMBOL × SIDE ================")
-    print(px.sort_values("PnL",ascending=False).to_string(index=False,formatters={
-        "WR":"{:.2f}".format,"PF":"{:.3f}".format,"PnL":"{:.2f}".format}))
-    print("========================================================")
+    df.to_csv(outdir/"walk_forward_oos_trades.csv",index=False)
+    print(f"[FORENSIC] {outdir/'walk_forward_oos_trades.csv'}")
 
 
 def main():
     refresh=os.getenv("XT_REFRESH","0")=="1"
-    root=Path("data/xt_v15")
-    outdir=Path("reports/xt_v15")
-
-    print("HUNTER-V15 — FORENSIC / SPLIT-ISOLATED / CAUSAL")
-    print("XT Futures + auxiliary Spot | 15m -> 1H/4H/1D")
+    root=Path("data/xt_v16")
+    outdir=Path("reports/xt_v16")
+    print("HUNTER-V16 — AUCTION DISPLACEMENT / RETEST + WALK-FORWARD")
     print(f"Capital=${INITIAL_CAPITAL:.0f} Margin=${MARGIN:.0f} Leverage={LEVERAGE:.0f}x RR=1:{RR:.0f}")
-    print("One global position; no overlap; no timeout; no BE/trailing.")
-    print("Segment policy: [start,end), no boundary trade carry-over.")
+    print("One global position; no overlap; next 1H open; no timeout/BE/trailing.")
 
     fut={}; spot={}
     for sym in SYMBOLS:
@@ -657,60 +688,86 @@ def main():
 
     btc_h1=complete_resample(fut["btc_usdt"],"1h",4)
     frames={sym:build_features(fut[sym],spot[sym],btc_h1) for sym in SYMBOLS}
-    split=split_timeline(frames)
-    print(f"\nSPLIT train=[{split.start},{split.train_end}) | validation=[{split.train_end},{split.val_end}) | OOS=[{split.val_end},{split.end})")
-    factor_audit(frames,split)
+    folds,t=make_folds(frames)
+    print(f"COMMON 1H: {t[0]} -> {t[-1]} | folds={len(folds)} | final_holdout={FINAL_HOLDOUT_DAYS}d")
+    factor_audit(frames,folds[0])
 
-    # Same small predeclared grid as V13. No OOS metrics enter selection.
-    # V15 hypothesis grid. These are predeclared structural variants, selected
-    # only on Train/Validation. The prior V14 OOS is NOT used for selection.
+    # Small predeclared grid. It is structural, not an OOS-tuned search.
     grid=[]
-    for s in (20,32,48):
-        for q in (6.5,7.0,7.5):
-            for a in (1.25,1.50):
-                for r in (0.50,0.75):
-                    for v in (0.0,0.5):
-                        for mode in ("BOTH","LONG_ONLY"):
-                            for bear_short in (True,False):
-                                grid.append(Config(
-                                    f"S{s}_Q{q}_A{a}_R{r}_V{v}_{mode}_BS{int(bear_short)}",
-                                    s,q,a,r,v,mode,bear_short))
+    for rn in (20,32,48):
+        for da in (0.8,1.0):
+            for bf in (0.55,0.70):
+                for vz in (0.0,0.5):
+                    for rt in (0.15,0.30):
+                        for sa in (1.25,1.50):
+                            for rf in (0.0,0.5):
+                                grid.append(Config(f"N{rn}_D{da}_B{bf}_V{vz}_R{rt}_S{sa}_RF{rf}",rn,da,bf,vz,rt,sa,rf))
 
-    results=[]
-    for cfg in grid:
-        tr=run_backtest(frames,cfg,split.start,split.train_end,"TRAIN")
-        va=run_backtest(frames,cfg,split.train_end,split.val_end,"VALIDATION")
-        results.append((score(tr,va),cfg,tr,va))
-    results.sort(key=lambda z:z[0],reverse=True)
-    eligible=[z for z in results if z[0]>-1e8]
-    if not eligible:
-        raise RuntimeError("No train/validation eligible configuration; no validated edge.")
+    fold_records=[]
+    all_oos_trades=[]
+    for fold in folds:
+        print(f"\n################ WALK-FORWARD FOLD {fold.number} ################")
+        print(f"TRAIN [{fold.train_start},{fold.train_end})")
+        print(f"VAL   [{fold.train_end},{fold.val_end})")
+        print(f"OOS   [{fold.val_end},{fold.oos_end})")
+        ranked=[]
+        for cfg in grid:
+            tr=run_backtest(frames,cfg,fold.train_start,fold.train_end,"TRAIN")
+            va=run_backtest(frames,cfg,fold.train_end,fold.val_end,"VALIDATION")
+            ranked.append((select_score(tr,va),cfg,tr,va))
+        ranked.sort(key=lambda z:z[0],reverse=True)
+        eligible=[z for z in ranked if z[0]>-1e8]
+        if not eligible:
+            raise RuntimeError(f"Fold {fold.number}: no eligible train/validation configuration")
+        _,cfg,tr,va=eligible[0]
+        oos=run_backtest(frames,cfg,fold.val_end,fold.oos_end,"OOS",collect_trades=True)
+        print(f"[FOLD {fold.number} SELECTED] {cfg.name}")
+        report(tr,f"FOLD {fold.number} TRAIN")
+        report(va,f"FOLD {fold.number} VALIDATION")
+        report(oos,f"FOLD {fold.number} OOS")
+        print_side_report(oos["trades_log"],f"FOLD {fold.number} OOS BY SIDE")
+        if oos["trades"] < MIN_FOLD_OOS_TRADES:
+            print(f"[FOLD {fold.number}] WARNING: only {oos['trades']} OOS trades")
+        fold_records.append((fold,cfg,tr,va,oos))
+        all_oos_trades.extend(oos["trades_log"] or [])
 
-    _,cfg,tr,va=eligible[0]
-    print(f"\n[SELECTED] {cfg.name}")
-    print(f"[SELECTED PARAMS] sweep={cfg.sweep} min_score={cfg.min_score} stop_atr={cfg.stop_atr} rank_floor={cfg.rank_floor} vol_floor={cfg.vol_floor} side_mode={cfg.side_mode} allow_bear_short={cfg.allow_bear_short}")
-    report(tr,"SELECTED TRAIN")
-    report(va,"SELECTED VALIDATION")
+    # Final holdout is evaluated only with the configuration selected from the
+    # immediately preceding walk-forward validation process. We deliberately do
+    # NOT search the final holdout or change parameters from its result.
+    last_cfg=fold_records[-1][1]
+    final_start=t[-1]-pd.Timedelta(days=FINAL_HOLDOUT_DAYS)
+    final_oos=run_backtest(frames,last_cfg,final_start,t[-1]+pd.Timedelta(hours=1),"FINAL_HOLDOUT",collect_trades=True)
+    report(final_oos,"FINAL UNTOUCHED HOLDOUT")
+    print_side_report(final_oos["trades_log"],"FINAL HOLDOUT BY SIDE")
 
-    oos=run_backtest(frames,cfg,split.val_end,split.end,"OOS",collect_trades=True)
-    report(oos,"UNTOUCHED OOS")
-    forensic_report(oos["trades_log"],outdir)
+    agg=aggregate_trade_stats(all_oos_trades,folds[0].val_end,folds[-1].oos_end)
+    print("\n================ AGGREGATED WALK-FORWARD OOS ================")
+    for k,v in agg.items():
+        if isinstance(v,float): print(f"{k:20s}: {v:.4f}")
+        else: print(f"{k:20s}: {v}")
+    print("==============================================================")
 
+    positive_folds=sum(1 for _,_,_,_,o in fold_records if o["pnl"]>0)
     checks={
-        "OOS trades":oos["trades"]>=MIN_OOS_TRADES,
-        "OOS WR":oos["wr"]>MIN_OOS_WR,
-        "OOS PF":oos["pf"]>MIN_OOS_PF,
-        "OOS PnL":oos["pnl"]>0,
-        "OOS loss streak":oos["streak"]<=MAX_OOS_STREAK,
-        "OOS DD":oos["dd_pct"]<MAX_OOS_DD_PCT,
+        "Agg OOS trades":agg["trades"]>=MIN_AGG_OOS_TRADES,
+        "Agg OOS PF":agg["pf"]>=MIN_AGG_OOS_PF,
+        "Agg OOS DD":agg["dd_pct"]<=MAX_AGG_OOS_DD_PCT,
+        "Agg OOS streak":agg["streak"]<=MAX_AGG_OOS_STREAK,
+        "Positive OOS folds":positive_folds>=MIN_POSITIVE_OOS_FOLDS,
     }
-    print("\n================ ACCEPTANCE GATE ================")
-    for k,v in checks.items():
-        print(f"{k:20s}: {'PASS' if v else 'FAIL'}")
+    print("\n================ WALK-FORWARD GATE ================")
+    for k,v in checks.items(): print(f"{k:22s}: {'PASS' if v else 'FAIL'}")
     accepted=all(checks.values())
-    print(f"ACCEPTED              : {accepted}")
-    print("==================================================")
-    print("[DECISION] ACCEPTED — all predeclared OOS criteria passed." if accepted else "[DECISION] REJECTED — no claim of robust edge.")
+    print(f"ROBUST_WALK_FORWARD     : {accepted}")
+    print("====================================================")
+
+    save_forensic(all_oos_trades,outdir)
+    save_forensic(final_oos["trades_log"],outdir/"final_holdout")
+
+    if accepted:
+        print("[DECISION] WALK-FORWARD SURVIVED. Final holdout is reported separately; no production claim is made from this run alone.")
+    else:
+        print("[DECISION] REJECTED. No stable edge demonstrated; close this strategy family and move to a new hypothesis.")
 
 
 if __name__=="__main__":
