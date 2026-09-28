@@ -60,7 +60,7 @@ FUTURES_URL = "https://fapi.xt.com/future/market/v1/public/q/kline"
 LOOKBACK_DAYS = 455
 WARMUP_DAYS = 90
 INTERVAL_MS = 60 * 60 * 1000
-LIMIT = 1500
+LIMIT = 1000
 
 INITIAL_CAPITAL = 1000.0
 MARGIN = 100.0
@@ -155,33 +155,43 @@ def fetch_xt(symbol, refresh=False):
     now = int(time.time() * 1000)
     start_raw = now - int((LOOKBACK_DAYS + WARMUP_DAYS) * 86400 * 1000)
     start_ms = ((start_raw + INTERVAL_MS - 1) // INTERVAL_MS) * INTERVAL_MS
-    end_ms = (now // INTERVAL_MS) * INTERVAL_MS - 1
+    # Only completed 1H candles are eligible.  The current candle start is
+    # therefore excluded by using the last completed candle as the upper bound.
+    end_ms = (now // INTERVAL_MS) * INTERVAL_MS - INTERVAL_MS
 
     if cache.exists() and not refresh:
         return validate(pd.read_csv(cache), symbol, start_ms, end_ms)
 
     session = requests.Session()
-    cursor = start_ms
+
+    # XT has repeatedly returned an empty final forward page for this endpoint.
+    # Forward pagination therefore is not used here.  We paginate BACKWARD from
+    # the last completed candle.  This avoids the unstable "cursor reaches the
+    # current boundary" behavior while preserving every historical candle.
+    cursor_end = end_ms
     all_rows = []
     page = 0
 
-    while cursor <= end_ms:
+    while cursor_end >= start_ms:
         page += 1
         if page > 1000:
             raise RuntimeError(f"{symbol}: pagination guard tripped")
 
-        window_end = min(end_ms, cursor + LIMIT * INTERVAL_MS - 1)
+        window_start = max(
+            start_ms,
+            cursor_end - (LIMIT - 1) * INTERVAL_MS,
+        )
         params = {
             "symbol": symbol,
             "interval": "1h",
-            "startTime": cursor,
-            "endTime": window_end,
+            "startTime": window_start,
+            "endTime": cursor_end,
             "limit": LIMIT,
         }
 
         payload = None
         last_error = None
-        for attempt in range(4):
+        for attempt in range(5):
             try:
                 response = session.get(FUTURES_URL, params=params, timeout=30)
                 response.raise_for_status()
@@ -196,159 +206,108 @@ def fetch_xt(symbol, refresh=False):
         if payload is None:
             raise RuntimeError(f"{symbol}: page {page} failed: {last_error}")
 
-        parsed = [p for p in (parse_row(r) for r in payload) if p is not None]
-        inside = [p for p in parsed if cursor <= p[0] <= window_end]
+        parsed = sorted(
+            [p for p in (parse_row(r) for r in payload) if p is not None],
+            key=lambda p: p[0],
+        )
+        inside = [
+            p for p in parsed
+            if window_start <= p[0] <= cursor_end
+        ]
 
+        # XT may occasionally answer a bounded request with an empty/stale
+        # payload. Retry the same request, then retry with a smaller backward
+        # window. No timestamp is skipped and no candle is fabricated.
         if not inside:
-            # XT may occasionally return an empty result for a bounded
-            # startTime+endTime window even though the same cursor is
-            # queryable through the endpoint's other supported forms.
-            # Recovery is allowed only when returned candles are actually
-            # inside the requested causal interval. Never fabricate or skip.
             recovered = None
 
-            # Recovery A: keep startTime, omit endTime. We still require the
-            # returned sequence to begin at/after the exact cursor; a later
-            # first timestamp is treated as a real data gap, not skipped.
-            for attempt in range(3):
-                try:
-                    alt_params = {
-                        "symbol": symbol,
-                        "interval": "1h",
-                        "startTime": cursor,
-                        "limit": LIMIT,
-                    }
-                    response = session.get(
-                        FUTURES_URL,
-                        params=alt_params,
-                        timeout=30,
-                    )
-                    response.raise_for_status()
-                    alt_payload = payload_rows(response.json())
-                    if alt_payload is None:
-                        raise RuntimeError("XT start-only response contains no kline list")
-
-                    alt_parsed = sorted(
-                        [p for p in (parse_row(r) for r in alt_payload) if p is not None],
-                        key=lambda p: p[0],
-                    )
-                    alt_inside = [
-                        p for p in alt_parsed
-                        if cursor <= p[0] <= end_ms
-                    ]
-
-                    if alt_inside and min(p[0] for p in alt_inside) == cursor:
-                        recovered = (alt_inside, end_ms)
-                        break
-                except Exception:
-                    pass
-                time.sleep(1.0 + attempt)
-
-            # Recovery B: exact-candle probe. This distinguishes an API
-            # pagination/window glitch from a genuine missing historical bar.
-            if recovered is None:
-                probe_end = min(end_ms, cursor + INTERVAL_MS - 1)
-                probe_params = {
+            for divisor in (2, 4, 8, 16):
+                small_limit = max(32, LIMIT // divisor)
+                small_start = max(
+                    start_ms,
+                    cursor_end - (small_limit - 1) * INTERVAL_MS,
+                )
+                small_params = {
                     "symbol": symbol,
                     "interval": "1h",
-                    "startTime": cursor,
-                    "endTime": probe_end,
-                    "limit": 2,
+                    "startTime": small_start,
+                    "endTime": cursor_end,
+                    "limit": small_limit,
                 }
+
                 for attempt in range(3):
                     try:
                         response = session.get(
                             FUTURES_URL,
-                            params=probe_params,
+                            params=small_params,
                             timeout=30,
                         )
                         response.raise_for_status()
-                        probe_payload = payload_rows(response.json())
-                        if probe_payload is None:
-                            raise RuntimeError("XT probe response contains no kline list")
+                        small_payload = payload_rows(response.json())
+                        if small_payload is None:
+                            raise RuntimeError("XT small-window response has no kline list")
 
-                        probe_parsed = [
-                            p for p in (parse_row(r) for r in probe_payload)
-                            if p is not None
-                        ]
-                        probe_inside = [
-                            p for p in probe_parsed
-                            if cursor <= p[0] <= probe_end
-                        ]
-                        if probe_inside:
-                            # The exact candle exists, so fetch a smaller
-                            # forward window and require exact cursor coverage.
-                            for small_limit in (256, 128, 64, 32):
-                                small_end = min(
-                                    end_ms,
-                                    cursor + small_limit * INTERVAL_MS - 1,
+                        small_parsed = sorted(
+                            [
+                                p for p in (
+                                    parse_row(r) for r in small_payload
                                 )
-                                small_params = {
-                                    "symbol": symbol,
-                                    "interval": "1h",
-                                    "startTime": cursor,
-                                    "endTime": small_end,
-                                    "limit": small_limit,
-                                }
-                                try:
-                                    small_response = session.get(
-                                        FUTURES_URL,
-                                        params=small_params,
-                                        timeout=30,
-                                    )
-                                    small_response.raise_for_status()
-                                    small_payload = payload_rows(
-                                        small_response.json()
-                                    )
-                                    if small_payload is None:
-                                        continue
-                                    small_parsed = sorted(
-                                        [
-                                            p for p in (
-                                                parse_row(r)
-                                                for r in small_payload
-                                            )
-                                            if p is not None
-                                        ],
-                                        key=lambda p: p[0],
-                                    )
-                                    small_inside = [
-                                        p for p in small_parsed
-                                        if cursor <= p[0] <= small_end
-                                    ]
-                                    if small_inside and min(
-                                        p[0] for p in small_inside
-                                    ) == cursor:
-                                        recovered = (small_inside, small_end)
-                                        break
-                                except Exception:
-                                    continue
+                                if p is not None
+                            ],
+                            key=lambda p: p[0],
+                        )
+                        small_inside = [
+                            p for p in small_parsed
+                            if small_start <= p[0] <= cursor_end
+                        ]
+                        if small_inside:
+                            recovered = small_inside
                             break
                     except Exception:
                         pass
                     time.sleep(1.0 + attempt)
 
+                if recovered is not None:
+                    break
+
             if recovered is None:
                 raise RuntimeError(
-                    f"{symbol}: page {page} cursor={cursor} returned no valid "
-                    "rows; XT API recovery failed without skipping/fabricating data"
+                    f"{symbol}: backward page {page} "
+                    f"window={window_start}->{cursor_end} returned no valid rows; "
+                    "XT API recovery failed without skipping/fabricating data"
                 )
 
-            inside, window_end = recovered
+            inside = recovered
+
+        # Critical integrity check: the API must cover the exact left boundary
+        # of the requested page unless this is the final (oldest) partial page.
+        # A later first timestamp would otherwise silently hide a data gap.
+        first_ts = min(p[0] for p in inside)
+        if first_ts > window_start and window_start > start_ms:
+            raise RuntimeError(
+                f"{symbol}: historical data gap detected during pagination; "
+                f"requested_start={window_start}, returned_first={first_ts}"
+            )
 
         all_rows.extend(inside)
-        max_ts = max(p[0] for p in inside)
-        next_cursor = max_ts + INTERVAL_MS
 
-        if next_cursor <= cursor:
-            raise RuntimeError(f"{symbol}: pagination stalled")
-        cursor = next_cursor
+        min_ts = min(p[0] for p in inside)
+        next_cursor_end = min_ts - INTERVAL_MS
 
-        if max_ts >= end_ms:
-            break
+        if next_cursor_end >= cursor_end:
+            raise RuntimeError(f"{symbol}: backward pagination stalled")
+
+        cursor_end = next_cursor_end
+
+        if page % 4 == 0:
+            print(f"[FETCH] {symbol} page={page} rows={len(all_rows)}")
+
         time.sleep(0.05)
 
-    x = pd.DataFrame(all_rows, columns=["ts", "open", "high", "low", "close", "volume"])
+    x = pd.DataFrame(
+        all_rows,
+        columns=["ts", "open", "high", "low", "close", "volume"],
+    )
     x["timestamp"] = pd.to_datetime(x.pop("ts"), unit="ms", utc=True)
 
     # Never use the currently forming 1H candle.
@@ -358,7 +317,6 @@ def fetch_xt(symbol, refresh=False):
     x = validate(x, symbol, start_ms, end_ms)
     x.to_csv(cache, index=False)
     return x
-
 
 def true_range(x):
     prev_close = x["close"].shift(1)
