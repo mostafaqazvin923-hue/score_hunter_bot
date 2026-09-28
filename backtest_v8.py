@@ -282,7 +282,14 @@ def build_features(df):
 
     # Shift so an hourly candle can only see the most recently COMPLETED 4H bar.
     h4 = h4[["ema20", "ema50", "atr", "trend_atr"]].shift(1)
-    x = x.join(h4.reindex(x.index, method="ffill"), rsuffix="_4h")
+    # Explicit names avoid pandas join suffix ambiguity when x has no same-named columns.
+    h4 = h4.rename(columns={
+        "ema20": "ema20_4h",
+        "ema50": "ema50_4h",
+        "atr": "atr_4h",
+        "trend_atr": "trend_atr_4h",
+    })
+    x = x.join(h4.reindex(x.index, method="ffill"))
 
     # Confirmation candle must reject continuation and reclaim the impulse midpoint.
     x["impulse_mid"] = (x["high"].shift(1) + x["low"].shift(1)) / 2.0
