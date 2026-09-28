@@ -1,54 +1,47 @@
 #!/usr/bin/env python3
 """
-HUNTER-V21-STAGE0
-FAILED AUCTION / RETURN-TO-VALUE MEAN REVERSION
+HUNTER-V22-STAGE0
+CROSS-SECTIONAL RELATIVE-VALUE ROTATION
 
-Research hypothesis
--------------------
-When price is operating inside a recent value/range, a one-sided auction that
-extends materially outside that range can fail. If the excursion candle closes
-back inside the prior value area and the next completed candle confirms the
-re-entry, price may mean-revert toward the range midpoint.
+Hypothesis
+----------
+At each completed 1H candle, compare each asset's trailing return to BTC's
+trailing return. Assets with unusually strong/weak relative performance may
+continue to mean-revert/rotate toward the cross-sectional median over the
+next short horizon. The signal is built only from information available at
+the completed signal candle; entry is at the next 1H open.
 
-This is intentionally different from:
-- V17 momentum/trend persistence,
-- V18 volatility exhaustion/capitulation,
-- V19 structure continuation,
-- V20 breakout acceptance.
-
-Entry:
-    next 1H OPEN after the completed confirmation candle.
-
-Risk:
-    fixed RR = 1:2
-    stop sensitivity = 1.00 / 1.25 / 1.50 ATR
-    no stop is selected by this script.
+This is intentionally different from V17-V21:
+- no breakout/continuation trigger,
+- no failed-auction pattern,
+- no candle-wick/capitulation trigger,
+- no volume/order-flow trigger.
+The primary information source is cross-sectional relative value.
 
 Integrity protocol
 ------------------
-- XT USDT-M futures, direct 1H OHLCV.
+- XT USDT-M perpetual futures, direct 1H OHLCV.
+- Fixed universe; no symbol selection from future results.
 - Latest incomplete candle removed.
-- All indicators are causal.
-- Prior range excludes the current candle.
-- Signal candle -> confirmation candle -> next-open entry.
-- One open position per symbol.
-- Different symbols may be open simultaneously.
+- All ranks/returns use only completed candles at or before signal time.
+- Entry is next completed candle OPEN.
+- One open position per symbol; different symbols may be simultaneous.
 - Maximum 10 simultaneous $100-margin positions.
-- A symbol cannot re-enter on its exit candle.
+- No same-symbol re-entry on the exit candle.
 - Same-candle SL+TP = LOSS.
-- No trailing, BE, timeout, pyramiding, or future-data filters.
-- Fixed universe and fixed hypothesis parameters.
-- No parameter optimization.
+- RR fixed at 1:2.
+- No trailing stop, BE, timeout, pyramiding, or parameter optimization.
+- Stop values 1.00/1.25/1.50 ATR are sensitivity outputs only; none is selected.
+- No future-data filters or symbol exclusions based on results.
 
-Important data limitation
--------------------------
-This is not true exchange-level order-flow/auction data. "Failed auction"
-is inferred from OHLCV price behavior only.
+Important limitation
+--------------------
+Relative return is a price-based proxy for relative value/rotation. It is not
+true order-book flow, funding, open interest, or institutional positioning.
 """
 
-import os
-import time
 import hashlib
+import time
 from pathlib import Path
 
 import numpy as np
@@ -78,25 +71,16 @@ FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 MAX_OPEN_POSITIONS = int(INITIAL_CAPITAL // MARGIN)
 
-# Pre-registered hypothesis parameters.
 ATR_PERIOD = 14
-VALUE_N = 24
-EXTENSION_ATR = 1.00
-MAX_TREND_ATR_4H = 0.75
-
-# The failed-auction candle must show meaningful rejection.
-MIN_WICK_FRACTION = 0.25
-MIN_CLOSE_BACK_IN_RANGE = True
-
-# Confirmation must move in the reversion direction and close beyond the
-# failed-auction candle's midpoint. It must still be a completed candle.
-CONFIRM_CLOSE_FRACTION = 0.50
-
-# Sensitivity only. Never selected by the script.
+RELATIVE_LOOKBACK = 24          # 24 completed 1H bars
+RELATIVE_Z_LOOKBACK = 72        # causal cross-sectional history
+ENTRY_QUANTILE = 0.20           # bottom/top 20% only
+MIN_RELATIVE_Z = 0.75
+MIN_CROSS_SECTION = 8
 STOP_ATR_VALUES = (1.00, 1.25, 1.50)
 
-CACHE_DIR = Path("data/xt_v21_stage0")
-REPORT_DIR = Path("reports/xt_v21_stage0")
+CACHE_DIR = Path("data/xt_v22_stage0")
+REPORT_DIR = Path("reports/xt_v22_stage0")
 
 
 def payload_rows(obj):
@@ -121,12 +105,8 @@ def parse_row(row):
             if None in (ts, o, h, l, c, v):
                 return None
             return int(ts), float(o), float(h), float(l), float(c), float(v)
-
         if isinstance(row, (list, tuple)) and len(row) >= 6:
-            return (
-                int(row[0]), float(row[1]), float(row[2]),
-                float(row[3]), float(row[4]), float(row[5])
-            )
+            return int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
     except Exception:
         return None
     return None
@@ -135,10 +115,7 @@ def parse_row(row):
 def validate(df, symbol, start_ms, end_ms):
     x = df.copy()
     x["timestamp"] = pd.to_datetime(x["timestamp"], utc=True)
-    x = x.sort_values("timestamp").drop_duplicates(
-        "timestamp", keep="last"
-    )
-
+    x = x.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
     x = x[
         (x["timestamp"] >= pd.to_datetime(start_ms, unit="ms", utc=True))
         & (x["timestamp"] <= pd.to_datetime(end_ms, unit="ms", utc=True))
@@ -150,30 +127,19 @@ def validate(df, symbol, start_ms, end_ms):
 
     if x[cols].isna().any().any():
         raise RuntimeError(f"{symbol}: NaN in OHLCV")
-
     if (x[["open", "high", "low", "close"]] <= 0).any().any():
         raise RuntimeError(f"{symbol}: non-positive price")
-
     if (x["volume"] < 0).any():
         raise RuntimeError(f"{symbol}: negative volume")
 
     gaps = x["timestamp"].diff().dropna().dt.total_seconds().div(3600.0)
-    bad = gaps > 1.0 + 1e-9
-    if bad.any():
-        raise RuntimeError(
-            f"{symbol}: {int(bad.sum())} futures 1H gaps; "
-            "no OHLCV fabrication allowed"
-        )
+    if (gaps > 1.0 + 1e-9).any():
+        raise RuntimeError(f"{symbol}: 1H data gap detected; no OHLCV fabrication allowed")
 
     minimum_rows = int((LOOKBACK_DAYS + WARMUP_DAYS) * 24 * 0.95)
     if len(x) < minimum_rows:
-        raise RuntimeError(f"{symbol}: only {len(x)} 1H rows")
+        raise RuntimeError(f"{symbol}: only {len(x)} rows; expected near full history")
 
-    print(
-        f"[VALIDATE] {symbol} rows={len(x)} "
-        f"first={x['timestamp'].iloc[0]} "
-        f"last={x['timestamp'].iloc[-1]}"
-    )
     return x.reset_index(drop=True)
 
 
@@ -182,18 +148,12 @@ def fetch_xt(symbol, refresh=False):
     cache = CACHE_DIR / f"{symbol}.csv"
 
     now = int(time.time() * 1000)
-    start_raw = now - int(
-        (LOOKBACK_DAYS + WARMUP_DAYS) * 86400 * 1000
-    )
-    start_ms = (
-        (start_raw + INTERVAL_MS - 1) // INTERVAL_MS
-    ) * INTERVAL_MS
+    start_raw = now - int((LOOKBACK_DAYS + WARMUP_DAYS) * 86400 * 1000)
+    start_ms = ((start_raw + INTERVAL_MS - 1) // INTERVAL_MS) * INTERVAL_MS
     end_ms = (now // INTERVAL_MS) * INTERVAL_MS - 1
 
     if cache.exists() and not refresh:
-        return validate(
-            pd.read_csv(cache), symbol, start_ms, end_ms
-        )
+        return validate(pd.read_csv(cache), symbol, start_ms, end_ms)
 
     session = requests.Session()
     cursor = start_ms
@@ -202,11 +162,10 @@ def fetch_xt(symbol, refresh=False):
 
     while cursor <= end_ms:
         page += 1
-        window_end = min(
-            end_ms,
-            cursor + LIMIT * INTERVAL_MS - 1
-        )
+        if page > 1000:
+            raise RuntimeError(f"{symbol}: pagination guard tripped")
 
+        window_end = min(end_ms, cursor + LIMIT * INTERVAL_MS - 1)
         params = {
             "symbol": symbol,
             "interval": "1h",
@@ -216,103 +175,54 @@ def fetch_xt(symbol, refresh=False):
         }
 
         payload = None
-        error = None
-
+        last_error = None
         for attempt in range(4):
             try:
-                response = session.get(
-                    FUTURES_URL,
-                    params=params,
-                    timeout=30,
-                )
+                response = session.get(FUTURES_URL, params=params, timeout=30)
                 response.raise_for_status()
                 payload = payload_rows(response.json())
-
                 if payload is None:
-                    raise RuntimeError(
-                        "XT response contains no kline list"
-                    )
+                    raise RuntimeError("XT response contains no kline list")
                 break
             except Exception as exc:
-                error = exc
+                last_error = exc
                 time.sleep(1.0 + attempt)
 
         if payload is None:
-            raise RuntimeError(
-                f"{symbol}: page {page} failed: {error}"
-            )
+            raise RuntimeError(f"{symbol}: page {page} failed: {last_error}")
 
-        parsed = [
-            p for p in (parse_row(r) for r in payload)
-            if p is not None
-        ]
-
-        inside = [
-            p for p in parsed
-            if cursor <= p[0] <= window_end
-        ]
+        parsed = [p for p in (parse_row(r) for r in payload) if p is not None]
+        inside = [p for p in parsed if cursor <= p[0] <= window_end]
 
         if not inside:
-            if window_end >= end_ms:
-                break
-            raise RuntimeError(
-                f"{symbol}: page {page} returned no rows"
-            )
+            raise RuntimeError(f"{symbol}: page {page} returned no valid rows")
 
         all_rows.extend(inside)
-
         max_ts = max(p[0] for p in inside)
         next_cursor = max_ts + INTERVAL_MS
 
         if next_cursor <= cursor:
-            raise RuntimeError(
-                f"{symbol}: pagination stalled"
-            )
-
+            raise RuntimeError(f"{symbol}: pagination stalled")
         cursor = next_cursor
-
-        if page % 4 == 0:
-            print(
-                f"[FETCH] {symbol} page={page} "
-                f"rows={len(all_rows)}"
-            )
 
         if max_ts >= end_ms:
             break
-
         time.sleep(0.05)
 
-    x = pd.DataFrame(
-        all_rows,
-        columns=[
-            "ts", "open", "high", "low", "close", "volume"
-        ],
-    )
-    x["timestamp"] = pd.to_datetime(
-        x.pop("ts"),
-        unit="ms",
-        utc=True,
-    )
+    x = pd.DataFrame(all_rows, columns=["ts", "open", "high", "low", "close", "volume"])
+    x["timestamp"] = pd.to_datetime(x.pop("ts"), unit="ms", utc=True)
 
-    # Never include the currently forming 1H candle.
-    cutoff = pd.Timestamp.now(
-        tz="UTC"
-    ).floor("1h")
+    # Never use the currently forming 1H candle.
+    cutoff = pd.Timestamp.now(tz="UTC").floor("1h")
     x = x[x["timestamp"] < cutoff]
 
-    x = validate(
-        x,
-        symbol,
-        start_ms,
-        end_ms,
-    )
+    x = validate(x, symbol, start_ms, end_ms)
     x.to_csv(cache, index=False)
     return x
 
 
 def true_range(x):
     prev_close = x["close"].shift(1)
-
     return pd.concat(
         [
             x["high"] - x["low"],
@@ -324,390 +234,164 @@ def true_range(x):
 
 
 def build_features(df):
-    x = df.set_index(
-        "timestamp"
-    ).sort_index().copy()
-
+    x = df.set_index("timestamp").sort_index().copy()
     x["tr"] = true_range(x)
-    x["atr"] = x["tr"].rolling(
-        ATR_PERIOD,
-        min_periods=ATR_PERIOD,
-    ).mean()
+    x["atr"] = x["tr"].rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean()
 
-    x["range"] = (
-        x["high"] - x["low"]
-    ).clip(lower=0.0)
+    # Return ending at t uses close[t] and close[t-L].
+    # It is only consumed after candle t is fully closed.
+    x["ret_24h"] = x["close"].pct_change(RELATIVE_LOOKBACK, fill_method=None)
 
-    safe_range = x["range"].replace(
-        0,
-        np.nan,
+    return x.replace([np.inf, -np.inf], np.nan)
+
+
+def prepare_panel(raw):
+    streams = {s: build_features(df) for s, df in raw.items()}
+    closes = pd.concat(
+        {s: x["close"] for s, x in streams.items()},
+        axis=1,
+        join="inner",
     )
+    closes.columns = list(closes.columns)
 
-    x["body"] = (
-        x["close"] - x["open"]
-    ).abs()
+    rel = closes.pct_change(RELATIVE_LOOKBACK, fill_method=None)
+    btc_rel = rel["btc_usdt"]
+    relative = rel.sub(btc_rel, axis=0)
 
-    x["upper_wick"] = (
-        x["high"]
-        - x[["open", "close"]].max(axis=1)
-    )
+    # Cross-sectional median and dispersion are computed at each completed t.
+    # Historical z-score is deliberately causal: it uses the current relative
+    # score plus only scores from earlier completed timestamps.
+    cs_median = relative.median(axis=1, skipna=True)
+    demeaned = relative.sub(cs_median, axis=0)
 
-    x["lower_wick"] = (
-        x[["open", "close"]].min(axis=1)
-        - x["low"]
-    )
+    hist_mean = demeaned.rolling(
+        RELATIVE_Z_LOOKBACK,
+        min_periods=RELATIVE_Z_LOOKBACK,
+    ).mean().shift(1)
+    hist_std = demeaned.rolling(
+        RELATIVE_Z_LOOKBACK,
+        min_periods=RELATIVE_Z_LOOKBACK,
+    ).std(ddof=0).shift(1)
 
-    x["close_loc"] = (
-        (x["close"] - x["low"])
-        / safe_range
-    )
+    z = (demeaned - hist_mean) / hist_std.replace(0, np.nan)
 
-    # Strictly prior value/range. Current candle is excluded.
-    x["value_hi"] = x["high"].shift(1).rolling(
-        VALUE_N,
-        min_periods=VALUE_N,
-    ).max()
-
-    x["value_lo"] = x["low"].shift(1).rolling(
-        VALUE_N,
-        min_periods=VALUE_N,
-    ).min()
-
-    x["value_mid"] = (
-        x["value_hi"] + x["value_lo"]
-    ) / 2.0
-
-    # Completed 4H regime. Shift by one completed 4H bar before mapping back
-    # to 1H timestamps, preventing use of a still-forming 4H candle.
-    h4 = x[
-        ["open", "high", "low", "close"]
-    ].resample(
-        "4h",
-        label="right",
-        closed="right",
-    ).agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-    }).dropna()
-
-    h4["ema20"] = h4["close"].ewm(
-        span=20,
-        adjust=False,
-        min_periods=20,
-    ).mean()
-
-    h4["ema50"] = h4["close"].ewm(
-        span=50,
-        adjust=False,
-        min_periods=50,
-    ).mean()
-
-    h4["tr"] = true_range(h4)
-    h4["atr"] = h4["tr"].rolling(
-        ATR_PERIOD,
-        min_periods=ATR_PERIOD,
-    ).mean()
-
-    h4["trend_atr"] = (
-        (h4["ema20"] - h4["ema50"])
-        / h4["atr"].replace(0, np.nan)
-    )
-
-    h4 = h4[
-        ["ema20", "ema50", "atr", "trend_atr"]
-    ].shift(1).rename(columns={
-        "ema20": "ema20_4h",
-        "ema50": "ema50_4h",
-        "atr": "atr_4h",
-        "trend_atr": "trend_atr_4h",
-    })
-
-    x = x.join(
-        h4.reindex(
-            x.index,
-            method="ffill",
-        )
-    )
-
-    x.replace(
-        [np.inf, -np.inf],
-        np.nan,
-        inplace=True,
-    )
-
-    return x
+    return streams, relative, z
 
 
-def candidate(x, i):
-    """
-    i = completed confirmation candle.
-    i-1 = failed-auction candle.
-    i+1 open = entry.
+def candidates_at(relative, z, ts):
+    row = relative.loc[ts]
+    zrow = z.loc[ts]
+    valid = row.notna() & zrow.notna()
+    if int(valid.sum()) < MIN_CROSS_SECTION:
+        return []
 
-    No candle after i is read by this function.
-    """
-    if i < 120 or i + 1 >= len(x):
-        return 0
+    values = row[valid]
+    lower = values.quantile(ENTRY_QUANTILE)
+    upper = values.quantile(1.0 - ENTRY_QUANTILE)
 
-    failed = x.iloc[i - 1]
-    confirm = x.iloc[i]
+    out = []
+    for symbol in values.index:
+        score = float(values[symbol])
+        zscore = float(zrow[symbol])
+        if not np.isfinite(score) or not np.isfinite(zscore):
+            continue
 
-    required = [
-        failed["atr"],
-        failed["value_hi"],
-        failed["value_lo"],
-        failed["value_mid"],
-        failed["high"],
-        failed["low"],
-        failed["open"],
-        failed["close"],
-        failed["upper_wick"],
-        failed["lower_wick"],
-        failed["range"],
-        confirm["open"],
-        confirm["high"],
-        confirm["low"],
-        confirm["close"],
-        confirm["close_loc"],
-        confirm["value_hi"],
-        confirm["value_lo"],
-        confirm["value_mid"],
-        confirm["trend_atr_4h"],
-    ]
+        # Relative weakness -> LONG (reversion toward the cross-sectional
+        # median); relative strength -> SHORT.
+        if score <= lower and zscore <= -MIN_RELATIVE_Z:
+            out.append((symbol, 1, zscore))
+        elif score >= upper and zscore >= MIN_RELATIVE_Z:
+            out.append((symbol, -1, zscore))
 
-    if any(pd.isna(v) for v in required):
-        return 0
-
-    atr = float(failed["atr"])
-    if atr <= 0:
-        return 0
-
-    value_hi = float(failed["value_hi"])
-    value_lo = float(failed["value_lo"])
-    value_mid = float(failed["value_mid"])
-
-    # ---------------------------------------------------------------
-    # LONG mean reversion:
-    # 1) price auctions materially below prior value,
-    # 2) the candle rejects the lower excursion,
-    # 3) it closes back inside the prior value,
-    # 4) next candle confirms upward re-entry.
-    # ---------------------------------------------------------------
-    long_extension = (
-        float(failed["low"])
-        <= value_lo - EXTENSION_ATR * atr
-    )
-
-    long_rejection = (
-        float(failed["lower_wick"])
-        / max(float(failed["range"]), 1e-12)
-        >= MIN_WICK_FRACTION
-        and float(failed["close"])
-        > value_lo
-        and float(failed["close_loc"]) >= 0.50
-    )
-
-    long_confirmation = (
-        float(confirm["close"]) > float(confirm["open"])
-        and float(confirm["close"]) > float(failed["close"])
-        and float(confirm["close"]) > (
-            float(failed["low"])
-            + CONFIRM_CLOSE_FRACTION
-            * float(failed["range"])
-        )
-        and float(confirm["close"]) > value_lo
-    )
-
-    # ---------------------------------------------------------------
-    # SHORT mean reversion:
-    # symmetric failed auction above prior value.
-    # ---------------------------------------------------------------
-    short_extension = (
-        float(failed["high"])
-        >= value_hi + EXTENSION_ATR * atr
-    )
-
-    short_rejection = (
-        float(failed["upper_wick"])
-        / max(float(failed["range"]), 1e-12)
-        >= MIN_WICK_FRACTION
-        and float(failed["close"])
-        < value_hi
-        and float(failed["close_loc"]) <= 0.50
-    )
-
-    short_confirmation = (
-        float(confirm["close"]) < float(confirm["open"])
-        and float(confirm["close"]) < float(failed["close"])
-        and float(confirm["close"]) < (
-            float(failed["high"])
-            - CONFIRM_CLOSE_FRACTION
-            * float(failed["range"])
-        )
-        and float(confirm["close"]) < value_hi
-    )
-
-    # Mean-reversion hypothesis is specifically for non-trending / bounded
-    # conditions. We reject strongly directional completed 4H regimes.
-    neutral_4h = (
-        abs(float(confirm["trend_atr_4h"]))
-        <= MAX_TREND_ATR_4H
-    )
-
-    if (
-        neutral_4h
-        and long_extension
-        and long_rejection
-        and long_confirmation
-    ):
-        return 1
-
-    if (
-        neutral_4h
-        and short_extension
-        and short_rejection
-        and short_confirmation
-    ):
-        return -1
-
-    return 0
+    # Deterministic ordering; this is not a performance-based selection.
+    out.sort(key=lambda item: (abs(item[2]), item[0]), reverse=True)
+    return out
 
 
-def compute_exit(
-    x,
-    entry_idx,
-    side,
-    entry,
-    sl,
-    tp,
-):
+def compute_exit(x, entry_idx, side, entry, sl, tp):
     for j in range(entry_idx, len(x)):
         bar = x.iloc[j]
-        ts = x.index[j]
-
-        if side == 1:
-            hit_sl = float(bar["low"]) <= sl
-            hit_tp = float(bar["high"]) >= tp
-        else:
-            hit_sl = float(bar["high"]) >= sl
-            hit_tp = float(bar["low"]) <= tp
+        hit_sl = float(bar["low"]) <= sl if side == 1 else float(bar["high"]) >= sl
+        hit_tp = float(bar["high"]) >= tp if side == 1 else float(bar["low"]) <= tp
 
         if not (hit_sl or hit_tp):
             continue
 
-        # Conservative same-candle ambiguity rule.
+        # If both are touched within one candle, classify as LOSS.
         win = bool(hit_tp and not hit_sl)
         exit_px = tp if win else sl
 
         gross = (
-            NOTIONAL
-            * (exit_px - entry)
-            / entry
+            NOTIONAL * (exit_px - entry) / entry
             if side == 1
-            else
-            NOTIONAL
-            * (entry - exit_px)
-            / entry
+            else NOTIONAL * (entry - exit_px) / entry
         )
-
         fees = NOTIONAL * FEE_RATE * 2.0
-        pnl = gross - fees
-
-        return ts, float(pnl), win
+        return x.index[j], float(gross - fees), win
 
     return None
 
 
-def simulate(raw, stop_mult):
-    streams = {
-        symbol: build_features(df)
-        for symbol, df in raw.items()
-    }
-
+def simulate(streams, relative, z, stop_mult):
     events = []
     raw_candidates = 0
 
-    for symbol, x in streams.items():
-        for i in range(len(x) - 1):
-            side = candidate(x, i)
-            if side:
-                raw_candidates += 1
-                events.append(
-                    (x.index[i], symbol, i, side)
-                )
+    for ts in relative.index:
+        cands = candidates_at(relative, z, ts)
+        raw_candidates += len(cands)
+        for symbol, side, zscore in cands:
+            x = streams[symbol]
+            if ts not in x.index:
+                continue
+            idx = x.index.get_loc(ts)
+            if isinstance(idx, slice) or idx + 1 >= len(x):
+                continue
+            events.append((ts, symbol, idx, side, zscore))
 
-    events.sort(
-        key=lambda item: (item[0], item[1])
-    )
+    events.sort(key=lambda e: (e[0], e[1]))
 
     equity = INITIAL_CAPITAL
-    peak_equity = INITIAL_CAPITAL
+    peak = INITIAL_CAPITAL
     max_dd = 0.0
-
-    # Position remains active through its exit timestamp so that another
-    # event on the same candle cannot open a replacement position.
     open_positions = {}
     last_exit_by_symbol = {}
-
     trades = []
 
-    for signal_ts, symbol, i, side in events:
+    for signal_ts, symbol, i, side, zscore in events:
         x = streams[symbol]
         entry_idx = i + 1
-
-        if entry_idx >= len(x):
-            continue
-
         entry_ts = x.index[entry_idx]
 
-        # Remove only positions whose exit happened strictly before entry.
+        # Keep a position alive through its exit timestamp. It becomes
+        # removable only once the event stream is strictly later.
         stale = [
-            pos_symbol
-            for pos_symbol, pos in open_positions.items()
-            if pos["exit_ts"] < entry_ts
+            s for s, p in open_positions.items()
+            if p["exit_ts"] < entry_ts
         ]
+        for s in stale:
+            del open_positions[s]
 
-        for pos_symbol in stale:
-            del open_positions[pos_symbol]
-
-        # Same-symbol overlap lock.
         if symbol in open_positions:
             continue
 
-        # Explicit no-same-exit-candle re-entry rule.
-        previous_exit = last_exit_by_symbol.get(symbol)
-        if previous_exit is not None and entry_ts <= previous_exit:
+        prev_exit = last_exit_by_symbol.get(symbol)
+        if prev_exit is not None and entry_ts <= prev_exit:
             continue
 
-        # Portfolio margin capacity.
         if len(open_positions) >= MAX_OPEN_POSITIONS:
             continue
 
-        required_margin = (
-            len(open_positions) + 1
-        ) * MARGIN
-
-        if equity < required_margin:
+        if equity < (len(open_positions) + 1) * MARGIN:
             continue
 
         atr = float(x.iloc[i]["atr"])
         if not np.isfinite(atr) or atr <= 0:
             continue
 
-        entry_raw = float(
-            x.iloc[entry_idx]["open"]
-        )
-
-        entry = (
-            entry_raw * (1.0 + SLIPPAGE)
-            if side == 1
-            else entry_raw * (1.0 - SLIPPAGE)
-        )
+        entry_raw = float(x.iloc[entry_idx]["open"])
+        entry = entry_raw * (1.0 + SLIPPAGE) if side == 1 else entry_raw * (1.0 - SLIPPAGE)
 
         stop_dist = stop_mult * atr
-
         if side == 1:
             sl = entry - stop_dist
             tp = entry + RR * stop_dist
@@ -715,440 +399,145 @@ def simulate(raw, stop_mult):
             sl = entry + stop_dist
             tp = entry - RR * stop_dist
 
-        result = compute_exit(
-            x,
-            entry_idx,
-            side,
-            entry,
-            sl,
-            tp,
-        )
-
+        result = compute_exit(x, entry_idx, side, entry, sl, tp)
         if result is None:
             continue
 
         exit_ts, pnl, win = result
-
-        open_positions[symbol] = {
-            "exit_ts": exit_ts,
-            "entry_ts": entry_ts,
-        }
+        open_positions[symbol] = {"entry_ts": entry_ts, "exit_ts": exit_ts}
 
         equity += pnl
-        peak_equity = max(
-            peak_equity,
-            equity,
-        )
-        max_dd = max(
-            max_dd,
-            peak_equity - equity,
-        )
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
 
-        trades.append({
-            "signal_ts": signal_ts,
-            "entry_ts": entry_ts,
-            "exit_ts": exit_ts,
-            "symbol": symbol,
-            "side": (
-                "LONG" if side == 1 else "SHORT"
-            ),
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "win": int(win),
-            "pnl": pnl,
-        })
-
+        trades.append(
+            {
+                "signal_ts": signal_ts,
+                "entry_ts": entry_ts,
+                "exit_ts": exit_ts,
+                "symbol": symbol,
+                "side": "LONG" if side == 1 else "SHORT",
+                "relative_score": float(relative.loc[signal_ts, symbol]),
+                "relative_z": zscore,
+                "entry": entry,
+                "sl": sl,
+                "tp": tp,
+                "win": int(win),
+                "pnl": pnl,
+            }
+        )
         last_exit_by_symbol[symbol] = exit_ts
 
-    return (
-        pd.DataFrame(trades),
-        raw_candidates,
-    )
+    return pd.DataFrame(trades), raw_candidates
 
 
 def summarize(trades):
     if trades.empty:
-        return {
-            "trades": 0,
-            "wins": 0,
-            "losses": 0,
-            "wr": 0.0,
-            "pf": 0.0,
-            "pnl": 0.0,
-            "dd": 0.0,
-            "dd_pct": 0.0,
-            "streak": 0,
-            "expectancy": 0.0,
-            "final": INITIAL_CAPITAL,
-        }
+        return dict(trades=0, wins=0, losses=0, wr=0.0, pf=0.0, pnl=0.0,
+                    dd=0.0, dd_pct=0.0, streak=0, expectancy=0.0, final=INITIAL_CAPITAL)
 
     pnl = trades["pnl"].astype(float)
+    wins = int((pnl > 0).sum())
+    losses = int((pnl <= 0).sum())
+    gw = float(pnl[pnl > 0].sum())
+    gl = float(-pnl[pnl <= 0].sum())
+    pf = gw / gl if gl > 0 else float("inf")
 
-    wins = int(
-        (pnl > 0).sum()
-    )
-    losses = int(
-        (pnl <= 0).sum()
-    )
-
-    gross_win = float(
-        pnl[pnl > 0].sum()
-    )
-    gross_loss = float(
-        -pnl[pnl <= 0].sum()
-    )
-
-    pf = (
-        gross_win / gross_loss
-        if gross_loss > 0
-        else float("inf")
-    )
-
-    equity = (
-        INITIAL_CAPITAL
-        + pnl.cumsum()
-    )
-
-    peak = equity.cummax()
-    dd = peak - equity
-
+    eq = INITIAL_CAPITAL + pnl.cumsum()
+    peak = eq.cummax()
+    dd = peak - eq
     max_dd = float(dd.max())
-    max_dd_pct = float(
-        (
-            dd
-            / peak.replace(
-                0,
-                np.nan,
-            )
-        ).max()
-        * 100.0
-    )
+    dd_pct = float((dd / peak.replace(0, np.nan)).max() * 100.0)
 
-    streak = 0
-    current = 0
-
-    for value in pnl:
-        if value <= 0:
+    streak = current = 0
+    for v in pnl:
+        if v <= 0:
             current += 1
-            streak = max(
-                streak,
-                current,
-            )
+            streak = max(streak, current)
         else:
             current = 0
 
-    return {
-        "trades": len(trades),
-        "wins": wins,
-        "losses": losses,
-        "wr": 100.0 * wins / len(trades),
-        "pf": pf,
-        "pnl": float(pnl.sum()),
-        "dd": max_dd,
-        "dd_pct": max_dd_pct,
-        "streak": streak,
-        "expectancy": float(
-            pnl.mean()
-        ),
-        "final": float(
-            equity.iloc[-1]
-        ),
-    }
+    return dict(
+        trades=len(trades),
+        wins=wins,
+        losses=losses,
+        wr=100.0 * wins / len(trades),
+        pf=pf,
+        pnl=float(pnl.sum()),
+        dd=max_dd,
+        dd_pct=dd_pct,
+        streak=streak,
+        expectancy=float(pnl.mean()),
+        final=float(eq.iloc[-1]),
+    )
 
 
-def print_report(
-    stop_mult,
-    trades,
-    raw_candidates,
-):
+def print_report(stop_mult, trades, raw_candidates):
     s = summarize(trades)
+    print("\n" + "=" * 78)
+    print(f"STAGE-0 STOP = {stop_mult:.2f} ATR | RR = 1:2")
+    print("=" * 78)
+    print(f"Raw candidate signals   : {raw_candidates}")
+    print(f"Closed trades           : {s['trades']}")
+    print(f"Wins                    : {s['wins']}")
+    print(f"Losses                  : {s['losses']}")
+    print(f"Win Rate                : {s['wr']:.2f}%")
+    print(f"Profit Factor           : {s['pf']:.4f}")
+    print(f"Net PnL                 : ${s['pnl']:,.2f}")
+    print(f"Max Drawdown            : ${s['dd']:,.2f}")
+    print(f"Max Drawdown %          : {s['dd_pct']:.2f}%")
+    print(f"Max Loss Streak         : {s['streak']}")
+    print(f"Expectancy / Trade      : ${s['expectancy']:.2f}")
+    print(f"Final Equity            : ${s['final']:,.2f}")
 
-    print("\n" + "=" * 76)
-    print(
-        f"STAGE-0 STOP = {stop_mult:.2f} ATR | "
-        "RR = 1:2"
-    )
-    print("=" * 76)
+    if trades.empty:
+        return
 
-    print(
-        f"Raw candidate signals   : "
-        f"{raw_candidates}"
-    )
-    print(
-        f"Closed trades           : "
-        f"{s['trades']}"
-    )
-    print(
-        f"Wins                    : "
-        f"{s['wins']}"
-    )
-    print(
-        f"Losses                  : "
-        f"{s['losses']}"
-    )
-    print(
-        f"Win Rate                : "
-        f"{s['wr']:.2f}%"
-    )
-    print(
-        f"Profit Factor           : "
-        f"{s['pf']:.4f}"
-    )
-    print(
-        f"Net PnL                 : "
-        f"${s['pnl']:,.2f}"
-    )
-    print(
-        f"Max Drawdown            : "
-        f"${s['dd']:,.2f}"
-    )
-    print(
-        f"Max Drawdown %          : "
-        f"{s['dd_pct']:.2f}%"
-    )
-    print(
-        f"Max Loss Streak         : "
-        f"{s['streak']}"
-    )
-    print(
-        f"Expectancy / Trade      : "
-        f"${s['expectancy']:.2f}"
-    )
-    print(
-        f"Final Equity            : "
-        f"${s['final']:,.2f}"
-    )
+    for key, g in trades.groupby("side", sort=True):
+        wr = 100.0 * g["win"].sum() / len(g)
+        print(f"SIDE {key:5s} trades={len(g):4d} WR={wr:6.2f}% PnL=${g['pnl'].sum():,.2f}")
 
-    if not trades.empty:
-        side = (
-            trades.groupby("side")
-            .agg(
-                trades=("pnl", "size"),
-                wins=("win", "sum"),
-                pnl=("pnl", "sum"),
-            )
-            .reset_index()
-        )
-
-        side["wr"] = (
-            100.0
-            * side["wins"]
-            / side["trades"]
-        )
-
-        print("\nBY SIDE")
-        print(
-            side.to_string(
-                index=False,
-                formatters={
-                    "pnl": lambda v: f"{v:.2f}",
-                    "wr": lambda v: f"{v:.2f}",
-                },
-            )
-        )
-
-        symbol = (
-            trades.groupby("symbol")
-            .agg(
-                trades=("pnl", "size"),
-                wins=("win", "sum"),
-                pnl=("pnl", "sum"),
-            )
-            .reset_index()
-        )
-
-        symbol["wr"] = (
-            100.0
-            * symbol["wins"]
-            / symbol["trades"]
-        )
-
-        print("\nBY SYMBOL")
-        print(
-            symbol.sort_values(
-                "pnl",
-                ascending=False,
-            ).to_string(
-                index=False,
-                formatters={
-                    "pnl": lambda v: f"{v:.2f}",
-                    "wr": lambda v: f"{v:.2f}",
-                },
-            )
-        )
+    print("\nBY SYMBOL")
+    for symbol, g in trades.groupby("symbol", sort=True):
+        wr = 100.0 * g["win"].sum() / len(g)
+        print(f"{symbol:10s} trades={len(g):4d} WR={wr:6.2f}% PnL=${g['pnl'].sum():,.2f}")
 
 
 def main():
-    print(
-        "HUNTER-V21-STAGE0 — "
-        "FAILED AUCTION / RETURN-TO-VALUE MEAN REVERSION"
-    )
+    print("HUNTER-V22-STAGE0 — CROSS-SECTIONAL RELATIVE-VALUE ROTATION")
+    print(f"Lookback={LOOKBACK_DAYS}d + warmup={WARMUP_DAYS}d | direct XT 1H futures")
+    print(f"RR=1:2 | margin=${MARGIN:.0f} | notional=${NOTIONAL:.0f} | fee={FEE_RATE} | slippage={SLIPPAGE}")
+    print(f"Relative lookback={RELATIVE_LOOKBACK}h | causal history={RELATIVE_Z_LOOKBACK}h")
+    print(f"Top/bottom quantile={ENTRY_QUANTILE:.2f} | min relative z={MIN_RELATIVE_Z:.2f}")
+    print("No parameter optimization; stop values are sensitivity outputs only.")
 
-    print(
-        f"Lookback={LOOKBACK_DAYS}d + "
-        f"warmup={WARMUP_DAYS}d | "
-        "1H direct XT futures"
-    )
+    raw = {}
+    for n, symbol in enumerate(SYMBOLS, 1):
+        print(f"\n[{n}/{len(SYMBOLS)}] Fetching {symbol}")
+        raw[symbol] = fetch_xt(symbol)
 
-    print(
-        f"RR=1:2 | margin=${MARGIN:.0f} | "
-        f"notional=${NOTIONAL:.0f} | "
-        f"fee={FEE_RATE} | "
-        f"slippage={SLIPPAGE}"
-    )
+    streams, relative, z = prepare_panel(raw)
 
-    print(
-        "Hypothesis: range extension -> failed "
-        "acceptance -> return inside value -> "
-        "confirmation"
-    )
-
-    print(
-        f"Per-symbol overlap lock | "
-        f"max simultaneous positions="
-        f"{MAX_OPEN_POSITIONS}"
-    )
-
-    print(
-        "No parameter optimization. "
-        "Stop sensitivity is reported, not selected."
-    )
-
-    refresh = (
-        os.getenv(
-            "XT_REFRESH",
-            "0",
-        ) == "1"
-    )
-
-    REPORT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    raw = {
-        symbol: fetch_xt(
-            symbol,
-            refresh=refresh,
-        )
-        for symbol in SYMBOLS
-    }
-
-    common_start = max(
-        df["timestamp"].min()
-        for df in raw.values()
-    )
-
-    common_end = min(
-        df["timestamp"].max()
-        for df in raw.values()
-    )
-
-    print(
-        f"COMMON 1H RANGE: "
-        f"{common_start} -> {common_end}"
-    )
-
-    raw = {
-        symbol: df[
-            (df["timestamp"] >= common_start)
-            & (df["timestamp"] <= common_end)
-        ].copy()
-        for symbol, df in raw.items()
-    }
-
-    results = []
+    # Require a stable common timeline. Candidate ranks are calculated only
+    # where the fixed universe has enough valid observations.
+    print("\nData preparation complete.")
+    print(f"Common completed timestamps: {len(relative)}")
 
     for stop_mult in STOP_ATR_VALUES:
-        trades, raw_candidates = simulate(
-            raw,
-            stop_mult,
-        )
+        trades, raw_candidates = simulate(streams, relative, z, stop_mult)
+        print_report(stop_mult, trades, raw_candidates)
 
-        print_report(
-            stop_mult,
-            trades,
-            raw_candidates,
-        )
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        if not trades.empty:
+            trades.to_csv(
+                REPORT_DIR / f"trades_stop_{stop_mult:.2f}.csv",
+                index=False,
+            )
 
-        trades.to_csv(
-            REPORT_DIR
-            / f"stage0_trades_stop_{stop_mult:.2f}.csv",
-            index=False,
-        )
-
-        summary = summarize(trades)
-        summary["stop_atr"] = stop_mult
-        results.append(summary)
-
-    summary_df = pd.DataFrame(results)
-    summary_df.to_csv(
-        REPORT_DIR / "stage0_summary.csv",
-        index=False,
-    )
-
-    # Conservative discovery gate. It does not choose a stop.
-    enough_activity = all(
-        r["trades"] >= 150
-        for r in results
-    )
-
-    positive_edge = all(
-        r["pf"] > 1.0
-        and r["expectancy"] > 0
-        for r in results
-    )
-
-    reasonable_wr = max(
-        r["wr"] for r in results
-    ) >= 40.0
-
-    drawdown_ok = all(
-        r["dd_pct"] <= 50.0
-        for r in results
-    )
-
-    print("\n" + "=" * 76)
-    print("STAGE-0 DECISION")
-    print("=" * 76)
-    print(
-        "No stop is selected by this script."
-    )
-    print(
-        "Activity >=150 trades across all stops : "
-        f"{'PASS' if enough_activity else 'FAIL'}"
-    )
-    print(
-        "Positive PF + expectancy across all    : "
-        f"{'PASS' if positive_edge else 'FAIL'}"
-    )
-    print(
-        "At least one stop WR >=40%             : "
-        f"{'PASS' if reasonable_wr else 'FAIL'}"
-    )
-    print(
-        "Max DD <=50% across all stops          : "
-        f"{'PASS' if drawdown_ok else 'FAIL'}"
-    )
-
-    if (
-        enough_activity
-        and positive_edge
-        and reasonable_wr
-        and drawdown_ok
-    ):
-        print(
-            "DISCOVERY_STATUS: PASS — "
-            "eligible for walk-forward"
-        )
-    else:
-        print(
-            "DISCOVERY_STATUS: REJECT — "
-            "do NOT tune or optimize this family"
-        )
-
-    print("=" * 76)
+    print("\nSTAGE-0 DECISION PROTOCOL")
+    print("No stop is selected here. Apply the pre-registered activity/edge/DD gates externally.")
+    print("If the family fails the gates, close V22 without tuning symbols, sides, quantiles, or stops.")
+    print("If it passes, proceed to clean walk-forward validation with a locked hypothesis.")
 
 
 if __name__ == "__main__":
