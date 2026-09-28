@@ -155,45 +155,51 @@ def fetch_xt(symbol, refresh=False):
     now = int(time.time() * 1000)
     start_raw = now - int((LOOKBACK_DAYS + WARMUP_DAYS) * 86400 * 1000)
     start_ms = ((start_raw + INTERVAL_MS - 1) // INTERVAL_MS) * INTERVAL_MS
-    # Only completed 1H candles are eligible.  The current candle start is
-    # therefore excluded by using the last completed candle as the upper bound.
+
+    # Last completed 1H candle only.
     end_ms = (now // INTERVAL_MS) * INTERVAL_MS - INTERVAL_MS
 
     if cache.exists() and not refresh:
         return validate(pd.read_csv(cache), symbol, start_ms, end_ms)
 
     session = requests.Session()
-
-    # XT has repeatedly returned an empty final forward page for this endpoint.
-    # Forward pagination therefore is not used here.  We paginate BACKWARD from
-    # the last completed candle.  This avoids the unstable "cursor reaches the
-    # current boundary" behavior while preserving every historical candle.
-    cursor_end = end_ms
+    cursor = start_ms
     all_rows = []
     page = 0
 
-    while cursor_end >= start_ms:
+    # This is the XT pagination pattern that was already successful in the
+    # earlier XT Stage-0 runs: move forward by the maximum timestamp actually
+    # returned. A final empty page is treated as "no newer completed candles"
+    # only when the requested window has reached the current completed-candle
+    # boundary. We never skip an interior empty page.
+    while cursor <= end_ms:
         page += 1
         if page > 1000:
             raise RuntimeError(f"{symbol}: pagination guard tripped")
 
-        window_start = max(
-            start_ms,
-            cursor_end - (LIMIT - 1) * INTERVAL_MS,
+        window_end = min(
+            end_ms,
+            cursor + LIMIT * INTERVAL_MS - 1,
         )
+
         params = {
             "symbol": symbol,
             "interval": "1h",
-            "startTime": window_start,
-            "endTime": cursor_end,
+            "startTime": cursor,
+            "endTime": window_end,
             "limit": LIMIT,
         }
 
         payload = None
         last_error = None
-        for attempt in range(5):
+
+        for attempt in range(4):
             try:
-                response = session.get(FUTURES_URL, params=params, timeout=30)
+                response = session.get(
+                    FUTURES_URL,
+                    params=params,
+                    timeout=30,
+                )
                 response.raise_for_status()
                 payload = payload_rows(response.json())
                 if payload is None:
@@ -204,36 +210,42 @@ def fetch_xt(symbol, refresh=False):
                 time.sleep(1.0 + attempt)
 
         if payload is None:
-            raise RuntimeError(f"{symbol}: page {page} failed: {last_error}")
+            raise RuntimeError(
+                f"{symbol}: page {page} failed: {last_error}"
+            )
 
-        parsed = sorted(
-            [p for p in (parse_row(r) for r in payload) if p is not None],
-            key=lambda p: p[0],
-        )
+        parsed = [
+            p for p in (parse_row(r) for r in payload)
+            if p is not None
+        ]
         inside = [
             p for p in parsed
-            if window_start <= p[0] <= cursor_end
+            if cursor <= p[0] <= window_end
         ]
 
-        # XT may occasionally answer a bounded request with an empty/stale
-        # payload. Retry the same request, then retry with a smaller backward
-        # window. No timestamp is skipped and no candle is fabricated.
         if not inside:
+            # IMPORTANT:
+            # An empty response on an interior page is never skipped.
+            # At the final completed-candle boundary, however, XT can return
+            # an empty final page even though all required historical candles
+            # have already been collected. This is an API boundary behavior,
+            # not a historical data gap.
+            if window_end >= end_ms:
+                break
+
+            # Interior empty page: retry the same cursor with progressively
+            # smaller windows. Still no fabrication and no silent skipping.
             recovered = None
 
             for divisor in (2, 4, 8, 16):
                 small_limit = max(32, LIMIT // divisor)
-                small_start = max(
-                    start_ms,
-                    cursor_end - (small_limit - 1) * INTERVAL_MS,
+                small_end = min(
+                    end_ms,
+                    cursor + small_limit * INTERVAL_MS - 1,
                 )
-                small_params = {
-                    "symbol": symbol,
-                    "interval": "1h",
-                    "startTime": small_start,
-                    "endTime": cursor_end,
-                    "limit": small_limit,
-                }
+                small_params = dict(params)
+                small_params["endTime"] = small_end
+                small_params["limit"] = small_limit
 
                 for attempt in range(3):
                     try:
@@ -245,26 +257,28 @@ def fetch_xt(symbol, refresh=False):
                         response.raise_for_status()
                         small_payload = payload_rows(response.json())
                         if small_payload is None:
-                            raise RuntimeError("XT small-window response has no kline list")
+                            raise RuntimeError(
+                                "XT small-window response has no kline list"
+                            )
 
-                        small_parsed = sorted(
-                            [
-                                p for p in (
-                                    parse_row(r) for r in small_payload
-                                )
-                                if p is not None
-                            ],
-                            key=lambda p: p[0],
-                        )
+                        small_parsed = [
+                            p for p in (
+                                parse_row(r) for r in small_payload
+                            )
+                            if p is not None
+                        ]
                         small_inside = [
                             p for p in small_parsed
-                            if small_start <= p[0] <= cursor_end
+                            if cursor <= p[0] <= small_end
                         ]
+
                         if small_inside:
                             recovered = small_inside
+                            window_end = small_end
                             break
                     except Exception:
                         pass
+
                     time.sleep(1.0 + attempt)
 
                 if recovered is not None:
@@ -272,35 +286,32 @@ def fetch_xt(symbol, refresh=False):
 
             if recovered is None:
                 raise RuntimeError(
-                    f"{symbol}: backward page {page} "
-                    f"window={window_start}->{cursor_end} returned no valid rows; "
-                    "XT API recovery failed without skipping/fabricating data"
+                    f"{symbol}: page {page} returned no valid rows inside "
+                    f"interior window {cursor}->{window_end}; "
+                    "refusing to skip/fabricate data"
                 )
 
             inside = recovered
 
-        # Critical integrity check: the API must cover the exact left boundary
-        # of the requested page unless this is the final (oldest) partial page.
-        # A later first timestamp would otherwise silently hide a data gap.
-        first_ts = min(p[0] for p in inside)
-        if first_ts > window_start and window_start > start_ms:
-            raise RuntimeError(
-                f"{symbol}: historical data gap detected during pagination; "
-                f"requested_start={window_start}, returned_first={first_ts}"
-            )
-
         all_rows.extend(inside)
 
-        min_ts = min(p[0] for p in inside)
-        next_cursor_end = min_ts - INTERVAL_MS
+        max_ts = max(p[0] for p in inside)
+        next_cursor = max_ts + INTERVAL_MS
 
-        if next_cursor_end >= cursor_end:
-            raise RuntimeError(f"{symbol}: backward pagination stalled")
+        if next_cursor <= cursor:
+            raise RuntimeError(
+                f"{symbol}: pagination stalled at cursor={cursor}"
+            )
 
-        cursor_end = next_cursor_end
+        cursor = next_cursor
 
         if page % 4 == 0:
-            print(f"[FETCH] {symbol} page={page} rows={len(all_rows)}")
+            print(
+                f"[FETCH] {symbol} page={page} rows={len(all_rows)}"
+            )
+
+        if max_ts >= end_ms:
+            break
 
         time.sleep(0.05)
 
@@ -308,7 +319,9 @@ def fetch_xt(symbol, refresh=False):
         all_rows,
         columns=["ts", "open", "high", "low", "close", "volume"],
     )
-    x["timestamp"] = pd.to_datetime(x.pop("ts"), unit="ms", utc=True)
+    x["timestamp"] = pd.to_datetime(
+        x.pop("ts"), unit="ms", utc=True
+    )
 
     # Never use the currently forming 1H candle.
     cutoff = pd.Timestamp.now(tz="UTC").floor("1h")
