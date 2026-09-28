@@ -140,6 +140,11 @@ def validate(df, symbol, start_ms, end_ms):
     if len(x) < minimum_rows:
         raise RuntimeError(f"{symbol}: only {len(x)} rows; expected near full history")
 
+    if len(x) >= 2:
+        deltas = x["timestamp"].diff().dropna().dt.total_seconds().div(3600.0)
+        if (deltas <= 0).any():
+            raise RuntimeError(f"{symbol}: non-monotonic timestamp sequence")
+
     return x.reset_index(drop=True)
 
 
@@ -195,7 +200,60 @@ def fetch_xt(symbol, refresh=False):
         inside = [p for p in parsed if cursor <= p[0] <= window_end]
 
         if not inside:
-            raise RuntimeError(f"{symbol}: page {page} returned no valid rows")
+            # XT can occasionally return an empty/stale page for a large
+            # requested window even though later candles exist. Do NOT
+            # fabricate candles and do NOT silently skip the interval.
+            # Retry the exact cursor with progressively smaller windows.
+            recovered = None
+            for divisor in (2, 4, 8):
+                retry_end = min(
+                    end_ms,
+                    cursor + max(1, LIMIT // divisor) * INTERVAL_MS - 1,
+                )
+                if retry_end < cursor:
+                    continue
+
+                retry_params = dict(params)
+                retry_params["endTime"] = retry_end
+
+                for attempt in range(3):
+                    try:
+                        response = session.get(
+                            FUTURES_URL,
+                            params=retry_params,
+                            timeout=30,
+                        )
+                        response.raise_for_status()
+                        retry_payload = payload_rows(response.json())
+                        if retry_payload is None:
+                            raise RuntimeError("XT retry response contains no kline list")
+
+                        retry_parsed = [
+                            p for p in (parse_row(r) for r in retry_payload)
+                            if p is not None
+                        ]
+                        retry_inside = [
+                            p for p in retry_parsed
+                            if cursor <= p[0] <= retry_end
+                        ]
+
+                        if retry_inside:
+                            recovered = (retry_inside, retry_end)
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(1.0 + attempt)
+
+                if recovered is not None:
+                    break
+
+            if recovered is None:
+                raise RuntimeError(
+                    f"{symbol}: page {page} returned no valid rows after "
+                    "pagination retries; refusing to skip/fabricate data"
+                )
+
+            inside, window_end = recovered
 
         all_rows.extend(inside)
         max_ts = max(p[0] for p in inside)
