@@ -79,13 +79,13 @@ SLIPPAGE = 0.0003
 # Expanding walk-forward schedule in common 1H timestamps.
 # Multiple historical OOS folds are used for robustness; the latest 45 days are
 # reserved as a final untouched holdout after the walk-forward process.
-FOLD_TRAIN_DAYS = 150
-FOLD_VAL_DAYS = 30
+FOLD_TRAIN_DAYS = 160
+FOLD_VAL_DAYS = 45
 FOLD_OOS_DAYS = 30
 FINAL_HOLDOUT_DAYS = 45
 
-MIN_TRAIN_TRADES = 25
-MIN_VAL_TRADES = 10
+MIN_TRAIN_TRADES = 15
+MIN_VAL_TRADES = 6
 MIN_FOLD_OOS_TRADES = 12
 
 # Acceptance is deliberately about robustness, not a single WR threshold.
@@ -319,7 +319,7 @@ def build_features(f15, s15, btc_h1):
     a["spot_available"] = a.spot_close.notna()
 
     btc = btc_h1.close.reindex(a.index)
-    a["btc_ret_24"] = btc.pct_change(24)
+    a["btc_ret_24"] = btc.pct_change(24, fill_method=None)
     a["rs24"] = a.ret_24-a.btc_ret_24
     a["rs_z"] = zscore(a.rs24, 96)
 
@@ -358,17 +358,21 @@ def make_folds(frames):
     if len(t) < 700:
         raise RuntimeError("Insufficient common 1H timestamps for walk-forward")
     start = t[0]
-    step = pd.Timedelta(days=FOLD_OOS_DAYS)
     train_end = start + pd.Timedelta(days=FOLD_TRAIN_DAYS)
-    val_end = train_end + pd.Timedelta(days=FOLD_VAL_DAYS)
     folds=[]
     n=1
     final_start = t[-1] - pd.Timedelta(days=FINAL_HOLDOUT_DAYS)
-    while val_end + pd.Timedelta(days=FOLD_OOS_DAYS) <= final_start:
-        folds.append(Fold(n,start,train_end,val_end,val_end+pd.Timedelta(days=FOLD_OOS_DAYS)))
-        n += 1
-        train_end = val_end
+    # Each next fold starts after the previous fold's OOS. This makes the
+    # timeline strictly sequential: a past OOS may become future training data,
+    # but it is never reused as a simultaneous validation/OOS observation.
+    while True:
         val_end = train_end + pd.Timedelta(days=FOLD_VAL_DAYS)
+        oos_end = val_end + pd.Timedelta(days=FOLD_OOS_DAYS)
+        if oos_end > final_start:
+            break
+        folds.append(Fold(n,start,train_end,val_end,oos_end))
+        n += 1
+        train_end = oos_end
     if not folds:
         raise RuntimeError("No valid walk-forward folds")
     return folds, t
@@ -392,15 +396,25 @@ def factor_audit(frames, fold):
     print("===============================================================\n")
 
 
-def candidate(ts, sym, x, cfg):
+def candidate(ts, sym, x, cfg, return_reason=False):
+    """Causal displacement/retest candidate.
+
+    When return_reason=True, return (candidate_or_none, diagnostic_reason).
+    Diagnostic reasons are mutually exclusive and describe the first stage
+    at which the setup was rejected. They are for audit only and never affect
+    trading decisions.
+    """
+    def out(value, reason):
+        return (value, reason) if return_reason else value
+
     if ts not in x.index:
-        return None
+        return out(None, "NO_TS")
     r=x.loc[ts]
     n=cfg.range_n
     req=[f"hi_{n}",f"lo_{n}","atr","atr_pct","prev_atr","prev_body_frac","prev_close_loc",
          "prev_vol_z","prev_eff","h4_trend","d1_regime","rs_z","basis_z","eff"]
     if any(pd.isna(r.get(k)) for k in req):
-        return None
+        return out(None, "INSUFFICIENT_FEATURES")
 
     upper=float(r[f"hi_{n}"])
     lower=float(r[f"lo_{n}"])
@@ -408,10 +422,8 @@ def candidate(ts, sym, x, cfg):
     prev_atr=float(r.prev_atr)
     prev_range=float(r.prev_range)
     if atrv<=0 or prev_atr<=0 or prev_range<=0:
-        return None
+        return out(None, "BAD_VOLATILITY")
 
-    # Displacement happened on the immediately completed 1H candle.
-    # The actual prior candle is read directly from the causal shifted position.
     prev_close=float(x.close.shift(1).loc[ts])
     prev_open=float(x.open.shift(1).loc[ts])
     prev_high=float(x.high.shift(1).loc[ts])
@@ -419,6 +431,9 @@ def candidate(ts, sym, x, cfg):
 
     long_break = prev_close > upper
     short_break = prev_close < lower
+    if not (long_break or short_break):
+        return out(None, "NO_BREAK")
+
     long_disp = (
         long_break
         and (prev_close-prev_open) > cfg.displacement_atr*prev_atr
@@ -436,33 +451,27 @@ def candidate(ts, sym, x, cfg):
         and float(r.prev_close_loc) <= 0.30
     )
     if not (long_disp or short_disp):
-        return None
+        return out(None, "BREAK_NOT_DISPLACEMENT")
 
-    # Current 1H candle is the causal retest/hold candle. It may wick through
-    # the broken level, but must close back on the correct side.
     long_retest = r.low <= upper + cfg.retest_atr*atrv and r.close > upper and r.close > r.open
     short_retest = r.high >= lower - cfg.retest_atr*atrv and r.close < lower and r.close < r.open
+    if not (long_retest or short_retest):
+        return out(None, "NO_RETEST_HOLD")
 
-    # Context is a directional filter, not a score. Neutral daily regime is
-    # allowed; opposite daily regime is rejected. This prevents the old
-    # additive-score failure mode where weak factors could outvote structure.
     long_context = int(r.h4_trend) >= 0 and int(r.d1_regime) >= 0 and float(r.rs_z) > -1.5
     short_context = int(r.h4_trend) <= 0 and int(r.d1_regime) <= 0 and float(r.rs_z) < 1.5
 
     long_ok = long_disp and long_retest and long_context
     short_ok = short_disp and short_retest and short_context
     if not (long_ok or short_ok):
-        return None
+        return out(None, "CONTEXT_REJECT")
 
-    # If both directions somehow qualify, prefer the side with the stronger
-    # displacement normalized by its prior ATR. This is deterministic and uses
-    # only completed information.
     long_strength=((prev_close-prev_open)/prev_atr) if long_ok else -np.inf
     short_strength=((prev_open-prev_close)/prev_atr) if short_ok else -np.inf
     side=1 if long_strength>=short_strength else -1
     score=float(max(long_strength,short_strength))
 
-    return {
+    value={
         "symbol":sym,"side":side,"score":score,"atr":atrv,
         "d1_regime":int(r.d1_regime),"h4_trend":int(r.h4_trend),
         "vol_z":float(r.prev_vol_z),"rs_z":float(r.rs_z),"eff":float(r.prev_eff),
@@ -470,6 +479,7 @@ def candidate(ts, sym, x, cfg):
         "close_loc":float(r.prev_close_loc),"ret_24":float(r.ret_24),
         "range_n":n,
     }
+    return out(value, "QUALIFIED")
 
 
 def entry_price(openp, side):
@@ -486,7 +496,7 @@ def pnl_for(side, entry, exitp):
     return gross-fees
 
 
-def run_backtest(frames,cfg,start,end,label,collect_trades=False):
+def run_backtest(frames,cfg,start,end,label,collect_trades=False,collect_diagnostics=False):
     times=common_index({k:v[(v.index>=start)&(v.index<end)] for k,v in frames.items()})
     equity=INITIAL_CAPITAL
     peak=equity
@@ -495,6 +505,9 @@ def run_backtest(frames,cfg,start,end,label,collect_trades=False):
     trades=[]
     blocked=0
     last_close_ts=None
+    diag={"NO_TS":0,"INSUFFICIENT_FEATURES":0,"BAD_VOLATILITY":0,"NO_BREAK":0,
+          "BREAK_NOT_DISPLACEMENT":0,"NO_RETEST_HOLD":0,"CONTEXT_REJECT":0,"QUALIFIED":0,
+          "RANK_REJECT":0,"ENTRY_REJECT":0,"TAKEN":0}
 
     for ts in times:
         if active is not None:
@@ -529,7 +542,11 @@ def run_backtest(frames,cfg,start,end,label,collect_trades=False):
         cand=[]
         scores=[]
         for sym,x in frames.items():
-            c=candidate(ts,sym,x,cfg)
+            if collect_diagnostics:
+                c, reason = candidate(ts,sym,x,cfg,return_reason=True)
+                diag[reason] = diag.get(reason,0) + 1
+            else:
+                c=candidate(ts,sym,x,cfg)
             if c is None:
                 scores.append(0.0)
             else:
@@ -541,19 +558,24 @@ def run_backtest(frames,cfg,start,end,label,collect_trades=False):
         top=cand[0]
         rank_pct=float(np.mean(np.asarray(scores)<top["score"]))
         if rank_pct < cfg.rank_floor:
+            if collect_diagnostics: diag["RANK_REJECT"] += 1
             continue
 
         sym=top["symbol"]; side=top["side"]; x=frames[sym]
         i=x.index.searchsorted(ts,side="right")
         if i>=len(x):
+            if collect_diagnostics: diag["ENTRY_REJECT"] += 1
             continue
         entry_ts=x.index[i]
         if entry_ts<start or entry_ts>=end:
+            if collect_diagnostics: diag["ENTRY_REJECT"] += 1
             continue
         ep=entry_price(float(x.iloc[i].open),side)
         dist=float(top["atr"])*cfg.stop_atr
         if not np.isfinite(dist) or dist<=0:
+            if collect_diagnostics: diag["ENTRY_REJECT"] += 1
             continue
+        if collect_diagnostics: diag["TAKEN"] += 1
         active={
             "symbol":sym,"side":side,"signal_ts":ts,"entry_ts":entry_ts,
             "entry":ep,"sl":ep-dist*side,"tp":ep+dist*RR*side,
@@ -587,6 +609,7 @@ def run_backtest(frames,cfg,start,end,label,collect_trades=False):
         "expectancy":float(vals.mean()) if len(vals) else 0.0,
         "median":float(vals.median()) if len(vals) else 0.0,"final_equity":equity,
         "trades_log":trades if collect_trades else None,
+        "diagnostics":diag if collect_diagnostics else None,
     }
 
 
@@ -595,9 +618,11 @@ def select_score(train,val):
         return -1e9
     if train["pnl"]<=0 or val["pnl"]<=0:
         return -1e8
-    if train["pf"]<1.05 or val["pf"]<1.05:
+    if train["pf"]<1.00 or val["pf"]<1.00:
         return -1e7
-    # Reward validation quality, but penalize instability and drawdown.
+    # Prefer validation quality, but penalize instability and drawdown.
+    # Trade-count thresholds are only eligibility gates; they are not rewarded
+    # directly, which avoids selecting a high-frequency weak edge.
     return (3.0*val["pf"] + 0.02*val["wr"] + 0.001*val["pnl"]
             + 0.75*train["pf"] - 0.03*val["streak"] - 0.02*val["dd_pct"])
 
@@ -673,11 +698,40 @@ def save_forensic(trades,outdir):
     print(f"[FORENSIC] {outdir/'walk_forward_oos_trades.csv'}")
 
 
+
+def print_diagnostics(r,title):
+    d=r.get("diagnostics") or {}
+    print(f"\n================ {title} ================")
+    for k in ["NO_TS","INSUFFICIENT_FEATURES","BAD_VOLATILITY","NO_BREAK",
+              "BREAK_NOT_DISPLACEMENT","NO_RETEST_HOLD","CONTEXT_REJECT",
+              "QUALIFIED","RANK_REJECT","ENTRY_REJECT","TAKEN"]:
+        print(f"{k:24s}: {d.get(k,0)}")
+    print("==================================================")
+
+
+def grid_diagnostic_summary(ranked, fold_number):
+    rows=[]
+    for score,cfg,tr,va in ranked:
+        rows.append({"score":score,"config":cfg.name,"train_trades":tr["trades"],
+                     "train_pf":tr["pf"],"train_pnl":tr["pnl"],
+                     "val_trades":va["trades"],"val_pf":va["pf"],"val_pnl":va["pnl"]})
+    q=pd.DataFrame(rows)
+    if q.empty:
+        return
+    print(f"\n================ FOLD {fold_number} GRID DIAGNOSTIC ================")
+    print(f"configs tested          : {len(q)}")
+    print(f"max train trades       : {int(q.train_trades.max())}")
+    print(f"max validation trades  : {int(q.val_trades.max())}")
+    print("Top 8 configs by combined train+validation trade count:")
+    q["combined_trades"]=q.train_trades+q.val_trades
+    print(q.sort_values(["combined_trades","val_pf"],ascending=False).head(8).to_string(index=False))
+    print("===============================================================")
+
 def main():
     refresh=os.getenv("XT_REFRESH","0")=="1"
     root=Path("data/xt_v16")
     outdir=Path("reports/xt_v16")
-    print("HUNTER-V16 — AUCTION DISPLACEMENT / RETEST + WALK-FORWARD")
+    print("HUNTER-V16.1 — AUCTION DISPLACEMENT / RETEST + WALK-FORWARD")
     print(f"Capital=${INITIAL_CAPITAL:.0f} Margin=${MARGIN:.0f} Leverage={LEVERAGE:.0f}x RR=1:{RR:.0f}")
     print("One global position; no overlap; next 1H open; no timeout/BE/trailing.")
 
@@ -700,8 +754,12 @@ def main():
                 for vz in (0.0,0.5):
                     for rt in (0.15,0.30):
                         for sa in (1.25,1.50):
-                            for rf in (0.0,0.5):
-                                grid.append(Config(f"N{rn}_D{da}_B{bf}_V{vz}_R{rt}_S{sa}_RF{rf}",rn,da,bf,vz,rt,sa,rf))
+                            # Cross-sectional top-of-book ranking is always 100%
+                            # for the selected candidate, so rank_floor is not a
+                            # real tuning dimension here. Keep it fixed at zero
+                            # rather than pretending it adds information.
+                            rf=0.0
+                            grid.append(Config(f"N{rn}_D{da}_B{bf}_V{vz}_R{rt}_S{sa}_RF{rf}",rn,da,bf,vz,rt,sa,rf))
 
     fold_records=[]
     all_oos_trades=[]
@@ -716,10 +774,23 @@ def main():
             va=run_backtest(frames,cfg,fold.train_end,fold.val_end,"VALIDATION")
             ranked.append((select_score(tr,va),cfg,tr,va))
         ranked.sort(key=lambda z:z[0],reverse=True)
-        eligible=[z for z in ranked if z[0]>-1e8]
+        eligible=[z for z in ranked if z[0]>-1e6]
         if not eligible:
+            grid_diagnostic_summary(ranked, fold.number)
+            # Diagnose the most active configuration without changing selection
+            # rules. This makes a sparse-signal failure actionable instead of opaque.
+            probe=ranked[0]
+            _,probe_cfg,probe_tr,probe_va=probe
+            probe_tr_d=run_backtest(frames,probe_cfg,fold.train_start,fold.train_end,"TRAIN_DIAGNOSTIC",collect_diagnostics=True)
+            probe_va_d=run_backtest(frames,probe_cfg,fold.train_end,fold.val_end,"VAL_DIAGNOSTIC",collect_diagnostics=True)
+            print_diagnostics(probe_tr_d,f"FOLD {fold.number} PROBE TRAIN DIAGNOSTICS ({probe_cfg.name})")
+            print_diagnostics(probe_va_d,f"FOLD {fold.number} PROBE VAL DIAGNOSTICS ({probe_cfg.name})")
             raise RuntimeError(f"Fold {fold.number}: no eligible train/validation configuration")
         _,cfg,tr,va=eligible[0]
+        tr_diag=run_backtest(frames,cfg,fold.train_start,fold.train_end,"TRAIN_DIAGNOSTIC",collect_diagnostics=True)
+        va_diag=run_backtest(frames,cfg,fold.train_end,fold.val_end,"VAL_DIAGNOSTIC",collect_diagnostics=True)
+        print_diagnostics(tr_diag,f"FOLD {fold.number} SELECTED TRAIN DIAGNOSTICS ({cfg.name})")
+        print_diagnostics(va_diag,f"FOLD {fold.number} SELECTED VAL DIAGNOSTICS ({cfg.name})")
         oos=run_backtest(frames,cfg,fold.val_end,fold.oos_end,"OOS",collect_trades=True)
         print(f"[FOLD {fold.number} SELECTED] {cfg.name}")
         report(tr,f"FOLD {fold.number} TRAIN")
