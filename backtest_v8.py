@@ -198,6 +198,14 @@ def fetch_xt(symbol, url, cache, refresh=False, futures=True):
         parsed = [p for p in (parse_row(r, spot=not futures) for r in payload) if p is not None]
         inside = [p for p in parsed if cursor <= p[0] <= window_end]
         if not inside:
+            # XT may legitimately return an empty final window when the requested
+            # end reaches the present but the newest completed 15m candle is
+            # earlier than that window. This is normal tail behavior, not a
+            # pagination failure. Empty windows before the requested tail remain
+            # fatal because they could indicate a real historical data hole.
+            if window_end >= end_ms:
+                print(f"[FETCH] {'FUT' if futures else 'SPOT'} {symbol} page={page} empty final window; stopping at last available candle")
+                break
             raise RuntimeError(f"{symbol}: page {page} returned no rows in [{cursor},{window_end}]")
         all_rows.extend(inside)
         mx = max(p[0] for p in inside)
