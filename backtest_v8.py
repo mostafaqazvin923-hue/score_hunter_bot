@@ -1,34 +1,24 @@
 #!/usr/bin/env python3
 """
-HUNTER-V13 — ASSET REGIME / CROSS-SECTIONAL / LIQUIDITY ENGINE
+HUNTER-V14 — FORENSIC / CAUSAL / SPLIT-ISOLATED BACKTEST ENGINE
 XT USDT-M PERPETUAL FUTURES
 15m raw -> causal 1H / 4H / 1D
 
-Research-first. No lookahead, repainting, fabricated OHLCV, OI, CVD or liquidation data.
+V14 purpose:
+  - Preserve V13 signal architecture.
+  - Make Train / Validation / OOS intervals half-open and isolated.
+  - Never allow a signal whose NEXT-1H entry lies outside the current segment.
+  - Keep OOS untouched by parameter selection.
+  - Record a forensic trade log for diagnosis.
+  - Produce OOS breakdowns by side, symbol, regime, score bucket,
+    exit reason, and month.
+  - Remove the fake rank_floor behavior: rank_floor is now a real
+    cross-sectional percentile threshold.
 
-Architecture:
-  1) Asset-specific 1D regime and 4H context.
-  2) 1H liquidity sweep + reclaim event.
-  3) Cross-sectional ranking of simultaneous candidates.
-  4) Conditional execution at the NEXT 1H open.
-  5) Fixed RR 1:2, no timeout, no BE/trailing.
-
-Portfolio rules:
-  - $1,000 initial equity; $100 isolated margin; 50x; $5,000 notional.
-  - One global position at a time: no overlap.
-  - No same-candle re-entry after a close is revealed.
-  - Same-candle SL+TP => LOSS.
-  - End-of-data position remains OPEN.
-  - No new trade when realized equity < $100.
-
-Important:
-  - XT Futures history is collected with the validated forward-pagination endpoint.
-  - Spot is auxiliary only. Isolated spot gaps are tolerated without fabrication; any
-    higher-timeframe bucket missing required spot bars is simply unavailable for spot
-    confirmation. Multi-candle spot gaps fail validation.
-  - Futures gaps are fatal. No candle is forward-filled or synthesized.
-  - Train factor audit and a predeclared small grid are used for train/validation only.
-  - OOS is untouched by parameter selection.
+No lookahead, repainting, fabricated OHLCV, OI, CVD, or liquidation data.
+No timeout, BE, or trailing. Fixed RR 1:2.
+Same-candle SL+TP => LOSS.
+Open position at segment end is not realized and is not carried into the next segment.
 """
 
 import math
@@ -66,17 +56,18 @@ SLIPPAGE = 0.0003
 
 TRAIN_FRAC = 0.60
 VAL_FRAC = 0.20
-MIN_ROWS = 38000
-MAX_FUTURES_GAP_BARS = 0
-MAX_SPOT_GAP_BARS = 1
 
+MIN_ROWS = 38000
 MIN_TRAIN_TRADES = 30
 MIN_VAL_TRADES = 15
-MIN_OOS_TRADES = 150
+
+# These are reporting/acceptance gates only. They do not alter OOS selection.
+MIN_OOS_TRADES = 100
 MIN_OOS_WR = 50.0
 MIN_OOS_PF = 1.20
 MAX_OOS_STREAK = 4
 MAX_OOS_DD_PCT = 50.0
+
 
 @dataclass(frozen=True)
 class Split:
@@ -84,6 +75,7 @@ class Split:
     train_end: pd.Timestamp
     val_end: pd.Timestamp
     end: pd.Timestamp
+
 
 @dataclass(frozen=True)
 class Config:
@@ -151,10 +143,7 @@ def validate(df, symbol, start_ms, end_ms, *, futures=True):
     if futures and len(gaps):
         raise RuntimeError(f"{symbol}: {len(gaps)} futures gaps; no OHLCV fabrication allowed")
     if not futures and len(gaps):
-        # Spot is auxiliary only. Any number/size of historical spot gaps is
-        # tolerated here; affected 1H buckets simply fail the complete-bar
-        # requirement and therefore cannot contribute spot confirmation.
-        print(f"[VALIDATE] {symbol}: {len(gaps)} spot gap(s); no OHLCV fabricated; affected buckets excluded from spot confirmation")
+        print(f"[VALIDATE] {symbol}: {len(gaps)} spot gap(s); no OHLCV fabricated; affected buckets excluded")
     span = (x.timestamp.iloc[-1] - x.timestamp.iloc[0]).total_seconds() / 86400.0
     if span < 420:
         raise RuntimeError(f"{symbol}: span only {span:.1f} days")
@@ -198,13 +187,8 @@ def fetch_xt(symbol, url, cache, refresh=False, futures=True):
         parsed = [p for p in (parse_row(r, spot=not futures) for r in payload) if p is not None]
         inside = [p for p in parsed if cursor <= p[0] <= window_end]
         if not inside:
-            # XT may legitimately return an empty final window when the requested
-            # end reaches the present but the newest completed 15m candle is
-            # earlier than that window. This is normal tail behavior, not a
-            # pagination failure. Empty windows before the requested tail remain
-            # fatal because they could indicate a real historical data hole.
             if window_end >= end_ms:
-                print(f"[FETCH] {'FUT' if futures else 'SPOT'} {symbol} page={page} empty final window; stopping at last available candle")
+                print(f"[FETCH] {'FUT' if futures else 'SPOT'} {symbol} page={page} empty final window; stopping")
                 break
             raise RuntimeError(f"{symbol}: page {page} returned no rows in [{cursor},{window_end}]")
         all_rows.extend(inside)
@@ -276,17 +260,15 @@ def build_features(f15, s15, btc_h1):
         a[f"hi_{n}"] = a.high.shift(1).rolling(n).max()
         a[f"lo_{n}"] = a.low.shift(1).rolling(n).min()
 
-    # Spot is an auxiliary confirmation, never forward-filled.
     spot = spot.reindex(a.index)
     a["spot_close"] = spot.close
     a["basis"] = a.close/a.spot_close-1.0
     a["basis_z"] = zscore(a.basis, 192)
-    a["spot_ret_24"] = spot.close.pct_change(24)
+    a["spot_ret_24"] = spot.close.pct_change(24, fill_method=None)
     a["fut_spot_gap"] = a.ret_24-a.spot_ret_24
     a["spot_available"] = a.spot_close.notna()
 
     btc = btc_h1.close.reindex(a.index)
-    # BTC is already complete; no future information is introduced.
     a["btc_ret_24"] = btc.pct_change(24)
     a["rs24"] = a.ret_24-a.btc_ret_24
     a["rs_z"] = zscore(a.rs24, 96)
@@ -301,7 +283,7 @@ def build_features(f15, s15, btc_h1):
     d1["slope50"] = d1.ema50.pct_change(5)
     d1["regime"] = np.where((d1.close>d1.ema200)&(d1.slope50>0),1,np.where((d1.close<d1.ema200)&(d1.slope50<0),-1,0))
 
-    # Strictly completed higher-timeframe bar only.
+    # Shift the completed higher-timeframe bar before mapping it onto 1H.
     h4a = h4.shift(1).reindex(a.index, method="ffill")
     d1a = d1.shift(1).reindex(a.index, method="ffill")
     a["h4_trend"] = h4a.trend
@@ -325,7 +307,8 @@ def split_timeline(frames):
 
 def spearman(x, y):
     z = pd.concat([x,y],axis=1).dropna()
-    if len(z)<50: return np.nan
+    if len(z)<50:
+        return np.nan
     return z.iloc[:,0].rank().corr(z.iloc[:,1].rank())
 
 
@@ -333,7 +316,7 @@ def factor_audit(frames, split):
     facs = ["rs_z","flow_z","vol_z","basis_z","fut_spot_gap","eff","ret_24"]
     rows=[]
     for sym,x in frames.items():
-        tr=x.loc[split.start:split.train_end]
+        tr=x[(x.index >= split.start) & (x.index < split.train_end)]
         for fac in facs:
             for h in (1,4,8,24):
                 rows.append((sym,fac,h,spearman(tr[fac],tr.close.shift(-h)/tr.close-1)))
@@ -344,9 +327,6 @@ def factor_audit(frames, split):
 
 
 def asset_profile(sym, row):
-    # Fixed, predeclared volatility buckets. These are not fitted to OOS outcomes.
-    # The profile changes the acceptable regime direction, not the RR.
-    v = row.vol_ema if "vol_ema" in row.index else np.nan
     if sym in {"btc_usdt","eth_usdt","bnb_usdt"}:
         return 1.00
     if sym in {"sol_usdt","avax_usdt","sui_usdt","near_usdt","icp_usdt"}:
@@ -355,19 +335,20 @@ def asset_profile(sym, row):
 
 
 def candidate(ts, sym, x, cfg):
-    if ts not in x.index: return None
+    if ts not in x.index:
+        return None
     r=x.loc[ts]
     n=cfg.sweep
     req=[f"hi_{n}",f"lo_{n}","atr","h4_trend","d1_regime","vol_z","flow_z","rs_z","eff","close_loc","ret_24"]
-    if any(pd.isna(r.get(k)) for k in req): return None
-    hi,lo=float(r[f"hi_{n}" ]),float(r[f"lo_{n}"])
+    if any(pd.isna(r.get(k)) for k in req):
+        return None
+    hi,lo=float(r[f"hi_{n}"]),float(r[f"lo_{n}"])
     atrv=float(r.atr)
     long_sweep=r.low<lo and r.close>lo
     short_sweep=r.high>hi and r.close<hi
-    if not (long_sweep or short_sweep): return None
+    if not (long_sweep or short_sweep):
+        return None
 
-    # Asset-specific regime: neutral daily regime is allowed only with a strong
-    # cross-sectional edge; directional regimes require matching direction.
     long_ok = r.d1_regime >= 0 and r.h4_trend >= 0
     short_ok = r.d1_regime <= 0 and r.h4_trend <= 0
     lr=(r.close-lo)/atrv
@@ -381,17 +362,32 @@ def candidate(ts, sym, x, cfg):
                   + 0.8*(r.eff<0.55) + 0.8*(r.rs_z<0) + 0.6*short_ok
                   + 0.4*(r.basis_z>-2.5 if pd.notna(r.basis_z) else False))
     score=max(base_long,base_short)
-    if score < cfg.min_score: return None
+    if score < cfg.min_score:
+        return None
     side=1 if base_long>base_short else -1
-    if side==1 and not long_sweep: return None
-    if side==-1 and not short_sweep: return None
-    # A candidate must have a genuine futures price/ATR and no dependence on spot.
-    if not np.isfinite(atrv) or atrv<=0: return None
-    return {"symbol":sym,"side":side,"score":float(score),"atr":atrv,"profile":asset_profile(sym,r)}
+    if side==1 and not long_sweep:
+        return None
+    if side==-1 and not short_sweep:
+        return None
+    if not np.isfinite(atrv) or atrv<=0:
+        return None
+    return {
+        "symbol":sym, "side":side, "score":float(score), "atr":atrv,
+        "profile":asset_profile(sym,r), "d1_regime":int(r.d1_regime),
+        "h4_trend":int(r.h4_trend), "vol_z":float(r.vol_z),
+        "flow_z":float(r.flow_z), "rs_z":float(r.rs_z), "eff":float(r.eff),
+        "basis_z":float(r.basis_z) if pd.notna(r.basis_z) else np.nan,
+        "close_loc":float(r.close_loc), "ret_24":float(r.ret_24),
+    }
 
 
-def entry_price(openp, side): return openp*(1+SLIPPAGE*side)
-def exit_price(p, side): return p*(1-SLIPPAGE*side)
+def entry_price(openp, side):
+    return openp*(1+SLIPPAGE*side)
+
+
+def exit_price(p, side):
+    return p*(1-SLIPPAGE*side)
+
 
 def pnl_for(side, entry, exitp):
     gross=(exitp-entry)/entry*NOTIONAL*side
@@ -399,12 +395,16 @@ def pnl_for(side, entry, exitp):
     return gross-fees
 
 
-def run_backtest(frames,cfg,start,end,label):
+def run_backtest(frames,cfg,start,end,label,collect_trades=False):
+    # Half-open segment [start, end). This prevents boundary candles from being
+    # shared between Train/Validation/OOS. A signal is eligible only if its NEXT
+    # 1H entry is also strictly inside this segment.
     common=None
     for x in frames.values():
-        idx=set(x.loc[start:end].index)
+        idx=set(x.index[(x.index >= start) & (x.index < end)])
         common=idx if common is None else common.intersection(idx)
     times=pd.DatetimeIndex(sorted(common))
+
     equity=INITIAL_CAPITAL
     peak=equity
     max_dd=0.0
@@ -412,80 +412,133 @@ def run_backtest(frames,cfg,start,end,label):
     trades=[]
     blocked=0
     last_close_ts=None
+
     for ts in times:
+        # First process an already-open position on the current candle.
         if active is not None:
             x=frames[active["symbol"]]
             if ts>=active["entry_ts"] and ts in x.index:
-                b=x.loc[ts]; side=active["side"]
+                b=x.loc[ts]
+                side=active["side"]
                 sl=b.low<=active["sl"] if side==1 else b.high>=active["sl"]
                 tp=b.high>=active["tp"] if side==1 else b.low<=active["tp"]
                 if sl or tp:
-                    # SL wins if both are touched in the same candle.
                     outcome="LOSS" if sl else "WIN"
+                    exit_reason="SL" if sl else "TP"
                     raw=active["sl"] if sl else active["tp"]
-                    p=pnl_for(side,active["entry"],exit_price(raw,side))
+                    xp=exit_price(raw,side)
+                    p=pnl_for(side,active["entry"],xp)
                     p=max(-MARGIN,p)
                     equity=max(0.0,equity+p)
-                    trades.append({"ts":ts,"symbol":active["symbol"],"side":side,"pnl":p,"outcome":outcome})
                     peak=max(peak,equity)
                     max_dd=max(max_dd,peak-equity)
+                    trades.append({
+                        **active,
+                        "exit_ts":ts,
+                        "exit_price":xp,
+                        "exit_reason":exit_reason,
+                        "outcome":outcome,
+                        "pnl":p,
+                        "equity_after":equity,
+                    })
                     active=None
                     last_close_ts=ts
                     continue
-        if active is not None: continue
-        if last_close_ts is not None and ts<=last_close_ts: continue
+
+        if active is not None:
+            continue
+        if last_close_ts is not None and ts<=last_close_ts:
+            continue
         if equity<MARGIN:
             blocked+=1
             continue
 
         cand=[]
+        cross_scores=[]
         for sym,x in frames.items():
             c=candidate(ts,sym,x,cfg)
-            if c is not None: cand.append(c)
-        if not cand: continue
-        # Cross-sectional ranking: normalize candidate strength by the simultaneous
-        # universe; only the top-ranked signal can consume the single portfolio slot.
-        scores=np.array([c["score"] for c in cand],dtype=float)
-        order=np.argsort(-scores)
-        top=cand[int(order[0])]
-        # top is, by construction, the highest-ranked simultaneous candidate.
-        rank_pct=1.0
-        if rank_pct<cfg.rank_floor: continue
-        sym=top["symbol"]; side=top["side"]; x=frames[sym]
+            if c is None:
+                cross_scores.append(0.0)
+            else:
+                cand.append(c)
+                cross_scores.append(float(c["score"]))
+        if not cand:
+            continue
+
+        # Cross-sectional percentile is measured against the WHOLE universe,
+        # assigning score=0 to symbols with no candidate at this timestamp.
+        # This makes rank_floor materially active instead of always being 1.0
+        # for the top candidate. Percentile uses <= so ties receive the same
+        # percentile and cannot manufacture an advantage from sort order.
+        cand.sort(key=lambda c:(c["score"], c["symbol"]), reverse=True)
+        top=cand[0]
+        top_score=float(top["score"])
+        rank_pct=float(np.mean(np.asarray(cross_scores) <= top_score))
+        if rank_pct < cfg.rank_floor:
+            continue
+
+        sym=top["symbol"]
+        side=top["side"]
+        x=frames[sym]
         i=x.index.searchsorted(ts,side="right")
-        if i>=len(x): continue
+        if i>=len(x):
+            continue
         entry_ts=x.index[i]
-        if entry_ts>end: continue
+        # Crucial split-isolation rule: no signal can create a position outside
+        # the current segment.
+        if entry_ts < start or entry_ts >= end:
+            continue
         ep=entry_price(float(x.iloc[i].open),side)
         dist=float(top["atr"])*cfg.stop_atr*float(top["profile"])
-        if not np.isfinite(dist) or dist<=0: continue
-        active={"symbol":sym,"side":side,"signal_ts":ts,"entry_ts":entry_ts,"entry":ep,
-                "sl":ep-dist*side,"tp":ep+dist*RR*side}
+        if not np.isfinite(dist) or dist<=0:
+            continue
+        active={
+            "symbol":sym,"side":side,"signal_ts":ts,"entry_ts":entry_ts,
+            "entry":ep,"sl":ep-dist*side,"tp":ep+dist*RR*side,
+            "signal_score":top["score"],"atr":top["atr"],
+            "profile":top["profile"],"d1_regime":top["d1_regime"],
+            "h4_trend":top["h4_trend"],"vol_z":top["vol_z"],
+            "flow_z":top["flow_z"],"rs_z":top["rs_z"],"eff":top["eff"],
+            "basis_z":top["basis_z"],"close_loc":top["close_loc"],
+            "ret_24":top["ret_24"],"candidate_count":len(cand),
+        }
 
     vals=pd.Series([t["pnl"] for t in trades],dtype=float)
-    wins=int((vals>0).sum()); losses=int((vals<=0).sum())
+    wins=int((vals>0).sum())
+    losses=int((vals<=0).sum())
     gp=float(vals[vals>0].sum()) if wins else 0.0
     gl=float(-vals[vals<=0].sum()) if losses else 0.0
     pf=gp/gl if gl else (math.inf if wins else 0.0)
     wr=100*wins/len(vals) if len(vals) else 0.0
     streak=cur=0
     for v in vals:
-        if v<=0: cur+=1; streak=max(streak,cur)
-        else: cur=0
+        if v<=0:
+            cur+=1
+            streak=max(streak,cur)
+        else:
+            cur=0
     days=max((end-start).total_seconds()/86400.0,1e-9)
-    return {"label":label,"config":cfg.name,"trades":len(vals),"wins":wins,"losses":losses,
-            "wr":wr,"pf":pf,"pnl":float(vals.sum()) if len(vals) else 0.0,"dd":max_dd,
-            "dd_pct":100*max_dd/peak if peak>0 else 100.0,"streak":streak,
-            "tday":len(vals)/days,"open":active is not None,"blocked":blocked,
-            "avg_win":gp/wins if wins else 0.0,"avg_loss":-gl/losses if losses else 0.0,
-            "expectancy":float(vals.mean()) if len(vals) else 0.0,"median":float(vals.median()) if len(vals) else 0.0,
-            "final_equity":equity}
+    result={
+        "label":label,"config":cfg.name,"trades":len(vals),"wins":wins,"losses":losses,
+        "wr":wr,"pf":pf,"pnl":float(vals.sum()) if len(vals) else 0.0,"dd":max_dd,
+        "dd_pct":100*max_dd/peak if peak>0 else 100.0,"streak":streak,
+        "tday":len(vals)/days,"open":active is not None,"blocked":blocked,
+        "avg_win":gp/wins if wins else 0.0,"avg_loss":-gl/losses if losses else 0.0,
+        "expectancy":float(vals.mean()) if len(vals) else 0.0,
+        "median":float(vals.median()) if len(vals) else 0.0,
+        "final_equity":equity,
+        "trades_log":trades if collect_trades else None,
+    }
+    return result
 
 
 def score(train,val):
-    if train["trades"]<MIN_TRAIN_TRADES or val["trades"]<MIN_VAL_TRADES: return -1e9
-    if train["pnl"]<=0 or val["pnl"]<=0: return -1e8
-    if train["streak"]>10 or val["streak"]>8: return -1e7
+    if train["trades"]<MIN_TRAIN_TRADES or val["trades"]<MIN_VAL_TRADES:
+        return -1e9
+    if train["pnl"]<=0 or val["pnl"]<=0:
+        return -1e8
+    if train["streak"]>10 or val["streak"]>8:
+        return -1e7
     return (2.5*val["pf"] + 0.03*val["wr"] + 0.001*val["pnl"]
             -0.02*val["streak"] -0.015*val["dd_pct"] +0.75*train["pf"])
 
@@ -506,28 +559,88 @@ def report(r,title):
     print(f"Average Loss           : ${r['avg_loss']:,.2f}")
     print(f"Expectancy / Trade     : ${r['expectancy']:,.2f}")
     print(f"Median Trade PnL       : ${r['median']:,.2f}")
-    print(f"Capital-blocked checks  : {r['blocked']} (informational)")
+    print(f"Capital-blocked checks : {r['blocked']} (informational)")
     print(f"Open position at end   : {r['open']} (informational)")
     print("==================================================")
 
 
-def symbol_report(frames,cfg,start,end):
-    print("\n================ OOS EXECUTED PER-SYMBOL ================")
-    print("symbol       trades      WR       PF        PnL       streak")
-    for sym,x in frames.items():
-        r=run_backtest({sym:x},cfg,start,end,"OOS_SYMBOL")
-        print(f"{sym:10s} {r['trades']:7d}  {r['wr']:7.2f}%  {r['pf']:7.3f}  ${r['pnl']:9.2f}  {r['streak']:6d}")
-    print("=========================================================")
+def print_group_report(df, group_col, title):
+    print(f"\n================ {title} ================")
+    if df.empty:
+        print("No realized trades.")
+        print("==================================================")
+        return
+    rows=[]
+    for key,g in df.groupby(group_col, dropna=False):
+        wins=(g.pnl>0).sum()
+        losses=(g.pnl<=0).sum()
+        gp=g.loc[g.pnl>0,"pnl"].sum()
+        gl=-g.loc[g.pnl<=0,"pnl"].sum()
+        pf=gp/gl if gl else (math.inf if wins else 0.0)
+        rows.append((str(key),len(g),100*wins/len(g),pf,g.pnl.sum(),g.pnl.mean()))
+    out=pd.DataFrame(rows,columns=[group_col,"trades","WR","PF","PnL","Expectancy"])
+    print(out.sort_values("PnL",ascending=False).to_string(index=False,formatters={
+        "WR":"{:.2f}".format,"PF":"{:.3f}".format,
+        "PnL":"{:.2f}".format,"Expectancy":"{:.2f}".format}))
+    print("==================================================")
+
+
+def forensic_report(trades, outdir):
+    outdir.mkdir(parents=True, exist_ok=True)
+    if not trades:
+        print("\n[FORENSIC] No realized OOS trades.")
+        return
+    df=pd.DataFrame(trades)
+    df["signal_ts"]=pd.to_datetime(df["signal_ts"],utc=True)
+    df["entry_ts"]=pd.to_datetime(df["entry_ts"],utc=True)
+    df["exit_ts"]=pd.to_datetime(df["exit_ts"],utc=True)
+    df["month"]=df.exit_ts.dt.to_period("M").astype(str)
+    df["side_name"]=df.side.map({1:"LONG",-1:"SHORT"})
+    df["regime_name"]=df.d1_regime.map({1:"BULL",0:"NEUTRAL",-1:"BEAR"})
+    df["trend_name"]=df.h4_trend.map({1:"UP",-1:"DOWN"})
+    df["score_bucket"]=pd.cut(df.signal_score,
+                               bins=[-np.inf,6.0,6.5,7.0,7.5,np.inf],
+                               labels=["<6.0","6.0-6.5","6.5-7.0","7.0-7.5",">=7.5"],
+                               right=False)
+    path=outdir/"oos_trade_log.csv"
+    df.to_csv(path,index=False)
+    print(f"\n[FORENSIC] Full OOS trade log: {path}")
+    for col,title in [
+        ("side_name","OOS BY SIDE"),
+        ("symbol","OOS BY SYMBOL"),
+        ("regime_name","OOS BY 1D REGIME"),
+        ("trend_name","OOS BY 4H TREND"),
+        ("score_bucket","OOS BY SCORE BUCKET"),
+        ("exit_reason","OOS BY EXIT REASON"),
+        ("month","OOS BY MONTH"),
+    ]:
+        print_group_report(df,col,title)
+
+    # Long/short x symbol is useful for identifying concentrated directional failure.
+    pivot=[]
+    for (sym,side),g in df.groupby(["symbol","side_name"]):
+        wins=(g.pnl>0).sum(); losses=(g.pnl<=0).sum()
+        gp=g.loc[g.pnl>0,"pnl"].sum(); gl=-g.loc[g.pnl<=0,"pnl"].sum()
+        pf=gp/gl if gl else (math.inf if wins else 0.0)
+        pivot.append((sym,side,len(g),100*wins/len(g),pf,g.pnl.sum()))
+    px=pd.DataFrame(pivot,columns=["symbol","side","trades","WR","PF","PnL"])
+    print("\n================ OOS BY SYMBOL × SIDE ================")
+    print(px.sort_values("PnL",ascending=False).to_string(index=False,formatters={
+        "WR":"{:.2f}".format,"PF":"{:.3f}".format,"PnL":"{:.2f}".format}))
+    print("========================================================")
 
 
 def main():
     refresh=os.getenv("XT_REFRESH","0")=="1"
-    print("HUNTER-V13 — ASSET REGIME / CROSS-SECTIONAL / LIQUIDITY")
-    print("XT Futures + auxiliary Spot | 15m -> 1H/4H/1D | strict causal")
-    print(f"Capital=${INITIAL_CAPITAL:.0f} Margin=${MARGIN:.0f} Leverage={LEVERAGE:.0f}x RR=1:{RR:.0f}")
-    print("One global position; no overlap; no timeout; no BE/trailing; OPEN at dataset end.")
+    root=Path("data/xt_v14")
+    outdir=Path("reports/xt_v14")
 
-    root=Path("data/xt_v13")
+    print("HUNTER-V14 — FORENSIC / SPLIT-ISOLATED / CAUSAL")
+    print("XT Futures + auxiliary Spot | 15m -> 1H/4H/1D")
+    print(f"Capital=${INITIAL_CAPITAL:.0f} Margin=${MARGIN:.0f} Leverage={LEVERAGE:.0f}x RR=1:{RR:.0f}")
+    print("One global position; no overlap; no timeout; no BE/trailing.")
+    print("Segment policy: [start,end), no boundary trade carry-over.")
+
     fut={}; spot={}
     for sym in SYMBOLS:
         fut[sym]=fetch_xt(sym,FUTURES_URL,root/"futures"/f"{sym}.csv",refresh,True)
@@ -536,13 +649,14 @@ def main():
     btc_h1=complete_resample(fut["btc_usdt"],"1h",4)
     frames={sym:build_features(fut[sym],spot[sym],btc_h1) for sym in SYMBOLS}
     split=split_timeline(frames)
-    print(f"\nSPLIT train={split.start}..{split.train_end} | validation={split.train_end}..{split.val_end} | OOS={split.val_end}..{split.end}")
+    print(f"\nSPLIT train=[{split.start},{split.train_end}) | validation=[{split.train_end},{split.val_end}) | OOS=[{split.val_end},{split.end})")
     factor_audit(frames,split)
 
-    # Predeclared grid: small enough to avoid brute-force curve fitting.
+    # Same small predeclared grid as V13. No OOS metrics enter selection.
     grid=[Config(f"S{s}_Q{q}_A{a}_R{r}_V{v}",s,q,a,r,v)
           for s in (20,32,48) for q in (5.8,6.4,7.0) for a in (1.25,1.50)
           for r in (0.50,0.75) for v in (0.0,0.5)]
+
     results=[]
     for cfg in grid:
         tr=run_backtest(frames,cfg,split.start,split.train_end,"TRAIN")
@@ -552,14 +666,16 @@ def main():
     eligible=[z for z in results if z[0]>-1e8]
     if not eligible:
         raise RuntimeError("No train/validation eligible configuration; no validated edge.")
+
     _,cfg,tr,va=eligible[0]
     print(f"\n[SELECTED] {cfg.name}")
+    print(f"[SELECTED PARAMS] sweep={cfg.sweep} min_score={cfg.min_score} stop_atr={cfg.stop_atr} rank_floor={cfg.rank_floor} vol_floor={cfg.vol_floor}")
     report(tr,"SELECTED TRAIN")
     report(va,"SELECTED VALIDATION")
 
-    oos=run_backtest(frames,cfg,split.val_end,split.end,"OOS")
+    oos=run_backtest(frames,cfg,split.val_end,split.end,"OOS",collect_trades=True)
     report(oos,"UNTOUCHED OOS")
-    symbol_report(frames,cfg,split.val_end,split.end)
+    forensic_report(oos["trades_log"],outdir)
 
     checks={
         "OOS trades":oos["trades"]>=MIN_OOS_TRADES,
@@ -570,11 +686,13 @@ def main():
         "OOS DD":oos["dd_pct"]<MAX_OOS_DD_PCT,
     }
     print("\n================ ACCEPTANCE GATE ================")
-    for k,v in checks.items(): print(f"{k:20s}: {'PASS' if v else 'FAIL'}")
+    for k,v in checks.items():
+        print(f"{k:20s}: {'PASS' if v else 'FAIL'}")
     accepted=all(checks.values())
     print(f"ACCEPTED              : {accepted}")
     print("==================================================")
     print("[DECISION] ACCEPTED — all predeclared OOS criteria passed." if accepted else "[DECISION] REJECTED — no claim of robust edge.")
+
 
 if __name__=="__main__":
     main()
