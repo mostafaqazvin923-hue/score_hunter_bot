@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-HUNTER-V18-STAGE0
-VOLATILITY EXHAUSTION / FAILED-EXTENSION REVERSAL — FAST DISCOVERY
+HUNTER-V19-STAGE0
+MARKET STRUCTURE / CONTROLLED PULLBACK CONTINUATION — FAST DISCOVERY
 
 Research hypothesis
 -------------------
-After an unusually large directional extension, price can mean-revert when:
-1) the completed 1H candle is an ATR-normalized volatility expansion,
-2) the extension over the prior 6H window is directionally extreme,
-3) the expansion candle closes near its extreme (capitulation),
-4) the NEXT completed 1H candle fails to continue the extreme and reclaims
-   the expansion candle's midpoint,
-5) the completed 4H regime is NOT strongly aligned with the impulse direction.
+A market that has already established directional structure can continue after a
+controlled pullback when:
+1) the completed 1H trend is directionally organized (EMA20/EMA50),
+2) a prior impulse has made a fresh local structure break,
+3) the following pullback stays controlled relative to ATR and does not
+   invalidate the broken structure,
+4) the confirmation candle rejects the pullback in the original direction,
+5) entry is at the next 1H open.
+
+This deliberately avoids liquidity-sweep, exhaustion, and momentum-only
+breakout logic. It is a continuation hypothesis, not a parameter search.
 
 Entry is at the next 1H open after confirmation. Fixed RR=1:2.
 No trailing, BE, timeout, pyramiding, overlap, or future-data filters.
@@ -64,19 +68,21 @@ SLIPPAGE = 0.0003
 
 # Pre-registered Stage-0 hypothesis parameters.
 ATR_PERIOD = 14
-IMPULSE_N = 6
-MIN_IMPULSE_ATR = 1.50
-MIN_EXTENSION_ATR = 1.25
-MAX_BODY_FRACTION = 0.35
-CAPITULATION_CLOSE = 0.20
-RECLAIM_FRACTION = 0.50
-MAX_4H_TREND_ATR = 0.35
+STRUCTURE_N = 12
+IMPULSE_N = 4
+MAX_PULLBACK_ATR = 1.25
+MIN_IMPULSE_ATR = 0.80
+MIN_IMPULSE_EFF = 0.45
+EMA_FAST = 20
+EMA_SLOW = 50
+MIN_EMA_SEPARATION_ATR = 0.10
+REJECTION_CLOSE = 0.60
 
 # Sensitivity only; no winner is selected.
 STOP_ATR_VALUES = (1.00, 1.25, 1.50)
 
-CACHE_DIR = Path("data/xt_v18_stage0")
-REPORT_DIR = Path("reports/xt_v18_stage0")
+CACHE_DIR = Path("data/xt_v19_stage0")
+REPORT_DIR = Path("reports/xt_v19_stage0")
 
 
 @dataclass
@@ -240,130 +246,121 @@ def build_features(df):
     x = df.set_index("timestamp").sort_index().copy()
     x["tr"] = true_range(x)
     x["atr"] = x["tr"].rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean()
-
-    # Signal candle expansion relative to ATR known before that candle closes.
     x["range"] = x["high"] - x["low"]
     x["range_atr"] = x["range"] / x["atr"].replace(0, np.nan)
-
     x["body"] = (x["close"] - x["open"]).abs()
-    x["body_frac"] = x["body"] / x["range"].replace(0, np.nan)
-
-    # 0 = close at low, 1 = close at high.
+    x["direction"] = np.sign(x["close"] - x["open"])
     x["close_loc"] = (x["close"] - x["low"]) / x["range"].replace(0, np.nan)
+    x["ema20"] = x["close"].ewm(span=EMA_FAST, adjust=False, min_periods=EMA_FAST).mean()
+    x["ema50"] = x["close"].ewm(span=EMA_SLOW, adjust=False, min_periods=EMA_SLOW).mean()
+    x["ema_sep_atr"] = (x["ema20"] - x["ema50"]) / x["atr"].replace(0, np.nan)
 
-    # Directional extension over the previous completed impulse window.
-    x["ret_6"] = x["close"].pct_change(IMPULSE_N, fill_method=None)
-    x["prior_hi_6"] = x["high"].shift(1).rolling(IMPULSE_N, min_periods=IMPULSE_N).max()
-    x["prior_lo_6"] = x["low"].shift(1).rolling(IMPULSE_N, min_periods=IMPULSE_N).min()
+    # The impulse candle is i-2; its structure break is evaluated against
+    # highs/lows strictly before the impulse candle.
+    x["prior_hi"] = x["high"].shift(1).rolling(STRUCTURE_N, min_periods=STRUCTURE_N).max()
+    x["prior_lo"] = x["low"].shift(1).rolling(STRUCTURE_N, min_periods=STRUCTURE_N).min()
+    x["impulse_range"] = x["high"].shift(2) - x["low"].shift(2)
+    x["impulse_atr"] = x["impulse_range"] / x["atr"].shift(2).replace(0, np.nan)
+    imp_open = x["open"].shift(2)
+    imp_close = x["close"].shift(2)
+    x["impulse_eff"] = (imp_close - imp_open).abs() / x["impulse_range"].replace(0, np.nan)
 
-    # 4H features built causally from completed 1H data.
-    h4 = (
-        x[["open", "high", "low", "close"]]
-        .resample("4h", label="right", closed="right")
-        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
-        .dropna()
-    )
+    # Pullback candle is i-1; confirmation candle is i.
+    x["impulse_mid"] = (x["high"].shift(2) + x["low"].shift(2)) / 2.0
+    x["break_level_long"] = x["prior_hi"].shift(2)
+    x["break_level_short"] = x["prior_lo"].shift(2)
+
+    # Pullback depth measured from the impulse close to the pullback extreme.
+    x["pullback_down"] = (x["close"].shift(2) - x["low"].shift(1)) / x["atr"].shift(2).replace(0, np.nan)
+    x["pullback_up"] = (x["high"].shift(1) - x["close"].shift(2)) / x["atr"].shift(2).replace(0, np.nan)
+
+    # Completed 4H trend, shifted so the current 1H bar sees only completed 4H data.
+    h4 = x[["open", "high", "low", "close"]].resample("4h", label="right", closed="right").agg(
+        {"open":"first", "high":"max", "low":"min", "close":"last"}
+    ).dropna()
     h4["ema20"] = h4["close"].ewm(span=20, adjust=False, min_periods=20).mean()
     h4["ema50"] = h4["close"].ewm(span=50, adjust=False, min_periods=50).mean()
-    h4["atr"] = (
-        pd.concat(
-            [
-                h4["high"] - h4["low"],
-                (h4["high"] - h4["close"].shift(1)).abs(),
-                (h4["low"] - h4["close"].shift(1)).abs(),
-            ],
-            axis=1,
-        )
-        .max(axis=1)
-        .rolling(14, min_periods=14)
-        .mean()
-    )
+    h4["atr"] = pd.concat([
+        h4["high"] - h4["low"],
+        (h4["high"] - h4["close"].shift(1)).abs(),
+        (h4["low"] - h4["close"].shift(1)).abs(),
+    ], axis=1).max(axis=1).rolling(14, min_periods=14).mean()
     h4["trend_atr"] = (h4["ema20"] - h4["ema50"]) / h4["atr"].replace(0, np.nan)
-
-    # Shift so an hourly candle can only see the most recently COMPLETED 4H bar.
-    h4 = h4[["ema20", "ema50", "atr", "trend_atr"]].shift(1)
-    # Explicit names avoid pandas join suffix ambiguity when x has no same-named columns.
-    h4 = h4.rename(columns={
-        "ema20": "ema20_4h",
-        "ema50": "ema50_4h",
-        "atr": "atr_4h",
-        "trend_atr": "trend_atr_4h",
+    h4 = h4[["ema20", "ema50", "atr", "trend_atr"]].shift(1).rename(columns={
+        "ema20":"ema20_4h", "ema50":"ema50_4h", "atr":"atr_4h", "trend_atr":"trend_atr_4h"
     })
     x = x.join(h4.reindex(x.index, method="ffill"))
-
-    # Confirmation candle must reject continuation and reclaim the impulse midpoint.
-    x["impulse_mid"] = (x["high"].shift(1) + x["low"].shift(1)) / 2.0
-
     x.replace([np.inf, -np.inf], np.nan, inplace=True)
     return x
 
-
 def candidate(x, i):
-    # i is the completed confirmation candle. The signal/extension candle is i-1.
-    # Entry occurs at the OPEN of i+1, so no current/future candle is used.
-    if i < 101 or i + 1 >= len(x):
+    # i = completed confirmation candle; entry at i+1 open.
+    if i < 120 or i + 1 >= len(x):
         return 0
-
     conf = x.iloc[i]
-    sig = x.iloc[i - 1]
+    pull = x.iloc[i - 1]
+    imp = x.iloc[i - 2]
 
-    required = [
-        sig["atr"], sig["range_atr"], sig["body_frac"], sig["close_loc"],
-        sig["ret_6"], sig["prior_hi_6"], sig["prior_lo_6"],
-        conf["trend_atr_4h"], sig["impulse_mid"], conf["close"],
+    req = [
+        imp["atr"], imp["impulse_atr"], imp["impulse_eff"],
+        imp["prior_hi"], imp["prior_lo"], imp["close"], imp["open"],
+        pull["low"], pull["high"], pull["close"],
+        conf["close"], conf["open"], conf["atr"], conf["ema20"],
+        conf["ema50"], conf["ema_sep_atr"], conf["trend_atr_4h"],
     ]
-    if any(pd.isna(v) for v in required):
+    if any(pd.isna(v) for v in req):
         return 0
 
-    # Signal candle must be an abnormal extension with capitulation-style shape.
-    if sig["range_atr"] < MIN_IMPULSE_ATR:
-        return 0
-    if sig["body_frac"] > MAX_BODY_FRACTION:
-        return 0
-
-    extension_atr = MIN_EXTENSION_ATR * sig["atr"]
-
-    # Long reversal: a downside extension breaks the prior 6H low, closes near
-    # its low, and the next completed candle rejects continuation and reclaims
-    # the extension candle midpoint.
-    down_extension = (
-        sig["ret_6"] <= -extension_atr / max(sig["close"], 1e-12)
-        and sig["low"] < sig["prior_lo_6"]
-        and sig["close_loc"] <= CAPITULATION_CLOSE
-    )
-    up_extension = (
-        sig["ret_6"] >= extension_atr / max(sig["close"], 1e-12)
-        and sig["high"] > sig["prior_hi_6"]
-        and sig["close_loc"] >= 1.0 - CAPITULATION_CLOSE
+    long_structure = imp["close"] > imp["prior_hi"]
+    short_structure = imp["close"] < imp["prior_lo"]
+    impulse_ok = (
+        imp["impulse_atr"] >= MIN_IMPULSE_ATR and
+        imp["impulse_eff"] >= MIN_IMPULSE_EFF
     )
 
+    # Controlled pullback: it reaches toward the broken structure but does not
+    # close back through it. Depth is capped in ATR terms.
+    long_pull = (
+        pull["low"] <= imp["close"] and
+        pull["low"] >= imp["close"] - MAX_PULLBACK_ATR * imp["atr"] and
+        pull["close"] >= imp["prior_hi"]
+    )
+    short_pull = (
+        pull["high"] >= imp["close"] and
+        pull["high"] <= imp["close"] + MAX_PULLBACK_ATR * imp["atr"] and
+        pull["close"] <= imp["prior_lo"]
+    )
+
+    # Confirmation rejects the pullback and closes in the impulse direction.
     long_confirm = (
-        conf["low"] <= sig["low"] * 1.0005
-        and conf["close"] > conf["open"]
-        and conf["close"] >= sig["impulse_mid"]
-        and conf["close"] > sig["close"]
+        conf["close"] > conf["open"] and
+        conf["close_loc"] >= REJECTION_CLOSE and
+        conf["close"] > pull["high"] and
+        conf["close"] > imp["close"]
     )
     short_confirm = (
-        conf["high"] >= sig["high"] * 0.9995
-        and conf["close"] < conf["open"]
-        and conf["close"] <= sig["impulse_mid"]
-        and conf["close"] < sig["close"]
+        conf["close"] < conf["open"] and
+        conf["close_loc"] <= 1.0 - REJECTION_CLOSE and
+        conf["close"] < pull["low"] and
+        conf["close"] < imp["close"]
     )
 
-    # Do not fade a strongly aligned completed 4H trend.
-    neutral_4h = abs(conf["trend_atr_4h"]) <= MAX_4H_TREND_ATR
-    if not neutral_4h:
-        return 0
+    long_trend = (
+        conf["ema20"] > conf["ema50"] and
+        conf["ema_sep_atr"] >= MIN_EMA_SEPARATION_ATR and
+        conf["trend_atr_4h"] > 0
+    )
+    short_trend = (
+        conf["ema20"] < conf["ema50"] and
+        conf["ema_sep_atr"] <= -MIN_EMA_SEPARATION_ATR and
+        conf["trend_atr_4h"] < 0
+    )
 
-    long_ok = down_extension and long_confirm
-    short_ok = up_extension and short_confirm
-
-    if long_ok and not short_ok:
+    if long_structure and impulse_ok and long_pull and long_confirm and long_trend:
         return 1
-    if short_ok and not long_ok:
+    if short_structure and impulse_ok and short_pull and short_confirm and short_trend:
         return -1
     return 0
-
 
 def simulate(features, stop_mult):
     # Merge all symbols into one chronological event stream.
@@ -565,7 +562,7 @@ def print_report(stop_mult, trades, raw_candidates, taken, max_dd):
 
 
 def main():
-    print("HUNTER-V18-STAGE0 — VOLATILITY EXHAUSTION / FAILED-EXTENSION REVERSAL")
+    print("HUNTER-V19-STAGE0 — VOLATILITY EXHAUSTION / FAILED-EXTENSION REVERSAL")
     print(
         f"Lookback={LOOKBACK_DAYS}d + warmup={WARMUP_DAYS}d | "
         f"1H direct XT futures"
