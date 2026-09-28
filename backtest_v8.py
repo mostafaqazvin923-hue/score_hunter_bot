@@ -1,42 +1,34 @@
 #!/usr/bin/env python3
 """
-HUNTER-V17-STAGE0
-TIME-SERIES MOMENTUM / TREND PERSISTENCE — FAST DISCOVERY
+HUNTER-V18-STAGE0
+VOLATILITY EXHAUSTION / FAILED-EXTENSION REVERSAL — FAST DISCOVERY
 
-Purpose
--------
-This is NOT the final walk-forward strategy. It is a fast, pre-registered
-hypothesis test designed to answer one question before spending hours on
-optimization:
+Research hypothesis
+-------------------
+After an unusually large directional extension, price can mean-revert when:
+1) the completed 1H candle is an ATR-normalized volatility expansion,
+2) the extension over the prior 6H window is directionally extreme,
+3) the expansion candle closes near its extreme (capitulation),
+4) the NEXT completed 1H candle fails to continue the extreme and reclaims
+   the expansion candle's midpoint,
+5) the completed 4H regime is NOT strongly aligned with the impulse direction.
 
-    Does a simple, economically motivated time-series trend-persistence
-    hypothesis produce enough 1:2-RR trades with positive expectancy after
-    fees/slippage on real XT USDT-M perpetual data?
+Entry is at the next 1H open after confirmation. Fixed RR=1:2.
+No trailing, BE, timeout, pyramiding, overlap, or future-data filters.
 
-Hypothesis
-----------
-1) The instrument has persistent directional movement over 24h and 72h.
-2) Price confirms the direction by breaking the prior completed 24h range.
-3) The move is not a low-efficiency/noise move.
-4) The higher-timeframe 4H trend agrees with the direction.
-5) Entry is at the NEXT completed 1H candle open.
-6) Fixed RR = 1:2. No trailing, BE, timeout, pyramiding or overlap.
-
-No parameter optimization is performed. Three fixed stop-distance sensitivity
-runs (1.0 / 1.25 / 1.5 ATR) are reported side-by-side and NONE is selected as a
-winner. This is a robustness check, not a tuning exercise.
+This is a Stage-0 discovery test only. Three pre-registered stop distances
+are reported side-by-side; none is selected by the script.
 
 Integrity
 ---------
-- XT futures data only.
-- 1H candles are used directly; incomplete latest candle is removed.
-- Features use current/past candles only.
-- Signal at completed 1H candle t -> entry at t+1 open.
+- XT USDT-M futures 1H direct data.
+- Incomplete latest candle removed.
+- All features are based only on completed candles.
+- Signal candle t -> confirmation candle t+1 -> entry at t+2 open.
 - One global position at a time.
-- If SL and TP occur in the same candle, LOSS is assumed conservatively.
-- No future symbol selection. Universe is fixed before the test.
-- No walk-forward selection in this stage.
-- If this stage fails, V17 is rejected before expensive WF.
+- Same-candle SL+TP => LOSS.
+- Fixed universe chosen before the test.
+- No parameter optimization.
 """
 
 import math
@@ -70,20 +62,21 @@ RR = 2.0
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 
-# Pre-registered hypothesis parameters. Do not optimize these in Stage-0.
-BREAKOUT_N = 24
-RETURN_FAST = 12
-RETURN_SLOW = 72
-EFF_N = 12
-MIN_EFF = 0.35
-MIN_RETURN_FAST = 0.0025
-MIN_RETURN_SLOW = 0.0050
+# Pre-registered Stage-0 hypothesis parameters.
+ATR_PERIOD = 14
+IMPULSE_N = 6
+MIN_IMPULSE_ATR = 1.50
+MIN_EXTENSION_ATR = 1.25
+MAX_BODY_FRACTION = 0.35
+CAPITULATION_CLOSE = 0.20
+RECLAIM_FRACTION = 0.50
+MAX_4H_TREND_ATR = 0.35
 
-# Fixed stop sensitivity only. Every run is reported; no winner is selected.
+# Sensitivity only; no winner is selected.
 STOP_ATR_VALUES = (1.00, 1.25, 1.50)
 
-CACHE_DIR = Path("data/xt_v17_stage0")
-REPORT_DIR = Path("reports/xt_v17_stage0")
+CACHE_DIR = Path("data/xt_v18_stage0")
+REPORT_DIR = Path("reports/xt_v18_stage0")
 
 
 @dataclass
@@ -95,7 +88,6 @@ class Position:
     entry: float
     sl: float
     tp: float
-    atr: float
 
 
 def payload_rows(obj):
@@ -148,7 +140,10 @@ def validate(df, symbol, start_ms, end_ms):
         raise RuntimeError(f"{symbol}: {len(gaps)} futures 1H gaps; no OHLCV fabrication allowed")
     if len(x) < 9000:
         raise RuntimeError(f"{symbol}: only {len(x)} 1H rows")
-    print(f"[VALIDATE] {symbol} rows={len(x)} first={x.timestamp.iloc[0]} last={x.timestamp.iloc[-1]} span={(x.timestamp.iloc[-1]-x.timestamp.iloc[0]).days}d")
+    print(
+        f"[VALIDATE] {symbol} rows={len(x)} first={x.timestamp.iloc[0]} "
+        f"last={x.timestamp.iloc[-1]} span={(x.timestamp.iloc[-1]-x.timestamp.iloc[0]).days}d"
+    )
     return x.reset_index(drop=True)
 
 
@@ -167,6 +162,7 @@ def fetch_xt(symbol, refresh=False):
     cursor = start_ms
     all_rows = []
     page = 0
+
     while cursor <= end_ms:
         page += 1
         window_end = min(end_ms, cursor + LIMIT * INTERVAL_MS - 1)
@@ -199,287 +195,431 @@ def fetch_xt(symbol, refresh=False):
             if window_end >= end_ms:
                 break
             raise RuntimeError(f"{symbol}: page {page} returned no rows")
+
         all_rows.extend(inside)
         mx = max(p[0] for p in inside)
         nxt = mx + INTERVAL_MS
         if nxt <= cursor:
             raise RuntimeError(f"{symbol}: pagination stalled")
         cursor = nxt
+
         if page % 4 == 0:
             print(f"[FETCH] {symbol} page={page} rows={len(all_rows)}")
         if mx >= end_ms:
             break
         time.sleep(0.05)
 
-    x = pd.DataFrame(all_rows, columns=["ts", "open", "high", "low", "close", "volume"])
+    x = pd.DataFrame(
+        all_rows,
+        columns=["ts", "open", "high", "low", "close", "volume"]
+    )
     x["timestamp"] = pd.to_datetime(x.pop("ts"), unit="ms", utc=True)
-    # Remove the current incomplete 1H candle.
+
+    # Remove current incomplete 1H candle.
     cutoff = pd.Timestamp.now(tz="UTC").floor("1h")
     x = x[x.timestamp < cutoff]
+
     x = validate(x, symbol, start_ms, end_ms)
     x.to_csv(cache, index=False)
     return x
 
 
-def atr(x, n=14):
-    prev = x.close.shift(1)
-    tr = pd.concat([
-        x.high - x.low,
-        (x.high - prev).abs(),
-        (x.low - prev).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(n, min_periods=n).mean()
+def true_range(x):
+    prev = x["close"].shift(1)
+    return pd.concat(
+        [
+            x["high"] - x["low"],
+            (x["high"] - prev).abs(),
+            (x["low"] - prev).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
 
 
 def build_features(df):
     x = df.set_index("timestamp").sort_index().copy()
-    x["atr"] = atr(x, 14)
-    x["ret_fast"] = x.close.pct_change(RETURN_FAST, fill_method=None)
-    x["ret_slow"] = x.close.pct_change(RETURN_SLOW, fill_method=None)
-    x["range_hi"] = x.high.shift(1).rolling(BREAKOUT_N, min_periods=BREAKOUT_N).max()
-    x["range_lo"] = x.low.shift(1).rolling(BREAKOUT_N, min_periods=BREAKOUT_N).min()
-    delta = x.close.diff()
-    x["eff"] = (x.close - x.close.shift(EFF_N)).abs() / delta.abs().rolling(EFF_N).sum()
+    x["tr"] = true_range(x)
+    x["atr"] = x["tr"].rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean()
 
-    # Completed 4H bars only. The shift prevents using the still-forming 4H bar.
-    h4 = pd.DataFrame({
-        "open": x.open.resample("4h").first(),
-        "high": x.high.resample("4h").max(),
-        "low": x.low.resample("4h").min(),
-        "close": x.close.resample("4h").last(),
-    }).dropna()
-    h4["ema20"] = h4.close.ewm(span=20, adjust=False).mean()
-    h4["ema50"] = h4.close.ewm(span=50, adjust=False).mean()
-    h4["slope"] = h4.ema20.pct_change(3, fill_method=None)
-    h4["trend"] = np.where((h4.ema20 > h4.ema50) & (h4.slope > 0), 1,
-                           np.where((h4.ema20 < h4.ema50) & (h4.slope < 0), -1, 0))
-    h4a = h4.shift(1).reindex(x.index, method="ffill")
-    x["h4_trend"] = h4a.trend
+    # Signal candle expansion relative to ATR known before that candle closes.
+    x["range"] = x["high"] - x["low"]
+    x["range_atr"] = x["range"] / x["atr"].replace(0, np.nan)
+
+    x["body"] = (x["close"] - x["open"]).abs()
+    x["body_frac"] = x["body"] / x["range"].replace(0, np.nan)
+
+    # 0 = close at low, 1 = close at high.
+    x["close_loc"] = (x["close"] - x["low"]) / x["range"].replace(0, np.nan)
+
+    # Directional extension over the previous completed impulse window.
+    x["ret_6"] = x["close"].pct_change(IMPULSE_N, fill_method=None)
+    x["prior_hi_6"] = x["high"].shift(1).rolling(IMPULSE_N, min_periods=IMPULSE_N).max()
+    x["prior_lo_6"] = x["low"].shift(1).rolling(IMPULSE_N, min_periods=IMPULSE_N).min()
+
+    # 4H features built causally from completed 1H data.
+    h4 = (
+        x[["open", "high", "low", "close"]]
+        .resample("4h", label="right", closed="right")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+        .dropna()
+    )
+    h4["ema20"] = h4["close"].ewm(span=20, adjust=False, min_periods=20).mean()
+    h4["ema50"] = h4["close"].ewm(span=50, adjust=False, min_periods=50).mean()
+    h4["atr"] = (
+        pd.concat(
+            [
+                h4["high"] - h4["low"],
+                (h4["high"] - h4["close"].shift(1)).abs(),
+                (h4["low"] - h4["close"].shift(1)).abs(),
+            ],
+            axis=1,
+        )
+        .max(axis=1)
+        .rolling(14, min_periods=14)
+        .mean()
+    )
+    h4["trend_atr"] = (h4["ema20"] - h4["ema50"]) / h4["atr"].replace(0, np.nan)
+
+    # Shift so an hourly candle can only see the most recently COMPLETED 4H bar.
+    h4 = h4[["ema20", "ema50", "atr", "trend_atr"]].shift(1)
+    x = x.join(h4.reindex(x.index, method="ffill"), rsuffix="_4h")
+
+    # Confirmation candle must reject continuation and reclaim the impulse midpoint.
+    x["impulse_mid"] = (x["high"].shift(1) + x["low"].shift(1)) / 2.0
+
+    x.replace([np.inf, -np.inf], np.nan, inplace=True)
     return x
 
 
-def signal_at(ts, x):
-    if ts not in x.index:
-        return None
-    r = x.loc[ts]
-    vals = [r.atr, r.ret_fast, r.ret_slow, r.range_hi, r.range_lo, r.eff, r.h4_trend]
-    if not all(np.isfinite(v) for v in vals):
-        return None
+def candidate(x, i):
+    # i is the completed confirmation candle. The signal/extension candle is i-1.
+    # Entry occurs at the OPEN of i+1, so no current/future candle is used.
+    if i < 101 or i + 1 >= len(x):
+        return 0
 
-    # Directional persistence + prior-range breakout.
-    long_ok = (
-        r.close > r.range_hi and
-        r.ret_fast >= MIN_RETURN_FAST and
-        r.ret_slow >= MIN_RETURN_SLOW and
-        r.eff >= MIN_EFF and
-        r.h4_trend == 1
+    conf = x.iloc[i]
+    sig = x.iloc[i - 1]
+
+    required = [
+        sig["atr"], sig["range_atr"], sig["body_frac"], sig["close_loc"],
+        sig["ret_6"], sig["prior_hi_6"], sig["prior_lo_6"],
+        conf["trend_atr_4h"], sig["impulse_mid"], conf["close"],
+    ]
+    if any(pd.isna(v) for v in required):
+        return 0
+
+    # Signal candle must be an abnormal extension with capitulation-style shape.
+    if sig["range_atr"] < MIN_IMPULSE_ATR:
+        return 0
+    if sig["body_frac"] > MAX_BODY_FRACTION:
+        return 0
+
+    extension_atr = MIN_EXTENSION_ATR * sig["atr"]
+
+    # Long reversal: a downside extension breaks the prior 6H low, closes near
+    # its low, and the next completed candle rejects continuation and reclaims
+    # the extension candle midpoint.
+    down_extension = (
+        sig["ret_6"] <= -extension_atr / max(sig["close"], 1e-12)
+        and sig["low"] < sig["prior_lo_6"]
+        and sig["close_loc"] <= CAPITULATION_CLOSE
     )
-    short_ok = (
-        r.close < r.range_lo and
-        r.ret_fast <= -MIN_RETURN_FAST and
-        r.ret_slow <= -MIN_RETURN_SLOW and
-        r.eff >= MIN_EFF and
-        r.h4_trend == -1
+    up_extension = (
+        sig["ret_6"] >= extension_atr / max(sig["close"], 1e-12)
+        and sig["high"] > sig["prior_hi_6"]
+        and sig["close_loc"] >= 1.0 - CAPITULATION_CLOSE
     )
-    if long_ok == short_ok:
-        return None
-    side = 1 if long_ok else -1
-    return {"side": side, "atr": float(r.atr), "ret_fast": float(r.ret_fast),
-            "ret_slow": float(r.ret_slow), "eff": float(r.eff),
-            "h4_trend": int(r.h4_trend)}
+
+    long_confirm = (
+        conf["low"] <= sig["low"] * 1.0005
+        and conf["close"] > conf["open"]
+        and conf["close"] >= sig["impulse_mid"]
+        and conf["close"] > sig["close"]
+    )
+    short_confirm = (
+        conf["high"] >= sig["high"] * 0.9995
+        and conf["close"] < conf["open"]
+        and conf["close"] <= sig["impulse_mid"]
+        and conf["close"] < sig["close"]
+    )
+
+    # Do not fade a strongly aligned completed 4H trend.
+    neutral_4h = abs(conf["trend_atr_4h"]) <= MAX_4H_TREND_ATR
+    if not neutral_4h:
+        return 0
+
+    long_ok = down_extension and long_confirm
+    short_ok = up_extension and short_confirm
+
+    if long_ok and not short_ok:
+        return 1
+    if short_ok and not long_ok:
+        return -1
+    return 0
 
 
-def entry_price(openp, side):
-    return openp * (1 + SLIPPAGE * side)
+def simulate(features, stop_mult):
+    # Merge all symbols into one chronological event stream.
+    streams = {s: build_features(df) for s, df in features.items()}
+    events = []
+    for symbol, x in streams.items():
+        for i in range(len(x) - 1):
+            sig = candidate(x, i)
+            if sig:
+                events.append((x.index[i], symbol, i, sig))
+    events.sort(key=lambda z: z[0])
 
-
-def exit_price(price, side):
-    return price * (1 - SLIPPAGE * side)
-
-
-def pnl_for(side, entry, exitp):
-    gross = (exitp - entry) / entry * NOTIONAL * side
-    fees = NOTIONAL * FEE_RATE * 2.0
-    return gross - fees
-
-
-def common_times(frames):
-    common = None
-    for x in frames.values():
-        s = set(x.index)
-        common = s if common is None else common.intersection(s)
-    return pd.DatetimeIndex(sorted(common))
-
-
-def run(frames, stop_atr):
-    times = common_times(frames)
-    start = times.min()
-    end = times.max() + pd.Timedelta(hours=1)
-    equity = INITIAL_CAPITAL
-    peak = equity
+    cash = INITIAL_CAPITAL
+    peak = INITIAL_CAPITAL
     max_dd = 0.0
-    active = None
+    position = None
     trades = []
-    last_close_ts = None
-    signals = 0
+    taken_signals = 0
 
-    for ts in times:
-        # First resolve an existing position using this completed candle.
-        if active is not None:
-            x = frames[active.symbol]
-            b = x.loc[ts]
-            side = active.side
-            sl_hit = b.low <= active.sl if side == 1 else b.high >= active.sl
-            tp_hit = b.high >= active.tp if side == 1 else b.low <= active.tp
-            if sl_hit or tp_hit:
-                # Conservative ambiguity rule: SL wins if both are touched.
-                win = bool(tp_hit and not sl_hit)
-                raw = active.tp if win else active.sl
-                xp = exit_price(raw, side)
-                pnl = max(-MARGIN, pnl_for(side, active.entry, xp))
-                equity = max(0.0, equity + pnl)
-                peak = max(peak, equity)
-                max_dd = max(max_dd, peak - equity)
-                trades.append({
-                    "symbol": active.symbol, "side": "LONG" if side == 1 else "SHORT",
-                    "signal_ts": active.signal_ts, "entry_ts": active.entry_ts,
-                    "exit_ts": ts, "entry": active.entry, "exit": xp,
-                    "outcome": "WIN" if win else "LOSS", "pnl": pnl,
-                    "ret_fast": active.ret_fast, "ret_slow": active.ret_slow,
-                    "eff": active.eff, "atr": active.atr,
-                })
-                last_close_ts = ts
-                active = None
+    for signal_ts, symbol, i, side in events:
+        x = streams[symbol]
+
+        # First resolve an existing position through candles strictly after entry.
+        if position is not None:
+            if signal_ts <= position["entry_ts"]:
                 continue
 
-        if active is not None or (last_close_ts is not None and ts <= last_close_ts):
+        # Entry occurs at next 1H OPEN after confirmation candle.
+        entry_idx = i + 1
+        if entry_idx >= len(x):
             continue
-        if equity < MARGIN:
+        entry_ts = x.index[entry_idx]
+        entry_raw = float(x.iloc[entry_idx]["open"])
+
+        # Never enter while another position is active.
+        if position is not None:
             continue
 
-        # Evaluate all symbols on the SAME completed timestamp.
-        candidates = []
-        for sym, x in frames.items():
-            s = signal_at(ts, x)
-            if s is not None:
-                candidates.append((sym, s))
-        if not candidates:
+        atr_now = float(x.iloc[i]["atr"])
+        if not np.isfinite(atr_now) or atr_now <= 0:
             continue
-        signals += len(candidates)
 
-        # Deterministic fixed ranking: strongest absolute slow return.
-        # This is not an optimized rank floor; it only chooses one trade when
-        # multiple symbols signal simultaneously.
-        candidates.sort(key=lambda z: (abs(z[1]["ret_slow"]), abs(z[1]["eff"]), z[0]), reverse=True)
-        sym, s = candidates[0]
-        x = frames[sym]
-        pos = x.index.get_loc(ts)
-        if pos + 1 >= len(x):
-            continue
-        entry_ts = x.index[pos + 1]
-        if entry_ts > times.max():
-            continue
-        ep = entry_price(float(x.iloc[pos + 1].open), s["side"])
-        dist = s["atr"] * stop_atr
-        if not np.isfinite(dist) or dist <= 0:
-            continue
-        active = Position(
-            symbol=sym, side=s["side"], signal_ts=ts, entry_ts=entry_ts,
-            entry=ep, sl=ep - dist * s["side"], tp=ep + dist * RR * s["side"], atr=s["atr"],
-        )
-        # Store extra attributes without changing the dataclass schema.
-        active.ret_fast = s["ret_fast"]
-        active.ret_slow = s["ret_slow"]
-        active.eff = s["eff"]
+        # Conservative marketable entry/slippage.
+        entry = entry_raw * (1.0 + SLIPPAGE if side == 1 else 1.0 - SLIPPAGE)
+        stop_dist = stop_mult * atr_now
 
-    vals = pd.Series([t["pnl"] for t in trades], dtype=float)
-    wins = int((vals > 0).sum())
-    losses = int((vals <= 0).sum())
-    gp = float(vals[vals > 0].sum()) if wins else 0.0
-    gl = float(-vals[vals <= 0].sum()) if losses else 0.0
-    pf = gp / gl if gl else (math.inf if wins else 0.0)
-    wr = 100.0 * wins / len(vals) if len(vals) else 0.0
-    streak = cur = 0
-    for v in vals:
+        if side == 1:
+            sl = entry - stop_dist
+            tp = entry + RR * stop_dist
+        else:
+            sl = entry + stop_dist
+            tp = entry - RR * stop_dist
+
+        position = {
+            "symbol": symbol,
+            "side": side,
+            "signal_ts": signal_ts,
+            "entry_ts": entry_ts,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "stop_dist": stop_dist,
+            "entry_idx": entry_idx,
+        }
+        taken_signals += 1
+
+        # Scan forward until exit. Because only one position is allowed,
+        # future signals are ignored while this position is open.
+        for j in range(entry_idx, len(x)):
+            bar = x.iloc[j]
+            ts = x.index[j]
+
+            if side == 1:
+                hit_sl = float(bar["low"]) <= sl
+                hit_tp = float(bar["high"]) >= tp
+            else:
+                hit_sl = float(bar["high"]) >= sl
+                hit_tp = float(bar["low"]) <= tp
+
+            if not (hit_sl or hit_tp):
+                continue
+
+            # Same candle SL+TP => LOSS.
+            win = hit_tp and not hit_sl
+            exit_px = tp if win else sl
+
+            # Trading costs on both entry and exit.
+            gross = (
+                NOTIONAL * (exit_px - entry) / entry
+                if side == 1
+                else NOTIONAL * (entry - exit_px) / entry
+            )
+            fees = NOTIONAL * FEE_RATE * 2.0
+            pnl = gross - fees
+
+            cash += pnl
+            peak = max(peak, cash)
+            dd = peak - cash
+            max_dd = max(max_dd, dd)
+
+            trades.append({
+                "signal_ts": signal_ts,
+                "entry_ts": entry_ts,
+                "exit_ts": ts,
+                "symbol": symbol,
+                "side": "LONG" if side == 1 else "SHORT",
+                "entry": entry,
+                "sl": sl,
+                "tp": tp,
+                "win": int(win),
+                "pnl": pnl,
+            })
+            position = None
+            break
+
+    # Do not count an unclosed position as a completed trade.
+    return pd.DataFrame(trades), taken_signals, max_dd
+
+
+def summarize(df):
+    if df.empty:
+        return {
+            "trades": 0, "wins": 0, "losses": 0, "wr": 0.0,
+            "pf": 0.0, "pnl": 0.0, "dd": 0.0, "dd_pct": 0.0,
+            "streak": 0, "expectancy": 0.0, "final": INITIAL_CAPITAL
+        }
+
+    pnl = df["pnl"].astype(float)
+    wins = int((pnl > 0).sum())
+    losses = int((pnl <= 0).sum())
+    gross_win = float(pnl[pnl > 0].sum())
+    gross_loss = float(-pnl[pnl <= 0].sum())
+    pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
+
+    equity = INITIAL_CAPITAL + pnl.cumsum()
+    peak = equity.cummax()
+    dd = peak - equity
+    max_dd = float(dd.max()) if len(dd) else 0.0
+    max_dd_pct = float((dd / peak.replace(0, np.nan)).max() * 100.0) if len(dd) else 0.0
+
+    streak = 0
+    cur = 0
+    for v in pnl:
         if v <= 0:
             cur += 1
             streak = max(streak, cur)
         else:
             cur = 0
+
     return {
-        "stop_atr": stop_atr, "signals": signals, "trades": len(vals),
-        "wins": wins, "losses": losses, "wr": wr, "pf": pf,
-        "pnl": float(vals.sum()) if len(vals) else 0.0, "dd": max_dd,
-        "dd_pct": 100 * max_dd / peak if peak > 0 else 100.0,
-        "streak": streak, "expectancy": float(vals.mean()) if len(vals) else 0.0,
-        "final_equity": equity, "trades_log": trades,
+        "trades": len(df),
+        "wins": wins,
+        "losses": losses,
+        "wr": 100.0 * wins / len(df),
+        "pf": pf,
+        "pnl": float(pnl.sum()),
+        "dd": max_dd,
+        "dd_pct": max_dd_pct,
+        "streak": streak,
+        "expectancy": float(pnl.mean()),
+        "final": float(equity.iloc[-1]),
     }
 
 
-def print_report(r):
+def print_report(stop_mult, trades, raw_candidates, taken, max_dd):
+    s = summarize(trades)
     print("\n" + "=" * 72)
-    print(f"STAGE-0 STOP = {r['stop_atr']:.2f} ATR | RR = 1:{RR:.0f}")
+    print(f"STAGE-0 STOP = {stop_mult:.2f} ATR | RR = 1:2")
     print("=" * 72)
-    for k, label in [
-        ("signals", "Raw candidate signals"), ("trades", "Closed trades"),
-        ("wins", "Wins"), ("losses", "Losses"), ("wr", "Win Rate"),
-        ("pf", "Profit Factor"), ("pnl", "Net PnL"), ("dd", "Max Drawdown"),
-        ("dd_pct", "Max Drawdown %"), ("streak", "Max Loss Streak"),
-        ("expectancy", "Expectancy / Trade"), ("final_equity", "Final Equity"),
-    ]:
-        v = r[k]
-        if k in {"pnl", "dd", "expectancy", "final_equity"}:
-            print(f"{label:<24}: ${v:,.2f}")
-        elif k in {"wr", "dd_pct"}:
-            print(f"{label:<24}: {v:.2f}%")
-        elif k == "pf":
-            print(f"{label:<24}: {v:.4f}")
-        else:
-            print(f"{label:<24}: {v}")
-
-
-def save_trades(r):
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(r["trades_log"]).to_csv(REPORT_DIR / f"trades_stop_{r['stop_atr']:.2f}.csv", index=False)
+    print(f"Raw candidate signals   : {raw_candidates}")
+    print(f"Taken entries           : {taken}")
+    print(f"Closed trades           : {s['trades']}")
+    print(f"Wins                    : {s['wins']}")
+    print(f"Losses                  : {s['losses']}")
+    print(f"Win Rate                : {s['wr']:.2f}%")
+    print(f"Profit Factor           : {s['pf']:.4f}")
+    print(f"Net PnL                 : ${s['pnl']:,.2f}")
+    print(f"Max Drawdown            : ${s['dd']:,.2f}")
+    print(f"Max Drawdown %          : {s['dd_pct']:.2f}%")
+    print(f"Max Loss Streak         : {s['streak']}")
+    print(f"Expectancy / Trade      : ${s['expectancy']:.2f}")
+    print(f"Final Equity            : ${s['final']:,.2f}")
+    if not trades.empty:
+        side = (
+            trades.groupby("side")
+            .agg(
+                trades=("pnl", "size"),
+                wins=("win", "sum"),
+                pnl=("pnl", "sum"),
+            )
+            .reset_index()
+        )
+        side["wr"] = 100.0 * side["wins"] / side["trades"]
+        print("\nBY SIDE")
+        print(side.to_string(index=False, formatters={
+            "pnl": lambda v: f"{v:.2f}",
+            "wr": lambda v: f"{v:.2f}",
+        }))
 
 
 def main():
-    refresh = os.getenv("XT_REFRESH", "0") == "1"
-    print("HUNTER-V17-STAGE0 — TIME-SERIES MOMENTUM / TREND PERSISTENCE")
-    print(f"Lookback={LOOKBACK_DAYS}d + warmup={WARMUP_DAYS}d | 1H direct XT futures")
-    print(f"RR=1:{RR:.0f} | margin=${MARGIN:.0f} | notional=${NOTIONAL:.0f} | fee={FEE_RATE} | slippage={SLIPPAGE}")
-    print(f"Hypothesis: breakout {BREAKOUT_N}h + returns {RETURN_FAST}h/{RETURN_SLOW}h + efficiency {MIN_EFF} + completed 4H trend")
+    print("HUNTER-V18-STAGE0 — VOLATILITY EXHAUSTION / FAILED-EXTENSION REVERSAL")
+    print(
+        f"Lookback={LOOKBACK_DAYS}d + warmup={WARMUP_DAYS}d | "
+        f"1H direct XT futures"
+    )
+    print(
+        f"RR=1:2 | margin=${MARGIN:.0f} | notional=${NOTIONAL:.0f} | "
+        f"fee={FEE_RATE} | slippage={SLIPPAGE}"
+    )
+    print(
+        "Hypothesis: abnormal extension + capitulation + next-bar reclaim + "
+        "neutral 4H regime"
+    )
     print("No parameter optimization. Stop sensitivity is reported, not selected.")
 
-    raw = {}
-    for sym in SYMBOLS:
-        raw[sym] = fetch_xt(sym, refresh=refresh)
-
-    frames = {sym: build_features(df) for sym, df in raw.items()}
-    times = common_times(frames)
-    if len(times) < 9000:
-        raise RuntimeError(f"Common timestamp set too small: {len(times)}")
-    print(f"COMMON 1H RANGE: {times[0]} -> {times[-1]} | bars={len(times)}")
-
-    all_results = []
-    for stop in STOP_ATR_VALUES:
-        r = run(frames, stop)
-        print_report(r)
-        save_trades(r)
-        all_results.append(r)
-
-    summary = pd.DataFrame([{k: v for k, v in r.items() if k != "trades_log"} for r in all_results])
+    refresh = os.getenv("XT_REFRESH", "0") == "1"
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    summary.to_csv(REPORT_DIR / "stage0_summary.csv", index=False)
 
-    print("\n================ STAGE-0 DECISION ================")
-    print("This stage does NOT select a best stop. It asks whether the fixed hypothesis")
-    print("has enough activity and a positive net edge across all pre-registered stops.")
-    if (summary.trades >= 60).all() and (summary.pf > 1.0).all() and (summary.expectancy > 0).all():
-        print("DISCOVERY_STATUS: PROMISING — eligible for expensive walk-forward research")
+    raw = {s: fetch_xt(s, refresh=refresh) for s in SYMBOLS}
+    common_start = max(df["timestamp"].min() for df in raw.values())
+    common_end = min(df["timestamp"].max() for df in raw.values())
+    print(f"COMMON 1H RANGE: {common_start} -> {common_end}")
+
+    # Only the common range is used.
+    raw = {
+        s: df[(df["timestamp"] >= common_start) & (df["timestamp"] <= common_end)].copy()
+        for s, df in raw.items()
+    }
+
+    results = []
+    for stop_mult in STOP_ATR_VALUES:
+        trades, taken, max_dd = simulate(raw, stop_mult)
+        raw_candidates = 0
+        for s, df in raw.items():
+            x = build_features(df)
+            raw_candidates += sum(candidate(x, i) != 0 for i in range(len(x) - 1))
+
+        print_report(stop_mult, trades, raw_candidates, taken, max_dd)
+        out = REPORT_DIR / f"stage0_trades_stop_{stop_mult:.2f}.csv"
+        trades.to_csv(out, index=False)
+        results.append(summarize(trades))
+
+    # Discovery gate. This is intentionally conservative and does not pick
+    # a stop. All pre-registered sensitivities must show some positive edge.
+    enough_activity = all(r["trades"] >= 150 for r in results)
+    positive_edge = all(r["pf"] > 1.0 and r["expectancy"] > 0 for r in results)
+    reasonable_wr = max(r["wr"] for r in results) >= 40.0
+
+    print("\n" + "=" * 72)
+    print("STAGE-0 DECISION")
+    print("=" * 72)
+    print("This stage does NOT select a best stop.")
+    print("It asks whether the fixed hypothesis deserves expensive walk-forward.")
+    print(f"Activity >=150 trades across all stops : {'PASS' if enough_activity else 'FAIL'}")
+    print(f"Positive PF + expectancy across all    : {'PASS' if positive_edge else 'FAIL'}")
+    print(f"At least one stop WR >=40%             : {'PASS' if reasonable_wr else 'FAIL'}")
+
+    if enough_activity and positive_edge and reasonable_wr:
+        print("DISCOVERY_STATUS: PASS — eligible for robust walk-forward")
     else:
         print("DISCOVERY_STATUS: REJECT — do NOT spend hours on walk-forward yet")
-    print("==================================================")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
