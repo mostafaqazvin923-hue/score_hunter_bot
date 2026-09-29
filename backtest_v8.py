@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HUNTER-V23.2-STAGE0: FUTURES BASIS DISLOCATION / REPRICING.
+"""HUNTER-V23.3-STAGE0: FUTURES BASIS DISLOCATION / REPRICING.
 
 Locked hypothesis (no Stage-0 tuning): cross-sectional perpetual-vs-spot
 basis contains information about short-horizon futures returns. We test the
@@ -24,7 +24,7 @@ FUT_URL="https://fapi.xt.com/future/market/v1/public/q/kline"
 # XT spot kline endpoint used by the public API. If XT changes its spot path,
 # fail loudly rather than substituting another data source.
 SPOT_URL="https://sapi.xt.com/v4/public/kline"
-LOOKBACK_DAYS=455; WARMUP_DAYS=90; H=3600000; LIMIT=1000
+LOOKBACK_DAYS=455; WARMUP_DAYS=30; H=3600000; LIMIT=1000
 INITIAL=1000.; MARGIN=100.; NOTIONAL=5000.; RR=2.; FEE=.0007; SLIP=.0003; MAX_POS=10
 ATR_N=14
 BASIS_Z_N=120; BASIS_CHANGE_N=24; QUANT=.20; MIN_Z=1.0; MIN_CS=8
@@ -218,7 +218,7 @@ def report(stop,t,raw):
 
 
 def main():
-    print("HUNTER-V23.2-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING"); print("XT 1H spot + perpetual | RR 1:2 | fixed universe | no optimization | no funding dependency | no spot-gap filling")
+    print("HUNTER-V23.3-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING"); print("XT 1H spot + perpetual | RR 1:2 | fixed universe | no optimization | no funding dependency | no spot-gap filling")
     raw={}
     for n,sym in enumerate(SYMBOLS,1):
         print(f"\n[{n}/{len(SYMBOLS)}] {sym}: futures"); fut=fetch_kline(FUT_URL,sym,"fut_")
