@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HUNTER-V23.10-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING
+"""HUNTER-V24-RESEARCH — EDGE DISCOVERY ENGINE
 
 LOCKED RESEARCH HYPOTHESIS
 --------------------------
@@ -73,11 +73,11 @@ MIN_Z = 1.0
 MIN_CS = 8
 STOPS = (1.0, 1.25, 1.5)
 
-CACHE = Path("data/xt_v23_10")
-REPORT = Path("reports/xt_v23_10")
+CACHE = Path("data/xt_v24_research")
+REPORT = Path("reports/xt_v24_research")
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "hunter-v23.9-stage0/1.0"})
+SESSION.headers.update({"User-Agent": "hunter-v24-research/1.1"})
 
 
 def sha256_file(path: Path) -> str:
@@ -462,8 +462,11 @@ def _self_test():
 
     try:
         globals()["request_json"] = fake_request
-        test_dir = Path("/tmp/hunter_v23_10_selftest")
+        test_dir = Path("/tmp/hunter_v24_selftest")
         test_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = test_dir / "futures_selftest_usdt.csv"
+        if cache_file.exists():
+            cache_file.unlink()
         old_cache = globals()["CACHE"]
         globals()["CACHE"] = test_dir
         fetched = fetch_kline("synthetic://futures", "selftest_usdt", "futures")
@@ -601,6 +604,7 @@ def build_research_streams(streams):
 def build_research_panel(research_streams):
     idx = sorted(set().union(*(x.index for x in research_streams.values())))
     idx = pd.DatetimeIndex(idx).sort_values()
+
     rows = []
     for symbol, x in research_streams.items():
         y = x.copy()
@@ -608,6 +612,19 @@ def build_research_panel(research_streams):
         y["timestamp"] = y.index
         rows.append(y.reset_index(drop=True))
     panel = pd.concat(rows, ignore_index=True)
+
+    # Same-timestamp cross-sectional information is allowed, but historical
+    # statistics used to normalize it must be causal.  basis_z is therefore
+    # calculated from the cross-sectional basis deviation relative to its
+    # historical 120-hour mean/std, shifted by one hour.
+    basis_wide = panel.pivot(index="timestamp", columns="symbol", values="basis").sort_index()
+    cs_median = basis_wide.median(axis=1, skipna=True)
+    deviation = basis_wide.sub(cs_median, axis=0)
+    hist_mu = deviation.rolling(BASIS_Z_N, min_periods=BASIS_Z_N).mean().shift(1)
+    hist_sd = deviation.rolling(BASIS_Z_N, min_periods=BASIS_Z_N).std(ddof=0).shift(1)
+    basis_z_wide = (deviation - hist_mu) / hist_sd.replace(0.0, np.nan)
+    basis_z_long = basis_z_wide.rename_axis(index="timestamp", columns="symbol").reset_index().melt(id_vars="timestamp", var_name="symbol", value_name="basis_z")
+    panel = panel.merge(basis_z_long, on=["timestamp", "symbol"], how="left", validate="one_to_one")
 
     # Cross-sectional ranks are same-timestamp information only.
     for col, outcol in [("ret_24h", "fut_ret24_cs_rank"), ("atr_pct", "vol_cs_rank")]:
