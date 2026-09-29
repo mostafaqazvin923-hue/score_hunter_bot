@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HUNTER-V23.5-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING
+"""HUNTER-V23.7-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING
 
 LOCKED RESEARCH HYPOTHESIS
 --------------------------
@@ -73,11 +73,11 @@ MIN_Z = 1.0
 MIN_CS = 8
 STOPS = (1.0, 1.25, 1.5)
 
-CACHE = Path("data/xt_v23_5")
-REPORT = Path("reports/xt_v23_5")
+CACHE = Path("data/xt_v23_7")
+REPORT = Path("reports/xt_v23_7")
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "hunter-v23.5-stage0/1.0"})
+SESSION.headers.update({"User-Agent": "hunter-v23.7-stage0/1.0"})
 
 
 def sha256_file(path: Path) -> str:
@@ -207,39 +207,37 @@ def fetch_kline(url, symbol, kind):
     CACHE.mkdir(parents=True, exist_ok=True)
     path = CACHE / f"{kind}_{symbol}.csv"
 
-    # XT's kline endpoint treats the time window as candle timestamps.
-    # Keep exactly REQUIRED_DAYS completed candles, with no off-by-one page
-    # request after the final candle. The previous version set start one
-    # full day-range too early, collected the full 462-day set, then asked
-    # XT for one additional empty page.
-    end_ms = now_hour_ms() - H  # last fully closed 1H candle
+    # Fetch exactly REQUIRED_DAYS completed candles.
+    # XT may cap/interpret forward startTime requests in a way that returns
+    # only a few hundred recent candles. Therefore pagination is deliberately
+    # BACKWARD: each request is anchored by endTime and moves to older candles.
+    end_ms = now_hour_ms() - H
     start_ms = end_ms - (REQUIRED_DAYS - 1) * H
     allow_spot = kind == "spot"
 
     if path.exists():
         try:
             cached = pd.read_csv(path)
-            return validate_ohlcv(cached, f"{kind}_{symbol}[cache]", start_ms, end_ms, allow_spot)
+            return validate_ohlcv(
+                cached, f"{kind}_{symbol}[cache]", start_ms, end_ms, allow_spot
+            )
         except Exception as exc:
             print(f"[CACHE] {kind}_{symbol}: invalid/stale cache ({exc}); refetching")
 
-    cur = start_ms
+    cur_end = end_ms
     all_rows = []
     page = 0
+    oldest_seen = None
 
-    while cur <= end_ms:
+    while cur_end >= start_ms:
         page += 1
         if page > 1000:
             raise RuntimeError(f"{kind}_{symbol}: pagination guard exceeded")
 
-        # Do NOT send a bounded endTime here. XT can treat the final boundary
-        # as exclusive and return an empty last page even when the requested
-        # history is valid. Paginate forward from startTime only, then locally
-        # discard candles newer than the last completed candle.
         params = {
             "symbol": symbol,
             "interval": "1h",
-            "startTime": cur,
+            "endTime": cur_end,
             "limit": LIMIT,
         }
         payload = request_json(url, params, f"{kind}_{symbol} page={page}")
@@ -248,35 +246,53 @@ def fetch_kline(url, symbol, kind):
             raise RuntimeError(f"{kind}_{symbol} page={page}: API returned no candle list")
 
         parsed = [parse_kline_row(r) for r in raw]
-        inside = sorted({r for r in parsed if r is not None and r[0] >= cur})
+        inside = sorted({
+            r for r in parsed
+            if r is not None and start_ms <= r[0] <= cur_end
+        })
 
         if not inside:
             raise RuntimeError(
-                f"{kind}_{symbol}: empty interior page at {pd.to_datetime(cur, unit='ms', utc=True)}; refusing skip/fabricate"
+                f"{kind}_{symbol}: empty backward page at "
+                f"{pd.to_datetime(cur_end, unit='ms', utc=True)}; refusing skip/fabricate"
             )
 
         all_rows.extend(inside)
+        min_ts = min(r[0] for r in inside)
         max_ts = max(r[0] for r in inside)
-        next_cur = max_ts + H
-        if next_cur <= cur:
-            raise RuntimeError(f"{kind}_{symbol}: pagination stalled at page={page}")
-        cur = next_cur
+
+        if oldest_seen is not None and min_ts >= oldest_seen:
+            raise RuntimeError(
+                f"{kind}_{symbol}: backward pagination stalled at page={page}; "
+                f"oldest_ts did not move backward"
+            )
+        oldest_seen = min_ts
 
         if page % 4 == 0:
-            print(f"[FETCH] {kind}_{symbol} page={page} rows={len(all_rows)}")
-        if max_ts >= end_ms:
+            print(
+                f"[FETCH] {kind}_{symbol} page={page} rows={len(all_rows)} "
+                f"oldest={pd.to_datetime(min_ts, unit='ms', utc=True)} "
+                f"newest={pd.to_datetime(max_ts, unit='ms', utc=True)}"
+            )
+
+        if min_ts <= start_ms:
             break
+
+        # Move strictly one candle before the oldest returned candle.
+        cur_end = min_ts - H
         time.sleep(0.05)
 
     frame = pd.DataFrame(
         all_rows, columns=["ts", "open", "high", "low", "close", "volume"]
     )
     frame["timestamp"] = pd.to_datetime(frame.pop("ts"), unit="ms", utc=True)
-    frame = frame[frame.timestamp <= pd.to_datetime(end_ms, unit="ms", utc=True)]
-    frame = validate_ohlcv(frame, f"{kind}_{symbol}", start_ms, end_ms, allow_spot)
+    frame = frame[(frame.timestamp >= pd.to_datetime(start_ms, unit="ms", utc=True)) &
+                  (frame.timestamp <= pd.to_datetime(end_ms, unit="ms", utc=True))]
+    frame = validate_ohlcv(
+        frame, f"{kind}_{symbol}", start_ms, end_ms, allow_spot
+    )
     frame.to_csv(path, index=False)
     return frame
-
 
 def true_range(x):
     prev_close = x["close"].shift(1)
@@ -546,7 +562,7 @@ def report(stop_mult, trades, raw_candidates):
 
 
 def main():
-    print("HUNTER-V23.5-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING")
+    print("HUNTER-V23.7-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING")
     print(
         "XT 1H spot + perpetual | 455d research + 7d warmup | RR 1:2 | "
         "fixed universe | no funding dependency | no spot-gap filling"
