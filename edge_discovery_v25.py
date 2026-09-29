@@ -10,29 +10,42 @@ SYMS=['BTC/USDT','ETH/USDT','SOL/USDT','SUI/USDT','AVAX/USDT','NEAR/USDT','ADA/U
 DAYS=455; WARMUP=7; BAR=4*3600*1000; LIMIT=1000; MIN_COV=.97
 OUT=Path('reports/xt_v25_derivatives_research'); OUT.mkdir(parents=True,exist_ok=True)
 KEY = os.getenv("COINGLASS_API_KEY", "")
-# GitHub Secrets must contain the raw CoinGlass API key only.
-# Remove only harmless transport artifacts; never alter the actual key.
-KEY = KEY.replace("\ufeff", "").strip()
-if KEY.startswith('"') and KEY.endswith('"'):
-    KEY = KEY[1:-1].strip()
-if KEY.startswith("'") and KEY.endswith("'"):
+
+# Secret diagnostics are deliberately non-secret:
+# we NEVER print the key itself or any substring of it.
+# Strip only UTF-8 BOM, surrounding ASCII whitespace, and one matching
+# pair of surrounding quotes. Do not silently change characters inside
+# the key.
+KEY = KEY.lstrip("\ufeff").strip()
+if len(KEY) >= 2 and KEY[0] == KEY[-1] and KEY[0] in ("'", '"'):
     KEY = KEY[1:-1].strip()
 
 if not KEY:
     raise RuntimeError(
-        "COINGLASS_API_KEY is missing. Add the raw CoinGlass API key "
-        "as a GitHub Actions repository secret."
+        "COINGLASS_API_KEY is missing/empty. "
+        "Set the GitHub Actions repository secret COINGLASS_API_KEY."
     )
 
-try:
-    KEY.encode("ascii")
-except UnicodeEncodeError as exc:
+bad = [(i, ord(ch)) for i, ch in enumerate(KEY) if ord(ch) > 127]
+if bad:
+    positions = ",".join(str(i) for i, _ in bad[:20])
     raise RuntimeError(
-        "COINGLASS_API_KEY contains non-ASCII characters. "
-        "CoinGlass API keys are ASCII header values. "
-        "Re-copy the raw API key into the GitHub secret without quotes, "
-        "spaces, or any other characters."
-    ) from exc
+        "COINGLASS_API_KEY has non-ASCII characters at character position(s) "
+        f"{positions} (0-based). The key itself is NOT printed. "
+        "This usually means the secret contains copied text/characters "
+        "that are not part of the raw API key. Replace the secret with the "
+        "exact raw API key from CoinGlass."
+    )
+
+# Detect accidental internal whitespace without revealing the secret.
+internal_ws = [i for i, ch in enumerate(KEY) if ch.isspace()]
+if internal_ws:
+    positions = ",".join(str(i) for i in internal_ws[:20])
+    raise RuntimeError(
+        "COINGLASS_API_KEY contains whitespace inside the value at "
+        f"character position(s) {positions} (0-based). "
+        "The key itself is NOT printed. Use the raw API key only."
+    )
 def get(url, params):
     last = None
     for i in range(4):
