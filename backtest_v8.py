@@ -395,205 +395,6 @@ def build_panel(streams):
     return basis, change, z
 
 
-def candidates_at(ts, basis, change, z, streams):
-    r = basis.loc[ts]
-    zr = z.loc[ts]
-    cr = change.loc[ts]
-
-    valid = r.notna() & zr.notna() & cr.notna()
-    if int(valid.sum()) < MIN_CS:
-        return []
-
-    v = r[valid]
-    low = float(v.quantile(QUANT))
-    high = float(v.quantile(1.0 - QUANT))
-    result = []
-
-    for symbol in v.index:
-        stream = streams[symbol]
-        if ts not in stream.index:
-            continue
-        bz = float(zr[symbol])
-        bc = float(cr[symbol])
-        spot_ret = float(stream.loc[ts, "spot_ret24"])
-        if not np.isfinite(bz) or not np.isfinite(bc) or not np.isfinite(spot_ret):
-            continue
-
-        basis_value = float(v[symbol])
-        if basis_value >= high and bz >= MIN_Z and bc <= 0.0 and spot_ret >= 0.0:
-            side = 1
-        elif basis_value <= low and bz <= -MIN_Z and bc >= 0.0 and spot_ret <= 0.0:
-            side = -1
-        else:
-            continue
-        result.append((symbol, side, bz))
-
-    result.sort(key=lambda q: (abs(q[2]), q[0]), reverse=True)
-    return result
-
-
-def resolve_exit(x, entry_idx, side, entry, stop, target):
-    for j in range(entry_idx, len(x)):
-        bar = x.iloc[j]
-        hit_stop = float(bar["low"]) <= stop if side == 1 else float(bar["high"]) >= stop
-        hit_target = float(bar["high"]) >= target if side == 1 else float(bar["low"]) <= target
-        if not (hit_stop or hit_target):
-            continue
-
-        # Conservative deterministic rule: if both touched in one candle,
-        # classify as loss because intrabar order is unknown.
-        win = bool(hit_target and not hit_stop)
-        exit_price = target if win else stop
-        if side == 1:
-            gross = NOTIONAL * (exit_price - entry) / entry
-        else:
-            gross = NOTIONAL * (entry - exit_price) / entry
-        net = gross - NOTIONAL * FEE * 2.0
-        return x.index[j], net, win
-    return None
-
-
-def simulate(streams, basis, change, z, stop_mult):
-    events = []
-    # The first WARMUP_DAYS are data warmup only; no trades may originate there.
-    warmup_cutoff = basis.index.min() + pd.Timedelta(days=WARMUP_DAYS)
-    raw_candidates = 0
-
-    for ts in basis.index:
-        if ts < warmup_cutoff:
-            continue
-        for symbol, side, bz in candidates_at(ts, basis, change, z, streams):
-            raw_candidates += 1
-            stream = streams[symbol]
-            if ts not in stream.index:
-                continue
-            idx = stream.index.get_loc(ts)
-            if isinstance(idx, slice) or idx + 1 >= len(stream):
-                continue
-            events.append((ts, symbol, idx, side, bz))
-
-    events.sort(key=lambda e: (e[0], e[1]))
-    open_until = {}
-    last_exit = {}
-    equity = INITIAL
-    trades = []
-
-    for signal_ts, symbol, signal_idx, side, bz in events:
-        x = streams[symbol]
-        entry_idx = signal_idx + 1
-        entry_ts = x.index[entry_idx]
-
-        # Release positions whose exit happened strictly before this entry.
-        for s in list(open_until):
-            if open_until[s] < entry_ts:
-                del open_until[s]
-
-        # Per-symbol overlap lock + no same-exit-candle re-entry.
-        if symbol in open_until:
-            continue
-        if symbol in last_exit and entry_ts <= last_exit[symbol]:
-            continue
-        if len(open_until) >= MAX_POS:
-            continue
-        if equity < (len(open_until) + 1) * MARGIN:
-            continue
-
-        atr = float(x.iloc[signal_idx]["atr"])
-        if not np.isfinite(atr) or atr <= 0:
-            continue
-
-        raw_entry = float(x.iloc[entry_idx]["open"])
-        entry = raw_entry * (1.0 + SLIP) if side == 1 else raw_entry * (1.0 - SLIP)
-        distance = stop_mult * atr
-        if side == 1:
-            stop = entry - distance
-            target = entry + RR * distance
-        else:
-            stop = entry + distance
-            target = entry - RR * distance
-
-        result = resolve_exit(x, entry_idx, side, entry, stop, target)
-        if result is None:
-            # Do not invent an exit at the dataset boundary.
-            continue
-
-        exit_ts, pnl, win = result
-        open_until[symbol] = exit_ts
-        last_exit[symbol] = exit_ts
-        equity += pnl
-
-        trades.append(
-            {
-                "signal_ts": signal_ts,
-                "entry_ts": entry_ts,
-                "exit_ts": exit_ts,
-                "symbol": symbol,
-                "side": "LONG" if side == 1 else "SHORT",
-                "basis": float(basis.loc[signal_ts, symbol]),
-                "basis_z": bz,
-                "basis_change_24h": float(change.loc[signal_ts, symbol]),
-                "entry": entry,
-                "sl": stop,
-                "tp": target,
-                "win": int(win),
-                "pnl": float(pnl),
-            }
-        )
-
-    return pd.DataFrame(trades), raw_candidates
-
-
-def report(stop_mult, trades, raw_candidates):
-    print("\n" + "=" * 80)
-    print(f"STAGE-0 STOP = {stop_mult:.2f} ATR | RR = 1:2")
-    print("=" * 80)
-
-    n = len(trades)
-    print(f"Raw candidate signals   : {raw_candidates}")
-    print(f"Closed trades            : {n}")
-    if n == 0:
-        return
-
-    pnl = trades["pnl"]
-    wins = int((pnl > 0).sum())
-    losses = n - wins
-    gross_win = float(pnl[pnl > 0].sum())
-    gross_loss = float(-pnl[pnl <= 0].sum())
-    pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
-    equity = INITIAL + pnl.cumsum()
-    peak = equity.cummax()
-    dd = peak - equity
-    dd_pct = float((dd / peak.replace(0, np.nan)).max() * 100.0)
-
-    streak = 0
-    max_streak = 0
-    for value in pnl:
-        streak = streak + 1 if value <= 0 else 0
-        max_streak = max(max_streak, streak)
-
-    print(f"Wins                    : {wins}")
-    print(f"Losses                  : {losses}")
-    print(f"Win Rate                : {100.0 * wins / n:.2f}%")
-    print(f"Profit Factor           : {pf:.4f}")
-    print(f"Net PnL                 : ${pnl.sum():,.2f}")
-    print(f"Max Drawdown            : ${dd.max():,.2f}")
-    print(f"Max Drawdown %          : {dd_pct:.2f}%")
-    print(f"Max Loss Streak         : {max_streak}")
-    print(f"Expectancy / Trade      : ${pnl.mean():,.2f}")
-    print(f"Final Equity            : ${equity.iloc[-1]:,.2f}")
-
-    for side, group in trades.groupby("side"):
-        print(
-            f"SIDE {side:5s} trades={len(group):4d} "
-            f"WR={100.0 * group.win.mean():6.2f}% PnL=${group.pnl.sum():,.2f}"
-        )
-
-    print("\nBY SYMBOL")
-    for symbol, group in trades.groupby("symbol"):
-        print(
-            f"{symbol:10s} trades={len(group):4d} "
-            f"WR={100.0 * group.win.mean():6.2f}% PnL=${group.pnl.sum():,.2f}"
-        )
 
 
 def _self_test():
@@ -677,62 +478,299 @@ def _self_test():
     print("[SELFTEST] PASS — validation, gap rejection, features, panel, XT end-exclusive pagination")
 
 
+
+# ========================= V24 RESEARCH ENGINE =========================
+# This stage is exploratory by design. It does NOT fit a trading strategy.
+# Features use only information available at signal time. Forward returns and
+# path labels are used only as research targets and are never fed back into
+# features. No parameter is selected automatically for deployment.
+
+HORIZONS = (1, 4, 8, 12, 24)
+FWD_HORIZONS = (4, 8, 12, 24)
+TAIL_Q = 0.20
+MIN_EVENT_N = 100
+
+FEATURES = [
+    "ret_1h", "ret_4h", "ret_12h", "ret_24h",
+    "atr_pct", "rv_24", "rv_72", "ema20_gap", "ema50_gap",
+    "ema200_gap", "trend_stack", "range_pct", "range_expansion",
+    "volume_z24", "close_pos_24", "breakout_up24", "breakout_dn24",
+    "basis", "basis_chg24", "basis_z", "basis_cs_rank",
+    "fut_ret24_cs_rank", "vol_cs_rank",
+]
+
+
+def _safe_z(s, n):
+    mu = s.rolling(n, min_periods=n).mean().shift(1)
+    sd = s.rolling(n, min_periods=n).std(ddof=0).shift(1)
+    return (s - mu) / sd.replace(0.0, np.nan)
+
+
+def _rank_cs(frame):
+    return frame.rank(axis=1, pct=True, method="average")
+
+
+def build_research_streams(streams):
+    out = {}
+    for symbol, x0 in streams.items():
+        x = x0.copy().sort_index()
+        c = x["close"]
+        h = x["high"]
+        l = x["low"]
+        v = x["volume"]
+
+        for n in HORIZONS:
+            x[f"ret_{n}h"] = c / c.shift(n) - 1.0
+
+        x["atr_pct"] = x["atr"] / c
+        x["rv_24"] = x["ret_1h"].rolling(24, min_periods=24).std().shift(1) * np.sqrt(24)
+        x["rv_72"] = x["ret_1h"].rolling(72, min_periods=72).std().shift(1) * np.sqrt(72)
+
+        ema20 = c.ewm(span=20, adjust=False, min_periods=20).mean()
+        ema50 = c.ewm(span=50, adjust=False, min_periods=50).mean()
+        ema200 = c.ewm(span=200, adjust=False, min_periods=200).mean()
+        x["ema20_gap"] = c / ema20 - 1.0
+        x["ema50_gap"] = c / ema50 - 1.0
+        x["ema200_gap"] = c / ema200 - 1.0
+        x["trend_stack"] = ((ema20 > ema50) & (ema50 > ema200)).astype(float) - ((ema20 < ema50) & (ema50 < ema200)).astype(float)
+
+        prev_c = c.shift(1)
+        x["range_pct"] = (h - l) / prev_c
+        med_range = x["range_pct"].rolling(24, min_periods=24).median().shift(1)
+        x["range_expansion"] = x["range_pct"] / med_range.replace(0.0, np.nan)
+
+        vm = v.rolling(24, min_periods=24).mean().shift(1)
+        vs = v.rolling(24, min_periods=24).std(ddof=0).shift(1)
+        x["volume_z24"] = (v - vm) / vs.replace(0.0, np.nan)
+
+        hi24 = h.rolling(24, min_periods=24).max().shift(1)
+        lo24 = l.rolling(24, min_periods=24).min().shift(1)
+        x["close_pos_24"] = (c - lo24) / (hi24 - lo24).replace(0.0, np.nan)
+        x["breakout_up24"] = (c / hi24 - 1.0)
+        x["breakout_dn24"] = (c / lo24 - 1.0)
+
+        # Forward labels are deliberately computed separately from the feature set.
+        for n in FWD_HORIZONS:
+            x[f"fwd_close_{n}h"] = c.shift(-n) / c - 1.0
+            # Path extremes begin on the next completed bar. This prevents the
+            # signal candle itself from becoming a future outcome.
+            future_high = pd.concat([h.shift(-j) for j in range(1, n + 1)], axis=1).max(axis=1)
+            future_low = pd.concat([l.shift(-j) for j in range(1, n + 1)], axis=1).min(axis=1)
+            x[f"mfe_{n}h"] = future_high / c - 1.0
+            x[f"mae_{n}h"] = future_low / c - 1.0
+
+        # First-hit path label at 1 ATR risk, 2R target. Entry is the next bar
+        # open, matching the eventual backtest convention. Same-bar TP+SL is LOSS.
+        x["rr2_long"] = np.nan
+        x["rr2_short"] = np.nan
+        for i in range(len(x) - 1):
+            atr = float(x.iloc[i]["atr"])
+            if not np.isfinite(atr) or atr <= 0:
+                continue
+            entry_raw = float(x.iloc[i + 1]["open"])
+            long_entry = entry_raw * (1.0 + SLIP)
+            short_entry = entry_raw * (1.0 - SLIP)
+            ld = atr
+            sd = atr
+            lt = long_entry + 2.0 * ld
+            ls = long_entry - ld
+            st = short_entry - 2.0 * sd
+            ss = short_entry + sd
+            long_result = np.nan
+            short_result = np.nan
+            for j in range(i + 1, len(x)):
+                bh = float(x.iloc[j]["high"]); bl = float(x.iloc[j]["low"])
+                lh = bh >= lt; ll = bl <= ls
+                sh = bh >= ss; sl = bl <= st
+                if lh or ll:
+                    long_result = 1.0 if (lh and not ll) else -1.0
+                    break
+            for j in range(i + 1, len(x)):
+                bh = float(x.iloc[j]["high"]); bl = float(x.iloc[j]["low"])
+                sh = bh >= ss; sl = bl <= st
+                if sh or sl:
+                    short_result = 1.0 if (sl and not sh) else -1.0
+                    break
+            x.iloc[i, x.columns.get_loc("rr2_long")] = long_result
+            x.iloc[i, x.columns.get_loc("rr2_short")] = short_result
+
+        out[symbol] = x.replace([np.inf, -np.inf], np.nan)
+    return out
+
+
+def build_research_panel(research_streams):
+    idx = sorted(set().union(*(x.index for x in research_streams.values())))
+    idx = pd.DatetimeIndex(idx).sort_values()
+    rows = []
+    for symbol, x in research_streams.items():
+        y = x.copy()
+        y["symbol"] = symbol
+        y["timestamp"] = y.index
+        rows.append(y.reset_index(drop=True))
+    panel = pd.concat(rows, ignore_index=True)
+
+    # Cross-sectional ranks are same-timestamp information only.
+    for col, outcol in [("ret_24h", "fut_ret24_cs_rank"), ("atr_pct", "vol_cs_rank")]:
+        panel[outcol] = panel.groupby("timestamp")[col].rank(pct=True, method="average")
+    panel["basis_cs_rank"] = panel.groupby("timestamp")["basis"].rank(pct=True, method="average")
+    return panel
+
+
+def _split_name(ts, start, end):
+    span = end - start
+    p1 = start + span * 0.50
+    p2 = start + span * 0.75
+    if ts < p1:
+        return "DISCOVERY_50"
+    if ts < p2:
+        return "DEVELOPMENT_25"
+    return "VALIDATION_25"
+
+
+def feature_report(panel, feature, label):
+    d = panel[["timestamp", "symbol", feature, label]].dropna().copy()
+    if len(d) < MIN_EVENT_N:
+        return None
+    q20 = d[feature].quantile(TAIL_Q)
+    q80 = d[feature].quantile(1.0 - TAIL_Q)
+    groups = {
+        "LOW20": d[d[feature] <= q20],
+        "MID60": d[(d[feature] > q20) & (d[feature] < q80)],
+        "HIGH20": d[d[feature] >= q80],
+    }
+    result = {"feature": feature, "label": label, "n_total": len(d)}
+    for name, g in groups.items():
+        result[f"{name}_n"] = len(g)
+        result[f"{name}_mean"] = float(g[label].mean()) if len(g) else np.nan
+        result[f"{name}_median"] = float(g[label].median()) if len(g) else np.nan
+        result[f"{name}_positive"] = float((g[label] > 0).mean()) if len(g) else np.nan
+    if len(groups["LOW20"]) and len(groups["HIGH20"]):
+        result["HIGH_minus_LOW"] = result["HIGH20_mean"] - result["LOW20_mean"]
+    else:
+        result["HIGH_minus_LOW"] = np.nan
+    return result
+
+
+def directional_report(panel, feature, label):
+    d = panel[["timestamp", "symbol", feature, label]].dropna().copy()
+    if len(d) < MIN_EVENT_N:
+        return None
+    rows = []
+    for side_name, sign in (("LONG", 1), ("SHORT", -1)):
+        value = sign * d[feature]
+        q = value.quantile(1.0 - TAIL_Q)
+        g = d[value >= q]
+        rows.append({
+            "feature": feature, "label": label, "side": side_name,
+            "n": len(g), "mean": float(g[label].mean()) if len(g) else np.nan,
+            "positive": float((g[label] > 0).mean()) if len(g) else np.nan,
+        })
+    return rows
+
+
+def summarize_rr(panel):
+    rows = []
+    for split in ("DISCOVERY_50", "DEVELOPMENT_25", "VALIDATION_25", "ALL"):
+        d = panel if split == "ALL" else panel[panel["split"] == split]
+        for side, col in (("LONG", "rr2_long"), ("SHORT", "rr2_short")):
+            v = d[col].dropna()
+            if len(v) == 0:
+                continue
+            wins = int((v > 0).sum()); losses = int((v < 0).sum())
+            rows.append({
+                "split": split, "side": side, "n": len(v),
+                "wins": wins, "losses": losses,
+                "win_rate": wins / len(v),
+                "mean_R": float(np.where(v > 0, 2.0, -1.0).mean()),
+            })
+    return pd.DataFrame(rows)
+
+
 def main():
+    print("HUNTER-V24-RESEARCH — EDGE DISCOVERY ENGINE")
+    print("No strategy fitting. No parameter optimization. No future data in features.")
+    print(f"XT 1H | {LOOKBACK_DAYS}d research + {WARMUP_DAYS}d warmup | fixed universe")
+
     _self_test()
-    print("HUNTER-V23.10-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING")
-    print(
-        "XT 1H spot + perpetual | 455d research + 7d warmup | RR 1:2 | "
-        "fixed universe | no funding dependency | no spot-gap filling"
-    )
-    print(f"Code SHA256: {sha256_file(Path(__file__))}")
-
-    streams = {}
-    for number, symbol in enumerate(SYMBOLS, 1):
-        print(f"\n[{number}/{len(SYMBOLS)}] {symbol}: futures")
-        futures = fetch_kline(FUT_URL, symbol, "futures")
-
-        print(f"[{number}/{len(SYMBOLS)}] {symbol}: spot")
-        spot = fetch_kline(SPOT_URL, symbol, "spot")
-
-        streams[symbol] = build_stream(futures, spot)
-        merged_days = (
-            streams[symbol].index[-1] - streams[symbol].index[0]
-        ).total_seconds() / 86400.0
-        print(
-            f"[DATA] {symbol}: merged_rows={len(streams[symbol])}, "
-            f"merged_span={merged_days:.1f}d"
-        )
-        if merged_days < LOOKBACK_DAYS:
-            raise RuntimeError(
-                f"{symbol}: merged futures/spot span {merged_days:.1f}d < required {LOOKBACK_DAYS}d"
-            )
-
-    basis, change, z = build_panel(streams)
-    print("\nData preparation complete.")
-    print(f"Panel timestamps: {len(basis)}")
-    print(f"Panel start     : {basis.index.min()}")
-    print(f"Panel end       : {basis.index.max()}")
-
     REPORT.mkdir(parents=True, exist_ok=True)
-    for stop_mult in STOPS:
-        trades, raw_candidates = simulate(streams, basis, change, z, stop_mult)
-        report(stop_mult, trades, raw_candidates)
-        if not trades.empty:
-            trades.to_csv(
-                REPORT / f"trades_stop_{stop_mult:.2f}.csv", index=False
-            )
+    streams = {}
+    for i, symbol in enumerate(SYMBOLS, 1):
+        print(f"\n[{i}/{len(SYMBOLS)}] {symbol}")
+        futures = fetch_kline(FUT_URL, symbol, "futures")
+        spot = fetch_kline(SPOT_URL, symbol, "spot")
+        streams[symbol] = build_stream(futures, spot)
 
-    print("\nSTAGE-0 DECISION PROTOCOL")
-    print("All three pre-registered stops are reported; no stop is selected here.")
-    print("If the family fails the pre-registered gates, close V23 without tuning.")
-    print("If it passes, proceed to clean walk-forward validation with the hypothesis locked.")
+    research_streams = build_research_streams(streams)
+    panel = build_research_panel(research_streams)
+    start = panel.timestamp.min(); end = panel.timestamp.max()
+    panel["split"] = panel["timestamp"].map(lambda x: _split_name(x, start, end))
+    panel.to_csv(REPORT / "research_panel.csv", index=False)
+
+    # Forward-return event study.
+    feature_rows = []
+    for feature in FEATURES:
+        for h in FWD_HORIZONS:
+            label = f"fwd_close_{h}h"
+            r = feature_report(panel, feature, label)
+            if r is not None:
+                feature_rows.append(r)
+    fr = pd.DataFrame(feature_rows)
+    if not fr.empty:
+        fr.sort_values(["label", "HIGH_minus_LOW"], ascending=[True, False]).to_csv(
+            REPORT / "feature_tail_report.csv", index=False
+        )
+
+    # Directional conditional study using only signal-time feature values.
+    dr = []
+    for feature in FEATURES:
+        for h in FWD_HORIZONS:
+            label = f"fwd_close_{h}h"
+            r = directional_report(panel, feature, label)
+            if r:
+                dr.extend(r)
+    pd.DataFrame(dr).to_csv(REPORT / "directional_tail_report.csv", index=False)
+
+    rr = summarize_rr(panel)
+    rr.to_csv(REPORT / "rr2_path_report.csv", index=False)
+
+    # A compact stability table: for each feature, compare HIGH-vs-LOW mean
+    # forward return separately in each time split. This is descriptive only.
+    stability = []
+    for feature in FEATURES:
+        for h in FWD_HORIZONS:
+            label = f"fwd_close_{h}h"
+            for split in ("DISCOVERY_50", "DEVELOPMENT_25", "VALIDATION_25"):
+                d = panel[panel.split == split][[feature, label]].dropna()
+                if len(d) < MIN_EVENT_N:
+                    continue
+                q1 = d[feature].quantile(TAIL_Q); q2 = d[feature].quantile(1-TAIL_Q)
+                lo = d[d[feature] <= q1][label]; hi = d[d[feature] >= q2][label]
+                stability.append({
+                    "feature": feature, "label": label, "split": split,
+                    "n_low": len(lo), "n_high": len(hi),
+                    "low_mean": float(lo.mean()), "high_mean": float(hi.mean()),
+                    "high_minus_low": float(hi.mean() - lo.mean()),
+                })
+    pd.DataFrame(stability).to_csv(REPORT / "stability_by_split.csv", index=False)
+
+    print("\n" + "=" * 80)
+    print("RESEARCH COMPLETE")
+    print("=" * 80)
+    print(f"Panel rows       : {len(panel):,}")
+    print(f"Panel timestamps : {panel.timestamp.nunique():,}")
+    print(f"Panel start      : {start}")
+    print(f"Panel end        : {end}")
+    print("Reports:")
+    for p in sorted(REPORT.glob("*.csv")):
+        print(f"  {p}")
+    print("\nIMPORTANT: This run does not select a strategy. It produces evidence for the next locked hypothesis.")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print("\nFATAL BACKTEST ERROR")
+        print("\nFATAL RESEARCH ERROR")
         print(f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
         raise
