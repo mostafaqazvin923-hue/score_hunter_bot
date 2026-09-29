@@ -1,9 +1,8 @@
-import os, time
+import os, time, json, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
 import pandas as pd
-import requests
 
 XT='https://fapi.xt.com'
 CG='https://open-api-v4.coinglass.com'
@@ -12,19 +11,40 @@ DAYS=455; WARMUP=7; BAR=4*3600*1000; LIMIT=1000; MIN_COV=.97
 OUT=Path('reports/xt_v25_derivatives_research'); OUT.mkdir(parents=True,exist_ok=True)
 KEY=os.getenv('COINGLASS_API_KEY','').strip()
 if not KEY: raise RuntimeError('COINGLASS_API_KEY is missing. Add it as a GitHub Actions repository secret.')
-s=requests.Session(); s.headers.update({'accept':'application/json','CG-API-KEY':KEY})
-
-def get(url,params):
-    last=None
+def get(url, params):
+    # ASCII-only urllib request layer.
+    # This replaces the requests layer that failed in GitHub Actions with:
+    # 'latin-1 codec can't encode characters...'
+    last = None
     for i in range(4):
         try:
-            r=s.get(url,params=params,timeout=30)
-            if r.status_code==429 or r.status_code>=500: raise RuntimeError(f'HTTP {r.status_code}')
-            r.raise_for_status(); j=r.json()
-            if str(j.get('code','0')) not in ('0','200'): raise RuntimeError(j.get('msg','API error'))
+            query = urllib.parse.urlencode(params, doseq=True, safe="")
+            full_url = url + ("?" + query if query else "")
+            headers = {
+                "Accept": "application/json",
+                "User-Agent": "score-hunter-v25/1.0",
+            }
+            if url.startswith(CG):
+                headers["CG-API-KEY"] = KEY
+
+            req = urllib.request.Request(
+                full_url,
+                headers=headers,
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=30) as response:
+                raw = response.read()
+                j = json.loads(raw.decode("utf-8"))
+
+            if isinstance(j, dict) and str(j.get("code", "0")) not in ("0", "200"):
+                raise RuntimeError(j.get("msg", "API error"))
             return j
-        except Exception as e: last=e; time.sleep(1.5*(i+1))
-    raise RuntimeError(f'GET failed: {url} {params}: {last}')
+
+        except Exception as e:
+            last = e
+            time.sleep(1.5 * (i + 1))
+
+    raise RuntimeError(f"GET failed: {url} {params}: {last}")
 
 def xt(sym,a,b):
     rows=[]; cur=a
