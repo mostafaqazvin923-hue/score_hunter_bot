@@ -9,8 +9,30 @@ CG='https://open-api-v4.coinglass.com'
 SYMS=['BTC/USDT','ETH/USDT','SOL/USDT','SUI/USDT','AVAX/USDT','NEAR/USDT','ADA/USDT','BNB/USDT','APT/USDT','CRV/USDT','ONDO/USDT','PENDLE/USDT','ICP/USDT','WIF/USDT']
 DAYS=455; WARMUP=7; BAR=4*3600*1000; LIMIT=1000; MIN_COV=.97
 OUT=Path('reports/xt_v25_derivatives_research'); OUT.mkdir(parents=True,exist_ok=True)
-KEY=os.getenv('COINGLASS_API_KEY','').strip()
-if not KEY: raise RuntimeError('COINGLASS_API_KEY is missing. Add it as a GitHub Actions repository secret.')
+KEY = os.getenv("COINGLASS_API_KEY", "")
+# GitHub Secrets must contain the raw CoinGlass API key only.
+# Remove only harmless transport artifacts; never alter the actual key.
+KEY = KEY.replace("\ufeff", "").strip()
+if KEY.startswith('"') and KEY.endswith('"'):
+    KEY = KEY[1:-1].strip()
+if KEY.startswith("'") and KEY.endswith("'"):
+    KEY = KEY[1:-1].strip()
+
+if not KEY:
+    raise RuntimeError(
+        "COINGLASS_API_KEY is missing. Add the raw CoinGlass API key "
+        "as a GitHub Actions repository secret."
+    )
+
+try:
+    KEY.encode("ascii")
+except UnicodeEncodeError as exc:
+    raise RuntimeError(
+        "COINGLASS_API_KEY contains non-ASCII characters. "
+        "CoinGlass API keys are ASCII header values. "
+        "Re-copy the raw API key into the GitHub secret without quotes, "
+        "spaces, or any other characters."
+    ) from exc
 def get(url, params):
     last = None
     for i in range(4):
