@@ -12,9 +12,6 @@ OUT=Path('reports/xt_v25_derivatives_research'); OUT.mkdir(parents=True,exist_ok
 KEY=os.getenv('COINGLASS_API_KEY','').strip()
 if not KEY: raise RuntimeError('COINGLASS_API_KEY is missing. Add it as a GitHub Actions repository secret.')
 def get(url, params):
-    # ASCII-only urllib request layer.
-    # This replaces the requests layer that failed in GitHub Actions with:
-    # 'latin-1 codec can't encode characters...'
     last = None
     for i in range(4):
         try:
@@ -27,42 +24,154 @@ def get(url, params):
             if url.startswith(CG):
                 headers["CG-API-KEY"] = KEY
 
-            req = urllib.request.Request(
-                full_url,
-                headers=headers,
-                method="GET",
-            )
+            req = urllib.request.Request(full_url, headers=headers, method="GET")
             with urllib.request.urlopen(req, timeout=30) as response:
-                raw = response.read()
-                j = json.loads(raw.decode("utf-8"))
+                j = json.loads(response.read().decode("utf-8"))
 
             if isinstance(j, dict) and str(j.get("code", "0")) not in ("0", "200"):
                 raise RuntimeError(j.get("msg", "API error"))
             return j
-
         except Exception as e:
             last = e
             time.sleep(1.5 * (i + 1))
-
     raise RuntimeError(f"GET failed: {url} {params}: {last}")
 
-def xt(sym,a,b):
-    rows=[]; cur=a
-    while cur<b:
-        j=get(f'{XT}/future/market/v1/public/q/kline',{'symbol':sym.replace('/','_'),'interval':'4h','startTime':cur,'endTime':min(b,cur+LIMIT*BAR),'limit':LIMIT})
-        d=j.get('result',j.get('data',[])); d=d.get('data',d.get('rows',[])) if isinstance(d,dict) else d
-        if not d: break
+def xt(sym, a, b):
+    rows = []
+    cur = a
+    symbol = sym.replace("/", "_").lower()
+
+    # XT's futures kline endpoint is treated as end-exclusive here.
+    # We advance from the actual newest candle returned, never by assumed
+    # page size, and never make a tiny tail request that can trigger the
+    # empty-page boundary seen in earlier XT pagination work.
+    page = 0
+    previous_max = None
+    WINDOW = LIMIT * BAR
+
+    while cur < b:
+        page += 1
+        if page > 1000:
+            raise RuntimeError(f"XT pagination guard exceeded: {sym}")
+
+        remaining = b - cur
+        final_window = remaining <= WINDOW
+
+        if final_window:
+            window_start = cur
+            window_end = b
+        else:
+            window_start = cur
+            window_end = cur + WINDOW
+
+        params = {
+            "symbol": symbol,
+            "interval": "4h",
+            "startTime": int(window_start),
+            "endTime": int(window_end),
+            "limit": LIMIT,
+        }
+
+        j = get(f"{XT}/future/market/v1/public/q/kline", params)
+
+        # XT has returned the kline list under different wrappers.
+        d = j
+        if isinstance(d, dict):
+            d = d.get("result", d.get("data", d.get("rows", d.get("list", []))))
+            if isinstance(d, dict):
+                d = d.get("data", d.get("rows", d.get("list", d.get("items", []))))
+
+        if not isinstance(d, list):
+            raise RuntimeError(
+                f"XT {sym} page={page}: unexpected kline response type: {type(d).__name__}"
+            )
+
+        parsed = []
         for x in d:
-            if isinstance(x,dict):
-                z=[x.get(k) for k in ('time','open','high','low','close','volume')]
-            else: z=x[:6]
-            rows.append([int(z[0]),*map(float,z[1:])])
-        last=max(int(x[0] if not isinstance(x,dict) else x.get('time',x.get('timestamp'))) for x in d)
-        if last<cur or last>=b: break
-        cur=last+BAR
-        if len(d)<2: break
-    if not rows: raise RuntimeError(f'No XT data: {sym}')
-    return pd.DataFrame(rows,columns=['ts','open','high','low','close','volume']).drop_duplicates('ts').sort_values('ts')
+            try:
+                if isinstance(x, dict):
+                    ts = x.get("time", x.get("timestamp", x.get("ts", x.get("t"))))
+                    o = x.get("open", x.get("o"))
+                    h = x.get("high", x.get("h"))
+                    l = x.get("low", x.get("l"))
+                    c = x.get("close", x.get("c"))
+                    v = x.get("volume", x.get("vol", x.get("v", x.get("amount", 0))))
+                    z = [ts, o, h, l, c, v]
+                elif isinstance(x, (list, tuple)) and len(x) >= 6:
+                    z = list(x[:6])
+                else:
+                    continue
+
+                if any(v is None for v in z[:5]):
+                    continue
+
+                ts = int(float(z[0]))
+                if ts < 10_000_000_000:
+                    ts *= 1000
+
+                if window_start <= ts < window_end:
+                    parsed.append(
+                        [ts, float(z[1]), float(z[2]), float(z[3]), float(z[4]), float(z[5] or 0)]
+                    )
+            except Exception:
+                continue
+
+        parsed.sort(key=lambda r: r[0])
+
+        if not parsed:
+            if final_window:
+                break
+            raise RuntimeError(
+                f"XT {sym}: empty bounded page={page}; "
+                f"window={pd.to_datetime(window_start, unit='ms', utc=True)} -> "
+                f"{pd.to_datetime(window_end, unit='ms', utc=True)}"
+            )
+
+        max_ts = parsed[-1][0]
+
+        if previous_max is not None and max_ts <= previous_max and not final_window:
+            raise RuntimeError(f"XT pagination stalled: {sym} page={page}")
+
+        rows.extend(parsed)
+        previous_max = max(previous_max or max_ts, max_ts)
+
+        print(
+            f"[XT] {sym} page={page} rows={len(set(r[0] for r in rows))} "
+            f"latest={pd.to_datetime(max_ts, unit='ms', utc=True)}"
+        )
+
+        if final_window:
+            break
+
+        next_cur = max_ts + BAR
+        if next_cur <= cur:
+            raise RuntimeError(f"XT pagination did not advance: {sym} page={page}")
+        cur = next_cur
+        time.sleep(0.05)
+
+    if not rows:
+        raise RuntimeError(f"No XT data: {sym}")
+
+    df = pd.DataFrame(
+        rows,
+        columns=["ts", "open", "high", "low", "close", "volume"],
+    )
+    df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
+
+    # Completed candles only.
+    now_ms = int(time.time() * 1000)
+    if len(df) and int(df["ts"].iloc[-1]) + BAR > now_ms:
+        df = df.iloc[:-1].copy()
+
+    if len(df) < int(DAYS * 24 * 0.95):
+        span = (
+            df["ts"].iloc[-1] - df["ts"].iloc[0]
+        ) / 86_400_000 if len(df) > 1 else 0
+        raise RuntimeError(
+            f"XT {sym}: insufficient 4h history: rows={len(df)}, span={span:.1f}d"
+        )
+
+    return df
 
 def cg(path,sym,a,b,ex=None):
     rows=[]; cur=a
