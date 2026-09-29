@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HUNTER-V23.9-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING
+"""HUNTER-V23.10-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING
 
 LOCKED RESEARCH HYPOTHESIS
 --------------------------
@@ -73,8 +73,8 @@ MIN_Z = 1.0
 MIN_CS = 8
 STOPS = (1.0, 1.25, 1.5)
 
-CACHE = Path("data/xt_v23_9")
-REPORT = Path("reports/xt_v23_9")
+CACHE = Path("data/xt_v23_10")
+REPORT = Path("reports/xt_v23_10")
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "hunter-v23.9-stage0/1.0"})
@@ -207,19 +207,10 @@ def fetch_kline(url, symbol, kind):
     CACHE.mkdir(parents=True, exist_ok=True)
     path = CACHE / f"{kind}_{symbol}.csv"
 
-    # XT's endpoint behaves reliably when each request has an explicit,
-    # bounded time window.  A startTime-only request can return only a small
-    # default history (observed ~461 candles), even when limit=1000 is sent.
-    # Therefore we use bounded windows and stop strictly after the required
-    # candle count has been collected.  We never make an extra boundary
-    # request after the last required candle.
     end_ms = now_hour_ms() - H
-    start_ms = end_ms - (REQUIRED_DAYS * 24 - 1) * H
-    allow_spot = kind == "spot"
     expected_rows = REQUIRED_DAYS * 24
-    expected_start_ms = end_ms - (expected_rows - 1) * H
-    if start_ms != expected_start_ms:
-        raise RuntimeError("internal date-range calculation mismatch")
+    start_ms = end_ms - (expected_rows - 1) * H
+    allow_spot = kind == "spot"
     WINDOW_CANDLES = 900
 
     if path.exists():
@@ -231,6 +222,12 @@ def fetch_kline(url, symbol, kind):
         except Exception as exc:
             print(f"[CACHE] {kind}_{symbol}: invalid/stale cache ({exc}); refetching")
 
+    # XT can return one fewer candle than the requested bounded window.  The
+    # safe solution is not to assume page-size == response-size and not to
+    # make a tiny one-hour request at the very end.  We advance by the actual
+    # newest timestamp received, then use one final full-width overlapping
+    # window for the tail.  All rows are deduplicated by timestamp and the
+    # validator remains the authority on real missing candles.
     cur = start_ms
     all_rows = []
     page = 0
@@ -241,12 +238,23 @@ def fetch_kline(url, symbol, kind):
         if page > 1000:
             raise RuntimeError(f"{kind}_{symbol}: pagination guard exceeded")
 
-        window_end = min(end_ms, cur + (WINDOW_CANDLES - 1) * H)
+        remaining = ((end_ms - cur) // H) + 1
+        final_window = remaining <= WINDOW_CANDLES
+
+        if final_window:
+            window_start = max(start_ms, end_ms - (WINDOW_CANDLES - 1) * H)
+            window_end = end_ms
+        else:
+            window_start = cur
+            window_end = cur + (WINDOW_CANDLES - 1) * H
+
         params = {
             "symbol": symbol,
             "interval": "1h",
-            "startTime": cur,
-            "endTime": window_end,
+            "startTime": int(window_start),
+            # XT behaves as if endTime is exclusive on this endpoint.
+            # Request one extra hour and filter it back to window_end.
+            "endTime": int(window_end + H),
             "limit": LIMIT,
         }
         payload = request_json(url, params, f"{kind}_{symbol} page={page}")
@@ -259,53 +267,48 @@ def fetch_kline(url, symbol, kind):
         parsed = [parse_kline_row(r) for r in raw]
         inside = sorted({
             r for r in parsed
-            if r is not None and cur <= r[0] <= window_end
+            if r is not None and window_start <= r[0] <= window_end
         })
 
+        # A final one-hour request is an XT boundary edge case.  Do not treat
+        # an empty tail request as proof of a valid dataset; instead validate
+        # the rows already collected.  Any actual missing candle/gap will be
+        # rejected by validate_ohlcv below.  Non-final empty pages are fatal.
         if not inside:
+            if final_window:
+                break
             raise RuntimeError(
                 f"{kind}_{symbol}: empty bounded page={page} at "
-                f"{pd.to_datetime(cur, unit='ms', utc=True)} -> "
+                f"{pd.to_datetime(window_start, unit='ms', utc=True)} -> "
                 f"{pd.to_datetime(window_end, unit='ms', utc=True)}; "
                 f"refusing skip/fabricate"
             )
 
         all_rows.extend(inside)
+        unique_ts = len({r[0] for r in all_rows})
         max_ts = max(r[0] for r in inside)
         min_ts = min(r[0] for r in inside)
 
-        if previous_max is not None and max_ts <= previous_max:
+        if previous_max is not None and not final_window and max_ts <= previous_max:
             raise RuntimeError(
                 f"{kind}_{symbol}: pagination stalled at page={page}; "
                 f"max timestamp did not move forward"
             )
-        previous_max = max_ts
+        previous_max = max(previous_max or max_ts, max_ts)
 
-        # De-duplicate by timestamp for the progress test.  Do not fabricate
-        # missing candles; validation below will reject material gaps.
-        unique_ts = len({r[0] for r in all_rows})
-
-        if page % 4 == 0 or unique_ts >= expected_rows:
+        if page % 4 == 0 or unique_ts >= expected_rows or final_window:
             print(
                 f"[FETCH] {kind}_{symbol} page={page} rows={unique_ts} "
                 f"oldest={pd.to_datetime(min(r[0] for r in all_rows), unit='ms', utc=True)} "
                 f"newest={pd.to_datetime(max(r[0] for r in all_rows), unit='ms', utc=True)}"
             )
 
-        # Exact completion condition: once all expected hourly timestamps are
-        # present, stop immediately. This prevents the old final empty-page
-        # failure at the end of the requested interval.
-        if unique_ts >= expected_rows:
-            break
-
-        if max_ts >= end_ms:
+        if unique_ts >= expected_rows or final_window:
             break
 
         next_cur = max_ts + H
         if next_cur <= cur:
-            raise RuntimeError(
-                f"{kind}_{symbol}: pagination stalled at page={page}"
-            )
+            raise RuntimeError(f"{kind}_{symbol}: pagination stalled at page={page}")
         cur = next_cur
         time.sleep(0.05)
 
@@ -317,9 +320,8 @@ def fetch_kline(url, symbol, kind):
         (frame.timestamp >= pd.to_datetime(start_ms, unit="ms", utc=True))
         & (frame.timestamp <= pd.to_datetime(end_ms, unit="ms", utc=True))
     ]
-    frame = validate_ohlcv(
-        frame, f"{kind}_{symbol}", start_ms, end_ms, allow_spot
-    )
+    frame = frame.drop_duplicates(subset=["timestamp"], keep="last")
+    frame = validate_ohlcv(frame, f"{kind}_{symbol}", start_ms, end_ms, allow_spot)
     frame.to_csv(path, index=False)
     return frame
 
@@ -654,11 +656,12 @@ def _self_test():
     def fake_request(url, params, label, attempts=4):
         calls.append(dict(params))
         lo, hi = int(params["startTime"]), int(params["endTime"])
-        return {"result": [list(r) for r in synthetic if lo <= r[0] <= hi]}
+        # Emulate XT's observed end-exclusive bounded-window behavior.
+        return {"result": [list(r) for r in synthetic if lo <= r[0] < hi]}
 
     try:
         globals()["request_json"] = fake_request
-        test_dir = Path("/tmp/hunter_v23_9_selftest")
+        test_dir = Path("/tmp/hunter_v23_10_selftest")
         test_dir.mkdir(parents=True, exist_ok=True)
         old_cache = globals()["CACHE"]
         globals()["CACHE"] = test_dir
@@ -671,12 +674,12 @@ def _self_test():
     finally:
         globals()["request_json"] = old_request
 
-    print("[SELFTEST] PASS — validation, gap rejection, features, panel, pagination")
+    print("[SELFTEST] PASS — validation, gap rejection, features, panel, XT end-exclusive pagination")
 
 
 def main():
     _self_test()
-    print("HUNTER-V23.9-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING")
+    print("HUNTER-V23.10-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING")
     print(
         "XT 1H spot + perpetual | 455d research + 7d warmup | RR 1:2 | "
         "fixed universe | no funding dependency | no spot-gap filling"
