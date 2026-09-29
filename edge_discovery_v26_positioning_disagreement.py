@@ -356,11 +356,19 @@ def fetch_funding(symbol: str, start_ms: int, end_ms: int):
         current_items, current_has_next, _ = parse_funding_items(payload)
         if not current_items:
             break
+        new_parsed = []
         for item in current_items:
             p = parse_funding_row(item)
             if p is not None:
                 parsed_all.append(p)
+                new_parsed.append(p)
         print(f"[XT-FUND] {symbol} NEXT id={cursor} rows_total={len(parsed_all)}")
+        # On XT, NEXT can walk backward through the funding history. Stop
+        # immediately once the newly fetched page reaches the requested start.
+        # Without this guard the API can traverse tens of thousands of old
+        # records even though only ~700 records are needed for a 455-day window.
+        if new_parsed and min(x["ts"] for x in new_parsed) <= start_ms:
+            break
         time.sleep(0.05)
 
     df = pd.DataFrame(parsed_all)
@@ -869,10 +877,29 @@ def main():
             else np.nan
         )
         if available_days < MIN_FUNDING_AVAILABLE_DAYS:
-            raise RuntimeError(
-                f"Funding history too short for {sym}: available_days={available_days:.1f}, "
-                f"minimum={MIN_FUNDING_AVAILABLE_DAYS}"
+            # A newly listed contract can have complete OHLCV but insufficient
+            # public funding history. Do not fabricate funding observations and
+            # do not abort the whole research run; exclude only this symbol and
+            # record the exclusion in the funding audit.
+            print(
+                f"[SKIP-FUNDING] {sym} available_days={available_days:.1f} "
+                f"< minimum={MIN_FUNDING_AVAILABLE_DAYS}"
             )
+            funding_cov.append({
+                "symbol": sym,
+                "status": "EXCLUDED_INSUFFICIENT_FUNDING_HISTORY",
+                "funding_events": len(funding),
+                "requested_research_days": DAYS,
+                "median_interval_hours": median_interval / 3600.0 if np.isfinite(median_interval) else np.nan,
+                "expected_events_available_span_approx": expected_funding_available,
+                "funding_cadence_coverage_available_span": fund_cadence_cov,
+                "available_funding_days": available_days,
+                "requested_window_coverage": available_days / DAYS if DAYS > 0 else np.nan,
+                "max_gap_hours": max_gap_h,
+                "first_funding_dt": pd.to_datetime(funding.ts.min(), unit="ms", utc=True),
+                "last_funding_dt": pd.to_datetime(funding.ts.max(), unit="ms", utc=True),
+            })
+            continue
 
         print(
             f"[FUNDING] {sym} events={len(funding)} median_interval_h="
@@ -909,6 +936,7 @@ def main():
         })
         funding_cov.append({
             "symbol": sym,
+            "status": "ELIGIBLE",
             "funding_events": len(funding),
             "requested_research_days": DAYS,
             "median_interval_hours": median_interval / 3600.0 if np.isfinite(median_interval) else np.nan,
@@ -926,6 +954,9 @@ def main():
             for direction, mask in by_dir.items():
                 trades = run_setup_on_symbol(df, funding, setup, direction, mask)
                 all_trades.extend(trades)
+
+    if not panels:
+        raise RuntimeError("No symbols have sufficient funding history for V26 research.")
 
     panel = pd.concat(panels, ignore_index=True).sort_values(["dt", "symbol"]).reset_index(drop=True)
     panel, split_a, split_b = assign_time_splits(panel)
