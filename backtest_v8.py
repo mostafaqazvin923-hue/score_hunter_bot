@@ -59,7 +59,7 @@ def krow(r):
     except Exception: return None
 
 
-def validate(x,name,start,end):
+def validate(x,name,start,end,allow_spot_gaps=False):
     x=x.copy(); x.timestamp=pd.to_datetime(x.timestamp,utc=True)
     x=x.sort_values("timestamp").drop_duplicates("timestamp",keep="last")
     x=x[(x.timestamp>=pd.to_datetime(start,unit="ms",utc=True))&(x.timestamp<=pd.to_datetime(end,unit="ms",utc=True))].copy()
@@ -67,7 +67,19 @@ def validate(x,name,start,end):
     if x[["open","high","low","close","volume"]].isna().any().any(): raise RuntimeError(f"{name}: NaN")
     if (x[["open","high","low","close"]]<=0).any().any() or (x.volume<0).any(): raise RuntimeError(f"{name}: invalid OHLCV")
     gaps=x.timestamp.diff().dropna().dt.total_seconds()/3600
-    if (gaps>1+1e-9).any(): raise RuntimeError(f"{name}: 1H gap; no fabrication")
+    bad=gaps>1+1e-9
+    if bad.any():
+        if not allow_spot_gaps:
+            raise RuntimeError(f"{name}: 1H gap; no fabrication")
+        # Spot is auxiliary context. We never fill or interpolate missing
+        # candles. Instead, permit small historical holes and make every
+        # feature that needs a 24h history explicitly require real 24h
+        # spacing. Large holes remain fatal.
+        max_gap=float(gaps.max())
+        gap_count=int(bad.sum())
+        if max_gap>6.0:
+            raise RuntimeError(f"{name}: spot gap too large ({max_gap:.2f}h); no fabrication")
+        print(f"[DATA] {name}: {gap_count} spot gap(s), max_gap={max_gap:.2f}h; gaps will NOT be filled")
     if len(x)<int((LOOKBACK_DAYS+WARMUP_DAYS)*24*.95): raise RuntimeError(f"{name}: insufficient history {len(x)}")
     return x.reset_index(drop=True)
 
@@ -75,7 +87,7 @@ def validate(x,name,start,end):
 def fetch_kline(url,symbol,prefix):
     CACHE.mkdir(parents=True,exist_ok=True); path=CACHE/f"{prefix}{symbol}.csv"
     now=int(time.time()*1000); start=((now-int((LOOKBACK_DAYS+WARMUP_DAYS)*86400e3)+H-1)//H)*H; end=(now//H)*H-H
-    if path.exists(): return validate(pd.read_csv(path),prefix+symbol,start,end)
+    if path.exists(): return validate(pd.read_csv(path),prefix+symbol,start,end,allow_spot_gaps=(prefix=="spot_"))
     s=requests.Session(); cur=start; out=[]; page=0
     while cur<=end:
         page+=1
@@ -113,7 +125,7 @@ def fetch_kline(url,symbol,prefix):
         time.sleep(.05)
     x=pd.DataFrame(out,columns=["ts","open","high","low","close","volume"]); x["timestamp"]=pd.to_datetime(x.pop("ts"),unit="ms",utc=True)
     x=x[x.timestamp<pd.Timestamp.now(tz="UTC").floor("1h")]
-    x=validate(x,prefix+symbol,start,end); x.to_csv(path,index=False); return x
+    x=validate(x,prefix+symbol,start,end,allow_spot_gaps=(prefix=="spot_")); x.to_csv(path,index=False); return x
 
 
 def frow(r):
@@ -166,7 +178,26 @@ def tr(x):
 def build(fut,spot,fund):
     f=fut.set_index("timestamp").sort_index(); s=spot.set_index("timestamp").sort_index()
     x=f.join(s[["close","open","high","low","volume"]].add_suffix("_spot"),how="inner")
-    x["basis"]=(x.close-x.close_spot)/x.close_spot; x["atr"]=tr(x).rolling(ATR_N,min_periods=ATR_N).mean(); x["spot_ret24"]=x.close_spot.pct_change(24,fill_method=None); x["basis_chg24"]=x.basis-x.basis.shift(BASIS_CHANGE_N)
+    x["basis"]=(x.close-x.close_spot)/x.close_spot
+    x["atr"]=tr(x).rolling(ATR_N,min_periods=ATR_N).mean()
+    # Never assume row-count == elapsed hours. A missing spot candle must
+    # invalidate a 24h feature rather than silently stretching it across a gap.
+    dt=x.index.to_series().diff()
+    valid24=dt.eq(pd.Timedelta(hours=1))
+    x["spot_ret24"]=np.nan
+    x["basis_chg24"]=np.nan
+    if len(x)>24:
+        t24=x.index.to_series().diff(24)
+        exact24=t24.eq(pd.Timedelta(hours=24))
+        # Use timestamp-aligned lookup, not positional arithmetic.
+        prior_idx=x.index-pd.Timedelta(hours=24)
+        spot_now=x["close_spot"]
+        spot_prev=pd.Series(spot_now.to_numpy(),index=x.index).reindex(prior_idx.to_numpy())
+        spot_prev.index=x.index
+        basis_prev=pd.Series(x["basis"].to_numpy(),index=x.index).reindex(prior_idx.to_numpy())
+        basis_prev.index=x.index
+        x.loc[exact24,"spot_ret24"]=(spot_now/spot_prev-1).loc[exact24]
+        x.loc[exact24,"basis_chg24"]=(x["basis"]-basis_prev).loc[exact24]
     ff=fund.set_index("timestamp")["funding_rate"].sort_index(); x=pd.merge_asof(x.reset_index().sort_values("timestamp"),ff.rename("funding_rate").reset_index(),on="timestamp",direction="backward",allow_exact_matches=True).set_index("timestamp")
     x["funding_mean"]=x.funding_rate.rolling(FUND_N,min_periods=FUND_N).mean(); return x.replace([np.inf,-np.inf],np.nan)
 
@@ -237,7 +268,7 @@ def report(stop,t,raw):
 
 
 def main():
-    print("HUNTER-V23-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING"); print("XT 1H spot + perpetual | RR 1:2 | fixed universe | no optimization")
+    print("HUNTER-V23.1-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING"); print("XT 1H spot + perpetual | RR 1:2 | fixed universe | no optimization | no spot-gap filling")
     raw={}
     for n,sym in enumerate(SYMBOLS,1):
         print(f"\n[{n}/{len(SYMBOLS)}] {sym}: futures"); fut=fetch_kline(FUT_URL,sym,"fut_")
@@ -248,6 +279,6 @@ def main():
     for stop in STOPS:
         t,rawn=simulate(raw,b,ch,z,stop); report(stop,t,rawn); REPORT.mkdir(parents=True,exist_ok=True)
         if not t.empty:t.to_csv(REPORT/f"trades_stop_{stop:.2f}.csv",index=False)
-    print("\nSTAGE-0 DECISION PROTOCOL\nNo stop is selected here. Apply the pre-registered activity/edge/DD gates externally.\nIf the family fails, close V23 without tuning symbols, sides, thresholds, funding bounds, or stops.\nIf it passes, proceed to clean walk-forward validation with the hypothesis locked.")
+    print("\nSTAGE-0 DECISION PROTOCOL\nNo stop is selected here. Apply the pre-registered activity/edge/DD gates externally.\nIf the family fails, close V23.1 without tuning symbols, sides, thresholds, funding bounds, or stops.\nIf it passes, proceed to clean walk-forward validation with the hypothesis locked.")
 
 if __name__=="__main__":main()
