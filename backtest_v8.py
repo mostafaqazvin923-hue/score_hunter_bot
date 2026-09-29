@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HUNTER-V23.4-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING
+"""HUNTER-V23.5-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING
 
 LOCKED RESEARCH HYPOTHESIS
 --------------------------
@@ -73,11 +73,11 @@ MIN_Z = 1.0
 MIN_CS = 8
 STOPS = (1.0, 1.25, 1.5)
 
-CACHE = Path("data/xt_v23_4")
-REPORT = Path("reports/xt_v23_4")
+CACHE = Path("data/xt_v23_5")
+REPORT = Path("reports/xt_v23_5")
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "hunter-v23.4-stage0/1.0"})
+SESSION.headers.update({"User-Agent": "hunter-v23.5-stage0/1.0"})
 
 
 def sha256_file(path: Path) -> str:
@@ -207,8 +207,13 @@ def fetch_kline(url, symbol, kind):
     CACHE.mkdir(parents=True, exist_ok=True)
     path = CACHE / f"{kind}_{symbol}.csv"
 
+    # XT's kline endpoint treats the time window as candle timestamps.
+    # Keep exactly REQUIRED_DAYS completed candles, with no off-by-one page
+    # request after the final candle. The previous version set start one
+    # full day-range too early, collected the full 462-day set, then asked
+    # XT for one additional empty page.
     end_ms = now_hour_ms() - H  # last fully closed 1H candle
-    start_ms = end_ms - REQUIRED_DAYS * 86_400_000
+    start_ms = end_ms - (REQUIRED_DAYS - 1) * H
     allow_spot = kind == "spot"
 
     if path.exists():
@@ -539,7 +544,7 @@ def report(stop_mult, trades, raw_candidates):
 
 
 def main():
-    print("HUNTER-V23.4-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING")
+    print("HUNTER-V23.5-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING")
     print(
         "XT 1H spot + perpetual | 455d research + 7d warmup | RR 1:2 | "
         "fixed universe | no funding dependency | no spot-gap filling"
