@@ -38,7 +38,7 @@ TIMEFRAME = "4h"
 BAR_MS = 4 * 3600 * 1000
 LIMIT = 1000
 MIN_KLINE_COVERAGE = 0.97
-MIN_FUNDING_COVERAGE = 0.90
+MIN_FUNDING_AVAILABLE_DAYS = 120
 
 # Funding state is normalized within each symbol using only prior 4H observations.
 FUNDING_LOOKBACK_BARS = 90 * 6  # 90 calendar days on a 4H grid.
@@ -325,10 +325,13 @@ def fetch_funding(symbol: str, start_ms: int, end_ms: int):
 
         payload = request("PREV", cursor)
         current_items, _, current_has_prev = parse_funding_items(payload)
+        if not current_items:
+            break
         for item in current_items:
             p = parse_funding_row(item)
             if p is not None:
                 parsed_all.append(p)
+        print(f"[XT-FUND] {symbol} PREV id={cursor} rows_total={len(parsed_all)}")
         time.sleep(0.05)
 
     # Walk toward newer records if the initial page was historical/oldest.
@@ -351,10 +354,13 @@ def fetch_funding(symbol: str, start_ms: int, end_ms: int):
 
         payload = request("NEXT", cursor)
         current_items, current_has_next, _ = parse_funding_items(payload)
+        if not current_items:
+            break
         for item in current_items:
             p = parse_funding_row(item)
             if p is not None:
                 parsed_all.append(p)
+        print(f"[XT-FUND] {symbol} NEXT id={cursor} rows_total={len(parsed_all)}")
         time.sleep(0.05)
 
     df = pd.DataFrame(parsed_all)
@@ -839,18 +845,39 @@ def main():
         diffs = funding.ts.diff().dropna() / 1000.0
         diffs = diffs[diffs > 0]
         median_interval = float(diffs.median()) if len(diffs) else np.nan
-        expected_funding = ((b - int(start.timestamp() * 1000)) / 1000.0) / median_interval if np.isfinite(median_interval) else np.nan
-        fund_cov = len(funding) / expected_funding if np.isfinite(expected_funding) and expected_funding > 0 else np.nan
         max_gap_h = float(diffs.max() / 3600.0) if len(diffs) else np.nan
-        if np.isfinite(fund_cov) and fund_cov < MIN_FUNDING_COVERAGE:
+
+        # XT's public funding-history endpoint may expose a shorter historical
+        # retention window than the OHLCV endpoint. Do not manufacture missing
+        # funding observations and do not reject the entire experiment merely
+        # because the requested 455-day OHLCV window is longer. Instead, audit
+        # the actually available funding span and let causal features produce
+        # signals only where funding is genuinely available.
+        funding_first_ms = int(funding.ts.min())
+        funding_last_ms = int(funding.ts.max())
+        available_start_ms = max(int(start.timestamp() * 1000), funding_first_ms)
+        available_end_ms = min(b, funding_last_ms)
+        available_days = max(0.0, (available_end_ms - available_start_ms) / 86400000.0)
+        expected_funding_available = (
+            ((available_end_ms - available_start_ms) / 1000.0) / median_interval
+            if np.isfinite(median_interval) and median_interval > 0 and available_end_ms > available_start_ms
+            else np.nan
+        )
+        fund_cadence_cov = (
+            len(funding) / expected_funding_available
+            if np.isfinite(expected_funding_available) and expected_funding_available > 0
+            else np.nan
+        )
+        if available_days < MIN_FUNDING_AVAILABLE_DAYS:
             raise RuntimeError(
-                f"Funding coverage failure {sym}: events={len(funding)}, "
-                f"expected~{expected_funding:.1f}, coverage={fund_cov:.4f}"
+                f"Funding history too short for {sym}: available_days={available_days:.1f}, "
+                f"minimum={MIN_FUNDING_AVAILABLE_DAYS}"
             )
 
         print(
             f"[FUNDING] {sym} events={len(funding)} median_interval_h="
-            f"{median_interval / 3600.0:.2f} max_gap_h={max_gap_h:.2f}"
+            f"{median_interval / 3600.0:.2f} max_gap_h={max_gap_h:.2f} "
+            f"available_days={available_days:.1f} cadence_cov={fund_cadence_cov:.4f}"
         )
 
         df = build_features(fut, spot, funding)
@@ -883,10 +910,12 @@ def main():
         funding_cov.append({
             "symbol": sym,
             "funding_events": len(funding),
-            "research_days": DAYS,
+            "requested_research_days": DAYS,
             "median_interval_hours": median_interval / 3600.0 if np.isfinite(median_interval) else np.nan,
-            "expected_events_approx": expected_funding,
-            "funding_coverage_approx": fund_cov,
+            "expected_events_available_span_approx": expected_funding_available,
+            "funding_cadence_coverage_available_span": fund_cadence_cov,
+            "available_funding_days": available_days,
+            "requested_window_coverage": available_days / DAYS if DAYS > 0 else np.nan,
             "max_gap_hours": max_gap_h,
             "first_funding_dt": pd.to_datetime(funding.ts.min(), unit="ms", utc=True),
             "last_funding_dt": pd.to_datetime(funding.ts.max(), unit="ms", utc=True),
