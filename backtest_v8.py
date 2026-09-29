@@ -1,234 +1,598 @@
 #!/usr/bin/env python3
-"""HUNTER-V23.3-STAGE0: FUTURES BASIS DISLOCATION / REPRICING.
+"""HUNTER-V23.4-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING
 
-Locked hypothesis (no Stage-0 tuning): cross-sectional perpetual-vs-spot
-basis contains information about short-horizon futures returns. We test the
-high-basis/low-basis factor with causal basis z-score, 24h basis repricing,
-and RR=1:2; stop values are sensitivity
-outputs only.
+LOCKED RESEARCH HYPOTHESIS
+--------------------------
+Perpetual-vs-spot basis dislocation/repricing contains short-horizon
+information in crypto futures. Signal logic is fixed before Stage-0 results:
+  LONG : high basis tail + basis falling + spot 24h return >= 0
+  SHORT: low basis tail  + basis rising  + spot 24h return <= 0
+with causal cross-sectional historical basis z-score.
 
-Integrity: independent XT spot + futures 1H OHLCV, completed candles only, next-bar entry, per-symbol overlap lock, simultaneous
-different symbols allowed, same exit-candle re-entry blocked, same-candle
-SL+TP=loss, no timeout/BE/trailing/pyramiding, fixed universe, no future
-symbol selection. OI is intentionally omitted because a historical XT OI
-series was not verified from the public API.
+IMPORTANT
+---------
+This version is rebuilt as a clean data/backtest engine. Funding is NOT a
+signal input and is not fetched. No missing candle is fabricated. Spot gaps
+up to 6h are tolerated only as real missing observations; timestamp-dependent
+features become NaN at affected timestamps. Futures gaps are fatal.
+
+Backtest rules
+--------------
+- 1H completed candles only
+- 455 days research window + 7 days warmup
+- initial equity $1,000; $100 margin; $5,000 notional (50x)
+- RR 1:2
+- fee 0.07% per side; slippage 0.03% per side
+- one position per symbol; max 10 simultaneous positions
+- next-bar-open entry
+- no timeout / BE / trailing / pyramiding
+- same candle SL+TP => LOSS
+- no re-entry on the exit candle
+- no carrying an open trade past the available data
+- fixed universe; no future symbol selection
+- Stage-0 tests all three pre-registered ATR stops; no selection here
 """
+
+import hashlib
 import time
+import traceback
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import requests
 
-SYMBOLS=["btc_usdt","eth_usdt","sol_usdt","sui_usdt","avax_usdt","near_usdt","ada_usdt","bnb_usdt","apt_usdt","crv_usdt","ondo_usdt","pendle_usdt","icp_usdt","wif_usdt"]
-FUT_URL="https://fapi.xt.com/future/market/v1/public/q/kline"
-# XT spot kline endpoint used by the public API. If XT changes its spot path,
-# fail loudly rather than substituting another data source.
-SPOT_URL="https://sapi.xt.com/v4/public/kline"
-LOOKBACK_DAYS=455; WARMUP_DAYS=30; H=3600000; LIMIT=1000
-INITIAL=1000.; MARGIN=100.; NOTIONAL=5000.; RR=2.; FEE=.0007; SLIP=.0003; MAX_POS=10
-ATR_N=14
-BASIS_Z_N=120; BASIS_CHANGE_N=24; QUANT=.20; MIN_Z=1.0; MIN_CS=8
-STOPS=(1.0,1.25,1.5)
-CACHE=Path("data/xt_v23_stage0"); REPORT=Path("reports/xt_v23_stage0")
+SYMBOLS = [
+    "btc_usdt", "eth_usdt", "sol_usdt", "sui_usdt", "avax_usdt",
+    "near_usdt", "ada_usdt", "bnb_usdt", "apt_usdt", "crv_usdt",
+    "ondo_usdt", "pendle_usdt", "icp_usdt", "wif_usdt",
+]
+
+FUT_URL = "https://fapi.xt.com/future/market/v1/public/q/kline"
+SPOT_URL = "https://sapi.xt.com/v4/public/kline"
+
+LOOKBACK_DAYS = 455
+WARMUP_DAYS = 7
+REQUIRED_DAYS = LOOKBACK_DAYS + WARMUP_DAYS
+H = 3_600_000
+LIMIT = 1000
+
+INITIAL = 1000.0
+MARGIN = 100.0
+NOTIONAL = 5000.0
+RR = 2.0
+FEE = 0.0007
+SLIP = 0.0003
+MAX_POS = 10
+
+ATR_N = 14
+BASIS_Z_N = 120
+BASIS_CHANGE_N = 24
+QUANT = 0.20
+MIN_Z = 1.0
+MIN_CS = 8
+STOPS = (1.0, 1.25, 1.5)
+
+CACHE = Path("data/xt_v23_4")
+REPORT = Path("reports/xt_v23_4")
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "hunter-v23.4-stage0/1.0"})
 
 
-def rows(obj):
-    if isinstance(obj,list): return obj
-    if not isinstance(obj,dict): return None
-    for k in ("result","data","rows","list"):
-        v=obj.get(k)
-        if isinstance(v,list): return v
-    r=obj.get("result")
-    if isinstance(r,dict):
-        for k in ("items","list","rows","data"):
-            v=r.get(k)
-            if isinstance(v,list): return v
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def now_hour_ms() -> int:
+    return (int(time.time() * 1000) // H) * H
+
+
+def rows(payload):
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return None
+    for key in ("result", "data", "rows", "list"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    result = payload.get("result")
+    if isinstance(result, dict):
+        for key in ("items", "list", "rows", "data"):
+            value = result.get(key)
+            if isinstance(value, list):
+                return value
     return None
 
 
-def krow(r):
+def parse_kline_row(row):
     try:
-        if isinstance(r,dict):
-            a=[r.get("t",r.get("timestamp")),r.get("o",r.get("open")),r.get("h",r.get("high")),r.get("l",r.get("low")),r.get("c",r.get("close")),r.get("a",r.get("v",r.get("volume",r.get("amount"))))]
-        elif isinstance(r,(list,tuple)) and len(r)>=6: a=r[:6]
-        else: return None
-        if any(v is None for v in a): return None
-        return int(a[0]),*[float(v) for v in a[1:]]
-    except Exception: return None
+        if isinstance(row, dict):
+            values = [
+                row.get("t", row.get("timestamp")),
+                row.get("o", row.get("open")),
+                row.get("h", row.get("high")),
+                row.get("l", row.get("low")),
+                row.get("c", row.get("close")),
+                row.get("a", row.get("v", row.get("volume", row.get("amount")))),
+            ]
+        elif isinstance(row, (list, tuple)) and len(row) >= 6:
+            values = list(row[:6])
+        else:
+            return None
+        if any(v is None for v in values):
+            return None
+        ts = int(float(values[0]))
+        if ts < 10_000_000_000:
+            ts *= 1000
+        return (ts,) + tuple(float(v) for v in values[1:])
+    except Exception:
+        return None
 
 
-def validate(x,name,start,end,allow_spot_gaps=False):
-    x=x.copy(); x.timestamp=pd.to_datetime(x.timestamp,utc=True)
-    x=x.sort_values("timestamp").drop_duplicates("timestamp",keep="last")
-    x=x[(x.timestamp>=pd.to_datetime(start,unit="ms",utc=True))&(x.timestamp<=pd.to_datetime(end,unit="ms",utc=True))].copy()
-    for c in ["open","high","low","close","volume"]: x[c]=pd.to_numeric(x[c],errors="coerce")
-    if x[["open","high","low","close","volume"]].isna().any().any(): raise RuntimeError(f"{name}: NaN")
-    if (x[["open","high","low","close"]]<=0).any().any() or (x.volume<0).any(): raise RuntimeError(f"{name}: invalid OHLCV")
-    gaps=x.timestamp.diff().dropna().dt.total_seconds()/3600
-    bad=gaps>1+1e-9
+def validate_ohlcv(df, name, start_ms, end_ms, allow_spot_gaps):
+    required = ["timestamp", "open", "high", "low", "close", "volume"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"{name}: missing columns {missing}")
+
+    x = df[required].copy()
+    x["timestamp"] = pd.to_datetime(x["timestamp"], utc=True, errors="coerce")
+    for col in ["open", "high", "low", "close", "volume"]:
+        x[col] = pd.to_numeric(x[col], errors="coerce")
+
+    if x.isna().any().any():
+        bad = int(x.isna().sum().sum())
+        raise RuntimeError(f"{name}: invalid/NaN OHLCV values={bad}")
+
+    x = x.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    start = pd.to_datetime(start_ms, unit="ms", utc=True)
+    end = pd.to_datetime(end_ms, unit="ms", utc=True)
+    x = x[(x.timestamp >= start) & (x.timestamp <= end)].copy()
+
+    if x.empty:
+        raise RuntimeError(f"{name}: zero candles after date filtering")
+    if (x[["open", "high", "low", "close"]] <= 0).any().any():
+        raise RuntimeError(f"{name}: non-positive OHLC")
+    if (x.volume < 0).any():
+        raise RuntimeError(f"{name}: negative volume")
+
+    gaps = x.timestamp.diff().dropna().dt.total_seconds() / 3600.0
+    bad = gaps > 1.0 + 1e-9
     if bad.any():
+        max_gap = float(gaps.max())
+        count = int(bad.sum())
         if not allow_spot_gaps:
-            raise RuntimeError(f"{name}: 1H gap; no fabrication")
-        # Spot is auxiliary context. We never fill or interpolate missing
-        # candles. Instead, permit small historical holes and make every
-        # feature that needs a 24h history explicitly require real 24h
-        # spacing. Large holes remain fatal.
-        max_gap=float(gaps.max())
-        gap_count=int(bad.sum())
-        if max_gap>6.0:
-            raise RuntimeError(f"{name}: spot gap too large ({max_gap:.2f}h); no fabrication")
-        print(f"[DATA] {name}: {gap_count} spot gap(s), max_gap={max_gap:.2f}h; gaps will NOT be filled")
-    if len(x)<int((LOOKBACK_DAYS+WARMUP_DAYS)*24*.95): raise RuntimeError(f"{name}: insufficient history {len(x)}")
+            raise RuntimeError(
+                f"{name}: FUTURES data gap detected; max_gap={max_gap:.2f}h; refusing fabrication"
+            )
+        if max_gap > 6.0:
+            raise RuntimeError(
+                f"{name}: SPOT gap too large; max_gap={max_gap:.2f}h; refusing fabrication"
+            )
+        print(f"[DATA] {name}: {count} spot gap(s), max_gap={max_gap:.2f}h; no filling")
+
+    expected = REQUIRED_DAYS * 24
+    min_required = int(expected * 0.95)
+    if len(x) < min_required:
+        span_days = (x.timestamp.iloc[-1] - x.timestamp.iloc[0]).total_seconds() / 86400.0
+        raise RuntimeError(
+            f"{name}: insufficient history: rows={len(x)}, need>={min_required}, span={span_days:.1f}d"
+        )
+
     return x.reset_index(drop=True)
 
 
-def fetch_kline(url,symbol,prefix):
-    CACHE.mkdir(parents=True,exist_ok=True); path=CACHE/f"{prefix}{symbol}.csv"
-    now=int(time.time()*1000); start=((now-int((LOOKBACK_DAYS+WARMUP_DAYS)*86400e3)+H-1)//H)*H; end=(now//H)*H-H
-    if path.exists(): return validate(pd.read_csv(path),prefix+symbol,start,end,allow_spot_gaps=(prefix=="spot_"))
-    s=requests.Session(); cur=start; out=[]; page=0
-    while cur<=end:
-        page+=1
-        if page>1000: raise RuntimeError(f"{symbol}: pagination guard")
-        we=min(end,cur+LIMIT*H-1); p={"symbol":symbol,"interval":"1h","startTime":cur,"endTime":we,"limit":LIMIT}
-        payload=None; err=None
-        for a in range(4):
-            try:
-                q=s.get(url,params=p,timeout=30); q.raise_for_status(); payload=rows(q.json())
-                if payload is None: raise RuntimeError("no kline list")
-                break
-            except Exception as e: err=e; time.sleep(1+a)
-        if payload is None: raise RuntimeError(f"{symbol}: page {page}: {err}")
-        inside=[v for v in (krow(r) for r in payload) if v and cur<=v[0]<=we]
+def request_json(url, params, label, attempts=4):
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = SESSION.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            payload = response.json()
+            return payload
+        except Exception as exc:
+            last = exc
+            if attempt < attempts:
+                time.sleep(attempt)
+    raise RuntimeError(f"{label}: request failed after {attempts} attempts: {last}")
+
+
+def fetch_kline(url, symbol, kind):
+    CACHE.mkdir(parents=True, exist_ok=True)
+    path = CACHE / f"{kind}_{symbol}.csv"
+
+    end_ms = now_hour_ms() - H  # last fully closed 1H candle
+    start_ms = end_ms - REQUIRED_DAYS * 86_400_000
+    allow_spot = kind == "spot"
+
+    if path.exists():
+        try:
+            cached = pd.read_csv(path)
+            return validate_ohlcv(cached, f"{kind}_{symbol}[cache]", start_ms, end_ms, allow_spot)
+        except Exception as exc:
+            print(f"[CACHE] {kind}_{symbol}: invalid/stale cache ({exc}); refetching")
+
+    cur = start_ms
+    all_rows = []
+    page = 0
+
+    while cur <= end_ms:
+        page += 1
+        if page > 1000:
+            raise RuntimeError(f"{kind}_{symbol}: pagination guard exceeded")
+
+        window_end = min(end_ms, cur + LIMIT * H - H)
+        params = {
+            "symbol": symbol,
+            "interval": "1h",
+            "startTime": cur,
+            "endTime": window_end,
+            "limit": LIMIT,
+        }
+        payload = request_json(url, params, f"{kind}_{symbol} page={page}")
+        raw = rows(payload)
+        if raw is None:
+            raise RuntimeError(f"{kind}_{symbol} page={page}: API returned no candle list")
+
+        parsed = [parse_kline_row(r) for r in raw]
+        inside = sorted({r for r in parsed if r is not None and cur <= r[0] <= window_end})
+
         if not inside:
-            if we>=end: break
-            recovered=None
-            for div in (2,4,8,16):
-                lim=max(32,LIMIT//div); se=min(end,cur+lim*H-1); pp=dict(p,endTime=se,limit=lim)
-                for a in range(3):
-                    try:
-                        q=s.get(url,params=pp,timeout=30); q.raise_for_status(); rr=rows(q.json()) or []
-                        cand=[v for v in (krow(r) for r in rr) if v and cur<=v[0]<=se]
-                        if cand: recovered=cand; break
-                    except Exception: pass
-                    time.sleep(1+a)
-                if recovered: break
-            if not recovered: raise RuntimeError(f"{symbol}: interior empty page; refusing skip/fabricate")
-            inside=recovered
-        out.extend(inside); mx=max(v[0] for v in inside); nxt=mx+H
-        if nxt<=cur: raise RuntimeError(f"{symbol}: pagination stalled")
-        cur=nxt
-        if page%4==0: print(f"[FETCH] {prefix}{symbol} page={page} rows={len(out)}")
-        if mx>=end: break
-        time.sleep(.05)
-    x=pd.DataFrame(out,columns=["ts","open","high","low","close","volume"]); x["timestamp"]=pd.to_datetime(x.pop("ts"),unit="ms",utc=True)
-    x=x[x.timestamp<pd.Timestamp.now(tz="UTC").floor("1h")]
-    x=validate(x,prefix+symbol,start,end,allow_spot_gaps=(prefix=="spot_")); x.to_csv(path,index=False); return x
+            raise RuntimeError(
+                f"{kind}_{symbol}: empty interior page at {pd.to_datetime(cur, unit='ms', utc=True)}; refusing skip/fabricate"
+            )
+
+        all_rows.extend(inside)
+        max_ts = max(r[0] for r in inside)
+        next_cur = max_ts + H
+        if next_cur <= cur:
+            raise RuntimeError(f"{kind}_{symbol}: pagination stalled at page={page}")
+        cur = next_cur
+
+        if page % 4 == 0:
+            print(f"[FETCH] {kind}_{symbol} page={page} rows={len(all_rows)}")
+        if max_ts >= end_ms:
+            break
+        time.sleep(0.05)
+
+    frame = pd.DataFrame(
+        all_rows, columns=["ts", "open", "high", "low", "close", "volume"]
+    )
+    frame["timestamp"] = pd.to_datetime(frame.pop("ts"), unit="ms", utc=True)
+    frame = frame[frame.timestamp <= pd.to_datetime(end_ms, unit="ms", utc=True)]
+    frame = validate_ohlcv(frame, f"{kind}_{symbol}", start_ms, end_ms, allow_spot)
+    frame.to_csv(path, index=False)
+    return frame
 
 
-def tr(x):
-    p=x.close.shift(1); return pd.concat([x.high-x.low,(x.high-p).abs(),(x.low-p).abs()],axis=1).max(axis=1)
+def true_range(x):
+    prev_close = x["close"].shift(1)
+    return pd.concat(
+        [
+            x["high"] - x["low"],
+            (x["high"] - prev_close).abs(),
+            (x["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
 
 
-def build(fut,spot):
-    f=fut.set_index("timestamp").sort_index(); s=spot.set_index("timestamp").sort_index()
-    x=f.join(s[["close","open","high","low","volume"]].add_suffix("_spot"),how="inner")
-    x["basis"]=(x.close-x.close_spot)/x.close_spot
-    x["atr"]=tr(x).rolling(ATR_N,min_periods=ATR_N).mean()
-    # Never assume row-count == elapsed hours. A missing spot candle must
-    # invalidate a 24h feature rather than silently stretching it across a gap.
-    dt=x.index.to_series().diff()
-    x["spot_ret24"]=np.nan
-    x["basis_chg24"]=np.nan
-    if len(x)>24:
-        t24=x.index.to_series().diff(24)
-        exact24=t24.eq(pd.Timedelta(hours=24))
-        # Use timestamp-aligned lookup, not positional arithmetic.
-        prior_idx=x.index-pd.Timedelta(hours=24)
-        spot_now=x["close_spot"]
-        spot_prev=pd.Series(spot_now.to_numpy(),index=x.index).reindex(prior_idx.to_numpy())
-        spot_prev.index=x.index
-        basis_prev=pd.Series(x["basis"].to_numpy(),index=x.index).reindex(prior_idx.to_numpy())
-        basis_prev.index=x.index
-        x.loc[exact24,"spot_ret24"]=(spot_now/spot_prev-1).loc[exact24]
-        x.loc[exact24,"basis_chg24"]=(x["basis"]-basis_prev).loc[exact24]
-    return x.replace([np.inf,-np.inf],np.nan)
+def build_stream(futures, spot):
+    f = futures.set_index("timestamp").sort_index()
+    s = spot.set_index("timestamp").sort_index()
+
+    x = f.join(
+        s[["close", "open", "high", "low", "volume"]].add_suffix("_spot"),
+        how="inner",
+    )
+    if x.empty:
+        raise RuntimeError("merged futures/spot series is empty")
+
+    x["basis"] = (x["close"] - x["close_spot"]) / x["close_spot"]
+    x["atr"] = true_range(x).rolling(ATR_N, min_periods=ATR_N).mean()
+
+    # Exact elapsed-time lookup. A missing spot candle can never be converted
+    # into a fake 24-row/24-hour observation.
+    x["spot_ret24"] = np.nan
+    x["basis_chg24"] = np.nan
+    prior_ts = x.index - pd.Timedelta(hours=BASIS_CHANGE_N)
+    exact_prior = prior_ts.isin(x.index)
+
+    spot_lookup = pd.Series(x["close_spot"].to_numpy(), index=x.index)
+    basis_lookup = pd.Series(x["basis"].to_numpy(), index=x.index)
+    spot_prev = spot_lookup.reindex(prior_ts)
+    basis_prev = basis_lookup.reindex(prior_ts)
+    spot_prev.index = x.index
+    basis_prev.index = x.index
+
+    x.loc[exact_prior, "spot_ret24"] = (
+        x.loc[exact_prior, "close_spot"] / spot_prev.loc[exact_prior] - 1.0
+    )
+    x.loc[exact_prior, "basis_chg24"] = (
+        x.loc[exact_prior, "basis"] - basis_prev.loc[exact_prior]
+    )
+
+    x = x.replace([np.inf, -np.inf], np.nan)
+    return x
 
 
-def panel(streams):
-    b=pd.concat({s:x.basis for s,x in streams.items()},axis=1,join="inner"); ch=pd.concat({s:x.basis_chg24 for s,x in streams.items()},axis=1,join="inner")
-    med=b.median(axis=1,skipna=True); d=b.sub(med,axis=0); mu=d.rolling(BASIS_Z_N,min_periods=BASIS_Z_N).mean().shift(1); sd=d.rolling(BASIS_Z_N,min_periods=BASIS_Z_N).std(ddof=0).shift(1); z=(d-mu)/sd.replace(0,np.nan); return b,ch,z
+def build_panel(streams):
+    # OUTER join is intentional. Missing data for one symbol must not delete
+    # valid observations from every other symbol. No values are filled.
+    basis = pd.concat({s: x["basis"] for s, x in streams.items()}, axis=1, join="outer")
+    change = pd.concat(
+        {s: x["basis_chg24"] for s, x in streams.items()}, axis=1, join="outer"
+    )
+
+    median = basis.median(axis=1, skipna=True)
+    deviation = basis.sub(median, axis=0)
+
+    # Historical cross-sectional factor statistics are shifted one bar so the
+    # current signal cannot influence its own z-score.
+    mu = deviation.rolling(BASIS_Z_N, min_periods=BASIS_Z_N).mean().shift(1)
+    sd = deviation.rolling(BASIS_Z_N, min_periods=BASIS_Z_N).std(ddof=0).shift(1)
+    z = (deviation - mu) / sd.replace(0.0, np.nan)
+    return basis, change, z
 
 
-def candidates(b,ch,z,streams,ts):
-    r=b.loc[ts]; zr=z.loc[ts]; cr=ch.loc[ts]; valid=r.notna()&zr.notna()&cr.notna()
-    if int(valid.sum())<MIN_CS:return []
-    v=r[valid]; lo=v.quantile(QUANT); hi=v.quantile(1-QUANT); out=[]
-    for sym in v.index:
-        bz=float(zr[sym]); bc=float(cr[sym]); x=streams[sym]; sr=float(x.loc[ts,"spot_ret24"]) if ts in x.index else np.nan
-        if not all(np.isfinite(q) for q in (bz,bc,sr)):continue
-        if float(v[sym])>=hi and bz>=MIN_Z and bc<=0 and sr>=0: side=1
-        elif float(v[sym])<=lo and bz<=-MIN_Z and bc>=0 and sr<=0: side=-1
-        else:continue
-        out.append((sym,side,bz))
-    out.sort(key=lambda q:(abs(q[2]),q[0]),reverse=True); return out
+def candidates_at(ts, basis, change, z, streams):
+    r = basis.loc[ts]
+    zr = z.loc[ts]
+    cr = change.loc[ts]
+
+    valid = r.notna() & zr.notna() & cr.notna()
+    if int(valid.sum()) < MIN_CS:
+        return []
+
+    v = r[valid]
+    low = float(v.quantile(QUANT))
+    high = float(v.quantile(1.0 - QUANT))
+    result = []
+
+    for symbol in v.index:
+        stream = streams[symbol]
+        if ts not in stream.index:
+            continue
+        bz = float(zr[symbol])
+        bc = float(cr[symbol])
+        spot_ret = float(stream.loc[ts, "spot_ret24"])
+        if not np.isfinite(bz) or not np.isfinite(bc) or not np.isfinite(spot_ret):
+            continue
+
+        basis_value = float(v[symbol])
+        if basis_value >= high and bz >= MIN_Z and bc <= 0.0 and spot_ret >= 0.0:
+            side = 1
+        elif basis_value <= low and bz <= -MIN_Z and bc >= 0.0 and spot_ret <= 0.0:
+            side = -1
+        else:
+            continue
+        result.append((symbol, side, bz))
+
+    result.sort(key=lambda q: (abs(q[2]), q[0]), reverse=True)
+    return result
 
 
-def exit_trade(x,idx,side,entry,sl,tp):
-    for j in range(idx,len(x)):
-        b=x.iloc[j]; hs=float(b.low)<=sl if side==1 else float(b.high)>=sl; ht=float(b.high)>=tp if side==1 else float(b.low)<=tp
-        if not(hs or ht):continue
-        win=bool(ht and not hs); px=tp if win else sl; gross=NOTIONAL*(px-entry)/entry if side==1 else NOTIONAL*(entry-px)/entry; return x.index[j],gross-NOTIONAL*FEE*2,win
+def resolve_exit(x, entry_idx, side, entry, stop, target):
+    for j in range(entry_idx, len(x)):
+        bar = x.iloc[j]
+        hit_stop = float(bar["low"]) <= stop if side == 1 else float(bar["high"]) >= stop
+        hit_target = float(bar["high"]) >= target if side == 1 else float(bar["low"]) <= target
+        if not (hit_stop or hit_target):
+            continue
+
+        # Conservative deterministic rule: if both touched in one candle,
+        # classify as loss because intrabar order is unknown.
+        win = bool(hit_target and not hit_stop)
+        exit_price = target if win else stop
+        if side == 1:
+            gross = NOTIONAL * (exit_price - entry) / entry
+        else:
+            gross = NOTIONAL * (entry - exit_price) / entry
+        net = gross - NOTIONAL * FEE * 2.0
+        return x.index[j], net, win
     return None
 
 
-def simulate(streams,b,ch,z,stop):
-    events=[]; raw=0
-    for ts in b.index:
-        for sym,side,bz in candidates(b,ch,z,streams,ts):
-            raw+=1; x=streams[sym]; i=x.index.get_loc(ts)
-            if not isinstance(i,slice) and i+1<len(x):events.append((ts,sym,i,side,bz))
-    events.sort(key=lambda e:(e[0],e[1])); openp={}; last_exit={}; equity=INITIAL; trades=[]
-    for ts,sym,i,side,bz in events:
-        x=streams[sym]; ei=i+1; ets=x.index[ei]
-        for s in [s for s,p in openp.items() if p<ets]:del openp[s]
-        if sym in openp or (sym in last_exit and ets<=last_exit[sym]) or len(openp)>=MAX_POS or equity<(len(openp)+1)*MARGIN:continue
-        atr=float(x.iloc[i].atr)
-        if not np.isfinite(atr) or atr<=0:continue
-        raw_entry=float(x.iloc[ei].open); entry=raw_entry*(1+SLIP) if side==1 else raw_entry*(1-SLIP); d=stop*atr; sl,tp=(entry-d,entry+RR*d) if side==1 else (entry+d,entry-RR*d)
-        res=exit_trade(x,ei,side,entry,sl,tp)
-        if res is None:continue
-        xt,pnl,win=res; openp[sym]=xt; last_exit[sym]=xt; equity+=pnl
-        trades.append(dict(signal_ts=ts,entry_ts=ets,exit_ts=xt,symbol=sym,side="LONG" if side==1 else "SHORT",basis=float(b.loc[ts,sym]),basis_z=bz,basis_change_24h=float(ch.loc[ts,sym]),entry=entry,sl=sl,tp=tp,win=int(win),pnl=float(pnl)))
-    return pd.DataFrame(trades),raw
+def simulate(streams, basis, change, z, stop_mult):
+    events = []
+    raw_candidates = 0
+
+    for ts in basis.index:
+        for symbol, side, bz in candidates_at(ts, basis, change, z, streams):
+            raw_candidates += 1
+            stream = streams[symbol]
+            if ts not in stream.index:
+                continue
+            idx = stream.index.get_loc(ts)
+            if isinstance(idx, slice) or idx + 1 >= len(stream):
+                continue
+            events.append((ts, symbol, idx, side, bz))
+
+    events.sort(key=lambda e: (e[0], e[1]))
+    open_until = {}
+    last_exit = {}
+    equity = INITIAL
+    trades = []
+
+    for signal_ts, symbol, signal_idx, side, bz in events:
+        x = streams[symbol]
+        entry_idx = signal_idx + 1
+        entry_ts = x.index[entry_idx]
+
+        # Release positions whose exit happened strictly before this entry.
+        for s in list(open_until):
+            if open_until[s] < entry_ts:
+                del open_until[s]
+
+        # Per-symbol overlap lock + no same-exit-candle re-entry.
+        if symbol in open_until:
+            continue
+        if symbol in last_exit and entry_ts <= last_exit[symbol]:
+            continue
+        if len(open_until) >= MAX_POS:
+            continue
+        if equity < (len(open_until) + 1) * MARGIN:
+            continue
+
+        atr = float(x.iloc[signal_idx]["atr"])
+        if not np.isfinite(atr) or atr <= 0:
+            continue
+
+        raw_entry = float(x.iloc[entry_idx]["open"])
+        entry = raw_entry * (1.0 + SLIP) if side == 1 else raw_entry * (1.0 - SLIP)
+        distance = stop_mult * atr
+        if side == 1:
+            stop = entry - distance
+            target = entry + RR * distance
+        else:
+            stop = entry + distance
+            target = entry - RR * distance
+
+        result = resolve_exit(x, entry_idx, side, entry, stop, target)
+        if result is None:
+            # Do not invent an exit at the dataset boundary.
+            continue
+
+        exit_ts, pnl, win = result
+        open_until[symbol] = exit_ts
+        last_exit[symbol] = exit_ts
+        equity += pnl
+
+        trades.append(
+            {
+                "signal_ts": signal_ts,
+                "entry_ts": entry_ts,
+                "exit_ts": exit_ts,
+                "symbol": symbol,
+                "side": "LONG" if side == 1 else "SHORT",
+                "basis": float(basis.loc[signal_ts, symbol]),
+                "basis_z": bz,
+                "basis_change_24h": float(change.loc[signal_ts, symbol]),
+                "entry": entry,
+                "sl": stop,
+                "tp": target,
+                "win": int(win),
+                "pnl": float(pnl),
+            }
+        )
+
+    return pd.DataFrame(trades), raw_candidates
 
 
-def report(stop,t,raw):
-    print("\n"+"="*78+f"\nSTAGE-0 STOP = {stop:.2f} ATR | RR = 1:2\n"+"="*78); n=len(t)
-    if n==0:print("Raw candidate signals   :",raw); print("Closed trades           : 0"); return
-    p=t.pnl; w=int((p>0).sum()); l=n-w; gw=p[p>0].sum(); gl=-p[p<=0].sum(); pf=gw/gl if gl else float("inf"); eq=INITIAL+p.cumsum(); pk=eq.cummax(); dd=pk-eq; ddp=(dd/pk.replace(0,np.nan)).max()*100; st=cur=0
-    for v in p:
-        cur=cur+1 if v<=0 else 0; st=max(st,cur)
-    print(f"Raw candidate signals   : {raw}\nClosed trades           : {n}\nWins                    : {w}\nLosses                  : {l}\nWin Rate                : {100*w/n:.2f}%\nProfit Factor           : {pf:.4f}\nNet PnL                 : ${p.sum():,.2f}\nMax Drawdown            : ${dd.max():,.2f}\nMax Drawdown %          : {ddp:.2f}%\nMax Loss Streak         : {st}\nExpectancy / Trade      : ${p.mean():.2f}\nFinal Equity            : ${eq.iloc[-1]:,.2f}")
-    for side,g in t.groupby("side"):
-        print(f"SIDE {side:5s} trades={len(g):4d} WR={100*g.win.mean():6.2f}% PnL=${g.pnl.sum():,.2f}")
+def report(stop_mult, trades, raw_candidates):
+    print("\n" + "=" * 80)
+    print(f"STAGE-0 STOP = {stop_mult:.2f} ATR | RR = 1:2")
+    print("=" * 80)
+
+    n = len(trades)
+    print(f"Raw candidate signals   : {raw_candidates}")
+    print(f"Closed trades            : {n}")
+    if n == 0:
+        return
+
+    pnl = trades["pnl"]
+    wins = int((pnl > 0).sum())
+    losses = n - wins
+    gross_win = float(pnl[pnl > 0].sum())
+    gross_loss = float(-pnl[pnl <= 0].sum())
+    pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
+    equity = INITIAL + pnl.cumsum()
+    peak = equity.cummax()
+    dd = peak - equity
+    dd_pct = float((dd / peak.replace(0, np.nan)).max() * 100.0)
+
+    streak = 0
+    max_streak = 0
+    for value in pnl:
+        streak = streak + 1 if value <= 0 else 0
+        max_streak = max(max_streak, streak)
+
+    print(f"Wins                    : {wins}")
+    print(f"Losses                  : {losses}")
+    print(f"Win Rate                : {100.0 * wins / n:.2f}%")
+    print(f"Profit Factor           : {pf:.4f}")
+    print(f"Net PnL                 : ${pnl.sum():,.2f}")
+    print(f"Max Drawdown            : ${dd.max():,.2f}")
+    print(f"Max Drawdown %          : {dd_pct:.2f}%")
+    print(f"Max Loss Streak         : {max_streak}")
+    print(f"Expectancy / Trade      : ${pnl.mean():,.2f}")
+    print(f"Final Equity            : ${equity.iloc[-1]:,.2f}")
+
+    for side, group in trades.groupby("side"):
+        print(
+            f"SIDE {side:5s} trades={len(group):4d} "
+            f"WR={100.0 * group.win.mean():6.2f}% PnL=${group.pnl.sum():,.2f}"
+        )
+
     print("\nBY SYMBOL")
-    for s,g in t.groupby("symbol"):
-        print(f"{s:10s} trades={len(g):4d} WR={100*g.win.mean():6.2f}% PnL=${g.pnl.sum():,.2f}")
+    for symbol, group in trades.groupby("symbol"):
+        print(
+            f"{symbol:10s} trades={len(group):4d} "
+            f"WR={100.0 * group.win.mean():6.2f}% PnL=${group.pnl.sum():,.2f}"
+        )
 
 
 def main():
-    print("HUNTER-V23.3-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING"); print("XT 1H spot + perpetual | RR 1:2 | fixed universe | no optimization | no funding dependency | no spot-gap filling")
-    raw={}
-    for n,sym in enumerate(SYMBOLS,1):
-        print(f"\n[{n}/{len(SYMBOLS)}] {sym}: futures"); fut=fetch_kline(FUT_URL,sym,"fut_")
-        print(f"[{n}/{len(SYMBOLS)}] {sym}: spot"); spot=fetch_kline(SPOT_URL,sym,"spot_")
-        raw[sym]=build(fut,spot)
-        if len(raw[sym])<int((LOOKBACK_DAYS+WARMUP_DAYS)*24*.95):raise RuntimeError(f"{sym}: merged history too short")
-    b,ch,z=panel(raw); print(f"\nData preparation complete.\nCommon completed timestamps: {len(b)}")
-    for stop in STOPS:
-        t,rawn=simulate(raw,b,ch,z,stop); report(stop,t,rawn); REPORT.mkdir(parents=True,exist_ok=True)
-        if not t.empty:t.to_csv(REPORT/f"trades_stop_{stop:.2f}.csv",index=False)
-    print("\nSTAGE-0 DECISION PROTOCOL\nNo stop is selected here. Apply the pre-registered activity/edge/DD gates externally.\nIf the family fails, close V23.2 without tuning symbols, sides, thresholds, stops.\nIf it passes, proceed to clean walk-forward validation with the hypothesis locked.")
+    print("HUNTER-V23.4-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING")
+    print(
+        "XT 1H spot + perpetual | 455d research + 7d warmup | RR 1:2 | "
+        "fixed universe | no funding dependency | no spot-gap filling"
+    )
+    print(f"Code SHA256: {sha256_file(Path(__file__))}")
 
-if __name__=="__main__":main()
+    streams = {}
+    for number, symbol in enumerate(SYMBOLS, 1):
+        print(f"\n[{number}/{len(SYMBOLS)}] {symbol}: futures")
+        futures = fetch_kline(FUT_URL, symbol, "futures")
+
+        print(f"[{number}/{len(SYMBOLS)}] {symbol}: spot")
+        spot = fetch_kline(SPOT_URL, symbol, "spot")
+
+        streams[symbol] = build_stream(futures, spot)
+        merged_days = (
+            streams[symbol].index[-1] - streams[symbol].index[0]
+        ).total_seconds() / 86400.0
+        print(
+            f"[DATA] {symbol}: merged_rows={len(streams[symbol])}, "
+            f"merged_span={merged_days:.1f}d"
+        )
+        if merged_days < LOOKBACK_DAYS:
+            raise RuntimeError(
+                f"{symbol}: merged futures/spot span {merged_days:.1f}d < required {LOOKBACK_DAYS}d"
+            )
+
+    basis, change, z = build_panel(streams)
+    print("\nData preparation complete.")
+    print(f"Panel timestamps: {len(basis)}")
+    print(f"Panel start     : {basis.index.min()}")
+    print(f"Panel end       : {basis.index.max()}")
+
+    REPORT.mkdir(parents=True, exist_ok=True)
+    for stop_mult in STOPS:
+        trades, raw_candidates = simulate(streams, basis, change, z, stop_mult)
+        report(stop_mult, trades, raw_candidates)
+        if not trades.empty:
+            trades.to_csv(
+                REPORT / f"trades_stop_{stop_mult:.2f}.csv", index=False
+            )
+
+    print("\nSTAGE-0 DECISION PROTOCOL")
+    print("All three pre-registered stops are reported; no stop is selected here.")
+    print("If the family fails the pre-registered gates, close V23 without tuning.")
+    print("If it passes, proceed to clean walk-forward validation with the hypothesis locked.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print("\nFATAL BACKTEST ERROR")
+        print(f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        raise
