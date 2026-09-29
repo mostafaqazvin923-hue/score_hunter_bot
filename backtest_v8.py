@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""HUNTER-V23-STAGE0: FUTURES BASIS DISLOCATION / REPRICING.
+"""HUNTER-V23.2-STAGE0: FUTURES BASIS DISLOCATION / REPRICING.
 
 Locked hypothesis (no Stage-0 tuning): cross-sectional perpetual-vs-spot
 basis contains information about short-horizon futures returns. We test the
 high-basis/low-basis factor with causal basis z-score, 24h basis repricing,
-and historical XT funding as context. RR=1:2; stop values are sensitivity
+and RR=1:2; stop values are sensitivity
 outputs only.
 
-Integrity: independent XT spot + futures 1H OHLCV, historical XT funding,
-completed candles only, next-bar entry, per-symbol overlap lock, simultaneous
+Integrity: independent XT spot + futures 1H OHLCV, completed candles only, next-bar entry, per-symbol overlap lock, simultaneous
 different symbols allowed, same exit-candle re-entry blocked, same-candle
 SL+TP=loss, no timeout/BE/trailing/pyramiding, fixed universe, no future
 symbol selection. OI is intentionally omitted because a historical XT OI
@@ -25,11 +24,10 @@ FUT_URL="https://fapi.xt.com/future/market/v1/public/q/kline"
 # XT spot kline endpoint used by the public API. If XT changes its spot path,
 # fail loudly rather than substituting another data source.
 SPOT_URL="https://sapi.xt.com/v4/public/kline"
-FUND_URL="https://fapi.xt.com/future/market/v1/public/q/funding-rate-record"
 LOOKBACK_DAYS=455; WARMUP_DAYS=90; H=3600000; LIMIT=1000
 INITIAL=1000.; MARGIN=100.; NOTIONAL=5000.; RR=2.; FEE=.0007; SLIP=.0003; MAX_POS=10
 ATR_N=14
-BASIS_Z_N=120; BASIS_CHANGE_N=24; QUANT=.20; MIN_Z=1.0; MIN_CS=8; FUND_N=3
+BASIS_Z_N=120; BASIS_CHANGE_N=24; QUANT=.20; MIN_Z=1.0; MIN_CS=8
 STOPS=(1.0,1.25,1.5)
 CACHE=Path("data/xt_v23_stage0"); REPORT=Path("reports/xt_v23_stage0")
 
@@ -128,54 +126,11 @@ def fetch_kline(url,symbol,prefix):
     x=validate(x,prefix+symbol,start,end,allow_spot_gaps=(prefix=="spot_")); x.to_csv(path,index=False); return x
 
 
-def frow(r):
-    try:
-        if not isinstance(r,dict): return None
-        t=r.get("createdTime",r.get("timestamp",r.get("t"))); rate=r.get("fundingRate",r.get("rate",r.get("r"))); i=r.get("id")
-        if t is None or rate is None:return None
-        return int(t),float(rate),None if i is None else int(i)
-    except Exception:return None
-
-
-def fetch_funding(symbol):
-    CACHE.mkdir(parents=True,exist_ok=True); path=CACHE/f"funding_{symbol}.csv"; now=int(time.time()*1000); start=now-int((LOOKBACK_DAYS+WARMUP_DAYS)*86400e3); end=now
-    if path.exists():
-        f=pd.read_csv(path)
-        f.timestamp=pd.to_datetime(f.timestamp,utc=True)
-        f=f[(f.timestamp>=pd.to_datetime(start,unit="ms",utc=True))&(f.timestamp<=pd.to_datetime(end,unit="ms",utc=True))].drop_duplicates("timestamp").sort_values("timestamp")
-        if len(f)>=int((LOOKBACK_DAYS+WARMUP_DAYS)*.9) and f.funding_rate.notna().all(): return f
-    s=requests.Session(); next_id=None; seen=set(); out=[]
-    for page in range(1,101):
-        p={"symbol":symbol,"direction":"PREV","limit":100}
-        if next_id is not None:p["id"]=next_id
-        payload=None
-        for a in range(4):
-            try:q=s.get(FUND_URL,params=p,timeout=30); q.raise_for_status(); payload=q.json(); break
-            except Exception:time.sleep(1+a)
-        if payload is None:raise RuntimeError(f"{symbol}: funding request failed")
-        rr=rows(payload) or []; items=[v for v in (frow(r) for r in rr) if v]
-        if not items:break
-        for v in items:
-            if v[2] is None or v[2] not in seen:out.append(v); v[2] is not None and seen.add(v[2])
-        oldest=min(v[0] for v in items)
-        if oldest<=start:break
-        ids=[v[2] for v in items if v[2] is not None]
-        if not ids:raise RuntimeError(f"{symbol}: funding page has no ids for pagination")
-        new=min(ids)-1
-        if next_id is not None and new>=next_id:raise RuntimeError(f"{symbol}: funding pagination stalled")
-        next_id=new; time.sleep(.05)
-    if not out:raise RuntimeError(f"{symbol}: zero funding records")
-    f=pd.DataFrame(out,columns=["timestamp_ms","funding_rate","id"]); f.timestamp=pd.to_datetime(f.timestamp_ms,unit="ms",utc=True); f=f.drop_duplicates("timestamp").sort_values("timestamp")
-    f=f[(f.timestamp>=pd.to_datetime(start,unit="ms",utc=True))&(f.timestamp<=pd.to_datetime(end,unit="ms",utc=True))]
-    if len(f)<int((LOOKBACK_DAYS+WARMUP_DAYS)*.9):raise RuntimeError(f"{symbol}: funding history incomplete: {len(f)}")
-    f.to_csv(path,index=False); return f
-
-
 def tr(x):
     p=x.close.shift(1); return pd.concat([x.high-x.low,(x.high-p).abs(),(x.low-p).abs()],axis=1).max(axis=1)
 
 
-def build(fut,spot,fund):
+def build(fut,spot):
     f=fut.set_index("timestamp").sort_index(); s=spot.set_index("timestamp").sort_index()
     x=f.join(s[["close","open","high","low","volume"]].add_suffix("_spot"),how="inner")
     x["basis"]=(x.close-x.close_spot)/x.close_spot
@@ -183,7 +138,6 @@ def build(fut,spot,fund):
     # Never assume row-count == elapsed hours. A missing spot candle must
     # invalidate a 24h feature rather than silently stretching it across a gap.
     dt=x.index.to_series().diff()
-    valid24=dt.eq(pd.Timedelta(hours=1))
     x["spot_ret24"]=np.nan
     x["basis_chg24"]=np.nan
     if len(x)>24:
@@ -198,8 +152,7 @@ def build(fut,spot,fund):
         basis_prev.index=x.index
         x.loc[exact24,"spot_ret24"]=(spot_now/spot_prev-1).loc[exact24]
         x.loc[exact24,"basis_chg24"]=(x["basis"]-basis_prev).loc[exact24]
-    ff=fund.set_index("timestamp")["funding_rate"].sort_index(); x=pd.merge_asof(x.reset_index().sort_values("timestamp"),ff.rename("funding_rate").reset_index(),on="timestamp",direction="backward",allow_exact_matches=True).set_index("timestamp")
-    x["funding_mean"]=x.funding_rate.rolling(FUND_N,min_periods=FUND_N).mean(); return x.replace([np.inf,-np.inf],np.nan)
+    return x.replace([np.inf,-np.inf],np.nan)
 
 
 def panel(streams):
@@ -212,15 +165,12 @@ def candidates(b,ch,z,streams,ts):
     if int(valid.sum())<MIN_CS:return []
     v=r[valid]; lo=v.quantile(QUANT); hi=v.quantile(1-QUANT); out=[]
     for sym in v.index:
-        bz=float(zr[sym]); bc=float(cr[sym]); x=streams[sym]; fm=float(x.loc[ts,"funding_mean"]) if ts in x.index else np.nan; sr=float(x.loc[ts,"spot_ret24"]) if ts in x.index else np.nan
-        if not all(np.isfinite(q) for q in (bz,bc,fm,sr)):continue
+        bz=float(zr[sym]); bc=float(cr[sym]); x=streams[sym]; sr=float(x.loc[ts,"spot_ret24"]) if ts in x.index else np.nan
+        if not all(np.isfinite(q) for q in (bz,bc,sr)):continue
         if float(v[sym])>=hi and bz>=MIN_Z and bc<=0 and sr>=0: side=1
         elif float(v[sym])<=lo and bz<=-MIN_Z and bc>=0 and sr<=0: side=-1
         else:continue
-        # Funding is recorded as causal context only; it never creates or
-        # filters the direction. This avoids introducing an arbitrary funding
-        # threshold after seeing results.
-        out.append((sym,side,bz,fm))
+        out.append((sym,side,bz))
     out.sort(key=lambda q:(abs(q[2]),q[0]),reverse=True); return out
 
 
@@ -235,11 +185,11 @@ def exit_trade(x,idx,side,entry,sl,tp):
 def simulate(streams,b,ch,z,stop):
     events=[]; raw=0
     for ts in b.index:
-        for sym,side,bz,fm in candidates(b,ch,z,streams,ts):
+        for sym,side,bz in candidates(b,ch,z,streams,ts):
             raw+=1; x=streams[sym]; i=x.index.get_loc(ts)
-            if not isinstance(i,slice) and i+1<len(x):events.append((ts,sym,i,side,bz,fm))
+            if not isinstance(i,slice) and i+1<len(x):events.append((ts,sym,i,side,bz))
     events.sort(key=lambda e:(e[0],e[1])); openp={}; last_exit={}; equity=INITIAL; trades=[]
-    for ts,sym,i,side,bz,fm in events:
+    for ts,sym,i,side,bz in events:
         x=streams[sym]; ei=i+1; ets=x.index[ei]
         for s in [s for s,p in openp.items() if p<ets]:del openp[s]
         if sym in openp or (sym in last_exit and ets<=last_exit[sym]) or len(openp)>=MAX_POS or equity<(len(openp)+1)*MARGIN:continue
@@ -249,7 +199,7 @@ def simulate(streams,b,ch,z,stop):
         res=exit_trade(x,ei,side,entry,sl,tp)
         if res is None:continue
         xt,pnl,win=res; openp[sym]=xt; last_exit[sym]=xt; equity+=pnl
-        trades.append(dict(signal_ts=ts,entry_ts=ets,exit_ts=xt,symbol=sym,side="LONG" if side==1 else "SHORT",basis=float(b.loc[ts,sym]),basis_z=bz,basis_change_24h=float(ch.loc[ts,sym]),funding_mean=fm,entry=entry,sl=sl,tp=tp,win=int(win),pnl=float(pnl)))
+        trades.append(dict(signal_ts=ts,entry_ts=ets,exit_ts=xt,symbol=sym,side="LONG" if side==1 else "SHORT",basis=float(b.loc[ts,sym]),basis_z=bz,basis_change_24h=float(ch.loc[ts,sym]),entry=entry,sl=sl,tp=tp,win=int(win),pnl=float(pnl)))
     return pd.DataFrame(trades),raw
 
 
@@ -268,17 +218,17 @@ def report(stop,t,raw):
 
 
 def main():
-    print("HUNTER-V23.1-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING"); print("XT 1H spot + perpetual | RR 1:2 | fixed universe | no optimization | no spot-gap filling")
+    print("HUNTER-V23.2-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING"); print("XT 1H spot + perpetual | RR 1:2 | fixed universe | no optimization | no funding dependency | no spot-gap filling")
     raw={}
     for n,sym in enumerate(SYMBOLS,1):
         print(f"\n[{n}/{len(SYMBOLS)}] {sym}: futures"); fut=fetch_kline(FUT_URL,sym,"fut_")
         print(f"[{n}/{len(SYMBOLS)}] {sym}: spot"); spot=fetch_kline(SPOT_URL,sym,"spot_")
-        print(f"[{n}/{len(SYMBOLS)}] {sym}: funding"); fund=fetch_funding(sym); raw[sym]=build(fut,spot,fund)
+        raw[sym]=build(fut,spot)
         if len(raw[sym])<int((LOOKBACK_DAYS+WARMUP_DAYS)*24*.95):raise RuntimeError(f"{sym}: merged history too short")
     b,ch,z=panel(raw); print(f"\nData preparation complete.\nCommon completed timestamps: {len(b)}")
     for stop in STOPS:
         t,rawn=simulate(raw,b,ch,z,stop); report(stop,t,rawn); REPORT.mkdir(parents=True,exist_ok=True)
         if not t.empty:t.to_csv(REPORT/f"trades_stop_{stop:.2f}.csv",index=False)
-    print("\nSTAGE-0 DECISION PROTOCOL\nNo stop is selected here. Apply the pre-registered activity/edge/DD gates externally.\nIf the family fails, close V23.1 without tuning symbols, sides, thresholds, funding bounds, or stops.\nIf it passes, proceed to clean walk-forward validation with the hypothesis locked.")
+    print("\nSTAGE-0 DECISION PROTOCOL\nNo stop is selected here. Apply the pre-registered activity/edge/DD gates externally.\nIf the family fails, close V23.2 without tuning symbols, sides, thresholds, stops.\nIf it passes, proceed to clean walk-forward validation with the hypothesis locked.")
 
 if __name__=="__main__":main()
