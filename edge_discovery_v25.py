@@ -163,12 +163,20 @@ def xt(sym, a, b):
     if len(df) and int(df["ts"].iloc[-1]) + BAR > now_ms:
         df = df.iloc[:-1].copy()
 
-    if len(df) < int(DAYS * 24 * 0.95):
+    # V25 uses 4h candles: 6 candles/day.
+    # DAYS is the research horizon in calendar days, so the expected
+    # completed-candle count is DAYS * (24/4), not DAYS * 24.
+    expected_4h_rows = int((DAYS + WARMUP) * 24 / 4)
+    min_required = int(expected_4h_rows * 0.95)
+
+    if len(df) < min_required:
         span = (
-            df["ts"].iloc[-1] - df["ts"].iloc[0]
-        ) / 86_400_000 if len(df) > 1 else 0
+            (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 86_400_000
+            if len(df) > 1 else 0
+        )
         raise RuntimeError(
-            f"XT {sym}: insufficient 4h history: rows={len(df)}, span={span:.1f}d"
+            f"XT {sym}: insufficient 4h history: rows={len(df)}, "
+            f"need>={min_required}, expected={expected_4h_rows}, span={span:.1f}d"
         )
 
     return df
