@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HUNTER-V23.7-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING
+"""HUNTER-V23.9-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING
 
 LOCKED RESEARCH HYPOTHESIS
 --------------------------
@@ -73,11 +73,11 @@ MIN_Z = 1.0
 MIN_CS = 8
 STOPS = (1.0, 1.25, 1.5)
 
-CACHE = Path("data/xt_v23_7")
-REPORT = Path("reports/xt_v23_7")
+CACHE = Path("data/xt_v23_9")
+REPORT = Path("reports/xt_v23_9")
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "hunter-v23.7-stage0/1.0"})
+SESSION.headers.update({"User-Agent": "hunter-v23.9-stage0/1.0"})
 
 
 def sha256_file(path: Path) -> str:
@@ -207,13 +207,20 @@ def fetch_kline(url, symbol, kind):
     CACHE.mkdir(parents=True, exist_ok=True)
     path = CACHE / f"{kind}_{symbol}.csv"
 
-    # Fetch exactly REQUIRED_DAYS completed candles.
-    # XT may cap/interpret forward startTime requests in a way that returns
-    # only a few hundred recent candles. Therefore pagination is deliberately
-    # BACKWARD: each request is anchored by endTime and moves to older candles.
+    # XT's endpoint behaves reliably when each request has an explicit,
+    # bounded time window.  A startTime-only request can return only a small
+    # default history (observed ~461 candles), even when limit=1000 is sent.
+    # Therefore we use bounded windows and stop strictly after the required
+    # candle count has been collected.  We never make an extra boundary
+    # request after the last required candle.
     end_ms = now_hour_ms() - H
-    start_ms = end_ms - (REQUIRED_DAYS - 1) * H
+    start_ms = end_ms - (REQUIRED_DAYS * 24 - 1) * H
     allow_spot = kind == "spot"
+    expected_rows = REQUIRED_DAYS * 24
+    expected_start_ms = end_ms - (expected_rows - 1) * H
+    if start_ms != expected_start_ms:
+        raise RuntimeError("internal date-range calculation mismatch")
+    WINDOW_CANDLES = 900
 
     if path.exists():
         try:
@@ -224,70 +231,92 @@ def fetch_kline(url, symbol, kind):
         except Exception as exc:
             print(f"[CACHE] {kind}_{symbol}: invalid/stale cache ({exc}); refetching")
 
-    cur_end = end_ms
+    cur = start_ms
     all_rows = []
     page = 0
-    oldest_seen = None
+    previous_max = None
 
-    while cur_end >= start_ms:
+    while cur <= end_ms:
         page += 1
         if page > 1000:
             raise RuntimeError(f"{kind}_{symbol}: pagination guard exceeded")
 
+        window_end = min(end_ms, cur + (WINDOW_CANDLES - 1) * H)
         params = {
             "symbol": symbol,
             "interval": "1h",
-            "endTime": cur_end,
+            "startTime": cur,
+            "endTime": window_end,
             "limit": LIMIT,
         }
         payload = request_json(url, params, f"{kind}_{symbol} page={page}")
         raw = rows(payload)
         if raw is None:
-            raise RuntimeError(f"{kind}_{symbol} page={page}: API returned no candle list")
+            raise RuntimeError(
+                f"{kind}_{symbol} page={page}: API returned no candle list"
+            )
 
         parsed = [parse_kline_row(r) for r in raw]
         inside = sorted({
             r for r in parsed
-            if r is not None and start_ms <= r[0] <= cur_end
+            if r is not None and cur <= r[0] <= window_end
         })
 
         if not inside:
             raise RuntimeError(
-                f"{kind}_{symbol}: empty backward page at "
-                f"{pd.to_datetime(cur_end, unit='ms', utc=True)}; refusing skip/fabricate"
+                f"{kind}_{symbol}: empty bounded page={page} at "
+                f"{pd.to_datetime(cur, unit='ms', utc=True)} -> "
+                f"{pd.to_datetime(window_end, unit='ms', utc=True)}; "
+                f"refusing skip/fabricate"
             )
 
         all_rows.extend(inside)
-        min_ts = min(r[0] for r in inside)
         max_ts = max(r[0] for r in inside)
+        min_ts = min(r[0] for r in inside)
 
-        if oldest_seen is not None and min_ts >= oldest_seen:
+        if previous_max is not None and max_ts <= previous_max:
             raise RuntimeError(
-                f"{kind}_{symbol}: backward pagination stalled at page={page}; "
-                f"oldest_ts did not move backward"
+                f"{kind}_{symbol}: pagination stalled at page={page}; "
+                f"max timestamp did not move forward"
             )
-        oldest_seen = min_ts
+        previous_max = max_ts
 
-        if page % 4 == 0:
+        # De-duplicate by timestamp for the progress test.  Do not fabricate
+        # missing candles; validation below will reject material gaps.
+        unique_ts = len({r[0] for r in all_rows})
+
+        if page % 4 == 0 or unique_ts >= expected_rows:
             print(
-                f"[FETCH] {kind}_{symbol} page={page} rows={len(all_rows)} "
-                f"oldest={pd.to_datetime(min_ts, unit='ms', utc=True)} "
-                f"newest={pd.to_datetime(max_ts, unit='ms', utc=True)}"
+                f"[FETCH] {kind}_{symbol} page={page} rows={unique_ts} "
+                f"oldest={pd.to_datetime(min(r[0] for r in all_rows), unit='ms', utc=True)} "
+                f"newest={pd.to_datetime(max(r[0] for r in all_rows), unit='ms', utc=True)}"
             )
 
-        if min_ts <= start_ms:
+        # Exact completion condition: once all expected hourly timestamps are
+        # present, stop immediately. This prevents the old final empty-page
+        # failure at the end of the requested interval.
+        if unique_ts >= expected_rows:
             break
 
-        # Move strictly one candle before the oldest returned candle.
-        cur_end = min_ts - H
+        if max_ts >= end_ms:
+            break
+
+        next_cur = max_ts + H
+        if next_cur <= cur:
+            raise RuntimeError(
+                f"{kind}_{symbol}: pagination stalled at page={page}"
+            )
+        cur = next_cur
         time.sleep(0.05)
 
     frame = pd.DataFrame(
         all_rows, columns=["ts", "open", "high", "low", "close", "volume"]
     )
     frame["timestamp"] = pd.to_datetime(frame.pop("ts"), unit="ms", utc=True)
-    frame = frame[(frame.timestamp >= pd.to_datetime(start_ms, unit="ms", utc=True)) &
-                  (frame.timestamp <= pd.to_datetime(end_ms, unit="ms", utc=True))]
+    frame = frame[
+        (frame.timestamp >= pd.to_datetime(start_ms, unit="ms", utc=True))
+        & (frame.timestamp <= pd.to_datetime(end_ms, unit="ms", utc=True))
+    ]
     frame = validate_ohlcv(
         frame, f"{kind}_{symbol}", start_ms, end_ms, allow_spot
     )
@@ -424,9 +453,13 @@ def resolve_exit(x, entry_idx, side, entry, stop, target):
 
 def simulate(streams, basis, change, z, stop_mult):
     events = []
+    # The first WARMUP_DAYS are data warmup only; no trades may originate there.
+    warmup_cutoff = basis.index.min() + pd.Timedelta(days=WARMUP_DAYS)
     raw_candidates = 0
 
     for ts in basis.index:
+        if ts < warmup_cutoff:
+            continue
         for symbol, side, bz in candidates_at(ts, basis, change, z, streams):
             raw_candidates += 1
             stream = streams[symbol]
@@ -561,8 +594,89 @@ def report(stop_mult, trades, raw_candidates):
         )
 
 
+def _self_test():
+    """Offline integrity tests; no network access and no strategy tuning."""
+    # 1) Validate exact hourly sequence for a synthetic futures dataset.
+    start = pd.Timestamp("2025-01-01 00:00:00", tz="UTC")
+    periods = REQUIRED_DAYS * 24
+    idx = pd.date_range(start, periods=periods, freq="1h", tz="UTC")
+    base = np.linspace(100.0, 120.0, periods)
+    df = pd.DataFrame({
+        "timestamp": idx,
+        "open": base,
+        "high": base + 1.0,
+        "low": base - 1.0,
+        "close": base + 0.2,
+        "volume": np.ones(periods),
+    })
+    checked = validate_ohlcv(
+        df, "SELFTEST", int(idx[0].timestamp() * 1000),
+        int(idx[-1].timestamp() * 1000), False
+    )
+    assert len(checked) == periods
+
+    # 2) A futures gap must be rejected, never filled.
+    gap_df = df.drop(index=123).reset_index(drop=True)
+    try:
+        validate_ohlcv(
+            gap_df, "SELFTEST_GAP", int(idx[0].timestamp() * 1000),
+            int(idx[-1].timestamp() * 1000), False
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("futures gap was not rejected")
+
+    # 3) Causal feature construction must produce a finite basis/ATR stream.
+    spot = df.copy()
+    spot[["open", "high", "low", "close"]] *= 0.999
+    stream = build_stream(df, spot)
+    assert stream["basis"].notna().sum() == periods
+    assert stream["atr"].notna().sum() == periods - ATR_N + 1
+
+    # 4) Panel/z-score construction works with two symbols and no fill.
+    streams = {"a_usdt": stream, "b_usdt": stream.copy()}
+    basis, change, z = build_panel(streams)
+    assert basis.shape[0] == periods
+    assert change.shape == basis.shape
+    assert z.shape == basis.shape
+
+    # 5) Pagination must stop after the required candles and must not make
+    # an unnecessary boundary request. Synthetic API pages are bounded exactly
+    # like the XT endpoint contract.
+    old_request = globals()["request_json"]
+    calls = []
+    fetch_end = pd.to_datetime(now_hour_ms() - H, unit="ms", utc=True)
+    fetch_start = fetch_end - pd.Timedelta(hours=periods - 1)
+    fetch_idx = pd.date_range(fetch_start, periods=periods, freq="1h", tz="UTC")
+    synthetic = [(int(ts.timestamp() * 1000), 100, 101, 99, 100.5, 1) for ts in fetch_idx]
+
+    def fake_request(url, params, label, attempts=4):
+        calls.append(dict(params))
+        lo, hi = int(params["startTime"]), int(params["endTime"])
+        return {"result": [list(r) for r in synthetic if lo <= r[0] <= hi]}
+
+    try:
+        globals()["request_json"] = fake_request
+        test_dir = Path("/tmp/hunter_v23_9_selftest")
+        test_dir.mkdir(parents=True, exist_ok=True)
+        old_cache = globals()["CACHE"]
+        globals()["CACHE"] = test_dir
+        fetched = fetch_kline("synthetic://futures", "selftest_usdt", "futures")
+        assert len(fetched) == periods
+        assert calls, "pagination made no calls"
+        assert all(c["startTime"] <= c["endTime"] for c in calls)
+        assert len(calls) <= 14, f"unexpected pagination count: {len(calls)}"
+        globals()["CACHE"] = old_cache
+    finally:
+        globals()["request_json"] = old_request
+
+    print("[SELFTEST] PASS — validation, gap rejection, features, panel, pagination")
+
+
 def main():
-    print("HUNTER-V23.7-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING")
+    _self_test()
+    print("HUNTER-V23.9-STAGE0 — FUTURES BASIS DISLOCATION / REPRICING")
     print(
         "XT 1H spot + perpetual | 455d research + 7d warmup | RR 1:2 | "
         "fixed universe | no funding dependency | no spot-gap filling"
