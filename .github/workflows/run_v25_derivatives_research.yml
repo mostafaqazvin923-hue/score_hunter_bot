@@ -1,25 +1,37 @@
-name: Run V25 Derivatives Research
+name: Run V25 XT-Only Research
+
 on:
   workflow_dispatch:
+
 jobs:
   research:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: pip
-      - run: pip install pandas numpy requests
+
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy
+
       - name: Compile check
-        run: python -m py_compile edge_discovery_v25.py
-      - name: Run V25
-        env:
-          COINGLASS_API_KEY: ${{ secrets.COINGLASS_API_KEY }}
-        run: python edge_discovery_v25.py
+        run: |
+          python -m py_compile edge_discovery_v25.py
+
+      - name: Run V25 XT-Only Research
+        run: |
+          python edge_discovery_v25.py
+
       - name: Upload reports
         uses: actions/upload-artifact@v4
         with:
-          name: v25-derivatives-research
-          path: reports/xt_v25_derivatives_research/
+          name: v25-xt-only-research
+          path: reports/xt_v25_ohlcv_research/
           if-no-files-found: error
