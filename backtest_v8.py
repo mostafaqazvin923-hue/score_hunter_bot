@@ -232,12 +232,14 @@ def fetch_kline(url, symbol, kind):
         if page > 1000:
             raise RuntimeError(f"{kind}_{symbol}: pagination guard exceeded")
 
-        window_end = min(end_ms, cur + LIMIT * H - H)
+        # Do NOT send a bounded endTime here. XT can treat the final boundary
+        # as exclusive and return an empty last page even when the requested
+        # history is valid. Paginate forward from startTime only, then locally
+        # discard candles newer than the last completed candle.
         params = {
             "symbol": symbol,
             "interval": "1h",
             "startTime": cur,
-            "endTime": window_end,
             "limit": LIMIT,
         }
         payload = request_json(url, params, f"{kind}_{symbol} page={page}")
@@ -246,7 +248,7 @@ def fetch_kline(url, symbol, kind):
             raise RuntimeError(f"{kind}_{symbol} page={page}: API returned no candle list")
 
         parsed = [parse_kline_row(r) for r in raw]
-        inside = sorted({r for r in parsed if r is not None and cur <= r[0] <= window_end})
+        inside = sorted({r for r in parsed if r is not None and r[0] >= cur})
 
         if not inside:
             raise RuntimeError(
