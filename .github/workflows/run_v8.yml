@@ -37,3 +37,10 @@ jobs:
       - name: Run Backtest V8
         run: |
           python backtest_v8.py
+
+      - name: Upload V24 Research Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: v24-research-reports
+          path: reports/xt_v24_research/
+          if-no-files-found: error
