@@ -1,0 +1,40 @@
+name: Run V32 Binance Order Flow Stage-0
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests
+
+      - name: Syntax check
+        run: |
+          python -m py_compile edge_discovery_v32_stage0_order_flow.py
+
+      - name: Run V32 Stage-0
+        run: |
+          python edge_discovery_v32_stage0_order_flow.py
+
+      - name: Upload V32 reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: v32-binance-order-flow-stage0
+          path: reports/binance_v32_order_flow/
+          if-no-files-found: error
