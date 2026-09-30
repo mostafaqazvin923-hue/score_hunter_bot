@@ -162,107 +162,169 @@ def net_r_for_exit(gross_r: float) -> float:
 # Binance public archive
 # ----------------------------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "V32-OrderFlow-Research/1.0"})
+SESSION.headers.update({"User-Agent": "V32-OrderFlow-Research/1.1"})
+
+ARCHIVE_BASE = "https://data.binance.vision/data/futures/um"
+
+
+def _download_zip(url: str, local: Path) -> bool:
+    """Download one Binance archive object. Return False for a genuine 404."""
+    if local.exists() and local.stat().st_size > 100:
+        return True
+
+    local.parent.mkdir(parents=True, exist_ok=True)
+    last_err = None
+    for attempt in range(4):
+        try:
+            r = SESSION.get(url, timeout=60)
+            if r.status_code == 404:
+                return False
+            r.raise_for_status()
+            if not r.content.startswith(b"PK"):
+                raise RuntimeError(f"Non-ZIP response from {url}")
+            local.write_bytes(r.content)
+            return True
+        except Exception as exc:
+            last_err = exc
+            try:
+                local.unlink()
+            except FileNotFoundError:
+                pass
+            if attempt < 3:
+                time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"Download failed: {url} :: {last_err}")
+
+
+def _read_kline_zip(path: Path) -> pd.DataFrame:
+    """Read both old headerless and new header-containing Binance CSVs."""
+    with zipfile.ZipFile(path) as z:
+        csv_names = [n for n in z.namelist() if n.lower().endswith(".csv")]
+        if not csv_names:
+            raise RuntimeError(f"No CSV inside {path}")
+        with z.open(csv_names[0]) as f:
+            df = pd.read_csv(f, header=None, names=COLS, dtype=str)
+
+    if len(df) and str(df.iloc[0]["open_time"]).strip().lower() == "open_time":
+        df = df.iloc[1:].copy()
+
+    df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
+    df = df.dropna(subset=["open_time"]).copy()
+    if not len(df):
+        return df
+
+    df["open_time"] = df["open_time"].astype("int64")
+    for c in ["open", "high", "low", "close", "volume", "quote_volume",
+              "taker_buy_base", "taker_buy_quote"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=[
+        "open", "high", "low", "close", "volume", "quote_volume",
+        "taker_buy_base", "taker_buy_quote"
+    ]).copy()
+    df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    return df
 
 
 def download_month(symbol: str, year: int, month: int) -> pd.DataFrame | None:
+    """Monthly archive. Return None when Binance has not published that month."""
     ym = f"{year:04d}-{month:02d}"
     fname = f"{symbol}-{INTERVAL}-{ym}.zip"
-    url = f"{BASE_URL}/{symbol}/{INTERVAL}/{fname}"
-    local = CACHE_DIR / symbol / fname
-    local.parent.mkdir(parents=True, exist_ok=True)
+    url = f"{ARCHIVE_BASE}/monthly/klines/{symbol}/{INTERVAL}/{fname}"
+    local = CACHE_DIR / symbol / "monthly" / fname
 
-    if not local.exists():
-        for attempt in range(4):
-            try:
-                r = SESSION.get(url, timeout=45)
-                if r.status_code == 404:
-                    return None
-                r.raise_for_status()
-                local.write_bytes(r.content)
-                break
-            except Exception:
-                if attempt == 3:
-                    raise
-                time.sleep(1.5 * (attempt + 1))
+    ok = _download_zip(url, local)
+    if not ok:
+        return None
+    return _read_kline_zip(local)
 
-    try:
-        with zipfile.ZipFile(local) as z:
-            names = z.namelist()
-            csv_name = next(n for n in names if n.lower().endswith(".csv"))
-            with z.open(csv_name) as f:
-                # Binance archive files can be either headerless (older)
-                # or contain a header row (newer archives). Read raw first
-                # and remove the header row deterministically.
-                df = pd.read_csv(f, header=None, names=COLS, dtype=str)
-        # Some newer Binance monthly archives contain the literal header row
-        # as the first CSV record. It must never enter the research dataset.
-        if len(df) and str(df.iloc[0]["open_time"]).strip().lower() == "open_time":
-            df = df.iloc[1:].copy()
-        return df
-    except Exception:
-        # Corrupt cache: remove and retry once.
-        try:
-            local.unlink()
-        except FileNotFoundError:
-            pass
-        r = SESSION.get(url, timeout=45)
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
-        local.write_bytes(r.content)
-        with zipfile.ZipFile(local) as z:
-            csv_name = next(n for n in z.namelist() if n.lower().endswith(".csv"))
-            with z.open(csv_name) as f:
-                df = pd.read_csv(f, header=None, names=COLS, dtype=str)
-        if len(df) and str(df.iloc[0]["open_time"]).strip().lower() == "open_time":
-            df = df.iloc[1:].copy()
-        return df
+
+def download_day(symbol: str, day: pd.Timestamp) -> pd.DataFrame | None:
+    """Daily archive fallback, used for months whose monthly file is unavailable."""
+    ds = day.strftime("%Y-%m-%d")
+    fname = f"{symbol}-{INTERVAL}-{ds}.zip"
+    url = f"{ARCHIVE_BASE}/daily/klines/{symbol}/{INTERVAL}/{fname}"
+    local = CACHE_DIR / symbol / "daily" / fname
+
+    ok = _download_zip(url, local)
+    if not ok:
+        return None
+    return _read_kline_zip(local)
 
 
 def fetch_symbol(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """
+    Build the requested range from Binance's public archive.
+
+    Important:
+    - Older complete months use monthly archives.
+    - If a monthly archive is unavailable (typically the current/recent month),
+      we fall back to daily archives for that month.
+    - We never forward-fill missing bars.
+    - Coverage is audited against the ACTUAL requested [start, end] range.
+    """
     parts = []
+    missing_objects = []
+
     for y, m in month_iter(start, end):
-        df = download_month(symbol, y, m)
-        if df is not None and len(df):
-            parts.append(df)
+        month_start = pd.Timestamp(y, m, 1, tz="UTC")
+        if m == 12:
+            next_month = pd.Timestamp(y + 1, 1, 1, tz="UTC")
+        else:
+            next_month = pd.Timestamp(y, m + 1, 1, tz="UTC")
+        month_end = next_month - pd.Timedelta(milliseconds=1)
+
+        # Try monthly first. Binance's monthly files may lag the daily files.
+        monthly = download_month(symbol, y, m)
+        if monthly is not None and len(monthly):
+            parts.append(monthly)
+            continue
+
+        # Monthly unavailable: use daily files for the requested portion of
+        # this month. This is expected for the newest month.
+        day = max(month_start, start.floor("D"))
+        last_day = min(month_end, end).floor("D")
+        while day <= last_day:
+            daily = download_day(symbol, day)
+            if daily is None:
+                missing_objects.append(f"{symbol}-{INTERVAL}-{day:%Y-%m-%d}")
+            elif len(daily):
+                parts.append(daily)
+            day += pd.Timedelta(days=1)
 
     if not parts:
         raise RuntimeError(f"No Binance archive data for {symbol}")
 
     df = pd.concat(parts, ignore_index=True)
-    # Defensive parsing: a malformed/header record can never become a timestamp.
-    df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
-    df = df.dropna(subset=["open_time"]).copy()
-    df["open_time"] = df["open_time"].astype("int64")
-    df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    for c in ["open", "high", "low", "close", "volume", "quote_volume",
-              "taker_buy_base", "taker_buy_quote"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["open", "high", "low", "close", "quote_volume",
-                           "taker_buy_quote"]).copy()
-
     df = df.sort_values("timestamp").drop_duplicates("timestamp")
-    # Remove incomplete current candle and any bars outside requested range.
+
+    # Requested bars only. Do not assume the newest candle is complete.
     now = utc_now().floor("h")
     df = df[df["timestamp"] < now]
     df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)]
 
-    expected = pd.date_range(start.floor("h"), end.floor("h"), freq="1h", tz="UTC")
-    idx = pd.DatetimeIndex(df["timestamp"])
-    missing = expected.difference(idx)
+    expected_index = pd.date_range(
+        start.floor("h"), end.floor("h"), freq="1h", tz="UTC"
+    )
+    actual_index = pd.DatetimeIndex(df["timestamp"])
+    missing = expected_index.difference(actual_index)
+
+    coverage = len(actual_index) / len(expected_index)
     gap_count = len(missing)
 
-    if len(df) < int(len(expected) * 0.97):
+    # We require the full requested range. A missing recent day is not hidden.
+    if coverage < 0.995:
+        sample_missing = ", ".join(str(x) for x in missing[:8])
         raise RuntimeError(
-            f"{symbol}: coverage too low rows={len(df)} expected={len(expected)} "
-            f"coverage={len(df)/len(expected):.4f}"
+            f"{symbol}: archive coverage failure rows={len(df)} "
+            f"expected={len(expected_index)} coverage={coverage:.4f} "
+            f"missing_bars={gap_count} sample_missing={sample_missing} "
+            f"missing_objects={len(missing_objects)}"
         )
 
     if gap_count:
-        # Missing bars are never forward-filled. We retain the data but flag gaps;
-        # event generation will not bridge gaps.
-        print(f"[WARN] {symbol}: missing hourly bars={gap_count}")
+        print(
+            f"[WARN] {symbol}: {gap_count} hourly bars missing despite "
+            f"coverage={coverage:.4f}"
+        )
 
     df["symbol"] = symbol
     df["gap_from_prev"] = (
