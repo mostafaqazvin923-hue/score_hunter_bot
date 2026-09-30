@@ -106,18 +106,32 @@ def normalize_row(r):
 
 
 def fetch_symbol(symbol, start_ms, end_ms):
+    """
+    XT's kline endpoint can return only the first LIMIT rows for a
+    large requested interval. A single 485-day request therefore
+    returns about 1000/11640 rows and looks like a coverage failure.
+
+    Use deterministic bounded windows instead of cursor pagination.
+    Each request covers at most 900 one-hour candles. This mirrors
+    the bounded-window approach that previously produced complete
+    XT historical coverage.
+    """
     rows = []
-    cursor = start_ms
-    for _ in range(1000):
-        if cursor >= end_ms:
-            break
+    window_bars = 900
+    window_ms = window_bars * BAR_MS
+    window_start = start_ms
+
+    while window_start < end_ms:
+        window_end = min(window_start + window_ms, end_ms)
+
         params = {
             "symbol": symbol,
             "interval": "1h",
-            "startTime": cursor,
-            "endTime": end_ms,
+            "startTime": window_start,
+            "endTime": window_end,
             "limit": LIMIT,
         }
+
         payload = None
         for attempt in range(RETRIES):
             try:
@@ -132,6 +146,7 @@ def fetch_symbol(symbol, start_ms, end_ms):
 
         raw = parse_rows(payload)
         batch = []
+
         for x in raw:
             y = normalize_row(x)
             if y is None:
@@ -140,40 +155,43 @@ def fetch_symbol(symbol, start_ms, end_ms):
                 ts = int(float(y[0]))
                 if ts < 10_000_000_000:
                     ts *= 1000
-                batch.append([
-                    ts,
-                    float(y[1]), float(y[2]), float(y[3]),
-                    float(y[4]), float(y[5])
-                ])
+
+                # Keep only the exact requested half-open window.
+                if window_start <= ts < window_end:
+                    batch.append([
+                        ts,
+                        float(y[1]), float(y[2]), float(y[3]),
+                        float(y[4]), float(y[5])
+                    ])
             except Exception:
                 continue
 
-        if not batch:
-            break
-
-        batch = sorted(set(tuple(x) for x in batch), key=lambda x: x[0])
         rows.extend(batch)
 
-        last_ts = batch[-1][0]
-        next_cursor = last_ts + BAR_MS
-        if next_cursor <= cursor:
-            break
-        cursor = next_cursor
+        # Advance by the requested window, not by the response's last
+        # timestamp. This prevents XT's response ordering/pagination
+        # behavior from truncating the historical range.
+        window_start = window_end
         time.sleep(SLEEP)
 
-        if last_ts >= end_ms - BAR_MS:
-            break
-
-    df = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume"])
+    df = pd.DataFrame(
+        rows,
+        columns=["timestamp", "open", "high", "low", "close", "volume"]
+    )
     if df.empty:
         return df
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+    df = (
+        df.drop_duplicates("timestamp")
+          .sort_values("timestamp")
+          .reset_index(drop=True)
+    )
 
     # Never use the currently incomplete candle.
     now_ms = int(time.time() * 1000)
-    cutoff = pd.Timestamp(now_ms - (now_ms % BAR_MS), unit="ms", tz="UTC")
+    cutoff_ms = now_ms - (now_ms % BAR_MS)
+    cutoff = pd.Timestamp(cutoff_ms, unit="ms", tz="UTC")
     df = df[df["timestamp"] < cutoff].copy()
 
     return df
@@ -207,7 +225,11 @@ def fetch_all():
         })
 
         if cov < MIN_COVERAGE or gaps != 0:
-            raise RuntimeError(f"Coverage failure {symbol}: coverage={cov:.4f}, gaps={gaps}")
+            raise RuntimeError(
+                f"Coverage failure {symbol}: coverage={cov:.4f}, "
+                f"rows={actual}/{expected}, gaps={gaps}, "
+                f"first={df["timestamp"].min()}, last={df["timestamp"].max()}"
+            )
 
         frames[symbol] = df
 
