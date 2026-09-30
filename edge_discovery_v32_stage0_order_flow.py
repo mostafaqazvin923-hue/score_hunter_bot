@@ -191,7 +191,14 @@ def download_month(symbol: str, year: int, month: int) -> pd.DataFrame | None:
             names = z.namelist()
             csv_name = next(n for n in names if n.lower().endswith(".csv"))
             with z.open(csv_name) as f:
-                df = pd.read_csv(f, header=None, names=COLS)
+                # Binance archive files can be either headerless (older)
+                # or contain a header row (newer archives). Read raw first
+                # and remove the header row deterministically.
+                df = pd.read_csv(f, header=None, names=COLS, dtype=str)
+        # Some newer Binance monthly archives contain the literal header row
+        # as the first CSV record. It must never enter the research dataset.
+        if len(df) and str(df.iloc[0]["open_time"]).strip().lower() == "open_time":
+            df = df.iloc[1:].copy()
         return df
     except Exception:
         # Corrupt cache: remove and retry once.
@@ -207,7 +214,10 @@ def download_month(symbol: str, year: int, month: int) -> pd.DataFrame | None:
         with zipfile.ZipFile(local) as z:
             csv_name = next(n for n in z.namelist() if n.lower().endswith(".csv"))
             with z.open(csv_name) as f:
-                return pd.read_csv(f, header=None, names=COLS)
+                df = pd.read_csv(f, header=None, names=COLS, dtype=str)
+        if len(df) and str(df.iloc[0]["open_time"]).strip().lower() == "open_time":
+            df = df.iloc[1:].copy()
+        return df
 
 
 def fetch_symbol(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
@@ -221,10 +231,16 @@ def fetch_symbol(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Data
         raise RuntimeError(f"No Binance archive data for {symbol}")
 
     df = pd.concat(parts, ignore_index=True)
+    # Defensive parsing: a malformed/header record can never become a timestamp.
+    df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
+    df = df.dropna(subset=["open_time"]).copy()
+    df["open_time"] = df["open_time"].astype("int64")
     df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     for c in ["open", "high", "low", "close", "volume", "quote_volume",
               "taker_buy_base", "taker_buy_quote"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close", "quote_volume",
+                           "taker_buy_quote"]).copy()
 
     df = df.sort_values("timestamp").drop_duplicates("timestamp")
     # Remove incomplete current candle and any bars outside requested range.
@@ -618,7 +634,7 @@ def main():
     audit.append("==================")
     audit.append(f"UTC generated: {utc_now()}")
     audit.append("Data: Binance USD-M Futures public historical 1H klines")
-    audit.append("Taker buy quote volume is taken directly from Binance kline field.")
+    audit.append("Taker buy quote volume is taken directly from Binance kline field. CSV header rows are explicitly detected/removed.")
     audit.append("Aggressive sell quote volume = total quote volume - taker buy quote volume.")
     audit.append("No OI, liquidation, funding, or fabricated CVD used.")
     audit.append("Signal uses closed bar t only.")
