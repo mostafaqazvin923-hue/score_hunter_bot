@@ -36,7 +36,6 @@ def fetch(sym,start,end):
         allr.extend(b); nxt=max(x[0] for x in b)+BAR
         if nxt<=cur: break
         cur=nxt; print(f'[XT-FUT] {sym} page={page} rows={len(allr)} latest={pd.to_datetime(max(x[0] for x in allr),unit="ms",utc=True)}')
-        if len(b)<LIMIT: break
     if not allr: raise RuntimeError(f'No data {sym}')
     d=pd.DataFrame(allr,columns=['ts','open','high','low','close','volume']).drop_duplicates('ts').sort_values('ts')
     gap=d.ts.diff().dropna();
