@@ -102,7 +102,7 @@ def build_panel(raw):
         frames.append(g)
     p=pd.concat(frames,ignore_index=True).sort_values(['ts','symbol']).reset_index(drop=True)
     leader=p[p.symbol.isin(LEADERS)].pivot(index='ts',columns='symbol',values='ret1').sort_index()
-    leader_basket=leader.mean(axis=1,min_count=len(LEADERS))
+    leader_basket=leader.sum(axis=1,min_count=len(LEADERS))/len(LEADERS)
     mu=leader_basket.rolling(LEADER_Z_N,min_periods=LEADER_Z_N).mean()
     sd=leader_basket.rolling(LEADER_Z_N,min_periods=LEADER_Z_N).std(ddof=0)
     leader_z=(leader_basket-mu)/sd.replace(0,np.nan)
