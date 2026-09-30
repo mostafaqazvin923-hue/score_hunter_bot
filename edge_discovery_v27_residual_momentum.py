@@ -28,14 +28,26 @@ def rows(x):
     return out
 
 def fetch(sym,start,end):
+    # XT futures Kline is reliably paginated by bounded time windows.
+    # Do NOT send the entire 455-day range with one start/end pair: XT may
+    # return only the most recent ~999 candles for that request.
+    window_bars=LIMIT-1
+    window_ms=window_bars*BAR
     cur=start; allr=[]; page=0
     while cur<end:
-        page+=1; b=rows(get({'symbol':sym,'interval':'4h','startTime':cur,'endTime':end,'limit':LIMIT}))
-        b=sorted(set(b)); b=[x for x in b if cur<=x[0]<end]
-        if not b: break
-        allr.extend(b); nxt=max(x[0] for x in b)+BAR
-        if nxt<=cur: break
-        cur=nxt; print(f'[XT-FUT] {sym} page={page} rows={len(allr)} latest={pd.to_datetime(max(x[0] for x in allr),unit="ms",utc=True)}')
+        page+=1
+        win_end=min(cur+window_ms,end)
+        b=rows(get({'symbol':sym,'interval':'4h','startTime':cur,'endTime':win_end,'limit':LIMIT}))
+        b=sorted(set(b)); b=[x for x in b if cur<=x[0]<win_end]
+        if not b:
+            raise RuntimeError(f'XT returned no candles for {sym} window {pd.to_datetime(cur,unit="ms",utc=True)} -> {pd.to_datetime(win_end,unit="ms",utc=True)}')
+        allr.extend(b)
+        expected_window=int(np.ceil((win_end-cur)/BAR))
+        print(f'[XT-FUT] {sym} page={page} window={pd.to_datetime(cur,unit="ms",utc=True)} -> {pd.to_datetime(win_end,unit="ms",utc=True)} rows={len(b)}/{expected_window} total={len(allr)}')
+        if len(b) < expected_window:
+            raise RuntimeError(f'XT window coverage failure {sym}: got={len(b)} expected={expected_window} page={page}')
+        cur=win_end
+        time.sleep(0.12)
     if not allr: raise RuntimeError(f'No data {sym}')
     d=pd.DataFrame(allr,columns=['ts','open','high','low','close','volume']).drop_duplicates('ts').sort_values('ts')
     gap=d.ts.diff().dropna();
