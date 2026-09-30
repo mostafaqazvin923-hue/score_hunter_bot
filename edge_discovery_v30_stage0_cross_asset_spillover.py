@@ -228,7 +228,7 @@ def fetch_all():
             raise RuntimeError(
                 f"Coverage failure {symbol}: coverage={cov:.4f}, "
                 f"rows={actual}/{expected}, gaps={gaps}, "
-                f"first={df["timestamp"].min()}, last={df["timestamp"].max()}"
+                f"first={df['timestamp'].min()}, last={df['timestamp'].max()}"
             )
 
         frames[symbol] = df
