@@ -1,331 +1,343 @@
-# V25 XT-ONLY RESEARCH ENGINE
-# No external derivatives vendor or API credentials are required.
-# Data source: XT public futures 4h OHLCV only.
-# This is an edge-discovery/research engine, not a fitted trading strategy.
-# Causal features only; RR path uses next-bar-open entry.
+#!/usr/bin/env python3
+"""
+HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN QUANTITATIVE ENGINE
+- Market: XT USDT-M Futures REST API (fapi.xt.com)
+- Timeframe: 4H Primary Setup with Daily Trend Context
+- Zero Lookahead, Zero Leakage, Strict Causal Pipeline
+"""
 
-import os, time, json, urllib.parse, urllib.request
-from datetime import datetime, timezone
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+import sys
+import time
+import requests
 import numpy as np
 import pandas as pd
 
-XT='https://fapi.xt.com'
-SYMS=['BTC/USDT','ETH/USDT','SOL/USDT','SUI/USDT','AVAX/USDT','NEAR/USDT','ADA/USDT','BNB/USDT','APT/USDT','CRV/USDT','ONDO/USDT','PENDLE/USDT','ICP/USDT','WIF/USDT']
-DAYS=455; WARMUP=7; BAR=4*3600*1000; LIMIT=1000; MIN_COV=.97
-OUT=Path('reports/xt_v25_ohlcv_research'); OUT.mkdir(parents=True,exist_ok=True)
-def get(url, params):
-    last = None
-    for i in range(4):
+SYMBOLS = [
+    "btc_usdt", "eth_usdt", "sol_usdt", "sui_usdt", "avax_usdt",
+    "near_usdt", "ada_usdt", "bnb_usdt", "apt_usdt", "crv_usdt",
+    "ondo_usdt", "pendle_usdt", "icp_usdt", "wif_usdt"
+]
+
+DATA_DIR = Path("data/xt_futures_ebp_4h")
+TOTAL_DAYS = 365
+WARMUP_DAYS = 60
+
+INITIAL_CAPITAL = 1000.0
+MARGIN_PER_TRADE = 100.0
+LEVERAGE = 20.0
+RR = 2.0
+
+FEE_RATE = 0.0007
+SLIPPAGE = 0.0003
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data-dir", default=str(DATA_DIR))
+    return p.parse_args()
+
+
+def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
+    file_path = data_dir / f"{symbol.upper()}_15m.csv"
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    interval_ms = 15 * 60 * 1000
+    target_start_ms = now_ms - int((TOTAL_DAYS + WARMUP_DAYS) * 86400 * 1000)
+    final_end_ms = (now_ms // interval_ms) * interval_ms - 1
+
+    if file_path.exists() and file_path.stat().st_size > 1000:
         try:
-            query = urllib.parse.urlencode(params, doseq=True, safe="")
-            full_url = url + ("?" + query if query else "")
-            headers = {
-                "Accept": "application/json",
-                "User-Agent": "score-hunter-v25/1.0",
-            }
-            req = urllib.request.Request(full_url, headers=headers, method="GET")
-            with urllib.request.urlopen(req, timeout=30) as response:
-                j = json.loads(response.read().decode("utf-8"))
+            df_cached = pd.read_csv(file_path)
+            if "timestamp" in df_cached.columns:
+                df_cached["timestamp_dt"] = pd.to_datetime(df_cached["timestamp"], unit="ms", utc=True)
+                row_count = len(df_cached)
+                span_days = (df_cached["timestamp_dt"].iloc[-1] - df_cached["timestamp_dt"].iloc[0]).total_seconds() / 86400.0
+                if row_count >= 38000 and span_days >= (TOTAL_DAYS + WARMUP_DAYS - 5):
+                    print(f"[CACHE] Validated cached dataset for {symbol.upper()}")
+                    return df_cached.drop(columns=["timestamp_dt"])
+        except Exception:
+            pass
 
-            if isinstance(j, dict) and str(j.get("code", "0")) not in ("0", "200"):
-                raise RuntimeError(j.get("msg", "API error"))
-            return j
-        except Exception as e:
-            last = e
-            time.sleep(1.5 * (i + 1))
-    raise RuntimeError(f"GET failed: {url} {params}: {last}")
-
-def xt(sym, a, b):
-    rows = []
-    cur = a
-    symbol = sym.replace("/", "_").lower()
-
-    # XT's futures kline endpoint is treated as end-exclusive here.
-    # We advance from the actual newest candle returned, never by assumed
-    # page size, and never make a tiny tail request that can trigger the
-    # empty-page boundary seen in earlier XT pagination work.
-    page = 0
-    previous_max = None
-    WINDOW = LIMIT * BAR
-
-    while cur < b:
-        page += 1
-        if page > 1000:
-            raise RuntimeError(f"XT pagination guard exceeded: {sym}")
-
-        remaining = b - cur
-        final_window = remaining <= WINDOW
-
-        if final_window:
-            window_start = cur
-            window_end = b
-        else:
-            window_start = cur
-            window_end = cur + WINDOW
-
-        params = {
-            "symbol": symbol,
-            "interval": "4h",
-            "startTime": int(window_start),
-            "endTime": int(window_end),
-            "limit": LIMIT,
-        }
-
-        j = get(f"{XT}/future/market/v1/public/q/kline", params)
-
-        # XT has returned the kline list under different wrappers.
-        d = j
-        if isinstance(d, dict):
-            d = d.get("result", d.get("data", d.get("rows", d.get("list", []))))
-            if isinstance(d, dict):
-                d = d.get("data", d.get("rows", d.get("list", d.get("items", []))))
-
-        if not isinstance(d, list):
-            raise RuntimeError(
-                f"XT {sym} page={page}: unexpected kline response type: {type(d).__name__}"
-            )
-
-        parsed = []
-        for x in d:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    url = "https://fapi.xt.com/future/market/v1/public/q/kline"
+    limit = 1500
+    current_start = target_start_ms
+    all_klines = []
+    
+    while current_start < final_end_ms:
+        window_end = min(final_end_ms, current_start + limit * interval_ms - 1)
+        params = {"symbol": symbol, "interval": "15m", "startTime": current_start, "endTime": window_end, "limit": limit}
+        
+        success, data = False, None
+        for attempt in range(3):
             try:
-                if isinstance(x, dict):
-                    ts = x.get("time", x.get("timestamp", x.get("ts", x.get("t"))))
-                    o = x.get("open", x.get("o"))
-                    h = x.get("high", x.get("h"))
-                    l = x.get("low", x.get("l"))
-                    c = x.get("close", x.get("c"))
-                    v = x.get("volume", x.get("vol", x.get("v", x.get("amount", 0))))
-                    z = [ts, o, h, l, c, v]
-                elif isinstance(x, (list, tuple)) and len(x) >= 6:
-                    z = list(x[:6])
-                else:
-                    continue
-
-                if any(v is None for v in z[:5]):
-                    continue
-
-                ts = int(float(z[0]))
-                if ts < 10_000_000_000:
-                    ts *= 1000
-
-                if window_start <= ts < window_end:
-                    parsed.append(
-                        [ts, float(z[1]), float(z[2]), float(z[3]), float(z[4]), float(z[5] or 0)]
-                    )
+                res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                if res.status_code == 200:
+                    res_json = res.json()
+                    data = res_json.get("result", res_json.get("data", res_json))
+                    if isinstance(data, list):
+                        success = True
+                        break
+            except Exception:
+                pass
+            time.sleep(1 * (attempt + 1))
+            
+        if not success or not data:
+            break
+            
+        parsed_batch = []
+        for k in data:
+            try:
+                ts, o, h, l, c, v = int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
+                parsed_batch.append([ts, o, h, l, c, v])
             except Exception:
                 continue
-
-        parsed.sort(key=lambda r: r[0])
-
-        if not parsed:
-            if final_window:
-                break
-            raise RuntimeError(
-                f"XT {sym}: empty bounded page={page}; "
-                f"window={pd.to_datetime(window_start, unit='ms', utc=True)} -> "
-                f"{pd.to_datetime(window_end, unit='ms', utc=True)}"
-            )
-
-        max_ts = parsed[-1][0]
-
-        if previous_max is not None and max_ts <= previous_max and not final_window:
-            raise RuntimeError(f"XT pagination stalled: {sym} page={page}")
-
-        rows.extend(parsed)
-        previous_max = max(previous_max or max_ts, max_ts)
-
-        print(
-            f"[XT] {sym} page={page} rows={len(set(r[0] for r in rows))} "
-            f"latest={pd.to_datetime(max_ts, unit='ms', utc=True)}"
-        )
-
-        if final_window:
+                
+        if not parsed_batch:
             break
-
-        next_cur = max_ts + BAR
-        if next_cur <= cur:
-            raise RuntimeError(f"XT pagination did not advance: {sym} page={page}")
-        cur = next_cur
+            
+        all_klines.extend(parsed_batch)
+        max_ts = max(item[0] for item in parsed_batch)
+        next_cursor = max_ts + interval_ms
+        if next_cursor <= current_start:
+            break
+        current_start = next_cursor
         time.sleep(0.05)
-
-    if not rows:
-        raise RuntimeError(f"No XT data: {sym}")
-
-    df = pd.DataFrame(
-        rows,
-        columns=["ts", "open", "high", "low", "close", "volume"],
-    )
-    df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
-
-    # Completed candles only.
-    now_ms = int(time.time() * 1000)
-    if len(df) and int(df["ts"].iloc[-1]) + BAR > now_ms:
-        df = df.iloc[:-1].copy()
-
-    # V25 uses 4h candles: 6 candles/day.
-    # DAYS is the research horizon in calendar days, so the expected
-    # completed-candle count is DAYS * (24/4), not DAYS * 24.
-    expected_4h_rows = int((DAYS + WARMUP) * 24 / 4)
-    min_required = int(expected_4h_rows * 0.95)
-
-    if len(df) < min_required:
-        span = (
-            (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 86_400_000
-            if len(df) > 1 else 0
-        )
-        raise RuntimeError(
-            f"XT {sym}: insufficient 4h history: rows={len(df)}, "
-            f"need>={min_required}, expected={expected_4h_rows}, span={span:.1f}d"
-        )
-
+        
+    df = pd.DataFrame(all_klines, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
+    df.to_csv(file_path, index=False)
     return df
 
-def z(s,n=24):
-    m=s.shift(1).rolling(n,min_periods=n).mean(); sd=s.shift(1).rolling(n,min_periods=n).std(ddof=0)
-    return (s-m)/sd.replace(0,np.nan)
 
-def features(x):
-    p=x.close.shift(1); tr=pd.concat([x.high-x.low,(x.high-p).abs(),(x.low-p).abs()],axis=1).max(axis=1)
-    x['atr']=tr.rolling(14,min_periods=14).mean(); x['atr_pct']=x.atr/x.close; x['ret4']=x.close.pct_change(); x['ret24']=x.close.pct_change(6)
-    x['rv24']=x.ret4.rolling(6,min_periods=6).std(); x['rv72']=x.ret4.rolling(18,min_periods=18).std()
-    for n in (20,50,200): x[f'ema{n}']=x.close.ewm(span=n,adjust=False,min_periods=n).mean(); x[f'ema{n}_gap']=x.close/x[f'ema{n}']-1
-    x['trend_stack']=((x.close>x.ema20)&(x.ema20>x.ema50)&(x.ema50>x.ema200)).astype(int)
-    x['range_expansion']=(x.high-x.low)/x.atr.replace(0,np.nan); x['volume_z24']=z(x.volume)
-    lo=x.low.rolling(24,min_periods=24).min().shift(1); hi=x.high.rolling(24,min_periods=24).max().shift(1); x['close_pos24']=(x.close-lo)/(hi-lo).replace(0,np.nan)
-    return x
+def load_and_resample(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    df["timestamp_dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.set_index("timestamp_dt").sort_index()
+    df = df[~df.index.duplicated(keep="last")].copy()
 
-def labels(x,h=24):
-    n=len(x); L=np.full(n,np.nan); S=np.full(n,np.nan)
-    for i in range(n-1):
-        a=x.atr.iloc[i]; e=x.open.iloc[i+1]
-        if not np.isfinite(a) or a<=0: continue
-        end=min(n,i+1+h)
-        for j in range(i+1,end):
-            if x.low.iloc[j]<=e-a and x.high.iloc[j]>=e+2*a: L[i]=0; break
-            if x.low.iloc[j]<=e-a: L[i]=-1; break
-            if x.high.iloc[j]>=e+2*a: L[i]=1; break
-        for j in range(i+1,end):
-            if x.high.iloc[j]>=e+a and x.low.iloc[j]<=e-2*a: S[i]=0; break
-            if x.high.iloc[j]>=e+a: S[i]=-1; break
-            if x.low.iloc[j]<=e-2*a: S[i]=1; break
-    return L,S
+    df_4h = df.resample('4h', closed='right', label='right').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
+    df_1d = df.resample('1d', closed='right', label='right').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
+    return {"4h": df_4h, "1d": df_1d}
 
-def tail(df,fs,label):
-    out=[]
-    for f in fs:
-        v=df[[f,label]].dropna()
-        if len(v)<1000: continue
-        q1,q3=v[f].quantile([.25,.75]); lo=v.loc[v[f]<=q1,label]; hi=v.loc[v[f]>=q3,label]
-        out.append({'feature':f,'label':label,'n_low':len(lo),'n_high':len(hi),'low_mean':lo.mean(),'high_mean':hi.mean(),'high_minus_low':hi.mean()-lo.mean()})
-    return pd.DataFrame(out)
+
+def calculate_ebp_features(dfs: dict[str, pd.DataFrame]):
+    h4 = dfs["4h"]
+    
+    # Causal Engulfing identification on 4H candles
+    # Candle t vs t-1
+    prev_open = h4["open"].shift(1)
+    prev_close = h4["close"].shift(1)
+    curr_open = h4["open"]
+    curr_close = h4["close"]
+
+    # Bullish Engulfing: prev is red, curr is green, curr body engulfs prev body
+    prev_is_red = prev_close < prev_open
+    curr_is_green = curr_close > curr_open
+    bull_engulf = prev_is_red & curr_is_green & (curr_close >= prev_open) & (curr_open <= prev_close)
+
+    # Bearish Engulfing: prev is green, curr is red, curr body engulfs prev body
+    prev_is_green = prev_close > prev_open
+    curr_is_red = curr_close < curr_open
+    bear_engulf = prev_is_green & curr_is_red & (curr_close <= prev_open) & (curr_open >= prev_close)
+
+    h4["bull_ebp"] = bull_engulf
+    h4["bear_ebp"] = bear_engulf
+
+    # Daily Trend Context (Causal using shift(1))
+    d1 = dfs["1d"]
+    prev_close_1d = d1["close"].shift(1)
+    d1["ema50"] = prev_close_1d.ewm(span=50, adjust=False, min_periods=50).mean()
+    d1["ema200"] = prev_close_1d.ewm(span=200, adjust=False, min_periods=200).mean()
+    d1["ema50_slope"] = d1["ema50"].diff()
+
+
+def run_backtest_4h_ebp(all_symbol_data: dict[str, dict[str, pd.DataFrame]], start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> tuple[list[dict], dict | None]:
+    all_4h_times = sorted(list(set().union(*(dfs["4h"].index for dfs in all_symbol_data.values()))))
+    all_4h_times = [t for t in all_4h_times if start_dt <= t <= end_dt]
+
+    active_position = None
+    trades = []
+    cooldowns = {sym: 0 for sym in all_symbol_data.keys()}
+
+    symbol_arrays = {}
+    for sym, dfs in all_symbol_data.items():
+        symbol_arrays[sym] = {
+            "h4_times": dfs["4h"].index, "h4_df": dfs["4h"],
+            "d1_times": dfs["1d"].index, "d1_df": dfs["1d"],
+        }
+
+    for ts in all_4h_times:
+        for sym in cooldowns:
+            if cooldowns[sym] > 0:
+                cooldowns[sym] -= 1
+
+        position_closed_this_iteration = False
+
+        # 1. Manage active position on 4H high/low
+        if active_position is not None:
+            sym = active_position["symbol"]
+            h4_df = symbol_arrays[sym]["h4_df"]
+            if ts in h4_df.index:
+                bar = h4_df.loc[ts]
+                hi, lo = float(bar["high"]), float(bar["low"])
+                side, sl, tp, entry = active_position["side"], active_position["sl"], active_position["tp"], active_position["entry"]
+                notional = MARGIN_PER_TRADE * LEVERAGE
+
+                hit_sl = lo <= sl if side == "LONG" else hi >= sl
+                hit_tp = hi >= tp if side == "LONG" else lo <= tp
+
+                if hit_sl or hit_tp:
+                    outcome = "LOSS" if (hit_sl and hit_tp) or hit_sl else "WIN"
+                    exit_price = sl if outcome == "LOSS" else tp
+
+                    gross = (exit_price - entry) / entry * notional if side == "LONG" else (entry - exit_price) / entry * notional
+                    fees = notional * FEE_RATE * 2.0
+                    pnl = gross - fees
+
+                    trades.append({
+                        "symbol": sym, "side": side, "entry_ts": active_position["entry_ts"], "exit_ts": ts,
+                        "outcome": outcome, "pnl": float(pnl), "entry": entry, "exit": exit_price,
+                    })
+                    cooldowns[sym] = 2
+                    active_position = None
+                    position_closed_this_iteration = True
+
+        if position_closed_this_iteration:
+            continue
+
+        # 2. Evaluate new entries if flat
+        if active_position is None:
+            candidates = []
+            for symbol, data in symbol_arrays.items():
+                if cooldowns[symbol] > 0:
+                    continue
+
+                h4_df, d1_df = data["h4_df"], data["d1_df"]
+                if ts not in h4_df.index:
+                    continue
+
+                h4_bar = h4_df.loc[ts]
+                d1_idx = data["d1_times"].searchsorted(ts, side="right") - 1
+                if d1_idx < 0:
+                    continue
+                d1_row = d1_df.iloc[d1_idx]
+
+                ema50, ema200, slope = d1_row.get("ema50", np.nan), d1_row.get("ema200", np.nan), d1_row.get("ema50_slope", np.nan)
+                if not all(np.isfinite([ema50, ema200, slope])):
+                    continue
+
+                daily_long = (d1_row["close"] > ema200) and (ema50 > ema200) and (slope > 0)
+                daily_short = (d1_row["close"] < ema200) and (ema50 < ema200) and (slope < 0)
+
+                bull_ebp = h4_bar.get("bull_ebp", False)
+                bear_ebp = h4_bar.get("bear_ebp", False)
+
+                if daily_long and bull_ebp:
+                    # Find low of the 2-candle pattern for SL
+                    h4_idx = h4_df.index.get_loc(ts)
+                    if h4_idx >= 1:
+                        prev_bar = h4_df.iloc[h4_idx - 1]
+                        sl = min(h4_bar["low"], prev_bar["low"])
+                        candidates.append((symbol, "LONG", ts, sl))
+
+                elif daily_short and bear_ebp:
+                    h4_idx = h4_df.index.get_loc(ts)
+                    if h4_idx >= 1:
+                        prev_bar = h4_df.iloc[h4_idx - 1]
+                        sl = max(h4_bar["high"], prev_bar["high"])
+                        candidates.append((symbol, "SHORT", ts, sl))
+
+            if candidates:
+                # Pick the first candidate or sort by volume/strength
+                symbol, side, trigger_ts, sl = candidates[0]
+                h4_df = symbol_arrays[symbol]["h4_df"]
+                next_indices = h4_df.index[h4_df.index > trigger_ts]
+                if len(next_indices) == 0:
+                    continue
+
+                entry_ts = next_indices[0]
+                raw_open = float(h4_df.loc[entry_ts, "open"])
+                entry = raw_open * (1.0 + SLIPPAGE) if side == "LONG" else raw_open * (1.0 - SLIPPAGE)
+                risk = (entry - sl) if side == "LONG" else (sl - entry)
+
+                if risk <= 0:
+                    continue
+
+                tp = entry + (RR * risk) if side == "LONG" else entry - (RR * risk)
+                active_position = {
+                    "symbol": symbol, "side": side,
+                    "entry_ts": entry_ts, "entry": entry, "sl": sl, "tp": tp,
+                }
+
+    return trades, active_position
+
 
 def main():
-    end = pd.Timestamp(datetime.now(timezone.utc)).floor('4h')
-    start = end - pd.Timedelta(days=DAYS)
-    fetch = start - pd.Timedelta(days=WARMUP)
-    a = int(fetch.timestamp() * 1000)
-    b = int(end.timestamp() * 1000)
+    args = parse_args()
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
 
-    panels = []
-    coverage = []
+    print("=" * 70)
+    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE")
+    print("=" * 70)
 
-    for sym in SYMS:
-        print('[DATA]', sym)
-        x = features(xt(sym, a, b))
-        x = x[(x.ts >= int(start.timestamp() * 1000)) & (x.ts < b)].copy()
+    all_symbol_data = {}
+    for sym in SYMBOLS:
+        try:
+            df_raw = fetch_xt_futures_data(sym, data_dir)
+            dfs = load_and_resample(df_raw)
+            calculate_ebp_features(dfs)
+            all_symbol_data[sym] = dfs
+        except Exception as e:
+            print(f"[ABORT] Error for symbol {sym}: {e}")
+            sys.exit(1)
 
-        expected = int(DAYS * 24 / 4)
-        actual = len(x)
-        cov = actual / expected if expected else 0.0
-        if cov < MIN_COV:
-            raise RuntimeError(
-                f'Coverage failure {sym}: rows={actual}, '
-                f'expected={expected}, coverage={cov:.4f}'
-            )
+    max_first_dt = max(dfs["4h"].index[0] for dfs in all_symbol_data.values())
+    max_last_dt = min(dfs["4h"].index[-1] for dfs in all_symbol_data.values())
+    
+    total_span = max_last_dt - max_first_dt
+    train_end = max_first_dt + total_span * 0.60
+    val_end = train_end + total_span * 0.20
 
-        x['rr_long'], x['rr_short'] = labels(x)
-        x['symbol'] = sym
-        panels.append(x)
-        coverage.append({
-            'symbol': sym,
-            'rows': actual,
-            'expected_rows': expected,
-            'coverage': cov,
-        })
+    print(f"[TIMELINE] OOS Test: {val_end} -> {max_last_dt}")
 
-    p = pd.concat(panels, ignore_index=True)
-    p['dt'] = pd.to_datetime(p.ts, unit='ms', utc=True)
-    p = p.sort_values(['dt', 'symbol'])
+    trades, _ = run_backtest_4h_ebp(all_symbol_data, val_end, max_last_dt)
 
-    p.to_csv(OUT / 'research_panel.csv', index=False)
-    pd.DataFrame(coverage).to_csv(OUT / 'coverage_audit.csv', index=False)
+    total = len(trades)
+    wins = sum(1 for t in trades if t["outcome"] == "WIN")
+    losses = total - wins
+    win_rate = (wins / total * 100.0) if total > 0 else 0.0
+    net_pnl = sum(t["pnl"] for t in trades)
 
-    fs = [
-        'atr_pct', 'ret4', 'ret24', 'rv24', 'rv72',
-        'ema20_gap', 'ema50_gap', 'ema200_gap',
-        'trend_stack', 'range_expansion', 'volume_z24',
-        'close_pos24'
-    ]
+    gross_profit = sum(t["pnl"] for t in trades if t["pnl"] > 0)
+    gross_loss = abs(sum(t["pnl"] for t in trades if t["pnl"] < 0))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float('inf') if gross_profit > 0 else 0.0)
 
-    pd.concat(
-        [tail(p, fs, 'rr_long'), tail(p, fs, 'rr_short')],
-        ignore_index=True
-    ).to_csv(OUT / 'feature_tail_report.csv', index=False)
+    consec, max_consec = 0, 0
+    for t in sorted(trades, key=lambda x: pd.Timestamp(x["exit_ts"])):
+        if t["outcome"] == "LOSS":
+            consec += 1
+            max_consec = max(max_consec, consec)
+        else:
+            consec = 0
 
-    times = np.sort(p.dt.unique())
-    rows = []
+    print("\n" + "=" * 40 + " OOS PERFORMANCE REPORT (4H EBP) " + "=" * 40)
+    print(f"OOS Trades          : {total}")
+    print(f"OOS Wins            : {wins}")
+    print(f"OOS Losses          : {losses}")
+    print(f"OOS Win Rate        : {win_rate:.2f}%")
+    print(f"OOS Profit Factor   : {profit_factor:.2f}")
+    print(f"OOS Net PnL         : ${net_pnl:,.2f}")
+    print(f"OOS Max Loss Streak : {max_consec}")
+    print("=" * 68)
 
-    for name, (u, v) in {
-        'DISCOVERY_50': (0, .5),
-        'DEVELOPMENT_25': (.5, .75),
-        'VALIDATION_25': (.75, 1)
-    }.items():
-        q = p[
-            (p.dt >= times[int(u * len(times))]) &
-            (p.dt <= times[min(len(times) - 1, int(v * len(times)) - 1)])
-        ]
-
-        for lab in ('rr_long', 'rr_short'):
-            y = q[lab].dropna()
-            rows.append({
-                'split': name,
-                'direction': lab,
-                'n': len(y),
-                'wins': int((y > 0).sum()),
-                'losses': int((y < 0).sum()),
-                'win_rate': (y > 0).mean(),
-                'mean_R': y.mean()
-            })
-
-    pd.DataFrame(rows).to_csv(OUT / 'rr2_path_report.csv', index=False)
-
-    st = []
-    for name, (u, v) in {
-        'DISCOVERY_50': (0, .5),
-        'DEVELOPMENT_25': (.5, .75),
-        'VALIDATION_25': (.75, 1)
-    }.items():
-        q = p[
-            (p.dt >= times[int(u * len(times))]) &
-            (p.dt <= times[min(len(times) - 1, int(v * len(times)) - 1)])
-        ]
-        t = pd.concat(
-            [tail(q, fs, 'rr_long'), tail(q, fs, 'rr_short')],
-            ignore_index=True
-        )
-        t['split'] = name
-        st.append(t)
-
-    pd.concat(st, ignore_index=True).to_csv(
-        OUT / 'stability_by_split.csv', index=False
-    )
-
-    print(
-        'V25 XT-ONLY COMPLETE:',
-        len(p), 'rows;',
-        p.symbol.nunique(), 'symbols'
-    )
+    oos_eligible = (total >= 100) and (win_rate > 45.0) and (profit_factor > 1.15) and (net_pnl > 0)
+    print(f"FINAL ACCEPTANCE STATUS: {'ACCEPTED = TRUE' if oos_eligible else 'ACCEPTED = FALSE (REJECTED)'}")
 
 
-if __name__=='__main__': main()
+if __name__ == "__main__":
+    main()
