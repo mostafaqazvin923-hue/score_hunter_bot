@@ -1,4 +1,4 @@
-#!/usr/init/env python3
+#!/usr/bin/env python3
 """
 HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT LBANK FUTURES)
 - Market: CCXT LBank Perpetual Swaps (Futures)
@@ -23,10 +23,10 @@ import numpy as np
 import pandas as pd
 
 SYMBOLS = [
-    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT",
-    "ADA/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT", "SUI/USDT:USDT", "NEAR/USDT:USDT",
-    "DOT/USDT:USDT", "UNI/USDT:USDT", "APT/USDT:USDT", "RENDER/USDT:USDT", "FET/USDT:USDT",
-    "AR/USDT:USDT", "OP/USDT:USDT", "ARB/USDT:USDT", "INJ/USDT:USDT", "PEPE/USDT:USDT"
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT",
+    "ADA/USDT", "AVAX/USDT", "LINK/USDT", "SUI/USDT", "NEAR/USDT",
+    "DOT/USDT", "UNI/USDT", "APT/USDT", "RENDER/USDT", "FET/USDT",
+    "AR/USDT", "OP/USDT", "ARB/USDT", "INJ/USDT", "PEPE/USDT"
 ]
 
 TOTAL_DAYS = 365
@@ -65,12 +65,24 @@ def fetch_ccxt_futures_data(symbol: str) -> pd.DataFrame:
 
     try:
         exchange.load_markets()
-        if symbol not in exchange.symbols:
-            alt_symbol = symbol.replace(":USDT", "")
-            if alt_symbol in exchange.symbols:
-                symbol = alt_symbol
-            else:
-                return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        
+        # پیدا کردن نام صحیح و پشتیبانی‌شده نماد در صرافی ل‌بنک
+        actual_symbol = None
+        base_currency = symbol.split('/')[0]
+        
+        for s in exchange.symbols:
+            market_info = exchange.markets.get(s, {})
+            if s.startswith(base_currency + '/') and 'USDT' in s and (market_info.get('swap', False) or market_info.get('linear', False)):
+                actual_symbol = s
+                break
+        
+        if not actual_symbol and symbol in exchange.symbols:
+            actual_symbol = symbol
+
+        if not actual_symbol:
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        
+        symbol = actual_symbol
 
         while current_start < now_ms:
             ohlcvs = exchange.fetch_ohlcv(symbol, timeframe='15m', since=current_start, limit=1000)
