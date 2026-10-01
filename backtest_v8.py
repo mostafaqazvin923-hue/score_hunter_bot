@@ -1,4 +1,4 @@
-#!/usr/init/env python3
+#!/usr/bin/env python3
 """
 HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT GATE.IO FUTURES)
 - Market: CCXT Gate.io Perpetual Swaps (Futures)
@@ -73,7 +73,8 @@ def fetch_ccxt_futures_data(symbol: str) -> pd.DataFrame:
                 return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
         while current_start < now_ms:
-            ohlcvs = exchange.fetch_ohlcv(symbol, timeframe='15m', since=current_start, limit=1000)
+            # دریافت مستقیم تایم‌فریم 4h برای جلوگیری از خطای محدودیت حجم تاریخچه صرافی
+            ohlcvs = exchange.fetch_ohlcv(symbol, timeframe='4h', since=current_start, limit=1000)
             if not ohlcvs or len(ohlcvs) == 0:
                 break
             
@@ -102,8 +103,8 @@ def load_and_resample(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     df = df.set_index("timestamp_dt").sort_index()
     df = df[~df.index.duplicated(keep="last")].copy()
 
-    df_4h = df.resample('4h', closed='right', label='right').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
-    df_1d = df.resample('1d', closed='right', label='right').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
+    df_4h = df.copy()
+    df_1d = df_4h.resample('1d', closed='right', label='right').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
     return {"4h": df_4h, "1d": df_1d}
 
 
