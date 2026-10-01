@@ -51,7 +51,7 @@ def fetch_ccxt_futures_data(symbol: str) -> pd.DataFrame:
     exchange = ccxt.xt({
         'enableRateLimit': True,
         'options': {
-            'defaultType': 'swap'  # Explicitly requesting futures perpetual contracts
+            'defaultType': 'swap'
         }
     })
 
@@ -64,7 +64,6 @@ def fetch_ccxt_futures_data(symbol: str) -> pd.DataFrame:
     try:
         exchange.load_markets()
         if symbol not in exchange.symbols:
-            # Fallback or alternative format try
             alt_symbol = symbol.replace(":USDT", "")
             if alt_symbol in exchange.symbols:
                 symbol = alt_symbol
@@ -320,8 +319,13 @@ def main():
     print(f"OOS Max Loss Streak : {max_consec}")
     print("=" * 68)
 
+    # ایجاد پوشه خروجی گزارش‌ها برای رفع خطای گیت‌هاب اکشن
+    report_dir = Path("reports/xt_v24_research")
+    report_dir.mkdir(parents=True, exist_ok=True)
+    
     if trades:
         df_trades = pd.DataFrame(trades)
+        df_trades.to_csv(report_dir / "trades_report.csv", index=False)
         df_trades["exit_month"] = pd.to_datetime(df_trades["exit_ts"]).dt.to_period("M")
         print("\n" + "=" * 35 + " MONTHLY PERFORMANCE BREAKDOWN " + "=" * 35)
         print(f"{'Month':<10} | {'Trades':<8} | {'Wins':<6} | {'Win Rate':<10} | {'PnL ($)':<10}")
@@ -333,6 +337,10 @@ def main():
             m_pnl = group["pnl"].sum()
             print(f"{str(month):<10} | {m_total:<8} | {m_wins:<6} | {m_wr:>6.2f}%    | ${m_pnl:>9.2f}")
         print("=" * 55)
+    else:
+        # حتی اگر معامله‌ای هم نبود برای خالی نبودن پوشه یک فایل متنی می‌سازیم
+        with open(report_dir / "summary.txt", "w") as f:
+            f.write("No trades executed.")
 
     oos_eligible = (total >= 100) and (win_rate > 45.0) and (profit_factor > 1.15) and (net_pnl > 0)
     print(f"FINAL ACCEPTANCE STATUS: {'ACCEPTED = TRUE' if oos_eligible else 'ACCEPTED = FALSE (REJECTED)'}")
