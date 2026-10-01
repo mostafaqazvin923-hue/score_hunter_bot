@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/init/env python3
 """
-HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT BINANCE FUTURES)
-- Market: CCXT Binance USDⓈ-M Perpetual Futures
+HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT GATE.IO FUTURES)
+- Market: CCXT Gate.io Perpetual Swaps (Futures)
 - Symbols: Top 20 Strongest Market Coins
 - Duration: Exactly 365 Days (1 Year)
 - Zero Lookahead, Zero Leakage, Strict Causal Pipeline
@@ -50,10 +50,10 @@ def fetch_ccxt_futures_data(symbol: str) -> pd.DataFrame:
     if ccxt is None:
         raise RuntimeError("ccxt library is not installed.")
 
-    exchange = ccxt.binance({
+    exchange = ccxt.gate({
         'enableRateLimit': True,
         'options': {
-            'defaultType': 'swap'  # Binance USD-M Perpetual Futures
+            'defaultType': 'swap'  # Gate.io Perpetual Swaps
         }
     })
 
@@ -85,7 +85,7 @@ def fetch_ccxt_futures_data(symbol: str) -> pd.DataFrame:
             current_start = fetched_last_ts + 1
             time.sleep(exchange.rateLimit / 1000.0)
     except Exception as e:
-        print(f"[DEBUG] CCXT Binance fetch error for {symbol}: {e}")
+        print(f"[DEBUG] CCXT Gate fetch error for {symbol}: {e}")
 
     if not all_klines:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -261,7 +261,7 @@ def main():
     args = parse_args()
 
     print("=" * 70)
-    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT BINANCE FUTURES)")
+    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT GATE.IO FUTURES)")
     print("=" * 70)
 
     all_symbol_data = {}
@@ -274,7 +274,7 @@ def main():
                 continue
             calculate_ebp_features(dfs)
             all_symbol_data[sym] = dfs
-            print(f"[SUCCESS] Loaded {sym} (Binance Futures)")
+            print(f"[SUCCESS] Loaded {sym} (Gate.io Futures)")
         except Exception as e:
             print(f"[ABORT] Error for symbol {sym}: {e}")
 
