@@ -1,7 +1,7 @@
-#!/usr/init/env python3
+#!/usr/bin/env python3
 """
-HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (BINANCE FUTURES)
-- Market: Binance USD-M Futures Public API
+HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (KUCOIN)
+- Market: KuCoin Public Spot/Futures API
 - Timeframe: 4H Primary Setup with Daily Trend Context & Monthly Breakdown
 - Zero Lookahead, Zero Leakage, Strict Causal Pipeline
 """
@@ -22,9 +22,9 @@ import numpy as np
 import pandas as pd
 
 SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT", "AVAXUSDT",
-    "NEARUSDT", "ADAUSDT", "BNBUSDT", "APTUSDT", "CRVUSDT",
-    "RENDERUSDT", "PENDLEUSDT", "ICPUSDT", "WIFUSDT"
+    "BTC-USDT", "ETH-USDT", "SOL-USDT", "SUI-USDT", "AVAX-USDT",
+    "NEAR-USDT", "ADA-USDT", "BNB-USDT", "APT-USDT", "CRV-USDT",
+    "RENDER-USDT", "PENDLE-USDT", "ICP-USDT", "WIF-USDT"
 ]
 
 TOTAL_DAYS = 365
@@ -44,24 +44,27 @@ def parse_args():
     return p.parse_args()
 
 
-def fetch_binance_futures_data(symbol: str) -> pd.DataFrame:
+def fetch_kucoin_data(symbol: str) -> pd.DataFrame:
     if requests is None:
         raise RuntimeError("requests library is not installed.")
 
-    url = "https://fapi.binance.com/fapi/v1/klines"
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    interval_ms = 15 * 60 * 1000  # 15m
-    target_start_ms = now_ms - int((TOTAL_DAYS + WARMUP_DAYS) * 86400 * 1000)
+    url = "https://api.kucoin.com/api/v1/market/candles"
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    target_start_ts = now_ts - int((TOTAL_DAYS + WARMUP_DAYS) * 86400)
     
-    current_start = target_start_ms
+    current_start = target_start_ts
     all_klines = []
     
-    while current_start < now_ms:
+    # KuCoin returns up to 1500 candles per request for 15min (15min = 900s)
+    step = 1500 * 900
+    
+    while current_start < now_ts:
+        current_end = min(now_ts, current_start + step)
         params = {
             "symbol": symbol,
-            "interval": "15m",
-            "startTime": current_start,
-            "limit": 1500
+            "type": "15min",
+            "startAt": current_start,
+            "endAt": current_end
         }
         
         success, data = False, None
@@ -69,35 +72,36 @@ def fetch_binance_futures_data(symbol: str) -> pd.DataFrame:
             try:
                 res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
                 if res.status_code == 200:
-                    data = res.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        success = True
-                        break
+                    res_json = res.json()
+                    if res_json.get("code") == "200000":
+                        data = res_json.get("data", [])
+                        if isinstance(data, list):
+                            success = True
+                            break
             except Exception:
                 pass
             time.sleep(1 * (attempt + 1))
             
         if not success or not data:
-            break
+            current_start = current_end
+            continue
             
         parsed_batch = []
+        # KuCoin format: [time, open, close, high, low, volume, turnover]
+        # Note: KuCoin kline format is [time_str_or_int, open, close, high, low, volume, turnover]
         for k in data:
             try:
-                ts, o, h, l, c, v = int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
+                ts = int(k[0]) * 1000  # convert to ms
+                o, c, h, l, v = float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
                 parsed_batch.append([ts, o, h, l, c, v])
             except Exception:
                 continue
                 
-        if not parsed_batch:
-            break
+        if parsed_batch:
+            all_klines.extend(parsed_batch)
             
-        all_klines.extend(parsed_batch)
-        max_ts = max(item[0] for item in parsed_batch)
-        next_cursor = max_ts + interval_ms
-        if next_cursor <= current_start:
-            break
-        current_start = next_cursor
-        time.sleep(0.05)
+        current_start = current_end
+        time.sleep(0.1)
         
     if not all_klines:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -273,13 +277,13 @@ def main():
     args = parse_args()
 
     print("=" * 70)
-    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (BINANCE)")
+    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (KUCOIN)")
     print("=" * 70)
 
     all_symbol_data = {}
     for sym in SYMBOLS:
         try:
-            df_raw = fetch_binance_futures_data(sym)
+            df_raw = fetch_kucoin_data(sym)
             dfs = load_and_resample(df_raw)
             if dfs["4h"].empty:
                 print(f"[WARNING] Skipping {sym}: 4H data is empty.")
