@@ -1,15 +1,16 @@
-#!/usr/bin/env python3
+#!/usr/init/env python3
 """
-HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT XT FUTURES)
-- Market: CCXT XT.com Perpetual Swaps (Futures)
-- Timeframe: 4H Primary Setup with Daily Trend Context & Monthly Breakdown
+HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT LBANK FUTURES)
+- Market: CCXT LBank Perpetual Swaps (Futures)
+- Symbols: Top 20 Strongest Market Coins
+- Duration: Exactly 365 Days (1 Year)
 - Zero Lookahead, Zero Leakage, Strict Causal Pipeline
 """
 
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import time
@@ -22,9 +23,10 @@ import numpy as np
 import pandas as pd
 
 SYMBOLS = [
-    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "SUI/USDT:USDT", "AVAX/USDT:USDT",
-    "NEAR/USDT:USDT", "ADA/USDT:USDT", "BNB/USDT:USDT", "APT/USDT:USDT", "CRV/USDT:USDT",
-    "ONDO/USDT:USDT", "PENDLE/USDT:USDT", "ICP/USDT:USDT", "WIF/USDT:USDT"
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT",
+    "ADA/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT", "SUI/USDT:USDT", "NEAR/USDT:USDT",
+    "DOT/USDT:USDT", "UNI/USDT:USDT", "APT/USDT:USDT", "RENDER/USDT:USDT", "FET/USDT:USDT",
+    "AR/USDT:USDT", "OP/USDT:USDT", "ARB/USDT:USDT", "INJ/USDT:USDT", "PEPE/USDT:USDT"
 ]
 
 TOTAL_DAYS = 365
@@ -48,10 +50,10 @@ def fetch_ccxt_futures_data(symbol: str) -> pd.DataFrame:
     if ccxt is None:
         raise RuntimeError("ccxt library is not installed.")
 
-    exchange = ccxt.xt({
+    exchange = ccxt.lbank({
         'enableRateLimit': True,
         'options': {
-            'defaultType': 'swap'
+            'defaultType': 'swap'  # LBank Futures Perpetual Swaps
         }
     })
 
@@ -83,7 +85,7 @@ def fetch_ccxt_futures_data(symbol: str) -> pd.DataFrame:
             current_start = fetched_last_ts + 1
             time.sleep(exchange.rateLimit / 1000.0)
     except Exception as e:
-        print(f"[DEBUG] CCXT fetch error for {symbol}: {e}")
+        print(f"[DEBUG] CCXT LBank fetch error for {symbol}: {e}")
 
     if not all_klines:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -259,7 +261,7 @@ def main():
     args = parse_args()
 
     print("=" * 70)
-    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT XT FUTURES)")
+    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT LBANK FUTURES)")
     print("=" * 70)
 
     all_symbol_data = {}
@@ -272,7 +274,7 @@ def main():
                 continue
             calculate_ebp_features(dfs)
             all_symbol_data[sym] = dfs
-            print(f"[SUCCESS] Loaded {sym} (Futures)")
+            print(f"[SUCCESS] Loaded {sym} (LBank Futures)")
         except Exception as e:
             print(f"[ABORT] Error for symbol {sym}: {e}")
 
@@ -319,7 +321,6 @@ def main():
     print(f"OOS Max Loss Streak : {max_consec}")
     print("=" * 68)
 
-    # ایجاد پوشه خروجی گزارش‌ها برای رفع خطای گیت‌هاب اکشن
     report_dir = Path("reports/xt_v24_research")
     report_dir.mkdir(parents=True, exist_ok=True)
     
@@ -338,7 +339,6 @@ def main():
             print(f"{str(month):<10} | {m_total:<8} | {m_wins:<6} | {m_wr:>6.2f}%    | ${m_pnl:>9.2f}")
         print("=" * 55)
     else:
-        # حتی اگر معامله‌ای هم نبود برای خالی نبودن پوشه یک فایل متنی می‌سازیم
         with open(report_dir / "summary.txt", "w") as f:
             f.write("No trades executed.")
 
