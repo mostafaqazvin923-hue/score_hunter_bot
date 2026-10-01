@@ -4,7 +4,7 @@ HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT GATE.IO FUTURES)
 - Market: CCXT Gate.io Perpetual Swaps (Futures)
 - Symbols: Top 20 Strongest Market Coins
 - Duration: Exactly 365 Days (1 Year)
-- Zero Lookahead, Zero Leakage, Strict Causal Pipeline
+- Multi-Symbol Independent Execution Pipeline
 """
 
 from __future__ import annotations
@@ -73,7 +73,6 @@ def fetch_ccxt_futures_data(symbol: str) -> pd.DataFrame:
                 return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
         while current_start < now_ms:
-            # دریافت مستقیم تایم‌فریم 4h برای جلوگیری از خطای محدودیت حجم تاریخچه صرافی
             ohlcvs = exchange.fetch_ohlcv(symbol, timeframe='4h', since=current_start, limit=1000)
             if not ohlcvs or len(ohlcvs) == 0:
                 break
@@ -140,7 +139,8 @@ def run_backtest_4h_ebp(all_symbol_data: dict[str, dict[str, pd.DataFrame]], sta
     all_4h_times = sorted(list(set().union(*(dfs["4h"].index for dfs in all_symbol_data.values() if not dfs["4h"].empty))))
     all_4h_times = [t for t in all_4h_times if start_dt <= t <= end_dt]
 
-    active_position = None
+    # مدیریت پوزیشن مستقل برای هر نماد به صورت جداگانه
+    active_positions = {sym: None for sym in all_symbol_data.keys()}
     trades = []
     cooldowns = {sym: 0 for sym in all_symbol_data.keys()}
 
@@ -158,86 +158,81 @@ def run_backtest_4h_ebp(all_symbol_data: dict[str, dict[str, pd.DataFrame]], sta
             if cooldowns[sym] > 0:
                 cooldowns[sym] -= 1
 
-        position_closed_this_iteration = False
+        # ۱. بررسی و به‌روزرسانی پوزیشن‌های بازِ هر نماد
+        for sym in list(active_positions.keys()):
+            pos = active_positions[sym]
+            if pos is not None:
+                h4_df = symbol_arrays[sym]["h4_df"]
+                if not h4_df.empty and ts in h4_df.index:
+                    bar = h4_df.loc[ts]
+                    hi, lo = float(bar["high"]), float(bar["low"])
+                    side, sl, tp, entry = pos["side"], pos["sl"], pos["tp"], pos["entry"]
+                    notional = MARGIN_PER_TRADE * LEVERAGE
 
-        if active_position is not None:
-            sym = active_position["symbol"]
-            h4_df = symbol_arrays[sym]["h4_df"]
-            if not h4_df.empty and ts in h4_df.index:
-                bar = h4_df.loc[ts]
-                hi, lo = float(bar["high"]), float(bar["low"])
-                side, sl, tp, entry = active_position["side"], active_position["sl"], active_position["tp"], active_position["entry"]
-                notional = MARGIN_PER_TRADE * LEVERAGE
+                    hit_sl = lo <= sl if side == "LONG" else hi >= sl
+                    hit_tp = hi >= tp if side == "LONG" else lo <= tp
 
-                hit_sl = lo <= sl if side == "LONG" else hi >= sl
-                hit_tp = hi >= tp if side == "LONG" else lo <= tp
+                    if hit_sl or hit_tp:
+                        outcome = "LOSS" if (hit_sl and hit_tp) or hit_sl else "WIN"
+                        exit_price = sl if outcome == "LOSS" else tp
 
-                if hit_sl or hit_tp:
-                    outcome = "LOSS" if (hit_sl and hit_tp) or hit_sl else "WIN"
-                    exit_price = sl if outcome == "LOSS" else tp
+                        gross = (exit_price - entry) / entry * notional if side == "LONG" else (entry - exit_price) / entry * notional
+                        fees = notional * FEE_RATE * 2.0
+                        pnl = gross - fees
 
-                    gross = (exit_price - entry) / entry * notional if side == "LONG" else (entry - exit_price) / entry * notional
-                    fees = notional * FEE_RATE * 2.0
-                    pnl = gross - fees
+                        trades.append({
+                            "symbol": sym, "side": side, "entry_ts": pos["entry_ts"], "exit_ts": ts,
+                            "outcome": outcome, "pnl": float(pnl), "entry": entry, "exit": exit_price,
+                        })
+                        cooldowns[sym] = 2
+                        active_positions[sym] = None
 
-                    trades.append({
-                        "symbol": sym, "side": side, "entry_ts": active_position["entry_ts"], "exit_ts": ts,
-                        "outcome": outcome, "pnl": float(pnl), "entry": entry, "exit": exit_price,
-                    })
-                    cooldowns[sym] = 2
-                    active_position = None
-                    position_closed_this_iteration = True
+        # ۲. بررسی سیگنال‌های جدید برای نمادهایی که پوزیشن باز ندارند
+        for symbol, data in symbol_arrays.items():
+            if active_positions[symbol] is not None or cooldowns[symbol] > 0:
+                continue
 
-        if position_closed_this_iteration:
-            continue
+            h4_df, d1_df = data["h4_df"], data["d1_df"]
+            if h4_df.empty or ts not in h4_df.index:
+                continue
 
-        if active_position is None:
-            candidates = []
-            for symbol, data in symbol_arrays.items():
-                if cooldowns[symbol] > 0:
-                    continue
+            h4_bar = h4_df.loc[ts]
+            d1_times = data["d1_times"]
+            if len(d1_times) == 0:
+                continue
+            d1_idx = d1_times.searchsorted(ts, side="right") - 1
+            if d1_idx < 0:
+                continue
+            d1_row = d1_df.iloc[d1_idx]
 
-                h4_df, d1_df = data["h4_df"], data["d1_df"]
-                if h4_df.empty or ts not in h4_df.index:
-                    continue
+            ema50, ema200, slope = d1_row.get("ema50", np.nan), d1_row.get("ema200", np.nan), d1_row.get("ema50_slope", np.nan)
+            if not all(np.isfinite([ema50, ema200, slope])):
+                continue
 
-                h4_bar = h4_df.loc[ts]
-                d1_times = data["d1_times"]
-                if len(d1_times) == 0:
-                    continue
-                d1_idx = d1_times.searchsorted(ts, side="right") - 1
-                if d1_idx < 0:
-                    continue
-                d1_row = d1_df.iloc[d1_idx]
+            daily_long = (d1_row["close"] > ema200) and (ema50 > ema200) and (slope > 0)
+            daily_short = (d1_row["close"] < ema200) and (ema50 < ema200) and (slope < 0)
 
-                ema50, ema200, slope = d1_row.get("ema50", np.nan), d1_row.get("ema200", np.nan), d1_row.get("ema50_slope", np.nan)
-                if not all(np.isfinite([ema50, ema200, slope])):
-                    continue
+            bull_ebp = h4_bar.get("bull_ebp", False)
+            bear_ebp = h4_bar.get("bear_ebp", False)
 
-                daily_long = (d1_row["close"] > ema200) and (ema50 > ema200) and (slope > 0)
-                daily_short = (d1_row["close"] < ema200) and (ema50 < ema200) and (slope < 0)
+            sl = None
+            side = None
+            if daily_long and bull_ebp:
+                h4_idx = h4_df.index.get_loc(ts)
+                if h4_idx >= 1:
+                    prev_bar = h4_df.iloc[h4_idx - 1]
+                    sl = min(h4_bar["low"], prev_bar["low"])
+                    side = "LONG"
 
-                bull_ebp = h4_bar.get("bull_ebp", False)
-                bear_ebp = h4_bar.get("bear_ebp", False)
+            elif daily_short and bear_ebp:
+                h4_idx = h4_df.index.get_loc(ts)
+                if h4_idx >= 1:
+                    prev_bar = h4_df.iloc[h4_idx - 1]
+                    sl = max(h4_bar["high"], prev_bar["high"])
+                    side = "SHORT"
 
-                if daily_long and bull_ebp:
-                    h4_idx = h4_df.index.get_loc(ts)
-                    if h4_idx >= 1:
-                        prev_bar = h4_df.iloc[h4_idx - 1]
-                        sl = min(h4_bar["low"], prev_bar["low"])
-                        candidates.append((symbol, "LONG", ts, sl))
-
-                elif daily_short and bear_ebp:
-                    h4_idx = h4_df.index.get_loc(ts)
-                    if h4_idx >= 1:
-                        prev_bar = h4_df.iloc[h4_idx - 1]
-                        sl = max(h4_bar["high"], prev_bar["high"])
-                        candidates.append((symbol, "SHORT", ts, sl))
-
-            if candidates:
-                symbol, side, trigger_ts, sl = candidates[0]
-                h4_df = symbol_arrays[symbol]["h4_df"]
-                next_indices = h4_df.index[h4_df.index > trigger_ts]
+            if side and sl is not None:
+                next_indices = h4_df.index[h4_df.index > ts]
                 if len(next_indices) == 0:
                     continue
 
@@ -250,12 +245,12 @@ def run_backtest_4h_ebp(all_symbol_data: dict[str, dict[str, pd.DataFrame]], sta
                     continue
 
                 tp = entry + (RR * risk) if side == "LONG" else entry - (RR * risk)
-                active_position = {
+                active_positions[symbol] = {
                     "symbol": symbol, "side": side,
                     "entry_ts": entry_ts, "entry": entry, "sl": sl, "tp": tp,
                 }
 
-    return trades, active_position
+    return trades, None
 
 
 def main():
@@ -328,7 +323,7 @@ def main():
     if trades:
         df_trades = pd.DataFrame(trades)
         df_trades.to_csv(report_dir / "trades_report.csv", index=False)
-        df_trades["exit_month"] = pd.to_datetime(df_trades["exit_ts"]).dt.to_period("M")
+        df_trades["exit_month"] = pd.to_datetime(df_trades["exit_ts"]).dt.to_period("M").astype(str)
         print("\n" + "=" * 35 + " MONTHLY PERFORMANCE BREAKDOWN " + "=" * 35)
         print(f"{'Month':<10} | {'Trades':<8} | {'Wins':<6} | {'Win Rate':<10} | {'PnL ($)':<10}")
         print("-" * 55)
@@ -343,7 +338,11 @@ def main():
         with open(report_dir / "summary.txt", "w") as f:
             f.write("No trades executed.")
 
-    oos_eligible = (total >= 100) and (win_rate > 45.0) and (profit_factor > 1.15) and (net_pnl > 0)
+    # شرط‌های پذیرش جدید بر اساس درخواست شما:
+    # ۱. تعداد معامله‌ها حداقل ۱۵۰۰ عدد
+    # ۲. وین‌ریت حداکثر ۵۰ درصد
+    # ۳. ضرر متوالی حداکثر ۴ عدد
+    oos_eligible = (total >= 1500) and (win_rate <= 50.0) and (max_consec <= 4) and (net_pnl > 0)
     print(f"FINAL ACCEPTANCE STATUS: {'ACCEPTED = TRUE' if oos_eligible else 'ACCEPTED = FALSE (REJECTED)'}")
 
 
