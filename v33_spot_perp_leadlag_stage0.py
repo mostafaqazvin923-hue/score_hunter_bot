@@ -682,4 +682,92 @@ def main():
         x = add_causal_features(spot15, perp15)
         trades = simulate_symbol(symbol, x)
 
-        print(f"  spot15={len(
+        print(
+            f"  spot15={len(spot15):,} "
+            f"perp15={len(perp15):,} "
+            f"candidates={len(trades):,}"
+        )
+        all_candidates.extend(trades)
+
+    # Portfolio-level overlap enforcement.
+    all_trades = enforce_portfolio_rules(all_candidates)
+    all_trades.sort(key=lambda t: t.entry_dt)
+
+    print("\n--- OVERLAP AUDIT ---")
+    print(f"candidate trades: {len(all_candidates):,}")
+    print(f"accepted trades : {len(all_trades):,}")
+
+    # Date splits.
+    bounds = split_dates(all_trades)
+    if bounds is None:
+        raise RuntimeError("No closed trades.")
+
+    d_disc, d_dev = bounds
+
+    disc = [t for t in all_trades if t.entry_dt < d_disc]
+    dev = [t for t in all_trades if d_disc <= t.entry_dt < d_dev]
+    val = [t for t in all_trades if t.entry_dt >= d_dev]
+
+    print("\n--- FROZEN SPLIT ---")
+    print(f"Discovery : < {d_disc}")
+    print(f"Development: {d_disc} -> {d_dev}")
+    print(f"Validation : >= {d_dev}")
+
+    print("\n--- RR PERFORMANCE ---")
+    print_section("Discovery", disc)
+    print_section("Development", dev)
+    print_section("Validation", val)
+    print_section("ALL", all_trades)
+
+    print("\n--- VALIDATION BY SYMBOL ---")
+    print(symbol_concentration(val).to_string())
+
+    vm = metrics(val)
+    sym = symbol_concentration(val)
+
+    # Concentration test uses absolute positive contribution.
+    positive_total = sym.loc[sym["net_r"] > 0, "net_r"].sum()
+    max_positive = sym["net_r"].max() if not sym.empty else 0.0
+    concentration = (
+        max_positive / positive_total
+        if positive_total > 0 else 1.0
+    )
+
+    print("\n--- FROZEN VALIDATION GATE ---")
+    checks = {
+        "PF >= 1.20": vm["pf"] >= 1.20,
+        "WR >= 40%": vm["wr"] >= 0.40,
+        "trades >= 150": vm["trades"] >= 150,
+        "max loss streak <= 4": vm["max_loss_streak"] <= 4,
+        "net R > 0": vm["net_r"] > 0,
+        "no >50% positive-net concentration": concentration <= 0.50,
+    }
+
+    for name, ok in checks.items():
+        print(f"{name:42s}: {'PASS' if ok else 'FAIL'}")
+
+    decision = "PASS" if all(checks.values()) else "REJECT"
+    print(f"\nFINAL DECISION: {decision}")
+
+    # Save trade log.
+    out = pd.DataFrame([{
+        "symbol": t.symbol,
+        "side": "LONG" if t.side == 1 else "SHORT",
+        "signal_dt": t.signal_dt,
+        "entry_dt": t.entry_dt,
+        "entry": t.entry,
+        "sl": t.sl,
+        "tp": t.tp,
+        "exit_dt": t.exit_dt,
+        "exit": t.exit,
+        "gross_r": t.gross_r,
+        "net_r": t.net_r,
+        "outcome": t.outcome,
+    } for t in all_trades])
+
+    out.to_csv("v33_trades.csv", index=False)
+    print("\nSaved: v33_trades.csv")
+
+
+if __name__ == "__main__":
+    main()
