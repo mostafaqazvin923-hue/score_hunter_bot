@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (LBANK FUTURES)
-- Market: LBank Futures Public API
+HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT XT FUTURES)
+- Market: CCXT XT.com Perpetual Swaps (Futures)
 - Timeframe: 4H Primary Setup with Daily Trend Context & Monthly Breakdown
 - Zero Lookahead, Zero Leakage, Strict Causal Pipeline
 """
@@ -13,18 +13,18 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import sys
 import time
-requests = None
+ccxt = None
 try:
-    import requests
+    import ccxt
 except ImportError:
     pass
 import numpy as np
 import pandas as pd
 
 SYMBOLS = [
-    "btc_usdt", "eth_usdt", "sol_usdt", "sui_usdt", "avax_usdt",
-    "near_usdt", "ada_usdt", "bnb_usdt", "apt_usdt", "crv_usdt",
-    "ondo_usdt", "pendle_usdt", "icp_usdt", "wif_usdt"
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "SUI/USDT:USDT", "AVAX/USDT:USDT",
+    "NEAR/USDT:USDT", "ADA/USDT:USDT", "BNB/USDT:USDT", "APT/USDT:USDT", "CRV/USDT:USDT",
+    "ONDO/USDT:USDT", "PENDLE/USDT:USDT", "ICP/USDT:USDT", "WIF/USDT:USDT"
 ]
 
 TOTAL_DAYS = 365
@@ -44,78 +44,48 @@ def parse_args():
     return p.parse_args()
 
 
-def fetch_lbank_futures_data(symbol: str) -> pd.DataFrame:
-    if requests is None:
-        raise RuntimeError("requests library is not installed.")
+def fetch_ccxt_futures_data(symbol: str) -> pd.DataFrame:
+    if ccxt is None:
+        raise RuntimeError("ccxt library is not installed.")
 
-    # LBank Futures API Endpoint for Klines/Candles
-    url = "https://contract.lbank.info/v1/kline"
+    exchange = ccxt.xt({
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'swap'  # Explicitly requesting futures perpetual contracts
+        }
+    })
+
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    interval_ms = 15 * 60 * 1000  # 15m
     target_start_ms = now_ms - int((TOTAL_DAYS + WARMUP_DAYS) * 86400 * 1000)
     
-    current_start = target_start_ms
     all_klines = []
-    
-    while current_start < now_ms:
-        # LBank contract API parameters typically use symbol, size, from, to or similar pagination
-        # Let's use size/time window approach based on LBank standard spec
-        params = {
-            "symbol": symbol.lower(),
-            "contractType": "swap",
-            "interval": "15m",
-            "size": 500,
-            "from": current_start
-        }
-        
-        success, data = False, None
-        for attempt in range(3):
-            try:
-                res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-                if res.status_code == 200:
-                    res_json = res.json()
-                    if res_json.get("result") == "true" or res_json.get("code") == 0:
-                        data = res_json.get("data", [])
-                        if isinstance(data, list):
-                            success = True
-                            break
-            except Exception:
-                pass
-            time.sleep(1 * (attempt + 1))
+    current_start = target_start_ms
+
+    try:
+        exchange.load_markets()
+        if symbol not in exchange.symbols:
+            # Fallback or alternative format try
+            alt_symbol = symbol.replace(":USDT", "")
+            if alt_symbol in exchange.symbols:
+                symbol = alt_symbol
+            else:
+                return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+        while current_start < now_ms:
+            ohlcvs = exchange.fetch_ohlcv(symbol, timeframe='15m', since=current_start, limit=1000)
+            if not ohlcvs or len(ohlcvs) == 0:
+                break
             
-        if not success or not data or len(data) == 0:
-            # Fallback to alternative public endpoint structure if needed or break
-            break
+            all_klines.extend(ohlcvs)
+            fetched_last_ts = ohlcvs[-1][0]
             
-        parsed_batch = []
-        max_ts = current_start
-        for k in data:
-            try:
-                # LBank standard kline format: [timestamp, open, high, low, close, volume] or object
-                if isinstance(k, dict):
-                    ts = int(k.get("time", k.get("timestamp", 0)))
-                    o, h, l, c, v = float(k.get("open", 0)), float(k.get("high", 0)), float(k.get("low", 0)), float(k.get("close", 0)), float(k.get("volume", 0))
-                else:
-                    ts, o, h, l, c, v = int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
-                
-                parsed_batch.append([ts, o, h, l, c, v])
-                if ts > max_ts:
-                    max_ts = ts
-            except Exception:
-                continue
-                
-        if not parsed_batch:
-            break
-            
-        all_klines.extend(parsed_batch)
-        next_cursor = max_ts + interval_ms
-        if next_cursor <= current_start:
-            current_start += interval_ms * 500
-        else:
-            current_start = next_cursor
-            
-        time.sleep(0.05)
-        
+            if fetched_last_ts <= current_start:
+                break
+            current_start = fetched_last_ts + 1
+            time.sleep(exchange.rateLimit / 1000.0)
+    except Exception as e:
+        print(f"[DEBUG] CCXT fetch error for {symbol}: {e}")
+
     if not all_klines:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
@@ -290,20 +260,20 @@ def main():
     args = parse_args()
 
     print("=" * 70)
-    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (LBANK)")
+    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT XT FUTURES)")
     print("=" * 70)
 
     all_symbol_data = {}
     for sym in SYMBOLS:
         try:
-            df_raw = fetch_lbank_futures_data(sym)
+            df_raw = fetch_ccxt_futures_data(sym)
             dfs = load_and_resample(df_raw)
             if dfs["4h"].empty:
                 print(f"[WARNING] Skipping {sym}: 4H data is empty.")
                 continue
             calculate_ebp_features(dfs)
             all_symbol_data[sym] = dfs
-            print(f"[SUCCESS] Loaded {sym}")
+            print(f"[SUCCESS] Loaded {sym} (Futures)")
         except Exception as e:
             print(f"[ABORT] Error for symbol {sym}: {e}")
 
