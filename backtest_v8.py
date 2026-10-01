@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT LBANK FUTURES)
-- Market: CCXT LBank Perpetual Swaps (Futures)
+HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT BINANCE FUTURES)
+- Market: CCXT Binance USDⓈ-M Perpetual Futures
 - Symbols: Top 20 Strongest Market Coins
 - Duration: Exactly 365 Days (1 Year)
 - Zero Lookahead, Zero Leakage, Strict Causal Pipeline
@@ -23,10 +23,10 @@ import numpy as np
 import pandas as pd
 
 SYMBOLS = [
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT",
-    "ADA/USDT", "AVAX/USDT", "LINK/USDT", "SUI/USDT", "NEAR/USDT",
-    "DOT/USDT", "UNI/USDT", "APT/USDT", "RENDER/USDT", "FET/USDT",
-    "AR/USDT", "OP/USDT", "ARB/USDT", "INJ/USDT", "PEPE/USDT"
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT",
+    "ADA/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT", "SUI/USDT:USDT", "NEAR/USDT:USDT",
+    "DOT/USDT:USDT", "UNI/USDT:USDT", "APT/USDT:USDT", "RENDER/USDT:USDT", "FET/USDT:USDT",
+    "AR/USDT:USDT", "OP/USDT:USDT", "ARB/USDT:USDT", "INJ/USDT:USDT", "PEPE/USDT:USDT"
 ]
 
 TOTAL_DAYS = 365
@@ -50,10 +50,10 @@ def fetch_ccxt_futures_data(symbol: str) -> pd.DataFrame:
     if ccxt is None:
         raise RuntimeError("ccxt library is not installed.")
 
-    exchange = ccxt.lbank({
+    exchange = ccxt.binance({
         'enableRateLimit': True,
         'options': {
-            'defaultType': 'swap'  # LBank Futures Perpetual Swaps
+            'defaultType': 'swap'  # Binance USD-M Perpetual Futures
         }
     })
 
@@ -65,24 +65,12 @@ def fetch_ccxt_futures_data(symbol: str) -> pd.DataFrame:
 
     try:
         exchange.load_markets()
-        
-        # پیدا کردن نام صحیح و پشتیبانی‌شده نماد در صرافی ل‌بنک
-        actual_symbol = None
-        base_currency = symbol.split('/')[0]
-        
-        for s in exchange.symbols:
-            market_info = exchange.markets.get(s, {})
-            if s.startswith(base_currency + '/') and 'USDT' in s and (market_info.get('swap', False) or market_info.get('linear', False)):
-                actual_symbol = s
-                break
-        
-        if not actual_symbol and symbol in exchange.symbols:
-            actual_symbol = symbol
-
-        if not actual_symbol:
-            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
-        
-        symbol = actual_symbol
+        if symbol not in exchange.symbols:
+            alt_symbol = symbol.replace(":USDT", "")
+            if alt_symbol in exchange.symbols:
+                symbol = alt_symbol
+            else:
+                return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
         while current_start < now_ms:
             ohlcvs = exchange.fetch_ohlcv(symbol, timeframe='15m', since=current_start, limit=1000)
@@ -97,7 +85,7 @@ def fetch_ccxt_futures_data(symbol: str) -> pd.DataFrame:
             current_start = fetched_last_ts + 1
             time.sleep(exchange.rateLimit / 1000.0)
     except Exception as e:
-        print(f"[DEBUG] CCXT LBank fetch error for {symbol}: {e}")
+        print(f"[DEBUG] CCXT Binance fetch error for {symbol}: {e}")
 
     if not all_klines:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -273,7 +261,7 @@ def main():
     args = parse_args()
 
     print("=" * 70)
-    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT LBANK FUTURES)")
+    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (CCXT BINANCE FUTURES)")
     print("=" * 70)
 
     all_symbol_data = {}
@@ -286,7 +274,7 @@ def main():
                 continue
             calculate_ebp_features(dfs)
             all_symbol_data[sym] = dfs
-            print(f"[SUCCESS] Loaded {sym} (LBank Futures)")
+            print(f"[SUCCESS] Loaded {sym} (Binance Futures)")
         except Exception as e:
             print(f"[ABORT] Error for symbol {sym}: {e}")
 
