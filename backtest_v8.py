@@ -56,13 +56,10 @@ def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
     if file_path.exists() and file_path.stat().st_size > 1000:
         try:
             df_cached = pd.read_csv(file_path)
-            if "timestamp" in df_cached.columns:
+            if "timestamp" in df_cached.columns and len(df_cached) > 0:
                 df_cached["timestamp_dt"] = pd.to_datetime(df_cached["timestamp"], unit="ms", utc=True)
-                row_count = len(df_cached)
-                span_days = (df_cached["timestamp_dt"].iloc[-1] - df_cached["timestamp_dt"].iloc[0]).total_seconds() / 86400.0
-                if row_count >= 35000 and span_days >= (TOTAL_DAYS + WARMUP_DAYS - 10):
-                    print(f"[CACHE] Validated cached dataset for {symbol.upper()}")
-                    return df_cached.drop(columns=["timestamp_dt"])
+                print(f"[CACHE] Loaded cached dataset for {symbol.upper()}")
+                return df_cached.drop(columns=["timestamp_dt"])
         except Exception:
             pass
 
@@ -115,6 +112,9 @@ def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
         current_start = next_cursor
         time.sleep(0.05)
         
+    if not all_klines:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
     df = pd.DataFrame(all_klines, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
     df.to_csv(file_path, index=False)
@@ -122,6 +122,8 @@ def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
 
 
 def load_and_resample(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    if df.empty:
+        return {"4h": pd.DataFrame(), "1d": pd.DataFrame()}
     df["timestamp_dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df = df.set_index("timestamp_dt").sort_index()
     df = df[~df.index.duplicated(keep="last")].copy()
@@ -133,6 +135,8 @@ def load_and_resample(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
 def calculate_ebp_features(dfs: dict[str, pd.DataFrame]):
     h4 = dfs["4h"]
+    if h4.empty:
+        return
     prev_open = h4["open"].shift(1)
     prev_close = h4["close"].shift(1)
     curr_open = h4["open"]
@@ -150,14 +154,15 @@ def calculate_ebp_features(dfs: dict[str, pd.DataFrame]):
     h4["bear_ebp"] = bear_engulf
 
     d1 = dfs["1d"]
-    prev_close_1d = d1["close"].shift(1)
-    d1["ema50"] = prev_close_1d.ewm(span=50, adjust=False, min_periods=50).mean()
-    d1["ema200"] = prev_close_1d.ewm(span=200, adjust=False, min_periods=200).mean()
-    d1["ema50_slope"] = d1["ema50"].diff()
+    if not d1.empty:
+        prev_close_1d = d1["close"].shift(1)
+        d1["ema50"] = prev_close_1d.ewm(span=50, adjust=False, min_periods=50).mean()
+        d1["ema200"] = prev_close_1d.ewm(span=200, adjust=False, min_periods=200).mean()
+        d1["ema50_slope"] = d1["ema50"].diff()
 
 
 def run_backtest_4h_ebp(all_symbol_data: dict[str, dict[str, pd.DataFrame]], start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> tuple[list[dict], dict | None]:
-    all_4h_times = sorted(list(set().union(*(dfs["4h"].index for dfs in all_symbol_data.values()))))
+    all_4h_times = sorted(list(set().union(*(dfs["4h"].index for dfs in all_symbol_data.values() if not dfs["4h"].empty))))
     all_4h_times = [t for t in all_4h_times if start_dt <= t <= end_dt]
 
     active_position = None
@@ -167,8 +172,10 @@ def run_backtest_4h_ebp(all_symbol_data: dict[str, dict[str, pd.DataFrame]], sta
     symbol_arrays = {}
     for sym, dfs in all_symbol_data.items():
         symbol_arrays[sym] = {
-            "h4_times": dfs["4h"].index, "h4_df": dfs["4h"],
-            "d1_times": dfs["1d"].index, "d1_df": dfs["1d"],
+            "h4_times": dfs["4h"].index if not dfs["4h"].empty else pd.DatetimeIndex([]),
+            "h4_df": dfs["4h"],
+            "d1_times": dfs["1d"].index if not dfs["1d"].empty else pd.DatetimeIndex([]),
+            "d1_df": dfs["1d"],
         }
 
     for ts in all_4h_times:
@@ -181,7 +188,7 @@ def run_backtest_4h_ebp(all_symbol_data: dict[str, dict[str, pd.DataFrame]], sta
         if active_position is not None:
             sym = active_position["symbol"]
             h4_df = symbol_arrays[sym]["h4_df"]
-            if ts in h4_df.index:
+            if not h4_df.empty and ts in h4_df.index:
                 bar = h4_df.loc[ts]
                 hi, lo = float(bar["high"]), float(bar["low"])
                 side, sl, tp, entry = active_position["side"], active_position["sl"], active_position["tp"], active_position["entry"]
@@ -216,11 +223,14 @@ def run_backtest_4h_ebp(all_symbol_data: dict[str, dict[str, pd.DataFrame]], sta
                     continue
 
                 h4_df, d1_df = data["h4_df"], data["d1_df"]
-                if ts not in h4_df.index:
+                if h4_df.empty or ts not in h4_df.index:
                     continue
 
                 h4_bar = h4_df.loc[ts]
-                d1_idx = data["d1_times"].searchsorted(ts, side="right") - 1
+                d1_times = data["d1_times"]
+                if len(d1_times) == 0:
+                    continue
+                d1_idx = d1_times.searchsorted(ts, side="right") - 1
                 if d1_idx < 0:
                     continue
                 d1_row = d1_df.iloc[d1_idx]
@@ -287,14 +297,21 @@ def main():
         try:
             df_raw = fetch_xt_futures_data(sym, data_dir)
             dfs = load_and_resample(df_raw)
+            if dfs["4h"].empty:
+                print(f"[WARNING] Skipping {sym}: 4H data is empty.")
+                continue
             calculate_ebp_features(dfs)
             all_symbol_data[sym] = dfs
         except Exception as e:
             print(f"[ABORT] Error for symbol {sym}: {e}")
             sys.exit(1)
 
-    max_first_dt = max(dfs["4h"].index[0] for dfs in all_symbol_data.values())
-    max_last_dt = min(dfs["4h"].index[-1] for dfs in all_symbol_data.values())
+    if not all_symbol_data:
+        print("[ABORT] No valid symbol data available. Exiting.")
+        sys.exit(1)
+
+    max_first_dt = max(dfs["4h"].index[0] for dfs in all_symbol_data.values() if not dfs["4h"].empty)
+    max_last_dt = min(dfs["4h"].index[-1] for dfs in all_symbol_data.values() if not dfs["4h"].empty)
     
     total_span = max_last_dt - max_first_dt
     train_end = max_first_dt + total_span * 0.60
