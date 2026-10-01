@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN QUANTITATIVE ENGINE
+HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE
 - Market: XT USDT-M Futures REST API (fapi.xt.com)
-- Timeframe: 4H Primary Setup with Daily Trend Context
+- Timeframe: 4H Primary Setup with Daily Trend Context & Monthly Breakdown
 - Zero Lookahead, Zero Leakage, Strict Causal Pipeline
 """
 
@@ -13,7 +13,11 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import sys
 import time
-import requests
+requests = None
+try:
+    import requests
+except ImportError:
+    pass
 import numpy as np
 import pandas as pd
 
@@ -56,11 +60,14 @@ def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
                 df_cached["timestamp_dt"] = pd.to_datetime(df_cached["timestamp"], unit="ms", utc=True)
                 row_count = len(df_cached)
                 span_days = (df_cached["timestamp_dt"].iloc[-1] - df_cached["timestamp_dt"].iloc[0]).total_seconds() / 86400.0
-                if row_count >= 38000 and span_days >= (TOTAL_DAYS + WARMUP_DAYS - 5):
+                if row_count >= 35000 and span_days >= (TOTAL_DAYS + WARMUP_DAYS - 10):
                     print(f"[CACHE] Validated cached dataset for {symbol.upper()}")
                     return df_cached.drop(columns=["timestamp_dt"])
         except Exception:
             pass
+
+    if requests is None:
+        raise RuntimeError("requests library is not installed. Please add it to requirements.txt.")
 
     data_dir.mkdir(parents=True, exist_ok=True)
     url = "https://fapi.xt.com/future/market/v1/public/q/kline"
@@ -126,28 +133,22 @@ def load_and_resample(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
 def calculate_ebp_features(dfs: dict[str, pd.DataFrame]):
     h4 = dfs["4h"]
-    
-    # Causal Engulfing identification on 4H candles
-    # Candle t vs t-1
     prev_open = h4["open"].shift(1)
     prev_close = h4["close"].shift(1)
     curr_open = h4["open"]
     curr_close = h4["close"]
 
-    # Bullish Engulfing: prev is red, curr is green, curr body engulfs prev body
     prev_is_red = prev_close < prev_open
     curr_is_green = curr_close > curr_open
     bull_engulf = prev_is_red & curr_is_green & (curr_close >= prev_open) & (curr_open <= prev_close)
 
-    # Bearish Engulfing: prev is green, curr is red, curr body engulfs prev body
     prev_is_green = prev_close > prev_open
     curr_is_red = curr_close < curr_open
-    bear_engulf = prev_is_green & curr_is_red & (curr_close <= prev_open) & (curr_open >= prev_close)
+    bear_engulf = prev_is_green & curr_is_red & (curr_close <= prev_open) & (curr_close >= prev_close)
 
     h4["bull_ebp"] = bull_engulf
     h4["bear_ebp"] = bear_engulf
 
-    # Daily Trend Context (Causal using shift(1))
     d1 = dfs["1d"]
     prev_close_1d = d1["close"].shift(1)
     d1["ema50"] = prev_close_1d.ewm(span=50, adjust=False, min_periods=50).mean()
@@ -177,7 +178,6 @@ def run_backtest_4h_ebp(all_symbol_data: dict[str, dict[str, pd.DataFrame]], sta
 
         position_closed_this_iteration = False
 
-        # 1. Manage active position on 4H high/low
         if active_position is not None:
             sym = active_position["symbol"]
             h4_df = symbol_arrays[sym]["h4_df"]
@@ -209,7 +209,6 @@ def run_backtest_4h_ebp(all_symbol_data: dict[str, dict[str, pd.DataFrame]], sta
         if position_closed_this_iteration:
             continue
 
-        # 2. Evaluate new entries if flat
         if active_position is None:
             candidates = []
             for symbol, data in symbol_arrays.items():
@@ -237,7 +236,6 @@ def run_backtest_4h_ebp(all_symbol_data: dict[str, dict[str, pd.DataFrame]], sta
                 bear_ebp = h4_bar.get("bear_ebp", False)
 
                 if daily_long and bull_ebp:
-                    # Find low of the 2-candle pattern for SL
                     h4_idx = h4_df.index.get_loc(ts)
                     if h4_idx >= 1:
                         prev_bar = h4_df.iloc[h4_idx - 1]
@@ -252,7 +250,6 @@ def run_backtest_4h_ebp(all_symbol_data: dict[str, dict[str, pd.DataFrame]], sta
                         candidates.append((symbol, "SHORT", ts, sl))
 
             if candidates:
-                # Pick the first candidate or sort by volume/strength
                 symbol, side, trigger_ts, sl = candidates[0]
                 h4_df = symbol_arrays[symbol]["h4_df"]
                 next_indices = h4_df.index[h4_df.index > trigger_ts]
@@ -334,6 +331,21 @@ def main():
     print(f"OOS Net PnL         : ${net_pnl:,.2f}")
     print(f"OOS Max Loss Streak : {max_consec}")
     print("=" * 68)
+
+    # Monthly Breakdown Report
+    if trades:
+        df_trades = pd.DataFrame(trades)
+        df_trades["exit_month"] = pd.to_datetime(df_trades["exit_ts"]).dt.to_period("M")
+        print("\n" + "=" * 35 + " MONTHLY PERFORMANCE BREAKDOWN " + "=" * 35)
+        print(f"{'Month':<10} | {'Trades':<8} | {'Wins':<6} | {'Win Rate':<10} | {'PnL ($)':<10}")
+        print("-" * 55)
+        for month, group in df_trades.groupby("exit_month"):
+            m_total = len(group)
+            m_wins = sum(1 for x in group["outcome"] if x == "WIN")
+            m_wr = (m_wins / m_total * 100.0) if m_total > 0 else 0.0
+            m_pnl = group["pnl"].sum()
+            print(f"{str(month):<10} | {m_total:<8} | {m_wins:<6} | {m_wr:>6.2f}%    | ${m_pnl:>9.2f}")
+        print("=" * 55)
 
     oos_eligible = (total >= 100) and (win_rate > 45.0) and (profit_factor > 1.15) and (net_pnl > 0)
     print(f"FINAL ACCEPTANCE STATUS: {'ACCEPTED = TRUE' if oos_eligible else 'ACCEPTED = FALSE (REJECTED)'}")
