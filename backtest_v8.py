@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (KUCOIN)
-- Market: KuCoin Public Spot/Futures API
+HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (LBANK FUTURES)
+- Market: LBank Futures Public API
 - Timeframe: 4H Primary Setup with Daily Trend Context & Monthly Breakdown
 - Zero Lookahead, Zero Leakage, Strict Causal Pipeline
 """
@@ -22,9 +22,9 @@ import numpy as np
 import pandas as pd
 
 SYMBOLS = [
-    "BTC-USDT", "ETH-USDT", "SOL-USDT", "SUI-USDT", "AVAX-USDT",
-    "NEAR-USDT", "ADA-USDT", "BNB-USDT", "APT-USDT", "CRV-USDT",
-    "RENDER-USDT", "PENDLE-USDT", "ICP-USDT", "WIF-USDT"
+    "btc_usdt", "eth_usdt", "sol_usdt", "sui_usdt", "avax_usdt",
+    "near_usdt", "ada_usdt", "bnb_usdt", "apt_usdt", "crv_usdt",
+    "ondo_usdt", "pendle_usdt", "icp_usdt", "wif_usdt"
 ]
 
 TOTAL_DAYS = 365
@@ -44,27 +44,28 @@ def parse_args():
     return p.parse_args()
 
 
-def fetch_kucoin_data(symbol: str) -> pd.DataFrame:
+def fetch_lbank_futures_data(symbol: str) -> pd.DataFrame:
     if requests is None:
         raise RuntimeError("requests library is not installed.")
 
-    url = "https://api.kucoin.com/api/v1/market/candles"
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-    target_start_ts = now_ts - int((TOTAL_DAYS + WARMUP_DAYS) * 86400)
+    # LBank Futures API Endpoint for Klines/Candles
+    url = "https://contract.lbank.info/v1/kline"
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    interval_ms = 15 * 60 * 1000  # 15m
+    target_start_ms = now_ms - int((TOTAL_DAYS + WARMUP_DAYS) * 86400 * 1000)
     
-    current_start = target_start_ts
+    current_start = target_start_ms
     all_klines = []
     
-    # KuCoin returns up to 1500 candles per request for 15min (15min = 900s)
-    step = 1500 * 900
-    
-    while current_start < now_ts:
-        current_end = min(now_ts, current_start + step)
+    while current_start < now_ms:
+        # LBank contract API parameters typically use symbol, size, from, to or similar pagination
+        # Let's use size/time window approach based on LBank standard spec
         params = {
-            "symbol": symbol,
-            "type": "15min",
-            "startAt": current_start,
-            "endAt": current_end
+            "symbol": symbol.lower(),
+            "contractType": "swap",
+            "interval": "15m",
+            "size": 500,
+            "from": current_start
         }
         
         success, data = False, None
@@ -73,7 +74,7 @@ def fetch_kucoin_data(symbol: str) -> pd.DataFrame:
                 res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
                 if res.status_code == 200:
                     res_json = res.json()
-                    if res_json.get("code") == "200000":
+                    if res_json.get("result") == "true" or res_json.get("code") == 0:
                         data = res_json.get("data", [])
                         if isinstance(data, list):
                             success = True
@@ -82,26 +83,38 @@ def fetch_kucoin_data(symbol: str) -> pd.DataFrame:
                 pass
             time.sleep(1 * (attempt + 1))
             
-        if not success or not data:
-            current_start = current_end
-            continue
+        if not success or not data or len(data) == 0:
+            # Fallback to alternative public endpoint structure if needed or break
+            break
             
         parsed_batch = []
-        # KuCoin format: [time, open, close, high, low, volume, turnover]
-        # Note: KuCoin kline format is [time_str_or_int, open, close, high, low, volume, turnover]
+        max_ts = current_start
         for k in data:
             try:
-                ts = int(k[0]) * 1000  # convert to ms
-                o, c, h, l, v = float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
+                # LBank standard kline format: [timestamp, open, high, low, close, volume] or object
+                if isinstance(k, dict):
+                    ts = int(k.get("time", k.get("timestamp", 0)))
+                    o, h, l, c, v = float(k.get("open", 0)), float(k.get("high", 0)), float(k.get("low", 0)), float(k.get("close", 0)), float(k.get("volume", 0))
+                else:
+                    ts, o, h, l, c, v = int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
+                
                 parsed_batch.append([ts, o, h, l, c, v])
+                if ts > max_ts:
+                    max_ts = ts
             except Exception:
                 continue
                 
-        if parsed_batch:
-            all_klines.extend(parsed_batch)
+        if not parsed_batch:
+            break
             
-        current_start = current_end
-        time.sleep(0.1)
+        all_klines.extend(parsed_batch)
+        next_cursor = max_ts + interval_ms
+        if next_cursor <= current_start:
+            current_start += interval_ms * 500
+        else:
+            current_start = next_cursor
+            
+        time.sleep(0.05)
         
     if not all_klines:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -277,13 +290,13 @@ def main():
     args = parse_args()
 
     print("=" * 70)
-    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (KUCOIN)")
+    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (LBANK)")
     print("=" * 70)
 
     all_symbol_data = {}
     for sym in SYMBOLS:
         try:
-            df_raw = fetch_kucoin_data(sym)
+            df_raw = fetch_lbank_futures_data(sym)
             dfs = load_and_resample(df_raw)
             if dfs["4h"].empty:
                 print(f"[WARNING] Skipping {sym}: 4H data is empty.")
