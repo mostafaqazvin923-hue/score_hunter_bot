@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/init/env python3
 """
-HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE
-- Market: XT USDT-M Futures REST API (fapi.xt.com)
+HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (BINANCE FUTURES)
+- Market: Binance USD-M Futures Public API
 - Timeframe: 4H Primary Setup with Daily Trend Context & Monthly Breakdown
 - Zero Lookahead, Zero Leakage, Strict Causal Pipeline
 """
@@ -22,12 +22,11 @@ import numpy as np
 import pandas as pd
 
 SYMBOLS = [
-    "btc_usdt", "eth_usdt", "sol_usdt", "sui_usdt", "avax_usdt",
-    "near_usdt", "ada_usdt", "bnb_usdt", "apt_usdt", "crv_usdt",
-    "ondo_usdt", "pendle_usdt", "icp_usdt", "wif_usdt"
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT", "AVAXUSDT",
+    "NEARUSDT", "ADAUSDT", "BNBUSDT", "APTUSDT", "CRVUSDT",
+    "RENDERUSDT", "PENDLEUSDT", "ICPUSDT", "WIFUSDT"
 ]
 
-DATA_DIR = Path("data/xt_futures_ebp_4h")
 TOTAL_DAYS = 365
 WARMUP_DAYS = 60
 
@@ -42,48 +41,36 @@ SLIPPAGE = 0.0003
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data-dir", default=str(DATA_DIR))
     return p.parse_args()
 
 
-def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
-    file_path = data_dir / f"{symbol.upper()}_15m.csv"
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    interval_ms = 15 * 60 * 1000
-    target_start_ms = now_ms - int((TOTAL_DAYS + WARMUP_DAYS) * 86400 * 1000)
-    final_end_ms = (now_ms // interval_ms) * interval_ms - 1
-
-    if file_path.exists() and file_path.stat().st_size > 1000:
-        try:
-            df_cached = pd.read_csv(file_path)
-            if "timestamp" in df_cached.columns and len(df_cached) > 0:
-                df_cached["timestamp_dt"] = pd.to_datetime(df_cached["timestamp"], unit="ms", utc=True)
-                print(f"[CACHE] Loaded cached dataset for {symbol.upper()}")
-                return df_cached.drop(columns=["timestamp_dt"])
-        except Exception:
-            pass
-
+def fetch_binance_futures_data(symbol: str) -> pd.DataFrame:
     if requests is None:
-        raise RuntimeError("requests library is not installed. Please add it to requirements.txt.")
+        raise RuntimeError("requests library is not installed.")
 
-    data_dir.mkdir(parents=True, exist_ok=True)
-    url = "https://fapi.xt.com/future/market/v1/public/q/kline"
-    limit = 1500
+    url = "https://fapi.binance.com/fapi/v1/klines"
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    interval_ms = 15 * 60 * 1000  # 15m
+    target_start_ms = now_ms - int((TOTAL_DAYS + WARMUP_DAYS) * 86400 * 1000)
+    
     current_start = target_start_ms
     all_klines = []
     
-    while current_start < final_end_ms:
-        window_end = min(final_end_ms, current_start + limit * interval_ms - 1)
-        params = {"symbol": symbol, "interval": "15m", "startTime": current_start, "endTime": window_end, "limit": limit}
+    while current_start < now_ms:
+        params = {
+            "symbol": symbol,
+            "interval": "15m",
+            "startTime": current_start,
+            "limit": 1500
+        }
         
         success, data = False, None
         for attempt in range(3):
             try:
                 res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
                 if res.status_code == 200:
-                    res_json = res.json()
-                    data = res_json.get("result", res_json.get("data", res_json))
-                    if isinstance(data, list):
+                    data = res.json()
+                    if isinstance(data, list) and len(data) > 0:
                         success = True
                         break
             except Exception:
@@ -117,7 +104,6 @@ def fetch_xt_futures_data(symbol: str, data_dir: Path) -> pd.DataFrame:
 
     df = pd.DataFrame(all_klines, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
-    df.to_csv(file_path, index=False)
     return df
 
 
@@ -285,26 +271,24 @@ def run_backtest_4h_ebp(all_symbol_data: dict[str, dict[str, pd.DataFrame]], sta
 
 def main():
     args = parse_args()
-    data_dir = Path(args.data_dir)
-    data_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE")
+    print("HUNTER-V9-EBP: 4H ENGULFING BAR PATTERN BACKTEST ENGINE (BINANCE)")
     print("=" * 70)
 
     all_symbol_data = {}
     for sym in SYMBOLS:
         try:
-            df_raw = fetch_xt_futures_data(sym, data_dir)
+            df_raw = fetch_binance_futures_data(sym)
             dfs = load_and_resample(df_raw)
             if dfs["4h"].empty:
                 print(f"[WARNING] Skipping {sym}: 4H data is empty.")
                 continue
             calculate_ebp_features(dfs)
             all_symbol_data[sym] = dfs
+            print(f"[SUCCESS] Loaded {sym}")
         except Exception as e:
             print(f"[ABORT] Error for symbol {sym}: {e}")
-            sys.exit(1)
 
     if not all_symbol_data:
         print("[ABORT] No valid symbol data available. Exiting.")
@@ -349,7 +333,6 @@ def main():
     print(f"OOS Max Loss Streak : {max_consec}")
     print("=" * 68)
 
-    # Monthly Breakdown Report
     if trades:
         df_trades = pd.DataFrame(trades)
         df_trades["exit_month"] = pd.to_datetime(df_trades["exit_ts"]).dt.to_period("M")
