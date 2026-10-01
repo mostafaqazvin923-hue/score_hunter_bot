@@ -13,15 +13,16 @@ import requests
 # CRT STAGE-0
 # 4H RANGE -> SWEEP -> RECLAIM -> 15M MSS -> RETEST
 #
-# Research venue: Binance USD-M Futures public historical data
+# Research venue:
+# Binance USD-M Futures public historical data
 #
-# Locked research rules:
-# - Fixed universe
+# Rules:
 # - 365 days + 30 days warmup
+# - Fixed 14-symbol universe
 # - 4H parent range
 # - 15M execution
-# - Signal only after completed candles
-# - Entry on next 15M candle OPEN after retest confirmation
+# - Completed candles only
+# - Entry at next 15M open after retest
 # - RR = 1:2
 # - No timeout
 # - No BE
@@ -31,7 +32,7 @@ import requests
 # - Different symbols may overlap
 # - No same-candle re-entry
 # - Same-candle SL + TP = LOSS
-# - Final unresolved trades are censored
+# - Unresolved final trades are censored
 # - Chronological 50/25/25 split
 # ============================================================
 
@@ -53,7 +54,6 @@ SYMBOLS = [
     "WIFUSDT",
 ]
 
-
 RESEARCH_DAYS = 365
 WARMUP_DAYS = 30
 
@@ -62,7 +62,6 @@ LTF_INTERVAL = "15m"
 
 RR = 2.0
 
-# Research cost assumptions
 FEE_RATE = 0.0007
 SLIPPAGE_RATE = 0.0003
 
@@ -70,21 +69,15 @@ MARGIN = 100.0
 LEVERAGE = 50.0
 NOTIONAL = MARGIN * LEVERAGE
 
-# Portfolio audit only.
-# Per-symbol overlap is enforced by the simulator.
 MAX_SIMULTANEOUS_POSITIONS = 10
 
-# CRT sweep filter
 MAX_SWEEP_DEPTH = 0.35
 
-# 15M MSS
 MSS_LOOKBACK = 4
 MSS_MAX_BARS = 8
 
-# Retest after MSS
 RETEST_MAX_BARS = 6
 
-# Avoid absurdly tiny/huge stop distances.
 MIN_RISK_PCT = 0.0005
 MAX_RISK_PCT = 0.08
 
@@ -92,6 +85,7 @@ DATA_DIR = Path("crt_data")
 
 
 session = requests.Session()
+
 session.headers.update(
     {
         "User-Agent": "Mozilla/5.0 CRT-Stage0-Research"
@@ -100,12 +94,53 @@ session.headers.update(
 
 
 # ============================================================
-# BINANCE DATA
+# TIMEZONE HELPERS
+# ============================================================
+
+def ensure_utc_timestamp(value):
+    """
+    Convert any timestamp to UTC-aware Timestamp.
+
+    Handles both:
+    - timezone-naive timestamps
+    - timezone-aware timestamps
+
+    This avoids:
+    ValueError:
+    Cannot pass a datetime or Timestamp with tzinfo
+    with the tz parameter.
+    """
+
+    ts = pd.Timestamp(value)
+
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+
+    return ts
+
+
+# ============================================================
+# MONTH RANGE
 # ============================================================
 
 def month_range(start, end):
-    current = pd.Timestamp(start).to_period("M")
-    last = pd.Timestamp(end).to_period("M")
+    """
+    Return YYYY-MM strings between start and end.
+
+    Period objects are deliberately made timezone-naive
+    to avoid pandas timezone warnings.
+    """
+
+    start_ts = ensure_utc_timestamp(start)
+    end_ts = ensure_utc_timestamp(end)
+
+    start_naive = start_ts.tz_localize(None)
+    end_naive = end_ts.tz_localize(None)
+
+    current = start_naive.to_period("M")
+    last = end_naive.to_period("M")
 
     months = []
 
@@ -116,8 +151,13 @@ def month_range(start, end):
     return months
 
 
+# ============================================================
+# DOWNLOAD
+# ============================================================
+
 def download_archive(url):
     try:
+
         response = session.get(
             url,
             timeout=60,
@@ -132,34 +172,60 @@ def download_archive(url):
         return None
 
 
+# ============================================================
+# READ BINANCE ZIP
+# ============================================================
+
 def read_binance_zip(blob):
-    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+
+    with zipfile.ZipFile(
+        io.BytesIO(blob)
+    ) as archive:
 
         csv_files = [
             name
-            for name in z.namelist()
+            for name in archive.namelist()
             if name.lower().endswith(".csv")
         ]
 
         if not csv_files:
-            raise RuntimeError("No CSV file inside Binance archive.")
+            raise RuntimeError(
+                "No CSV file inside Binance archive."
+            )
 
-        with z.open(csv_files[0]) as f:
+        with archive.open(
+            csv_files[0]
+        ) as file:
+
             df = pd.read_csv(
-                f,
+                file,
                 header=None,
             )
 
-    # Binance archives can contain a header row.
-    if len(df) > 0:
-        first = str(df.iloc[0, 0]).strip().lower()
+    # --------------------------------------------------------
+    # Binance sometimes includes a header row.
+    # --------------------------------------------------------
 
-        if first in ("open_time", "open time"):
+    if len(df) > 0:
+
+        first_value = (
+            str(df.iloc[0, 0])
+            .strip()
+            .lower()
+        )
+
+        if first_value in (
+            "open_time",
+            "open time",
+        ):
+
             df = df.iloc[1:].copy()
 
     if df.shape[1] < 12:
+
         raise RuntimeError(
-            f"Unexpected Binance CSV columns: {df.shape[1]}"
+            f"Unexpected Binance CSV columns: "
+            f"{df.shape[1]}"
         )
 
     df = df.iloc[:, :12].copy()
@@ -204,6 +270,7 @@ def read_binance_zip(blob):
     ]
 
     for column in numeric_columns:
+
         df[column] = pd.to_numeric(
             df[column],
             errors="coerce",
@@ -231,15 +298,28 @@ def read_binance_zip(blob):
     ].copy()
 
 
+# ============================================================
+# FETCH BINANCE KLINES
+# ============================================================
+
 def fetch_binance_klines(
     symbol,
     interval,
     start,
     end,
 ):
+
     DATA_DIR.mkdir(
         parents=True,
         exist_ok=True,
+    )
+
+    start_ts = ensure_utc_timestamp(
+        start
+    )
+
+    end_ts = ensure_utc_timestamp(
+        end
     )
 
     cache_file = (
@@ -247,77 +327,94 @@ def fetch_binance_klines(
         / f"{symbol}_{interval}.csv"
     )
 
-    # Use cache only when it covers the requested period.
+    # --------------------------------------------------------
+    # CACHE
+    # --------------------------------------------------------
+
     if cache_file.exists():
 
         try:
+
             cached = pd.read_csv(
                 cache_file
             )
 
-            cached["open_time"] = pd.to_datetime(
-                cached["open_time"],
-                utc=True,
+            cached["open_time"] = (
+                pd.to_datetime(
+                    cached["open_time"],
+                    utc=True,
+                )
             )
 
-            cached = cached.sort_values(
-                "open_time"
+            cached = (
+                cached
+                .sort_values("open_time")
+                .reset_index(drop=True)
             )
 
             if (
                 len(cached) > 0
-                and cached["open_time"].min() <= pd.Timestamp(start)
-                and cached["open_time"].max() >= pd.Timestamp(end)
+                and cached["open_time"].min()
+                <= start_ts
+                and cached["open_time"].max()
+                >= end_ts
             ):
+
                 return cached
 
         except Exception:
+
             pass
 
     frames = []
 
-    # --------------------------------------------------------
-    # Monthly archives
-    # --------------------------------------------------------
+    # ========================================================
+    # MONTHLY ARCHIVES
+    # ========================================================
 
     for ym in month_range(
-        start,
-        end,
+        start_ts,
+        end_ts,
     ):
 
         url = (
-            "https://data.binance.vision/data/futures/um/"
-            f"monthly/klines/{symbol}/{interval}/"
+            "https://data.binance.vision/data/"
+            "futures/um/monthly/klines/"
+            f"{symbol}/{interval}/"
             f"{symbol}-{interval}-{ym}.zip"
         )
 
-        blob = download_archive(url)
+        blob = download_archive(
+            url
+        )
 
         if blob is not None:
 
             try:
+
                 frame = read_binance_zip(
                     blob
                 )
 
-                frames.append(frame)
+                frames.append(
+                    frame
+                )
 
             except Exception as exc:
+
                 print(
-                    f"  monthly parse failed "
+                    f"  Monthly parse failed "
                     f"{symbol} {ym}: {exc}"
                 )
 
         time.sleep(0.05)
 
-    # --------------------------------------------------------
-    # Daily fallback.
-    #
-    # Used for recent/current months that may not yet have
-    # monthly archive files.
-    # --------------------------------------------------------
+    # ========================================================
+    # DAILY FALLBACK
+    # ========================================================
 
     if frames:
+
         existing = pd.concat(
             frames,
             ignore_index=True,
@@ -329,18 +426,20 @@ def fetch_binance_klines(
         )
 
     else:
+
         existing = pd.DataFrame()
+
         existing_days = set()
 
-    daily_start = pd.Timestamp(
-        start,
-        tz="UTC",
-    ).floor("D")
+    daily_start = (
+        start_ts
+        .floor("D")
+    )
 
-    daily_end = pd.Timestamp(
-        end,
-        tz="UTC",
-    ).floor("D")
+    daily_end = (
+        end_ts
+        .floor("D")
+    )
 
     for day in pd.date_range(
         daily_start,
@@ -348,43 +447,61 @@ def fetch_binance_klines(
         freq="D",
     ):
 
-        date_string = day.strftime(
-            "%Y-%m-%d"
+        date_string = (
+            day.strftime(
+                "%Y-%m-%d"
+            )
         )
 
         if date_string in existing_days:
             continue
 
         url = (
-            "https://data.binance.vision/data/futures/um/"
-            f"daily/klines/{symbol}/{interval}/"
+            "https://data.binance.vision/data/"
+            "futures/um/daily/klines/"
+            f"{symbol}/{interval}/"
             f"{symbol}-{interval}-{date_string}.zip"
         )
 
-        blob = download_archive(url)
+        blob = download_archive(
+            url
+        )
 
         if blob is not None:
 
             try:
+
                 frame = read_binance_zip(
                     blob
                 )
 
-                frames.append(frame)
+                frames.append(
+                    frame
+                )
 
             except Exception as exc:
+
                 print(
-                    f"  daily parse failed "
+                    f"  Daily parse failed "
                     f"{symbol} {date_string}: {exc}"
                 )
 
         time.sleep(0.02)
 
+    # ========================================================
+    # NO DATA
+    # ========================================================
+
     if not frames:
+
         raise RuntimeError(
             f"{symbol} {interval}: "
             "no Binance historical data downloaded."
         )
+
+    # ========================================================
+    # MERGE
+    # ========================================================
 
     df = pd.concat(
         frames,
@@ -399,29 +516,37 @@ def fetch_binance_klines(
         .sort_values(
             "open_time"
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )
 
-    start_ts = pd.Timestamp(
-        start,
-        tz="UTC",
-    )
-
-    end_ts = pd.Timestamp(
-        end,
-        tz="UTC",
-    )
+    # ========================================================
+    # DATE FILTER
+    # ========================================================
 
     df = df[
-        (df["open_time"] >= start_ts)
-        & (df["open_time"] < end_ts)
+        (
+            df["open_time"]
+            >= start_ts
+        )
+        &
+        (
+            df["open_time"]
+            < end_ts
+        )
     ].copy()
 
     if len(df) == 0:
+
         raise RuntimeError(
             f"{symbol} {interval}: "
             "empty dataframe after date filtering."
         )
+
+    # ========================================================
+    # SAVE CACHE
+    # ========================================================
 
     df.to_csv(
         cache_file,
@@ -432,7 +557,7 @@ def fetch_binance_klines(
 
 
 # ============================================================
-# DATA QUALITY
+# DATA CONTINUITY AUDIT
 # ============================================================
 
 def audit_continuity(
@@ -441,7 +566,9 @@ def audit_continuity(
     symbol,
     interval_name,
 ):
+
     if len(df) < 10:
+
         raise RuntimeError(
             f"{symbol} {interval_name}: "
             "too few rows."
@@ -480,10 +607,11 @@ def audit_continuity(
 
 
 # ============================================================
-# 4H REFERENCE FEATURES
+# 4H FEATURES
 # ============================================================
 
 def prepare_4h(df):
+
     x = df.copy()
 
     x["range"] = (
@@ -543,17 +671,9 @@ def prepare_4h(df):
         .mean()
     )
 
-    # IMPORTANT:
-    #
-    # We use the CLOSED parent candle's relationship.
-    #
-    # +1 = bullish context
-    # -1 = bearish context
-    #
-    # No future candle is used.
-
     x["bias"] = np.where(
-        x["ema20"] > x["ema50"],
+        x["ema20"]
+        > x["ema50"],
         1,
         -1,
     )
@@ -562,16 +682,19 @@ def prepare_4h(df):
 
 
 # ============================================================
-# BUILD LTF DATA WITH PREVIOUS CLOSED 4H RANGE
+# ATTACH CLOSED 4H RANGE TO 15M
 # ============================================================
 
 def attach_parent_range(
     h4,
     m15,
 ):
+
     reference = h4.copy()
 
-    reference["htf_close_time"] = (
+    reference[
+        "htf_close_time"
+    ] = (
         reference["open_time"]
         + pd.Timedelta(
             hours=4
@@ -604,18 +727,27 @@ def attach_parent_range(
         "parent_bias",
     ]
 
-    ltf = m15.copy()
+    ltf = (
+        m15
+        .copy()
+        .sort_values(
+            "open_time"
+        )
+    )
 
-    # Only a COMPLETED 4H candle can become the parent.
+    # IMPORTANT:
     #
-    # Example:
-    # 4H candle 08:00 -> 12:00
-    # It becomes available to 15M data starting at 12:00.
+    # A 4H candle becomes available ONLY after it closes.
+    #
+    # Therefore:
+    #
+    # 08:00 -> 12:00
+    #
+    # can only be used by 15M candles
+    # starting at 12:00.
 
     ltf = pd.merge_asof(
-        ltf.sort_values(
-            "open_time"
-        ),
+        ltf,
         reference.sort_values(
             "htf_close_time"
         ),
@@ -638,17 +770,22 @@ def attach_parent_range(
 
 
 # ============================================================
-# CRT DETECTION
+# CRT SETUP DETECTION
 # ============================================================
 
 def find_crt_setups(
     df,
     symbol,
 ):
+
     bars = (
         df
-        .sort_values("open_time")
-        .reset_index(drop=True)
+        .sort_values(
+            "open_time"
+        )
+        .reset_index(
+            drop=True
+        )
     )
 
     trades = []
@@ -686,70 +823,70 @@ def find_crt_setups(
             )
             or parent_range <= 0
         ):
+
             i += 1
             continue
 
-        # ----------------------------------------------------
-        # Parent candle identity
-        # ----------------------------------------------------
+        parent_time = (
+            current.htf_close_time
+        )
 
-        parent_time = current.htf_close_time
-
-        # ----------------------------------------------------
+        # ====================================================
         # CRT SWEEP
-        #
-        # LONG:
-        # 15M candle sweeps below parent low
-        # and closes back inside range.
-        #
-        # SHORT:
-        # 15M candle sweeps above parent high
-        # and closes back inside range.
-        # ----------------------------------------------------
+        # ====================================================
 
         side = None
 
+        # LONG:
+        # sweep parent low,
+        # close back inside range.
+
         if (
-            current.low < parent_low
-            and current.close > parent_low
-            and current.close < parent_high
+            current.low
+            < parent_low
+            and
+            current.close
+            > parent_low
+            and
+            current.close
+            < parent_high
         ):
+
             side = "LONG"
+
             sweep_price = float(
                 current.low
             )
 
+        # SHORT:
+        # sweep parent high,
+        # close back inside range.
+
         elif (
-            current.high > parent_high
-            and current.close < parent_high
-            and current.close > parent_low
+            current.high
+            > parent_high
+            and
+            current.close
+            < parent_high
+            and
+            current.close
+            > parent_low
         ):
+
             side = "SHORT"
+
             sweep_price = float(
                 current.high
             )
 
         else:
+
             i += 1
             continue
 
-        # ----------------------------------------------------
-        # Make sure the parent did not change on the sweep.
-        # ----------------------------------------------------
-
-        if (
-            current.htf_close_time
-            != parent_time
-        ):
-            i += 1
-            continue
-
-        # ----------------------------------------------------
-        # Sweep depth.
-        #
-        # Too-deep penetration is treated as breakout/
-        # price discovery rather than clean liquidity sweep.
-        # ----------------------------------------------------
+        # ====================================================
+        # SWEEP DEPTH
+        # ====================================================
 
         if side == "LONG":
 
@@ -770,17 +907,13 @@ def find_crt_setups(
             or sweep_depth
             > MAX_SWEEP_DEPTH
         ):
+
             i += 1
             continue
 
-        # ----------------------------------------------------
-        # HTF directional context.
-        #
-        # Long sweep needs bullish parent context.
-        # Short sweep needs bearish parent context.
-        #
-        # This is intentionally simple and PRE-REGISTERED.
-        # ----------------------------------------------------
+        # ====================================================
+        # HTF BIAS
+        # ====================================================
 
         parent_bias = int(
             current.parent_bias
@@ -790,6 +923,7 @@ def find_crt_setups(
             side == "LONG"
             and parent_bias != 1
         ):
+
             i += 1
             continue
 
@@ -797,25 +931,20 @@ def find_crt_setups(
             side == "SHORT"
             and parent_bias != -1
         ):
+
             i += 1
             continue
 
-        # ----------------------------------------------------
+        # ====================================================
         # 15M MSS
-        #
-        # After the sweep:
-        #
-        # LONG:
-        # close above recent local high
-        #
-        # SHORT:
-        # close below recent local low
-        # ----------------------------------------------------
+        # ====================================================
 
         mss_index = None
 
         search_end = min(
-            i + MSS_MAX_BARS + 1,
+            i
+            + MSS_MAX_BARS
+            + 1,
             total,
         )
 
@@ -831,7 +960,8 @@ def find_crt_setups(
                     .iloc[
                         max(
                             0,
-                            j - MSS_LOOKBACK,
+                            j
+                            - MSS_LOOKBACK,
                         ):j
                     ]
                     .max()
@@ -842,6 +972,7 @@ def find_crt_setups(
                     .iloc[j]
                     > local_high
                 ):
+
                     mss_index = j
                     break
 
@@ -852,7 +983,8 @@ def find_crt_setups(
                     .iloc[
                         max(
                             0,
-                            j - MSS_LOOKBACK,
+                            j
+                            - MSS_LOOKBACK,
                         ):j
                     ]
                     .min()
@@ -863,23 +995,18 @@ def find_crt_setups(
                     .iloc[j]
                     < local_low
                 ):
+
                     mss_index = j
                     break
 
         if mss_index is None:
+
             i += 1
             continue
 
-        # ----------------------------------------------------
-        # RETEST
-        #
-        # We use the body of the MSS candle as the retest zone.
-        #
-        # The retest itself is confirmed by price trading into
-        # the zone.
-        #
-        # Entry happens at the NEXT candle OPEN.
-        # ----------------------------------------------------
+        # ====================================================
+        # RETEST ZONE
+        # ====================================================
 
         mss_open = float(
             bars["open"]
@@ -925,17 +1052,25 @@ def find_crt_setups(
 
             if touches_zone:
 
-                # IMPORTANT:
-                # The retest candle is confirmation only.
-                # Entry is NEXT candle open.
+                # Retest candle is confirmation.
+                #
+                # Actual execution happens
+                # at the NEXT 15M OPEN.
+
                 entry_index = j + 1
+
                 break
 
         if (
             entry_index is None
             or entry_index >= total
         ):
-            i = mss_index + 1
+
+            i = (
+                mss_index
+                + 1
+            )
+
             continue
 
         entry_price = float(
@@ -943,20 +1078,20 @@ def find_crt_setups(
             .iloc[entry_index]
         )
 
-        # Entry must remain inside the original CRT range.
+        # Entry must remain inside original range.
+
         if not (
             parent_low
             < entry_price
             < parent_high
         ):
+
             i = entry_index
             continue
 
-        # ----------------------------------------------------
-        # STOP = SWEEP EXTREME
-        #
-        # TARGET = 2R
-        # ----------------------------------------------------
+        # ====================================================
+        # STOP / TARGET
+        # ====================================================
 
         stop_price = sweep_price
 
@@ -985,6 +1120,7 @@ def find_crt_setups(
             )
 
         if risk <= 0:
+
             i = entry_index
             continue
 
@@ -994,843 +1130,15 @@ def find_crt_setups(
         )
 
         if (
-            risk_pct < MIN_RISK_PCT
-            or risk_pct > MAX_RISK_PCT
+            risk_pct
+            < MIN_RISK_PCT
+            or
+            risk_pct
+            > MAX_RISK_PCT
         ):
+
             i = entry_index
             continue
 
-        # ----------------------------------------------------
-        # RR FEASIBILITY CHECK
-        #
-        # If the opposite CRT side is closer than 2R,
-        # the trade is not a valid CRT 1:2 setup.
-        # ----------------------------------------------------
-
-        if side == "LONG":
-
-            available_reward = (
-                parent_high
-                - entry_price
-            )
-
-        else:
-
-            available_reward = (
-                entry_price
-                - parent_low
-            )
-
-        if (
-            available_reward
-            < RR * risk
-        ):
-            i = entry_index
-            continue
-
-        # ----------------------------------------------------
-        # FORWARD TRADE SIMULATION
-        #
-        # No timeout.
-        # No trailing.
-        # No BE.
-        #
-        # Same candle SL + TP = LOSS.
-        # ----------------------------------------------------
-
-        exit_index = None
-        gross_r = None
-        exit_reason = None
-
-        for k in range(
-            entry_index,
-            total,
-        ):
-
-            bar_high = float(
-                bars["high"]
-                .iloc[k]
-            )
-
-            bar_low = float(
-                bars["low"]
-                .iloc[k]
-            )
-
-            if side == "LONG":
-
-                hit_sl = (
-                    bar_low
-                    <= stop_price
-                )
-
-                hit_tp = (
-                    bar_high
-                    >= target_price
-                )
-
-            else:
-
-                hit_sl = (
-                    bar_high
-                    >= stop_price
-                )
-
-                hit_tp = (
-                    bar_low
-                    <= target_price
-                )
-
-            # Ambiguous candle:
-            # conservative assumption = LOSS.
-            if hit_sl and hit_tp:
-
-                exit_index = k
-                gross_r = -1.0
-                exit_reason = (
-                    "BOTH_SL_TP_SAME_CANDLE"
-                )
-                break
-
-            if hit_sl:
-
-                exit_index = k
-                gross_r = -1.0
-                exit_reason = "SL"
-                break
-
-            if hit_tp:
-
-                exit_index = k
-                gross_r = RR
-                exit_reason = "TP"
-                break
-
-        # ----------------------------------------------------
-        # CENSORED TRADE
-        #
-        # If neither SL nor TP occurs before dataset end,
-        # exclude it from performance.
-        # ----------------------------------------------------
-
-        if exit_index is None:
-            break
-
-        # ----------------------------------------------------
-        # COST MODEL
-        #
-        # Round trip:
-        # entry fee + exit fee
-        # entry slippage + exit slippage
-        #
-        # Convert absolute trading cost to R.
-        # ----------------------------------------------------
-
-        trading_cost = (
-            2.0
-            * NOTIONAL
-            * (
-                FEE_RATE
-                + SLIPPAGE_RATE
-            )
-        )
-
-        dollar_risk = (
-            NOTIONAL
-            * risk_pct
-        )
-
-        cost_r = (
-            trading_cost
-            / dollar_risk
-        )
-
-        net_r = (
-            gross_r
-            - cost_r
-        )
-
-        trades.append(
-            {
-                "symbol": symbol,
-                "parent_time": parent_time,
-                "sweep_time": current.open_time,
-                "mss_time": bars[
-                    "open_time"
-                ].iloc[mss_index],
-                "retest_time": bars[
-                    "open_time"
-                ].iloc[
-                    entry_index - 1
-                ],
-                "entry_time": bars[
-                    "open_time"
-                ].iloc[entry_index],
-                "exit_time": bars[
-                    "open_time"
-                ].iloc[exit_index],
-
-                "side": side,
-
-                "parent_high": parent_high,
-                "parent_low": parent_low,
-                "parent_range": parent_range,
-
-                "sweep_price": sweep_price,
-                "sweep_depth": sweep_depth,
-
-                "entry": entry_price,
-                "sl": stop_price,
-                "tp": target_price,
-
-                "risk_pct": risk_pct,
-
-                "gross_r": gross_r,
-                "cost_r": cost_r,
-                "net_r": net_r,
-
-                "win": int(
-                    gross_r > 0
-                ),
-
-                "exit_reason": exit_reason,
-            }
-        )
-
-        # ----------------------------------------------------
-        # PER-SYMBOL OVERLAP LOCK
-        #
-        # Nothing else on this symbol can be opened until
-        # this trade closes.
-        #
-        # +1 means no same-candle re-entry.
-        # ----------------------------------------------------
-
-        i = exit_index + 1
-
-    return pd.DataFrame(
-        trades
-    )
-
-
-# ============================================================
-# STATISTICS
-# ============================================================
-
-def calculate_summary(
-    trades,
-):
-    if len(trades) == 0:
-
-        return {
-            "trades": 0,
-            "wins": 0,
-            "losses": 0,
-            "wr_pct": np.nan,
-            "gross_r": 0.0,
-            "net_r": 0.0,
-            "pf": np.nan,
-            "max_loss_streak": 0,
-            "avg_net_r": np.nan,
-        }
-
-    wins = int(
-        (
-            trades["gross_r"]
-            > 0
-        ).sum()
-    )
-
-    losses = int(
-        (
-            trades["gross_r"]
-            < 0
-        ).sum()
-    )
-
-    gross_profit = (
-        trades.loc[
-            trades["net_r"] > 0,
-            "net_r",
-        ].sum()
-    )
-
-    gross_loss = -(
-        trades.loc[
-            trades["net_r"] < 0,
-            "net_r",
-        ].sum()
-    )
-
-    if gross_loss > 0:
-        pf = (
-            gross_profit
-            / gross_loss
-        )
-    else:
-        pf = np.inf
-
-    streak = 0
-    max_streak = 0
-
-    for win in trades[
-        "win"
-    ].tolist():
-
-        if win == 0:
-
-            streak += 1
-
-            max_streak = max(
-                max_streak,
-                streak,
-            )
-
-        else:
-            streak = 0
-
-    return {
-        "trades": len(trades),
-        "wins": wins,
-        "losses": losses,
-        "wr_pct": (
-            100.0
-            * wins
-            / len(trades)
-        ),
-        "gross_r": trades[
-            "gross_r"
-        ].sum(),
-        "net_r": trades[
-            "net_r"
-        ].sum(),
-        "pf": pf,
-        "max_loss_streak": max_streak,
-        "avg_net_r": trades[
-            "net_r"
-        ].mean(),
-    }
-
-
-# ============================================================
-# PORTFOLIO AUDIT
-# ============================================================
-
-def audit_overlap(
-    trades,
-):
-    if len(trades) == 0:
-
-        return {
-            "symbol_overlap_errors": 0,
-            "max_simultaneous": 0,
-            "portfolio_limit": (
-                MAX_SIMULTANEOUS_POSITIONS
-            ),
-        }
-
-    ordered = trades.sort_values(
-        "entry_time"
-    ).reset_index(
-        drop=True
-    )
-
-    active = []
-
-    symbol_overlap_errors = 0
-    max_simultaneous = 0
-
-    for _, row in ordered.iterrows():
-
-        entry_time = row[
-            "entry_time"
-        ]
-
-        # Remove closed positions.
-        active = [
-            item
-            for item in active
-            if item["exit_time"]
-            > entry_time
-        ]
-
-        # Check same-symbol overlap.
-        for item in active:
-
-            if (
-                item["symbol"]
-                == row["symbol"]
-            ):
-
-                symbol_overlap_errors += 1
-
-        active.append(
-            {
-                "symbol": row[
-                    "symbol"
-                ],
-                "exit_time": row[
-                    "exit_time"
-                ],
-            }
-        )
-
-        max_simultaneous = max(
-            max_simultaneous,
-            len(active),
-        )
-
-    return {
-        "symbol_overlap_errors": (
-            symbol_overlap_errors
-        ),
-        "max_simultaneous": (
-            max_simultaneous
-        ),
-        "portfolio_limit": (
-            MAX_SIMULTANEOUS_POSITIONS
-        ),
-    }
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    end = (
-        pd.Timestamp.now(
-            tz="UTC"
-        )
-        .floor("15min")
-    )
-
-    start = (
-        end
-        - pd.Timedelta(
-            days=(
-                RESEARCH_DAYS
-                + WARMUP_DAYS
-            )
-        )
-    )
-
-    print("=" * 70)
-    print(
-        "CRT STAGE-0"
-    )
-    print(
-        "4H RANGE -> SWEEP -> RECLAIM -> "
-        "15M MSS -> RETEST"
-    )
-    print("=" * 70)
-
-    print(
-        "Window:",
-        start,
-        "->",
-        end,
-    )
-
-    print(
-        "Symbols:",
-        len(SYMBOLS),
-    )
-
-    print(
-        "RR:",
-        RR,
-    )
-
-    print(
-        "Fee:",
-        FEE_RATE,
-    )
-
-    print(
-        "Slippage:",
-        SLIPPAGE_RATE,
-    )
-
-    print()
-
-    all_trades = []
-
-    for index, symbol in enumerate(
-        SYMBOLS,
-        start=1,
-    ):
-
-        print(
-            f"[{index}/{len(SYMBOLS)}] "
-            f"{symbol}",
-            flush=True,
-        )
-
-        # ----------------------------------------------------
-        # Download 4H
-        # ----------------------------------------------------
-
-        h4 = fetch_binance_klines(
-            symbol,
-            HTF_INTERVAL,
-            start,
-            end,
-        )
-
-        # ----------------------------------------------------
-        # Download 15M
-        # ----------------------------------------------------
-
-        m15 = fetch_binance_klines(
-            symbol,
-            LTF_INTERVAL,
-            start,
-            end,
-        )
-
-        # ----------------------------------------------------
-        # Remove incomplete final candles.
-        # ----------------------------------------------------
-
-        h4 = h4[
-            h4["open_time"]
-            + pd.Timedelta(
-                hours=4
-            )
-            <= end
-        ].copy()
-
-        m15 = m15[
-            m15["open_time"]
-            + pd.Timedelta(
-                minutes=15
-            )
-            <= end
-        ].copy()
-
-        # ----------------------------------------------------
-        # Data integrity audit.
-        # ----------------------------------------------------
-
-        audit_continuity(
-            h4,
-            240,
-            symbol,
-            "4H",
-        )
-
-        audit_continuity(
-            m15,
-            15,
-            symbol,
-            "15M",
-        )
-
-        # ----------------------------------------------------
-        # Prepare parent candles.
-        # ----------------------------------------------------
-
-        h4 = prepare_4h(
-            h4
-        )
-
-        # ----------------------------------------------------
-        # Attach previous CLOSED 4H candle to 15M.
-        # ----------------------------------------------------
-
-        data = attach_parent_range(
-            h4,
-            m15,
-        )
-
-        # ----------------------------------------------------
-        # Detect CRT trades.
-        # ----------------------------------------------------
-
-        symbol_trades = find_crt_setups(
-            data,
-            symbol,
-        )
-
-        print(
-            "  Trades:",
-            len(symbol_trades),
-        )
-
-        if len(symbol_trades) > 0:
-
-            all_trades.append(
-                symbol_trades
-            )
-
-    if not all_trades:
-
-        raise RuntimeError(
-            "CRT produced zero trades."
-        )
-
-    trades = pd.concat(
-        all_trades,
-        ignore_index=True,
-    )
-
-    trades = trades.sort_values(
-        "entry_time"
-    ).reset_index(
-        drop=True
-    )
-
-    # ========================================================
-    # CHRONOLOGICAL SPLIT
-    #
-    # 50% Discovery
-    # 25% Development
-    # 25% Validation
-    #
-    # IMPORTANT:
-    # Validation is untouched.
-    # ========================================================
-
-    n = len(trades)
-
-    split_1 = int(
-        n * 0.50
-    )
-
-    split_2 = int(
-        n * 0.75
-    )
-
-    trades["split"] = np.where(
-        np.arange(n) < split_1,
-        "DISCOVERY",
-        np.where(
-            np.arange(n) < split_2,
-            "DEVELOPMENT",
-            "VALIDATION",
-        ),
-    )
-
-    # ========================================================
-    # OVERALL SPLIT SUMMARY
-    # ========================================================
-
-    split_rows = []
-
-    for split_name in [
-        "DISCOVERY",
-        "DEVELOPMENT",
-        "VALIDATION",
-    ]:
-
-        subset = trades[
-            trades["split"]
-            == split_name
-        ].copy()
-
-        stats = calculate_summary(
-            subset
-        )
-
-        stats["split"] = split_name
-
-        split_rows.append(
-            stats
-        )
-
-    summary = pd.DataFrame(
-        split_rows
-    )
-
-    summary = summary[
-        [
-            "split",
-            "trades",
-            "wins",
-            "losses",
-            "wr_pct",
-            "gross_r",
-            "net_r",
-            "pf",
-            "max_loss_streak",
-            "avg_net_r",
-        ]
-    ]
-
-    # ========================================================
-    # SYMBOL / SIDE SUMMARY
-    # ========================================================
-
-    symbol_rows = []
-
-    for (
-        split_name,
-        symbol,
-        side,
-    ), group in trades.groupby(
-        [
-            "split",
-            "symbol",
-            "side",
-        ]
-    ):
-
-        stats = calculate_summary(
-            group
-        )
-
-        stats.update(
-            {
-                "split": split_name,
-                "symbol": symbol,
-                "side": side,
-            }
-        )
-
-        symbol_rows.append(
-            stats
-        )
-
-    symbol_summary = pd.DataFrame(
-        symbol_rows
-    )
-
-    symbol_summary = symbol_summary[
-        [
-            "split",
-            "symbol",
-            "side",
-            "trades",
-            "wins",
-            "losses",
-            "wr_pct",
-            "gross_r",
-            "net_r",
-            "pf",
-            "max_loss_streak",
-            "avg_net_r",
-        ]
-    ]
-
-    # ========================================================
-    # OVERLAP AUDIT
-    # ========================================================
-
-    overlap = audit_overlap(
-        trades
-    )
-
-    audit_df = pd.DataFrame(
-        [
-            {
-                "total_trades": len(
-                    trades
-                ),
-                "symbol_overlap_errors": (
-                    overlap[
-                        "symbol_overlap_errors"
-                    ]
-                ),
-                "max_simultaneous": (
-                    overlap[
-                        "max_simultaneous"
-                    ]
-                ),
-                "portfolio_limit": (
-                    overlap[
-                        "portfolio_limit"
-                    ]
-                ),
-                "portfolio_limit_exceeded": (
-                    overlap[
-                        "max_simultaneous"
-                    ]
-                    > MAX_SIMULTANEOUS_POSITIONS
-                ),
-            }
-        ]
-    )
-
-    # ========================================================
-    # SAVE RESULTS
-    # ========================================================
-
-    trades.to_csv(
-        "crt_stage0_trades.csv",
-        index=False,
-    )
-
-    summary.to_csv(
-        "crt_stage0_summary.csv",
-        index=False,
-    )
-
-    symbol_summary.to_csv(
-        "crt_stage0_validation_symbols.csv",
-        index=False,
-    )
-
-    audit_df.to_csv(
-        "crt_stage0_audit.csv",
-        index=False,
-    )
-
-    # ========================================================
-    # PRINT
-    # ========================================================
-
-    print()
-    print("=" * 70)
-    print(
-        "CRT STAGE-0 SUMMARY"
-    )
-    print("=" * 70)
-
-    print(
-        summary.to_string(
-            index=False
-        )
-    )
-
-    print()
-    print(
-        "OVERLAP AUDIT"
-    )
-
-    print(
-        audit_df.to_string(
-            index=False
-        )
-    )
-
-    print()
-    print(
-        "Files saved:"
-    )
-
-    print(
-        "  crt_stage0_trades.csv"
-    )
-
-    print(
-        "  crt_stage0_summary.csv"
-    )
-
-    print(
-        "  crt_stage0_validation_symbols.csv"
-    )
-
-    print(
-        "  crt_stage0_audit.csv"
-    )
-
-    print()
-    print(
-        "CRT STAGE-0 COMPLETE"
-    )
-
-
-if __name__ == "__main__":
-    main()
+        # ====================================================
+        # 1
