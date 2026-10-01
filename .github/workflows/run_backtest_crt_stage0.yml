@@ -15,36 +15,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-
       - name: Setup Python
         uses: actions/setup-python@v5
-
         with:
           python-version: "3.11"
 
-
       - name: Install dependencies
         run: |
-
           python -m pip install --upgrade pip
-
-          pip install \
-            numpy \
-            pandas \
-            requests
-
+          pip install numpy pandas requests
 
       - name: Validate Python
         run: |
-
           python -m py_compile crt_stage0.py
-
           echo "Python syntax check: PASS"
-
 
       - name: Remove stale outputs
         run: |
-
           rm -f crt_stage0_trades.csv
           rm -f crt_stage0_summary.csv
           rm -f crt_stage0_validation_symbols.csv
@@ -52,22 +39,15 @@ jobs:
 
           echo "Old CRT outputs removed."
 
-
       - name: Run CRT Stage-0
         run: |
-
           python -u crt_stage0.py
-
 
       - name: Verify outputs
         run: |
-
           test -s crt_stage0_trades.csv
-
           test -s crt_stage0_summary.csv
-
           test -s crt_stage0_validation_symbols.csv
-
           test -s crt_stage0_audit.csv
 
           echo "======================================"
@@ -80,22 +60,13 @@ jobs:
             crt_stage0_validation_symbols.csv \
             crt_stage0_audit.csv
 
-
       - name: Upload CRT results
         uses: actions/upload-artifact@v4
-
         with:
-
           name: crt-stage0-results
-
           if-no-files-found: error
-
           path: |
-
             crt_stage0_trades.csv
-
             crt_stage0_summary.csv
-
             crt_stage0_validation_symbols.csv
-
             crt_stage0_audit.csv
