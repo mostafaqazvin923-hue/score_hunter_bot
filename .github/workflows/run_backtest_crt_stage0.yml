@@ -5,14 +5,11 @@ on:
 
 jobs:
   backtest:
-
     runs-on: ubuntu-24.04
-
     timeout-minutes: 180
 
     steps:
-
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -25,10 +22,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy pandas requests
 
-      - name: Validate Python
+      - name: Validate Python syntax
         run: |
           python -m py_compile crt_stage0.py
+          echo "======================================"
           echo "Python syntax check: PASS"
+          echo "======================================"
 
       - name: Remove stale outputs
         run: |
@@ -41,10 +40,18 @@ jobs:
 
       - name: Run CRT Stage-0
         run: |
+          echo "======================================"
+          echo "STARTING CRT STAGE-0"
+          echo "======================================"
+
           python -u crt_stage0.py
 
       - name: Verify outputs
         run: |
+          echo "======================================"
+          echo "VERIFYING CRT OUTPUT FILES"
+          echo "======================================"
+
           test -s crt_stage0_trades.csv
           test -s crt_stage0_summary.csv
           test -s crt_stage0_validation_symbols.csv
@@ -61,10 +68,11 @@ jobs:
             crt_stage0_audit.csv
 
       - name: Upload CRT results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: crt-stage0-results
-          if-no-files-found: error
+          if-no-files-found: warn
           path: |
             crt_stage0_trades.csv
             crt_stage0_summary.csv
