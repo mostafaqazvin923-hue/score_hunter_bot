@@ -1,4 +1,3 @@
-
 name: "EBP Setup 1 Backtest"
 
 on:
@@ -7,19 +6,32 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+
+    timeout-minutes: 60
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install dependencies
-        run: pip install pandas numpy requests
-      - name: Run Setup 1
-        run: python ebp_setup1_backtest.py
-      - name: Upload results
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests
+
+      - name: Run EBP Setup 1
+        run: |
+          python ebp_setup1_backtest.py
+
+      - name: Upload backtest results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ebp_setup1_results
           path: ebp_setup1_outputs/
-          
+          if-no-files-found: warn
