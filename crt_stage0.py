@@ -1,4 +1,7 @@
+#!/usr/bin/env python3
+
 import io
+import math
 import time
 import zipfile
 from pathlib import Path
@@ -9,67 +12,14 @@ import requests
 
 
 # ============================================================
-# CRT STAGE-0 DIAGNOSTIC
-#
-# PREVIOUS COMPLETED 4H RANGE
-#          ↓
-# 15M SWEEP
-#          ↓
-# RECLAIM
-#          ↓
-# 15M MSS
-#          ↓
-# RETEST
-#          ↓
-# NEXT 15M OPEN
-#          ↓
-# SL / TP = 1 : 2
-#
-# IMPORTANT:
-# The CRT range is ALWAYS the PREVIOUS completed 4H candle.
-#
-# No future 4H candle information is used.
-# ============================================================
-
-
-# ============================================================
-# RESEARCH RULES
-# ============================================================
-#
-# - No lookahead
-# - No future leak
-# - No timeout
-# - No breakeven
-# - No trailing
-# - No pyramiding
-# - One open trade per symbol
-# - Different symbols may overlap
-# - Maximum 10 simultaneous positions
-# - Same-candle SL + TP = LOSS
-# - Unresolved final trades are censored
-# - Entry = next 15M open after retest
-# ============================================================
-
-
-# ============================================================
 # CONFIG
 # ============================================================
 
 SYMBOLS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "SOLUSDT",
-    "SUIUSDT",
-    "AVAXUSDT",
-    "NEARUSDT",
-    "ADAUSDT",
-    "BNBUSDT",
-    "APTUSDT",
-    "CRVUSDT",
-    "ONDOUSDT",
-    "PENDLEUSDT",
-    "ICPUSDT",
-    "WIFUSDT",
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT",
+    "AVAXUSDT", "NEARUSDT", "ADAUSDT", "BNBUSDT",
+    "APTUSDT", "CRVUSDT", "ONDOUSDT", "PENDLEUSDT",
+    "ICPUSDT", "WIFUSDT",
 ]
 
 RESEARCH_DAYS = 365
@@ -81,7 +31,7 @@ LTF_INTERVAL = "15m"
 RR = 2.0
 
 FEE_RATE = 0.0007
-SLIPPAGE_RATE = 0.0003
+SLIPPAGE = 0.0003
 
 MARGIN = 100.0
 LEVERAGE = 50.0
@@ -89,10 +39,7 @@ NOTIONAL = MARGIN * LEVERAGE
 
 MAX_SIMULTANEOUS_POSITIONS = 10
 
-# ------------------------------------------------------------
-# CRT STRUCTURE
-# ------------------------------------------------------------
-
+# Pre-registered CRT constraint.
 MAX_SWEEP_DEPTH = 0.35
 
 MSS_LOOKBACK = 4
@@ -102,54 +49,95 @@ RETEST_MAX_BARS = 6
 MIN_RISK_PCT = 0.0005
 MAX_RISK_PCT = 0.08
 
-# ------------------------------------------------------------
-# Diagnostic mode
-# ------------------------------------------------------------
-
-DIAGNOSTIC = True
+BASE_URL = "https://data.binance.vision/data/futures/um"
 
 DATA_DIR = Path("crt_data")
+DATA_DIR.mkdir(exist_ok=True)
 
-OUTPUT_FILES = [
-    Path("crt_stage0_trades.csv"),
-    Path("crt_stage0_summary.csv"),
-    Path("crt_stage0_validation_symbols.csv"),
-    Path("crt_stage0_audit.csv"),
-    Path("crt_stage0_diagnostic.csv"),
-]
+OUT_TRADES = "crt_stage0_trades.csv"
+OUT_SUMMARY = "crt_stage0_summary.csv"
+OUT_VALIDATION = "crt_stage0_validation_symbols.csv"
+OUT_AUDIT = "crt_stage0_audit.csv"
 
-
-# ============================================================
-# HTTP
-# ============================================================
-
-session = requests.Session()
-
-session.headers.update(
-    {
-        "User-Agent": "Mozilla/5.0 CRT-Stage0-Research"
-    }
-)
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "CRT-Stage0-Research/1.0"
+})
 
 
 # ============================================================
 # TIME HELPERS
 # ============================================================
 
-def ensure_utc_timestamp(value):
-
+def ensure_utc(value):
     ts = pd.Timestamp(value)
 
     if ts.tzinfo is None:
-        ts = ts.tz_localize("UTC")
-    else:
-        ts = ts.tz_convert("UTC")
+        return ts.tz_localize("UTC")
 
-    return ts
+    return ts.tz_convert("UTC")
+
+
+def month_range(start, end):
+    start = (
+        ensure_utc(start)
+        .tz_localize(None)
+        .to_period("M")
+    )
+
+    end = (
+        ensure_utc(end)
+        .tz_localize(None)
+        .to_period("M")
+    )
+
+    return pd.period_range(
+        start,
+        end,
+        freq="M"
+    )
+
+
+def day_range(start, end):
+    start = (
+        ensure_utc(start)
+        .tz_localize(None)
+        .to_period("D")
+    )
+
+    end = (
+        ensure_utc(end)
+        .tz_localize(None)
+        .to_period("D")
+    )
+
+    return pd.period_range(
+        start,
+        end,
+        freq="D"
+    )
+
+
+def interval_delta(interval):
+    if interval.endswith("m"):
+        return pd.Timedelta(
+            minutes=int(interval[:-1])
+        )
+
+    if interval.endswith("h"):
+        return pd.Timedelta(
+            hours=int(interval[:-1])
+        )
+
+    if interval.endswith("d"):
+        return pd.Timedelta(
+            days=int(interval[:-1])
+        )
+
+    raise ValueError(interval)
 
 
 def latest_completed_15m():
-
     now = pd.Timestamp.now(tz="UTC")
 
     return (
@@ -158,121 +146,94 @@ def latest_completed_15m():
     )
 
 
-def month_range(start, end):
+def latest_completed_4h():
+    now = pd.Timestamp.now(tz="UTC")
 
-    start_ts = (
-        ensure_utc_timestamp(start)
-        .tz_localize(None)
+    return (
+        now.floor("4h")
+        - pd.Timedelta(hours=4)
     )
-
-    end_ts = (
-        ensure_utc_timestamp(end)
-        .tz_localize(None)
-    )
-
-    current = start_ts.to_period("M")
-    last = end_ts.to_period("M")
-
-    result = []
-
-    while current <= last:
-
-        result.append(str(current))
-        current += 1
-
-    return result
 
 
 # ============================================================
-# DOWNLOAD
+# BINANCE VISION
 # ============================================================
 
-def download_archive(url, timeout=60):
-
-    try:
-
-        response = session.get(
-            url,
-            timeout=timeout,
+def archive_url(
+    symbol,
+    interval,
+    period,
+    monthly=True
+):
+    if monthly:
+        return (
+            f"{BASE_URL}/monthly/klines/"
+            f"{symbol}/{interval}/"
+            f"{symbol}-{interval}-{period}.zip"
         )
 
-        if response.status_code == 200:
+    return (
+        f"{BASE_URL}/daily/klines/"
+        f"{symbol}/{interval}/"
+        f"{symbol}-{interval}-{period}.zip"
+    )
+
+
+def download_bytes(
+    url,
+    retries=3
+):
+    last_error = None
+
+    for attempt in range(
+        1,
+        retries + 1
+    ):
+        try:
+            response = SESSION.get(
+                url,
+                timeout=45
+            )
+
+            if response.status_code == 404:
+                return None
+
+            response.raise_for_status()
 
             return response.content
 
-        if response.status_code != 404:
+        except Exception as exc:
+            last_error = exc
 
-            print(
-                f"HTTP {response.status_code}: {url}",
-                flush=True,
-            )
+            if attempt < retries:
+                time.sleep(
+                    1.5 * attempt
+                )
 
-        return None
-
-    except requests.RequestException as exc:
-
-        print(
-            f"Request error: {exc}",
-            flush=True,
-        )
-
-        return None
+    raise RuntimeError(
+        f"Download failed: {url} | {last_error}"
+    )
 
 
-# ============================================================
-# BINANCE ZIP
-# ============================================================
-
-def read_binance_zip(blob):
-
+def parse_vision_zip(content):
     with zipfile.ZipFile(
-        io.BytesIO(blob)
-    ) as archive:
+        io.BytesIO(content)
+    ) as z:
 
-        csv_files = [
-            name
-            for name in archive.namelist()
-            if name.lower().endswith(".csv")
-        ]
+        names = z.namelist()
 
-        if not csv_files:
-
+        if not names:
             raise RuntimeError(
-                "No CSV inside Binance archive."
+                "Empty Binance archive"
             )
 
-        with archive.open(
-            csv_files[0]
-        ) as file:
-
+        with z.open(names[0]) as f:
             df = pd.read_csv(
-                file,
-                header=None,
+                f,
+                header=None
             )
 
-    if len(df) > 0:
-
-        first = str(
-            df.iloc[0, 0]
-        ).strip().lower()
-
-        if first in {
-            "open_time",
-            "open time",
-        }:
-
-            df = df.iloc[1:].copy()
-
-    if df.shape[1] < 12:
-
-        raise RuntimeError(
-            f"Unexpected Binance columns: "
-            f"{df.shape[1]}"
-        )
-
-    df = df.iloc[:, :12].copy()
-
-    df.columns = [
+    expected = [
         "open_time",
         "open",
         "high",
@@ -287,44 +248,59 @@ def read_binance_zip(blob):
         "ignore",
     ]
 
-    df["open_time"] = pd.to_numeric(
-        df["open_time"],
-        errors="coerce",
-    )
+    # Header-row protection
+    if (
+        str(df.iloc[0, 0]).lower()
+        in {"open_time", "open time"}
+    ):
+        df = (
+            df.iloc[1:]
+            .reset_index(drop=True)
+        )
 
-    df = df.dropna(
-        subset=["open_time"]
-    )
+    if df.shape[1] < 6:
+        raise RuntimeError(
+            f"Unexpected kline columns: "
+            f"{df.shape[1]}"
+        )
 
-    df["open_time"] = pd.to_datetime(
-        df["open_time"],
-        unit="ms",
-        utc=True,
-    )
+    df.columns = expected[:df.shape[1]]
 
     numeric_columns = [
+        "open_time",
         "open",
         "high",
         "low",
         "close",
         "volume",
+        "close_time",
         "quote_volume",
+        "trades",
+        "taker_buy_base",
+        "taker_buy_quote",
     ]
 
     for column in numeric_columns:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce",
-        )
+        if column in df.columns:
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce"
+            )
 
     df = df.dropna(
         subset=[
+            "open_time",
             "open",
             "high",
             "low",
             "close",
         ]
+    )
+
+    df["open_time"] = pd.to_datetime(
+        df["open_time"].astype("int64"),
+        unit="ms",
+        utc=True
     )
 
     return df[
@@ -335,33 +311,22 @@ def read_binance_zip(blob):
             "low",
             "close",
             "volume",
-            "quote_volume",
         ]
     ].copy()
 
-
-# ============================================================
-# FETCH
-# ============================================================
 
 def fetch_binance_klines(
     symbol,
     interval,
     start,
-    end,
+    end
 ):
-
-    start_ts = ensure_utc_timestamp(start)
-    end_ts = ensure_utc_timestamp(end)
-
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    start = ensure_utc(start)
+    end = ensure_utc(end)
 
     cache_file = (
-        DATA_DIR
-        / f"{symbol}_{interval}.csv"
+        DATA_DIR /
+        f"{symbol}_{interval}.csv"
     )
 
     # --------------------------------------------------------
@@ -371,7 +336,6 @@ def fetch_binance_klines(
     if cache_file.exists():
 
         try:
-
             cached = pd.read_csv(
                 cache_file
             )
@@ -379,395 +343,326 @@ def fetch_binance_klines(
             cached["open_time"] = pd.to_datetime(
                 cached["open_time"],
                 utc=True,
+                errors="coerce"
+            )
+
+            cached = cached.dropna(
+                subset=["open_time"]
             )
 
             cached = (
                 cached
                 .sort_values("open_time")
-                .drop_duplicates("open_time")
-                .reset_index(drop=True)
+                .drop_duplicates(
+                    "open_time",
+                    keep="last"
+                )
             )
 
             if (
-                len(cached) >= 10
-                and cached["open_time"].min() <= start_ts
-                and cached["open_time"].max() >= end_ts
+                not cached.empty
+                and cached["open_time"].min() <= start
+                and cached["open_time"].max() >= end
             ):
-
-                result = cached[
-                    (cached["open_time"] >= start_ts)
+                return cached[
+                    (
+                        cached["open_time"] >= start
+                    )
                     &
-                    (cached["open_time"] < end_ts)
+                    (
+                        cached["open_time"] <= end
+                    )
                 ].copy()
 
-                if len(result) >= 10:
+        except Exception:
+            pass
 
-                    return result
-
-        except Exception as exc:
-
-            print(
-                f"Cache ignored: {exc}",
-                flush=True,
-            )
-
-    frames = []
+    parts = []
 
     # --------------------------------------------------------
     # MONTHLY
     # --------------------------------------------------------
 
-    for ym in month_range(
-        start_ts,
-        end_ts,
+    for period in month_range(
+        start,
+        end
     ):
 
-        url = (
-            "https://data.binance.vision/data/"
-            "futures/um/monthly/klines/"
-            f"{symbol}/{interval}/"
-            f"{symbol}-{interval}-{ym}.zip"
+        ym = str(period)
+
+        url = archive_url(
+            symbol,
+            interval,
+            ym,
+            monthly=True
         )
 
-        blob = download_archive(url)
+        content = download_bytes(url)
 
-        if blob is not None:
+        if content is not None:
 
-            frames.append(
-                read_binance_zip(blob)
+            parts.append(
+                parse_vision_zip(
+                    content
+                )
             )
-
-        time.sleep(0.03)
-
-    # --------------------------------------------------------
-    # EXISTING DAYS
-    # --------------------------------------------------------
-
-    if frames:
-
-        monthly = pd.concat(
-            frames,
-            ignore_index=True,
-        )
-
-        existing_days = set(
-            monthly["open_time"]
-            .dt.strftime("%Y-%m-%d")
-        )
-
-    else:
-
-        existing_days = set()
 
     # --------------------------------------------------------
     # DAILY FALLBACK
     # --------------------------------------------------------
 
-    day = start_ts.floor("D")
-    last_day = end_ts.floor("D")
+    if parts:
 
-    while day <= last_day:
-
-        date_string = day.strftime("%Y-%m-%d")
-
-        if date_string not in existing_days:
-
-            url = (
-                "https://data.binance.vision/data/"
-                "futures/um/daily/klines/"
-                f"{symbol}/{interval}/"
-                f"{symbol}-{interval}-"
-                f"{date_string}.zip"
-            )
-
-            blob = download_archive(url)
-
-            if blob is not None:
-
-                frames.append(
-                    read_binance_zip(blob)
-                )
-
-            time.sleep(0.01)
-
-        day += pd.Timedelta(days=1)
-
-    if not frames:
-
-        raise RuntimeError(
-            f"{symbol} {interval}: "
-            "NO BINANCE DATA DOWNLOADED."
+        combined = pd.concat(
+            parts,
+            ignore_index=True
         )
 
-    df = pd.concat(
-        frames,
-        ignore_index=True,
-    )
+        combined["open_time"] = pd.to_datetime(
+            combined["open_time"],
+            utc=True
+        )
 
-    df["open_time"] = pd.to_datetime(
-        df["open_time"],
-        utc=True,
-    )
+        have_min = (
+            combined["open_time"].min()
+        )
 
-    df = (
-        df
-        .drop_duplicates("open_time")
-        .sort_values("open_time")
-        .reset_index(drop=True)
-    )
-
-    # --------------------------------------------------------
-    # REMOVE INCOMPLETE CURRENT CANDLE
-    # --------------------------------------------------------
-
-    if interval == "15m":
-
-        completed_limit = (
-            latest_completed_15m()
+        have_max = (
+            combined["open_time"].max()
         )
 
     else:
 
-        completed_limit = (
-            end_ts
-        )
+        combined = pd.DataFrame()
 
-    df = df[
-        df["open_time"] <= completed_limit
-    ].copy()
+        have_min = None
+        have_max = None
 
-    # --------------------------------------------------------
-    # WINDOW
-    # --------------------------------------------------------
+    need_daily = (
+        combined.empty
+        or have_min > start
+        or have_max < end
+    )
 
-    df = df[
-        (df["open_time"] >= start_ts)
-        &
-        (df["open_time"] < end_ts)
-    ].copy()
+    if need_daily:
 
-    if len(df) < 10:
+        for period in day_range(
+            start,
+            end
+        ):
 
+            ds = str(period)
+
+            url = archive_url(
+                symbol,
+                interval,
+                ds,
+                monthly=False
+            )
+
+            content = download_bytes(url)
+
+            if content is not None:
+
+                parts.append(
+                    parse_vision_zip(
+                        content
+                    )
+                )
+
+    if not parts:
         raise RuntimeError(
             f"{symbol} {interval}: "
-            "too few rows."
+            f"no Binance data downloaded"
+        )
+
+    df = pd.concat(
+        parts,
+        ignore_index=True
+    )
+
+    df["open_time"] = pd.to_datetime(
+        df["open_time"],
+        utc=True
+    )
+
+    df = (
+        df
+        .sort_values("open_time")
+        .drop_duplicates(
+            "open_time",
+            keep="last"
+        )
+    )
+
+    df = df[
+        (
+            df["open_time"] >= start
+        )
+        &
+        (
+            df["open_time"] <= end
+        )
+    ].copy()
+
+    if df.empty:
+        raise RuntimeError(
+            f"{symbol} {interval}: "
+            f"empty requested range"
         )
 
     df.to_csv(
         cache_file,
-        index=False,
+        index=False
     )
 
-    return df
+    return (
+        df
+        .reset_index(drop=True)
+    )
 
 
 # ============================================================
-# CONTINUITY
+# DATA AUDIT
 # ============================================================
 
 def audit_continuity(
     df,
-    expected_minutes,
-    symbol,
-    name,
+    interval,
+    symbol
 ):
-
-    timestamps = (
-        pd.to_datetime(
-            df["open_time"],
-            utc=True,
+    if df.empty:
+        raise RuntimeError(
+            f"{symbol} {interval}: "
+            f"empty dataframe"
         )
-        .sort_values()
-        .drop_duplicates()
+
+    expected = interval_delta(
+        interval
     )
 
-    gaps = (
-        timestamps.diff()
+    ordered = (
+        df
+        .sort_values("open_time")
+        .copy()
+    )
+
+    diffs = (
+        ordered["open_time"]
+        .diff()
         .dropna()
-        .dt.total_seconds()
-        / 60.0
     )
 
-    bad = gaps[
-        gaps > expected_minutes * 1.01
+    gaps = diffs[
+        diffs > expected
     ]
 
-    if len(bad) > 0:
+    if not gaps.empty:
 
         raise RuntimeError(
-            f"{symbol} {name}: "
-            f"DATA GAP detected. "
-            f"Max gap={bad.max():.2f} minutes."
-        )
-
-    median_gap = float(
-        gaps.median()
-    )
-
-    if abs(
-        median_gap - expected_minutes
-    ) > 0.01:
-
-        raise RuntimeError(
-            f"{symbol} {name}: "
-            f"unexpected interval "
-            f"{median_gap:.2f} minutes."
+            f"{symbol} {interval}: "
+            f"gap detected. "
+            f"largest={gaps.max()}"
         )
 
 
 # ============================================================
-# 4H FEATURES
+# 4H RANGE
 # ============================================================
 
-def prepare_4h(df):
+def prepare_4h(h4):
 
-    x = df.copy()
-
-    x["open_time"] = pd.to_datetime(
-        x["open_time"],
-        utc=True,
+    h4 = (
+        h4
+        .sort_values("open_time")
+        .reset_index(drop=True)
+        .copy()
     )
 
-    x["range"] = (
-        x["high"] - x["low"]
-    )
-
-    previous_close = x["close"].shift(1)
-
-    true_range = pd.concat(
-        [
-            x["high"] - x["low"],
-            (x["high"] - previous_close).abs(),
-            (x["low"] - previous_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    x["atr14"] = (
-        true_range
-        .rolling(
-            14,
-            min_periods=14,
-        )
-        .mean()
-    )
-
-    x["range_pct"] = (
-        x["range"] / x["close"]
-    )
-
-    x["ema20"] = (
-        x["close"]
-        .ewm(
-            span=20,
-            adjust=False,
-        )
-        .mean()
-    )
-
-    x["ema50"] = (
-        x["close"]
-        .ewm(
-            span=50,
-            adjust=False,
-        )
-        .mean()
-    )
-
-    x["bias"] = np.where(
-        x["ema20"] > x["ema50"],
-        1,
-        -1,
-    )
-
-    return x
-
-
-# ============================================================
-# ATTACH PREVIOUS COMPLETED 4H RANGE
-# ============================================================
-#
-# CRITICAL CHANGE:
-#
-# A 15M candle AFTER a completed 4H candle uses that
-# completed 4H candle as the REFERENCE RANGE.
-#
-# Therefore:
-#
-# 4H candle A closes
-#       ↓
-# 4H candle A high/low becomes known
-#       ↓
-# subsequent 15M candles may sweep A high/low
-#
-# This is causal.
-# ============================================================
-
-def attach_parent_range(
-    h4,
-    m15,
-):
-
-    h = h4.copy()
-    l = m15.copy()
-
-    h["open_time"] = pd.to_datetime(
-        h["open_time"],
-        utc=True,
-    )
-
-    l["open_time"] = pd.to_datetime(
-        l["open_time"],
-        utc=True,
-    )
-
-    # --------------------------------------------------------
-    # COMPLETION TIME
-    # --------------------------------------------------------
-
-    h["htf_close_time"] = (
-        h["open_time"]
+    # A 4H candle beginning at 08:00 closes at 12:00.
+    h4["htf_close_time"] = (
+        h4["open_time"]
         + pd.Timedelta(hours=4)
     )
 
-    # --------------------------------------------------------
-    # USE COMPLETED 4H CANDLE
-    # --------------------------------------------------------
+    h4["parent_high"] = h4["high"]
+    h4["parent_low"] = h4["low"]
 
-    reference = h[
+    h4["parent_range"] = (
+        h4["parent_high"]
+        - h4["parent_low"]
+    )
+
+    h4["valid_parent_range"] = (
+        h4["parent_range"] > 0
+    )
+
+    return h4
+
+
+# ============================================================
+# IMPORTANT CAUSAL ALIGNMENT FIX
+# ============================================================
+
+def attach_parent_range(
+    ltf,
+    h4
+):
+    """
+    Causal mapping:
+
+        4H 08:00 -> closes 12:00
+
+        15M 12:00
+        15M 12:15
+        15M 12:30
+        ...
+
+    may see the completed 08:00-12:00 range.
+
+    But:
+
+        15M 11:45
+
+    may NOT see the 08:00-12:00 range.
+
+    This prevents lookahead.
+    """
+
+    ltf = (
+        ltf
+        .sort_values("open_time")
+        .reset_index(drop=True)
+        .copy()
+    )
+
+    h4 = (
+        h4
+        .sort_values("open_time")
+        .reset_index(drop=True)
+        .copy()
+    )
+
+    reference = h4[
         [
             "htf_close_time",
             "open_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "range",
-            "atr14",
-            "range_pct",
-            "bias",
+            "parent_high",
+            "parent_low",
+            "parent_range",
+            "valid_parent_range",
         ]
     ].copy()
 
-    reference.columns = [
-        "htf_close_time",
-        "reference_open_time",
-        "parent_open",
-        "parent_high",
-        "parent_low",
-        "parent_close",
-        "parent_range",
-        "parent_atr",
-        "parent_range_pct",
-        "parent_bias",
-    ]
-
     # --------------------------------------------------------
-    # INT64 MERGE KEYS
+    # THE KEY FIX
+    #
+    # Do NOT merge datetime64[ms] with datetime64[us].
+    # Convert BOTH sides to int64 nanoseconds.
     # --------------------------------------------------------
 
-    l["_merge_key"] = (
-        l["open_time"]
+    ltf["_merge_key"] = (
+        ltf["open_time"]
         .astype("int64")
     )
 
@@ -776,8 +671,8 @@ def attach_parent_range(
         .astype("int64")
     )
 
-    l = (
-        l
+    ltf = (
+        ltf
         .sort_values("_merge_key")
         .reset_index(drop=True)
     )
@@ -788,41 +683,63 @@ def attach_parent_range(
         .reset_index(drop=True)
     )
 
-    # --------------------------------------------------------
-    # CAUSAL ASOF
-    # --------------------------------------------------------
-
-    l = pd.merge_asof(
-        l,
+    mapped = pd.merge_asof(
+        ltf,
         reference,
         on="_merge_key",
         direction="backward",
         allow_exact_matches=True,
     )
 
-    l = l.drop(
+    mapped["parent_close_time"] = pd.to_datetime(
+        mapped["htf_close_time"],
+        utc=True,
+        errors="coerce"
+    )
+
+    # --------------------------------------------------------
+    # EXPLICIT CAUSAL VALIDATION
+    # --------------------------------------------------------
+
+    mapped["parent_range_valid"] = (
+        mapped["parent_high"].notna()
+        &
+        mapped["parent_low"].notna()
+        &
+        mapped["parent_range"].gt(0)
+        &
+        (
+            mapped["parent_close_time"]
+            <= mapped["open_time"]
+        )
+    )
+
+    mapped = mapped.drop(
         columns=["_merge_key"]
     )
 
-    l = l.dropna(
-        subset=[
-            "htf_close_time",
-            "parent_high",
-            "parent_low",
-            "parent_bias",
-        ]
-    ).reset_index(drop=True)
-
-    return l
+    return mapped
 
 
 # ============================================================
-# DIAGNOSTIC COUNTER FACTORY
+# CRT SIGNAL ENGINE
 # ============================================================
 
-def new_diagnostic():
+def find_crt_setups(
+    df,
+    symbol
+):
 
-    return {
+    bars = (
+        df
+        .sort_values("open_time")
+        .reset_index(drop=True)
+        .copy()
+    )
+
+    stats = {
+        "symbol": symbol,
+
         "parent_range_bars": 0,
         "valid_parent_range": 0,
 
@@ -834,9 +751,6 @@ def new_diagnostic():
 
         "sweep_depth_valid_long": 0,
         "sweep_depth_valid_short": 0,
-
-        "bias_valid_long": 0,
-        "bias_valid_short": 0,
 
         "mss_long": 0,
         "mss_short": 0,
@@ -855,710 +769,797 @@ def new_diagnostic():
 
         "final_long": 0,
         "final_short": 0,
+
+        "final_candidates": 0,
     }
 
+    setups = []
 
-# ============================================================
-# FIND CRT SETUPS
-# ============================================================
+    n = len(bars)
 
-def find_crt_setups(
-    df,
-    symbol,
-):
+    i = 0
 
-    bars = (
-        df
-        .sort_values("open_time")
-        .reset_index(drop=True)
-    )
+    while i < n - 1:
 
-    candidates = []
+        row = bars.iloc[i]
 
-    diag = new_diagnostic()
+        if pd.notna(
+            row["parent_high"]
+        ):
+            stats[
+                "parent_range_bars"
+            ] += 1
 
-    total = len(bars)
+        if not bool(
+            row["parent_range_valid"]
+        ):
+            i += 1
+            continue
 
-    i = MSS_LOOKBACK + 2
-
-    while i < total - 20:
-
-        current = bars.iloc[i]
-
-        diag["parent_range_bars"] += 1
+        stats[
+            "valid_parent_range"
+        ] += 1
 
         parent_high = float(
-            current.parent_high
+            row["parent_high"]
         )
 
         parent_low = float(
-            current.parent_low
+            row["parent_low"]
         )
 
-        parent_range = (
-            parent_high - parent_low
+        parent_range = float(
+            row["parent_range"]
         )
-
-        if (
-            not np.isfinite(parent_high)
-            or not np.isfinite(parent_low)
-            or parent_range <= 0
-        ):
-
-            i += 1
-            continue
-
-        diag["valid_parent_range"] += 1
-
-        # ====================================================
-        # SWEEP + RECLAIM
-        # ====================================================
-
-        side = None
-        sweep_price = None
 
         # ----------------------------------------------------
-        # LONG:
-        # price sweeps previous 4H LOW
-        # then closes back above it
+        # LONG SWEEP
         # ----------------------------------------------------
 
-        if (
-            float(current.low) < parent_low
-            and float(current.close) > parent_low
-        ):
+        long_sweep = (
+            float(row["low"])
+            < parent_low
+        )
 
-            diag["long_sweep"] += 1
-
-            # Must reclaim inside the range
-            if float(current.close) < parent_high:
-
-                diag["long_reclaim"] += 1
-
-                side = "LONG"
-
-                sweep_price = float(
-                    current.low
-                )
+        long_reclaim = (
+            long_sweep
+            and
+            float(row["close"])
+            > parent_low
+        )
 
         # ----------------------------------------------------
-        # SHORT:
-        # price sweeps previous 4H HIGH
-        # then closes back below it
+        # SHORT SWEEP
         # ----------------------------------------------------
 
-        elif (
-            float(current.high) > parent_high
-            and float(current.close) < parent_high
-        ):
-
-            diag["short_sweep"] += 1
-
-            if float(current.close) > parent_low:
-
-                diag["short_reclaim"] += 1
-
-                side = "SHORT"
-
-                sweep_price = float(
-                    current.high
-                )
-
-        if side is None:
-
-            i += 1
-            continue
-
-        # ====================================================
-        # SWEEP DEPTH
-        # ====================================================
-
-        if side == "LONG":
-
-            sweep_depth = (
-                parent_low - sweep_price
-            ) / parent_range
-
-        else:
-
-            sweep_depth = (
-                sweep_price - parent_high
-            ) / parent_range
-
-        if not (
-            0 <= sweep_depth <= MAX_SWEEP_DEPTH
-        ):
-
-            i += 1
-            continue
-
-        if side == "LONG":
-
-            diag[
-                "sweep_depth_valid_long"
-            ] += 1
-
-        else:
-
-            diag[
-                "sweep_depth_valid_short"
-            ] += 1
-
-        # ====================================================
-        # HTF BIAS
-        # ====================================================
-
-        parent_bias = int(
-            current.parent_bias
+        short_sweep = (
+            float(row["high"])
+            > parent_high
         )
 
-        if side == "LONG":
-
-            if parent_bias != 1:
-
-                i += 1
-                continue
-
-            diag["bias_valid_long"] += 1
-
-        else:
-
-            if parent_bias != -1:
-
-                i += 1
-                continue
-
-            diag["bias_valid_short"] += 1
-
-        # ====================================================
-        # MSS
-        # ====================================================
-
-        mss_index = None
-
-        search_end = min(
-            i + MSS_MAX_BARS + 1,
-            total,
-        )
-
-        for j in range(
-            i + 1,
-            search_end,
-        ):
-
-            look_start = max(
-                0,
-                j - MSS_LOOKBACK,
-            )
-
-            previous = bars.iloc[
-                look_start:j
-            ]
-
-            if len(previous) == 0:
-                continue
-
-            if side == "LONG":
-
-                local_high = float(
-                    previous["high"].max()
-                )
-
-                if (
-                    float(
-                        bars["close"].iloc[j]
-                    )
-                    > local_high
-                ):
-
-                    mss_index = j
-                    break
-
-            else:
-
-                local_low = float(
-                    previous["low"].min()
-                )
-
-                if (
-                    float(
-                        bars["close"].iloc[j]
-                    )
-                    < local_low
-                ):
-
-                    mss_index = j
-                    break
-
-        if mss_index is None:
-
-            i += 1
-            continue
-
-        if side == "LONG":
-
-            diag["mss_long"] += 1
-
-        else:
-
-            diag["mss_short"] += 1
-
-        # ====================================================
-        # MSS BODY
-        # ====================================================
-
-        mss_open = float(
-            bars["open"].iloc[mss_index]
-        )
-
-        mss_close = float(
-            bars["close"].iloc[mss_index]
-        )
-
-        zone_high = max(
-            mss_open,
-            mss_close,
-        )
-
-        zone_low = min(
-            mss_open,
-            mss_close,
-        )
-
-        # ====================================================
-        # RETEST
-        # ====================================================
-
-        entry_index = None
-
-        retest_end = min(
-            mss_index + RETEST_MAX_BARS + 1,
-            total,
-        )
-
-        for j in range(
-            mss_index + 1,
-            retest_end,
-        ):
-
-            touches_zone = (
-                float(
-                    bars["low"].iloc[j]
-                ) <= zone_high
-                and
-                float(
-                    bars["high"].iloc[j]
-                ) >= zone_low
-            )
-
-            if touches_zone:
-
-                # Entry is NEXT candle
-                entry_index = j + 1
-
-                break
-
-        if (
-            entry_index is None
-            or entry_index >= total
-        ):
-
-            i = mss_index + 1
-            continue
-
-        if side == "LONG":
-
-            diag["retest_long"] += 1
-
-        else:
-
-            diag["retest_short"] += 1
-
-        # ====================================================
-        # ENTRY
-        # ====================================================
-
-        entry_price = float(
-            bars["open"].iloc[entry_index]
-        )
-
-        if not (
-            parent_low
-            < entry_price
+        short_reclaim = (
+            short_sweep
+            and
+            float(row["close"])
             < parent_high
-        ):
-
-            i = entry_index
-            continue
-
-        if side == "LONG":
-
-            diag["entry_valid_long"] += 1
-
-        else:
-
-            diag["entry_valid_short"] += 1
-
-        # ====================================================
-        # STOP
-        # ====================================================
-
-        stop_price = sweep_price
-
-        # ====================================================
-        # RISK / TARGET
-        # ====================================================
-
-        if side == "LONG":
-
-            risk = (
-                entry_price
-                - stop_price
-            )
-
-            target_price = (
-                entry_price
-                + RR * risk
-            )
-
-        else:
-
-            risk = (
-                stop_price
-                - entry_price
-            )
-
-            target_price = (
-                entry_price
-                - RR * risk
-            )
-
-        if risk <= 0:
-
-            i = entry_index
-            continue
-
-        risk_pct = (
-            risk / entry_price
         )
 
-        if not (
-            MIN_RISK_PCT
-            <= risk_pct
-            <= MAX_RISK_PCT
-        ):
+        if long_sweep:
+            stats[
+                "long_sweep"
+            ] += 1
 
-            i = entry_index
+        if short_sweep:
+            stats[
+                "short_sweep"
+            ] += 1
+
+        candidates_here = []
+
+        # ====================================================
+        # LONG
+        # ====================================================
+
+        if long_reclaim:
+
+            stats[
+                "long_reclaim"
+            ] += 1
+
+            sweep_price = float(
+                row["low"]
+            )
+
+            depth = (
+                parent_low
+                - sweep_price
+            ) / parent_range
+
+            if (
+                depth > 0
+                and
+                depth <= MAX_SWEEP_DEPTH
+            ):
+
+                stats[
+                    "sweep_depth_valid_long"
+                ] += 1
+
+                # --------------------------------------------
+                # PRE-SWEEP STRUCTURE
+                # --------------------------------------------
+
+                structure_start = max(
+                    0,
+                    i - MSS_LOOKBACK
+                )
+
+                structure_slice = (
+                    bars.iloc[
+                        structure_start:i
+                    ]
+                )
+
+                if not structure_slice.empty:
+
+                    structure_high = float(
+                        structure_slice[
+                            "high"
+                        ].max()
+                    )
+
+                    mss_index = None
+
+                    max_j = min(
+                        n - 1,
+                        i + MSS_MAX_BARS
+                    )
+
+                    for j in range(
+                        i + 1,
+                        max_j + 1
+                    ):
+
+                        if (
+                            float(
+                                bars.iloc[j][
+                                    "close"
+                                ]
+                            )
+                            >
+                            structure_high
+                        ):
+                            mss_index = j
+                            break
+
+                    if mss_index is not None:
+
+                        stats[
+                            "mss_long"
+                        ] += 1
+
+                        mss = (
+                            bars.iloc[
+                                mss_index
+                            ]
+                        )
+
+                        body_low = min(
+                            float(mss["open"]),
+                            float(mss["close"])
+                        )
+
+                        body_high = max(
+                            float(mss["open"]),
+                            float(mss["close"])
+                        )
+
+                        retest_index = None
+
+                        end_retest = min(
+                            n - 2,
+                            mss_index
+                            + RETEST_MAX_BARS
+                        )
+
+                        for r in range(
+                            mss_index + 1,
+                            end_retest + 1
+                        ):
+
+                            rr = bars.iloc[r]
+
+                            touches_body = (
+                                float(rr["low"])
+                                <= body_high
+                                and
+                                float(rr["high"])
+                                >= body_low
+                            )
+
+                            holds_sweep = (
+                                float(rr["close"])
+                                > sweep_price
+                            )
+
+                            if (
+                                touches_body
+                                and
+                                holds_sweep
+                            ):
+                                retest_index = r
+                                break
+
+                        if retest_index is not None:
+
+                            stats[
+                                "retest_long"
+                            ] += 1
+
+                            entry_index = (
+                                retest_index + 1
+                            )
+
+                            if entry_index < n:
+
+                                entry = float(
+                                    bars.iloc[
+                                        entry_index
+                                    ]["open"]
+                                )
+
+                                # Entry must remain inside
+                                # the completed CRT range.
+                                if (
+                                    entry > parent_low
+                                    and
+                                    entry < parent_high
+                                ):
+
+                                    stats[
+                                        "entry_valid_long"
+                                    ] += 1
+
+                                    risk = (
+                                        entry
+                                        - sweep_price
+                                    )
+
+                                    if risk > 0:
+
+                                        risk_pct = (
+                                            risk / entry
+                                        )
+
+                                        if (
+                                            MIN_RISK_PCT
+                                            <=
+                                            risk_pct
+                                            <=
+                                            MAX_RISK_PCT
+                                        ):
+
+                                            stats[
+                                                "risk_valid_long"
+                                            ] += 1
+
+                                            target = (
+                                                entry
+                                                + RR * risk
+                                            )
+
+                                            if target > entry:
+
+                                                stats[
+                                                    "target_valid_long"
+                                                ] += 1
+
+                                                candidates_here.append({
+                                                    "symbol": symbol,
+                                                    "side": "LONG",
+                                                    "signal_index": i,
+                                                    "mss_index": mss_index,
+                                                    "retest_index": retest_index,
+                                                    "entry_index": entry_index,
+                                                    "signal_time": row["open_time"],
+                                                    "entry_time": bars.iloc[entry_index]["open_time"],
+                                                    "parent_close_time": row["parent_close_time"],
+                                                    "parent_high": parent_high,
+                                                    "parent_low": parent_low,
+                                                    "sweep_price": sweep_price,
+                                                    "entry_price": entry,
+                                                    "stop_price": sweep_price,
+                                                    "target_price": target,
+                                                    "risk_pct": risk_pct,
+                                                })
+
+        # ====================================================
+        # SHORT
+        # ====================================================
+
+        if short_reclaim:
+
+            stats[
+                "short_reclaim"
+            ] += 1
+
+            sweep_price = float(
+                row["high"]
+            )
+
+            depth = (
+                sweep_price
+                - parent_high
+            ) / parent_range
+
+            if (
+                depth > 0
+                and
+                depth <= MAX_SWEEP_DEPTH
+            ):
+
+                stats[
+                    "sweep_depth_valid_short"
+                ] += 1
+
+                structure_start = max(
+                    0,
+                    i - MSS_LOOKBACK
+                )
+
+                structure_slice = (
+                    bars.iloc[
+                        structure_start:i
+                    ]
+                )
+
+                if not structure_slice.empty:
+
+                    structure_low = float(
+                        structure_slice[
+                            "low"
+                        ].min()
+                    )
+
+                    mss_index = None
+
+                    max_j = min(
+                        n - 1,
+                        i + MSS_MAX_BARS
+                    )
+
+                    for j in range(
+                        i + 1,
+                        max_j + 1
+                    ):
+
+                        if (
+                            float(
+                                bars.iloc[j][
+                                    "close"
+                                ]
+                            )
+                            <
+                            structure_low
+                        ):
+                            mss_index = j
+                            break
+
+                    if mss_index is not None:
+
+                        stats[
+                            "mss_short"
+                        ] += 1
+
+                        mss = (
+                            bars.iloc[
+                                mss_index
+                            ]
+                        )
+
+                        body_low = min(
+                            float(mss["open"]),
+                            float(mss["close"])
+                        )
+
+                        body_high = max(
+                            float(mss["open"]),
+                            float(mss["close"])
+                        )
+
+                        retest_index = None
+
+                        end_retest = min(
+                            n - 2,
+                            mss_index
+                            + RETEST_MAX_BARS
+                        )
+
+                        for r in range(
+                            mss_index + 1,
+                            end_retest + 1
+                        ):
+
+                            rr = bars.iloc[r]
+
+                            touches_body = (
+                                float(rr["low"])
+                                <= body_high
+                                and
+                                float(rr["high"])
+                                >= body_low
+                            )
+
+                            holds_sweep = (
+                                float(rr["close"])
+                                < sweep_price
+                            )
+
+                            if (
+                                touches_body
+                                and
+                                holds_sweep
+                            ):
+                                retest_index = r
+                                break
+
+                        if retest_index is not None:
+
+                            stats[
+                                "retest_short"
+                            ] += 1
+
+                            entry_index = (
+                                retest_index + 1
+                            )
+
+                            if entry_index < n:
+
+                                entry = float(
+                                    bars.iloc[
+                                        entry_index
+                                    ]["open"]
+                                )
+
+                                if (
+                                    entry > parent_low
+                                    and
+                                    entry < parent_high
+                                ):
+
+                                    stats[
+                                        "entry_valid_short"
+                                    ] += 1
+
+                                    risk = (
+                                        sweep_price
+                                        - entry
+                                    )
+
+                                    if risk > 0:
+
+                                        risk_pct = (
+                                            risk / entry
+                                        )
+
+                                        if (
+                                            MIN_RISK_PCT
+                                            <=
+                                            risk_pct
+                                            <=
+                                            MAX_RISK_PCT
+                                        ):
+
+                                            stats[
+                                                "risk_valid_short"
+                                            ] += 1
+
+                                            target = (
+                                                entry
+                                                - RR * risk
+                                            )
+
+                                            if target < entry:
+
+                                                stats[
+                                                    "target_valid_short"
+                                                ] += 1
+
+                                                candidates_here.append({
+                                                    "symbol": symbol,
+                                                    "side": "SHORT",
+                                                    "signal_index": i,
+                                                    "mss_index": mss_index,
+                                                    "retest_index": retest_index,
+                                                    "entry_index": entry_index,
+                                                    "signal_time": row["open_time"],
+                                                    "entry_time": bars.iloc[entry_index]["open_time"],
+                                                    "parent_close_time": row["parent_close_time"],
+                                                    "parent_high": parent_high,
+                                                    "parent_low": parent_low,
+                                                    "sweep_price": sweep_price,
+                                                    "entry_price": entry,
+                                                    "stop_price": sweep_price,
+                                                    "target_price": target,
+                                                    "risk_pct": risk_pct,
+                                                })
+
+        # ----------------------------------------------------
+        # Candidate accepted.
+        # ----------------------------------------------------
+
+        if candidates_here:
+
+            candidates_here.sort(
+                key=lambda x: x[
+                    "entry_index"
+                ]
+            )
+
+            selected = (
+                candidates_here[0]
+            )
+
+            setups.append(
+                selected
+            )
+
+            if selected["side"] == "LONG":
+                stats[
+                    "final_long"
+                ] += 1
+            else:
+                stats[
+                    "final_short"
+                ] += 1
+
+            stats[
+                "final_candidates"
+            ] += 1
+
+            # Prevent same-symbol re-entry
+            # while this setup is pending.
+            i = (
+                selected["entry_index"]
+                + 1
+            )
+
             continue
 
-        if side == "LONG":
+        i += 1
 
-            diag["risk_valid_long"] += 1
-
-        else:
-
-            diag["risk_valid_short"] += 1
-
-        # ====================================================
-        # TARGET MUST BE INSIDE RANGE
-        # ====================================================
-
-        if side == "LONG":
-
-            if target_price > parent_high:
-
-                i = entry_index
-                continue
-
-        else:
-
-            if target_price < parent_low:
-
-                i = entry_index
-                continue
-
-        if side == "LONG":
-
-            diag["target_valid_long"] += 1
-            diag["final_long"] += 1
-
-        else:
-
-            diag["target_valid_short"] += 1
-            diag["final_short"] += 1
-
-        # ====================================================
-        # FINAL CANDIDATE
-        # ====================================================
-
-        candidates.append(
-            {
-                "symbol": symbol,
-
-                "side": side,
-
-                "reference_4h_time":
-                    current.reference_open_time,
-
-                "parent_time":
-                    current.htf_close_time,
-
-                "sweep_time":
-                    current.open_time,
-
-                "mss_time":
-                    bars[
-                        "open_time"
-                    ].iloc[mss_index],
-
-                "retest_time":
-                    bars[
-                        "open_time"
-                    ].iloc[
-                        entry_index - 1
-                    ],
-
-                "entry_time":
-                    bars[
-                        "open_time"
-                    ].iloc[entry_index],
-
-                "entry_index":
-                    int(entry_index),
-
-                "entry":
-                    entry_price,
-
-                "stop":
-                    stop_price,
-
-                "target":
-                    target_price,
-
-                "risk":
-                    risk,
-
-                "risk_pct":
-                    risk_pct,
-
-                "parent_high":
-                    parent_high,
-
-                "parent_low":
-                    parent_low,
-            }
-        )
-
-        # ----------------------------------------------------
-        # No same-symbol re-entry before this candidate
-        # ----------------------------------------------------
-
-        i = entry_index + 1
-
-    return candidates, diag
+    return setups, stats
 
 
 # ============================================================
-# SIMULATE
+# TRADE SIMULATION
 # ============================================================
 
 def simulate_trade(
-    candidate,
     bars,
+    setup
 ):
 
-    entry_index = int(
-        candidate["entry_index"]
-    )
+    entry_index = setup[
+        "entry_index"
+    ]
 
-    side = candidate["side"]
+    side = setup[
+        "side"
+    ]
 
-    entry = float(
-        candidate["entry"]
-    )
-
-    stop = float(
-        candidate["stop"]
-    )
-
-    target = float(
-        candidate["target"]
-    )
-
-    if side == "LONG":
-
-        effective_entry = (
-            entry * (1 + SLIPPAGE_RATE)
-        )
-
-        effective_stop = (
-            stop * (1 - SLIPPAGE_RATE)
-        )
-
-        effective_target = (
-            target * (1 - SLIPPAGE_RATE)
-        )
-
-    else:
-
-        effective_entry = (
-            entry * (1 - SLIPPAGE_RATE)
-        )
-
-        effective_stop = (
-            stop * (1 + SLIPPAGE_RATE)
-        )
-
-        effective_target = (
-            target * (1 + SLIPPAGE_RATE)
-        )
-
-    if side == "LONG":
-
-        risk_eff = (
-            effective_entry
-            - effective_stop
-        )
-
-    else:
-
-        risk_eff = (
-            effective_stop
-            - effective_entry
-        )
-
-    if risk_eff <= 0:
+    if entry_index >= len(bars):
         return None
 
-    for k in range(
+    raw_entry = float(
+        bars.iloc[
+            entry_index
+        ]["open"]
+    )
+
+    if side == "LONG":
+
+        entry = (
+            raw_entry
+            * (1.0 + SLIPPAGE)
+        )
+
+        stop = (
+            setup["stop_price"]
+            * (1.0 - SLIPPAGE)
+        )
+
+        target = (
+            setup["target_price"]
+            * (1.0 - SLIPPAGE)
+        )
+
+    else:
+
+        entry = (
+            raw_entry
+            * (1.0 - SLIPPAGE)
+        )
+
+        stop = (
+            setup["stop_price"]
+            * (1.0 + SLIPPAGE)
+        )
+
+        target = (
+            setup["target_price"]
+            * (1.0 + SLIPPAGE)
+        )
+
+    initial_risk = (
+        entry - stop
+        if side == "LONG"
+        else stop - entry
+    )
+
+    if initial_risk <= 0:
+        return None
+
+    exit_index = None
+    exit_price = None
+    outcome = None
+
+    for j in range(
         entry_index,
-        len(bars),
+        len(bars)
     ):
 
+        bar = bars.iloc[j]
+
         high = float(
-            bars["high"].iloc[k]
+            bar["high"]
         )
 
         low = float(
-            bars["low"].iloc[k]
+            bar["low"]
         )
-
-        timestamp = bars[
-            "open_time"
-        ].iloc[k]
 
         if side == "LONG":
 
             hit_sl = (
-                low <= effective_stop
+                low <= stop
             )
 
             hit_tp = (
-                high >= effective_target
+                high >= target
             )
+
+            # Locked convention:
+            # same candle SL+TP = LOSS
+            if hit_sl and hit_tp:
+
+                exit_index = j
+                exit_price = stop
+                outcome = "LOSS"
+
+                break
+
+            if hit_sl:
+
+                exit_index = j
+                exit_price = stop
+                outcome = "LOSS"
+
+                break
+
+            if hit_tp:
+
+                exit_index = j
+                exit_price = target
+                outcome = "WIN"
+
+                break
 
         else:
 
             hit_sl = (
-                high >= effective_stop
+                high >= stop
             )
 
             hit_tp = (
-                low <= effective_target
+                low <= target
             )
 
-        if not (
-            hit_sl or hit_tp
-        ):
-            continue
+            if hit_sl and hit_tp:
 
-        if hit_sl and hit_tp:
+                exit_index = j
+                exit_price = stop
+                outcome = "LOSS"
 
-            outcome = "LOSS"
-            exit_reason = (
-                "SL_AND_TP_SAME_CANDLE_LOSS"
-            )
-            gross_r = -1.0
+                break
 
-        elif hit_sl:
+            if hit_sl:
 
-            outcome = "LOSS"
-            exit_reason = "SL"
-            gross_r = -1.0
+                exit_index = j
+                exit_price = stop
+                outcome = "LOSS"
 
-        else:
+                break
 
-            outcome = "WIN"
-            exit_reason = "TP"
-            gross_r = RR
+            if hit_tp:
 
-        risk_pct_effective = (
-            risk_eff / effective_entry
+                exit_index = j
+                exit_price = target
+                outcome = "WIN"
+
+                break
+
+    # Unresolved final-sample trade:
+    # censored, NOT forced to loss/win.
+    if exit_index is None:
+        return None
+
+    gross_r = (
+        (
+            exit_price - entry
         )
-
-        dollar_risk = (
-            NOTIONAL
-            * risk_pct_effective
+        / initial_risk
+        if side == "LONG"
+        else
+        (
+            entry - exit_price
         )
+        / initial_risk
+    )
 
-        fee_dollars = (
-            2
-            * FEE_RATE
-            * NOTIONAL
-        )
+    fee_dollars = (
+        NOTIONAL
+        * FEE_RATE
+        * 2.0
+    )
 
-        fee_r = (
-            fee_dollars / dollar_risk
-            if dollar_risk > 0
-            else 0.0
-        )
+    risk_dollars = (
+        NOTIONAL
+        * initial_risk
+        / entry
+    )
 
-        net_r = gross_r - fee_r
+    if risk_dollars <= 0:
+        return None
 
-        pnl = net_r * dollar_risk
+    fee_r = (
+        fee_dollars
+        / risk_dollars
+    )
 
-        return {
-            **candidate,
+    net_r = (
+        gross_r
+        - fee_r
+    )
 
-            "exit_time":
-                timestamp,
+    pnl = (
+        net_r
+        * risk_dollars
+    )
 
-            "outcome":
-                outcome,
+    return {
+        **setup,
 
-            "exit_reason":
-                exit_reason,
+        "entry_price_effective": entry,
+        "stop_price_effective": stop,
+        "target_price_effective": target,
 
-            "effective_entry":
-                effective_entry,
+        "exit_time": bars.iloc[
+            exit_index
+        ]["open_time"],
 
-            "effective_stop":
-                effective_stop,
+        "exit_index": exit_index,
+        "exit_price": exit_price,
 
-            "effective_target":
-                effective_target,
+        "outcome": outcome,
 
-            "gross_r":
-                gross_r,
+        "gross_r": gross_r,
+        "fee_r": fee_r,
+        "net_r": net_r,
 
-            "fee_r":
-                fee_r,
-
-            "net_r":
-                net_r,
-
-            "dollar_risk":
-                dollar_risk,
-
-            "pnl":
-                pnl,
-
-            "exit_index":
-                int(k),
-        }
-
-    # Censored
-    return None
+        "risk_dollars": risk_dollars,
+        "pnl": pnl,
+    }
 
 
 # ============================================================
@@ -1566,43 +1567,34 @@ def simulate_trade(
 # ============================================================
 
 def enforce_portfolio_constraints(
-    raw_candidates,
-    symbol_bars,
+    trades
 ):
 
-    resolved = []
+    if not trades:
+        return []
 
-    for symbol, candidates in (
-        raw_candidates.items()
-    ):
-
-        bars = symbol_bars[symbol]
-
-        for candidate in candidates:
-
-            trade = simulate_trade(
-                candidate,
-                bars,
-            )
-
-            if trade is not None:
-
-                resolved.append(trade)
-
-    resolved.sort(
+    ordered = sorted(
+        trades,
         key=lambda x: (
-            x["entry_time"],
+            pd.Timestamp(
+                x["entry_time"]
+            ),
             x["symbol"],
+            x["side"],
         )
     )
 
     accepted = []
 
-    symbol_last_exit = {}
+    last_exit_by_symbol = {}
 
     active = []
 
-    for trade in resolved:
+    for trade in ordered:
+
+        symbol = trade[
+            "symbol"
+        ]
 
         entry_time = pd.Timestamp(
             trade["entry_time"]
@@ -1612,37 +1604,45 @@ def enforce_portfolio_constraints(
             trade["exit_time"]
         )
 
-        symbol = trade["symbol"]
-
-        active = [
-            item
-            for item in active
-            if pd.Timestamp(
-                item["exit_time"]
-            ) > entry_time
-        ]
-
-        if symbol in symbol_last_exit:
+        # One simultaneous trade per symbol.
+        if symbol in last_exit_by_symbol:
 
             if (
                 entry_time
-                <= symbol_last_exit[symbol]
+                <=
+                last_exit_by_symbol[
+                    symbol
+                ]
             ):
-
                 continue
+
+        # Remove already closed positions.
+        active = [
+            t
+            for t in active
+            if pd.Timestamp(
+                t["exit_time"]
+            )
+            > entry_time
+        ]
 
         if (
             len(active)
             >= MAX_SIMULTANEOUS_POSITIONS
         ):
-
             continue
 
-        accepted.append(trade)
+        accepted.append(
+            trade
+        )
 
-        symbol_last_exit[symbol] = exit_time
+        active.append(
+            trade
+        )
 
-        active.append(trade)
+        last_exit_by_symbol[
+            symbol
+        ] = exit_time
 
     return accepted
 
@@ -1651,306 +1651,265 @@ def enforce_portfolio_constraints(
 # METRICS
 # ============================================================
 
-def max_loss_streak(values):
+def max_loss_streak(
+    trades
+):
 
-    current = 0
-    best = 0
+    streak = 0
+    maximum = 0
 
-    for value in values:
+    ordered = sorted(
+        trades,
+        key=lambda x: pd.Timestamp(
+            x["exit_time"]
+        )
+    )
 
-        if value < 0:
+    for trade in ordered:
 
-            current += 1
-            best = max(best, current)
+        if trade["net_r"] < 0:
+
+            streak += 1
+
+            maximum = max(
+                maximum,
+                streak
+            )
 
         else:
 
-            current = 0
+            streak = 0
 
-    return best
+    return maximum
+
+
+def profit_factor(
+    trades
+):
+
+    wins = sum(
+        t["net_r"]
+        for t in trades
+        if t["net_r"] > 0
+    )
+
+    losses = -sum(
+        t["net_r"]
+        for t in trades
+        if t["net_r"] < 0
+    )
+
+    if losses <= 0:
+
+        if wins > 0:
+            return math.inf
+
+        return 0.0
+
+    return (
+        wins / losses
+    )
 
 
 def summarize(
     trades,
-    split_name,
+    label
+):
+
+    n = len(trades)
+
+    if n == 0:
+
+        return {
+            "split": label,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "gross_r": 0.0,
+            "net_r": 0.0,
+            "pnl": 0.0,
+            "max_loss_streak": 0,
+        }
+
+    wins = sum(
+        1
+        for t in trades
+        if t["net_r"] > 0
+    )
+
+    losses = sum(
+        1
+        for t in trades
+        if t["net_r"] < 0
+    )
+
+    return {
+        "split": label,
+        "trades": n,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": (
+            100.0
+            * wins
+            / n
+        ),
+        "profit_factor": profit_factor(
+            trades
+        ),
+        "gross_r": sum(
+            t["gross_r"]
+            for t in trades
+        ),
+        "net_r": sum(
+            t["net_r"]
+            for t in trades
+        ),
+        "pnl": sum(
+            t["pnl"]
+            for t in trades
+        ),
+        "max_loss_streak":
+            max_loss_streak(
+                trades
+            ),
+    }
+
+
+def split_trades(
+    trades
+):
+
+    ordered = sorted(
+        trades,
+        key=lambda x: pd.Timestamp(
+            x["exit_time"]
+        )
+    )
+
+    n = len(ordered)
+
+    a = int(
+        n * 0.50
+    )
+
+    b = int(
+        n * 0.75
+    )
+
+    return (
+        ordered[:a],
+        ordered[a:b],
+        ordered[b:],
+    )
+
+
+# ============================================================
+# AUDIT
+# ============================================================
+
+def audit_trades(
+    trades
 ):
 
     if not trades:
 
         return {
-            "split": split_name,
             "trades": 0,
-            "wins": 0,
-            "losses": 0,
-            "win_rate_pct": np.nan,
-            "profit_factor": np.nan,
-            "gross_r": 0.0,
-            "net_r": 0.0,
-            "pnl": 0.0,
-            "max_loss_streak": 0,
-            "max_drawdown_r": 0.0,
+            "same_symbol_overlap": 0,
+            "same_symbol_reentry": 0,
+            "max_simultaneous": 0,
         }
 
     ordered = sorted(
         trades,
-        key=lambda x: x["exit_time"],
-    )
-
-    values = np.array(
-        [
-            float(t["net_r"])
-            for t in ordered
-        ],
-        dtype=float,
-    )
-
-    wins = int(
-        (values > 0).sum()
-    )
-
-    losses = int(
-        (values < 0).sum()
-    )
-
-    gross_profit = (
-        float(
-            values[values > 0].sum()
+        key=lambda x: pd.Timestamp(
+            x["entry_time"]
         )
-        if wins
-        else 0.0
     )
-
-    gross_loss = (
-        float(
-            -values[values < 0].sum()
-        )
-        if losses
-        else 0.0
-    )
-
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 0
-        else np.inf
-    )
-
-    equity = np.cumsum(values)
-
-    running_peak = np.maximum.accumulate(
-        np.r_[0.0, equity]
-    )
-
-    drawdown = (
-        np.r_[0.0, equity]
-        - running_peak
-    )
-
-    return {
-        "split": split_name,
-        "trades": len(values),
-        "wins": wins,
-        "losses": losses,
-
-        "win_rate_pct":
-            100.0 * wins / len(values),
-
-        "profit_factor":
-            profit_factor,
-
-        "gross_r":
-            float(
-                sum(
-                    t["gross_r"]
-                    for t in ordered
-                )
-            ),
-
-        "net_r":
-            float(values.sum()),
-
-        "pnl":
-            float(
-                sum(
-                    t["pnl"]
-                    for t in ordered
-                )
-            ),
-
-        "max_loss_streak":
-            max_loss_streak(values),
-
-        "max_drawdown_r":
-            float(-drawdown.min()),
-    }
-
-
-def split_trades(trades):
-
-    ordered = sorted(
-        trades,
-        key=lambda x: x["exit_time"],
-    )
-
-    n = len(ordered)
-
-    first = int(n * 0.50)
-    second = int(n * 0.75)
-
-    return (
-        ordered[:first],
-        ordered[first:second],
-        ordered[second:],
-    )
-
-
-# ============================================================
-# VALIDATION SYMBOLS
-# ============================================================
-
-def validation_symbol_rows(
-    validation
-):
-
-    rows = []
-
-    for symbol in SYMBOLS:
-
-        symbol_trades = [
-            trade
-            for trade in validation
-            if trade["symbol"] == symbol
-        ]
-
-        row = summarize(
-            symbol_trades,
-            "VALIDATION",
-        )
-
-        row["symbol"] = symbol
-
-        rows.append(row)
-
-    return rows
-
-
-# ============================================================
-# FINAL AUDIT
-# ============================================================
-
-def audit_trades(trades):
-
-    ordered = sorted(
-        trades,
-        key=lambda x: x["entry_time"],
-    )
-
-    max_active = 0
-    max_active_time = None
-
-    for trade in ordered:
-
-        timestamp = pd.Timestamp(
-            trade["entry_time"]
-        )
-
-        active_count = sum(
-            (
-                pd.Timestamp(
-                    other["entry_time"]
-                )
-                <= timestamp
-                <
-                pd.Timestamp(
-                    other["exit_time"]
-                )
-            )
-            for other in ordered
-        )
-
-        if active_count > max_active:
-
-            max_active = active_count
-            max_active_time = timestamp
 
     same_symbol_overlap = 0
+    same_symbol_reentry = 0
+    max_active = 0
 
     by_symbol = {}
 
     for trade in ordered:
 
-        symbol = trade["symbol"]
+        symbol = trade[
+            "symbol"
+        ]
 
-        previous_trades = by_symbol.get(
-            symbol,
-            [],
+        entry = pd.Timestamp(
+            trade["entry_time"]
         )
 
-        for previous in previous_trades:
+        exit_time = pd.Timestamp(
+            trade["exit_time"]
+        )
+
+        if symbol in by_symbol:
+
+            previous = by_symbol[
+                symbol
+            ]
 
             if (
-                pd.Timestamp(
-                    trade["entry_time"]
-                )
+                entry
                 <=
-                pd.Timestamp(
-                    previous["exit_time"]
-                )
+                previous["exit_time"]
             ):
-
                 same_symbol_overlap += 1
 
-        by_symbol.setdefault(
-            symbol,
-            [],
-        ).append(trade)
+            if (
+                entry
+                ==
+                previous["exit_time"]
+            ):
+                same_symbol_reentry += 1
 
-    status = (
-        "PASS"
-        if (
-            max_active
-            <= MAX_SIMULTANEOUS_POSITIONS
-            and same_symbol_overlap == 0
+        by_symbol[
+            symbol
+        ] = {
+            "entry_time": entry,
+            "exit_time": exit_time,
+        }
+
+        active = 0
+
+        for other in ordered:
+
+            other_entry = pd.Timestamp(
+                other["entry_time"]
+            )
+
+            other_exit = pd.Timestamp(
+                other["exit_time"]
+            )
+
+            if (
+                other_entry
+                <=
+                entry
+                <
+                other_exit
+            ):
+                active += 1
+
+        max_active = max(
+            max_active,
+            active
         )
-        else
-        "FAIL"
-    )
 
     return {
-        "total_accepted_trades":
-            len(ordered),
-
-        "max_simultaneous_positions":
-            max_active,
-
-        "max_simultaneous_limit":
-            MAX_SIMULTANEOUS_POSITIONS,
-
-        "portfolio_overlap_violation":
-            int(
-                max_active
-                > MAX_SIMULTANEOUS_POSITIONS
-            ),
-
-        "same_symbol_overlap_violations":
+        "trades": len(trades),
+        "same_symbol_overlap":
             same_symbol_overlap,
-
-        "parent_range_lookahead":
-            "NONE_PREVIOUS_COMPLETED_4H_ONLY",
-
-        "entry_execution":
-            "NEXT_15M_OPEN_AFTER_RETEST",
-
-        "same_candle_sl_tp":
-            "LOSS",
-
-        "unresolved_final_trades":
-            "CENSORED",
-
-        "status":
-            status,
-
-        "max_active_time":
-            max_active_time,
+        "same_symbol_reentry":
+            same_symbol_reentry,
+        "max_simultaneous":
+            max_active,
     }
 
 
@@ -1960,339 +1919,315 @@ def audit_trades(trades):
 
 def main():
 
-    end_ts = latest_completed_15m()
+    latest15 = (
+        latest_completed_15m()
+    )
+
+    latest4 = (
+        latest_completed_4h()
+    )
+
+    end_ts = min(
+        latest15,
+        latest4
+    )
 
     research_start = (
         end_ts
-        - pd.Timedelta(days=RESEARCH_DAYS)
+        - pd.Timedelta(
+            days=RESEARCH_DAYS
+        )
     )
 
     fetch_start = (
         research_start
-        - pd.Timedelta(days=WARMUP_DAYS)
+        - pd.Timedelta(
+            days=WARMUP_DAYS
+        )
     )
 
-    print("=" * 78)
-    print("CRT STAGE-0 DIAGNOSTIC")
+    print("=" * 72)
     print(
-        "PREVIOUS 4H RANGE -> "
-        "15M SWEEP -> RECLAIM -> MSS -> RETEST"
+        "CRT STAGE-0"
     )
-    print("=" * 78)
+    print(
+        "4H RANGE -> "
+        "15M SWEEP -> "
+        "RECLAIM -> "
+        "MSS -> "
+        "RETEST"
+    )
+    print("=" * 72)
 
     print(
-        f"Fetch window : {fetch_start} -> {end_ts}"
-    )
-
-    print(
-        f"Research     : {research_start} -> {end_ts}"
-    )
-
-    print(
-        f"Symbols      : {len(SYMBOLS)}"
-    )
-
-    print(
-        f"RR           : {RR}:1"
+        f"Fetch window : "
+        f"{fetch_start}"
     )
 
     print(
-        f"Max positions: {MAX_SIMULTANEOUS_POSITIONS}"
+        f"Research     : "
+        f"{research_start}"
+    )
+
+    print(
+        f"End          : "
+        f"{end_ts}"
+    )
+
+    print(
+        f"Symbols      : "
+        f"{len(SYMBOLS)}"
+    )
+
+    print(
+        f"RR           : "
+        f"{RR}:1"
+    )
+
+    print(
+        f"Max positions: "
+        f"{MAX_SIMULTANEOUS_POSITIONS}"
     )
 
     print()
+    print(
+        "CAUSAL ALIGNMENT:"
+    )
+    print(
+        "15M can only use a 4H range "
+        "after that 4H candle is closed."
+    )
+    print()
 
-    # --------------------------------------------------------
-    # REMOVE OLD OUTPUTS
-    # --------------------------------------------------------
+    all_candidates = []
 
-    for output_file in OUTPUT_FILES:
-
-        if output_file.exists():
-
-            output_file.unlink()
-
-    all_candidates = {}
-
-    symbol_bars = {}
-
-    data_audit_rows = []
-
-    diagnostic_rows = []
+    diagnostics = []
 
     # ========================================================
-    # SYMBOL LOOP
+    # DATA + SIGNAL GENERATION
     # ========================================================
 
-    for number, symbol in enumerate(
+    for index, symbol in enumerate(
         SYMBOLS,
-        1,
+        1
     ):
 
         print(
-            f"[{number}/{len(SYMBOLS)}] {symbol}",
-            flush=True,
+            f"[{index}/{len(SYMBOLS)}] "
+            f"{symbol}"
         )
 
         h4 = fetch_binance_klines(
             symbol,
             HTF_INTERVAL,
             fetch_start,
-            end_ts,
+            end_ts
         )
 
         m15 = fetch_binance_klines(
             symbol,
             LTF_INTERVAL,
             fetch_start,
-            end_ts,
+            end_ts
         )
 
         audit_continuity(
             h4,
-            240,
-            symbol,
-            "4H",
+            HTF_INTERVAL,
+            symbol
         )
 
         audit_continuity(
             m15,
-            15,
-            symbol,
-            "15M",
+            LTF_INTERVAL,
+            symbol
         )
 
-        h4 = prepare_4h(h4)
+        h4 = h4[
+            (
+                h4["open_time"]
+                >= fetch_start
+            )
+            &
+            (
+                h4["open_time"]
+                <= end_ts
+            )
+        ].copy()
 
-        combined = attach_parent_range(
-            h4,
+        m15 = m15[
+            (
+                m15["open_time"]
+                >= fetch_start
+            )
+            &
+            (
+                m15["open_time"]
+                <= end_ts
+            )
+        ].copy()
+
+        h4 = prepare_4h(
+            h4
+        )
+
+        m15 = attach_parent_range(
             m15,
+            h4
         )
 
-        candidates, diag = find_crt_setups(
-            combined,
-            symbol,
-        )
-
-        all_candidates[symbol] = candidates
-
-        symbol_bars[symbol] = combined
-
-        # ----------------------------------------------------
-        # DIAGNOSTIC ROW
-        # ----------------------------------------------------
-
-        diagnostic_row = {
-            "symbol": symbol,
-            **diag,
-            "final_candidates":
-                len(candidates),
-        }
-
-        diagnostic_rows.append(
-            diagnostic_row
-        )
-
-        data_audit_rows.append(
-            {
-                "symbol": symbol,
-                "h4_rows": len(h4),
-                "m15_rows": len(m15),
-                "combined_rows": len(combined),
-
-                "candidate_setups":
-                    len(candidates),
-
-                "h4_start":
-                    h4["open_time"].min(),
-
-                "h4_end":
-                    h4["open_time"].max(),
-
-                "m15_start":
-                    m15["open_time"].min(),
-
-                "m15_end":
-                    m15["open_time"].max(),
-            }
+        causal_mappings = int(
+            m15[
+                "parent_range_valid"
+            ].sum()
         )
 
         print(
-            f"    4H={len(h4):,} "
-            f"15M={len(m15):,} "
-            f"parent-bars={diag['valid_parent_range']:,}"
+            f"    4H rows="
+            f"{len(h4):,} | "
+            f"15M rows="
+            f"{len(m15):,} | "
+            f"causal mappings="
+            f"{causal_mappings:,}"
+        )
+
+        # This is a hard data-integrity check.
+        if causal_mappings == 0:
+
+            raise RuntimeError(
+                f"{symbol}: "
+                f"ZERO causal 4H->15M mappings. "
+                f"Data alignment is invalid."
+            )
+
+        setups, stats = (
+            find_crt_setups(
+                m15,
+                symbol
+            )
+        )
+
+        stats[
+            "h4_rows"
+        ] = len(h4)
+
+        stats[
+            "m15_rows"
+        ] = len(m15)
+
+        stats[
+            "causal_mappings"
+        ] = causal_mappings
+
+        diagnostics.append(
+            stats
+        )
+
+        all_candidates.extend(
+            setups
         )
 
         print(
-            f"    "
-            f"L sweep={diag['long_sweep']:,} "
-            f"-> reclaim={diag['long_reclaim']:,} "
-            f"-> depth={diag['sweep_depth_valid_long']:,} "
-            f"-> bias={diag['bias_valid_long']:,} "
-            f"-> MSS={diag['mss_long']:,} "
-            f"-> retest={diag['retest_long']:,} "
-            f"-> risk={diag['risk_valid_long']:,} "
-            f"-> 2R={diag['target_valid_long']:,}"
+            "    "
+            f"sweep L/S="
+            f"{stats['long_sweep']}/"
+            f"{stats['short_sweep']} | "
+            f"reclaim L/S="
+            f"{stats['long_reclaim']}/"
+            f"{stats['short_reclaim']} | "
+            f"MSS L/S="
+            f"{stats['mss_long']}/"
+            f"{stats['mss_short']} | "
+            f"retest L/S="
+            f"{stats['retest_long']}/"
+            f"{stats['retest_short']} | "
+            f"candidates="
+            f"{stats['final_candidates']}"
         )
 
-        print(
-            f"    "
-            f"S sweep={diag['short_sweep']:,} "
-            f"-> reclaim={diag['short_reclaim']:,} "
-            f"-> depth={diag['sweep_depth_valid_short']:,} "
-            f"-> bias={diag['bias_valid_short']:,} "
-            f"-> MSS={diag['mss_short']:,} "
-            f"-> retest={diag['retest_short']:,} "
-            f"-> risk={diag['risk_valid_short']:,} "
-            f"-> 2R={diag['target_valid_short']:,}"
-        )
-
-        print(
-            f"    FINAL CANDIDATES="
-            f"{len(candidates):,}",
-            flush=True,
-        )
-
-    # ========================================================
-    # TOTAL DIAGNOSTIC
-    # ========================================================
-
-    diagnostic_df = pd.DataFrame(
-        diagnostic_rows
+    diagnostics_df = pd.DataFrame(
+        diagnostics
     )
 
-    diagnostic_df.to_csv(
-        "crt_stage0_diagnostic.csv",
-        index=False,
+    # Always save diagnostics.
+    diagnostics_df.to_csv(
+        OUT_AUDIT,
+        index=False
     )
+
+    # ========================================================
+    # DIAGNOSTIC TOTALS
+    # ========================================================
 
     print()
-    print("=" * 78)
-    print("DIAGNOSTIC TOTALS")
-    print("=" * 78)
+    print("=" * 72)
+    print(
+        "DIAGNOSTIC TOTALS"
+    )
+    print("=" * 72)
 
-    numeric_columns = [
-        column
-        for column in diagnostic_df.columns
-        if column != "symbol"
+    diagnostic_columns = [
+        "parent_range_bars",
+        "valid_parent_range",
+        "long_sweep",
+        "short_sweep",
+        "long_reclaim",
+        "short_reclaim",
+        "sweep_depth_valid_long",
+        "sweep_depth_valid_short",
+        "mss_long",
+        "mss_short",
+        "retest_long",
+        "retest_short",
+        "entry_valid_long",
+        "entry_valid_short",
+        "risk_valid_long",
+        "risk_valid_short",
+        "target_valid_long",
+        "target_valid_short",
+        "final_long",
+        "final_short",
+        "final_candidates",
     ]
 
-    totals = diagnostic_df[
-        numeric_columns
-    ].sum()
+    for column in diagnostic_columns:
 
-    for column in numeric_columns:
+        if column in diagnostics_df:
 
-        print(
-            f"{column:35s}: "
-            f"{int(totals[column]):,}"
-        )
-
-    total_candidates = int(
-        totals["final_candidates"]
-    )
+            print(
+                f"{column:35s}: "
+                f"{int(diagnostics_df[column].sum())}"
+            )
 
     print()
     print(
         f"TOTAL CANDIDATE SETUPS: "
-        f"{total_candidates:,}"
+        f"{len(all_candidates)}"
     )
 
     # ========================================================
-    # DO NOT HIDE ZERO CANDIDATE RESULT
-    # ========================================================
-    #
-    # If zero, we still save diagnostic files and STOP.
-    #
-    # This is intentional.
-    #
-    # We do NOT randomly loosen thresholds.
+    # ZERO CANDIDATE
     # ========================================================
 
-    if total_candidates == 0:
-
-        pd.DataFrame(
-            data_audit_rows
-        ).to_csv(
-            "crt_stage0_audit.csv",
-            index=False,
-        )
-
-        pd.DataFrame(
-            [
-                {
-                    "metric":
-                        "status",
-
-                    "value":
-                        "ZERO_CANDIDATES_DIAGNOSTIC_ONLY",
-                },
-
-                {
-                    "metric":
-                        "note",
-
-                    "value":
-                        (
-                            "No trade simulation performed. "
-                            "No parameters changed automatically."
-                        ),
-                },
-            ]
-        ).to_csv(
-            "crt_stage0_summary.csv",
-            index=False,
-        )
-
-        pd.DataFrame(
-            columns=[
-                "symbol",
-                "split",
-                "trades",
-                "wins",
-                "losses",
-                "win_rate_pct",
-                "profit_factor",
-                "gross_r",
-                "net_r",
-                "pnl",
-                "max_loss_streak",
-                "max_drawdown_r",
-            ]
-        ).to_csv(
-            "crt_stage0_validation_symbols.csv",
-            index=False,
-        )
-
-        pd.DataFrame(
-            columns=[
-                "symbol",
-                "side",
-                "entry_time",
-                "exit_time",
-                "entry",
-                "stop",
-                "target",
-                "net_r",
-                "pnl",
-            ]
-        ).to_csv(
-            "crt_stage0_trades.csv",
-            index=False,
-        )
+    if not all_candidates:
 
         print()
-        print("=" * 78)
+        print("=" * 72)
         print(
-            "ZERO CANDIDATES."
+            "ZERO CRT CANDIDATES."
         )
         print(
-            "DIAGNOSTIC FILES WERE GENERATED."
+            "NO PERFORMANCE RESULT "
+            "IS VALID."
         )
         print(
-            "NO PARAMETERS WERE AUTOMATICALLY CHANGED."
+            "DIAGNOSTIC FILE GENERATED."
         )
-        print("=" * 78)
+        print(
+            "NO PARAMETERS WERE "
+            "AUTOMATICALLY CHANGED."
+        )
+        print("=" * 72)
 
         return
 
@@ -2300,241 +2235,233 @@ def main():
     # SIMULATION
     # ========================================================
 
-    trades = enforce_portfolio_constraints(
-        all_candidates,
-        symbol_bars,
+    simulated = []
+
+    for symbol in SYMBOLS:
+
+        candidates = [
+            x
+            for x in all_candidates
+            if x["symbol"] == symbol
+        ]
+
+        if not candidates:
+            continue
+
+        bars = fetch_binance_klines(
+            symbol,
+            LTF_INTERVAL,
+            fetch_start,
+            end_ts
+        )
+
+        bars = (
+            bars
+            .sort_values("open_time")
+            .reset_index(drop=True)
+        )
+
+        for setup in candidates:
+
+            result = simulate_trade(
+                bars,
+                setup
+            )
+
+            if result is not None:
+
+                simulated.append(
+                    result
+                )
+
+    print()
+    print(
+        "Closed trades before "
+        "portfolio constraints: "
+        f"{len(simulated)}"
+    )
+
+    accepted = (
+        enforce_portfolio_constraints(
+            simulated
+        )
     )
 
     print(
-        f"RESOLVED/ACCEPTED TRADES: "
-        f"{len(trades):,}"
+        "Accepted trades after "
+        "portfolio constraints: "
+        f"{len(accepted)}"
     )
-
-    if not trades:
-
-        raise RuntimeError(
-            "ZERO RESOLVED TRADES after "
-            "execution/portfolio constraints."
-        )
 
     # ========================================================
     # SPLITS
     # ========================================================
 
-    (
-        discovery,
-        development,
-        validation,
-    ) = split_trades(trades)
-
-    summary_rows = [
-        summarize(trades, "ALL"),
-        summarize(discovery, "DISCOVERY"),
-        summarize(development, "DEVELOPMENT"),
-        summarize(validation, "VALIDATION"),
-    ]
-
-    # ========================================================
-    # AUDIT
-    # ========================================================
-
-    audit = audit_trades(trades)
-
-    # ========================================================
-    # TRADES
-    # ========================================================
-
-    trade_columns = [
-        "symbol",
-        "side",
-        "reference_4h_time",
-        "parent_time",
-        "sweep_time",
-        "mss_time",
-        "retest_time",
-        "entry_time",
-        "exit_time",
-        "entry",
-        "stop",
-        "target",
-        "effective_entry",
-        "effective_stop",
-        "effective_target",
-        "risk",
-        "risk_pct",
-        "gross_r",
-        "fee_r",
-        "net_r",
-        "dollar_risk",
-        "pnl",
-        "outcome",
-        "exit_reason",
-        "parent_high",
-        "parent_low",
-    ]
-
-    trades_df = pd.DataFrame(trades)
-
-    trades_df[
-        trade_columns
-    ].to_csv(
-        "crt_stage0_trades.csv",
-        index=False,
-    )
-
-    # ========================================================
-    # SUMMARY
-    # ========================================================
-
-    pd.DataFrame(
-        summary_rows
-    ).to_csv(
-        "crt_stage0_summary.csv",
-        index=False,
-    )
-
-    # ========================================================
-    # VALIDATION SYMBOLS
-    # ========================================================
-
-    pd.DataFrame(
-        validation_symbol_rows(
-            validation
+    discovery, development, validation = (
+        split_trades(
+            accepted
         )
-    ).to_csv(
-        "crt_stage0_validation_symbols.csv",
-        index=False,
     )
 
-    # ========================================================
-    # AUDIT
-    # ========================================================
-
-    audit_rows = [
-        {
-            "metric": key,
-            "value": value,
-        }
-        for key, value in audit.items()
-    ]
-
-    for row in data_audit_rows:
-
-        audit_rows.append(
-            {
-                "metric":
-                    f'DATA_{row["symbol"]}',
-
-                "value":
-                    (
-                        f'4H={row["h4_rows"]}; '
-                        f'15M={row["m15_rows"]}; '
-                        f'combined={row["combined_rows"]}; '
-                        f'candidates='
-                        f'{row["candidate_setups"]}'
-                    ),
-            }
-        )
-
-    pd.DataFrame(
-        audit_rows
-    ).to_csv(
-        "crt_stage0_audit.csv",
-        index=False,
-    )
-
-    # ========================================================
-    # OUTPUT VALIDATION
-    # ========================================================
-
-    missing = []
-
-    for output_file in OUTPUT_FILES:
-
-        if (
-            not output_file.exists()
-            or output_file.stat().st_size == 0
-        ):
-
-            missing.append(
-                str(output_file)
-            )
-
-    if missing:
-
-        raise RuntimeError(
-            "OUTPUT VALIDATION FAILED: "
-            f"{missing}"
-        )
-
-    # ========================================================
-    # RESULTS
-    # ========================================================
+    summaries = pd.DataFrame([
+        summarize(
+            accepted,
+            "ALL"
+        ),
+        summarize(
+            discovery,
+            "DISCOVERY"
+        ),
+        summarize(
+            development,
+            "DEVELOPMENT"
+        ),
+        summarize(
+            validation,
+            "VALIDATION"
+        ),
+    ])
 
     print()
-    print("=" * 78)
-    print("RESULTS")
-    print("=" * 78)
+    print("=" * 72)
+    print(
+        "SUMMARY"
+    )
+    print("=" * 72)
 
-    for row in summary_rows:
-
-        pf = row["profit_factor"]
-
-        if np.isinf(pf):
-
-            pf_text = "INF"
-
-        elif np.isnan(pf):
-
-            pf_text = "NA"
-
-        else:
-
-            pf_text = f"{pf:.3f}"
-
-        print(
-            f'{row["split"]:12s} '
-            f'trades={row["trades"]:5d} '
-            f'WR={row["win_rate_pct"]:.2f}% '
-            f'PF={pf_text} '
-            f'NetR={row["net_r"]:.2f} '
-            f'Streak={row["max_loss_streak"]}'
+    print(
+        summaries.to_string(
+            index=False,
+            float_format=lambda x:
+                f"{x:.6f}"
         )
+    )
+
+    # ========================================================
+    # VALIDATION BY SYMBOL
+    # ========================================================
+
+    validation_rows = []
+
+    for symbol in SYMBOLS:
+
+        symbol_trades = [
+            x
+            for x in validation
+            if x["symbol"] == symbol
+        ]
+
+        row = summarize(
+            symbol_trades,
+            f"VALIDATION_{symbol}"
+        )
+
+        row["symbol"] = symbol
+
+        validation_rows.append(
+            row
+        )
+
+    validation_df = pd.DataFrame(
+        validation_rows
+    )
+
+    # ========================================================
+    # SAVE OUTPUTS
+    # ========================================================
+
+    trades_df = pd.DataFrame(
+        accepted
+    )
+
+    if not trades_df.empty:
+
+        trades_df = (
+            trades_df
+            .sort_values("exit_time")
+        )
+
+    trades_df.to_csv(
+        OUT_TRADES,
+        index=False
+    )
+
+    summaries.to_csv(
+        OUT_SUMMARY,
+        index=False
+    )
+
+    validation_df.to_csv(
+        OUT_VALIDATION,
+        index=False
+    )
+
+    diagnostics_df.to_csv(
+        OUT_AUDIT,
+        index=False
+    )
 
     # ========================================================
     # FINAL AUDIT
     # ========================================================
 
-    print()
-    print("=" * 78)
-    print("FINAL AUDIT")
-    print("=" * 78)
-
-    for key, value in audit.items():
-
-        print(
-            f"{key}: {value}"
-        )
-
-    if audit["status"] != "PASS":
-
-        raise RuntimeError(
-            "TRADE AUDIT FAILED: "
-            f"{audit}"
-        )
-
-    print()
-    print("=" * 78)
-    print(
-        "CRT STAGE-0 COMPLETED SUCCESSFULLY"
+    audit = audit_trades(
+        accepted
     )
-    print("=" * 78)
 
+    print()
+    print("=" * 72)
+    print(
+        "FINAL AUDIT"
+    )
+    print("=" * 72)
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
+    print(
+        audit
+    )
+
+    if (
+        audit[
+            "same_symbol_overlap"
+        ]
+        != 0
+    ):
+        raise RuntimeError(
+            "AUDIT FAIL: "
+            "same-symbol overlap detected."
+        )
+
+    if (
+        audit[
+            "same_symbol_reentry"
+        ]
+        != 0
+    ):
+        raise RuntimeError(
+            "AUDIT FAIL: "
+            "same-symbol same-time "
+            "re-entry detected."
+        )
+
+    if (
+        audit[
+            "max_simultaneous"
+        ]
+        > MAX_SIMULTANEOUS_POSITIONS
+    ):
+        raise RuntimeError(
+            "AUDIT FAIL: "
+            "maximum simultaneous "
+            "positions exceeded."
+        )
+
+    print()
+    print("=" * 72)
+    print(
+        "CRT STAGE-0 COMPLETE"
+    )
+    print("=" * 72)
+
 
 if __name__ == "__main__":
-
     main()
