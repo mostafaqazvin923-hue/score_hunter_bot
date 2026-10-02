@@ -24,48 +24,111 @@ jobs:
 
       - name: Validate Python syntax
         run: |
+          echo "=============================================="
+          echo "VALIDATING CRT PYTHON FILE"
+          echo "=============================================="
+
           python -m py_compile crt_stage0.py
-          echo "======================================"
+
           echo "Python syntax check: PASS"
-          echo "======================================"
 
       - name: Remove stale outputs
         run: |
+          echo "=============================================="
+          echo "REMOVING OLD OUTPUT FILES"
+          echo "=============================================="
+
           rm -f crt_stage0_trades.csv
           rm -f crt_stage0_summary.csv
           rm -f crt_stage0_validation_symbols.csv
           rm -f crt_stage0_audit.csv
 
-          echo "Old CRT outputs removed."
+          echo "Old outputs removed."
 
       - name: Run CRT Stage-0
         run: |
-          echo "======================================"
+          echo "=============================================="
           echo "STARTING CRT STAGE-0"
-          echo "======================================"
+          echo "=============================================="
 
           python -u crt_stage0.py
 
-      - name: Verify outputs
+          echo "=============================================="
+          echo "CRT PYTHON PROCESS FINISHED"
+          echo "=============================================="
+
+      - name: Verify output files
         run: |
-          echo "======================================"
-          echo "VERIFYING CRT OUTPUT FILES"
-          echo "======================================"
+          echo "=============================================="
+          echo "VERIFYING OUTPUT FILES"
+          echo "=============================================="
 
-          test -s crt_stage0_trades.csv
-          test -s crt_stage0_summary.csv
-          test -s crt_stage0_validation_symbols.csv
-          test -s crt_stage0_audit.csv
+          echo ""
+          echo "Checking audit file..."
 
-          echo "======================================"
-          echo "ALL CRT OUTPUT FILES EXIST"
-          echo "======================================"
+          if [ ! -s crt_stage0_audit.csv ]; then
+            echo "ERROR: crt_stage0_audit.csv is missing or empty."
+            exit 1
+          fi
 
-          ls -lh \
-            crt_stage0_trades.csv \
-            crt_stage0_summary.csv \
-            crt_stage0_validation_symbols.csv \
-            crt_stage0_audit.csv
+          echo "Audit file: PRESENT"
+
+          echo ""
+          echo "Checking trades file..."
+
+          if [ -s crt_stage0_trades.csv ]; then
+            echo "Trades file: PRESENT"
+          else
+            echo "Trades file: EMPTY"
+            echo "This can happen during a diagnostic zero-candidate run."
+          fi
+
+          echo ""
+          echo "Checking summary file..."
+
+          if [ -s crt_stage0_summary.csv ]; then
+            echo "Summary file: PRESENT"
+          else
+            echo "Summary file: EMPTY"
+            echo "This can happen during a diagnostic zero-candidate run."
+          fi
+
+          echo ""
+          echo "Checking validation file..."
+
+          if [ -s crt_stage0_validation_symbols.csv ]; then
+            echo "Validation file: PRESENT"
+          else
+            echo "Validation file: EMPTY"
+            echo "This can happen during a diagnostic zero-candidate run."
+          fi
+
+          echo ""
+          echo "=============================================="
+          echo "AVAILABLE CRT OUTPUT FILES"
+          echo "=============================================="
+
+          ls -lh crt_stage0_*.csv
+
+      - name: Print audit file
+        run: |
+          echo "=============================================="
+          echo "CRT AUDIT FILE"
+          echo "=============================================="
+
+          cat crt_stage0_audit.csv
+
+      - name: Print summary file
+        run: |
+          echo "=============================================="
+          echo "CRT SUMMARY FILE"
+          echo "=============================================="
+
+          if [ -s crt_stage0_summary.csv ]; then
+            cat crt_stage0_summary.csv
+          else
+            echo "Summary is empty."
+          fi
 
       - name: Upload CRT results
         if: always()
