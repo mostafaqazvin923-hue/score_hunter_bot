@@ -1,0 +1,25 @@
+
+name: "EBP Setup 1 Backtest"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install pandas numpy requests
+      - name: Run Setup 1
+        run: python ebp_setup1_backtest.py
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ebp_setup1_results
+          path: ebp_setup1_outputs/
+          
