@@ -1,391 +1,1383 @@
-
-import io, math, time, zipfile, requests
+import io
+import time
+import zipfile
+import calendar
 from pathlib import Path
+
+import requests
 import numpy as np
 import pandas as pd
 
+
 # ============================================================
-# SETUP 1 — Equal High/Low -> Fake Breakout -> First Pullback
-# Faithful mechanical translation of pages 4–10 of "10 ستاپ برتر.pdf"
-#
-# Research protocol:
-# - Binance USD-M Futures public klines
-# - Fixed 14-symbol universe
-# - 1H primary timeframe
-# - 365d test + 60d warmup
-# - RR = 1:2
-# - $1,000 initial capital, $100 margin, 50x leverage
-# - fee 0.07%/side, slippage 0.03%/side
-# - one open trade per symbol; different symbols may overlap
-# - no same-candle re-entry
-# - same-candle SL+TP = LOSS
-# - unresolved end-of-sample trades excluded
-# - chronological 50/25/25 Discovery/Development/Validation
-#
-# IMPORTANT:
-# The PDF leaves "equal", "confirmation", and "sharp" partly discretionary.
-# They are frozen here BEFORE seeing results:
-#   equal-high tolerance = max(0.20 ATR, 0.15% of price)
-#   equal-low tolerance  = same
-#   pivot = 2 bars left + 2 bars right (confirmed pivot)
-#   trend = last two confirmed swing highs/lows form LH + LL
-#   A->B sharpness = <= 6 bars and retracement <= 23.6%
-#   fake breakout = wick crosses aligned level and CLOSE returns below/above it
-#   first pullback = first retracement after fake breakout, max 6 bars
-#   confirmation = first candle closing back in the setup direction after pullback
-# No BOS/IDM/CHOCH is used, matching page 9.
+# CONFIG
 # ============================================================
 
 SYMBOLS = [
-    "BTCUSDT","ETHUSDT","SOLUSDT","SUIUSDT","AVAXUSDT","NEARUSDT",
-    "ADAUSDT","BNBUSDT","APTUSDT","CRVUSDT","ONDOUSDT","PENDLEUSDT",
-    "ICPUSDT","WIFUSDT"
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT",
+    "AVAXUSDT", "NEARUSDT", "ADAUSDT", "BNBUSDT",
+    "APTUSDT", "CRVUSDT", "ONDOUSDT", "PENDLEUSDT",
+    "ICPUSDT", "WIFUSDT",
 ]
+
 INTERVAL = "1h"
-DAYS_TEST = 365
-DAYS_WARMUP = 60
+
+TEST_DAYS = 365
+WARMUP_DAYS = 60
+
 RR = 2.0
+
 INITIAL_CAPITAL = 1000.0
 MARGIN = 100.0
 LEVERAGE = 50.0
 NOTIONAL = MARGIN * LEVERAGE
+
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
-PIVOT_LR = 2
-EQUAL_ATR_MULT = 0.20
+
+# Mechanical interpretation of Setup 1
+PIVOT = 2
+
+EQUAL_ATR = 0.20
 EQUAL_PCT = 0.0015
+
 MAX_AB_BARS = 6
 MAX_PULLBACK_BARS = 6
-FIB_MAX_RETRACE = 0.236
-MIN_RISK_PCT = 0.0005
-MAX_RISK_PCT = 0.08
-MAX_SIMULTANEOUS = 10
 
-BASE = "https://fapi.binance.com/fapi/v1/klines"
+MAX_RETRACE = 0.236
 
-def utc_now():
+MIN_RISK = 0.0005
+MAX_RISK = 0.08
+
+ARCHIVE_BASE = (
+    "https://data.binance.vision/data/futures/um"
+)
+
+
+# ============================================================
+# TIME
+# ============================================================
+
+def now_utc():
     return pd.Timestamp.now(tz="UTC")
 
+
+# ============================================================
+# BINANCE ARCHIVE DOWNLOAD
+# ============================================================
+
+def download_zip(url):
+
+    for attempt in range(3):
+
+        try:
+
+            r = requests.get(
+                url,
+                timeout=60
+            )
+
+            if r.status_code == 404:
+                return None
+
+            r.raise_for_status()
+
+            z = zipfile.ZipFile(
+                io.BytesIO(r.content)
+            )
+
+            names = [
+                x for x in z.namelist()
+                if x.lower().endswith(".csv")
+            ]
+
+            if not names:
+                return None
+
+            with z.open(names[0]) as f:
+                return pd.read_csv(
+                    f,
+                    header=None
+                )
+
+        except Exception as e:
+
+            if attempt == 2:
+                print(
+                    f"DOWNLOAD FAILED: {url}\n"
+                    f"ERROR: {e}"
+                )
+                return None
+
+            time.sleep(1 + attempt)
+
+    return None
+
+
+# ============================================================
+# FETCH SYMBOL
+# ============================================================
+
 def fetch_symbol(symbol, start_ms, end_ms):
-    rows = []
-    cur = start_ms
-    for _ in range(300):
-        p = {"symbol": symbol, "interval": INTERVAL,
-             "startTime": cur, "endTime": end_ms, "limit": 1000}
-        for attempt in range(4):
-            try:
-                r = requests.get(BASE, params=p, timeout=30)
-                r.raise_for_status()
-                data = r.json()
-                break
-            except Exception:
-                if attempt == 3:
-                    raise
-                time.sleep(1.5 * (attempt + 1))
-        if not data:
-            break
-        rows.extend(data)
-        nxt = int(data[-1][0]) + 1
-        if nxt <= cur:
-            break
-        cur = nxt
-        if len(data) < 1000:
-            break
-        time.sleep(0.08)
-    if not rows:
+
+    start = pd.to_datetime(
+        start_ms,
+        unit="ms",
+        utc=True
+    )
+
+    end = pd.to_datetime(
+        end_ms,
+        unit="ms",
+        utc=True
+    )
+
+    frames = []
+
+    months = pd.period_range(
+        start.to_period("M"),
+        end.to_period("M"),
+        freq="M"
+    )
+
+    for period in months:
+
+        year = period.year
+        month = period.month
+
+        monthly_url = (
+            f"{ARCHIVE_BASE}/monthly/klines/"
+            f"{symbol}/{INTERVAL}/"
+            f"{symbol}-{INTERVAL}-"
+            f"{year}-{month:02d}.zip"
+        )
+
+        raw = download_zip(monthly_url)
+
+        if raw is not None:
+
+            frames.append(raw)
+
+            continue
+
+        # ----------------------------------------------------
+        # Daily fallback
+        # ----------------------------------------------------
+
+        days = calendar.monthrange(
+            year,
+            month
+        )[1]
+
+        for day in range(1, days + 1):
+
+            date_str = (
+                f"{year}-{month:02d}-{day:02d}"
+            )
+
+            daily_url = (
+                f"{ARCHIVE_BASE}/daily/klines/"
+                f"{symbol}/{INTERVAL}/"
+                f"{symbol}-{INTERVAL}-"
+                f"{date_str}.zip"
+            )
+
+            raw = download_zip(daily_url)
+
+            if raw is not None:
+                frames.append(raw)
+
+    if not frames:
         return pd.DataFrame()
-    cols = ["open_time","open","high","low","close","volume","close_time",
-            "quote_volume","trades","taker_buy_base","taker_buy_quote","ignore"]
-    df = pd.DataFrame(rows, columns=cols)
-    df = df.drop_duplicates("open_time").sort_values("open_time")
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    # Remove current incomplete candle.
-    df = df[df["close_time"] <= utc_now()].copy()
-    return df[["open_time","close_time","open","high","low","close","volume"]].reset_index(drop=True)
 
-def atr(df, n=14):
-    prev = df["close"].shift(1)
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev).abs(),
-        (df["low"] - prev).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(n, min_periods=n).mean()
+    x = pd.concat(
+        frames,
+        ignore_index=True
+    )
 
-def confirmed_pivots(df):
-    h = df["high"].to_numpy()
-    l = df["low"].to_numpy()
-    ph = np.zeros(len(df), dtype=bool)
-    pl = np.zeros(len(df), dtype=bool)
-    k = PIVOT_LR
-    for i in range(k, len(df)-k):
-        if h[i] >= np.max(h[i-k:i]) and h[i] > np.max(h[i+1:i+k+1]):
-            ph[i] = True
-        if l[i] <= np.min(l[i-k:i]) and l[i] < np.min(l[i+1:i+k+1]):
-            pl[i] = True
-    # A pivot at i is only tradable/known at i+k.
-    return ph, pl
+    x = (
+        x.drop_duplicates(subset=[0])
+        .sort_values(0)
+        .reset_index(drop=True)
+    )
 
-def costs(entry, exit_price):
-    # Fee on entry + exit, slippage already incorporated into prices.
-    return NOTIONAL * FEE_RATE * 2.0
+    if x.shape[1] < 12:
+        raise RuntimeError(
+            f"{symbol}: invalid Binance archive format"
+        )
 
-def apply_slippage(price, side, is_entry):
+    x = x.iloc[:, :12]
+
+    x.columns = [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "quote_volume",
+        "trades",
+        "taker_buy_base",
+        "taker_buy_quote",
+        "ignore",
+    ]
+
+    for col in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]:
+
+        x[col] = pd.to_numeric(
+            x[col],
+            errors="coerce"
+        )
+
+    x["open_time"] = pd.to_datetime(
+        x["open_time"],
+        unit="ms",
+        utc=True
+    )
+
+    x["close_time"] = pd.to_datetime(
+        x["close_time"],
+        unit="ms",
+        utc=True
+    )
+
+    x = x.dropna(
+        subset=[
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+    )
+
+    x = x[
+        (x.open_time >= start)
+        &
+        (x.open_time < end)
+    ]
+
+    # Remove incomplete current candle
+    x = x[
+        x.close_time <= now_utc()
+    ]
+
+    x = x.reset_index(drop=True)
+
+    return x[
+        [
+            "open_time",
+            "close_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
+    ]
+
+
+# ============================================================
+# FEATURES
+# ============================================================
+
+def add_features(df):
+
+    x = df.copy()
+
+    previous_close = x.close.shift(1)
+
+    tr = pd.concat(
+        [
+            x.high - x.low,
+            (x.high - previous_close).abs(),
+            (x.low - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    x["atr"] = tr.rolling(
+        14,
+        min_periods=14
+    ).mean()
+
+    x["pivot_high"] = False
+    x["pivot_low"] = False
+
+    for i in range(
+        PIVOT,
+        len(x) - PIVOT
+    ):
+
+        left_high = x.high.iloc[
+            i - PIVOT:i
+        ].max()
+
+        right_high = x.high.iloc[
+            i + 1:i + PIVOT + 1
+        ].max()
+
+        left_low = x.low.iloc[
+            i - PIVOT:i
+        ].min()
+
+        right_low = x.low.iloc[
+            i + 1:i + PIVOT + 1
+        ].min()
+
+        if (
+            x.high.iloc[i] >= left_high
+            and
+            x.high.iloc[i] > right_high
+        ):
+            x.loc[
+                x.index[i],
+                "pivot_high"
+            ] = True
+
+        if (
+            x.low.iloc[i] <= left_low
+            and
+            x.low.iloc[i] < right_low
+        ):
+            x.loc[
+                x.index[i],
+                "pivot_low"
+            ] = True
+
+    return x
+
+
+# ============================================================
+# SETUP 1 CANDIDATES
+#
+# PDF concept:
+#
+# Downtrend
+# -> aligned/equal highs
+# -> lowest valley
+# -> fake breakout
+# -> first pullback
+# -> confirmation
+#
+# Symmetric logic for long.
+# ============================================================
+
+def find_candidates(df, symbol):
+
+    x = add_features(df)
+
+    pivot_highs = []
+    pivot_lows = []
+
+    candidates = []
+
+    for i in range(len(x)):
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Pivot at i-PIVOT is only available now.
+        # This prevents future-leak from pivot confirmation.
+        # ----------------------------------------------------
+
+        if i >= PIVOT:
+
+            confirmed = i - PIVOT
+
+            if x.pivot_high.iloc[confirmed]:
+                pivot_highs.append(confirmed)
+
+            if x.pivot_low.iloc[confirmed]:
+                pivot_lows.append(confirmed)
+
+            pivot_highs = pivot_highs[-20:]
+            pivot_lows = pivot_lows[-20:]
+
+        if (
+            len(pivot_highs) < 2
+            or
+            len(pivot_lows) < 2
+        ):
+            continue
+
+        h1 = pivot_highs[-2]
+        h2 = pivot_highs[-1]
+
+        l1 = pivot_lows[-2]
+        l2 = pivot_lows[-1]
+
+        # ====================================================
+        # SHORT SETUP
+        # ====================================================
+
+        # Initial downtrend:
+        # lower high + lower low
+
+        downtrend = (
+            h2 > h1
+            and
+            l2 > l1
+            and
+            x.high.iloc[h2] < x.high.iloc[h1]
+            and
+            x.low.iloc[l2] < x.low.iloc[l1]
+        )
+
+        if downtrend:
+
+            level = (
+                x.high.iloc[h1]
+                +
+                x.high.iloc[h2]
+            ) / 2.0
+
+            atr_ref = x.atr.iloc[h2]
+
+            if pd.isna(atr_ref):
+                continue
+
+            tolerance = max(
+                atr_ref * EQUAL_ATR,
+                level * EQUAL_PCT
+            )
+
+            equal_highs = (
+                abs(
+                    x.high.iloc[h1]
+                    -
+                    x.high.iloc[h2]
+                )
+                <= tolerance
+            )
+
+            if equal_highs:
+
+                valleys = [
+                    z
+                    for z in pivot_lows
+                    if z > h2 and z < i
+                ]
+
+                if valleys:
+
+                    valley = min(
+                        valleys,
+                        key=lambda z: x.low.iloc[z]
+                    )
+
+                    valley_price = float(
+                        x.low.iloc[valley]
+                    )
+
+                    # ----------------------------------------
+                    # Fake breakout
+                    # ----------------------------------------
+
+                    for breakout in range(
+                        valley + 1,
+                        min(
+                            len(x),
+                            valley + MAX_AB_BARS + 1
+                        ),
+                    ):
+
+                        candle_high = float(
+                            x.high.iloc[breakout]
+                        )
+
+                        candle_close = float(
+                            x.close.iloc[breakout]
+                        )
+
+                        # Wick above equal highs,
+                        # close back below.
+                        if candle_high <= level:
+                            continue
+
+                        if candle_close >= level:
+                            continue
+
+                        move = level - valley_price
+
+                        if move <= 0:
+                            continue
+
+                        # ------------------------------------
+                        # Retracement filter
+                        # ------------------------------------
+
+                        internal = x.iloc[
+                            valley + 1:breakout
+                        ]
+
+                        if not internal.empty:
+
+                            retracement = (
+                                level
+                                -
+                                float(
+                                    internal.low.min()
+                                )
+                            ) / move
+
+                            if retracement > MAX_RETRACE:
+                                continue
+
+                        # ------------------------------------
+                        # First pullback
+                        # ------------------------------------
+
+                        for pullback in range(
+                            breakout + 1,
+                            min(
+                                len(x),
+                                breakout
+                                + MAX_PULLBACK_BARS
+                                + 1,
+                            ),
+                        ):
+
+                            # Must return toward broken level.
+                            if (
+                                x.low.iloc[pullback]
+                                > level
+                            ):
+                                continue
+
+                            # Do not allow a complete invalidation.
+                            if (
+                                x.low.iloc[pullback]
+                                <= valley_price
+                            ):
+                                break
+
+                            # Confirmation candle:
+                            # bearish close and lower than
+                            # previous candle low.
+                            confirmed = (
+                                x.close.iloc[pullback]
+                                <
+                                x.open.iloc[pullback]
+                                and
+                                x.close.iloc[pullback]
+                                <
+                                x.low.iloc[pullback - 1]
+                            )
+
+                            if not confirmed:
+                                continue
+
+                            entry_bar = pullback + 1
+
+                            if entry_bar >= len(x):
+                                break
+
+                            raw_entry = float(
+                                x.open.iloc[entry_bar]
+                            )
+
+                            # Two protective references:
+                            # pullback area and fake-break high.
+                            stop = min(
+                                float(
+                                    x.high.iloc[breakout]
+                                ),
+                                float(
+                                    x.iloc[
+                                        breakout:
+                                        pullback + 1
+                                    ].high.max()
+                                ),
+                            )
+
+                            risk = stop - raw_entry
+
+                            if risk <= 0:
+                                break
+
+                            risk_pct = risk / raw_entry
+
+                            if not (
+                                MIN_RISK
+                                <= risk_pct
+                                <= MAX_RISK
+                            ):
+                                break
+
+                            target = (
+                                raw_entry
+                                -
+                                RR * risk
+                            )
+
+                            # PDF target is the lowest valley.
+                            # With locked RR 1:2, the 2R target
+                            # must be reachable before that valley.
+                            if target < valley_price:
+                                break
+
+                            candidates.append(
+                                {
+                                    "symbol": symbol,
+                                    "side": "SHORT",
+                                    "signal_bar": breakout,
+                                    "confirm_bar": pullback,
+                                    "entry_bar": entry_bar,
+                                    "entry": raw_entry,
+                                    "stop": stop,
+                                    "target": target,
+                                }
+                            )
+
+                            break
+
+                        break
+
+        # ====================================================
+        # LONG — SYMMETRIC VERSION
+        # ====================================================
+
+        uptrend = (
+            h2 > h1
+            and
+            l2 > l1
+            and
+            x.high.iloc[h2] > x.high.iloc[h1]
+            and
+            x.low.iloc[l2] > x.low.iloc[l1]
+        )
+
+        if uptrend:
+
+            level = (
+                x.low.iloc[l1]
+                +
+                x.low.iloc[l2]
+            ) / 2.0
+
+            atr_ref = x.atr.iloc[l2]
+
+            if pd.isna(atr_ref):
+                continue
+
+            tolerance = max(
+                atr_ref * EQUAL_ATR,
+                level * EQUAL_PCT
+            )
+
+            equal_lows = (
+                abs(
+                    x.low.iloc[l1]
+                    -
+                    x.low.iloc[l2]
+                )
+                <= tolerance
+            )
+
+            if equal_lows:
+
+                peaks = [
+                    z
+                    for z in pivot_highs
+                    if z > l2 and z < i
+                ]
+
+                if peaks:
+
+                    peak = max(
+                        peaks,
+                        key=lambda z: x.high.iloc[z]
+                    )
+
+                    peak_price = float(
+                        x.high.iloc[peak]
+                    )
+
+                    # ----------------------------------------
+                    # Fake downside breakout
+                    # ----------------------------------------
+
+                    for breakout in range(
+                        peak + 1,
+                        min(
+                            len(x),
+                            peak + MAX_AB_BARS + 1
+                        ),
+                    ):
+
+                        candle_low = float(
+                            x.low.iloc[breakout]
+                        )
+
+                        candle_close = float(
+                            x.close.iloc[breakout]
+                        )
+
+                        if candle_low >= level:
+                            continue
+
+                        if candle_close <= level:
+                            continue
+
+                        move = peak_price - level
+
+                        if move <= 0:
+                            continue
+
+                        internal = x.iloc[
+                            peak + 1:breakout
+                        ]
+
+                        if not internal.empty:
+
+                            retracement = (
+                                float(
+                                    internal.high.max()
+                                )
+                                -
+                                level
+                            ) / move
+
+                            if retracement > MAX_RETRACE:
+                                continue
+
+                        # ------------------------------------
+                        # First pullback
+                        # ------------------------------------
+
+                        for pullback in range(
+                            breakout + 1,
+                            min(
+                                len(x),
+                                breakout
+                                + MAX_PULLBACK_BARS
+                                + 1,
+                            ),
+                        ):
+
+                            if (
+                                x.high.iloc[pullback]
+                                < level
+                            ):
+                                continue
+
+                            if (
+                                x.high.iloc[pullback]
+                                >= peak_price
+                            ):
+                                break
+
+                            confirmed = (
+                                x.close.iloc[pullback]
+                                >
+                                x.open.iloc[pullback]
+                                and
+                                x.close.iloc[pullback]
+                                >
+                                x.high.iloc[pullback - 1]
+                            )
+
+                            if not confirmed:
+                                continue
+
+                            entry_bar = pullback + 1
+
+                            if entry_bar >= len(x):
+                                break
+
+                            raw_entry = float(
+                                x.open.iloc[entry_bar]
+                            )
+
+                            stop = max(
+                                float(
+                                    x.low.iloc[breakout]
+                                ),
+                                float(
+                                    x.iloc[
+                                        breakout:
+                                        pullback + 1
+                                    ].low.min()
+                                ),
+                            )
+
+                            risk = raw_entry - stop
+
+                            if risk <= 0:
+                                break
+
+                            risk_pct = risk / raw_entry
+
+                            if not (
+                                MIN_RISK
+                                <= risk_pct
+                                <= MAX_RISK
+                            ):
+                                break
+
+                            target = (
+                                raw_entry
+                                +
+                                RR * risk
+                            )
+
+                            if target > peak_price:
+                                break
+
+                            candidates.append(
+                                {
+                                    "symbol": symbol,
+                                    "side": "LONG",
+                                    "signal_bar": breakout,
+                                    "confirm_bar": pullback,
+                                    "entry_bar": entry_bar,
+                                    "entry": raw_entry,
+                                    "stop": stop,
+                                    "target": target,
+                                }
+                            )
+
+                            break
+
+                        break
+
+    if not candidates:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(candidates)
+        .drop_duplicates(
+            subset=[
+                "symbol",
+                "entry_bar",
+            ]
+        )
+        .sort_values("entry_bar")
+        .reset_index(drop=True)
+    )
+
+
+# ============================================================
+# EXECUTION COST
+# ============================================================
+
+def apply_entry_slippage(price, side):
+
     if side == "LONG":
-        return price * (1 + SLIPPAGE) if is_entry else price * (1 - SLIPPAGE)
-    return price * (1 - SLIPPAGE) if is_entry else price * (1 + SLIPPAGE)
+        return price * (1 + SLIPPAGE)
 
-def trade_r(side, entry, exit_price, stop, target):
-    risk = abs(entry - stop)
-    if risk <= 0:
-        return None
-    gross = (exit_price-entry)/risk if side=="LONG" else (entry-exit_price)/risk
-    fee_r = costs(entry, exit_price) / (NOTIONAL * (risk/entry))
-    return gross - fee_r
+    return price * (1 - SLIPPAGE)
 
-def make_candidates(df, symbol):
-    df = df.copy()
-    df["atr"] = atr(df)
-    ph, pl = confirmed_pivots(df)
-    df["pivot_high"] = ph
-    df["pivot_low"] = pl
-    c = []
-    # Work only from confirmed pivots. i is the bar where the pivot becomes known.
-    highs, lows = [], []
-    for i in range(len(df)):
-        if i >= PIVOT_LR and df.at[i-PIVOT_LR, "pivot_high"]:
-            highs.append(i-PIVOT_LR)
-            highs = highs[-8:]
-        if i >= PIVOT_LR and df.at[i-PIVOT_LR, "pivot_low"]:
-            lows.append(i-PIVOT_LR)
-            lows = lows[-8:]
 
-        if len(highs) < 2 or len(lows) < 2:
-            continue
+def apply_exit_slippage(price, side):
 
-        # Latest two confirmed swing highs/lows define the downtrend.
-        h1, h2 = highs[-2], highs[-1]
-        l1, l2 = lows[-2], lows[-1]
-        if not (df.at[h2,"high"] < df.at[h1,"high"] and df.at[l2,"low"] < df.at[l1,"low"]):
-            continue
-        # Need the aligned highs before the lowest valley.
-        level = (df.at[h1,"high"] + df.at[h2,"high"]) / 2
-        a1 = df.at[h1,"high"]; a2 = df.at[h2,"high"]
-        tol = max(float(df.at[max(h1,h2),"atr"]) * EQUAL_ATR_MULT,
-                  level * EQUAL_PCT)
-        if abs(a1-a2) > tol:
-            continue
-        if a2 > a1 + tol:
-            continue
-        valley_idx = l2
-        if valley_idx <= h2:
-            continue
-        # Valley must be the lowest low after the aligned highs and before the fake break.
-        seg = df.iloc[h2: i+1]
-        if seg.empty:
-            continue
-        # Candidate valley is the lowest confirmed low after the aligned highs.
-        post_lows = [x for x in lows if h2 < x <= i]
-        if not post_lows:
-            continue
-        valley_idx = min(post_lows, key=lambda x: df.at[x,"low"])
-        valley = df.at[valley_idx,"low"]
-        if valley_idx >= i:
-            continue
+    if side == "LONG":
+        return price * (1 - SLIPPAGE)
 
-        # Need a strong move from valley to fake breakout: <=6 bars, retrace <=23.6%.
-        # Search the FIRST qualifying fake breakout after the valley.
-        for b in range(valley_idx + 1, min(i + 1, valley_idx + MAX_AB_BARS + 8)):
-            # Fake breakout is known only at close b: high above level, close back below.
-            if df.at[b,"high"] <= level or df.at[b,"close"] >= level:
-                continue
-            bars = b - valley_idx
-            if bars < 1 or bars > MAX_AB_BARS:
-                continue
-            move = level - valley
-            if move <= 0:
-                continue
-            # Maximum adverse retracement between valley and breakout.
-            path_low = df.iloc[valley_idx:b+1]["low"].min()
-            retrace = (level - path_low) / move if move else 999
-            # path_low is the valley itself; use internal pullbacks only.
-            if len(df.iloc[valley_idx+1:b]) > 0:
-                internal_low = df.iloc[valley_idx+1:b]["low"].min()
-                retrace = max(0.0, (level-internal_low)/move)
-            if retrace > FIB_MAX_RETRACE:
-                continue
+    return price * (1 + SLIPPAGE)
 
-            # First pullback after fake breakout: price moves down but does not break the valley.
-            pb_start = b + 1
-            pb_end = min(len(df)-1, b + MAX_PULLBACK_BARS)
-            if pb_start > pb_end:
-                continue
-            confirmation = None
-            pullback_low = None
-            for p in range(pb_start, pb_end+1):
-                if df.at[p,"low"] <= level:
-                    pullback_low = df.at[p,"low"] if pullback_low is None else min(pullback_low, df.at[p,"low"])
-                # Confirmation = first bullish close back above prior candle high after touching/retesting level.
-                touched = (pullback_low is not None)
-                if touched and df.at[p,"close"] > df.at[p-1,"high"] and df.at[p,"close"] > df.at[p,"open"]:
-                    confirmation = p
-                    break
-            if confirmation is None:
-                continue
 
-            entry_bar = confirmation + 1
-            if entry_bar >= len(df):
-                continue
-            # SL: behind pullback; if fake-break peak is close, use it as second option.
-            pb_stop = pullback_low
-            fake_stop = df.at[b,"high"]
-            stop = min(pb_stop, fake_stop)  # tighter of the two valid protective references
-            entry_ref = df.at[entry_bar,"open"]
-            if stop >= entry_ref:
-                continue
-            risk = entry_ref - stop
-            if risk/entry_ref < MIN_RISK_PCT or risk/entry_ref > MAX_RISK_PCT:
-                continue
-            target = entry_ref + RR*risk
-            # PDF target is lowest valley. If RR target is beyond it, the setup is not a 1:2 trade.
-            if target > valley:
-                continue
-            c.append({
-                "symbol":symbol, "side":"LONG", "signal_bar":b,
-                "confirmation_bar":confirmation, "entry_bar":entry_bar,
-                "entry_ref":entry_ref, "stop":stop, "target":target,
-                "aligned_level":level, "valley":valley,
-                "fake_high":fake_stop
-            })
-            break
-    if not c:
-        return pd.DataFrame(columns=["symbol","side","signal_bar","confirmation_bar","entry_bar",
-                                     "entry_ref","stop","target","aligned_level","valley","fake_high"])
-    out = pd.DataFrame(c).drop_duplicates(["symbol","entry_bar"]).sort_values("entry_bar")
-    return out
+# ============================================================
+# SINGLE SYMBOL SIMULATION
+#
+# One trade per symbol at a time.
+# Same-symbol re-entry only after exit.
+# ============================================================
 
-def simulate(df, candidates):
+def simulate_symbol(df, candidates):
+
     if candidates.empty:
-        return pd.DataFrame(), pd.DataFrame()
-    trades, diag = [], []
-    occupied_until = -1
-    # Per-symbol only; candidates are already one symbol.
-    for _, s in candidates.iterrows():
-        e = int(s.entry_bar)
-        if e <= occupied_until:
-            continue
-        entry_raw = float(df.at[e,"open"])
-        entry = apply_slippage(entry_raw, "LONG", True)
-        stop, target = float(s.stop), float(s.target)
-        exit_idx = None; exit_raw = None; outcome = None
-        for j in range(e, len(df)):
-            hi, lo = float(df.at[j,"high"]), float(df.at[j,"low"])
-            if lo <= stop and hi >= target:
-                exit_idx=j; exit_raw=stop; outcome="LOSS"; break
-            if lo <= stop:
-                exit_idx=j; exit_raw=stop; outcome="LOSS"; break
-            if hi >= target:
-                exit_idx=j; exit_raw=target; outcome="WIN"; break
-        if exit_idx is None:
-            continue
-        exit_price = apply_slippage(exit_raw, "LONG", False)
-        r = trade_r("LONG", entry, exit_price, stop, target)
-        trades.append({
-            "symbol":s.symbol,"side":"LONG","entry_bar":e,"exit_bar":exit_idx,
-            "entry":entry,"exit":exit_price,"stop":stop,"target":target,
-            "outcome":outcome,"R":r
-        })
-        occupied_until = exit_idx
-    return pd.DataFrame(trades), pd.DataFrame(diag)
+        return pd.DataFrame()
 
-def stats(t):
-    if t.empty:
-        return {"trades":0,"wins":0,"losses":0,"wr":np.nan,"pf":np.nan,"net_R":0.0,"max_streak":0}
-    wins = (t.R > 0).sum()
-    losses = (t.R <= 0).sum()
-    gp = t.loc[t.R>0,"R"].sum()
-    gl = -t.loc[t.R<=0,"R"].sum()
-    streak=mx=0
-    for x in t.R:
-        if x <= 0: streak += 1; mx=max(mx,streak)
-        else: streak=0
-    return {"trades":len(t),"wins":int(wins),"losses":int(losses),
-            "wr":100*wins/len(t),"pf":gp/gl if gl>0 else np.inf,
-            "net_R":t.R.sum(),"max_streak":mx}
+    trades = []
+
+    occupied_until = -1
+
+    for _, setup in candidates.sort_values(
+        "entry_bar"
+    ).iterrows():
+
+        entry_bar = int(
+            setup.entry_bar
+        )
+
+        if entry_bar <= occupied_until:
+            continue
+
+        side = setup.side
+
+        entry = apply_entry_slippage(
+            float(df.open.iloc[entry_bar]),
+            side
+        )
+
+        stop = float(setup.stop)
+        target = float(setup.target)
+
+        exit_bar = None
+        exit_raw = None
+        result = None
+
+        for j in range(
+            entry_bar,
+            len(df)
+        ):
+
+            high = float(df.high.iloc[j])
+            low = float(df.low.iloc[j])
+
+            if side == "LONG":
+
+                hit_sl = low <= stop
+                hit_tp = high >= target
+
+            else:
+
+                hit_sl = high >= stop
+                hit_tp = low <= target
+
+            # Locked rule:
+            # same candle SL + TP = LOSS
+            if hit_sl and hit_tp:
+
+                exit_bar = j
+                exit_raw = stop
+                result = "LOSS"
+                break
+
+            if hit_sl:
+
+                exit_bar = j
+                exit_raw = stop
+                result = "LOSS"
+                break
+
+            if hit_tp:
+
+                exit_bar = j
+                exit_raw = target
+                result = "WIN"
+                break
+
+        # Unresolved final trade = censored
+        if exit_bar is None:
+            continue
+
+        exit_price = apply_exit_slippage(
+            exit_raw,
+            side
+        )
+
+        risk_price = abs(
+            entry - stop
+        )
+
+        if side == "LONG":
+            gross_R = (
+                exit_price - entry
+            ) / risk_price
+        else:
+            gross_R = (
+                entry - exit_price
+            ) / risk_price
+
+        # Fee converted to R.
+        # Round-trip fee on fixed notional.
+        fee_dollars = (
+            NOTIONAL
+            * FEE_RATE
+            * 2
+        )
+
+        one_R_dollars = (
+            NOTIONAL
+            * (
+                risk_price / entry
+            )
+        )
+
+        fee_R = (
+            fee_dollars / one_R_dollars
+            if one_R_dollars > 0
+            else 0
+        )
+
+        net_R = gross_R - fee_R
+
+        trades.append(
+            {
+                "symbol": setup.symbol,
+                "side": side,
+                "entry_time": df.open_time.iloc[
+                    entry_bar
+                ],
+                "exit_time": df.close_time.iloc[
+                    exit_bar
+                ],
+                "entry": entry,
+                "exit": exit_price,
+                "stop": stop,
+                "target": target,
+                "outcome": result,
+                "gross_R": gross_R,
+                "fee_R": fee_R,
+                "R": net_R,
+            }
+        )
+
+        occupied_until = exit_bar
+
+    if not trades:
+        return pd.DataFrame()
+
+    return pd.DataFrame(trades)
+
+
+# ============================================================
+# STATS
+# ============================================================
+
+def calculate_stats(trades):
+
+    if trades.empty:
+
+        return {
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "wr": np.nan,
+            "pf": np.nan,
+            "net_R": 0.0,
+            "max_streak": 0,
+        }
+
+    wins = trades.R > 0
+
+    gross_profit = trades.loc[
+        wins,
+        "R"
+    ].sum()
+
+    gross_loss = -trades.loc[
+        ~wins,
+        "R"
+    ].sum()
+
+    if gross_loss > 0:
+        pf = gross_profit / gross_loss
+    else:
+        pf = np.inf
+
+    streak = 0
+    max_streak = 0
+
+    for r in trades.R:
+
+        if r <= 0:
+
+            streak += 1
+
+            max_streak = max(
+                max_streak,
+                streak
+            )
+
+        else:
+
+            streak = 0
+
+    return {
+        "trades": len(trades),
+        "wins": int(wins.sum()),
+        "losses": int((~wins).sum()),
+        "wr": 100 * wins.mean(),
+        "pf": pf,
+        "net_R": trades.R.sum(),
+        "max_streak": max_streak,
+    }
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    out = Path("ebp_setup1_outputs"); out.mkdir(exist_ok=True)
-    end = utc_now().floor("h")
-    start = end - pd.Timedelta(days=DAYS_TEST + DAYS_WARMUP)
-    split0 = end - pd.Timedelta(days=DAYS_TEST)
-    split1 = split0 + pd.Timedelta(days=DAYS_TEST/4)
-    split2 = split1 + pd.Timedelta(days=DAYS_TEST/4)
 
-    all_trades=[]
-    funnel=[]
-    for sym in SYMBOLS:
-        print(f"Fetching {sym} ...", flush=True)
-        df=fetch_symbol(sym, int(start.timestamp()*1000), int(end.timestamp()*1000))
-        if len(df)<500:
-            print(f"{sym}: insufficient rows {len(df)}", flush=True); continue
-        cand=make_candidates(df, sym)
-        print(f"{sym}: rows={len(df):,} candidates={len(cand):,}", flush=True)
-        t,_=simulate(df,cand)
-        if not t.empty:
-            t["entry_time"]=df.loc[t.entry_bar.values,"open_time"].to_numpy()
-            t["exit_time"]=df.loc[t.exit_bar.values,"close_time"].to_numpy()
-            all_trades.append(t)
+    output = Path(
+        "ebp_setup1_outputs"
+    )
 
-    trades=pd.concat(all_trades,ignore_index=True) if all_trades else pd.DataFrame()
-    if trades.empty:
-        print("NO CLOSED TRADES")
-        pd.DataFrame(columns=["symbol","side","entry_bar","exit_bar","entry","exit","stop","target","outcome","R","entry_time","exit_time"]).to_csv(out/"trades.csv",index=False)
+    output.mkdir(
+        exist_ok=True
+    )
+
+    end = now_utc().floor("h")
+
+    full_start = (
+        end
+        -
+        pd.Timedelta(
+            days=TEST_DAYS + WARMUP_DAYS
+        )
+    )
+
+    test_start = (
+        end
+        -
+        pd.Timedelta(
+            days=TEST_DAYS
+        )
+    )
+
+    discovery_end = (
+        test_start
+        +
+        pd.Timedelta(
+            days=TEST_DAYS * 0.50
+        )
+    )
+
+    development_end = (
+        discovery_end
+        +
+        pd.Timedelta(
+            days=TEST_DAYS * 0.25
+        )
+    )
+
+    all_trades = []
+
+    total_candidates = 0
+
+    for symbol in SYMBOLS:
+
+        print(
+            f"\nFetching {symbol} ...",
+            flush=True
+        )
+
+        df = fetch_symbol(
+            symbol,
+            int(
+                full_start.timestamp()
+                * 1000
+            ),
+            int(
+                end.timestamp()
+                * 1000
+            ),
+        )
+
+        if len(df) < 500:
+
+            print(
+                f"{symbol}: "
+                f"insufficient rows={len(df)}"
+            )
+
+            continue
+
+        candidates = find_candidates(
+            df,
+            symbol
+        )
+
+        total_candidates += len(
+            candidates
+        )
+
+        print(
+            f"{symbol}: "
+            f"rows={len(df):,} "
+            f"candidates={len(candidates):,}",
+            flush=True
+        )
+
+        trades = simulate_symbol(
+            df,
+            candidates
+        )
+
+        if not trades.empty:
+            all_trades.append(trades)
+
+    # --------------------------------------------------------
+    # Combined trades
+    # --------------------------------------------------------
+
+    if all_trades:
+
+        trades = pd.concat(
+            all_trades,
+            ignore_index=True
+        )
+
+        trades = trades.sort_values(
+            "entry_time"
+        ).reset_index(drop=True)
+
     else:
-        trades=trades.sort_values("entry_time").reset_index(drop=True)
-        trades.to_csv(out/"trades.csv",index=False)
 
-    # Chronological splits by actual entry timestamp.
-    rows=[]
+        trades = pd.DataFrame()
+
+    trades.to_csv(
+        output / "trades.csv",
+        index=False
+    )
+
+    # --------------------------------------------------------
+    # Chronological split
+    # --------------------------------------------------------
+
+    summary_rows = []
+
     if not trades.empty:
-        for name,a,b in [
-            ("Discovery", start, split0),
-            ("Development", split0, split1),
-            ("Validation", split1, end)
-        ]:
-            x=trades[(trades.entry_time>=a)&(trades.entry_time<b)]
-            st=stats(x); st["split"]=name
-            rows.append(st)
-    summary=pd.DataFrame(rows, columns=["split","trades","wins","losses","wr","pf","net_R","max_streak"])
-    summary.to_csv(out/"summary.csv",index=False)
 
-    per_symbol=[]
+        splits = [
+            (
+                "Discovery",
+                test_start,
+                discovery_end,
+            ),
+            (
+                "Development",
+                discovery_end,
+                development_end,
+            ),
+            (
+                "Validation",
+                development_end,
+                end,
+            ),
+        ]
+
+        for name, start, finish in splits:
+
+            subset = trades[
+                (trades.entry_time >= start)
+                &
+                (trades.entry_time < finish)
+            ]
+
+            stats = calculate_stats(
+                subset
+            )
+
+            summary_rows.append(
+                {
+                    "split": name,
+                    **stats,
+                }
+            )
+
+    summary = pd.DataFrame(
+        summary_rows
+    )
+
+    summary.to_csv(
+        output / "summary.csv",
+        index=False
+    )
+
+    # --------------------------------------------------------
+    # Per symbol / direction
+    # --------------------------------------------------------
+
+    per_symbol_rows = []
+
     if not trades.empty:
-        for (sym,side),x in trades.groupby(["symbol","side"]):
-            st=stats(x); st.update({"symbol":sym,"side":side})
-            per_symbol.append(st)
-    pd.DataFrame(per_symbol).to_csv(out/"per_symbol.csv",index=False)
 
-    # Funnel / diagnostic counts are generated from candidate totals and final closed trades.
-    diag=pd.DataFrame([{
-        "symbols":len(SYMBOLS),
-        "candidate_setups":sum(1 for _ in []) if False else 0,
-        "closed_trades":len(trades),
-        "note":"Candidate count is printed per symbol; see Actions log. trades.csv contains only closed trades."
-    }])
-    diag.to_csv(out/"diagnostics.csv",index=False)
+        for (
+            symbol,
+            side
+        ), subset in trades.groupby(
+            ["symbol", "side"]
+        ):
 
-    print("\n=== SETUP 1 RESULT ===")
-    print(summary.to_string(index=False) if not summary.empty else "No split results.")
-    if not summary.empty:
-        v=summary[summary.split=="Validation"].iloc[0]
-        gate=(v.trades>=150 and v.wr>=40 and v.pf>=1.20 and v.max_streak<=4 and v.net_R>0)
-        print(f"\nValidation gate (research gate only): {'PASS' if gate else 'REJECT'}")
-        print("Gate: >=150 trades, WR>=40%, PF>=1.20, max loss streak<=4, net_R>0.")
-        print("No threshold mining is performed after seeing results.")
+            stats = calculate_stats(
+                subset
+            )
 
-if __name__=="__main__":
+            per_symbol_rows.append(
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    **stats,
+                }
+            )
+
+    per_symbol = pd.DataFrame(
+        per_symbol_rows
+    )
+
+    per_symbol.to_csv(
+        output / "per_symbol.csv",
+        index=False
+    )
+
+    # --------------------------------------------------------
+    # Diagnostics
+    # --------------------------------------------------------
+
+    diagnostics = pd.DataFrame(
+        [
+            {
+                "candidate_setups":
+                    total_candidates,
+                "closed_trades":
+                    len(trades),
+            }
+        ]
+    )
+
+    diagnostics.to_csv(
+        output / "diagnostics.csv",
+        index=False
+    )
+
+    # --------------------------------------------------------
+    # Console report
+    # --------------------------------------------------------
+
+    print("\n")
+    print("=" * 70)
+    print("EBP SETUP 1 — FINAL REPORT")
+    print("=" * 70)
+
+    if summary.empty:
+
+        print(
+            "NO CLOSED TRADES"
+        )
+
+    else:
+
+        print(
+            summary.to_string(
+                index=False
+            )
+        )
+
+    print("\n")
+    print(
+        f"TOTAL CANDIDATES: "
+        f"{total_candidates}"
+    )
+
+    print(
+        f"TOTAL CLOSED TRADES: "
+        f"{len(trades)}"
+    )
+
+    print("=" * 70)
+
+
+if __name__ == "__main__":
     main()
-          
