@@ -1,0 +1,49 @@
+name: Run Backtest Setup 2 V2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 60
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests
+
+      - name: Run Setup 2 V2
+        run: |
+          python backtest_setup2_v2.py
+
+      - name: Upload Setup 2 V2 ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup2-v2-trade-ledger
+          path: setup2_v2_trade_ledger.csv
+          if-no-files-found: ignore
+
+      - name: Upload Setup 2 V2 reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup2-v2-reports
+          path: reports/setup2_v2/
+          if-no-files-found: ignore
