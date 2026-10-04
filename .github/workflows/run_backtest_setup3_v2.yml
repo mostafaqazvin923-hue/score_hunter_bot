@@ -1,0 +1,38 @@
+name: "Setup 3 V2 Backtest"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests
+
+      - name: Compile check
+        run: |
+          python -m py_compile backtest_setup3_v2.py
+
+      - name: Run Setup 3 V2
+        run: |
+          python backtest_setup3_v2.py
+
+      - name: Upload Setup 3 V2 results
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup3_v2_results
+          path: setup3_v2_outputs/
+          if-no-files-found: error
