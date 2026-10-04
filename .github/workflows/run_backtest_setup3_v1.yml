@@ -1,0 +1,49 @@
+name: Run Backtest Setup 3 V1
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Cache Binance 1h archives
+        uses: actions/cache@v4
+        with:
+          path: data/binance_1h_setup3_v1
+          key: setup3-v1-binance-1h-${{ runner.os }}-${{ hashFiles('backtest_setup3_v1.py') }}
+          restore-keys: |
+            setup3-v1-binance-1h-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests
+
+      - name: Compile check
+        run: |
+          python -m py_compile backtest_setup3_v1.py
+
+      - name: Run Backtest Setup 3 V1
+        run: |
+          python backtest_setup3_v1.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup3-v1-results
+          path: |
+            setup3_v1_trade_ledger.csv
+            setup3_v1_report.txt
+          if-no-files-found: warn
