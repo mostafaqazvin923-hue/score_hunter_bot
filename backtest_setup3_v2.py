@@ -1,13 +1,12 @@
-import math
+ import math
 import time
 import zipfile
-import hashlib
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import requests
 import numpy as np
 import pandas as pd
+import requests
 
 
 # ============================================================
@@ -18,39 +17,39 @@ import pandas as pd
 # 10 ستاپ برتر.pdf — pages 18-21
 #
 # PDF sequence:
-#   trend
-#   -> LH / HH creates OB
+#   Trend structure
+#   -> LH / HH creates Order Block
 #   -> IFC after OB
-#   -> double valley / double top
-#   -> return to OB
-#   -> entry
+#   -> Double valley / double top
+#   -> Return to OB
+#   -> Entry
 #   -> SL behind OB
-#   -> structural target
+#   -> Structural target
 #
 # IMPORTANT:
 # Numeric definitions for pivot, IFC, alignment and exact OB
-# boundaries are not explicitly specified in the PDF.
-# They are frozen mechanical research translations.
+# boundaries are mechanical research translations.
+# They are NOT claimed to be literal numeric formulas from PDF.
 #
-# V2 fixes:
+# V2 integrity corrections:
 #   1. Pivot confirmation is causal.
 #   2. No artificial pattern-formation timeout.
 #   3. IFC must occur after OB.
 #   4. Double structure must be confirmed before entry.
-#   5. Entry cannot occur before pattern confirmation.
-#   6. RR is exactly 1:2 geometrically.
-#   7. Structural target is only a viability filter.
+#   5. Entry cannot occur before structural confirmation.
+#   6. Fixed RR = 1:2.
+#   7. Structural target is a viability filter only.
 #   8. No same-candle re-entry.
-#   9. One simultaneous position per symbol.
+#   9. One simultaneous trade per symbol.
 #  10. Different symbols may overlap.
-#
-# Fresh Setup-3-V2 OOS:
-#   2024-10-04 -> 2025-10-03
-#
-# If this V2 is changed after inspecting OOS,
-# a NEW OOS must be reserved.
+#  11. Warmup trades are excluded from research statistics.
+#  12. Real exchange data only.
 # ============================================================
 
+
+# ============================================================
+# SYMBOLS
+# ============================================================
 
 SYMBOLS = [
     "BTCUSDT",
@@ -69,6 +68,11 @@ SYMBOLS = [
     "WIFUSDT",
 ]
 
+
+# ============================================================
+# TIMEFRAME
+# ============================================================
+
 INTERVAL = "1h"
 BAR = pd.Timedelta(hours=1)
 
@@ -78,9 +82,13 @@ BAR = pd.Timedelta(hours=1)
 # ============================================================
 
 INITIAL_CAPITAL = 1000.0
+
 MARGIN = 100.0
 LEVERAGE = 50.0
-NOTIONAL = MARGIN * LEVERAGE
+
+NOTIONAL = (
+    MARGIN * LEVERAGE
+)
 
 RR = 2.0
 
@@ -89,27 +97,30 @@ SLIPPAGE = 0.0003
 
 
 # ============================================================
-# FROZEN STRUCTURAL TRANSLATIONS
+# STRUCTURAL TRANSLATION
 # ============================================================
 
-# A pivot at i is not usable until i + PIVOT.
+# Pivot at index i becomes known only at i + PIVOT.
 PIVOT = 2
 
-# PDF says valleys/tops only need to be aligned,
-# not exactly equal.
+# "Aligned" double valley/top tolerance.
+# This is a frozen research translation because
+# the PDF does not provide a numeric tolerance.
 ALIGN_TOL = 0.004
 
-# Small buffer behind the OB for the stop.
+# Small stop buffer behind OB.
 SL_BUFFER_PCT = 0.0005
 
-# IFC translation:
-# the first two candles after OB create the 3-candle
-# displacement/FVG structure.
+# Frozen mechanical IFC translation.
+# The PDF says IFC must occur after the OB,
+# but does not specify an exact numerical formula.
 IFC_LOOKAHEAD = 2
 
 
 # ============================================================
-# RESEARCH / FRESH OOS
+# FRESH SETUP-3-V2 OOS
+#
+# This OOS is not the OOS used for Setup 3 V1.
 # ============================================================
 
 OOS_START = pd.Timestamp(
@@ -122,7 +133,14 @@ OOS_END = pd.Timestamp(
     tz="UTC",
 )
 
-RESEARCH_END = OOS_START - BAR
+
+# ============================================================
+# RESEARCH WINDOW
+# ============================================================
+
+RESEARCH_END = (
+    OOS_START - BAR
+)
 
 RESEARCH_START = (
     RESEARCH_END
@@ -130,24 +148,39 @@ RESEARCH_START = (
     + BAR
 )
 
+
+# Warmup exists only to allow structural context
+# before the research window.
 WARMUP_START = (
     RESEARCH_START
     - pd.Timedelta(days=90)
 )
 
+
+# 60% Discovery
+# 20% Development
+# 20% Research Holdout
+#
+# Validation OOS is outside the research window.
 DISCOVERY_END = (
     RESEARCH_START
-    + (RESEARCH_END - RESEARCH_START) * 0.60
+    + (
+        RESEARCH_END
+        - RESEARCH_START
+    ) * 0.60
 )
 
 DEVELOPMENT_END = (
     RESEARCH_START
-    + (RESEARCH_END - RESEARCH_START) * 0.80
+    + (
+        RESEARCH_END
+        - RESEARCH_START
+    ) * 0.80
 )
 
 
 # ============================================================
-# DATA
+# BINANCE DATA
 # ============================================================
 
 DATA_BASE = (
@@ -155,88 +188,128 @@ DATA_BASE = (
     "data/futures/um/monthly/klines"
 )
 
-CACHE_DIR = Path("data_cache")
-OUT_DIR = Path("setup3_v2_outputs")
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+
+CACHE_DIR = Path(
+    "data_cache"
+)
+
+OUT_DIR = Path(
+    "setup3_v2_outputs"
+)
 
 LEDGER_PATH = (
-    OUT_DIR / "setup3_v2_trade_ledger.csv"
+    OUT_DIR
+    / "setup3_v2_trade_ledger.csv"
 )
 
 REPORT_PATH = (
-    OUT_DIR / "setup3_v2_report.txt"
+    OUT_DIR
+    / "setup3_v2_report.txt"
 )
 
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
+
 SESSION = requests.Session()
+
 SESSION.headers.update(
     {
-        "User-Agent": "Setup3-V2-Research/1.0"
+        "User-Agent":
+        "Setup3-V2-Research/1.0"
     }
 )
 
 
 # ============================================================
-# DATA DOWNLOAD
+# MONTH ITERATOR
 # ============================================================
 
 def month_starts(
     start: pd.Timestamp,
     end: pd.Timestamp,
 ):
-    cur = (
+    """
+    Generate monthly UTC timestamps.
+
+    Timezone is explicitly removed before Period conversion
+    to avoid pandas timezone-dropping warnings.
+    """
+
+    start_naive = (
         start
+        .tz_convert("UTC")
+        .tz_localize(None)
+    )
+
+    end_naive = (
+        end
+        .tz_convert("UTC")
+        .tz_localize(None)
+    )
+
+    current = (
+        start_naive
         .to_period("M")
         .to_timestamp()
         .tz_localize("UTC")
     )
 
     last = (
-        end
+        end_naive
         .to_period("M")
         .to_timestamp()
         .tz_localize("UTC")
     )
 
-    while cur <= last:
-        yield cur
+    while current <= last:
 
-        cur = (
-            cur
+        yield current
+
+        current = (
+            current
             + pd.offsets.MonthBegin(1)
         ).normalize()
 
-        if cur.tzinfo is None:
-            cur = cur.tz_localize("UTC")
 
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-
-    with path.open("rb") as f:
-        for chunk in iter(
-            lambda: f.read(1024 * 1024),
-            b"",
-        ):
-            h.update(chunk)
-
-    return h.hexdigest()
-
+# ============================================================
+# DOWNLOAD MONTH
+# ============================================================
 
 def download_month(
     symbol: str,
     month: pd.Timestamp,
-) -> Path:
+) -> Optional[Path]:
+    """
+    Download one Binance Futures monthly archive.
+
+    IMPORTANT:
+    404 is NOT immediately treated as a fatal error.
+
+    The caller determines whether the missing month is:
+      - before the first available archive -> pre-listing
+      - after the first available archive  -> fatal gap
+    """
 
     CACHE_DIR.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    name = (
+    filename = (
         f"{symbol}-1h-"
         f"{month.strftime('%Y-%m')}.zip"
     )
 
-    path = CACHE_DIR / name
+    path = (
+        CACHE_DIR
+        / filename
+    )
 
     if (
         path.exists()
@@ -246,33 +319,37 @@ def download_month(
 
     url = (
         f"{DATA_BASE}/"
-        f"{symbol}/1h/{name}"
+        f"{symbol}/1h/{filename}"
     )
 
     for attempt in range(1, 4):
 
         try:
-            r = SESSION.get(
+
+            response = SESSION.get(
                 url,
                 timeout=30,
             )
 
+            # Successful archive.
             if (
-                r.status_code == 200
-                and len(r.content) > 1000
+                response.status_code == 200
+                and len(response.content) > 1000
             ):
                 path.write_bytes(
-                    r.content
+                    response.content
                 )
+
                 return path
 
-            if r.status_code == 404:
-                raise FileNotFoundError(
-                    f"Archive missing: {url}"
-                )
+            # A missing archive is handled by fetch_symbol().
+            if response.status_code == 404:
+                return None
 
             raise RuntimeError(
-                f"HTTP {r.status_code}: {url}"
+                f"HTTP "
+                f"{response.status_code}: "
+                f"{url}"
             )
 
         except Exception:
@@ -285,34 +362,49 @@ def download_month(
             )
 
     raise RuntimeError(
-        "Download failed"
+        "Download failed."
     )
 
+
+# ============================================================
+# READ ARCHIVE
+# ============================================================
 
 def read_archive(
     path: Path,
 ) -> pd.DataFrame:
+    """
+    Read Binance monthly kline archive.
 
-    with zipfile.ZipFile(path) as z:
+    Only real exchange OHLCV data is used.
+    No synthetic candles are created.
+    """
 
-        names = [
-            n
-            for n in z.namelist()
-            if n.lower().endswith(".csv")
+    with zipfile.ZipFile(path) as archive:
+
+        csv_names = [
+            name
+            for name in archive.namelist()
+            if name.lower().endswith(".csv")
         ]
 
-        if not names:
+        if not csv_names:
+
             raise RuntimeError(
                 f"No CSV inside {path}"
             )
 
-        with z.open(names[0]) as f:
+        with archive.open(
+            csv_names[0]
+        ) as file:
+
             df = pd.read_csv(
-                f,
+                file,
                 header=None,
             )
 
     if df.shape[1] < 6:
+
         raise RuntimeError(
             f"Bad kline columns: {path}"
         )
@@ -333,15 +425,16 @@ def read_archive(
         errors="coerce",
     )
 
-    for c in [
+    for column in [
         "open",
         "high",
         "low",
         "close",
         "volume",
     ]:
-        df[c] = pd.to_numeric(
-            df[c],
+
+        df[column] = pd.to_numeric(
+            df[column],
             errors="coerce",
         )
 
@@ -365,31 +458,98 @@ def read_archive(
     ]
 
 
+# ============================================================
+# FETCH SYMBOL
+# ============================================================
+
 def fetch_symbol(
     symbol: str,
     start: pd.Timestamp,
     end: pd.Timestamp,
 ) -> pd.DataFrame:
+    """
+    Fetch real Binance Futures 1H data.
+
+    Data integrity rules:
+
+    1. Missing months before first available archive are allowed.
+       This represents pre-listing history.
+
+    2. Once the first archive exists, any missing monthly archive
+       is a fatal data gap.
+
+    3. After assembling the real data, every hourly candle must
+       exist between first available candle and last available
+       candle.
+
+    4. OOS must have complete hourly coverage.
+
+    5. No forward filling.
+    6. No synthetic candles.
+    """
 
     frames = []
 
-    for month in month_starts(
-        start,
-        end,
-    ):
+    first_available_month = None
+
+    requested_months = list(
+        month_starts(
+            start,
+            end,
+        )
+    )
+
+    for month in requested_months:
+
         path = download_month(
             symbol,
             month,
         )
 
+        # ----------------------------------------------------
+        # Archive does not exist.
+        # ----------------------------------------------------
+
+        if path is None:
+
+            # Before the first real archive:
+            # symbol simply did not exist yet.
+            if first_available_month is None:
+
+                continue
+
+            # After listing:
+            # this is a real historical data gap.
+            raise RuntimeError(
+                f"{symbol}: "
+                f"fatal archive gap after "
+                f"first available month "
+                f"{first_available_month.strftime('%Y-%m')}: "
+                f"missing "
+                f"{month.strftime('%Y-%m')}"
+            )
+
+        # First real archive found.
+        if first_available_month is None:
+
+            first_available_month = month
+
         frames.append(
             read_archive(path)
         )
 
+    # No archive at all.
     if not frames:
+
         raise RuntimeError(
-            f"No archives for {symbol}"
+            f"{symbol}: "
+            f"no historical data available "
+            f"between {start} and {end}"
         )
+
+    # --------------------------------------------------------
+    # Combine real exchange data.
+    # --------------------------------------------------------
 
     df = pd.concat(
         frames,
@@ -398,44 +558,66 @@ def fetch_symbol(
 
     df = (
         df
-        .drop_duplicates("time")
+        .drop_duplicates(
+            subset="time"
+        )
         .sort_values("time")
         .reset_index(drop=True)
     )
 
+    # --------------------------------------------------------
+    # Requested range.
+    # --------------------------------------------------------
+
     df = df[
-        (df.time >= start)
-        & (df.time <= end)
+        (df["time"] >= start)
+        & (df["time"] <= end)
     ].copy()
 
     if df.empty:
+
         raise RuntimeError(
-            f"No data for {symbol}"
+            f"{symbol}: "
+            f"no data after requested "
+            f"date filtering"
         )
 
-    # Remove incomplete current candle.
+    # --------------------------------------------------------
+    # Remove incomplete latest candle.
+    # --------------------------------------------------------
+
     now = pd.Timestamp.now(
         tz="UTC"
     )
 
     df = df[
-        df.time + BAR <= now
+        df["time"] + BAR <= now
     ].copy()
 
     if df.empty:
+
         raise RuntimeError(
-            f"No completed candles for {symbol}"
+            f"{symbol}: "
+            f"no completed candles"
         )
 
-    expected = pd.date_range(
-        df.time.iloc[0],
-        df.time.iloc[-1],
-        freq="1h",
-        tz="UTC",
-    )
+    # --------------------------------------------------------
+    # Strict full-history continuity.
+    #
+    # Important:
+    # We start from the first REAL candle.
+    # Pre-listing history is not considered a gap.
+    # --------------------------------------------------------
 
     actual = pd.DatetimeIndex(
-        df.time
+        df["time"]
+    )
+
+    expected = pd.date_range(
+        actual[0],
+        actual[-1],
+        freq="1h",
+        tz="UTC",
     )
 
     missing = expected.difference(
@@ -443,172 +625,266 @@ def fetch_symbol(
     )
 
     if len(missing):
+
         raise RuntimeError(
-            f"{symbol}: fatal 1h data gaps: "
-            f"{missing[:5].tolist()}"
+            f"{symbol}: "
+            f"fatal 1H data gaps after "
+            f"first available candle: "
+            f"{missing[:10].tolist()}"
         )
+
+    # --------------------------------------------------------
+    # Fresh OOS coverage.
+    # --------------------------------------------------------
+
+    oos = df[
+        (df["time"] >= OOS_START)
+        & (df["time"] <= OOS_END)
+    ].copy()
+
+    if oos.empty:
+
+        raise RuntimeError(
+            f"{symbol}: "
+            f"no data covering fresh OOS "
+            f"{OOS_START} -> {OOS_END}"
+        )
+
+    expected_oos = pd.date_range(
+        OOS_START,
+        OOS_END,
+        freq="1h",
+        tz="UTC",
+    )
+
+    actual_oos = pd.DatetimeIndex(
+        oos["time"]
+    )
+
+    missing_oos = (
+        expected_oos
+        .difference(actual_oos)
+    )
+
+    if len(missing_oos):
+
+        raise RuntimeError(
+            f"{symbol}: "
+            f"fatal OOS data gaps: "
+            f"{missing_oos[:10].tolist()}"
+        )
+
+    print(
+        f"{symbol}: "
+        f"first real candle = "
+        f"{df['time'].iloc[0]} | "
+        f"OOS coverage = OK"
+    )
 
     return df.set_index("time")
 
 
 # ============================================================
-# CAUSAL PIVOTS
+# CAUSAL PIVOT HIGH
 # ============================================================
 
 def is_pivot_high(
     df: pd.DataFrame,
-    i: int,
+    index: int,
 ) -> bool:
 
-    if i < PIVOT:
+    if index < PIVOT:
         return False
 
-    if i + PIVOT >= len(df):
+    if index + PIVOT >= len(df):
         return False
 
-    h = float(
-        df.high.iloc[i]
+    value = float(
+        df["high"].iloc[index]
     )
 
-    left = df.high.iloc[
-        i - PIVOT:i
+    left = df["high"].iloc[
+        index - PIVOT:index
     ]
 
-    right = df.high.iloc[
-        i + 1:i + PIVOT + 1
+    right = df["high"].iloc[
+        index + 1:index + PIVOT + 1
     ]
 
     return (
-        h >= float(left.max())
-        and h > float(right.max())
+        value >= float(left.max())
+        and
+        value > float(right.max())
     )
 
+
+# ============================================================
+# CAUSAL PIVOT LOW
+# ============================================================
 
 def is_pivot_low(
     df: pd.DataFrame,
-    i: int,
+    index: int,
 ) -> bool:
 
-    if i < PIVOT:
+    if index < PIVOT:
         return False
 
-    if i + PIVOT >= len(df):
+    if index + PIVOT >= len(df):
         return False
 
-    lo = float(
-        df.low.iloc[i]
+    value = float(
+        df["low"].iloc[index]
     )
 
-    left = df.low.iloc[
-        i - PIVOT:i
+    left = df["low"].iloc[
+        index - PIVOT:index
     ]
 
-    right = df.low.iloc[
-        i + 1:i + PIVOT + 1
+    right = df["low"].iloc[
+        index + 1:index + PIVOT + 1
     ]
 
     return (
-        lo <= float(left.min())
-        and lo < float(right.min())
+        value <= float(left.min())
+        and
+        value < float(right.min())
     )
 
+
+# ============================================================
+# ALIGNMENT
+# ============================================================
 
 def aligned(
-    a: float,
-    b: float,
+    first: float,
+    second: float,
 ) -> bool:
 
     return (
-        abs(a - b)
-        / max(abs(a), abs(b), 1e-12)
+        abs(first - second)
+        /
+        max(
+            abs(first),
+            abs(second),
+            1e-12,
+        )
         <= ALIGN_TOL
     )
 
 
 # ============================================================
-# IFC
+# IFC — BEARISH
 # ============================================================
 
 def bearish_ifc(
     df: pd.DataFrame,
-    ob_idx: int,
+    ob_index: int,
 ) -> bool:
+    """
+    Mechanical research translation of IFC.
 
-    j = ob_idx + IFC_LOOKAHEAD
+    The PDF does not specify an exact numerical formula.
+    This version uses a bearish 3-candle displacement/FVG
+    relationship immediately after the OB.
+    """
 
-    if j >= len(df):
-        return False
-
-    # Mechanical research translation:
-    # bearish FVG immediately after OB.
-    return (
-        float(df.low.iloc[ob_idx])
-        >
-        float(df.high.iloc[j])
+    future_index = (
+        ob_index
+        + IFC_LOOKAHEAD
     )
 
-
-def bullish_ifc(
-    df: pd.DataFrame,
-    ob_idx: int,
-) -> bool:
-
-    j = ob_idx + IFC_LOOKAHEAD
-
-    if j >= len(df):
+    if future_index >= len(df):
         return False
 
     return (
-        float(df.high.iloc[ob_idx])
-        <
-        float(df.low.iloc[j])
+        float(
+            df["low"].iloc[ob_index]
+        )
+        >
+        float(
+            df["high"].iloc[future_index]
+        )
     )
 
 
 # ============================================================
-# ORDER BLOCK
+# IFC — BULLISH
+# ============================================================
+
+def bullish_ifc(
+    df: pd.DataFrame,
+    ob_index: int,
+) -> bool:
+
+    future_index = (
+        ob_index
+        + IFC_LOOKAHEAD
+    )
+
+    if future_index >= len(df):
+        return False
+
+    return (
+        float(
+            df["high"].iloc[ob_index]
+        )
+        <
+        float(
+            df["low"].iloc[future_index]
+        )
+    )
+
+
+# ============================================================
+# ORDER BLOCK ZONE
 # ============================================================
 
 def candle_ob_zone(
     df: pd.DataFrame,
-    idx: int,
+    index: int,
     side: str,
 ) -> Tuple[float, float]:
 
-    o = float(
-        df.open.iloc[idx]
+    open_price = float(
+        df["open"].iloc[index]
     )
 
-    c = float(
-        df.close.iloc[idx]
+    close_price = float(
+        df["close"].iloc[index]
     )
 
-    h = float(
-        df.high.iloc[idx]
+    high_price = float(
+        df["high"].iloc[index]
     )
 
-    l = float(
-        df.low.iloc[idx]
+    low_price = float(
+        df["low"].iloc[index]
     )
 
     if side == "SHORT":
 
-        # Bearish supply OB:
-        # candle body is the executable zone.
+        # Bearish supply OB.
         return (
-            min(o, c),
-            h,
+            min(
+                open_price,
+                close_price,
+            ),
+            high_price,
         )
 
     # Bullish demand OB.
     return (
-        l,
-        max(o, c),
+        low_price,
+        max(
+            open_price,
+            close_price,
+        ),
     )
 
 
 # ============================================================
-# CANDIDATE GENERATION
+# BUILD STRUCTURAL CANDIDATES
 # ============================================================
 
 def build_candidates(
@@ -621,28 +897,37 @@ def build_candidates(
 
     candidates = []
 
-    for confirm_i in range(
+    # --------------------------------------------------------
+    # confirm_index represents CURRENTLY AVAILABLE information.
+    #
+    # A pivot at pivot_index is confirmed only when:
+    #
+    #     confirm_index = pivot_index + PIVOT
+    #
+    # Therefore the pivot is never used before confirmation.
+    # --------------------------------------------------------
+
+    for confirm_index in range(
         PIVOT,
         len(df) - PIVOT,
     ):
 
-        pivot_i = (
-            confirm_i - PIVOT
+        pivot_index = (
+            confirm_index - PIVOT
         )
 
-        # IMPORTANT:
-        # pivot_i is usable ONLY NOW.
         if is_pivot_high(
             df,
-            pivot_i,
+            pivot_index,
         ):
+
             highs.append(
                 (
-                    pivot_i,
-                    confirm_i,
+                    pivot_index,
+                    confirm_index,
                     float(
-                        df.high.iloc[
-                            pivot_i
+                        df["high"].iloc[
+                            pivot_index
                         ]
                     ),
                 )
@@ -650,127 +935,154 @@ def build_candidates(
 
         if is_pivot_low(
             df,
-            pivot_i,
+            pivot_index,
         ):
+
             lows.append(
                 (
-                    pivot_i,
-                    confirm_i,
+                    pivot_index,
+                    confirm_index,
                     float(
-                        df.low.iloc[
-                            pivot_i
+                        df["low"].iloc[
+                            pivot_index
                         ]
                     ),
                 )
             )
 
         # ====================================================
-        # BEARISH
+        # BEARISH SETUP
+        #
         # Trend down
-        # LH -> OB
-        # IFC
-        # double valley
+        # -> LH creates OB
+        # -> IFC after OB
+        # -> double valley
+        # -> confirmed
         # ====================================================
 
         if (
             len(highs) >= 2
-            and len(lows) >= 2
+            and
+            len(lows) >= 2
         ):
 
-            h_prev = highs[-2]
-            h_ob = highs[-1]
+            previous_high = highs[-2]
+            ob_high = highs[-1]
 
-            # Lower high.
-            if (
-                h_ob[0] > h_prev[0]
-                and h_ob[2] < h_prev[2]
-            ):
+            # Lower High.
+            lower_high = (
+                ob_high[0]
+                > previous_high[0]
+                and
+                ob_high[2]
+                < previous_high[2]
+            )
+
+            if lower_high:
 
                 prior_lows = [
-                    x
-                    for x in lows
-                    if x[0] < h_ob[0]
+                    item
+                    for item in lows
+                    if item[0] < ob_high[0]
                 ]
 
                 if len(prior_lows) >= 2:
 
-                    pl1 = prior_lows[-2]
-                    pl2 = prior_lows[-1]
+                    prior_low_1 = prior_lows[-2]
+                    prior_low_2 = prior_lows[-1]
 
                     downtrend = (
-                        pl2[2] < pl1[2]
+                        prior_low_2[2]
+                        <
+                        prior_low_1[2]
                     )
 
                     if downtrend:
 
-                        ob_idx = h_ob[0]
+                        ob_index = (
+                            ob_high[0]
+                        )
 
                         if (
-                            ob_idx
+                            ob_index
                             + IFC_LOOKAHEAD
                             < len(df)
-                            and bearish_ifc(
+                            and
+                            bearish_ifc(
                                 df,
-                                ob_idx,
+                                ob_index,
                             )
                         ):
 
-                            post_lows = [
-                                x
-                                for x in lows
-                                if x[0] > ob_idx
+                            post_ob_lows = [
+                                item
+                                for item in lows
+                                if item[0] > ob_index
+                                and item[1] <= confirm_index
                             ]
 
-                            eligible = [
-                                x
-                                for x in post_lows
-                                if x[1] <= confirm_i
-                            ]
+                            if len(
+                                post_ob_lows
+                            ) >= 2:
 
-                            if len(eligible) >= 2:
-
-                                v1 = eligible[-2]
-                                v2 = eligible[-1]
-
-                                valid_structure = (
-                                    v2[0] > v1[0]
-                                    and v1[2] < pl2[2]
-                                    and v2[2] < pl2[2]
+                                valley_1 = (
+                                    post_ob_lows[-2]
                                 )
 
-                                # Source says the two valleys
-                                # are aligned and second valley
-                                # should not be below the first.
-                                valid_alignment = (
+                                valley_2 = (
+                                    post_ob_lows[-1]
+                                )
+
+                                structure_ok = (
+                                    valley_2[0]
+                                    > valley_1[0]
+                                    and
+                                    valley_1[2]
+                                    <
+                                    prior_low_2[2]
+                                    and
+                                    valley_2[2]
+                                    <
+                                    prior_low_2[2]
+                                )
+
+                                alignment_ok = (
                                     aligned(
-                                        v1[2],
-                                        v2[2],
+                                        valley_1[2],
+                                        valley_2[2],
                                     )
                                     and
-                                    v2[2] >= v1[2]
+                                    valley_2[2]
+                                    >=
+                                    valley_1[2]
                                 )
 
                                 if (
-                                    valid_structure
-                                    and valid_alignment
+                                    structure_ok
+                                    and
+                                    alignment_ok
                                 ):
 
-                                    ready = max(
-                                        v2[1],
-                                        ob_idx
+                                    ready_index = max(
+                                        valley_2[1],
+                                        ob_index
                                         + IFC_LOOKAHEAD,
                                     )
 
-                                    # Candidate becomes known
-                                    # exactly at confirmation.
-                                    if ready == confirm_i:
+                                    # Candidate is created exactly
+                                    # when all required information
+                                    # is confirmed.
+                                    if (
+                                        ready_index
+                                        == confirm_index
+                                    ):
 
                                         (
-                                            ob_lo,
-                                            ob_hi,
+                                            ob_low,
+                                            ob_high_price,
                                         ) = candle_ob_zone(
                                             df,
-                                            ob_idx,
+                                            ob_index,
                                             "SHORT",
                                         )
 
@@ -778,121 +1090,1731 @@ def build_candidates(
                                             {
                                                 "symbol": symbol,
                                                 "side": "SHORT",
-                                                "ob_idx": ob_idx,
-                                                "ob_confirm": h_ob[1],
-                                                "double_1": v1[0],
-                                                "double_2": v2[0],
-                                                "double_confirm": v2[1],
-                                                "ready_index": ready,
-                                                "ob_low": ob_lo,
-                                                "ob_high": ob_hi,
+                                                "ob_idx": ob_index,
+                                                "ob_confirm": ob_high[1],
+                                                "double_1": valley_1[0],
+                                                "double_2": valley_2[0],
+                                                "ready_index": ready_index,
+                                                "ob_low": ob_low,
+                                                "ob_high": ob_high_price,
                                                 "structural_target": min(
-                                                    v1[2],
-                                                    v2[2],
+                                                    valley_1[2],
+                                                    valley_2[2],
                                                 ),
-                                                "prior_valley": pl2[2],
                                                 "pattern_confirm_time":
-                                                    df.index[ready],
+                                                    df.index[
+                                                        ready_index
+                                                    ],
                                             }
                                         )
 
         # ====================================================
-        # BULLISH
+        # BULLISH SETUP
+        #
         # Trend up
-        # HH -> OB
-        # IFC
-        # double top
+        # -> HL / HH structural OB
+        # -> IFC after OB
+        # -> double top
+        # -> confirmed
         # ====================================================
 
         if (
             len(highs) >= 2
-            and len(lows) >= 2
+            and
+            len(lows) >= 2
         ):
 
-            l_prev = lows[-2]
-            l_ob = lows[-1]
+            previous_low = lows[-2]
+            ob_low = lows[-1]
 
-            # Higher low.
-            if (
-                l_ob[0] > l_prev[0]
-                and l_ob[2] > l_prev[2]
-            ):
+            # Higher Low.
+            higher_low = (
+                ob_low[0]
+                > previous_low[0]
+                and
+                ob_low[2]
+                > previous_low[2]
+            )
+
+            if higher_low:
 
                 prior_highs = [
-                    x
-                    for x in highs
-                    if x[0] < l_ob[0]
+                    item
+                    for item in highs
+                    if item[0] < ob_low[0]
                 ]
 
                 if len(prior_highs) >= 2:
 
-                    ph1 = prior_highs[-2]
-                    ph2 = prior_highs[-1]
+                    prior_high_1 = prior_highs[-2]
+                    prior_high_2 = prior_highs[-1]
 
                     uptrend = (
-                        ph2[2] > ph1[2]
+                        prior_high_2[2]
+                        >
+                        prior_high_1[2]
                     )
 
                     if uptrend:
 
-                        ob_idx = l_ob[0]
+                        ob_index = (
+                            ob_low[0]
+                        )
 
                         if (
-                            ob_idx
+                            ob_index
                             + IFC_LOOKAHEAD
                             < len(df)
-                            and bullish_ifc(
+                            and
+                            bullish_ifc(
                                 df,
-                                ob_idx,
+                                ob_index,
                             )
                         ):
 
-                            post_highs = [
-                                x
-                                for x in highs
-                                if x[0] > ob_idx
+                            post_ob_highs = [
+                                item
+                                for item in highs
+                                if item[0] > ob_index
+                                and item[1] <= confirm_index
                             ]
 
-                            eligible = [
-                                x
-                                for x in post_highs
-                                if x[1] <= confirm_i
-                            ]
+                            if len(
+                                post_ob_highs
+                            ) >= 2:
 
-                            if len(eligible) >= 2:
-
-                                t1 = eligible[-2]
-                                t2 = eligible[-1]
-
-                                valid_structure = (
-                                    t2[0] > t1[0]
-                                    and t1[2] > ph2[2]
-                                    and t2[2] > ph2[2]
+                                top_1 = (
+                                    post_ob_highs[-2]
                                 )
 
-                                valid_alignment = (
+                                top_2 = (
+                                    post_ob_highs[-1]
+                                )
+
+                                structure_ok = (
+                                    top_2[0]
+                                    > top_1[0]
+                                    and
+                                    top_1[2]
+                                    >
+                                    prior_high_2[2]
+                                    and
+                                    top_2[2]
+                                    >
+                                    prior_high_2[2]
+                                )
+
+                                alignment_ok = (
                                     aligned(
-                                        t1[2],
-                                        t2[2],
+                                        top_1[2],
+                                        top_2[2],
                                     )
                                     and
-                                    t2[2] <= t1[2]
+                                    top_2[2]
+                                    <=
+                                    top_1[2]
                                 )
 
                                 if (
-                                    valid_structure
-                                    and valid_alignment
+                                    structure_ok
+                                    and
+                                    alignment_ok
                                 ):
 
-                                    ready = max(
-                                        t2[1],
-                                        ob_idx
+                                    ready_index = max(
+                                        top_2[1],
+                                        ob_index
                                         + IFC_LOOKAHEAD,
                                     )
 
-                                    if ready == confirm_i:
+                                    if (
+                                        ready_index
+                                        == confirm_index
+                                    ):
 
                                         (
+                                            ob_low_price,
+                                            ob_high_price,
+                                        ) = candle_ob_zone(
+                                            df,
+                                            ob_index,
+                                            "LONG",
+                                        )
+
+                                        candidates.append(
+                                            {
+                                                "symbol": symbol,
+                                                "side": "LONG",
+                                                "ob_idx": ob_index,
+                                                "ob_confirm": ob_low[1],
+                                                "double_1": top_1[0],
+                                                "double_2": top_2[0],
+                                                "ready_index": ready_index,
+                                                "ob_low": ob_low_price,
+                                                "ob_high": ob_high_price,
+                                                "structural_target": max(
+                                                    top_1[2],
+                                                    top_2[2],
+                                                ),
+                                                "pattern_confirm_time":
+                                                    df.index[
+                                                        ready_index
+                                                    ],
+                                            }
+                                        )
+
+    # ========================================================
+    # DEDUPLICATION
+    # ========================================================
+
+    seen = set()
+
+    output = []
+
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (
+            item["pattern_confirm_time"],
+            item["symbol"],
+            item["side"],
+            item["ob_idx"],
+            item["double_2"],
+        ),
+    ):
+
+        key = (
+            candidate["symbol"],
+            candidate["side"],
+            candidate["ob_idx"],
+            candidate["double_1"],
+            candidate["double_2"],
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        output.append(
+            candidate
+        )
+
+    return output
+
+
+# ============================================================
+# SLIPPAGE
+# ============================================================
+
+def slipped_entry(
+    price: float,
+    side: str,
+) -> float:
+
+    if side == "LONG":
+
+        return price * (
+            1.0 + SLIPPAGE
+        )
+
+    return price * (
+        1.0 - SLIPPAGE
+    )
+
+
+def slipped_exit(
+    price: float,
+    side: str,
+) -> float:
+
+    if side == "LONG":
+
+        return price * (
+            1.0 - SLIPPAGE
+        )
+
+    return price * (
+        1.0 + SLIPPAGE
+    )
+
+
+# ============================================================
+# SIMULATE ONE CANDIDATE
+# ============================================================
+
+def simulate_candidate(
+    df: pd.DataFrame,
+    candidate: dict,
+) -> Optional[dict]:
+
+    side = candidate["side"]
+
+    # --------------------------------------------------------
+    # Entry cannot occur on the confirmation candle.
+    #
+    # Earliest possible entry:
+    #
+    #     ready_index + 1
+    # --------------------------------------------------------
+
+    start_index = (
+        candidate["ready_index"]
+        + 1
+    )
+
+    if start_index >= len(df):
+
+        return None
+
+    # --------------------------------------------------------
+    # Order Block zone and stop.
+    # --------------------------------------------------------
+
+    if side == "LONG":
+
+        raw_limit = (
+            candidate["ob_high"]
+        )
+
+        stop = (
+            candidate["ob_low"]
+            * (
+                1.0
+                - SL_BUFFER_PCT
+            )
+        )
+
+    else:
+
+        raw_limit = (
+            candidate["ob_low"]
+        )
+
+        stop = (
+            candidate["ob_high"]
+            * (
+                1.0
+                + SL_BUFFER_PCT
+            )
+        )
+
+    # --------------------------------------------------------
+    # Search for return to OB.
+    #
+    # NO artificial timeout.
+    #
+    # The setup remains valid until:
+    #   - OB is touched -> entry
+    #   - OB is structurally invalidated -> reject
+    #   - dataset ends
+    # --------------------------------------------------------
+
+    entry_index = None
+
+    for index in range(
+        start_index,
+        len(df),
+    ):
+
+        row = df.iloc[index]
+
+        low = float(
+            row["low"]
+        )
+
+        high = float(
+            row["high"]
+        )
+
+        touched = (
+            low
+            <= raw_limit
+            <= high
+        )
+
+        if touched:
+
+            entry_index = index
+
+            break
+
+        # ----------------------------------------------------
+        # Invalidation before entry.
+        # ----------------------------------------------------
+
+        if side == "LONG":
+
+            if low < stop:
+
+                return None
+
+        else:
+
+            if high > stop:
+
+                return None
+
+    if entry_index is None:
+
+        return None
+
+    # --------------------------------------------------------
+    # Entry
+    # --------------------------------------------------------
+
+    entry = slipped_entry(
+        float(raw_limit),
+        side,
+    )
+
+    if side == "LONG":
+
+        risk_price = (
+            entry
+            - stop
+        )
+
+    else:
+
+        risk_price = (
+            stop
+            - entry
+        )
+
+    if risk_price <= 0:
+
+        return None
+
+    # --------------------------------------------------------
+    # FIXED RR 1:2
+    # --------------------------------------------------------
+
+    if side == "LONG":
+
+        target = (
+            entry
+            + RR * risk_price
+        )
+
+    else:
+
+        target = (
+            entry
+            - RR * risk_price
+        )
+
+    structural_target = float(
+        candidate[
+            "structural_target"
+        ]
+    )
+
+    # --------------------------------------------------------
+    # Structural target viability.
+    #
+    # We DO NOT replace the TP with the structural target.
+    #
+    # User requires fixed 1:2.
+    #
+    # LONG:
+    #   2R must be at or before structural target.
+    #
+    # SHORT:
+    #   2R must be at or before structural target.
+    # --------------------------------------------------------
+
+    if (
+        side == "LONG"
+        and
+        target > structural_target
+    ):
+
+        return None
+
+    if (
+        side == "SHORT"
+        and
+        target < structural_target
+    ):
+
+        return None
+
+    # --------------------------------------------------------
+    # Position sizing.
+    # --------------------------------------------------------
+
+    quantity = (
+        NOTIONAL
+        / entry
+    )
+
+    entry_fee = (
+        NOTIONAL
+        * FEE_RATE
+    )
+
+    # --------------------------------------------------------
+    # Exit.
+    #
+    # Exit checking begins on the candle AFTER entry.
+    #
+    # If SL and TP both occur on the same later candle,
+    # SL wins conservatively.
+    #
+    # No timeout.
+    # --------------------------------------------------------
+
+    exit_index = None
+    outcome = None
+    raw_exit = None
+
+    for index in range(
+        entry_index + 1,
+        len(df),
+    ):
+
+        row = df.iloc[index]
+
+        low = float(
+            row["low"]
+        )
+
+        high = float(
+            row["high"]
+        )
+
+        if side == "LONG":
+
+            hit_sl = (
+                low <= stop
+            )
+
+            hit_tp = (
+                high >= target
+            )
+
+        else:
+
+            hit_sl = (
+                high >= stop
+            )
+
+            hit_tp = (
+                low <= target
+            )
+
+        # Conservative same-candle resolution.
+        if (
+            hit_sl
+            and
+            hit_tp
+        ):
+
+            exit_index = index
+            outcome = "LOSS"
+            raw_exit = stop
+
+            break
+
+        if hit_sl:
+
+            exit_index = index
+            outcome = "LOSS"
+            raw_exit = stop
+
+            break
+
+        if hit_tp:
+
+            exit_index = index
+            outcome = "WIN"
+            raw_exit = target
+
+            break
+
+    # --------------------------------------------------------
+    # Unresolved position.
+    # --------------------------------------------------------
+
+    if exit_index is None:
+
+        return {
+            **candidate,
+
+            "entry_index":
+                entry_index,
+
+            "entry_time":
+                df.index[entry_index],
+
+            "entry":
+                entry,
+
+            "stop":
+                stop,
+
+            "target":
+                target,
+
+            "risk_price":
+                risk_price,
+
+            "structural_target":
+                structural_target,
+
+            "exit_index":
+                np.nan,
+
+            "exit_time":
+                pd.NaT,
+
+            "exit":
+                np.nan,
+
+            "outcome":
+                "UNRESOLVED",
+
+            "gross_pnl":
+                np.nan,
+
+            "fees":
+                np.nan,
+
+            "pnl":
+                np.nan,
+
+            "r_multiple":
+                np.nan,
+        }
+
+    # --------------------------------------------------------
+    # Exit execution.
+    # --------------------------------------------------------
+
+    exit_price = slipped_exit(
+        float(raw_exit),
+        side,
+    )
+
+    if side == "LONG":
+
+        gross_pnl = (
+            exit_price
+            - entry
+        ) * quantity
+
+    else:
+
+        gross_pnl = (
+            entry
+            - exit_price
+        ) * quantity
+
+    exit_fee = (
+        abs(
+            exit_price
+            * quantity
+        )
+        * FEE_RATE
+    )
+
+    fees = (
+        entry_fee
+        + exit_fee
+    )
+
+    pnl = (
+        gross_pnl
+        - fees
+    )
+
+    risk_cash = (
+        risk_price
+        * quantity
+    )
+
+    r_multiple = (
+        pnl
+        / risk_cash
+    )
+
+    return {
+        **candidate,
+
+        "entry_index":
+            entry_index,
+
+        "entry_time":
+            df.index[entry_index],
+
+        "entry":
+            entry,
+
+        "stop":
+            stop,
+
+        "target":
+            target,
+
+        "risk_price":
+            risk_price,
+
+        "structural_target":
+            structural_target,
+
+        "exit_index":
+            exit_index,
+
+        "exit_time":
+            df.index[exit_index],
+
+        "exit":
+            exit_price,
+
+        "outcome":
+            outcome,
+
+        "gross_pnl":
+            gross_pnl,
+
+        "fees":
+            fees,
+
+        "pnl":
+            pnl,
+
+        "r_multiple":
+            r_multiple,
+    }
+
+
+# ============================================================
+# SPLIT
+# ============================================================
+
+def split_name(
+    timestamp: pd.Timestamp,
+) -> str:
+
+    # Warmup is explicitly excluded from statistics.
+    if timestamp < RESEARCH_START:
+
+        return "WARMUP"
+
+    if timestamp < DISCOVERY_END:
+
+        return "Discovery"
+
+    if timestamp < DEVELOPMENT_END:
+
+        return "Development"
+
+    if timestamp < OOS_START:
+
+        return "Research_Holdout"
+
+    return "Validation_OOS"
+
+
+# ============================================================
+# PORTFOLIO SIMULATION
+# ============================================================
+
+def portfolio_simulation(
+    candidates: List[dict],
+    data: Dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+
+    simulated = []
+
+    for candidate in candidates:
+
+        trade = simulate_candidate(
+            data[
+                candidate["symbol"]
+            ],
+            candidate,
+        )
+
+        if trade is None:
+
+            continue
+
+        # ----------------------------------------------------
+        # Never allow warmup trades into the research sample.
+        # They may use warmup candles for structure, but their
+        # actual entry must occur inside the research period.
+        # ----------------------------------------------------
+
+        if (
+            trade["entry_time"]
+            < RESEARCH_START
+        ):
+
+            continue
+
+        simulated.append(
+            trade
+        )
+
+    if not simulated:
+
+        return pd.DataFrame()
+
+    raw = pd.DataFrame(
+        simulated
+    )
+
+    raw = (
+        raw
+        .sort_values(
+            [
+                "entry_time",
+                "symbol",
+                "side",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    # ========================================================
+    # USER'S CURRENT OVERLAP RULE
+    #
+    # One simultaneous position per symbol.
+    #
+    # Different symbols may overlap.
+    #
+    # If previous trade exits on candle J,
+    # new trade may enter on J+1.
+    # ========================================================
+
+    last_exit = {}
+
+    accepted = []
+
+    for _, trade in raw.iterrows():
+
+        symbol = trade["symbol"]
+
+        if symbol in last_exit:
+
+            previous_exit = (
+                last_exit[symbol]
+            )
+
+            if (
+                trade["entry_time"]
+                <= previous_exit
+            ):
+
+                continue
+
+        accepted.append(
+            trade.to_dict()
+        )
+
+        if pd.notna(
+            trade["exit_time"]
+        ):
+
+            last_exit[symbol] = (
+                trade["exit_time"]
+            )
+
+        else:
+
+            # An unresolved position remains open
+            # through the dataset.
+            last_exit[symbol] = (
+                pd.Timestamp.max
+                .tz_localize("UTC")
+            )
+
+    return pd.DataFrame(
+        accepted
+    )
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def metrics(
+    trades: pd.DataFrame,
+) -> dict:
+
+    closed = trades[
+        trades["outcome"].isin(
+            [
+                "WIN",
+                "LOSS",
+            ]
+        )
+    ].copy()
+
+    if closed.empty:
+
+        return {
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "wr": 0.0,
+            "pf": 0.0,
+            "net_r": 0.0,
+            "pnl": 0.0,
+            "max_streak": 0,
+        }
+
+    wins = int(
+        (
+            closed["outcome"]
+            == "WIN"
+        ).sum()
+    )
+
+    losses = int(
+        (
+            closed["outcome"]
+            == "LOSS"
+        ).sum()
+    )
+
+    gross_profit = float(
+        closed.loc[
+            closed["pnl"] > 0,
+            "pnl",
+        ].sum()
+    )
+
+    gross_loss = float(
+        -closed.loc[
+            closed["pnl"] < 0,
+            "pnl",
+        ].sum()
+    )
+
+    if gross_loss > 0:
+
+        pf = (
+            gross_profit
+            / gross_loss
+        )
+
+    elif gross_profit > 0:
+
+        pf = math.inf
+
+    else:
+
+        pf = 0.0
+
+    streak = 0
+    max_streak = 0
+
+    ordered = (
+        closed
+        .sort_values(
+            "entry_time"
+        )
+    )
+
+    for outcome in (
+        ordered[
+            "outcome"
+        ].tolist()
+    ):
+
+        if outcome == "LOSS":
+
+            streak += 1
+
+            max_streak = max(
+                max_streak,
+                streak,
+            )
+
+        else:
+
+            streak = 0
+
+    return {
+        "trades":
+            len(closed),
+
+        "wins":
+            wins,
+
+        "losses":
+            losses,
+
+        "wr":
+            (
+                100.0
+                * wins
+                / len(closed)
+            ),
+
+        "pf":
+            pf,
+
+        "net_r":
+            float(
+                closed[
+                    "r_multiple"
+                ].sum()
+            ),
+
+        "pnl":
+            float(
+                closed[
+                    "pnl"
+                ].sum()
+            ),
+
+        "max_streak":
+            max_streak,
+    }
+
+
+# ============================================================
+# EQUITY / DRAWDOWN
+# ============================================================
+
+def equity_and_dd(
+    trades: pd.DataFrame,
+) -> Tuple[
+    float,
+    float,
+    float,
+]:
+
+    equity = (
+        INITIAL_CAPITAL
+    )
+
+    peak = equity
+    max_dd = 0.0
+
+    closed = trades[
+        trades["outcome"].isin(
+            [
+                "WIN",
+                "LOSS",
+            ]
+        )
+        &
+        trades["exit_time"].notna()
+    ].copy()
+
+    closed = (
+        closed
+        .sort_values(
+            "exit_time"
+        )
+    )
+
+    for _, trade in (
+        closed.iterrows()
+    ):
+
+        equity += float(
+            trade["pnl"]
+        )
+
+        peak = max(
+            peak,
+            equity,
+        )
+
+        max_dd = max(
+            max_dd,
+            peak - equity,
+        )
+
+    if peak > 0:
+
+        dd_pct = (
+            max_dd
+            / peak
+            * 100.0
+        )
+
+    else:
+
+        dd_pct = math.inf
+
+    return (
+        equity,
+        max_dd,
+        dd_pct,
+    )
+
+
+# ============================================================
+# FINAL INTEGRITY AUDIT
+# ============================================================
+
+def integrity_audit(
+    trades: pd.DataFrame,
+) -> List[Tuple[str, str]]:
+
+    causal_ok = True
+    target_ok = True
+    same_symbol_ok = True
+    same_candle_ok = True
+    rr_ok = True
+
+    # ========================================================
+    # TRADE-LEVEL CHECKS
+    # ========================================================
+
+    for _, trade in (
+        trades.iterrows()
+    ):
+
+        # ----------------------------------------------------
+        # Entry cannot occur on/before confirmation.
+        # ----------------------------------------------------
+
+        if (
+            trade["entry_index"]
+            <=
+            trade["ready_index"]
+        ):
+
+            causal_ok = False
+
+        # ----------------------------------------------------
+        # Explicit timestamp check.
+        # ----------------------------------------------------
+
+        if (
+            trade["entry_time"]
+            <=
+            trade["pattern_confirm_time"]
+        ):
+
+            causal_ok = False
+
+        # ----------------------------------------------------
+        # Exit cannot occur on same candle as entry.
+        # ----------------------------------------------------
+
+        if pd.notna(
+            trade["exit_index"]
+        ):
+
+            if (
+                trade["exit_index"]
+                <=
+                trade["entry_index"]
+            ):
+
+                same_candle_ok = False
+
+        # ----------------------------------------------------
+        # RR geometric check.
+        # ----------------------------------------------------
+
+        if trade["side"] == "LONG":
+
+            risk = (
+                trade["entry"]
+                -
+                trade["stop"]
+            )
+
+            if risk <= 0:
+
+                rr_ok = False
+
+            else:
+
+                actual_rr = (
+                    trade["target"]
+                    -
+                    trade["entry"]
+                ) / risk
+
+                if abs(
+                    actual_rr
+                    - RR
+                ) > 1e-9:
+
+                    rr_ok = False
+
+            # TP must be reachable before structural target.
+            if (
+                trade["target"]
+                >
+                trade["structural_target"]
+                + 1e-12
+            ):
+
+                target_ok = False
+
+        else:
+
+            risk = (
+                trade["stop"]
+                -
+                trade["entry"]
+            )
+
+            if risk <= 0:
+
+                rr_ok = False
+
+            else:
+
+                actual_rr = (
+                    trade["entry"]
+                    -
+                    trade["target"]
+                ) / risk
+
+                if abs(
+                    actual_rr
+                    - RR
+                ) > 1e-9:
+
+                    rr_ok = False
+
+            if (
+                trade["target"]
+                <
+                trade["structural_target"]
+                - 1e-12
+            ):
+
+                target_ok = False
+
+        # ----------------------------------------------------
+        # Structural confirmation consistency.
+        #
+        # Double-2 pivot itself must have been confirmed by
+        # ready_index.
+        # ----------------------------------------------------
+
+        if (
+            trade["double_2"]
+            + PIVOT
+            >
+            trade["ready_index"]
+        ):
+
+            causal_ok = False
+
+        # ----------------------------------------------------
+        # OB confirmation must precede final readiness.
+        # ----------------------------------------------------
+
+        if (
+            trade["ob_confirm"]
+            >
+            trade["ready_index"]
+        ):
+
+            causal_ok = False
+
+    # ========================================================
+    # SAME-SYMBOL OVERLAP
+    # ========================================================
+
+    ordered = (
+        trades
+        .sort_values(
+            "entry_time"
+        )
+    )
+
+    for _, group in (
+        ordered.groupby("symbol")
+    ):
+
+        previous_exit = None
+
+        for _, trade in (
+            group.iterrows()
+        ):
+
+            if (
+                previous_exit
+                is not None
+                and
+                trade["entry_time"]
+                <= previous_exit
+            ):
+
+                same_symbol_ok = False
+
+            if pd.notna(
+                trade["exit_time"]
+            ):
+
+                previous_exit = (
+                    trade["exit_time"]
+                )
+
+    return [
+        (
+            "Data gaps",
+            "PASSED",
+        ),
+        (
+            "Structural causality",
+            "PASSED"
+            if causal_ok
+            else "FAILED",
+        ),
+        (
+            "Future target leak",
+            "PASSED"
+            if target_ok
+            else "FAILED",
+        ),
+        (
+            "Same-symbol overlap",
+            "PASSED"
+            if same_symbol_ok
+            else "FAILED",
+        ),
+        (
+            "Same-candle re-entry/exit",
+            "PASSED"
+            if same_candle_ok
+            else "FAILED",
+        ),
+        (
+            "RR 1:2 consistency",
+            "PASSED"
+            if rr_ok
+            else "FAILED",
+        ),
+    ]
+
+
+# ============================================================
+# REPORT FORMAT
+# ============================================================
+
+def format_metrics(
+    name: str,
+    result: dict,
+) -> str:
+
+    if math.isinf(
+        result["pf"]
+    ):
+
+        pf_text = "inf"
+
+    else:
+
+        pf_text = (
+            f'{result["pf"]:.3f}'
+        )
+
+    return (
+        f"{name:<18} "
+        f'{result["trades"]:>7} '
+        f'{result["wins"]:>7} '
+        f'{result["losses"]:>7} '
+        f'{result["wr"]:>8.2f} '
+        f"{pf_text:>8} "
+        f'{result["net_r"]:>12.3f} '
+        f'{result["pnl"]:>12.2f} '
+        f'{result["max_streak"]:>10}'
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    OUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    data = {}
+
+    # ========================================================
+    # DOWNLOAD
+    # ========================================================
+
+    print(
+        "Downloading strict Binance Futures 1H data..."
+    )
+
+    for symbol in SYMBOLS:
+
+        print(
+            f"Loading {symbol}...",
+            flush=True,
+        )
+
+        data[symbol] = (
+            fetch_symbol(
+                symbol,
+                WARMUP_START,
+                OOS_END,
+            )
+        )
+
+        print(
+            f"{symbol} OK "
+            f"{len(data[symbol])}"
+        )
+
+    # ========================================================
+    # BUILD CANDIDATES
+    # ========================================================
+
+    all_candidates = []
+
+    for symbol, df in data.items():
+
+        candidates = (
+            build_candidates(
+                df,
+                symbol,
+            )
+        )
+
+        usable = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate[
+                    "pattern_confirm_time"
+                ]
+                <= OOS_END
+            )
+        ]
+
+        all_candidates.extend(
+            usable
+        )
+
+        print(
+            f"{symbol}: "
+            f"{len(candidates)} "
+            f"structural candidates"
+        )
+
+    if not all_candidates:
+
+        raise RuntimeError(
+            "No structural candidates produced."
+        )
+
+    print(
+        f"TOTAL STRUCTURAL CANDIDATES: "
+        f"{len(all_candidates)}"
+    )
+
+    # ========================================================
+    # PORTFOLIO SIMULATION
+    # ========================================================
+
+    print(
+        "Running portfolio simulation..."
+    )
+
+    trades = (
+        portfolio_simulation(
+            all_candidates,
+            data,
+        )
+    )
+
+    if trades.empty:
+
+        raise RuntimeError(
+            "No trades produced."
+        )
+
+    trades["split"] = (
+        trades["entry_time"]
+        .map(split_name)
+    )
+
+    # ========================================================
+    # AUDIT
+    # ========================================================
+
+    checks = integrity_audit(
+        trades
+    )
+
+    audit_passed = all(
+        status == "PASSED"
+        for _, status in checks
+    )
+
+    # ========================================================
+    # REPORT
+    # ========================================================
+
+    lines = []
+
+    lines.append(
+        "=" * 110
+    )
+
+    lines.append(
+        "SETUP 3 V2 — BACKTEST REPORT"
+    )
+
+    lines.append(
+        "=" * 110
+    )
+
+    lines.append(
+        f"{'split':<18} "
+        f"{'trades':>7} "
+        f"{'wins':>7} "
+        f"{'losses':>7} "
+        f"{'WR_%':>8} "
+        f"{'PF':>8} "
+        f"{'net_R':>12} "
+        f"{'PnL_$':>12} "
+        f"{'max_streak':>10}"
+    )
+
+    lines.append(
+        "-" * 110
+    )
+
+    for split in [
+        "Discovery",
+        "Development",
+        "Research_Holdout",
+        "Validation_OOS",
+    ]:
+
+        split_trades = trades[
+            trades["split"]
+            == split
+        ]
+
+        lines.append(
+            format_metrics(
+                split,
+                metrics(
+                    split_trades
+                ),
+            )
+        )
+
+    lines.append(
+        format_metrics(
+            "TOTAL",
+            metrics(trades),
+        )
+    )
+
+    # ========================================================
+    # EQUITY
+    # ========================================================
+
+    (
+        final_equity,
+        max_dd,
+        dd_pct,
+    ) = equity_and_dd(
+        trades
+    )
+
+    unresolved = int(
+        (
+            trades["outcome"]
+            == "UNRESOLVED"
+        ).sum()
+    )
+
+    lines.extend(
+        [
+            "",
+            f"Initial Capital : "
+            f"${INITIAL_CAPITAL:,.2f}",
+
+            f"Final Equity    : "
+            f"${final_equity:,.2f}",
+
+            f"Fixed Margin    : "
+            f"${MARGIN:,.2f}",
+
+            f"Leverage        : "
+            f"{LEVERAGE:.0f}x",
+
+            f"Notional        : "
+            f"${NOTIONAL:,.2f}",
+
+            f"Max DD          : "
+            f"${max_dd:,.2f} "
+            f"({dd_pct:.2f}%)",
+
+            f"Unresolved      : "
+            f"{unresolved}",
+
+            "",
+            "=" * 110,
+            "INTEGRITY AUDIT",
+            "=" * 110,
+        ]
+    )
+
+    for name, status in checks:
+
+        lines.append(
+            f"{name:<32}: "
+            f"{status}"
+        )
+
+    lines.append(
+        f"{'AUDIT STATUS':<32}: "
+        f"{'PASSED' if audit_passed else 'FAILED'}"
+    )
+
+    # ========================================================
+    # RESEARCH PROTOCOL
+    # ========================================================
+
+    lines.extend(
+        [
+            "",
+            "RESEARCH PROTOCOL",
+            "=" * 110,
+
+            "Source basis: "
+            "10 ستاپ برتر.pdf pages 18-21.",
+
+            "V2 is a frozen mechanical translation.",
+
+            "Numeric pivot / IFC / alignment / "
+            "OB formulas are not claimed to be "
+            "literal PDF formulas.",
+
+            "Pivot confirmation is causal: "
+            "pivot i is usable only at i + PIVOT.",
+
+            "No artificial pattern-formation "
+            "timeout is used.",
+
+            "Entry starts only after full "
+            "structural confirmation.",
+
+            "Fixed RR=1:2 is calculated from "
+            "actual entry and stop.",
+
+            "Double valley/top is used only as "
+            "structural target viability.",
+
+            "No BE, trailing, or artificial "
+            "exit timeout.",
+
+            "One simultaneous trade per symbol.",
+
+            "Different symbols may overlap.",
+
+            "Same-symbol re-entry requires "
+            "previous exit candle + 1.",
+
+            "Warmup trades are excluded from "
+            "research statistics.",
+
+            f"Fresh OOS: "
+            f"{OOS_START.isoformat()} "
+            f"-> "
+            f"{OOS_END.isoformat()}",
+
+            "OOS is not used for parameter selection.",
+
+            "Any V2 modification after OOS inspection "
+            "requires another fresh OOS.",
+
+            "",
+        ]
+    )
+
+    report = "\n".join(
+        lines
+    )
+
+    print(
+        report
+    )
+
+    REPORT_PATH.write_text(
+        report,
+        encoding="utf-8",
+    )
+
+    # ========================================================
+    # TRADE LEDGER
+    # ========================================================
+
+    ledger_columns = [
+        "split",
+        "symbol",
+        "side",
+        "ob_idx",
+        "ob_confirm",
+        "double_1",
+        "double_2",
+        "ready_index",
+        "pattern_confirm_time",
+        "entry_index",
+        "entry_time",
+        "entry",
+        "stop",
+        "target",
+        "structural_target",
+        "exit_index",
+        "exit_time",
+        "exit",
+        "outcome",
+        "gross_pnl",
+        "fees",
+        "pnl",
+        "r_multiple",
+    ]
+
+    for column in ledger_columns:
+
+        if column not in trades.columns:
+
+            trades[column] = np.nan
+
+    trades[
+        ledger_columns
+    ].to_csv(
+        LEDGER_PATH,
+        index=False,
+    )
+
+    print(
+        f"Saved: "
+        f"{LEDGER_PATH}"
+    )
+
+    print(
+        f"Saved: "
+        f"{REPORT_PATH}"
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()                                   (
                                             ob_lo,
                                             ob_hi,
                                         ) = candle_ob_zone(
