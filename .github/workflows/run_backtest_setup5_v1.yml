@@ -2,18 +2,19 @@ name: Run Backtest Setup 5 V1
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "backtest_setup5_v1.py"
-      - ".github/workflows/run_backtest_setup5_v1.yml"
+
+permissions:
+  contents: read
 
 jobs:
   backtest:
+    name: Setup 5 V1 Backtest
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -26,16 +27,73 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy requests
 
-      - name: Compile check
-        run: python -m py_compile backtest_setup5_v1.py
+      - name: Verify files
+        run: |
+          echo "===== WORKSPACE ====="
+          pwd
+          echo
+          echo "===== FILES ====="
+          ls -lah
+          echo
+          echo "===== BACKTEST FILE ====="
+          test -f backtest_setup5_v1.py
+          wc -l backtest_setup5_v1.py
+          echo
+          echo "===== PYTHON VERSION ====="
+          python --version
 
       - name: Run Setup 5 V1
-        run: python backtest_setup5_v1.py
+        shell: bash
+        run: |
+          set -o pipefail
 
-      - name: Upload backtest artifacts
+          echo "========================================"
+          echo " STARTING SETUP 5 V1 BACKTEST"
+          echo "========================================"
+
+          python -u backtest_setup5_v1.py 2>&1 | tee setup5_console.log
+
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo
+          echo "========================================"
+          echo " BACKTEST EXIT CODE: ${EXIT_CODE}"
+          echo "========================================"
+
+          exit "${EXIT_CODE}"
+
+      - name: Show generated outputs
+        if: always()
+        run: |
+          echo "========================================"
+          echo " GENERATED FILES"
+          echo "========================================"
+
+          if [ -d "setup5_outputs" ]; then
+            find setup5_outputs -maxdepth 2 -type f -print -exec ls -lh {} \;
+          else
+            echo "setup5_outputs directory was not created."
+          fi
+
+          echo
+          echo "========================================"
+          echo " CONSOLE LOG SIZE"
+          echo "========================================"
+
+          if [ -f "setup5_console.log" ]; then
+            wc -l setup5_console.log
+            tail -100 setup5_console.log
+          else
+            echo "setup5_console.log not found."
+          fi
+
+      - name: Upload backtest results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: setup5-v1-results
-          path: setup5_outputs/
+          path: |
+            setup5_outputs/
+            setup5_console.log
           if-no-files-found: warn
+          retention-days: 30
