@@ -1,66 +1,39 @@
 #!/usr/bin/env python3
 """
-SETUP 4 V2 — HTF Zone -> Reaction -> OB -> Aligned Liquidity
-           -> Liquidity Break -> OB Retest
+SETUP 4 V2
+HTF Zone -> Reaction -> OB -> Aligned Liquidity
+-> Liquidity Break -> OB Retest
 
 Binance USD-M Futures
 15m execution / 4h context
 
-SOURCE BASIS
-------------
+SOURCE
+------
 Mechanical research translation of Setup 4 from:
 "10 ستاپ برتر.pdf"
 
-The PDF is qualitative. Numeric parameters below are frozen
-mechanical translations and are NOT claimed to be literal PDF values.
+The PDF is qualitative.
+Numeric parameters in this code are frozen mechanical research
+translations and are NOT claimed to be literal PDF specifications.
 
-IMPORTANT RESEARCH PROTOCOL
----------------------------
-Fresh OOS for Setup 4 V2:
-    2024-10-04 through 2025-10-03 UTC
+RESEARCH PROTOCOL
+-----------------
+Previous Setup 4 V1 OOS:
+    2025-10-04 -> 2026-10-03
 
-The previous Setup 4 V1 OOS:
-    2025-10-04 through 2026-10-03 UTC
+Fresh Setup 4 V2 OOS:
+    2024-10-04 -> 2025-10-03
 
-is NOT used for V2 development.
+The fresh OOS is not used for development/tuning.
 
-RESEARCH WINDOWS
-----------------
-Research period:
-    365 days immediately before the fresh OOS.
+RESEARCH:
+    365 days immediately before fresh OOS.
 
-Discovery:
+DISCOVERY:
     first half of research period.
 
-Development:
+DEVELOPMENT:
     second half of research period.
-
-OOS:
-    completely separate reserved period.
-
-CAUSALITY
----------
-- 4H pivots are only usable after PIVOT completed 4H candles.
-- A 4H zone is only available after its pivot is confirmed.
-- Every structural index must be strictly before entry.
-- Entry is at the NEXT 15m candle open after the completed OB retest.
-- Entry candle itself is never checked for SL/TP.
-- If SL and TP are both touched on the same later candle, SL wins.
-- No timeout.
-- No breakeven.
-- No trailing.
-- No synthetic candles.
-- No forward fill.
-- No same-candle re-entry.
-
-OVERLAP RULE
-------------
-Maximum one simultaneous open trade per symbol.
-
-Different symbols may have simultaneous open trades.
-
-A symbol may not re-enter until the previous trade has
-actually closed. Re-entry on the same exit candle is forbidden.
 
 RISK
 ----
@@ -69,6 +42,21 @@ Margin          : $100
 Leverage        : 50x
 Notional        : $5,000
 RR              : 1:2
+
+INTEGRITY
+---------
+- No lookahead.
+- Confirmed 4H pivots only.
+- Confirmed 15m pivots only.
+- No same-candle re-entry.
+- No same-symbol overlap.
+- Different symbols may overlap.
+- No synthetic candles.
+- No forward fill.
+- No artificial timeout.
+- No trailing.
+- No breakeven.
+- No future target information.
 """
 
 from __future__ import annotations
@@ -105,13 +93,14 @@ SYMBOLS = [
 ]
 
 BASE_URL = (
-    "https://data.binance.vision/data/futures/um/monthly/klines"
+    "https://data.binance.vision/"
+    "data/futures/um/monthly/klines"
 )
 
 INTERVAL = "15m"
 
 # ============================================================
-# FRESH OOS — LOCKED FOR V2
+# FRESH OOS
 # ============================================================
 
 OOS_START = pd.Timestamp(
@@ -124,25 +113,35 @@ OOS_END = pd.Timestamp(
     tz="UTC",
 )
 
-# Research period is exactly 365 days immediately before OOS.
-RESEARCH_END = OOS_START - pd.Timedelta(minutes=15)
+# ============================================================
+# RESEARCH
+# ============================================================
+
 RESEARCH_START = (
-    OOS_START - pd.Timedelta(days=365)
+    OOS_START
+    - pd.Timedelta(days=365)
 )
 
-# Additional warmup before research.
+RESEARCH_END = (
+    OOS_START
+    - pd.Timedelta(minutes=15)
+)
+
 WARMUP_START = (
-    RESEARCH_START - pd.Timedelta(days=90)
+    RESEARCH_START
+    - pd.Timedelta(days=90)
 )
 
-# Split research into two equal calendar halves.
 RESEARCH_MID = (
     RESEARCH_START
-    + (OOS_START - RESEARCH_START) / 2
+    + (
+        OOS_START
+        - RESEARCH_START
+    ) / 2
 )
 
 # ============================================================
-# CAPITAL / COSTS
+# CAPITAL
 # ============================================================
 
 INITIAL_CAPITAL = 1000.0
@@ -151,11 +150,12 @@ LEVERAGE = 50.0
 NOTIONAL = MARGIN * LEVERAGE
 
 RR = 2.0
+
 FEE_RATE = 0.0007
 SLIPPAGE = 0.0003
 
 # ============================================================
-# MECHANICAL TRANSLATION
+# STRUCTURAL PARAMETERS
 # ============================================================
 
 PIVOT = 2
@@ -178,54 +178,104 @@ MAX_RISK_PCT = 0.08
 # OUTPUT
 # ============================================================
 
-OUT = Path("setup4_v2_outputs")
-OUT.mkdir(exist_ok=True)
+OUT = Path(
+    "setup4_v2_outputs"
+)
+
+OUT.mkdir(
+    exist_ok=True
+)
 
 SESSION = requests.Session()
+
 SESSION.headers.update(
     {
-        "User-Agent": "setup4-v2-research/1.0"
+        "User-Agent":
+            "setup4-v2-research/1.0"
     }
 )
 
 
 # ============================================================
-# DATA HELPERS
+# DATE / MONTH HELPERS
 # ============================================================
 
 def month_range(start, end):
     """
     Return all calendar months intersecting [start, end].
+
+    Convert UTC timestamps to naive UTC before Period conversion
+    so pandas does not emit the timezone warning.
     """
 
-    cur = pd.Timestamp(start).to_period("M")
-    last = pd.Timestamp(end).to_period("M")
+    start_ts = pd.Timestamp(start)
+
+    end_ts = pd.Timestamp(end)
+
+    if start_ts.tzinfo is None:
+        start_ts = start_ts.tz_localize("UTC")
+    else:
+        start_ts = start_ts.tz_convert("UTC")
+
+    if end_ts.tzinfo is None:
+        end_ts = end_ts.tz_localize("UTC")
+    else:
+        end_ts = end_ts.tz_convert("UTC")
+
+    start_naive = (
+        start_ts
+        .tz_localize(None)
+    )
+
+    end_naive = (
+        end_ts
+        .tz_localize(None)
+    )
+
+    cur = start_naive.to_period("M")
+    last = end_naive.to_period("M")
 
     result = []
 
     while cur <= last:
+
         result.append(
-            (cur.year, cur.month)
+            (
+                cur.year,
+                cur.month,
+            )
         )
+
         cur += 1
 
     return result
 
 
-def fetch_month(symbol, year, month):
+# ============================================================
+# DATA DOWNLOAD
+# ============================================================
+
+def fetch_month(
+    symbol,
+    year,
+    month,
+):
     filename = (
         f"{symbol}-{INTERVAL}-"
         f"{year:04d}-{month:02d}.zip"
     )
 
     url = (
-        f"{BASE_URL}/{symbol}/"
-        f"{INTERVAL}/{filename}"
+        f"{BASE_URL}/"
+        f"{symbol}/"
+        f"{INTERVAL}/"
+        f"{filename}"
     )
 
     for attempt in range(4):
 
         try:
+
             response = SESSION.get(
                 url,
                 timeout=60,
@@ -244,7 +294,8 @@ def fetch_month(symbol, year, month):
                 raise
 
             time.sleep(
-                1.5 * (attempt + 1)
+                1.5
+                * (attempt + 1)
             )
 
     return None
@@ -258,10 +309,13 @@ def parse_archive(blob):
         csv_files = [
             name
             for name in archive.namelist()
-            if name.lower().endswith(".csv")
+            if name.lower().endswith(
+                ".csv"
+            )
         ]
 
         if not csv_files:
+
             raise RuntimeError(
                 "Archive has no CSV file"
             )
@@ -360,23 +414,21 @@ def fetch_symbol(symbol):
     404 before first available archive:
         allowed.
 
-    404 after first available archive:
+    404 after first availability:
         fatal.
 
-    No forward-fill.
     No synthetic candles.
+    No forward-fill.
     No silent gap removal.
     """
 
-    start = WARMUP_START
-    end = OOS_END
-
     frames = []
+
     first_available = False
 
     for year, month in month_range(
-        start,
-        end,
+        WARMUP_START,
+        OOS_END,
     ):
 
         blob = fetch_month(
@@ -392,21 +444,25 @@ def fetch_symbol(symbol):
 
             raise RuntimeError(
                 "Missing Binance archive after "
-                f"first availability: "
+                "first availability: "
                 f"{symbol} "
                 f"{year:04d}-{month:02d}"
             )
 
         first_available = True
 
-        frame = parse_archive(blob)
+        frame = parse_archive(
+            blob
+        )
 
         if not frame.empty:
             frames.append(frame)
 
     if not frames:
+
         raise RuntimeError(
-            f"No historical archive found for {symbol}"
+            f"No historical archive found "
+            f"for {symbol}"
         )
 
     df = pd.concat(
@@ -416,41 +472,59 @@ def fetch_symbol(symbol):
 
     df = (
         df
-        .drop_duplicates("time")
-        .sort_values("time")
-        .reset_index(drop=True)
+        .drop_duplicates(
+            "time"
+        )
+        .sort_values(
+            "time"
+        )
+        .reset_index(
+            drop=True
+        )
     )
 
     df = df[
-        (df.time >= start)
-        & (df.time <= end)
+        (df.time >= WARMUP_START)
+        &
+        (df.time <= OOS_END)
     ].copy()
 
     if df.empty:
+
         raise RuntimeError(
             f"No usable rows for {symbol}"
         )
 
-    # The requested historical endpoint is fully completed.
-    # Still remove an actually incomplete final candle if encountered.
-    now = pd.Timestamp.now(tz="UTC")
+    # Remove only an actually incomplete final candle.
+    now = pd.Timestamp.now(
+        tz="UTC"
+    )
 
     if (
         not df.empty
         and
-        df.time.iloc[-1]
-        + pd.Timedelta(minutes=15)
-        > now
+        (
+            df.time.iloc[-1]
+            + pd.Timedelta(
+                minutes=15
+            )
+            > now
+        )
     ):
-        df = df.iloc[:-1].copy()
+
+        df = df.iloc[
+            :-1
+        ].copy()
 
     if df.empty:
+
         raise RuntimeError(
-            f"No usable rows after incomplete "
-            f"candle removal for {symbol}"
+            f"No usable rows after "
+            f"incomplete candle removal "
+            f"for {symbol}"
         )
 
-    # Strict 15m continuity.
+    # Strict continuity.
     expected = pd.date_range(
         start=df.time.iloc[0],
         end=df.time.iloc[-1],
@@ -469,8 +543,10 @@ def fetch_symbol(symbol):
     if len(missing):
 
         raise RuntimeError(
-            f"15m data gap for {symbol}: "
-            f"{len(missing)} missing candles; "
+            f"15m data gap for "
+            f"{symbol}: "
+            f"{len(missing)} missing "
+            f"candles; "
             f"first={missing[0]}"
         )
 
@@ -480,26 +556,35 @@ def fetch_symbol(symbol):
 
 
 # ============================================================
-# INDICATORS
+# ATR
 # ============================================================
 
-def atr(df, period):
-    previous_close = df.close.shift(1)
+def atr(
+    df,
+    period,
+):
+    previous_close = (
+        df.close.shift(1)
+    )
 
     true_range = pd.concat(
         [
             df.high - df.low,
-            (
-                df.low
-                - previous_close
-            ).abs(),
+
             (
                 df.high
                 - previous_close
             ).abs(),
+
+            (
+                df.low
+                - previous_close
+            ).abs(),
         ],
         axis=1,
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     return true_range.rolling(
         period,
@@ -508,18 +593,16 @@ def atr(df, period):
 
 
 # ============================================================
-# CAUSAL PIVOTS
+# CONFIRMED PIVOTS
 # ============================================================
 
 def confirmed_pivots(df):
     """
-    pivot_high[i] / pivot_low[i] identify the structural pivot
-    located at i.
+    Structural pivot at i becomes usable only at i + PIVOT.
 
-    A pivot at i becomes KNOWABLE only at i + PIVOT.
-
-    We keep the pivot at its structural index and explicitly
-    carry the confirmation index separately through the logic.
+    pivot_high / pivot_low remain attached to the structural
+    candle. The calling logic explicitly enforces the confirmation
+    delay.
     """
 
     x = df.copy()
@@ -546,7 +629,8 @@ def confirmed_pivots(df):
         ]
 
         right_highs = x.high.iloc[
-            i + 1:i + 1 + PIVOT
+            i + 1:
+            i + 1 + PIVOT
         ]
 
         left_lows = x.low.iloc[
@@ -554,7 +638,8 @@ def confirmed_pivots(df):
         ]
 
         right_lows = x.low.iloc[
-            i + 1:i + 1 + PIVOT
+            i + 1:
+            i + 1 + PIVOT
         ]
 
         if (
@@ -564,6 +649,7 @@ def confirmed_pivots(df):
             x.high.iloc[i]
             >= right_highs.max()
         ):
+
             pivot_high[i] = True
 
         if (
@@ -571,21 +657,29 @@ def confirmed_pivots(df):
             < left_lows.min()
             and
             x.low.iloc[i]
-            <= right_lows.min()
+            <= right_lows.max()
         ):
+
             pivot_low[i] = True
 
-    x["pivot_high"] = pivot_high
-    x["pivot_low"] = pivot_low
+    x["pivot_high"] = (
+        pivot_high
+    )
+
+    x["pivot_low"] = (
+        pivot_low
+    )
 
     return x
 
 
+# ============================================================
+# 4H CONTEXT
+# ============================================================
+
 def make_htf(df):
     """
-    Build completed 4H candles.
-
-    A 4H candle is used only after its own 4H close.
+    Build completed 4H candles from real 15m data.
     """
 
     htf = (
@@ -630,20 +724,15 @@ def make_htf(df):
 
 
 # ============================================================
-# HTF ZONES — CAUSAL
+# HTF ZONES
 # ============================================================
 
 def build_zones(htf):
     """
-    A confirmed 4H pivot creates a zone.
+    A structural 4H pivot becomes an available HTF zone only
+    after PIVOT completed 4H candles.
 
-    IMPORTANT V1 FIX:
-    The old code inspected pivot_high at the confirmation row
-    while reading the price from i-PIVOT. That could use the wrong
-    pivot state.
-
-    V2 explicitly checks the structural pivot at pivot_i and only
-    makes the zone available at confirm_i = pivot_i + PIVOT.
+    The ATR used for the zone is taken at confirmation time.
     """
 
     zones = []
@@ -657,12 +746,10 @@ def build_zones(htf):
             pivot_i + PIVOT
         )
 
-        row_at_confirmation = htf.iloc[
-            confirm_i
-        ]
-
         atr_value = float(
-            row_at_confirmation.atr
+            htf.atr.iloc[
+                confirm_i
+            ]
         )
 
         if not np.isfinite(
@@ -673,6 +760,18 @@ def build_zones(htf):
         if atr_value <= 0:
             continue
 
+        pivot_time = (
+            htf.time.iloc[
+                pivot_i
+            ]
+        )
+
+        confirm_time = (
+            htf.time.iloc[
+                confirm_i
+            ]
+        )
+
         if bool(
             htf.pivot_high.iloc[
                 pivot_i
@@ -680,37 +779,48 @@ def build_zones(htf):
         ):
 
             price = float(
-                htf.high.iloc[pivot_i]
+                htf.high.iloc[
+                    pivot_i
+                ]
             )
 
             zones.append(
                 {
-                    "side": "SHORT",
-                    "pivot_i": int(
-                        pivot_i
-                    ),
-                    "confirm_i": int(
-                        confirm_i
-                    ),
+                    "side":
+                        "SHORT",
+
+                    "pivot_i":
+                        int(pivot_i),
+
+                    "confirm_i":
+                        int(confirm_i),
+
                     "pivot_time":
-                        htf.time.iloc[
-                            pivot_i
-                        ],
+                        pivot_time,
+
                     "confirm_time":
-                        htf.time.iloc[
-                            confirm_i
-                        ],
-                    "center": price,
-                    "low": (
-                        price
-                        - HTF_ZONE_ATR_MULT
-                        * atr_value
-                    ),
-                    "high": (
-                        price
-                        + HTF_ZONE_ATR_MULT
-                        * atr_value
-                    ),
+                        confirm_time,
+
+                    "center":
+                        price,
+
+                    "low":
+                        (
+                            price
+                            - (
+                                HTF_ZONE_ATR_MULT
+                                * atr_value
+                            )
+                        ),
+
+                    "high":
+                        (
+                            price
+                            + (
+                                HTF_ZONE_ATR_MULT
+                                * atr_value
+                            )
+                        ),
                 }
             )
 
@@ -721,43 +831,54 @@ def build_zones(htf):
         ):
 
             price = float(
-                htf.low.iloc[pivot_i]
+                htf.low.iloc[
+                    pivot_i
+                ]
             )
 
             zones.append(
                 {
-                    "side": "LONG",
-                    "pivot_i": int(
-                        pivot_i
-                    ),
-                    "confirm_i": int(
-                        confirm_i
-                    ),
+                    "side":
+                        "LONG",
+
+                    "pivot_i":
+                        int(pivot_i),
+
+                    "confirm_i":
+                        int(confirm_i),
+
                     "pivot_time":
-                        htf.time.iloc[
-                            pivot_i
-                        ],
+                        pivot_time,
+
                     "confirm_time":
-                        htf.time.iloc[
-                            confirm_i
-                        ],
-                    "center": price,
-                    "low": (
-                        price
-                        - HTF_ZONE_ATR_MULT
-                        * atr_value
-                    ),
-                    "high": (
-                        price
-                        + HTF_ZONE_ATR_MULT
-                        * atr_value
-                    ),
+                        confirm_time,
+
+                    "center":
+                        price,
+
+                    "low":
+                        (
+                            price
+                            - (
+                                HTF_ZONE_ATR_MULT
+                                * atr_value
+                            )
+                        ),
+
+                    "high":
+                        (
+                            price
+                            + (
+                                HTF_ZONE_ATR_MULT
+                                * atr_value
+                            )
+                        ),
                 }
             )
 
     zones.sort(
         key=lambda z: z[
-            "confirm_i"
+            "confirm_time"
         ]
     )
 
@@ -768,9 +889,15 @@ def build_zones(htf):
 # STRUCTURAL HELPERS
 # ============================================================
 
-def aligned(a, b):
+def aligned(
+    a,
+    b,
+):
     reference = max(
-        abs((a + b) / 2.0),
+        abs(
+            (a + b)
+            / 2.0
+        ),
         1e-12,
     )
 
@@ -786,40 +913,38 @@ def known_pivots(
     current_i,
 ):
     """
-    Return every pivot whose confirmation is known at current_i.
+    Return 15m pivots whose confirmation is already known.
 
-    Pivot j becomes usable only when:
+    Pivot j is usable only if:
         j + PIVOT <= current_i
     """
 
     max_pivot = (
-        current_i - PIVOT
+        current_i
+        - PIVOT
     )
 
     if max_pivot < PIVOT:
         return [], []
 
-    highs = [
-        j
-        for j in range(
-            PIVOT,
-            max_pivot + 1,
-        )
-        if bool(
-            x.pivot_high.iloc[j]
-        )
-    ]
+    highs = []
 
-    lows = [
-        j
-        for j in range(
-            PIVOT,
-            max_pivot + 1,
-        )
+    lows = []
+
+    for j in range(
+        PIVOT,
+        max_pivot + 1,
+    ):
+
         if bool(
-            x.pivot_low.iloc[j]
-        )
-    ]
+            x["pivot_high"].iloc[j]
+        ):
+            highs.append(j)
+
+        if bool(
+            x["pivot_low"].iloc[j]
+        ):
+            lows.append(j)
 
     return highs, lows
 
@@ -829,9 +954,16 @@ def first_zone_touch(
     start_i,
     zone,
 ):
+    """
+    First 15m candle touching the confirmed HTF zone.
+
+    Reaction search is limited to MAX_REACTION_BARS.
+    """
+
     end_i = min(
         len(x) - 1,
-        start_i + MAX_REACTION_BARS,
+        start_i
+        + MAX_REACTION_BARS,
     )
 
     for j in range(
@@ -839,20 +971,29 @@ def first_zone_touch(
         end_i + 1,
     ):
 
-        if (
+        candle_low = float(
             x.low.iloc[j]
+        )
+
+        candle_high = float(
+            x.high.iloc[j]
+        )
+
+        if (
+            candle_low
             <= zone["high"]
             and
-            x.high.iloc[j]
+            candle_high
             >= zone["low"]
         ):
+
             return j
 
     return None
 
 
 # ============================================================
-# CANDIDATE GENERATION
+# CANDIDATES
 # ============================================================
 
 def make_candidates(
@@ -862,26 +1003,29 @@ def make_candidates(
     zones,
 ):
     """
-    Generate all structurally valid candidates over the FULL
-    research + OOS data range.
+    Generate structural candidates from the full available
+    research + OOS data.
+
+    x:
+        15m dataframe with confirmed 15m pivots.
+
+    htf:
+        4H dataframe with confirmed 4H pivots.
 
     No performance filtering is performed here.
-
-    This is important because Discovery/Development must actually
-    contain historical trades rather than being accidentally
-    replaced by the OOS window.
     """
 
     candidates = []
 
     for zone in zones:
 
-        zone_time = zone[
-            "confirm_time"
-        ]
+        zone_confirm_time = (
+            zone["confirm_time"]
+        )
 
         future_rows = x.index[
-            x.time > zone_time
+            x.time
+            > zone_confirm_time
         ]
 
         if len(future_rows) == 0:
@@ -902,10 +1046,14 @@ def make_candidates(
 
         reaction_end = min(
             len(x) - 1,
-            touch_i + MAX_REACTION_BARS,
+            touch_i
+            + MAX_REACTION_BARS,
         )
 
-        # Search the first valid structural sequence after reaction.
+        # ----------------------------------------------------
+        # Search structural reaction.
+        # ----------------------------------------------------
+
         for current_i in range(
             touch_i + 1,
             reaction_end + 1,
@@ -918,9 +1066,9 @@ def make_candidates(
                 )
             )
 
-            # ==================================================
+            # =================================================
             # SHORT
-            # ==================================================
+            # =================================================
 
             if zone["side"] == "SHORT":
 
@@ -937,9 +1085,11 @@ def make_candidates(
                 if not lower_highs:
                     continue
 
-                ob_i = lower_highs[-1]
+                ob_i = (
+                    lower_highs[-1]
+                )
 
-                # OB pivot itself must already be confirmed.
+                # Explicit causal confirmation.
                 if (
                     ob_i + PIVOT
                     > current_i
@@ -959,11 +1109,17 @@ def make_candidates(
                     )
 
                     if (
-                        x.high.iloc[ob_i]
+                        float(
+                            x.high.iloc[
+                                ob_i
+                            ]
+                        )
                         >=
-                        x.high.iloc[
-                            previous_high
-                        ]
+                        float(
+                            x.high.iloc[
+                                previous_high
+                            ]
+                        )
                     ):
                         continue
 
@@ -982,18 +1138,31 @@ def make_candidates(
                 ) < 2:
                     continue
 
-                h1 = aligned_highs[-2]
-                h2 = aligned_highs[-1]
+                h1 = aligned_highs[
+                    -2
+                ]
+
+                h2 = aligned_highs[
+                    -1
+                ]
 
                 if not aligned(
-                    x.high.iloc[h1],
-                    x.high.iloc[h2],
+                    float(
+                        x.high.iloc[h1]
+                    ),
+                    float(
+                        x.high.iloc[h2]
+                    ),
                 ):
                     continue
 
                 liquidity_level = max(
-                    x.high.iloc[h1],
-                    x.high.iloc[h2],
+                    float(
+                        x.high.iloc[h1]
+                    ),
+                    float(
+                        x.high.iloc[h2]
+                    ),
                 )
 
                 break_i = None
@@ -1010,18 +1179,27 @@ def make_candidates(
                 ):
 
                     if (
-                        x.high.iloc[b]
+                        float(
+                            x.high.iloc[b]
+                        )
                         > liquidity_level
                     ):
+
                         break_i = b
                         break
 
                 if break_i is None:
                     continue
 
+                # OB midpoint.
                 midpoint = (
-                    x.low.iloc[ob_i]
-                    + x.high.iloc[ob_i]
+                    float(
+                        x.low.iloc[ob_i]
+                    )
+                    +
+                    float(
+                        x.high.iloc[ob_i]
+                    )
                 ) / 2.0
 
                 retest_i = None
@@ -1031,11 +1209,20 @@ def make_candidates(
                     len(x),
                 ):
 
-                    if (
+                    candle_low = float(
                         x.low.iloc[e]
+                    )
+
+                    candle_high = float(
+                        x.high.iloc[e]
+                    )
+
+                    if (
+                        candle_low
                         <= midpoint
-                        <= x.high.iloc[e]
+                        <= candle_high
                     ):
+
                         retest_i = e
                         break
 
@@ -1046,16 +1233,23 @@ def make_candidates(
                     retest_i + 1
                 )
 
-                if entry_i >= len(x):
+                if (
+                    entry_i
+                    >= len(x)
+                ):
                     continue
 
                 entry = float(
-                    x.open.iloc[entry_i]
+                    x.open.iloc[
+                        entry_i
+                    ]
                 )
 
                 sl = (
                     float(
-                        x.high.iloc[ob_i]
+                        x.high.iloc[
+                            ob_i
+                        ]
                     )
                     * (
                         1.0
@@ -1064,14 +1258,16 @@ def make_candidates(
                 )
 
                 risk = (
-                    sl - entry
+                    sl
+                    - entry
                 )
 
                 if risk <= 0:
                     continue
 
                 risk_pct = (
-                    risk / entry
+                    risk
+                    / entry
                 )
 
                 if not (
@@ -1091,12 +1287,12 @@ def make_candidates(
 
                 structural_target = float(
                     x.low.iloc[
-                        ob_i:h2 + 1
+                        ob_i:
+                        h2 + 1
                     ].min()
                 )
 
-                # SHORT:
-                # TP must remain no farther than the structural target.
+                # SHORT structural viability.
                 if (
                     tp
                     < structural_target
@@ -1105,14 +1301,23 @@ def make_candidates(
 
                 candidates.append(
                     {
-                        "symbol": symbol,
-                        "side": "SHORT",
+                        "symbol":
+                            symbol,
+
+                        "side":
+                            "SHORT",
 
                         "zone_pivot_i":
                             zone["pivot_i"],
 
                         "zone_confirm_i":
                             zone["confirm_i"],
+
+                        "zone_pivot_time":
+                            zone["pivot_time"],
+
+                        "zone_confirm_time":
+                            zone["confirm_time"],
 
                         "touch_i":
                             touch_i,
@@ -1149,12 +1354,11 @@ def make_candidates(
                     }
                 )
 
-                # One candidate per zone/side sequence.
                 break
 
-            # ==================================================
+            # =================================================
             # LONG
-            # ==================================================
+            # =================================================
 
             else:
 
@@ -1171,7 +1375,9 @@ def make_candidates(
                 if not higher_lows:
                     continue
 
-                ob_i = higher_lows[-1]
+                ob_i = (
+                    higher_lows[-1]
+                )
 
                 if (
                     ob_i + PIVOT
@@ -1192,11 +1398,17 @@ def make_candidates(
                     )
 
                     if (
-                        x.low.iloc[ob_i]
+                        float(
+                            x.low.iloc[
+                                ob_i
+                            ]
+                        )
                         <=
-                        x.low.iloc[
-                            previous_low
-                        ]
+                        float(
+                            x.low.iloc[
+                                previous_low
+                            ]
+                        )
                     ):
                         continue
 
@@ -1215,18 +1427,31 @@ def make_candidates(
                 ) < 2:
                     continue
 
-                l1 = aligned_lows[-2]
-                l2 = aligned_lows[-1]
+                l1 = aligned_lows[
+                    -2
+                ]
+
+                l2 = aligned_lows[
+                    -1
+                ]
 
                 if not aligned(
-                    x.low.iloc[l1],
-                    x.low.iloc[l2],
+                    float(
+                        x.low.iloc[l1]
+                    ),
+                    float(
+                        x.low.iloc[l2]
+                    ),
                 ):
                     continue
 
                 liquidity_level = min(
-                    x.low.iloc[l1],
-                    x.low.iloc[l2],
+                    float(
+                        x.low.iloc[l1]
+                    ),
+                    float(
+                        x.low.iloc[l2]
+                    ),
                 )
 
                 break_i = None
@@ -1243,9 +1468,12 @@ def make_candidates(
                 ):
 
                     if (
-                        x.low.iloc[b]
+                        float(
+                            x.low.iloc[b]
+                        )
                         < liquidity_level
                     ):
+
                         break_i = b
                         break
 
@@ -1253,8 +1481,13 @@ def make_candidates(
                     continue
 
                 midpoint = (
-                    x.low.iloc[ob_i]
-                    + x.high.iloc[ob_i]
+                    float(
+                        x.low.iloc[ob_i]
+                    )
+                    +
+                    float(
+                        x.high.iloc[ob_i]
+                    )
                 ) / 2.0
 
                 retest_i = None
@@ -1264,11 +1497,20 @@ def make_candidates(
                     len(x),
                 ):
 
-                    if (
+                    candle_low = float(
                         x.low.iloc[e]
+                    )
+
+                    candle_high = float(
+                        x.high.iloc[e]
+                    )
+
+                    if (
+                        candle_low
                         <= midpoint
-                        <= x.high.iloc[e]
+                        <= candle_high
                     ):
+
                         retest_i = e
                         break
 
@@ -1279,16 +1521,23 @@ def make_candidates(
                     retest_i + 1
                 )
 
-                if entry_i >= len(x):
+                if (
+                    entry_i
+                    >= len(x)
+                ):
                     continue
 
                 entry = float(
-                    x.open.iloc[entry_i]
+                    x.open.iloc[
+                        entry_i
+                    ]
                 )
 
                 sl = (
                     float(
-                        x.low.iloc[ob_i]
+                        x.low.iloc[
+                            ob_i
+                        ]
                     )
                     * (
                         1.0
@@ -1297,14 +1546,16 @@ def make_candidates(
                 )
 
                 risk = (
-                    entry - sl
+                    entry
+                    - sl
                 )
 
                 if risk <= 0:
                     continue
 
                 risk_pct = (
-                    risk / entry
+                    risk
+                    / entry
                 )
 
                 if not (
@@ -1324,12 +1575,12 @@ def make_candidates(
 
                 structural_target = float(
                     x.high.iloc[
-                        ob_i:l2 + 1
+                        ob_i:
+                        l2 + 1
                     ].max()
                 )
 
-                # LONG:
-                # TP must remain no farther than the structural target.
+                # LONG structural viability.
                 if (
                     tp
                     > structural_target
@@ -1338,14 +1589,23 @@ def make_candidates(
 
                 candidates.append(
                     {
-                        "symbol": symbol,
-                        "side": "LONG",
+                        "symbol":
+                            symbol,
+
+                        "side":
+                            "LONG",
 
                         "zone_pivot_i":
                             zone["pivot_i"],
 
                         "zone_confirm_i":
                             zone["confirm_i"],
+
+                        "zone_pivot_time":
+                            zone["pivot_time"],
+
+                        "zone_confirm_time":
+                            zone["confirm_time"],
 
                         "touch_i":
                             touch_i,
@@ -1404,17 +1664,18 @@ def simulate(
     candidates,
 ):
     """
-    Per-symbol overlap rule.
+    Per-symbol overlap rule:
 
-    Different symbols are independent.
-
-    The entry candle itself is never checked for exit.
-
-    A trade that has no exit by the end of the dataset is
-    unresolved and blocks all later same-symbol entries.
+    - maximum one open trade per symbol
+    - different symbols can overlap
+    - no same-candle re-entry
+    - entry candle is not checked for SL/TP
+    - SL wins when both SL and TP are touched
+    - no timeout
     """
 
     closed = []
+
     unresolved = []
 
     last_exit_i = -1
@@ -1425,7 +1686,6 @@ def simulate(
             "entry_i"
         ]
 
-        # Same-symbol lock.
         if (
             entry_i
             <= last_exit_i
@@ -1433,9 +1693,12 @@ def simulate(
             continue
 
         exit_i = None
+
         result = None
+
         exit_price = None
 
+        # Never check entry candle.
         for j in range(
             entry_i + 1,
             len(x),
@@ -1476,11 +1739,14 @@ def simulate(
                     <= candidate["tp"]
                 )
 
-            if hit_sl or hit_tp:
+            if (
+                hit_sl
+                or hit_tp
+            ):
 
                 exit_i = j
 
-                # Conservative intrabar ambiguity rule.
+                # Conservative rule.
                 if hit_sl:
 
                     result = "LOSS"
@@ -1504,8 +1770,13 @@ def simulate(
             unresolved.append(
                 {
                     **candidate,
-                    "exit_i": None,
-                    "result": "UNRESOLVED",
+
+                    "exit_i":
+                        None,
+
+                    "result":
+                        "UNRESOLVED",
+
                     "entry_time":
                         x.time.iloc[
                             entry_i
@@ -1514,7 +1785,7 @@ def simulate(
             )
 
             # No artificial timeout.
-            # This unresolved trade remains open.
+            # Same symbol remains blocked.
             last_exit_i = (
                 len(x) - 1
             )
@@ -1602,7 +1873,10 @@ def simulate(
 
         last_exit_i = exit_i
 
-    return closed, unresolved
+    return (
+        closed,
+        unresolved,
+    )
 
 
 # ============================================================
@@ -1637,7 +1911,7 @@ def stats(trades):
     gross_profit = sum(
         max(
             0.0,
-            t["pnl"],
+            float(t["pnl"]),
         )
         for t in trades
     )
@@ -1645,20 +1919,26 @@ def stats(trades):
     gross_loss = sum(
         min(
             0.0,
-            t["pnl"],
+            float(t["pnl"]),
         )
         for t in trades
     )
 
     streak = 0
+
     max_streak = 0
 
-    for t in sorted(
+    for trade in sorted(
         trades,
-        key=lambda z: z["exit_time"],
+        key=lambda t: t[
+            "exit_time"
+        ],
     ):
 
-        if t["result"] == "LOSS":
+        if (
+            trade["result"]
+            == "LOSS"
+        ):
 
             streak += 1
 
@@ -1672,14 +1952,21 @@ def stats(trades):
             streak = 0
 
     return {
-        "trades": len(trades),
-        "wins": wins,
-        "losses": losses,
+        "trades":
+            len(trades),
+
+        "wins":
+            wins,
+
+        "losses":
+            losses,
 
         "wr":
-            100.0
-            * wins
-            / len(trades),
+            (
+                100.0
+                * wins
+                / len(trades)
+            ),
 
         "pf":
             (
@@ -1695,13 +1982,15 @@ def stats(trades):
 
         "net_R":
             sum(
-                t["r_multiple"]
+                float(
+                    t["r_multiple"]
+                )
                 for t in trades
             ),
 
         "pnl":
             sum(
-                t["pnl"]
+                float(t["pnl"])
                 for t in trades
             ),
 
@@ -1710,18 +1999,25 @@ def stats(trades):
     }
 
 
-def max_drawdown(trades):
-
+def max_drawdown(
+    trades
+):
     equity = INITIAL_CAPITAL
+
     peak = equity
+
     max_dd = 0.0
 
     for trade in sorted(
         trades,
-        key=lambda t: t["exit_time"],
+        key=lambda t: t[
+            "exit_time"
+        ],
     ):
 
-        equity += trade["pnl"]
+        equity += float(
+            trade["pnl"]
+        )
 
         peak = max(
             peak,
@@ -1740,27 +2036,36 @@ def max_drawdown(trades):
 # SPLIT CLASSIFICATION
 # ============================================================
 
-def classify_entry_time(entry_time):
+def classify_entry_time(
+    entry_time
+):
     t = pd.Timestamp(
         entry_time
     )
 
     if t.tzinfo is None:
-        t = t.tz_localize("UTC")
+
+        t = t.tz_localize(
+            "UTC"
+        )
+
     else:
-        t = t.tz_convert("UTC")
+
+        t = t.tz_convert(
+            "UTC"
+        )
 
     if (
         RESEARCH_START
         <= t
-        <= RESEARCH_MID
+        < RESEARCH_MID
     ):
         return "Discovery"
 
     if (
-        t > RESEARCH_MID
-        and
-        t < OOS_START
+        RESEARCH_MID
+        <= t
+        < OOS_START
     ):
         return "Development"
 
@@ -1774,94 +2079,130 @@ def classify_entry_time(entry_time):
     return "Outside"
 
 
+# ============================================================
+# SPLIT REPORT
+# ============================================================
+
 def split_report(
-    trades,
+    closed_trades,
     unresolved,
-    candidate_diagnostics,
 ):
-    """
-    Split by ENTRY time.
-
-    Discovery/Development are the research period.
-    OOS is the reserved fresh period.
-    """
-
     groups = {
         "Discovery": [],
         "Development": [],
         "Validation_OOS": [],
     }
 
-    for trade in trades:
+    for trade in closed_trades:
 
         split = classify_entry_time(
             trade["entry_time"]
         )
 
         if split in groups:
-            groups[split].append(
+
+            groups[
+                split
+            ].append(
                 trade
             )
 
     rows = []
 
-    for name in [
+    for split_name in [
         "Discovery",
         "Development",
         "Validation_OOS",
     ]:
 
         result = stats(
-            groups[name]
+            groups[
+                split_name
+            ]
+        )
+
+        unresolved_count = sum(
+            1
+            for trade in unresolved
+            if (
+                classify_entry_time(
+                    trade[
+                        "entry_time"
+                    ]
+                )
+                == split_name
+            )
         )
 
         rows.append(
             {
-                "split": name,
+                "split":
+                    split_name,
+
                 "trades":
                     result["trades"],
+
                 "wins":
                     result["wins"],
+
                 "losses":
                     result["losses"],
+
                 "WR_%":
                     result["wr"],
+
                 "PF":
                     result["pf"],
+
                 "net_R":
                     result["net_R"],
+
                 "PnL_$":
                     result["pnl"],
+
                 "max_streak":
-                    result["max_streak"],
+                    result[
+                        "max_streak"
+                    ],
+
                 "unresolved":
-                    0,
+                    unresolved_count,
             }
         )
 
-    total_result = stats(
-        trades
+    total = stats(
+        closed_trades
     )
 
     rows.append(
         {
-            "split": "TOTAL",
+            "split":
+                "TOTAL",
+
             "trades":
-                total_result["trades"],
+                total["trades"],
+
             "wins":
-                total_result["wins"],
+                total["wins"],
+
             "losses":
-                total_result["losses"],
+                total["losses"],
+
             "WR_%":
-                total_result["wr"],
+                total["wr"],
+
             "PF":
-                total_result["pf"],
+                total["pf"],
+
             "net_R":
-                total_result["net_R"],
+                total["net_R"],
+
             "PnL_$":
-                total_result["pnl"],
+                total["pnl"],
+
             "max_streak":
-                total_result["max_streak"],
+                total["max_streak"],
+
             "unresolved":
                 len(unresolved),
         }
@@ -1870,6 +2211,211 @@ def split_report(
     return pd.DataFrame(
         rows
     )
+
+
+# ============================================================
+# DIAGNOSTICS
+# ============================================================
+
+def diagnostic_rows(
+    symbol,
+    x,
+    zones,
+    candidates,
+    closed,
+    unresolved,
+):
+    rows = []
+
+    split_ranges = [
+        (
+            "Discovery",
+            RESEARCH_START,
+            RESEARCH_MID,
+        ),
+        (
+            "Development",
+            RESEARCH_MID,
+            OOS_START,
+        ),
+        (
+            "Validation_OOS",
+            OOS_START,
+            OOS_END
+            + pd.Timedelta(
+                minutes=1
+            ),
+        ),
+    ]
+
+    for (
+        split_name,
+        start,
+        end,
+    ) in split_ranges:
+
+        split_candidates = [
+            c
+            for c in candidates
+            if (
+                start
+                <= x.time.iloc[
+                    c["entry_i"]
+                ]
+                < end
+            )
+        ]
+
+        split_closed = [
+            t
+            for t in closed
+            if (
+                start
+                <= t["entry_time"]
+                < end
+            )
+        ]
+
+        split_unresolved = [
+            t
+            for t in unresolved
+            if (
+                start
+                <= t["entry_time"]
+                < end
+            )
+        ]
+
+        split_zones = [
+            z
+            for z in zones
+            if (
+                start
+                <= z["confirm_time"]
+                < end
+            )
+        ]
+
+        candidate_times = [
+            x.time.iloc[
+                c["entry_i"]
+            ]
+            for c
+            in split_candidates
+        ]
+
+        rows.append(
+            {
+                "symbol":
+                    symbol,
+
+                "split":
+                    split_name,
+
+                "data_first":
+                    str(
+                        x.time.iloc[0]
+                    ),
+
+                "data_last":
+                    str(
+                        x.time.iloc[-1]
+                    ),
+
+                "candles":
+                    len(x),
+
+                "htf_zones":
+                    len(
+                        split_zones
+                    ),
+
+                "candidates":
+                    len(
+                        split_candidates
+                    ),
+
+                "closed":
+                    len(
+                        split_closed
+                    ),
+
+                "unresolved":
+                    len(
+                        split_unresolved
+                    ),
+
+                "earliest_candidate":
+                    (
+                        str(
+                            min(
+                                candidate_times
+                            )
+                        )
+                        if candidate_times
+                        else ""
+                    ),
+
+                "latest_candidate":
+                    (
+                        str(
+                            max(
+                                candidate_times
+                            )
+                        )
+                        if candidate_times
+                        else ""
+                    ),
+            }
+        )
+
+    return rows
+
+
+def monthly_candidate_rows(
+    symbol,
+    x,
+    candidates,
+):
+    rows = []
+
+    for candidate in candidates:
+
+        t = pd.Timestamp(
+            x.time.iloc[
+                candidate["entry_i"]
+            ]
+        )
+
+        split = classify_entry_time(
+            t
+        )
+
+        if split == "Outside":
+            continue
+
+        rows.append(
+            {
+                "symbol":
+                    symbol,
+
+                "split":
+                    split,
+
+                "entry_time":
+                    t,
+
+                "year_month":
+                    t.strftime(
+                        "%Y-%m"
+                    ),
+
+                "side":
+                    candidate["side"],
+            }
+        )
+
+    return rows
 
 
 # ============================================================
@@ -1883,64 +2429,169 @@ def audit(
     errors = []
 
     all_trades = (
-        closed_trades
-        + unresolved
+        list(closed_trades)
+        + list(unresolved)
     )
 
     for trade in all_trades:
 
         # ----------------------------------------------------
-        # Structural causality
+        # 1. Structural timestamps
         # ----------------------------------------------------
 
-        required_order = [
-            trade["zone_pivot_i"],
-            trade["zone_confirm_i"],
-            trade["touch_i"],
-            trade["ob_i"],
-            trade["align1_i"],
-            trade["align2_i"],
-            trade["break_i"],
-            trade["retest_i"],
-            trade["entry_i"],
+        zone_pivot_time = pd.Timestamp(
+            trade[
+                "zone_pivot_time"
+            ]
+        )
+
+        zone_confirm_time = pd.Timestamp(
+            trade[
+                "zone_confirm_time"
+            ]
+        )
+
+        touch_time = pd.Timestamp(
+            trade[
+                "touch_time"
+            ]
+        )
+
+        ob_time = pd.Timestamp(
+            trade[
+                "ob_time"
+            ]
+        )
+
+        align1_time = pd.Timestamp(
+            trade[
+                "align1_time"
+            ]
+        )
+
+        align2_time = pd.Timestamp(
+            trade[
+                "align2_time"
+            ]
+        )
+
+        break_time = pd.Timestamp(
+            trade[
+                "break_time"
+            ]
+        )
+
+        retest_time = pd.Timestamp(
+            trade[
+                "retest_time"
+            ]
+        )
+
+        entry_time = pd.Timestamp(
+            trade[
+                "entry_time"
+            ]
+        )
+
+        structural_times = [
+            zone_pivot_time,
+            zone_confirm_time,
+            touch_time,
+            ob_time,
+            align1_time,
+            align2_time,
+            break_time,
+            retest_time,
+        ]
+
+        # Zone pivot itself precedes confirmation.
+        if not (
+            zone_pivot_time
+            < zone_confirm_time
+        ):
+
+            errors.append(
+                "HTF pivot confirmation "
+                "ordering violation"
+            )
+
+        # Every structure event must precede entry.
+        for structural_time in (
+            structural_times
+        ):
+
+            if not (
+                structural_time
+                < entry_time
+            ):
+
+                errors.append(
+                    "future structural "
+                    "information"
+                )
+
+        # Explicit sequence.
+        ordered = [
+            zone_confirm_time,
+            touch_time,
+            ob_time,
+            align1_time,
+            align2_time,
+            break_time,
+            retest_time,
+            entry_time,
         ]
 
         if not all(
             a < b
             for a, b in zip(
-                required_order,
-                required_order[1:],
+                ordered,
+                ordered[1:],
             )
         ):
-            errors.append(
-                "future/structural ordering violation"
-            )
 
-        # Zone pivot must have had enough 4H candles to confirm.
-        if (
-            trade["zone_confirm_i"]
-            !=
-            trade["zone_pivot_i"]
-            + PIVOT
-        ):
             errors.append(
-                "HTF pivot confirmation timing violation"
+                "structural sequence "
+                "ordering violation"
             )
 
         # ----------------------------------------------------
-        # Entry must be after completed retest candle.
+        # 2. HTF confirmation delay
+        # ----------------------------------------------------
+
+        expected_confirm = (
+            zone_pivot_time
+            + pd.Timedelta(
+                hours=4 * PIVOT
+            )
+        )
+
+        if (
+            zone_confirm_time
+            != expected_confirm
+        ):
+
+            errors.append(
+                "HTF confirmation "
+                "timing violation"
+            )
+
+        # ----------------------------------------------------
+        # 3. Entry after retest
         # ----------------------------------------------------
 
         if not (
-            trade["entry_i"]
-            > trade["retest_i"]
+            entry_time
+            > retest_time
         ):
+
             errors.append(
-                "entry not after retest"
+                "entry not after "
+                "completed retest"
             )
 
         # ----------------------------------------------------
-        # Risk / RR
+        # 4. RR
         # ----------------------------------------------------
 
         entry = float(
@@ -1960,6 +2611,7 @@ def audit(
         )
 
         if risk <= 0:
+
             errors.append(
                 "invalid risk"
             )
@@ -1985,12 +2637,13 @@ def audit(
             )
             > tolerance
         ):
+
             errors.append(
                 "RR mismatch"
             )
 
         # ----------------------------------------------------
-        # Structural target direction
+        # 5. Structural target viability
         # ----------------------------------------------------
 
         structural_target = float(
@@ -2002,32 +2655,36 @@ def audit(
         if trade["side"] == "LONG":
 
             if tp > structural_target:
+
                 errors.append(
-                    "LONG TP beyond structural target"
+                    "LONG TP beyond "
+                    "structural target"
                 )
 
         else:
 
             if tp < structural_target:
+
                 errors.append(
-                    "SHORT TP beyond structural target"
+                    "SHORT TP beyond "
+                    "structural target"
                 )
 
     # --------------------------------------------------------
-    # Same-symbol overlap and same-candle re-entry.
+    # 6. Same-symbol overlap
     # --------------------------------------------------------
 
-    ordered = sorted(
+    ordered_trades = sorted(
         closed_trades,
         key=lambda t: (
             t["symbol"],
-            t["entry_i"],
+            t["entry_time"],
         ),
     )
 
     for previous, current in zip(
-        ordered,
-        ordered[1:],
+        ordered_trades,
+        ordered_trades[1:],
     ):
 
         if (
@@ -2036,18 +2693,28 @@ def audit(
         ):
             continue
 
+        previous_exit = pd.Timestamp(
+            previous["exit_time"]
+        )
+
+        current_entry = pd.Timestamp(
+            current["entry_time"]
+        )
+
         if (
-            current["entry_i"]
-            <= previous["exit_i"]
+            current_entry
+            <= previous_exit
         ):
+
             errors.append(
                 "same-symbol overlap"
             )
 
         if (
-            current["entry_i"]
-            == previous["exit_i"]
+            current_entry
+            == previous_exit
         ):
+
             errors.append(
                 "same-candle re-entry"
             )
@@ -2058,175 +2725,60 @@ def audit(
 
 
 # ============================================================
-# DIAGNOSTICS
+# ENRICH TRADE TIMES
 # ============================================================
 
-def diagnostic_rows(
-    symbol,
-    df,
-    zones,
-    candidates,
-    closed,
-    unresolved,
+def enrich_trade_times(
+    trade,
+    x,
 ):
-    rows = []
+    """
+    Add exact 15m timestamps for all structural indices.
 
-    for split_name, start, end in [
-        (
-            "Discovery",
-            RESEARCH_START,
-            RESEARCH_MID,
-        ),
-        (
-            "Development",
-            RESEARCH_MID
-            + pd.Timedelta(minutes=15),
-            OOS_START
-            - pd.Timedelta(minutes=15),
-        ),
-        (
-            "Validation_OOS",
-            OOS_START,
-            OOS_END,
-        ),
-    ]:
+    This prevents mixing 4H and 15m integer indices during audit.
+    """
 
-        split_candidates = [
-            c
-            for c in candidates
-            if (
-                start
-                <= df.time.iloc[
-                    c["entry_i"]
-                ]
-                <= end
-            )
+    result = dict(
+        trade
+    )
+
+    result["touch_time"] = (
+        x.time.iloc[
+            trade["touch_i"]
         ]
+    )
 
-        split_closed = [
-            t
-            for t in closed
-            if (
-                start
-                <= t["entry_time"]
-                <= end
-            )
+    result["ob_time"] = (
+        x.time.iloc[
+            trade["ob_i"]
         ]
+    )
 
-        split_unresolved = [
-            t
-            for t in unresolved
-            if (
-                start
-                <= t["entry_time"]
-                <= end
-            )
+    result["align1_time"] = (
+        x.time.iloc[
+            trade["align1_i"]
         ]
+    )
 
-        rows.append(
-            {
-                "symbol":
-                    symbol,
-                "split":
-                    split_name,
-                "data_first":
-                    str(df.time.iloc[0]),
-                "data_last":
-                    str(df.time.iloc[-1]),
-                "candles":
-                    len(df),
-                "htf_zones":
-                    len(
-                        [
-                            z
-                            for z in zones
-                            if (
-                                start
-                                <= z[
-                                    "confirm_time"
-                                ]
-                                <= end
-                            )
-                        ]
-                    ),
-                "candidates":
-                    len(split_candidates),
-                "closed":
-                    len(split_closed),
-                "unresolved":
-                    len(split_unresolved),
-                "earliest_candidate":
-                    (
-                        str(
-                            min(
-                                df.time.iloc[
-                                    c["entry_i"]
-                                ]
-                                for c
-                                in split_candidates
-                            )
-                        )
-                        if split_candidates
-                        else ""
-                    ),
-                "latest_candidate":
-                    (
-                        str(
-                            max(
-                                df.time.iloc[
-                                    c["entry_i"]
-                                ]
-                                for c
-                                in split_candidates
-                            )
-                        )
-                        if split_candidates
-                        else ""
-                    ),
-            }
-        )
+    result["align2_time"] = (
+        x.time.iloc[
+            trade["align2_i"]
+        ]
+    )
 
-    return rows
+    result["break_time"] = (
+        x.time.iloc[
+            trade["break_i"]
+        ]
+    )
 
+    result["retest_time"] = (
+        x.time.iloc[
+            trade["retest_i"]
+        ]
+    )
 
-def monthly_candidate_rows(
-    symbol,
-    df,
-    candidates,
-):
-    rows = []
-
-    for candidate in candidates:
-
-        t = pd.Timestamp(
-            df.time.iloc[
-                candidate["entry_i"]
-            ]
-        )
-
-        split = classify_entry_time(
-            t
-        )
-
-        if split == "Outside":
-            continue
-
-        rows.append(
-            {
-                "symbol":
-                    symbol,
-                "split":
-                    split,
-                "entry_time":
-                    t,
-                "year_month":
-                    t.strftime("%Y-%m"),
-                "side":
-                    candidate["side"],
-            }
-        )
-
-    return rows
+    return result
 
 
 # ============================================================
@@ -2236,16 +2788,24 @@ def monthly_candidate_rows(
 def main():
 
     all_closed = []
+
     all_unresolved = []
 
     audit_rows = []
+
     diagnostic_all = []
+
     monthly_candidates = []
+
+    # --------------------------------------------------------
+    # SYMBOL LOOP
+    # --------------------------------------------------------
 
     for symbol in SYMBOLS:
 
         print(
-            f"[DATA] Fetching {symbol}"
+            f"[DATA] Fetching "
+            f"{symbol}"
         )
 
         df = fetch_symbol(
@@ -2259,6 +2819,20 @@ def main():
             f"{df.time.iloc[-1]}"
         )
 
+        # ----------------------------------------------------
+        # CRITICAL V2 FIX:
+        #
+        # 15m structure needs its own confirmed pivots.
+        # ----------------------------------------------------
+
+        x = confirmed_pivots(
+            df
+        )
+
+        # ----------------------------------------------------
+        # 4H context
+        # ----------------------------------------------------
+
         htf = make_htf(
             df
         )
@@ -2267,31 +2841,55 @@ def main():
             htf
         )
 
+        # ----------------------------------------------------
+        # Candidate generation
+        # ----------------------------------------------------
+
         candidates = make_candidates(
             symbol,
-            df,
+            x,
             htf,
             zones,
         )
 
+        # ----------------------------------------------------
+        # Simulation
+        # ----------------------------------------------------
+
         closed, unresolved = simulate(
             symbol,
-            df,
+            x,
             candidates,
         )
 
-        all_closed.extend(
-            closed
-        )
+        # ----------------------------------------------------
+        # Enrich exact structural timestamps.
+        # ----------------------------------------------------
 
-        all_unresolved.extend(
-            unresolved
-        )
+        closed = [
+            enrich_trade_times(
+                trade,
+                x,
+            )
+            for trade in closed
+        ]
+
+        unresolved = [
+            enrich_trade_times(
+                trade,
+                x,
+            )
+            for trade in unresolved
+        ]
+
+        # ----------------------------------------------------
+        # Diagnostics
+        # ----------------------------------------------------
 
         diagnostic_all.extend(
             diagnostic_rows(
                 symbol,
-                df,
+                x,
                 zones,
                 candidates,
                 closed,
@@ -2302,27 +2900,50 @@ def main():
         monthly_candidates.extend(
             monthly_candidate_rows(
                 symbol,
-                df,
+                x,
                 candidates,
             )
+        )
+
+        # ----------------------------------------------------
+        # Store
+        # ----------------------------------------------------
+
+        all_closed.extend(
+            closed
+        )
+
+        all_unresolved.extend(
+            unresolved
         )
 
         audit_rows.append(
             {
                 "symbol":
                     symbol,
+
                 "rows":
-                    len(df),
+                    len(x),
+
                 "first":
-                    str(df.time.iloc[0]),
+                    str(
+                        x.time.iloc[0]
+                    ),
+
                 "last":
-                    str(df.time.iloc[-1]),
+                    str(
+                        x.time.iloc[-1]
+                    ),
+
                 "htf_zones":
                     len(zones),
+
                 "candidates":
                     len(candidates),
+
                 "closed":
                     len(closed),
+
                 "unresolved":
                     len(unresolved),
             }
@@ -2330,7 +2951,7 @@ def main():
 
         print(
             f"[RESULT] {symbol}: "
-            f"zones={len(zones)} "
+            f"4H_zones={len(zones)} "
             f"candidates={len(candidates)} "
             f"closed={len(closed)} "
             f"unresolved={len(unresolved)}"
@@ -2355,7 +2976,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Audit
+    # FINAL INTEGRITY AUDIT
     # --------------------------------------------------------
 
     integrity_errors = audit(
@@ -2373,14 +2994,17 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Reports
+    # SPLIT REPORT
     # --------------------------------------------------------
 
     report = split_report(
         all_closed,
         all_unresolved,
-        diagnostic_all,
     )
+
+    # --------------------------------------------------------
+    # OUTPUT CSVs
+    # --------------------------------------------------------
 
     report.to_csv(
         OUT
@@ -2445,7 +3069,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Candidate summary
+    # Candidate counts
     # --------------------------------------------------------
 
     candidate_counts = {
@@ -2463,7 +3087,7 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Text report
+    # TEXT REPORT
     # --------------------------------------------------------
 
     output = []
@@ -2472,9 +3096,7 @@ def main():
         "SETUP 4 V2 — BACKTEST REPORT"
     )
 
-    output.append(
-        ""
-    )
+    output.append("")
 
     output.append(
         "RESEARCH WINDOW"
@@ -2495,9 +3117,7 @@ def main():
         f"{RESEARCH_MID}"
     )
 
-    output.append(
-        ""
-    )
+    output.append("")
 
     output.append(
         "FRESH OOS — LOCKED"
@@ -2513,9 +3133,7 @@ def main():
         f"{OOS_END}"
     )
 
-    output.append(
-        ""
-    )
+    output.append("")
 
     output.append(
         "CAPITAL"
@@ -2541,9 +3159,7 @@ def main():
         f"${NOTIONAL:.2f}"
     )
 
-    output.append(
-        ""
-    )
+    output.append("")
 
     output.append(
         "CANDIDATES BY SPLIT"
@@ -2564,9 +3180,7 @@ def main():
         f"{candidate_counts['Validation_OOS']}"
     )
 
-    output.append(
-        ""
-    )
+    output.append("")
 
     output.append(
         "OVERALL CLOSED-TRADE RESULT"
@@ -2627,9 +3241,7 @@ def main():
         f"{len(all_unresolved)}"
     )
 
-    output.append(
-        ""
-    )
+    output.append("")
 
     output.append(
         "FINAL INTEGRITY AUDIT"
@@ -2663,9 +3275,7 @@ def main():
         "AUDIT STATUS: PASSED"
     )
 
-    output.append(
-        ""
-    )
+    output.append("")
 
     if not report.empty:
 
