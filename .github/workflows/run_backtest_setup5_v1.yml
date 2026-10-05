@@ -11,9 +11,12 @@ jobs:
     name: Setup 5 V1 Backtest
     runs-on: ubuntu-latest
 
-    timeout-minutes: 30
+    # The previous run reached ~30 minutes and was cancelled.
+    # Give the complete 14-symbol backtest enough time.
+    timeout-minutes: 120
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -22,70 +25,24 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Restore Binance data cache
+        uses: actions/cache@v4
+        with:
+          path: .binance_cache
+          key: setup5-binance-15m-${{ runner.os }}-${{ hashFiles('backtest_setup5_v1.py') }}
+          restore-keys: |
+            setup5-binance-15m-${{ runner.os }}-
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy requests
-
-      - name: Verify files
-        run: |
-          echo "===== WORKSPACE ====="
-          pwd
-          echo
-          echo "===== FILES ====="
-          ls -lah
-          echo
-          echo "===== BACKTEST FILE ====="
-          test -f backtest_setup5_v1.py
-          wc -l backtest_setup5_v1.py
-          echo
-          echo "===== PYTHON VERSION ====="
-          python --version
+          pip install --no-cache-dir pandas numpy requests
 
       - name: Run Setup 5 V1
-        shell: bash
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
-          set -o pipefail
-
-          echo "========================================"
-          echo " STARTING SETUP 5 V1 BACKTEST"
-          echo "========================================"
-
-          python -u backtest_setup5_v1.py 2>&1 | tee setup5_console.log
-
-          EXIT_CODE=${PIPESTATUS[0]}
-
-          echo
-          echo "========================================"
-          echo " BACKTEST EXIT CODE: ${EXIT_CODE}"
-          echo "========================================"
-
-          exit "${EXIT_CODE}"
-
-      - name: Show generated outputs
-        if: always()
-        run: |
-          echo "========================================"
-          echo " GENERATED FILES"
-          echo "========================================"
-
-          if [ -d "setup5_outputs" ]; then
-            find setup5_outputs -maxdepth 2 -type f -print -exec ls -lh {} \;
-          else
-            echo "setup5_outputs directory was not created."
-          fi
-
-          echo
-          echo "========================================"
-          echo " CONSOLE LOG SIZE"
-          echo "========================================"
-
-          if [ -f "setup5_console.log" ]; then
-            wc -l setup5_console.log
-            tail -100 setup5_console.log
-          else
-            echo "setup5_console.log not found."
-          fi
+          python -u backtest_setup5_v1.py
 
       - name: Upload backtest results
         if: always()
@@ -93,7 +50,5 @@ jobs:
         with:
           name: setup5-v1-results
           path: |
-            setup5_outputs/
-            setup5_console.log
-          if-no-files-found: warn
-          retention-days: 30
+            setup5_v1_trades.csv
+          if-no-files-found: ignore
