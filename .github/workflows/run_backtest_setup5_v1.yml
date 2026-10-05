@@ -1,0 +1,41 @@
+name: Run Backtest Setup 5 V1
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "backtest_setup5_v1.py"
+      - ".github/workflows/run_backtest_setup5_v1.yml"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests
+
+      - name: Compile check
+        run: python -m py_compile backtest_setup5_v1.py
+
+      - name: Run Setup 5 V1
+        run: python backtest_setup5_v1.py
+
+      - name: Upload backtest artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup5-v1-results
+          path: setup5_outputs/
+          if-no-files-found: warn
