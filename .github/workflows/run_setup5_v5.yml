@@ -1,0 +1,48 @@
+name: Run Setup 5 V5 Diagnostic
+
+on:
+  workflow_dispatch:
+
+auto_cancel: false
+
+jobs:
+  backtest:
+    name: Setup 5 V5 Diagnostic Backtest
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas requests
+
+      - name: Run Setup 5 V5
+        run: |
+          python backtest_setup5_v5.py
+
+      - name: Upload Setup 5 V5 results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup5-v5-diagnostic-results
+          path: |
+            setup5_v5_summary.csv
+            setup5_v5_oos_direction.csv
+            setup5_v5_a_ob_limit_trades.csv
+            setup5_v5_a_ob_limit_candidates.csv
+            setup5_v5_b_ob_confirm_trades.csv
+            setup5_v5_b_ob_confirm_candidates.csv
+            setup5_v5_c_sweep_then_ob_trades.csv
+            setup5_v5_c_sweep_then_ob_candidates.csv
+            setup5_v5_d_strong_choch_trades.csv
+            setup5_v5_d_strong_choch_candidates.csv
+          if-no-files-found: ignore
