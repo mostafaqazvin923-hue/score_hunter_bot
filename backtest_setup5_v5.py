@@ -127,7 +127,11 @@ def fetch(symbol,interval,start,end):
     df=df[(df.open_time>=start)&(df.open_time<=end)&(df.close_time<=utc_now())].reset_index(drop=True)
     return df
 def validate(df,mins,symbol,name):
-    if len(df)<3000: raise RuntimeError(f"{symbol} {name}: too few rows {len(df)}")
+    # 4H history contains fewer rows by design: ~6 candles/day.
+    # 365d test + 90d warmup + HTF context does not guarantee 3000 rows.
+    # Keep a meaningful integrity floor without rejecting valid history.
+    min_rows = 30000 if name == "15m" else 1800
+    if len(df) < min_rows: raise RuntimeError(f"{symbol} {name}: too few rows {len(df)} (minimum {min_rows})")
     if not df.open_time.is_monotonic_increasing or df.open_time.duplicated().any(): raise RuntimeError(f"{symbol} {name}: timestamps invalid")
     gaps=df.open_time.diff().dropna(); bad=gaps[gaps!=pd.Timedelta(minutes=mins)]
     if not bad.empty: raise RuntimeError(f"{symbol} {name}: gap {bad.max()}")
