@@ -60,7 +60,7 @@ MAX_REACTION_WAIT=96; MAX_CHOCH_WAIT=160; MAX_LIQ_TO_OB_BARS=24; MAX_POST_SWEEP_
 MIN_CHOCH_BODY_BASE=0.10; MIN_CHOCH_EXT_BASE=0.02
 MIN_CHOCH_BODY_STRONG=0.60; MIN_CHOCH_EXT_STRONG=0.20
 MIN_SWEEP_PEN_ATR=0.00; MIN_OB_REACTION_BODY_ATR=0.05
-MAX_WORKERS=min(8,len(SYMBOLS)); REQUEST_TIMEOUT=30
+MAX_WORKERS=min(6,len(SYMBOLS)); REQUEST_TIMEOUT=30
 ARCHIVE_BASE="https://data.binance.vision/data/futures/um"
 BACKTEST_END=os.getenv("BACKTEST_END","").strip()
 TRAIN_FRAC=.50; VALID_FRAC=.20; OOS_FRAC=.30
@@ -147,28 +147,47 @@ def pivots(df,p=PIVOT):
 def last_before(flag,idx):
     q=np.flatnonzero(flag[:max(0,idx-PIVOT+1)])
     return int(q[-1]) if len(q) else None
+
+def confirmed_last_arrays(flag,p=PIVOT):
+    # last confirmed pivot available at each CLOSED candle. A pivot at k is only
+    # usable from k+p onward. This is causal and removes repeated flatnonzero scans.
+    n=len(flag); out=np.full(n,-1,dtype=np.int32); prev=-1
+    for i in range(n):
+        k=i-p
+        if k>=0 and flag[k]: prev=k
+        out[i]=prev
+    return out
+
+def confirmed_second_arrays(flag,p=PIVOT):
+    n=len(flag); out=np.full(n,-1,dtype=np.int32); last=-1; second=-1
+    for i in range(n):
+        k=i-p
+        if k>=0 and flag[k]: second,last=last,k
+        out[i]=second
+    return out
 def htf_map(htf,times): return np.searchsorted(htf.close_time.astype('int64').to_numpy(),times.astype('int64').to_numpy(),side='right')-1
-def trend(ex,ph,pl,i):
-    hs=np.flatnonzero(ph[:i+1]); ls=np.flatnonzero(pl[:i+1]); hs=hs[hs+PIVOT<=i]; ls=ls[ls+PIVOT<=i]
-    if len(hs)<2 or len(ls)<2:return False,False
-    h1,h2=hs[-1],hs[-2]; l1,l2=ls[-1],ls[-2]
-    return bool(ex.high.iloc[h1]<ex.high.iloc[h2] and ex.low.iloc[l1]<ex.low.iloc[l2]), bool(ex.high.iloc[h1]>ex.high.iloc[h2] and ex.low.iloc[l1]>ex.low.iloc[l2])
+def trend_from_arrays(ex,lp_h,sp_h,lp_l,sp_l,i):
+    h1,h2,l1,l2=int(lp_h[i]),int(sp_h[i]),int(lp_l[i]),int(sp_l[i])
+    if min(h1,h2,l1,l2)<0:return False,False
+    down=ex.high.iloc[h1]<ex.high.iloc[h2] and ex.low.iloc[l1]<ex.low.iloc[l2]
+    up=ex.high.iloc[h1]>ex.high.iloc[h2] and ex.low.iloc[l1]>ex.low.iloc[l2]
+    return bool(down),bool(up)
 def htf_context(htf):
     ph,pl=pivots(htf); out=htf.copy(); out['ph']=ph; out['pl']=pl; return out
 
-def find_choch(ex,ph,pl,reaction,zone_low,zone_high,direction,strong=False):
+def find_choch(ex,ph,pl,reaction,zone_low,zone_high,direction,strong=False,lp_h=None,lp_l=None):
     body_thr=MIN_CHOCH_BODY_STRONG if strong else MIN_CHOCH_BODY_BASE; ext_thr=MIN_CHOCH_EXT_STRONG if strong else MIN_CHOCH_EXT_BASE
     for c in range(reaction+1,min(len(ex)-2,reaction+MAX_CHOCH_WAIT)):
         if direction=='LONG':
-            q=np.flatnonzero(ph[:c+1]); q=q[q+PIVOT<=c]
-            if not len(q): continue
-            level=float(ex.high.iloc[q[-1]])
+            q=int(lp_h[c]) if lp_h is not None else last_before(ph,c+1)
+            if q<0: continue
+            level=float(ex.high.iloc[q])
             if ex.low.iloc[c] < zone_low*(1-.0035): return None
             body=abs(float(ex.close.iloc[c])-float(ex.open.iloc[c]))/max(float(ex.atr.iloc[c]),1e-12)
             ext=(float(ex.close.iloc[c])-level)/max(float(ex.atr.iloc[c]),1e-12)
             if ex.close.iloc[c]>level and body>=body_thr and ext>=ext_thr:
                 if strong:
-                    mids=np.flatnonzero(pl[reaction+1:c]); mids=mids[mids+reaction+1+PIVOT<=c]
+                    mids=np.flatnonzero(pl[reaction+1:max(reaction+1,c-PIVOT+1)])
                     # At least one confirmed valley between reaction and CHOCH.
                     if not len(mids): continue
                 return c,body,ext
@@ -181,7 +200,7 @@ def find_choch(ex,ph,pl,reaction,zone_low,zone_high,direction,strong=False):
             ext=(level-float(ex.close.iloc[c]))/max(float(ex.atr.iloc[c]),1e-12)
             if ex.close.iloc[c]<level and body>=body_thr and ext>=ext_thr:
                 if strong:
-                    mids=np.flatnonzero(ph[reaction+1:c]); mids=mids[mids+reaction+1+PIVOT<=c]
+                    mids=np.flatnonzero(ph[reaction+1:max(reaction+1,c-PIVOT+1)])
                     if not len(mids): continue
                 return c,body,ext
     return None
@@ -228,63 +247,94 @@ def ifc_after_ob(ex,ob,entry,direction):
         if direction=='SHORT' and ex.high.iloc[i+1]<ex.low.iloc[i-1]: return 1
     return 0
 
-def make_variant(symbol,ex,htf,variant):
-    ex=ex.copy(); ex['atr']=atr(ex); ph,pl=pivots(ex); h=htf_context(htf); hm=htf_map(h,ex.open_time); out=[]
-    strong=variant=='D_STRONG_CHOCH'
+def build_structures(ex,htf,strong=False):
+    """Build each causal structural sequence once. Variants reuse these events."""
+    ex=ex.copy(); ex['atr']=atr(ex); ph,pl=pivots(ex)
+    lp_h=confirmed_last_arrays(ph); sp_h=confirmed_second_arrays(ph)
+    lp_l=confirmed_last_arrays(pl); sp_l=confirmed_second_arrays(pl)
+    h=htf_context(htf); hm=htf_map(h,ex.open_time)
+    hph=h.ph.to_numpy(bool); hpl=h.pl.to_numpy(bool)
+    hlast_ph=confirmed_last_arrays(hph); hlast_pl=confirmed_last_arrays(hpl)
+    out=[]; seen=set()
     for i in range(40,len(ex)-2):
-        if not np.isfinite(ex.atr.iloc[i]) or ex.atr.iloc[i]<=0:continue
-        down,up=trend(ex,ph,pl,i); hidx=int(hm[i])
-        if hidx<0:continue
+        if not np.isfinite(ex.atr.iloc[i]) or ex.atr.iloc[i]<=0: continue
+        down,up=trend_from_arrays(ex,lp_h,sp_h,lp_l,sp_l,i); hidx=int(hm[i])
+        if hidx<0: continue
         for direction,active in [('LONG',down),('SHORT',up)]:
-            if not active:continue
-            flags=h.pl.to_numpy(bool) if direction=='LONG' else h.ph.to_numpy(bool)
-            zq=np.flatnonzero(flags[:hidx+1]); zq=zq[zq+PIVOT<=hidx]
-            if not len(zq):continue
-            z=int(zq[-1])
+            if not active: continue
+            z=int(hlast_pl[hidx] if direction=='LONG' else hlast_ph[hidx])
+            if z<0: continue
             if direction=='LONG': zl=float(h.low.iloc[z]); zh=float(max(h.open.iloc[z],h.close.iloc[z]))
             else: zl=float(min(h.open.iloc[z],h.close.iloc[z])); zh=float(h.high.iloc[z])
             reaction=None
-            for r in range(i,min(len(ex),i+MAX_REACTION_WAIT)):
-                if ex.low.iloc[r]<=zh and ex.high.iloc[r]>=zl: reaction=r;break
-            if reaction is None or reaction<=i:continue
-            ch=find_choch(ex,ph,pl,reaction,zl,zh,direction,strong)
-            if ch is None:continue
+            hi=min(len(ex),i+MAX_REACTION_WAIT)
+            hits=np.flatnonzero((ex.low.iloc[i:hi].to_numpy()<=zh)&(ex.high.iloc[i:hi].to_numpy()>=zl))
+            if len(hits): reaction=i+int(hits[0])
+            if reaction is None or reaction<=i: continue
+            key=(direction,z,reaction)
+            if key in seen: continue
+            ch=find_choch(ex,ph,pl,reaction,zl,zh,direction,strong,lp_h,lp_l)
+            if ch is None: continue
             choch,body,ext=ch
             obx=ob_info(ex,pl,ph,reaction,choch,direction)
-            if not obx:continue
+            if not obx: continue
             ob,obl,obh,sl=obx
             liq=liquidity(ex,ph,pl,choch,ob,direction)
-            if not liq:continue
+            if not liq: continue
             l1,l2,level=liq
-            sw=sweep(ex,l2,level,direction)
-            # Variant A/B allow the diagnostic to isolate whether explicit sweep
-            # sequencing is the issue; C/D require it.
-            if variant in ('C_SWEEP_THEN_OB','D_STRONG_CHOCH') and sw is None:continue
-            sweep_idx,pen=(sw if sw else (l2,0.0))
-            start=sweep_idx+1 if sw else l2+1
-            sig=None
-            for r in range(start,min(len(ex)-1,start+MAX_POST_SWEEP_WAIT)):
-                touched=ex.low.iloc[r]<=obh and ex.high.iloc[r]>=obl
-                if not touched:continue
-                if variant=='B_OB_CONFIRM' or variant in ('C_SWEEP_THEN_OB','D_STRONG_CHOCH'):
-                    rng=max(float(ex.high.iloc[r]-ex.low.iloc[r]),1e-12); cl=(float(ex.close.iloc[r])-float(ex.low.iloc[r]))/rng
-                    rb=abs(float(ex.close.iloc[r])-float(ex.open.iloc[r]))/max(float(ex.atr.iloc[r]),1e-12)
-                    ok=(float(ex.close.iloc[r])>float(ex.open.iloc[r]) and cl>=.55 and rb>=MIN_OB_REACTION_BODY_ATR) if direction=='LONG' else (float(ex.close.iloc[r])<float(ex.open.iloc[r]) and cl<=.45 and rb>=MIN_OB_REACTION_BODY_ATR)
-                    if not ok:continue
-                sig=r;break
-            if sig is None:continue
-            entry_idx=sig+1; entry=float(ex.open.iloc[entry_idx])*(1+SLIPPAGE if direction=='LONG' else 1-SLIPPAGE)
-            risk=(entry-sl) if direction=='LONG' else (sl-entry)
-            if risk<=0 or risk/entry<MIN_RISK or risk/entry>MAX_RISK:continue
-            st=structural(ex,ph,pl,choch,entry_idx,direction)
-            if not st:continue
-            tid,target=st; room=(target-entry)/risk if direction=='LONG' else (entry-target)/risk
-            if room<RR:continue
-            tp=entry+RR*risk if direction=='LONG' else entry-RR*risk
-            rng=max(float(ex.high.iloc[sig]-ex.low.iloc[sig]),1e-12); cl=(float(ex.close.iloc[sig])-float(ex.low.iloc[sig]))/rng; rb=abs(float(ex.close.iloc[sig])-float(ex.open.iloc[sig]))/max(float(ex.atr.iloc[sig]),1e-12)
-            c=Candidate(variant,symbol,direction,sig,entry_idx,z,reaction,choch,ob,l1,l2,sweep_idx,tid,target,entry,sl,tp,risk,body,ext,pen,room,ifc_after_ob(ex,ob,entry_idx,direction),rb,cl)
-            audit_candidate(c);out.append(c)
-    uniq={(c.symbol,c.direction,c.entry_idx):c for c in out}; return sorted(uniq.values(),key=lambda c:c.entry_idx)
+            seen.add(key)
+            out.append(dict(direction=direction,htf_zone_idx=z,reaction_idx=reaction,choch_idx=choch,ob_idx=ob,
+                            ob_low=obl,ob_high=obh,sl=sl,liq_idx1=l1,liq_idx2=l2,liq_level=level,
+                            choch_body_atr=float(body),choch_ext_atr=float(ext)))
+    return ex,ph,pl,h,hm,out
+
+def make_variant_from_structures(ex,ph,pl,structures,variant):
+    out=[]
+    for st in structures:
+        direction=st['direction']; ob=st['ob_idx']; obl=st['ob_low']; obh=st['ob_high']; sl=st['sl']
+        l1,l2,level=st['liq_idx1'],st['liq_idx2'],st['liq_level']
+        sw=sweep(ex,l2,level,direction)
+        if variant in ('C_SWEEP_THEN_OB','D_STRONG_CHOCH') and sw is None: continue
+        sweep_idx,pen=(sw if sw else (l2,0.0))
+        start=sweep_idx+1 if sw else l2+1
+        sig=None; rb=0.; cl=.5
+        stop=min(len(ex)-1,start+MAX_POST_SWEEP_WAIT)
+        for r in range(start,stop):
+            if ex.low.iloc[r]>obh or ex.high.iloc[r]<obl: continue
+            rng=max(float(ex.high.iloc[r]-ex.low.iloc[r]),1e-12)
+            cl=(float(ex.close.iloc[r])-float(ex.low.iloc[r]))/rng
+            rb=abs(float(ex.close.iloc[r])-float(ex.open.iloc[r]))/max(float(ex.atr.iloc[r]),1e-12)
+            if variant in ('B_OB_CONFIRM','C_SWEEP_THEN_OB','D_STRONG_CHOCH'):
+                ok=(float(ex.close.iloc[r])>float(ex.open.iloc[r]) and cl>=.55 and rb>=MIN_OB_REACTION_BODY_ATR) if direction=='LONG' else (float(ex.close.iloc[r])<float(ex.open.iloc[r]) and cl<=.45 and rb>=MIN_OB_REACTION_BODY_ATR)
+                if not ok: continue
+            sig=r; break
+        if sig is None: continue
+        entry_idx=sig+1
+        entry=float(ex.open.iloc[entry_idx])*(1+SLIPPAGE if direction=='LONG' else 1-SLIPPAGE)
+        risk=(entry-sl) if direction=='LONG' else (sl-entry)
+        if risk<=0 or risk/entry<MIN_RISK or risk/entry>MAX_RISK: continue
+        starget=structural(ex,ph,pl,st['choch_idx'],entry_idx,direction)
+        if not starget: continue
+        tid,target=starget; room=(target-entry)/risk if direction=='LONG' else (entry-target)/risk
+        if room<RR: continue
+        tp=entry+RR*risk if direction=='LONG' else entry-RR*risk
+        c=Candidate(variant,'',direction,sig,entry_idx,st['htf_zone_idx'],st['reaction_idx'],st['choch_idx'],ob,l1,l2,sweep_idx,tid,target,entry,sl,tp,risk,st['choch_body_atr'],st['choch_ext_atr'],float(pen),float(room),ifc_after_ob(ex,ob,entry_idx,direction),float(rb),float(cl))
+        out.append(c)
+    return sorted(out,key=lambda c:c.entry_idx)
+
+def make_all_variants(symbol,ex,htf):
+    # Base/standard CHOCH structure is built once for A/B/C; strong structure once for D.
+    ex,ph,pl,h,hm,base=build_structures(ex,htf,strong=False)
+    _,_,_,_,_,strong=build_structures(ex,htf,strong=True)
+    result={}
+    for v in ('A_OB_LIMIT','B_OB_CONFIRM','C_SWEEP_THEN_OB'):
+        cs=make_variant_from_structures(ex,ph,pl,base,v)
+        for c in cs: c.symbol=symbol; audit_candidate(c)
+        result[v]=cs
+    cs=make_variant_from_structures(ex,ph,pl,strong,'D_STRONG_CHOCH')
+    for c in cs: c.symbol=symbol; audit_candidate(c)
+    result['D_STRONG_CHOCH']=cs
+    return ex,result
 
 def audit_candidate(c):
     assert c.htf_zone_idx<c.choch_idx<c.entry_idx
@@ -334,8 +384,9 @@ def split(ts,start,end):
 def process(symbol,start,end):
     ex=fetch(symbol,EXEC_TF,start-pd.Timedelta(days=WARMUP_DAYS),end); h=fetch(symbol,HTF_TF,start-pd.Timedelta(days=WARMUP_DAYS+10),end)
     validate(ex,15,symbol,'15m'); validate(h,240,symbol,'4h'); result={}
+    _,allcands=make_all_variants(symbol,ex,h)
     for v in VARIANTS:
-        c=make_variant(symbol,ex,h,v); t,u=simulate(ex,c,symbol,v); audit_trades(t); result[v]=(c,t,u)
+        c=allcands[v]; t,u=simulate(ex,c,symbol,v); audit_trades(t); result[v]=(c,t,u)
     return symbol,result
 
 def print_m(name,ts):
