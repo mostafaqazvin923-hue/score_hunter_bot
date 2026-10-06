@@ -3,7 +3,6 @@ name: Run Setup 5 V5 Diagnostic
 on:
   workflow_dispatch:
 
-auto_cancel: false
 
 jobs:
   backtest:
