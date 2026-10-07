@@ -1,20 +1,20 @@
 {
     "active": {
-        "BTC": {
-            "symbol": "BTC/USDT",
-            "direction": "LONG",
-            "entry_price": 85825.72,
-            "tp": 87949.78535714286,
-            "sl": 84763.68732142857,
-            "time": "2026-10-04 20:00:00"
+        "ETH": {
+            "symbol": "ETH/USDT",
+            "direction": "SHORT",
+            "entry_price": 2657.83,
+            "tp": 2519.2714285714283,
+            "sl": 2727.1092857142858,
+            "time": "2026-10-07 01:00:00"
         },
-        "ADA": {
-            "symbol": "ADA/USDT",
-            "direction": "LONG",
-            "entry_price": 0.2766,
-            "tp": 0.30333928571428576,
-            "sl": 0.26323035714285714,
-            "time": "2026-10-06 09:00:00"
+        "XRP": {
+            "symbol": "XRP/USDT",
+            "direction": "SHORT",
+            "entry_price": 1.4763,
+            "tp": 1.3763499999999997,
+            "sl": 1.526275,
+            "time": "2026-10-07 01:00:00"
         }
     },
     "cooldown": {}
