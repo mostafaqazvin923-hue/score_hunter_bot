@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""HUNTER-X2: portfolio-aware research backtest on real Binance UM futures klines.
+"""HUNTER-X3: portfolio-aware research backtest on real Binance UM futures klines.
 
-Hypothesis: trend-aligned impulse -> controlled pullback -> reclaim/continuation.
+Hypothesis: volatility compression -> range breakout -> retest/hold -> continuation.
 Tests 15m, 1h and 4h using the same 15m source data. Entries are next-bar open.
 No lookahead, no same-symbol re-entry on the exit bar, one position per symbol,
-portfolio margin capacity enforced, fixed notional $5,000 when permitted.
+portfolio margin capacity enforced, notional capped at $5,000, with position size reduced to a 1% equity risk budget.
 Trades whose stop loss plus estimated round-trip fees exceed a conservative $75
 budget are skipped, because $100 isolated margin must not be treated as $400 risk.
 SL/TP same candle: SL first. Gap through stop: exit at worse bar open, plus slippage.
@@ -26,12 +26,12 @@ TEST_DAYS=365; WARMUP_DAYS=90
 INITIAL_CAPITAL=1000.0; MARGIN=100.0; LEVERAGE=50.0; NOTIONAL=MARGIN*LEVERAGE
 RR=2.0; FEE=0.0007; SLIPPAGE=0.0003
 # Do not risk the full isolated margin. Includes a round-trip fee estimate.
-MAX_STOP_LOSS_BUDGET=75.0
-ATR_N=14; EMA_FAST=20; EMA_SLOW=50; EMA_REGIME=200
-PULLBACK_LOOKBACK=5; SWING_LOOKBACK=8; ATR_STOP=1.25
-MIN_STOP_PCT=0.001; MAX_STOP_PCT=MAX_STOP_LOSS_BUDGET/NOTIONAL
-OUT=Path('hunter_x2_results'); OUT.mkdir(exist_ok=True)
-S=requests.Session(); S.headers['User-Agent']='HUNTER-X2-research/1.0'
+RISK_PER_TRADE_PCT=0.01
+ATR_N=14; EMA_FAST=50; EMA_REGIME=200
+SWING_LOOKBACK=8; ATR_STOP=1.2
+MIN_STOP_PCT=0.001; MAX_STOP_PCT=0.025
+OUT=Path('hunter_x3_results'); OUT.mkdir(exist_ok=True)
+S=requests.Session(); S.headers['User-Agent']='HUNTER-X3-research/1.0'
 
 def now(): return datetime.now(timezone.utc)
 def fetch(url,retries=3):
@@ -92,31 +92,44 @@ def indicators(d):
     x=d.copy(); prev=x.close.shift(1)
     tr=pd.concat([x.high-x.low,(x.high-prev).abs(),(x.low-prev).abs()],axis=1).max(axis=1)
     x['atr']=tr.ewm(alpha=1/ATR_N,adjust=False,min_periods=ATR_N).mean()
-    for span,name in [(EMA_FAST,'ema_fast'),(EMA_SLOW,'ema_slow'),(EMA_REGIME,'ema_regime')]:
-        x[name]=x.close.ewm(span=span,adjust=False,min_periods=span).mean()
-    x['prior_high']=x.high.shift(1).rolling(20,min_periods=20).max()
-    x['prior_low']=x.low.shift(1).rolling(20,min_periods=20).min()
+    x['ema_fast']=x.close.ewm(span=EMA_FAST,adjust=False,min_periods=EMA_FAST).mean()
+    x['ema_regime']=x.close.ewm(span=EMA_REGIME,adjust=False,min_periods=EMA_REGIME).mean()
+    # Breakout levels only use candles that had closed before the breakout candle.
+    x['range_high']=x.high.shift(1).rolling(20,min_periods=20).max()
+    x['range_low']=x.low.shift(1).rolling(20,min_periods=20).min()
     x['swing_low']=x.low.shift(1).rolling(SWING_LOOKBACK,min_periods=SWING_LOOKBACK).min()
     x['swing_high']=x.high.shift(1).rolling(SWING_LOOKBACK,min_periods=SWING_LOOKBACK).max()
-    # Pullback happened within recent bars, but today's close reclaims fast EMA.
-    x['recent_low_touch']=(x.low.shift(1)<=x.ema_fast.shift(1)*1.003).rolling(PULLBACK_LOOKBACK,min_periods=PULLBACK_LOOKBACK).max().eq(1)
-    x['recent_high_touch']=(x.high.shift(1)>=x.ema_fast.shift(1)*0.997).rolling(PULLBACK_LOOKBACK,min_periods=PULLBACK_LOOKBACK).max().eq(1)
-    rng=(x.high-x.low).replace(0,np.nan)
-    x['clv']=(x.close-x.low)/rng
-    x['prev_close']=x.close.shift(1)
     x['atr_pct']=x.atr/x.close
+    x['atr_pct_q40']=x.atr_pct.rolling(100,min_periods=60).quantile(0.40)
+    x['vol_median']=x.volume.rolling(20,min_periods=20).median()
+    x['compression_prior']=(x.atr_pct.shift(2) <= x.atr_pct_q40.shift(2))
+    x['prev2_vol_median']=x.vol_median.shift(2)
+    x['clv']=(x.close-x.low)/(x.high-x.low).replace(0,np.nan)
+    x['ema_slope']=x.ema_regime-x.ema_regime.shift(10)
+    for col in ['close','open','high','low','atr','range_high','range_low','volume','vol_median','atr_pct','atr_pct_q40','ema_fast','ema_regime','ema_slope']:
+        x['prev_'+col]=x[col].shift(1)
     return x
 
 def get_signal(r):
-    keys=['atr','ema_fast','ema_slow','ema_regime','swing_low','swing_high','clv','prev_close']
-    if any(pd.isna(r[k]) for k in keys):return None
-    # Avoid weak/flat regime and extremely quiet or chaotic markets.
-    if not 0.001 <= r.atr_pct <= 0.035:return None
-    bullish=r.close>r.ema_regime and r.ema_fast>r.ema_slow and r.ema_slow>r.ema_regime
-    bearish=r.close<r.ema_regime and r.ema_fast<r.ema_slow and r.ema_slow<r.ema_regime
-    if bullish and bool(r.recent_low_touch) and r.close>r.ema_fast and r.close>r.open and r.clv>=0.65 and r.close>r.prev_close:
+    keys=['atr','ema_fast','ema_regime','range_high','range_low','swing_low','swing_high','atr_pct','atr_pct_q40','vol_median','clv','ema_slope']
+    if any(pd.isna(r[k]) for k in keys): return None
+    if not 0.001 <= r.atr_pct <= 0.04: return None
+    # Compression is evaluated before the breakout candle; no current/future data is used.
+    if pd.isna(r.atr_pct_q40): return None
+    # Previous candle must break the prior 20-bar boundary; current candle retests and holds it.
+    # `prev_*` fields are prepared in main indicator frame from the prior completed bar.
+    required=['prev_close','prev_open','prev_high','prev_low','prev_atr','prev_range_high','prev_range_low','prev_volume','prev_vol_median','prev_atr_pct','prev_atr_pct_q40','prev_ema_fast','prev_ema_regime','prev_ema_slope']
+    if any(pd.isna(r[k]) for k in required): return None
+    compressed = bool(r.compression_prior)
+    if not compressed: return None
+    volume_ok = r.prev_volume >= 1.2*r.prev2_vol_median
+    if not volume_ok: return None
+    bull_regime = r.close > r.ema_regime and r.ema_fast > r.ema_regime and r.ema_slope > 0
+    bear_regime = r.close < r.ema_regime and r.ema_fast < r.ema_regime and r.ema_slope < 0
+    long_level=float(r.prev_range_high); short_level=float(r.prev_range_low)
+    if bull_regime and r.prev_close > long_level + 0.15*r.prev_atr and r.low <= long_level + 0.25*r.atr and r.close > long_level and r.close > r.open and r.clv >= 0.60:
         return 'LONG'
-    if bearish and bool(r.recent_high_touch) and r.close<r.ema_fast and r.close<r.open and r.clv<=0.35 and r.close<r.prev_close:
+    if bear_regime and r.prev_close < short_level - 0.15*r.prev_atr and r.high >= short_level - 0.25*r.atr and r.close < short_level and r.close < r.open and r.clv <= 0.40:
         return 'SHORT'
     return None
 
@@ -131,6 +144,7 @@ def simulate(tf,frames,tstart,tend):
     positions={}; trades=[]; balance=INITIAL_CAPITAL; stats={'skipped_margin':0,'skipped_stop_budget':0,'skipped_invalid':0}
     # Signals are evaluated on the just-closed candle; executed at this timestamp's open.
     for ts in all_times:
+        closed_this_bar=set()
         # Existing positions: process this candle's OHLC for stop/target. On gaps, use open if worse.
         for sym in list(positions):
             pos=positions[sym]; d=frames[sym]; j=ixmaps[sym].get(ts)
@@ -153,11 +167,12 @@ def simulate(tf,frames,tstart,tend):
             balance+=net
             trades.append({**{k:pos[k] for k in ['timeframe','symbol','side','signal_time','entry_time','entry','stop','target','qty','risk_budget_est']},'exit_time':ts.isoformat(),'exit_price':xp,'exit_reason':reason,'gross_pnl':gross,'fees':fees,'net_pnl':net,'bars_held':j-pos['entry_index']+1,'balance_after_close':balance})
             del positions[sym]
+            closed_this_bar.add(sym)
         # Candidate signals from prior closed candle for each symbol at this bar's open.
         candidates=[]
         for sym,d in frames.items():
             j=ixmaps[sym].get(ts)
-            if j is None or sym in positions or j<1:continue
+            if j is None or sym in positions or sym in closed_this_bar or j<1:continue
             prev=d.iloc[j-1]
             if d.index[j-1]>=tend or d.index[j-1]<tstart:continue
             side=get_signal(prev)
@@ -165,24 +180,23 @@ def simulate(tf,frames,tstart,tend):
         # Deterministic ordering avoids look-ahead; symbols sorted alphabetically for simultaneous signals.
         for sym,d,j,r,side in sorted(candidates,key=lambda z:z[0]):
             if sym in positions:continue
-            used_margin=len(positions)*MARGIN
-            reserved_risk=sum(float(p['risk_budget_est']) for p in positions.values())
-            # Reserve both required margin and a conservative loss budget for every open position.
-            if balance-used_margin-reserved_risk < MARGIN + MAX_STOP_LOSS_BUDGET:
-                stats['skipped_margin']+=1;continue
             raw_open=float(d.open.iloc[j]); entry=slip_entry(raw_open,side); atr=float(r.atr)
             if side=='LONG':
-                stop=min(float(r.swing_low),entry-ATR_STOP*atr); risk=entry-stop; target=entry+RR*risk
+                stop=min(float(r.swing_low),float(r.low),entry-ATR_STOP*atr); risk=entry-stop; target=entry+RR*risk
             else:
-                stop=max(float(r.swing_high),entry+ATR_STOP*atr); risk=stop-entry; target=entry-RR*risk
+                stop=max(float(r.swing_high),float(r.high),entry+ATR_STOP*atr); risk=stop-entry; target=entry-RR*risk
             if risk<=0 or not MIN_STOP_PCT<=risk/entry<=MAX_STOP_PCT:
                 stats['skipped_invalid']+=1;continue
-            qty=NOTIONAL/entry
-            # Conservative loss estimate includes stop slippage and round-trip fees.
-            estimated=qty*risk + FEE*qty*(entry+stop) + NOTIONAL*SLIPPAGE*2
-            if estimated>MAX_STOP_LOSS_BUDGET:
-                stats['skipped_stop_budget']+=1;continue
-            positions[sym]={'timeframe':tf,'symbol':sym,'side':side,'signal_time':d.index[j-1].isoformat(),'entry_time':ts,'entry_index':j,'entry':entry,'stop':stop,'target':target,'qty':qty,'risk_budget_est':estimated}
+            risk_cash=max(1.0, balance*RISK_PER_TRADE_PCT)
+            cost_per_unit=risk + FEE*(entry+stop) + 2*SLIPPAGE*entry
+            qty=min(NOTIONAL/entry, risk_cash/max(cost_per_unit, 1e-12))
+            estimated=qty*cost_per_unit
+            margin_used=qty*entry/LEVERAGE
+            used_margin=sum(float(p['margin_used']) for p in positions.values())
+            reserved_risk=sum(float(p['risk_budget_est']) for p in positions.values())
+            if used_margin+margin_used > min(balance, len(SYMBOLS)*MARGIN) or balance-used_margin-reserved_risk < margin_used+estimated:
+                stats['skipped_margin']+=1;continue
+            positions[sym]={'timeframe':tf,'symbol':sym,'side':side,'signal_time':d.index[j-1].isoformat(),'entry_time':ts,'entry_index':j,'entry':entry,'stop':stop,'target':target,'qty':qty,'risk_budget_est':estimated,'margin_used':margin_used}
             # Entry occurs at this candle's open, so this candle's high/low must be checked.
             # Never postpone first-bar SL/TP evaluation until the next candle.
             bar=d.iloc[j]
@@ -204,6 +218,7 @@ def simulate(tf,frames,tstart,tend):
                 xp=slip_exit(float(raw),side); direction=1 if side=='LONG' else -1
                 gross=direction*(xp-entry)*qty; fees=FEE*qty*(entry+xp); net=gross-fees; balance+=net
                 pos=positions.pop(sym)
+                closed_this_bar.add(sym)
                 trades.append({**{k:pos[k] for k in ['timeframe','symbol','side','signal_time','entry_time','entry','stop','target','qty','risk_budget_est']},'exit_time':ts.isoformat(),'exit_price':xp,'exit_reason':reason,'gross_pnl':gross,'fees':fees,'net_pnl':net,'bars_held':1,'balance_after_close':balance})
     # Mark remaining open positions at final available close, explicitly; apply exit slip and fees.
     for sym,pos in list(positions.items()):
@@ -226,7 +241,7 @@ def summarize(tf,trades,stats):
 
 def main():
     end=now().replace(minute=0,second=0,microsecond=0); start=end-timedelta(days=TEST_DAYS+WARMUP_DAYS); tstart=pd.Timestamp(end-timedelta(days=TEST_DAYS)); tend=pd.Timestamp(end)
-    print(f'HUNTER-X2 test={tstart} -> {tend}; capital=${INITIAL_CAPITAL}; margin/trade=${MARGIN}; leverage={LEVERAGE}x; notional=${NOTIONAL}; RR=1:2')
+    print(f'HUNTER-X3 test={tstart} -> {tend}; capital=${INITIAL_CAPITAL}; max_margin/trade=${MARGIN}; max_leverage={LEVERAGE}x; max_notional=${NOTIONAL}; risk/trade={RISK_PER_TRADE_PCT:.1%} equity; RR=1:2')
     base={}
     for n,sym in enumerate(SYMBOLS,1):
         d=download(sym,start,end)
