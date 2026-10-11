@@ -1,18 +1,17 @@
-name: HUNTER-X2 Backtest
+name: HUNTER-X3 Backtest
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - "backtest_hunter_x2.py"
-      - "requirements_hunter_x2.txt"
-      - ".github/workflows/hunter_x2_backtest.yml"
+      - "backtest_hunter_x3.py"
+      - ".github/workflows/hunter_x3_backtest.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: hunter-x2-backtest
+  group: hunter-x3-backtest
   cancel-in-progress: false
 
 jobs:
@@ -28,17 +27,17 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: python -m pip install --upgrade pip numpy pandas requests
-      - name: Validate required source file
-        run: test -f backtest_hunter_x2.py
+      - name: Validate source file
+        run: test -f backtest_hunter_x3.py
       - name: Validate syntax
-        run: python -m py_compile backtest_hunter_x2.py
+        run: python -m py_compile backtest_hunter_x3.py
       - name: Run backtest
-        run: python -u backtest_hunter_x2.py
+        run: python -u backtest_hunter_x3.py
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hunter-x2-results-${{ github.run_number }}
-          path: hunter_x2_results/
+          name: hunter-x3-results-${{ github.run_number }}
+          path: hunter_x3_results/
           if-no-files-found: warn
           retention-days: 30
