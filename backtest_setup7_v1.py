@@ -15,6 +15,7 @@ IMPORTANT:
 - A 4H candle becomes usable only after it closes.
 - A 15m pivot becomes usable only after PIVOT confirmation candles have closed.
 - Entry is never on the same candle that reveals the setup/confirmation.
+- SL/TP checks begin on the candle AFTER entry; no same-candle entry/exit assumptions.
 - Per-symbol overlap lock: max one open trade per symbol; different symbols may overlap.
 - No timeout, breakeven, trailing stop, or same-candle re-entry.
 - Fixed RR = 1:2.
@@ -949,10 +950,13 @@ def backtest_symbol(symbol: str, exec_df: pd.DataFrame, htf_df: pd.DataFrame) ->
 
         side = pending["side"]
         ob_low, ob_high = pending["ob_low"], pending["ob_high"]
-        # Resting limit order is active only after CHOCH candle closes. Fill at the OB edge
-        # when a later candle touches it; entry candle is then evaluated for SL/TP conservatively.
+        # Resting limit order is active only after CHOCH/target confirmation.
+        # Fill at the OB edge when this later candle touches it. Because OHLC cannot
+        # establish intrabar order, NEVER evaluate SL/TP on the entry candle; begin
+        # exit checks on the next candle (project integrity rule).
         if side == "SHORT":
-            if row.high < ob_low:
+            # A valid retest requires actual OHLC intersection with the OB zone.
+            if row.high < ob_low or row.low > ob_high:
                 continue
             entry = apply_entry_slippage(ob_low, side)
             stop = ob_high
@@ -963,7 +967,8 @@ def backtest_symbol(symbol: str, exec_df: pd.DataFrame, htf_df: pd.DataFrame) ->
                 pending = None; continue
             target = target_2r
         else:
-            if row.low > ob_high:
+            # A valid retest requires actual OHLC intersection with the OB zone.
+            if row.low > ob_high or row.high < ob_low:
                 continue
             entry = apply_entry_slippage(ob_high, side)
             stop = ob_low
@@ -979,7 +984,7 @@ def backtest_symbol(symbol: str, exec_df: pd.DataFrame, htf_df: pd.DataFrame) ->
             pending = None; continue
 
         exit_idx = None; exit_raw = None; outcome = None
-        for j in range(i, n):
+        for j in range(i + 1, n):
             hi = float(ex.iloc[j].high); lo = float(ex.iloc[j].low)
             hit_sl = hi >= stop if side == "SHORT" else lo <= stop
             hit_tp = lo <= target if side == "SHORT" else hi >= target
