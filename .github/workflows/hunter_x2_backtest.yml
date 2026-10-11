@@ -1,0 +1,42 @@
+name: HUNTER-X2 Backtest
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "backtest_hunter_x2.py"
+      - "requirements_hunter_x2.txt"
+      - ".github/workflows/hunter_x2_backtest.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hunter-x2-backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -r requirements_hunter_x2.txt
+      - name: Validate syntax
+        run: python -m py_compile backtest_hunter_x2.py
+      - name: Run backtest
+        run: python -u backtest_hunter_x2.py
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hunter-x2-results-${{ github.run_number }}
+          path: hunter_x2_results/
+          if-no-files-found: warn
+          retention-days: 30
