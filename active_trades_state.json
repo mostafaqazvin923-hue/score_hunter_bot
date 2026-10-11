@@ -1,13 +1,4 @@
 {
-    "active": {
-        "BTC": {
-            "symbol": "BTC/USDT",
-            "direction": "SHORT",
-            "entry_price": 80937.3,
-            "tp": 75475.35964285715,
-            "sl": 83668.27017857143,
-            "time": "2026-10-08 16:00:00"
-        }
-    },
+    "active": {},
     "cooldown": {}
 }
