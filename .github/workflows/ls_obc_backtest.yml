@@ -1,0 +1,51 @@
+name: LS-OBC Backtest
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'backtest_ls_obc_v1.py'
+      - '.github/workflows/ls_obc_backtest.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip pandas numpy requests
+
+      - name: Syntax check
+        run: python -m py_compile backtest_ls_obc_v1.py
+
+      - name: Run LS-OBC backtest
+        env:
+          TEST_YEARS: '3'
+          INITIAL_CAPITAL: '1000'
+          MARGIN_PER_TRADE: '100'
+          LEVERAGE: '50'
+          MAX_TRADE_LOSS_USD: '75'
+        run: python backtest_ls_obc_v1.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ls-obc-results
+          path: |
+            ls_obc_results/
+            market_cache_ls_obc/
+          if-no-files-found: warn
+          retention-days: 30
