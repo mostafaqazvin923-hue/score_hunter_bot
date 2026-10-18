@@ -48,14 +48,6 @@
             "sl": 12.406500000000001,
             "time": "2026-10-17 12:00:00"
         },
-        "BTC": {
-            "symbol": "BTC/USDT",
-            "direction": "SHORT",
-            "entry_price": 81354.03,
-            "tp": 80457.58964285711,
-            "sl": 81802.25017857144,
-            "time": "2026-10-17 15:00:00"
-        },
         "AVAX": {
             "symbol": "AVAX/USDT",
             "direction": "SHORT",
