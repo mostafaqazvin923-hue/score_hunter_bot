@@ -40,14 +40,6 @@
             "sl": 0.22683928571428572,
             "time": "2026-10-17 12:00:00"
         },
-        "LINK": {
-            "symbol": "LINK/USDT",
-            "direction": "SHORT",
-            "entry_price": 12.047,
-            "tp": 11.328,
-            "sl": 12.406500000000001,
-            "time": "2026-10-17 12:00:00"
-        },
         "AVAX": {
             "symbol": "AVAX/USDT",
             "direction": "SHORT",
