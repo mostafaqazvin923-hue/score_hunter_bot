@@ -31,8 +31,8 @@ def get(path, params, retries=5):
 
 
 def month_starts(start_ms, end_ms):
-    start = pd.to_datetime(start_ms, unit='ms', utc=True).to_period('M')
-    end = pd.to_datetime(end_ms, unit='ms', utc=True).to_period('M')
+    start = pd.to_datetime(start_ms, unit='ms', utc=True).tz_localize(None).to_period('M')
+    end = pd.to_datetime(end_ms, unit='ms', utc=True).tz_localize(None).to_period('M')
     return list(pd.period_range(start, end, freq='M'))
 
 def archive_csv(url):
@@ -57,9 +57,17 @@ def klines_from_rows(rows):
     d = pd.DataFrame(rows)
     if d.shape[1] < 7:
         raise RuntimeError(f'Unexpected kline CSV/API columns: {d.shape[1]}')
+
+    # Some archive CSVs include a header row (or a header repeated in a
+    # concatenated monthly dataset). Remove non-numeric timestamp rows before
+    # converting prices/timestamps. Never treat 'open_time' as a candle.
+    d = d[pd.to_numeric(d.iloc[:, 0], errors='coerce').notna()].copy()
+    if d.empty:
+        raise RuntimeError('Kline dataset contains no numeric open timestamps')
     d = d.iloc[:, :12] if d.shape[1] >= 12 else d
     d = d.rename(columns={0:'open_ms',1:'open',2:'high',3:'low',4:'close',5:'volume',6:'close_ms'})
-    d = d.drop_duplicates('open_ms').sort_values('open_ms')
+    d['open_ms'] = pd.to_numeric(d['open_ms'], errors='coerce')
+    d = d.dropna(subset=['open_ms']).drop_duplicates('open_ms').sort_values('open_ms')
     for c in ['open','high','low','close','volume']:
         d[c] = pd.to_numeric(d[c], errors='coerce')
     d['open_time'] = pd.to_datetime(pd.to_numeric(d.open_ms), unit='ms', utc=True)
