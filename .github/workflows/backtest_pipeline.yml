@@ -1,0 +1,33 @@
+name: FRD-MR Strategy Pipeline
+
+on:
+  workflow_dispatch:  # امکان اجرای دستی از طریق پنل گیت‌هاب
+  schedule:
+    - cron: '0 0 * * 1' # اجرا به صورت هفتگی (اختیاری)
+
+jobs:
+  run-backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install Dependencies
+      run: |
+        python -m Василь pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run Data Fetching and Validation
+      run: |
+        python fetch_data.py
+
+    - name: Check Data Cache Output
+      run: |
+        echo "بررسی وجود فایل‌های داده در پوشه کش..."
+        ls -la data_cache/
