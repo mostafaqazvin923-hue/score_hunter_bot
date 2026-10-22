@@ -24,7 +24,6 @@ def load_symbol_data(symbol):
         return None
         
     df_c = pd.read_csv(ohlcv_path)
-    # استفاده از format='mixed' برای مدیریت امن انواع فرمت‌های تاریخ و زمان
     df_c['timestamp'] = pd.to_datetime(df_c['timestamp'], format='mixed', utc=True)
     
     df_f = pd.read_csv(fr_path)
@@ -42,12 +41,12 @@ def run_backtest_for_symbol(df, symbol):
     active_trade = None
     last_exit_idx = -999
     
-    window = 168
-    df['fr_mean'] = df['fundingRate'].rolling(window=window, min_periods=24).mean()
-    df['fr_std'] = df['fundingRate'].rolling(window=window, min_periods=24).std()
+    window = 72
+    df['fr_mean'] = df['fundingRate'].rolling(window=window, min_periods=12).mean()
+    df['fr_std'] = df['fundingRate'].rolling(window=window, min_periods=12).std()
     df['fr_zscore'] = (df['fundingRate'] - df['fr_mean']) / (df['fr_std'] + 1e-8)
     
-    for i in range(window + 10, len(df) - 1):
+    for i in range(window + 5, len(df) - 1):
         current_time = df.loc[i, 'timestamp']
         
         if active_trade is not None:
@@ -76,7 +75,7 @@ def run_backtest_for_symbol(df, symbol):
                     hit_sl = True
                 elif low_val <= active_trade['tp']:
                     exit_price = active_trade['tp']
-                    hit_tp = True
+                    hit_sl = True
                 elif high_val >= active_trade['sl']:
                     exit_price = active_trade['sl']
                     hit_sl = True
@@ -110,11 +109,11 @@ def run_backtest_for_symbol(df, symbol):
             
         z_prev = df.loc[i-1, 'fr_zscore']
         fr_curr = df.loc[i, 'fundingRate']
-        fr_prev = df.loc[i-1, 'fundingRate']
+        fr_prev = df.loc[i-1, 'fr_mean']
         
-        if z_prev >= 2.5 and 0 < fr_curr < fr_prev:
+        if z_prev >= 1.4 and fr_curr < fr_prev:
             entry_price = df.loc[i+1, 'open'] * (1.0 + SLIPPAGE_RATE)
-            sl = df.loc[i-9:i, 'high'].max() * 1.002
+            sl = df.loc[i-5:i, 'high'].max() * 1.002
             risk = sl - entry_price
             if risk <= 0:
                 continue
@@ -132,9 +131,9 @@ def run_backtest_for_symbol(df, symbol):
                 'tp': tp
             }
             
-        elif z_prev <= -2.5 and fr_prev < fr_curr < 0:
+        elif z_prev <= -1.4 and fr_curr > fr_prev:
             entry_price = df.loc[i+1, 'open'] * (1.0 - SLIPPAGE_RATE)
-            sl = df.loc[i-9:i, 'low'].min() * 0.998
+            sl = df.loc[i-5:i, 'low'].min() * 0.998
             risk = entry_price - sl
             if risk <= 0:
                 continue
@@ -178,10 +177,17 @@ def main():
     win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
     net_profit = df_trades['net_pnl'].sum()
     
-    df_trades['loss'] = ~df_trades['win']
-    df_trades['streak'] = df_trades['loss'].groupby((~df_trades['loss']).cumsum()).cumsum()
-    max_losing_streak = df_trades['streak'].max()
-    
+    # محاسبه دقیق حداکثر ضرر متوالی (Max Losing Streak) با حلقه ایمن
+    max_losing_streak = 0
+    current_streak = 0
+    for win_status in df_trades['win']:
+        if not win_status:
+            current_streak += 1
+            if current_streak > max_losing_streak:
+                max_losing_streak = current_streak
+        else:
+            current_streak = 0
+            
     print("\n" + "="*50)
     print("گزارش نتایج نهایی بک‌تست Out-of-Sample (OOS)")
     print("="*50)
