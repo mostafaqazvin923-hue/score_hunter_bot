@@ -1,3 +1,5 @@
-pandas
-numpy
-requests
+requests>=2.31.0
+pandas>=2.2.0
+numpy>=1.26.4
+ccxt>=4.2.25
+
