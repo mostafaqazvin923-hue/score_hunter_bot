@@ -34,6 +34,15 @@ def load_symbol_data(symbol):
                        on='timestamp', 
                        direction='backward')
     df['fundingRate'] = df['fundingRate'].fillna(0.0)
+    
+    # محاسبه ATR برای تعیین حد ضرر پویا و مقاوم در برابر نویز
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    df['atr'] = true_range.rolling(14).mean()
+    
     return df
 
 def run_backtest_for_symbol(df, symbol):
@@ -41,12 +50,12 @@ def run_backtest_for_symbol(df, symbol):
     active_trade = None
     last_exit_idx = -999
     
-    window = 72
-    df['fr_mean'] = df['fundingRate'].rolling(window=window, min_periods=12).mean()
-    df['fr_std'] = df['fundingRate'].rolling(window=window, min_periods=12).std()
+    window = 96  # ۴ روزه برای پایداری بهتر سیگنال‌ها
+    df['fr_mean'] = df['fundingRate'].rolling(window=window, min_periods=24).mean()
+    df['fr_std'] = df['fundingRate'].rolling(window=window, min_periods=24).std()
     df['fr_zscore'] = (df['fundingRate'] - df['fr_mean']) / (df['fr_std'] + 1e-8)
     
-    for i in range(window + 5, len(df) - 1):
+    for i in range(window + 15, len(df) - 1):
         current_time = df.loc[i, 'timestamp']
         
         if active_trade is not None:
@@ -75,7 +84,7 @@ def run_backtest_for_symbol(df, symbol):
                     hit_sl = True
                 elif low_val <= active_trade['tp']:
                     exit_price = active_trade['tp']
-                    hit_sl = True
+                    hit_tp = True
                 elif high_val >= active_trade['sl']:
                     exit_price = active_trade['sl']
                     hit_sl = True
@@ -109,15 +118,17 @@ def run_backtest_for_symbol(df, symbol):
             
         z_prev = df.loc[i-1, 'fr_zscore']
         fr_curr = df.loc[i, 'fundingRate']
-        fr_prev = df.loc[i-1, 'fr_mean']
+        fr_prev = df.loc[i-1, 'fundingRate']
+        current_atr = df.loc[i, 'atr']
         
-        if z_prev >= 1.4 and fr_curr < fr_prev:
+        if pd.isna(current_atr) or current_atr <= 0:
+            continue
+            
+        # سیگنال SHORT: فاندینگ بالای ۱.۸ انحراف معیار و شروع به کاهش
+        if z_prev >= 1.8 and fr_curr < fr_prev:
             entry_price = df.loc[i+1, 'open'] * (1.0 + SLIPPAGE_RATE)
-            sl = df.loc[i-5:i, 'high'].max() * 1.002
-            risk = sl - entry_price
-            if risk <= 0:
-                continue
-            tp = entry_price - (2.0 * risk)
+            sl = entry_price + (2.0 * current_atr)  # حد ضرر مبتنی بر ATR (مقاوم در برابر وپک)
+            tp = entry_price - (4.0 * current_atr)  # نسبت دقیق ۱ به ۲
             
             liq_price = entry_price * (1.0 + (1.0 / LEVERAGE) * 0.95)
             if sl >= liq_price:
@@ -131,13 +142,11 @@ def run_backtest_for_symbol(df, symbol):
                 'tp': tp
             }
             
-        elif z_prev <= -1.4 and fr_curr > fr_prev:
+        # سیگنال LONG: فاندینگ زیر منفی ۱.۸ انحراف معیار و شروع به افزایش
+        elif z_prev <= -1.8 and fr_curr > fr_prev:
             entry_price = df.loc[i+1, 'open'] * (1.0 - SLIPPAGE_RATE)
-            sl = df.loc[i-5:i, 'low'].min() * 0.998
-            risk = entry_price - sl
-            if risk <= 0:
-                continue
-            tp = entry_price + (2.0 * risk)
+            sl = entry_price - (2.0 * current_atr)
+            tp = entry_price + (4.0 * current_atr)  # نسبت دقیق ۱ به ۲
             
             liq_price = entry_price * (1.0 - (1.0 / LEVERAGE) * 0.95)
             if sl <= liq_price:
@@ -177,7 +186,6 @@ def main():
     win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
     net_profit = df_trades['net_pnl'].sum()
     
-    # محاسبه دقیق حداکثر ضرر متوالی (Max Losing Streak) با حلقه ایمن
     max_losing_streak = 0
     current_streak = 0
     for win_status in df_trades['win']:
