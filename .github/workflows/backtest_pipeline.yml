@@ -1,7 +1,7 @@
 name: FRD-MR Strategy Pipeline
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # امکان اجرای دستی از طریق پنل گیت‌هاب
 
 jobs:
   run-backtest:
@@ -28,7 +28,11 @@ jobs:
       run: |
         python fetch_data.py
 
-    - name: Check Data Cache Output
+    - name: Run Strategy Backtest Engine
       run: |
-        echo "بررسی فایل‌های داده کش شده:"
+        python backtest_fred_x1.py
+
+    - name: Check Data Cache and Outputs
+      run: |
+        echo "بررسی پوشه کش و فایل‌های خروجی..."
         ls -la data_cache/
