@@ -1,7 +1,7 @@
 name: FRD-MR Strategy Pipeline
 
 on:
-  workflow_dispatch:  # امکان اجرای دستی از طریق پنل گیت‌هاب
+  workflow_dispatch:
 
 jobs:
   run-backtest:
@@ -24,15 +24,11 @@ jobs:
       run: |
         pip install -r requirements.txt
 
-    - name: Verify Installed Packages
-      run: |
-        python -c "import ccxt; import pandas; import numpy; print('All libraries imported successfully!')"
-
     - name: Run Data Fetching and Validation
       run: |
         python fetch_data.py
 
     - name: Check Data Cache Output
       run: |
-        echo "بررسی وجود فایل‌های داده در پوشه کش..."
+        echo "بررسی فایل‌های داده کش شده:"
         ls -la data_cache/
