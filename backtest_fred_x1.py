@@ -24,10 +24,11 @@ def load_symbol_data(symbol):
         return None
         
     df_c = pd.read_csv(ohlcv_path)
-    df_c['timestamp'] = pd.to_datetime(df_c['timestamp'], utc=True)
+    # استفاده از format='mixed' برای مدیریت امن انواع فرمت‌های تاریخ و زمان
+    df_c['timestamp'] = pd.to_datetime(df_c['timestamp'], format='mixed', utc=True)
     
     df_f = pd.read_csv(fr_path)
-    df_f['timestamp'] = pd.to_datetime(df_f['timestamp'], utc=True)
+    df_f['timestamp'] = pd.to_datetime(df_f['timestamp'], format='mixed', utc=True)
     
     df = pd.merge_asof(df_c.sort_values('timestamp'), 
                        df_f.sort_values('timestamp'), 
