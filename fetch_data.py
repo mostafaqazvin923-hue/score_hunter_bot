@@ -7,32 +7,20 @@ import pandas as pd
 import numpy as np
 
 SYMBOLS = [
-    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'SUIUSDT', 'AVAXUSDT', 
-    'NEARUSDT', 'ADAUSDT', 'BNBUSDT', 'APTUSDT', 'CRVUSDT', 
-    'ONDOUSDT', 'PENDLEUSDT', 'ICPUSDT', 'WIFUSDT'
+    'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'SUI/USDT:USDT', 'AVAX/USDT:USDT', 
+    'NEAR/USDT:USDT', 'ADA/USDT:USDT', 'BNB/USDT:USDT', 'APT/USDT:USDT', 'CRV/USDT:USDT', 
+    'ONDO/USDT:USDT', 'PENDLE/USDT:USDT', 'ICP/USDT:USDT', 'WIF/USDT:USDT'
 ]
 TIMEFRAME = '1h'
 DAYS_TO_FETCH = 365 + 60
 DATA_DIR = 'data_cache'
 
 def get_exchange():
-    # استفاده از تنظیمات پابلیک و غیرفعال کردن چک‌های اضافی برای دور زدن محدودیت‌های جغرافیایی سرور CI
-    exchange = ccxt.binance({
+    # استفاده از بای‌بیت به دلیل عدم وجود محدودیت جغرافیایی IP 451 در سرورهای CI
+    exchange = ccxt.bybit({
         'enableRateLimit': True,
-        'options': {
-            'defaultType': 'future',
-            'adjustForTimeDifference': True
-        }
+        'options': {'defaultType': 'swap'}
     })
-    
-    # تنظیم هاست جایگزین عمومی بایننس فیوچرز در صورت مسدود بودن api.binance.com
-    # صرافی بایننس اندپوینت‌های عمومی دیگری نیز برای فیوچرز دارد
-    exchange.urls['api'] = {
-        'public': 'https://fapi.binance.com/fapi/v1',
-        'private': 'https://fapi.binance.com/fapi/v1',
-        'v1': 'https://fapi.binance.com/api/v1',
-        'v3': 'https://fapi.binance.com/api/v3',
-    }
     return exchange
 
 def fetch_ohlcv_data(exchange, symbol, since_ms):
@@ -40,10 +28,10 @@ def fetch_ohlcv_data(exchange, symbol, since_ms):
     current_since = since_ms
     now_ms = exchange.milliseconds()
     
-    print(f"[{symbol}] در حال دریافت داده‌های OHLCV...")
+    print(f"[{symbol}] در حال دریافت داده‌های OHLCV از صرافی جایگزین...")
     while current_since < now_ms:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, since=current_since, limit=1500)
+            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, since=current_since, limit=1000)
             if not ohlcv:
                 break
             all_ohlcv.extend(ohlcv)
@@ -68,7 +56,8 @@ def fetch_funding_rate_data(exchange, symbol, since_ms):
     print(f"[{symbol}] در حال دریافت تاریخچه Funding Rate...")
     while current_since < now_ms:
         try:
-            funding_rates = exchange.fetch_funding_rate_history(symbol, since=current_since, limit=1000)
+            # در بای‌بیت ممکن است تاریخچه فاندینگ پارامترهای متفاوتی داشته باشد یا از فچ فاندینگ ریت هکستوری استفاده شود
+            funding_rates = exchange.fetch_funding_rate_history(symbol, since=current_since, limit=200)
             if not funding_rates:
                 break
             for fr in funding_rates:
@@ -80,7 +69,7 @@ def fetch_funding_rate_data(exchange, symbol, since_ms):
             time.sleep(exchange.rateLimit / 1000.0)
         except Exception as e:
             print(f"[خطا] دریافت Funding Rate برای {symbol}: {e}")
-            sys.exit(1)
+            break
             
     if not all_fr:
         print(f"[خطا بحرانی] هیچ داده فاندینگی برای {symbol} دریافت نشد!")
@@ -94,7 +83,6 @@ def fetch_funding_rate_data(exchange, symbol, since_ms):
 
 def validate_and_clean_data(df_ohlcv, df_fr, symbol):
     print(f"[{symbol}] در حال اعتبارسنجی داده‌ها...")
-    
     if df_ohlcv[['open', 'high', 'low', 'close', 'volume']].isnull().any().any():
         print(f"[خطا] داده‌های OHLCV برای {symbol} حاوی مقادیر NaN است.")
         sys.exit(1)
@@ -128,16 +116,18 @@ def main():
         print(f"شروع پردازش نماد: {symbol}")
         print("="*50)
         
+        file_prefix = symbol.split('/')[0] # تبدیل BTC/USDT:USDT به BTCUSDT برای نام فایل
+        
         df_ohlcv = fetch_ohlcv_data(exchange, symbol, since_ms)
         df_fr = fetch_funding_rate_data(exchange, symbol, since_ms)
         validate_and_clean_data(df_ohlcv, df_fr, symbol)
         
-        ohlcv_path = os.path.join(DATA_DIR, f"{symbol}_OHLCV.csv")
-        fr_path = os.path.join(DATA_DIR, f"{symbol}_FundingRate.csv")
+        ohlcv_path = os.path.join(DATA_DIR, f"{file_prefix}_OHLCV.csv")
+        fr_path = os.path.join(DATA_DIR, f"{file_prefix}_FundingRate.csv")
         
         df_ohlcv.to_csv(ohlcv_path, index=False)
         df_fr.to_csv(fr_path, index=False)
-        print(f"[{symbol}] داده‌ها با موفقیت ذخیره شدند.")
+        print(f"[{file_prefix}] داده‌ها با موفقیت ذخیره شدند.")
 
     print("\n[موفقیت] دریافت و اعتبارسنجی تمام نمادها با موفقیت پایان یافت.")
 
