@@ -16,7 +16,6 @@ TIMEFRAME = '1h'
 DAYS_TO_FETCH = 365 + 60  # ۳۶۵ روز تست + ۶۰ روز Warm-up
 DATA_DIR = 'data_cache'
 
-# ایجاد پوشه کش در همین لحظه برای جلوگیری از خطای عدم وجود دایرکتوری
 os.makedirs(DATA_DIR, exist_ok=True)
 
 VISION_BASE = "https://data.binance.vision/data/futures/um"
@@ -45,21 +44,17 @@ def generate_months_and_days(start_dt, end_dt):
     return sorted(list(months)), days
 
 def parse_kline_dataframe(raw_df):
-    first_val = str(raw_df.iloc[0, 0]).lower()
-    if 'time' in first_val or 'open' in first_val:
-        raw_df.columns = [str(c).strip().lower() for c in raw_df.iloc]
-        df = raw_df.iloc[1:].copy()
-        time_col = next((c for c in df.columns if 'time' in c or 'open_time' in c), df.columns[0])
-        open_col = next((c for c in df.columns if c == 'open'), df.columns[1])
-        high_col = next((c for c in df.columns if c == 'high'), df.columns[2])
-        low_col = next((c for c in df.columns if c == 'low'), df.columns[3])
-        close_col = next((c for c in df.columns if c == 'close'), df.columns[4])
-        vol_col = next((c for c in df.columns if 'volume' in c), df.columns[5])
-        df = df[[time_col, open_col, high_col, low_col, close_col, vol_col]]
-        df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-    else:
-        df = raw_df.iloc[:, [0, 1, 2, 3, 4, 5]].copy()
-        df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+    """
+    فایل‌های Binance Vision Klines بدون هیدر هستند و حداقل ۱۲ ستون استاندارد دارند:
+    0: open_time, 1: open, 2: high, 3: low, 4: close, 5: volume, ...
+    """
+    if raw_df.shape[1] < 6:
+        # اگر ستون‌ها کمتر از حد استاندارد باشند
+        return pd.DataFrame()
+
+    # انتخاب ۶ ستون اول به عنوان OHLCV و Timestamp
+    df = raw_df.iloc[:, [0, 1, 2, 3, 4, 5]].copy()
+    df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
 
     df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
     for col in ['open', 'high', 'low', 'close', 'volume']:
@@ -92,9 +87,9 @@ def fetch_klines_for_symbol(symbol):
                     with z.open(csv_filename) as f:
                         df_m = pd.read_csv(f, header=None)
                         parsed_m = parse_kline_dataframe(df_m)
-                        all_dfs.append(parsed_m)
+                        if not parsed_m.empty:
+                            all_dfs.append(parsed_m)
             elif resp.status_code == 404:
-                # ممکن است توکن در آن ماه هنوز لیست نشده باشد (خطای 404 طبیعی است)
                 month_days = [d for d in days if d.year == year and d.month == month]
                 for d in month_days:
                     d_str = d.strftime("%Y-%m-%d")
@@ -108,7 +103,8 @@ def fetch_klines_for_symbol(symbol):
                             with dz.open(d_csv) as df_file:
                                 df_d = pd.read_csv(df_file, header=None)
                                 parsed_d = parse_kline_dataframe(df_d)
-                                all_dfs.append(parsed_d)
+                                if not parsed_d.empty:
+                                    all_dfs.append(parsed_d)
             else:
                 failed_requests += 1
         except Exception as e:
@@ -195,16 +191,16 @@ def fetch_funding_rate_for_symbol(symbol):
                     with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
                         csv_filename = z.namelist()[0]
                         with z.open(csv_filename) as f:
-                            df_fr_m = pd.read_csv(f)
-                            time_col = next((c for c in df_fr_m.columns if 'time' in str(c).lower()), df_fr_m.columns[1])
-                            rate_col = next((c for c in df_fr_m.columns if 'rate' in str(c).lower()), df_fr_m.columns[2])
-                            for _, row in df_fr_m.iterrows():
-                                t_val = row[time_col]
-                                t_dt = pd.to_datetime(t_val, unit='ms', utc=True) if isinstance(t_val, (int, float)) else pd.to_datetime(t_val, utc=True)
-                                all_fr.append({
-                                    'timestamp': t_dt,
-                                    'fundingRate': float(row[rate_col])
-                                })
+                            df_fr_m = pd.read_csv(f, header=None)
+                            if df_fr_m.shape[1] >= 3:
+                                for _, row in df_fr_m.iterrows():
+                                    t_val = row[1]
+                                    r_val = row[2]
+                                    t_dt = pd.to_datetime(t_val, unit='ms', utc=True) if isinstance(t_val, (int, float)) else pd.to_datetime(t_val, utc=True)
+                                    all_fr.append({
+                                        'timestamp': t_dt,
+                                        'fundingRate': float(r_val)
+                                    })
                 else:
                     failed_requests += 1
             except Exception as e:
