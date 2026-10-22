@@ -44,22 +44,13 @@ def generate_months_and_days(start_dt, end_dt):
     return sorted(list(months)), days
 
 def parse_kline_dataframe(raw_df):
-    """
-    فایل‌های Binance Vision Klines بدون هیدر هستند و حداقل ۱۲ ستون استاندارد دارند:
-    0: open_time, 1: open, 2: high, 3: low, 4: close, 5: volume, ...
-    """
     if raw_df.shape[1] < 6:
-        # اگر ستون‌ها کمتر از حد استاندارد باشند
         return pd.DataFrame()
-
-    # انتخاب ۶ ستون اول به عنوان OHLCV و Timestamp
     df = raw_df.iloc[:, [0, 1, 2, 3, 4, 5]].copy()
     df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-
     df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
     for col in ['open', 'high', 'low', 'close', 'volume']:
         df[col] = pd.to_numeric(df[col], errors='coerce')
-        
     df.dropna(subset=['timestamp'], inplace=True)
     return df
 
@@ -105,11 +96,13 @@ def fetch_klines_for_symbol(symbol):
                                 parsed_d = parse_kline_dataframe(df_d)
                                 if not parsed_d.empty:
                                     all_dfs.append(parsed_d)
+                    else:
+                        failed_requests += 1
             else:
                 failed_requests += 1
         except Exception as e:
             failed_requests += 1
-            print(f"[هشدار] خطا در دریافت آرشیو برای {symbol} در ماه {year}-{m_str}: {e}")
+            print(f"[هشدار] خطا در دریافت کندل {symbol} در ماه {year}-{m_str}: {e}")
 
     if not all_dfs:
         print(f"[خطا بحرانی] هیچ داده‌ای برای {symbol} از Binance Vision دریافت نشد!")
@@ -117,18 +110,51 @@ def fetch_klines_for_symbol(symbol):
 
     df = pd.concat(all_dfs, ignore_index=True)
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-    
     df.drop_duplicates(subset=['timestamp'], inplace=True)
     df.sort_values('timestamp', inplace=True)
     df.reset_index(drop=True, inplace=True)
-
     df = df[(df['timestamp'] >= pd.Timestamp(start_dt)) & (df['timestamp'] < pd.Timestamp(end_dt))]
     
-    if df.empty:
-        print(f"[خطا بحرانی] دی‌اف کندل‌های {symbol} پس از فیلتر بازه زمانی خالی است!")
-        sys.exit(1)
-        
     return df, success_requests, failed_requests, used_urls
+
+def parse_funding_dataframe(df_raw):
+    if df_raw.empty:
+        return pd.DataFrame()
+    try:
+        first_val = str(df_raw.iloc[0, 0]).lower()
+        if 'time' in first_val or 'calc' in first_val or 'symbol' in first_val:
+            df = df_raw.iloc[1:].copy()
+        else:
+            df = df_raw.copy()
+        
+        time_col = None
+        rate_col = None
+        for col in df.columns:
+            sample_val = str(df[col].iloc[0]) if len(df) > 0 else ""
+            if sample_val.isdigit() and len(sample_val) >= 10:
+                if time_col is None:
+                    time_col = col
+            try:
+                float_val = float(sample_val)
+                if -1.0 <= float_val <= 1.0 and float_val != 0.0:
+                    if rate_col is None:
+                        rate_col = col
+            except:
+                pass
+                
+        if time_col is None:
+            time_col = 1 if df.shape[1] > 1 else 0
+        if rate_col is None:
+            rate_col = 2 if df.shape[1] > 2 else (1 if df.shape[1] > 1 else 0)
+            
+        res = pd.DataFrame()
+        res['timestamp'] = pd.to_numeric(df[time_col], errors='coerce')
+        res['fundingRate'] = pd.to_numeric(df[rate_col], errors='coerce')
+        res.dropna(subset=['timestamp', 'fundingRate'], inplace=True)
+        return res
+    except Exception as e:
+        print(f"[خطا در پارس فاندینگ] {e}")
+        return pd.DataFrame()
 
 def fetch_funding_rate_for_symbol(symbol):
     start_dt, end_dt = get_target_date_range()
@@ -136,14 +162,14 @@ def fetch_funding_rate_for_symbol(symbol):
     end_ms = int(end_dt.timestamp() * 1000)
     
     all_fr = []
-    current_start = start_ms
     success_requests = 0
     failed_requests = 0
     used_url = FAPI_BASE
 
     print(f"[{symbol}] در حال دریافت تاریخچه Funding Rate از REST API بایننس...")
-    
     api_failed = False
+    current_start = start_ms
+    
     while current_start < end_ms:
         params = {
             'symbol': symbol,
@@ -153,8 +179,9 @@ def fetch_funding_rate_for_symbol(symbol):
         }
         try:
             resp = requests.get(FAPI_BASE, params=params, timeout=15)
+            print(f"[HTTP FAPI] GET {symbol} -> Status: {resp.status_code}")
             if resp.status_code in [403, 451]:
-                print(f"[هشدار] دسترسی به REST API فاندینگ با محدودیت مواجه شد ({resp.status_code}). استفاده از آرشیو Binance Vision...")
+                print(f"[هشدار] دسترسی REST API فاندینگ مسدود است ({resp.status_code}). استفاده از آرشیو رسمی Binance Vision...")
                 api_failed = True
                 break
             elif resp.status_code == 200:
@@ -173,44 +200,72 @@ def fetch_funding_rate_for_symbol(symbol):
                 current_start = next_start
             else:
                 failed_requests += 1
+                api_failed = True
                 break
         except Exception as e:
+            print(f"[هشدار] خطای ارتباطی REST API فاندینگ: {e}")
             api_failed = True
             break
 
     if api_failed or not all_fr:
-        print(f"[{symbol}] استفاده از آرشیو ماهیانه Binance Vision برای Funding Rate...")
-        months, _ = generate_months_and_days(start_dt, end_dt)
+        print(f"[{symbol}] استفاده از آرشیو رسمی Binance Vision برای Funding Rate...")
+        months, days = generate_months_and_days(start_dt, end_dt)
+        
         for year, month in months:
             m_str = f"{month:02d}"
             fr_url = f"{VISION_BASE}/monthly/fundingRate/{symbol}/{symbol}-fundingRate-{year}-{m_str}.zip"
+            used_url = fr_url
             try:
                 resp = requests.get(fr_url, timeout=30)
+                print(f"[HTTP Vision FR] GET {fr_url} -> Status: {resp.status_code}, Size: {len(resp.content)} bytes")
                 if resp.status_code == 200:
                     success_requests += 1
                     with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
                         csv_filename = z.namelist()[0]
                         with z.open(csv_filename) as f:
                             df_fr_m = pd.read_csv(f, header=None)
-                            if df_fr_m.shape[1] >= 3:
-                                for _, row in df_fr_m.iterrows():
-                                    t_val = row[1]
-                                    r_val = row[2]
-                                    t_dt = pd.to_datetime(t_val, unit='ms', utc=True) if isinstance(t_val, (int, float)) else pd.to_datetime(t_val, utc=True)
-                                    all_fr.append({
-                                        'timestamp': t_dt,
-                                        'fundingRate': float(r_val)
-                                    })
+                            parsed_fr = parse_funding_dataframe(df_fr_m)
+                            for _, row in parsed_fr.iterrows():
+                                t_val = row['timestamp']
+                                t_dt = pd.to_datetime(t_val, unit='ms', utc=True)
+                                all_fr.append({
+                                    'timestamp': t_dt,
+                                    'fundingRate': float(row['fundingRate'])
+                                })
+                elif resp.status_code == 404:
+                    month_days = [d for d in days if d.year == year and d.month == month]
+                    for d in month_days:
+                        d_str = d.strftime("%Y-%m-%d")
+                        d_url = f"{VISION_BASE}/daily/fundingRate/{symbol}/{symbol}-fundingRate-{d_str}.zip"
+                        d_resp = requests.get(d_url, timeout=15)
+                        if d_resp.status_code == 200:
+                            success_requests += 1
+                            with zipfile.ZipFile(io.BytesIO(d_resp.content)) as dz:
+                                d_csv = dz.namelist()[0]
+                                with dz.open(d_csv) as df_file:
+                                    df_d = pd.read_csv(df_file, header=None)
+                                    parsed_d = parse_funding_dataframe(df_d)
+                                    for _, row in parsed_d.iterrows():
+                                        t_val = row['timestamp']
+                                        t_dt = pd.to_datetime(t_val, unit='ms', utc=True)
+                                        all_fr.append({
+                                            'timestamp': t_dt,
+                                            'fundingRate': float(row['fundingRate'])
+                                        })
+                        else:
+                            failed_requests += 1
                 else:
                     failed_requests += 1
             except Exception as e:
                 failed_requests += 1
+                print(f"[هشدار] خطا در دریافت فاندینگ ویژن برای {symbol} در ماه {year}-{m_str}: {e}")
 
     if not all_fr:
-        print(f"[خطا بحرانی] هیچ رکورد فاندینگی برای {symbol} دریافت نشد!")
+        print(f"[خطا بحرانی] هیچ رکورد فاندینگی برای {symbol} از منابع رسمی بایننس دریافت نشد!")
         sys.exit(1)
 
     df_fr = pd.DataFrame(all_fr)
+    df_fr['timestamp'] = pd.to_datetime(df_fr['timestamp'], utc=True)
     df_fr.drop_duplicates(subset=['timestamp'], inplace=True)
     df_fr.sort_values('timestamp', inplace=True)
     df_fr.reset_index(drop=True, inplace=True)
@@ -268,7 +323,7 @@ def main():
         df_fr.to_csv(os.path.join(DATA_DIR, f"{symbol}_FundingRate.csv"), index=False)
         print(f"فایل‌های {symbol} با موفقیت در {DATA_DIR} ذخیره شدند.")
 
-    print("\n[موفقیت] تمام ۱۴ نماد با موفقیت از Binance Vision دریافت، اعتبارسنجی و ذخیره شدند.")
+    print("\n[موفقیت] تمام ۱۴ نماد با موفقیت از منابع رسمی بایننس دریافت، اعتبارسنجی و ذخیره شدند.")
 
 if __name__ == '__main__':
     main()
