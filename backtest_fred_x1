@@ -1,0 +1,210 @@
+import os
+import pandas as pd
+import numpy as np
+from datetime import datetime, timezone
+
+SYMBOLS = [
+    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'SUIUSDT', 'AVAXUSDT', 
+    'NEARUSDT', 'ADAUSDT', 'BNBUSDT', 'APTUSDT', 'CRVUSDT', 
+    'ONDOUSDT', 'PENDLEUSDT', 'ICPUSDT', 'WIFUSDT'
+]
+DATA_DIR = 'data_cache'
+
+# پارامترهای مدیریت سرمایه و پوزیشن
+INITIAL_CAPITAL = 1000.0
+MARGIN_PER_TRADE = 100.0
+LEVERAGE = 50.0
+NOTIONAL_SIZE = MARGIN_PER_TRADE * LEVERAGE  # 5000 دلار
+TAKER_FEE_RATE = 0.05 / 100  # 0.05% کارمزد تیکر ورود و خروج
+SLIPPAGE_RATE = 0.03 / 100   # 0.03% اسلیپیج
+
+def load_symbol_data(symbol):
+    ohlcv_path = os.path.join(DATA_DIR, f"{symbol}_OHLCV.csv")
+    fr_path = os.path.join(DATA_DIR, f"{symbol}_FundingRate.csv")
+    
+    if not os.path.exists(ohlcv_path) or not os.path.exists(fr_path):
+        return None
+        
+    df_c = pd.read_csv(ohlcv_path)
+    df_c['timestamp'] = pd.to_datetime(df_c['timestamp'], utc=True)
+    
+    df_f = pd.read_csv(fr_path)
+    df_f['timestamp'] = pd.to_datetime(df_f['timestamp'], utc=True)
+    
+    # ادغام فاندینگ ریت با کندل‌ها به صورت Forward Fill (جلوگیری از Lookahead)
+    df = pd.merge_asof(df_c.sort_values('timestamp'), 
+                       df_f.sort_values('timestamp'), 
+                       on='timestamp', 
+                       direction='backward')
+    df['fundingRate'] = df['fundingRate'].fillna(0.0)
+    return df
+
+def run_backtest_for_symbol(df, symbol):
+    trades = []
+    active_trade = None
+    last_exit_idx = -999
+    
+    # محاسبه میانگین متحرک و انحراف معیار فاندینگ (پنجره گذشته‌نگر ۱۶۸ ساعته = ۷ روز)
+    window = 168
+    df['fr_mean'] = df['fundingRate'].rolling(window=window, min_periods=24).mean()
+    df['fr_std'] = df['fundingRate'].rolling(window=window, min_periods=24).std()
+    df['fr_zscore'] = (df['fundingRate'] - df['fr_mean']) / (df['fr_std'] + 1e-8)
+    
+    for i in range(window + 10, len(df) - 1):
+        current_time = df.loc[i, 'timestamp']
+        close_price = df.loc[i, 'close']
+        
+        # ۱. بررسی مدیریت پوزیشن باز موجود
+        if active_trade is not None:
+            high_val = df.loc[i, 'high']
+            low_val = df.loc[i, 'low']
+            
+            hit_tp = False
+            hit_sl = False
+            exit_price = 0.0
+            
+            if active_trade['side'] == 'LONG':
+                # قیمت لیکوییدشدن در اهرم ۵۰x (حدود ۲ درصد حرکت مخالف بدون احتساب مارجین نگهداری)
+                liq_price = active_trade['entry_price'] * (1.0 - (1.0 / LEVERAGE) * 0.95)
+                if low_val <= liq_price:
+                    exit_price = liq_price
+                    hit_sl = True
+                elif high_val >= active_trade['tp']:
+                    exit_price = active_trade['tp']
+                    hit_tp = True
+                elif low_val <= active_trade['sl']:
+                    exit_price = active_trade['sl']
+                    hit_sl = True
+            else: # SHORT
+                liq_price = active_trade['entry_price'] * (1.0 + (1.0 / LEVERAGE) * 0.95)
+                if high_val >= liq_price:
+                    exit_price = liq_price
+                    hit_sl = True
+                elif low_val <= active_trade['tp']:
+                    exit_price = active_trade['tp']
+                    hit_tp = True
+                elif high_val >= active_trade['sl']:
+                    exit_price = active_trade['sl']
+                    hit_sl = True
+                    
+            if hit_tp or hit_sl:
+                # محاسبه سود و زیان (PnL) ناخالص و خالص پس از کارمزد
+                notional = NOTIONAL_SIZE
+                if active_trade['side'] == 'LONG':
+                    gross_pnl = notional * (exit_price - active_trade['entry_price']) / active_trade['entry_price']
+                else:
+                    gross_pnl = notional * (active_trade['entry_price'] - exit_price) / active_trade['entry_price']
+                    
+                fees = notional * TAKER_FEE_RATE * 2 # ورود و خروج
+                net_pnl = gross_pnl - fees
+                
+                trades.append({
+                    'symbol': symbol,
+                    'side': active_trade['side'],
+                    'entry_time': active_trade['entry_time'],
+                    'exit_time': current_time,
+                    'entry_price': active_trade['entry_price'],
+                    'exit_price': exit_price,
+                    'net_pnl': net_pnl,
+                    'win': net_pnl > 0
+                })
+                last_exit_idx = i
+                active_trade = None
+            continue
+            
+        # ۲. بررسی شرایط ورود جدید (بدون ورود مجدد در همان کندل بسته شدن)
+        if i <= last_exit_idx + 1:
+            continue
+            
+        z_prev = df.loc[i-1, 'fr_zscore']
+        fr_curr = df.loc[i, 'fundingRate']
+        fr_prev = df.loc[i-1, 'fundingRate']
+        
+        # سیگنال SHORT: فاندینگ افراطی مثبت و در حال کاهش
+        if z_prev >= 2.5 and 0 < fr_curr < fr_prev:
+            entry_price = df.loc[i+1, 'open'] * (1.0 + SLIPPAGE_RATE) # ورود در کندل بعدی با اسلیپیج
+            sl = df.loc[i-9:i, 'high'].max() * 1.002 # سقف محلی با بافر
+            risk = sl - entry_price
+            if risk <= 0:
+                continue
+            tp = entry_price - (2.0 * risk) # نسبت دقیق ۱ به ۲
+            
+            # بررسی تطابق با لیکوییدشن
+            liq_price = entry_price * (1.0 + (1.0 / LEVERAGE) * 0.95)
+            if sl >= liq_price: # ریسک لیکویید شدن پیش از استاپ
+                continue
+                
+            active_trade = {
+                'side': 'SHORT',
+                'entry_time': df.loc[i+1, 'timestamp'],
+                'entry_price': entry_price,
+                'sl': sl,
+                'tp': tp
+            }
+            
+        # سیگنال LONG: فاندینگ افراطی منفی و در حال بازگشت
+        elif z_prev <= -2.5 and fr_prev < fr_curr < 0:
+            entry_price = df.loc[i+1, 'open'] * (1.0 - SLIPPAGE_RATE)
+            sl = df.loc[i-9:i, 'low'].min() * 0.998 # کف محلی با بافر
+            risk = entry_price - sl
+            if risk <= 0:
+                continue
+            tp = entry_price + (2.0 * risk) # نسبت دقیق ۱ به ۲
+            
+            liq_price = entry_price * (1.0 - (1.0 / LEVERAGE) * 0.95)
+            if sl <= liq_price:
+                continue
+                
+            active_trade = {
+                'side': 'LONG',
+                'entry_time': df.loc[i+1, 'timestamp'],
+                'entry_price': entry_price,
+                'sl': sl,
+                'tp': tp
+            }
+            
+    return trades
+
+def main():
+    all_trades = []
+    for symbol in SYMBOLS:
+        df = load_symbol_data(symbol)
+        if df is None:
+            continue
+            
+        # تفکیک زمانی Train (60%), Validation (20%), OOS (20%)
+        total_len = len(df)
+        train_idx = int(total_len * 0.60)
+        val_idx = int(total_len * 0.80)
+        
+        # تمرکز روی بخش Out-of-Sample (20٪ پایانی) برای ارزیابی نهایی
+        df_oos = df.iloc[val_idx:].reset_index(drop=True)
+        trades = run_backtest_for_symbol(df_oos, symbol)
+        all_trades.extend(trades)
+        
+    if not all_trades:
+        print("[نتیجه] هیچ معامله‌ای در بخش Out-of-Sample ثبت نشد.")
+        return
+        
+    df_trades = pd.DataFrame(all_trades)
+    total_trades = len(df_trades)
+    wins = df_trades['win'].sum()
+    win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
+    net_profit = df_trades['net_pnl'].sum()
+    
+    # محاسبه حداکثر باخت متوالی (Losing Streak)
+    df_trades['loss'] = ~df_trades['win']
+    df_trades['streak'] = df_trades['loss'].groupby((~df_trades['loss']).cumsum()).cumsum()
+    max_losing_streak = df_trades['streak'].max()
+    
+    print("\n" + "="*50)
+    print("گزارش نتایج نهایی بک‌تست Out-of-Sample (OOS)")
+    print("="*50)
+    print(f"تعداد کل معاملات OOS: {total_trades}")
+    print(f"نرخ برد (Win Rate): {win_rate:.2f}%")
+    print(f"سود خالص کل (Net PnL): ${net_profit:.2f}")
+    print(f"حداکثر ضرر متوالی (Max Losing Streak): {max_losing_streak}")
+    print("="*50)
+
+if __name__ == '__main__':
+    main()
