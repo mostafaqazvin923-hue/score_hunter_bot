@@ -1,16 +1,17 @@
+
 name: MarkitTick Futures Backtest
 
 on:
   workflow_dispatch:
     inputs:
       days:
-        description: 'Historical days to test'
+        description: "Historical days to test"
         required: true
-        default: '365'
+        default: "365"
       symbols:
-        description: 'Optional space-separated symbols; leave blank for all 10'
+        description: "Optional space-separated symbols"
         required: false
-        default: ''
+        default: ""
 
 permissions:
   contents: read
@@ -19,35 +20,40 @@ jobs:
   backtest:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: markittick_backtest/requirements.txt
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
       - name: Install dependencies
-        run: python -m pip install -r markittick_backtest/requirements.txt
-      - name: Run one-year Binance Futures backtest
+        run: python -m pip install -r requirements.txt
+
+      - name: Run backtest
         shell: bash
+        env:
+          DAYS: ${{ inputs.days }}
+          SYMBOLS: ${{ inputs.symbols }}
         run: |
-          cd markittick_backtest
-          DAYS='${{ inputs.days }}'
-          SYMBOLS='${{ inputs.symbols }}'
           if [[ -n "$SYMBOLS" ]]; then
             python backtest_markittick_futures.py --days "$DAYS" --symbols $SYMBOLS
           else
             python backtest_markittick_futures.py --days "$DAYS"
           fi
-      - name: Upload backtest report and raw candles
+
+      - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: markittick-futures-backtest
           path: |
-            markittick_backtest/backtest_output/
-            markittick_backtest/data/
+            backtest_output/
+            data/
           if-no-files-found: warn
           retention-days: 30
