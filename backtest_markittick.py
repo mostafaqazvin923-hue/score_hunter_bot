@@ -11,14 +11,14 @@ DATA_DIR = 'data_cache'
 
 INITIAL_CAPITAL = 1000.0
 MARGIN_PER_TRADE = 100.0
-LEVERAGE = 50.0
+LEVERAGE = 50.0  # حفظ اهرم ۵۰x به درخواست شما
 NOTIONAL_SIZE = MARGIN_PER_TRADE * LEVERAGE
 TAKER_FEE_RATE = 0.05 / 100
 SLIPPAGE_RATE = 0.03 / 100
 
 ATR_MULT = 1.5
 AP = 14
-BO_SENS = 2.5
+BO_SENS = 3.0  # افزایش جزئی حساسیت برای حذف سیگنال‌های ضعیف و کاهش کارمزد اضافی
 
 def load_symbol_data(symbol):
     ohlcv_path = os.path.join(DATA_DIR, f"{symbol}_OHLCV.csv")
