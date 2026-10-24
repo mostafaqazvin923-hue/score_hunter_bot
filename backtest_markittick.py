@@ -16,7 +16,6 @@ NOTIONAL_SIZE = MARGIN_PER_TRADE * LEVERAGE
 TAKER_FEE_RATE = 0.05 / 100
 SLIPPAGE_RATE = 0.03 / 100
 
-# پارامترهای استخراج شده از تصویر تنظیمات شما
 ATR_MULT = 1.5
 AP = 14
 BO_SENS = 2.5
@@ -40,7 +39,6 @@ def load_symbol_data(symbol):
                        direction='backward')
     df['fundingRate'] = df['fundingRate'].fillna(0.0)
     
-    # محاسبه True Range و ATR
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
@@ -48,7 +46,6 @@ def load_symbol_data(symbol):
     df['tr'] = np.max(ranges, axis=1)
     df['atr'] = df['tr'].rolling(AP).mean()
     
-    # محاسبه MFI
     typical_price = (df['high'] + df['low'] + df['close']) / 3.0
     money_flow = typical_price * df['volume']
     pos_flow = np.where(typical_price > typical_price.shift(1), money_flow, 0)
@@ -81,7 +78,6 @@ def run_backtest_for_symbol(df, symbol):
         else:
             alpha_trend[i] = min(down_t.iloc[i], prev_at) if not pd.isna(down_t.iloc[i]) else prev_at
             
-        # تعیین جهت روند
         if i >= 3:
             if alpha_trend[i-1] > alpha_trend[i-3]:
                 direction[i] = 1
@@ -90,7 +86,6 @@ def run_backtest_for_symbol(df, symbol):
             else:
                 direction[i] = direction[i-1]
                 
-        # رفع خطای قبلی: مقایسه ساده
         if i < 15:
             continue
             
@@ -183,4 +178,68 @@ def run_backtest_for_symbol(df, symbol):
                 'side': 'LONG',
                 'entry_time': df.loc[i+1, 'timestamp'],
                 'entry_price': entry_price,
-                'sl
+                'sl': sl,
+                'tp': tp
+            }
+        elif sell_signal:
+            entry_price = df.loc[i+1, 'open'] * (1.0 + SLIPPAGE_RATE)
+            sl = alpha_trend[i] if not pd.isna(alpha_trend[i]) else entry_price + (2.0 * current_atr)
+            risk = sl - entry_price
+            if risk <= 0:
+                continue
+            tp = entry_price - (2.0 * risk)
+            
+            active_trade = {
+                'side': 'SHORT',
+                'entry_time': df.loc[i+1, 'timestamp'],
+                'entry_price': entry_price,
+                'sl': sl,
+                'tp': tp
+            }
+            
+    return trades
+
+def main():
+    all_trades = []
+    for symbol in SYMBOLS:
+        df = load_symbol_data(symbol)
+        if df is None:
+            continue
+            
+        total_len = len(df)
+        val_idx = int(total_len * 0.80)
+        df_oos = df.iloc[val_idx:].reset_index(drop=True)
+        trades = run_backtest_for_symbol(df_oos, symbol)
+        all_trades.extend(trades)
+        
+    if not all_trades:
+        print("[نتیجه] هیچ معامله‌ای در بخش Out-of-Sample ثبت نشد.")
+        return
+        
+    df_trades = pd.DataFrame(all_trades)
+    total_trades = len(df_trades)
+    wins = df_trades['win'].sum()
+    win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
+    net_profit = df_trades['net_pnl'].sum()
+    
+    max_losing_streak = 0
+    current_streak = 0
+    for win_status in df_trades['win']:
+        if not win_status:
+            current_streak += 1
+            if current_streak > max_losing_streak:
+                max_losing_streak = current_streak
+        else:
+            current_streak = 0
+            
+    print("\n" + "="*50)
+    print("گزارش نتایج نهایی بک‌تست Out-of-Sample (OOS)")
+    print("="*50)
+    print(f"تعداد کل معاملات OOS: {total_trades}")
+    print(f"نرخ برد (Win Rate): {win_rate:.2f}%")
+    print(f"سود خالص کل (Net PnL): ${net_profit:.2f}")
+    print(f"حداکثر ضرر متوالی (Max Losing Streak): {max_losing_streak}")
+    print("="*50)
+
+if __name__ == '__main__':
+    main()
