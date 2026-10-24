@@ -30,10 +30,9 @@ jobs:
 
     - name: Run Strategy Backtest Engine
       run: |
-        python backtest_fred_x1.py
+        python backtest_markittick.py
 
     - name: Check Data Cache and Outputs
       run: |
         echo "بررسی پوشه کش و فایل‌های خروجی..."
         ls -la data_cache/
-        
