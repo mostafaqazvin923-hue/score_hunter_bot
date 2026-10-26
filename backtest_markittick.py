@@ -16,9 +16,10 @@ NOTIONAL_SIZE = MARGIN_PER_TRADE * LEVERAGE
 TAKER_FEE_RATE = 0.05 / 100
 SLIPPAGE_RATE = 0.03 / 100
 
-ATR_MULT = 2.0  # افزایش برای فیلتر نویزها
-AP = 14
-BO_SENS = 3.5  # سخت‌گیرانه‌تر کردن بریک‌اوت برای کاهش خطا
+BB_PERIOD = 20
+BB_STD = 2.0
+RSI_PERIOD = 14
+ATR_PERIOD = 14
 
 def load_symbol_data(symbol):
     ohlcv_path = os.path.join(DATA_DIR, f"{symbol}_OHLCV.csv")
@@ -44,19 +45,23 @@ def load_symbol_data(symbol):
     low_close = np.abs(df['low'] - df['close'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     df['tr'] = np.max(ranges, axis=1)
-    df['atr'] = df['tr'].rolling(AP).mean()
+    df['atr'] = df['tr'].rolling(ATR_PERIOD).mean()
     
-    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+    df['bb_middle'] = df['close'].rolling(BB_PERIOD).mean()
+    rolling_std = df['close'].rolling(BB_PERIOD).std()
+    df['bb_upper'] = df['bb_middle'] + (rolling_std * BB_STD)
+    df['bb_lower'] = df['bb_middle'] - (rolling_std * BB_STD)
     
-    typical_price = (df['high'] + df['low'] + df['close']) / 3.0
-    money_flow = typical_price * df['volume']
-    pos_flow = np.where(typical_price > typical_price.shift(1), money_flow, 0)
-    neg_flow = np.where(typical_price < typical_price.shift(1), money_flow, 0)
-    pos_mf = pd.Series(pos_flow).rolling(AP).sum()
-    neg_mf = pd.Series(neg_flow).rolling(AP).sum()
-    mfi = 100 - (100 / (1 + pos_mf / (neg_mf + 1e-8)))
-    df['mfi'] = mfi.shift(1)
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(RSI_PERIOD).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(RSI_PERIOD).mean()
+    rs = gain / (loss + 1e-8)
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    df['bb_upper'] = df['bb_upper'].shift(1)
+    df['bb_lower'] = df['bb_lower'].shift(1)
+    df['rsi'] = df['rsi'].shift(1)
+    df['atr'] = df['atr'].shift(1)
     
     return df
 
@@ -66,29 +71,7 @@ def run_backtest_for_symbol(df, symbol):
     last_exit_idx = -999
     
     n = len(df)
-    alpha_trend = np.zeros(n)
-    direction = np.ones(n, dtype=int)
-    
-    up_t = df['low'].shift(1) - df['atr'] * ATR_MULT
-    down_t = df['high'].shift(1) + df['atr'] * ATR_MULT
-    
-    for i in range(200, n):
-        mfi_val = df.loc[i, 'mfi']
-        prev_at = alpha_trend[i-1] if i > 0 else 0.0
-        
-        if mfi_val >= 50:
-            alpha_trend[i] = max(up_t.iloc[i], prev_at) if not pd.isna(up_t.iloc[i]) else prev_at
-        else:
-            alpha_trend[i] = min(down_t.iloc[i], prev_at) if not pd.isna(down_t.iloc[i]) else prev_at
-            
-        if i >= 3:
-            if alpha_trend[i-1] > alpha_trend[i-3]:
-                direction[i] = 1
-            elif alpha_trend[i-1] < alpha_trend[i-3]:
-                direction[i] = -1
-            else:
-                direction[i] = direction[i-1]
-                
+    for i in range(50, n):
         if active_trade is not None:
             high_val = df.loc[i, 'high']
             low_val = df.loc[i, 'low']
@@ -147,61 +130,44 @@ def run_backtest_for_symbol(df, symbol):
         if i <= last_exit_idx + 1:
             continue
             
-        c1 = df.loc[i-1, 'close']
-        c2 = df.loc[i-2, 'close']
-        at1 = alpha_trend[i-1]
-        at2 = alpha_trend[i-2]
-        
-        is_cross_up = (c1 > at1) and (c2 <= at2)
-        is_cross_dn = (c1 < at1) and (c2 >= at2)
-        bo_momentum = abs(c1 - c2) > (df.loc[i-1, 'atr'] * BO_SENS)
-        
-        is_trend_cross_up = (alpha_trend[i-1] > alpha_trend[i-3]) and (alpha_trend[i-2] <= alpha_trend[i-4] if i >= 4 else True)
-        is_trend_cross_dn = (alpha_trend[i-1] < alpha_trend[i-3]) and (alpha_trend[i-2] >= alpha_trend[i-4] if i >= 4 else True)
-        
-        raw_buy = is_trend_cross_up or (bo_momentum and is_cross_up)
-        raw_sell = is_trend_cross_dn or (bo_momentum and is_cross_dn)
-        
-        # فیلترهای چندلایه برای بالا بردن دقت و کاهش ضررهای متوالی
-        current_close = df.loc[i-1, 'close']
-        ema50 = df.loc[i-1, 'ema50']
-        ema200 = df.loc[i-1, 'ema200']
-        mfi_current = df.loc[i-1, 'mfi']
-        
-        # شرط سخت‌گیرانه: قیمت باید بالای هر دو EMA باشد و MFI روند صعودی تایید کند
-        buy_signal = raw_buy and (current_close > ema50) and (current_close > ema200) and (mfi_current > 52)
-        sell_signal = raw_sell and (current_close < ema50) and (current_close < ema200) and (mfi_current < 48)
-        
+        close_prev = df.loc[i-1, 'close']
+        bb_lower = df.loc[i-1, 'bb_lower']
+        bb_upper = df.loc[i-1, 'bb_upper']
+        rsi_val = df.loc[i-1, 'rsi']
         current_atr = df.loc[i, 'atr']
+        
         if pd.isna(current_atr) or current_atr <= 0:
             continue
             
+        buy_signal = (close_prev <= bb_lower) and (rsi_val < 30)
+        sell_signal = (close_prev >= bb_upper) and (rsi_val > 70)
+        
         if buy_signal:
-            entry_price = df.loc[i+1, 'open'] * (1.0 - SLIPPAGE_RATE)
-            sl = alpha_trend[i] if not pd.isna(alpha_trend[i]) else entry_price - (1.5 * current_atr)
+            entry_price = df.loc[i, 'open'] * (1.0 - SLIPPAGE_RATE)
+            sl = entry_price - (1.0 * current_atr)
             risk = entry_price - sl
             if risk <= 0:
                 continue
-            tp = entry_price + (2.0 * risk)
+            tp = entry_price + (2.0 * risk)  # ریسک به ریوارد دقیقاً ۱ به ۲
             
             active_trade = {
                 'side': 'LONG',
-                'entry_time': df.loc[i+1, 'timestamp'],
+                'entry_time': df.loc[i, 'timestamp'],
                 'entry_price': entry_price,
                 'sl': sl,
                 'tp': tp
             }
         elif sell_signal:
-            entry_price = df.loc[i+1, 'open'] * (1.0 + SLIPPAGE_RATE)
-            sl = alpha_trend[i] if not pd.isna(alpha_trend[i]) else entry_price + (1.5 * current_atr)
+            entry_price = df.loc[i, 'open'] * (1.0 + SLIPPAGE_RATE)
+            sl = entry_price + (1.0 * current_atr)
             risk = sl - entry_price
             if risk <= 0:
                 continue
-            tp = entry_price - (2.0 * risk)
+            tp = entry_price - (2.0 * risk)  # ریسک به ریوارد دقیقاً ۱ به ۲
             
             active_trade = {
                 'side': 'SHORT',
-                'entry_time': df.loc[i+1, 'timestamp'],
+                'entry_time': df.loc[i, 'timestamp'],
                 'entry_price': entry_price,
                 'sl': sl,
                 'tp': tp
@@ -243,7 +209,7 @@ def main():
             current_streak = 0
             
     print("\n" + "="*50)
-    print("گزارش نتایج نهایی با فیلترهای سخت‌گیرانه (وین‌ریت و استریک)")
+    print("گزارش نتایج استراتژی با ریسک به ریوارد ۱ به ۲")
     print("="*50)
     print(f"تعداد کل معاملات OOS: {total_trades}")
     print(f"نرخ برد (Win Rate): {win_rate:.2f}%")
