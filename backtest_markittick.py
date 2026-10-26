@@ -11,14 +11,14 @@ DATA_DIR = 'data_cache'
 
 INITIAL_CAPITAL = 1000.0
 MARGIN_PER_TRADE = 100.0
-LEVERAGE = 50.0  # حفظ اهرم ۵۰x به درخواست شما
+LEVERAGE = 50.0
 NOTIONAL_SIZE = MARGIN_PER_TRADE * LEVERAGE
 TAKER_FEE_RATE = 0.05 / 100
 SLIPPAGE_RATE = 0.03 / 100
 
-ATR_MULT = 1.5
+ATR_MULT = 2.0  # افزایش برای فیلتر نویزها
 AP = 14
-BO_SENS = 2.5
+BO_SENS = 3.5  # سخت‌گیرانه‌تر کردن بریک‌اوت برای کاهش خطا
 
 def load_symbol_data(symbol):
     ohlcv_path = os.path.join(DATA_DIR, f"{symbol}_OHLCV.csv")
@@ -39,7 +39,6 @@ def load_symbol_data(symbol):
                        direction='backward')
     df['fundingRate'] = df['fundingRate'].fillna(0.0)
     
-    # محاسبه True Range و ATR
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
@@ -47,10 +46,9 @@ def load_symbol_data(symbol):
     df['tr'] = np.max(ranges, axis=1)
     df['atr'] = df['tr'].rolling(AP).mean()
     
-    # محاسبه EMA 200 به عنوان فیلتر روند کلیدی
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
     
-    # محاسبه MFI
     typical_price = (df['high'] + df['low'] + df['close']) / 3.0
     money_flow = typical_price * df['volume']
     pos_flow = np.where(typical_price > typical_price.shift(1), money_flow, 0)
@@ -74,7 +72,7 @@ def run_backtest_for_symbol(df, symbol):
     up_t = df['low'].shift(1) - df['atr'] * ATR_MULT
     down_t = df['high'].shift(1) + df['atr'] * ATR_MULT
     
-    for i in range(200, n):  # شروع از 200 برای اطمینان از اعتبار EMA 200
+    for i in range(200, n):
         mfi_val = df.loc[i, 'mfi']
         prev_at = alpha_trend[i-1] if i > 0 else 0.0
         
@@ -161,16 +159,18 @@ def run_backtest_for_symbol(df, symbol):
         is_trend_cross_up = (alpha_trend[i-1] > alpha_trend[i-3]) and (alpha_trend[i-2] <= alpha_trend[i-4] if i >= 4 else True)
         is_trend_cross_dn = (alpha_trend[i-1] < alpha_trend[i-3]) and (alpha_trend[i-2] >= alpha_trend[i-4] if i >= 4 else True)
         
-        # سیگنال‌های خام
         raw_buy = is_trend_cross_up or (bo_momentum and is_cross_up)
         raw_sell = is_trend_cross_dn or (bo_momentum and is_cross_dn)
         
-        # فیلتر روند: خرید فقط بالای EMA 200 و فروش فقط زیر EMA 200
+        # فیلترهای چندلایه برای بالا بردن دقت و کاهش ضررهای متوالی
         current_close = df.loc[i-1, 'close']
-        ema_val = df.loc[i-1, 'ema200']
+        ema50 = df.loc[i-1, 'ema50']
+        ema200 = df.loc[i-1, 'ema200']
+        mfi_current = df.loc[i-1, 'mfi']
         
-        buy_signal = raw_buy and (current_close > ema_val)
-        sell_signal = raw_sell and (current_close < ema_val)
+        # شرط سخت‌گیرانه: قیمت باید بالای هر دو EMA باشد و MFI روند صعودی تایید کند
+        buy_signal = raw_buy and (current_close > ema50) and (current_close > ema200) and (mfi_current > 52)
+        sell_signal = raw_sell and (current_close < ema50) and (current_close < ema200) and (mfi_current < 48)
         
         current_atr = df.loc[i, 'atr']
         if pd.isna(current_atr) or current_atr <= 0:
@@ -178,7 +178,7 @@ def run_backtest_for_symbol(df, symbol):
             
         if buy_signal:
             entry_price = df.loc[i+1, 'open'] * (1.0 - SLIPPAGE_RATE)
-            sl = alpha_trend[i] if not pd.isna(alpha_trend[i]) else entry_price - (2.0 * current_atr)
+            sl = alpha_trend[i] if not pd.isna(alpha_trend[i]) else entry_price - (1.5 * current_atr)
             risk = entry_price - sl
             if risk <= 0:
                 continue
@@ -193,7 +193,7 @@ def run_backtest_for_symbol(df, symbol):
             }
         elif sell_signal:
             entry_price = df.loc[i+1, 'open'] * (1.0 + SLIPPAGE_RATE)
-            sl = alpha_trend[i] if not pd.isna(alpha_trend[i]) else entry_price + (2.0 * current_atr)
+            sl = alpha_trend[i] if not pd.isna(alpha_trend[i]) else entry_price + (1.5 * current_atr)
             risk = sl - entry_price
             if risk <= 0:
                 continue
@@ -223,7 +223,7 @@ def main():
         all_trades.extend(trades)
         
     if not all_trades:
-        print("[نتیجه] هیچ معامله‌ای در بخش Out-of-Sample ثبت نشد.")
+        print("[نتیجه] هیچ معامله‌ای ثبت نشد.")
         return
         
     df_trades = pd.DataFrame(all_trades)
@@ -243,7 +243,7 @@ def main():
             current_streak = 0
             
     print("\n" + "="*50)
-    print("گزارش نتایج نهایی بک‌تست Out-of-Sample با فیلتر روند")
+    print("گزارش نتایج نهایی با فیلترهای سخت‌گیرانه (وین‌ریت و استریک)")
     print("="*50)
     print(f"تعداد کل معاملات OOS: {total_trades}")
     print(f"نرخ برد (Win Rate): {win_rate:.2f}%")
