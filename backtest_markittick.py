@@ -35,14 +35,12 @@ def load_symbol_data(symbol):
                        direction='backward')
     df['fundingRate'] = df['fundingRate'].fillna(0.0)
     
-    # محاسبه True Range و ATR واقعی
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     df['tr'] = np.max(ranges, axis=1)
     
-    # شیفت دادن داده‌ها برای جلوگیری کامل از Look-ahead bias
     df['close_prev'] = df['close'].shift(1)
     df['high_prev'] = df['high'].shift(1)
     df['low_prev'] = df['low'].shift(1)
@@ -75,14 +73,16 @@ def main():
         print("[خطا] هیچ داده‌ای بارگذاری نشد.")
         return
         
-    # ادغام تمام داده‌های OOS در یک تایم‌لاین واحد و مرتب‌سازی زمانی دقیق
     master_df = pd.concat(all_oos_dfs, ignore_index=True)
     master_df = master_df.sort_values('timestamp').reset_index(drop=True)
     
-    active_trades = {}      # symbol -> trade dict
-    last_exit_time = {}     # symbol -> timestamp cooldown
-    traded_dates = set()    # قفل روزانه گلچین تک‌معامله در کل سبد
+    active_trades = {}      
+    last_exit_time = {}     
+    traded_dates = set()    
     trades_list = []
+    
+    # استفاده از حداقل مقدار Timestamp با پشتبانی UTC برای جلوگیری از خطای ناسازگاری منطقه زمانی
+    min_utc_timestamp = pd.Timestamp("1970-01-01 00:00:00", tz="UTC")
     
     n = len(master_df)
     for idx in range(50, n):
@@ -91,7 +91,6 @@ def main():
         ts = row['timestamp']
         current_date = row['date']
         
-        # ۱. مدیریت پوزیشن فعال روی این ارز خاص
         if sym in active_trades:
             trade = active_trades[sym]
             high_val = row['high']
@@ -163,8 +162,7 @@ def main():
                 del active_trades[sym]
             continue
             
-        # ۲. بررسی شرایط ورود (Cooldown و فیلتر روزانه گلچین سراسری)
-        if ts <= last_exit_time.get(sym, pd.Timestamp.min):
+        if ts <= last_exit_time.get(sym, min_utc_timestamp):
             continue
             
         if current_date in traded_dates:
@@ -253,7 +251,7 @@ def main():
             current_streak = 0
             
     print("\n" + "="*50)
-    print("گزارش نتایج اصلاح‌شده (بدون باگ و کاملا هماهنگ تقویمی)")
+    print("گزارش نتایج نهایی (بدون باگ منطقه زمانی)")
     print("="*50)
     print(f"تعداد کل معاملات OOS: {total_trades}")
     print(f"میانگین اهرم‌های پویا: {avg_lev:.1f}x")
