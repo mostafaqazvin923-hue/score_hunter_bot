@@ -10,14 +10,14 @@ SYMBOLS = [
 DATA_DIR = 'data_cache'
 
 INITIAL_CAPITAL = 1000.0
-MARGIN_PER_TRADE = 100.0  # مارجین ثابت ۱۰۰ دلار برای هر معامله
-MAX_LEVERAGE = 75.0       # سقف مجاز اهرم صرافی
-MIN_LEVERAGE = 2.0        # کف مجاز اهرم
+MARGIN_PER_TRADE = 100.0
+MAX_LEVERAGE = 75.0
+MIN_LEVERAGE = 2.0
 TAKER_FEE_RATE = 0.05 / 100
 SLIPPAGE_RATE = 0.03 / 100
 
-BB_PERIOD = 20
-BB_STD = 2.0
+EMA_FAST = 20
+EMA_SLOW = 50
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 
@@ -47,19 +47,20 @@ def load_symbol_data(symbol):
     df['tr'] = np.max(ranges, axis=1)
     df['atr'] = df['tr'].rolling(ATR_PERIOD).mean()
     
-    df['bb_middle'] = df['close'].rolling(BB_PERIOD).mean()
-    rolling_std = df['close'].rolling(BB_PERIOD).std()
-    df['bb_upper'] = df['bb_middle'] + (rolling_std * BB_STD)
-    df['bb_lower'] = df['bb_middle'] - (rolling_std * BB_STD)
+    # میانگین‌های متحرک برای تشخیص روند و پولبک
+    df['ema_fast'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
     
+    # RSI
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(RSI_PERIOD).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(RSI_PERIOD).mean()
     rs = gain / (loss + 1e-8)
     df['rsi'] = 100 - (100 / (1 + rs))
     
-    df['bb_upper'] = df['bb_upper'].shift(1)
-    df['bb_lower'] = df['bb_lower'].shift(1)
+    # شیفت برای جلوگیری از Look-ahead bias
+    df['ema_fast'] = df['ema_fast'].shift(1)
+    df['ema_slow'] = df['ema_slow'].shift(1)
     df['rsi'] = df['rsi'].shift(1)
     df['atr'] = df['atr'].shift(1)
     
@@ -71,7 +72,7 @@ def run_backtest_for_symbol(df, symbol):
     last_exit_idx = -999
     
     n = len(df)
-    for i in range(50, n):
+    for i in range(60, n):
         if active_trade is not None:
             high_val = df.loc[i, 'high']
             low_val = df.loc[i, 'low']
@@ -133,25 +134,34 @@ def run_backtest_for_symbol(df, symbol):
         if i <= last_exit_idx + 1:
             continue
             
-        close_prev = df.loc[i-1, 'close']
-        bb_lower = df.loc[i-1, 'bb_lower']
-        bb_upper = df.loc[i-1, 'bb_upper']
-        rsi_val = df.loc[i-1, 'rsi']
+        c1 = df.loc[i-1, 'close']
+        l1 = df.loc[i-1, 'low']
+        h1 = df.loc[i-1, 'high']
+        ef1 = df.loc[i-1, 'ema_fast']
+        es1 = df.loc[i-1, 'ema_slow']
+        rsi1 = df.loc[i-1, 'rsi']
         current_atr = df.loc[i, 'atr']
         
         if pd.isna(current_atr) or current_atr <= 0:
             continue
             
-        buy_signal = (close_prev <= bb_lower) and (rsi_val < 30)
-        sell_signal = (close_prev >= bb_upper) and (rsi_val > 70)
+        # منطق پولبک به روند (Trend Pullback):
+        # روند صعودی: EMA سریع بالای EMA کند و قیمت کلی بالای EMA کند
+        uptrend = (ef1 > es1) and (c1 > es1)
+        # پولبک صعودی: قیمت به نزدیکی یا پایین‌تر از EMA سریع اصلاح کرده و RSI بالای 40 است (هنوز روند نزولی نشده)
+        buy_pullback = uptrend and (l1 <= ef1) and (rsi1 > 40) and (rsi1 < 55) and (c1 > ef1)
         
-        if buy_signal:
+        # روند نزولی: EMA سریع پایین EMA کند و قیمت کلی پایین EMA کند
+        downtrend = (ef1 < es1) and (c1 < es1)
+        # پولبک نزولی: قیمت به نزدیکی یا بالاتر از EMA سریع اصلاح کرده و RSI زیر 60 است
+        sell_pullback = downtrend and (h1 >= ef1) and (rsi1 < 60) and (rsi1 > 45) and (c1 < ef1)
+        
+        if buy_pullback:
             entry_price = df.loc[i, 'open'] * (1.0 - SLIPPAGE_RATE)
-            sl_dist = current_atr * 1.0
+            sl_dist = current_atr * 1.5
             sl = entry_price - sl_dist
-            tp = entry_price + (2.0 * sl_dist)  # ریوارد ۱ به ۲
+            tp = entry_price + (2.0 * sl_dist)  # ریسک به ریوارد دقیقاً ۱ به ۲
             
-            # محاسبه اهرم پویا بر اساس حد ضرر ۵۰ درصدی مارجین
             risk_pct = sl_dist / entry_price
             dynamic_lev = 0.50 / risk_pct
             dynamic_lev = max(MIN_LEVERAGE, min(MAX_LEVERAGE, dynamic_lev))
@@ -164,13 +174,12 @@ def run_backtest_for_symbol(df, symbol):
                 'tp': tp,
                 'leverage': dynamic_lev
             }
-        elif sell_signal:
+        elif sell_pullback:
             entry_price = df.loc[i, 'open'] * (1.0 + SLIPPAGE_RATE)
-            sl_dist = current_atr * 1.0
+            sl_dist = current_atr * 1.5
             sl = entry_price + sl_dist
-            tp = entry_price - (2.0 * sl_dist)  # ریوارد ۱ به ۲
+            tp = entry_price - (2.0 * sl_dist)  # ریسک به ریوارد دقیقاً ۱ به ۲
             
-            # محاسبه اهرم پویا بر اساس حد ضرر ۵۰ درصدی مارجین
             risk_pct = sl_dist / entry_price
             dynamic_lev = 0.50 / risk_pct
             dynamic_lev = max(MIN_LEVERAGE, min(MAX_LEVERAGE, dynamic_lev))
@@ -221,7 +230,7 @@ def main():
             current_streak = 0
             
     print("\n" + "="*50)
-    print("گزارش نتایج استراتژی با «اهرم پویا» (TP=100% | SL=50%)")
+    print("گزارش نتایج استراتژی پولبک به روند (Trend Pullback)")
     print("="*50)
     print(f"تعداد کل معاملات OOS: {total_trades}")
     print(f"میانگین اهرم‌های محاسبه‌شده: {avg_lev:.1f}x")
