@@ -11,14 +11,14 @@ DATA_DIR = 'data_cache'
 
 INITIAL_CAPITAL = 1000.0
 MARGIN_PER_TRADE = 100.0
-MAX_LEVERAGE = 75.0
+MAX_LEVERAGE = 50.0
 MIN_LEVERAGE = 2.0
 TAKER_FEE_RATE = 0.05 / 100
 SLIPPAGE_RATE = 0.03 / 100
 
-EMA_FAST = 20
-EMA_SLOW = 50
-RSI_PERIOD = 14
+# پارامترهای ساختاری بریک‌آوت و حجم
+CHANNEL_PERIOD = 20
+VOLUME_MA_PERIOD = 20
 ATR_PERIOD = 14
 
 def load_symbol_data(symbol):
@@ -40,6 +40,7 @@ def load_symbol_data(symbol):
                        direction='backward')
     df['fundingRate'] = df['fundingRate'].fillna(0.0)
     
+    # محاسبه True Range و ATR واقعی
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
@@ -47,18 +48,16 @@ def load_symbol_data(symbol):
     df['tr'] = np.max(ranges, axis=1)
     df['atr'] = df['tr'].rolling(ATR_PERIOD).mean()
     
-    df['ema_fast'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
-    df['ema_slow'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
+    # کانال Donchian برای تشخیص سقف و کف ساختاری (بدون نگاه به آینده با شیفت)
+    df['highest_high'] = df['high'].rolling(CHANNEL_PERIOD).max().shift(1)
+    df['lowest_low'] = df['low'].rolling(CHANNEL_PERIOD).min().shift(1)
     
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(RSI_PERIOD).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(RSI_PERIOD).mean()
-    rs = gain / (loss + 1e-8)
-    df['rsi'] = 100 - (100 / (1 + rs))
+    # میانگین حجم معاملات برای تأیید حجم واقعی بریک‌آوت
+    df['vol_ma'] = df['volume'].rolling(VOLUME_MA_PERIOD).mean().shift(1)
     
-    df['ema_fast'] = df['ema_fast'].shift(1)
-    df['ema_slow'] = df['ema_slow'].shift(1)
-    df['rsi'] = df['rsi'].shift(1)
+    # میانگین متحرک ۲۰۰ برای فیلتر روند کلان ساختاری
+    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean().shift(1)
+    
     df['atr'] = df['atr'].shift(1)
     
     return df
@@ -69,7 +68,7 @@ def run_backtest_for_symbol(df, symbol):
     last_exit_idx = -999
     
     n = len(df)
-    for i in range(60, n):
+    for i in range(200, n):
         if active_trade is not None:
             high_val = df.loc[i, 'high']
             low_val = df.loc[i, 'low']
@@ -82,14 +81,13 @@ def run_backtest_for_symbol(df, symbol):
             exit_price = 0.0
             
             if active_trade['side'] == 'LONG':
-                # فرمول واقعی‌تر لیکوییدیشن با احتساب ضریب اطمینان مارجین
                 liq_price = active_trade['entry_price'] * (1.0 - (0.90 / leverage))
                 
                 hit_liq = low_val <= liq_price
                 hit_tp = high_val >= active_trade['tp']
                 hit_sl = low_val <= active_trade['sl']
                 
-                # رفع باگ تداخل: اگر لیکویید شد یا هم‌زمان استاپ و تارگت خورد، اولویت قطعی با ضرر/استاپ است
+                # مدیریت دقیق تقدم و تاخر در یک کندل (اولویت محافظه‌کارانه با استاپ/لیکویید)
                 if hit_liq:
                     exit_price = liq_price
                     hit_sl = True
@@ -148,25 +146,29 @@ def run_backtest_for_symbol(df, symbol):
             continue
             
         c1 = df.loc[i-1, 'close']
-        l1 = df.loc[i-1, 'low']
-        h1 = df.loc[i-1, 'high']
-        ef1 = df.loc[i-1, 'ema_fast']
-        es1 = df.loc[i-1, 'ema_slow']
-        rsi1 = df.loc[i-1, 'rsi']
+        v1 = df.loc[i-1, 'volume']
+        vol_ma1 = df.loc[i-1, 'vol_ma']
+        hh1 = df.loc[i-1, 'highest_high']
+        ll1 = df.loc[i-1, 'lowest_low']
+        ema200 = df.loc[i-1, 'ema200']
         current_atr = df.loc[i, 'atr']
         
-        if pd.isna(current_atr) or current_atr <= 0:
+        if pd.isna(current_atr) or current_atr <= 0 or pd.isna(vol_ma1):
             continue
             
-        uptrend = (ef1 > es1) and (c1 > es1)
-        buy_pullback = uptrend and (l1 <= ef1) and (rsi1 > 40) and (rsi1 < 55) and (c1 > ef1)
+        # فیلتر حجم سنگین و شکست ساختاری کانال
+        volume_confirmed = v1 > (vol_ma1 * 1.6)
         
-        downtrend = (ef1 < es1) and (c1 < es1)
-        sell_pullback = downtrend and (h1 >= ef1) and (rsi1 < 60) and (rsi1 > 45) and (c1 < ef1)
+        # شرط خرید: شکست سقف کانال + حجم بالا + بالاتر از روند کلان EMA 200
+        buy_signal = (c1 > hh1) and volume_confirmed and (c1 > ema200)
         
-        if buy_pullback:
-            entry_price = df.loc[i, 'open'] * (1.0 - SLIPPAGE_RATE)
-            sl_dist = current_atr * 1.5
+        # شرط فروش: شکست کف کانال + حجم بالا + پایین‌تر از روند کلان EMA 200
+        sell_signal = (c1 < ll1) and volume_confirmed and (c1 < ema200)
+        
+        if buy_signal:
+            entry_price = df.loc[i, 'open'] * (1.0 + SLIPPAGE_RATE)
+            # استاپ لاس پشت کف کندل قبل یا محدوده ATR ساختاری
+            sl_dist = max(current_atr * 1.2, (entry_price - df.loc[i-1, 'low']))
             sl = entry_price - sl_dist
             tp = entry_price + (2.0 * sl_dist)  # ریسک به ریوارد دقیقاً ۱ به ۲
             
@@ -182,9 +184,9 @@ def run_backtest_for_symbol(df, symbol):
                 'tp': tp,
                 'leverage': dynamic_lev
             }
-        elif sell_pullback:
-            entry_price = df.loc[i, 'open'] * (1.0 + SLIPPAGE_RATE)
-            sl_dist = current_atr * 1.5
+        elif sell_signal:
+            entry_price = df.loc[i, 'open'] * (1.0 - SLIPPAGE_RATE)
+            sl_dist = max(current_atr * 1.2, (df.loc[i-1, 'high'] - entry_price))
             sl = entry_price + sl_dist
             tp = entry_price - (2.0 * sl_dist)  # ریسک به ریوارد دقیقاً ۱ به ۲
             
@@ -238,10 +240,10 @@ def main():
             current_streak = 0
             
     print("\n" + "="*50)
-    print("گزارش نتایج نهایی (بدون باگ و کاملا واقع‌گرایانه)")
+    print("گزارش نتایج استراتژی ساختاری حجم و شکست (VSA Breakout)")
     print("="*50)
     print(f"تعداد کل معاملات OOS: {total_trades}")
-    print(f"میانگین اهرم‌های محاسبه‌شده: {avg_lev:.1f}x")
+    print(f"میانگین اهرم‌های پویا: {avg_lev:.1f}x")
     print(f"نرخ برد (Win Rate): {win_rate:.2f}%")
     print(f"سود خالص کل (Net PnL): ${net_profit:.2f}")
     print(f"حداکثر ضرر متوالی (Max Losing Streak): {max_losing_streak}")
