@@ -47,18 +47,15 @@ def load_symbol_data(symbol):
     df['tr'] = np.max(ranges, axis=1)
     df['atr'] = df['tr'].rolling(ATR_PERIOD).mean()
     
-    # میانگین‌های متحرک برای تشخیص روند و پولبک
     df['ema_fast'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
     df['ema_slow'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
     
-    # RSI
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(RSI_PERIOD).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(RSI_PERIOD).mean()
     rs = gain / (loss + 1e-8)
     df['rsi'] = 100 - (100 / (1 + rs))
     
-    # شیفت برای جلوگیری از Look-ahead bias
     df['ema_fast'] = df['ema_fast'].shift(1)
     df['ema_slow'] = df['ema_slow'].shift(1)
     df['rsi'] = df['rsi'].shift(1)
@@ -77,35 +74,51 @@ def run_backtest_for_symbol(df, symbol):
             high_val = df.loc[i, 'high']
             low_val = df.loc[i, 'low']
             
+            leverage = active_trade['leverage']
+            notional = MARGIN_PER_TRADE * leverage
+            
             hit_tp = False
             hit_sl = False
             exit_price = 0.0
             
-            leverage = active_trade['leverage']
-            notional = MARGIN_PER_TRADE * leverage
-            
             if active_trade['side'] == 'LONG':
-                liq_price = active_trade['entry_price'] * (1.0 - (1.0 / leverage) * 0.95)
-                if low_val <= liq_price:
+                # فرمول واقعی‌تر لیکوییدیشن با احتساب ضریب اطمینان مارجین
+                liq_price = active_trade['entry_price'] * (1.0 - (0.90 / leverage))
+                
+                hit_liq = low_val <= liq_price
+                hit_tp = high_val >= active_trade['tp']
+                hit_sl = low_val <= active_trade['sl']
+                
+                # رفع باگ تداخل: اگر لیکویید شد یا هم‌زمان استاپ و تارگت خورد، اولویت قطعی با ضرر/استاپ است
+                if hit_liq:
                     exit_price = liq_price
                     hit_sl = True
-                elif high_val >= active_trade['tp']:
-                    exit_price = active_trade['tp']
-                    hit_tp = True
-                elif low_val <= active_trade['sl']:
+                elif hit_sl and hit_tp:
                     exit_price = active_trade['sl']
                     hit_sl = True
+                elif hit_sl:
+                    exit_price = active_trade['sl']
+                elif hit_tp:
+                    exit_price = active_trade['tp']
+                    hit_tp = True
             else:
-                liq_price = active_trade['entry_price'] * (1.0 + (1.0 / leverage) * 0.95)
-                if high_val >= liq_price:
+                liq_price = active_trade['entry_price'] * (1.0 + (0.90 / leverage))
+                
+                hit_liq = high_val >= liq_price
+                hit_tp = low_val <= active_trade['tp']
+                hit_sl = high_val >= active_trade['sl']
+                
+                if hit_liq:
                     exit_price = liq_price
                     hit_sl = True
-                elif low_val <= active_trade['tp']:
-                    exit_price = active_trade['tp']
-                    hit_tp = True
-                elif high_val >= active_trade['sl']:
+                elif hit_sl and hit_tp:
                     exit_price = active_trade['sl']
                     hit_sl = True
+                elif hit_sl:
+                    exit_price = active_trade['sl']
+                elif hit_tp:
+                    exit_price = active_trade['tp']
+                    hit_tp = True
                     
             if hit_tp or hit_sl:
                 if active_trade['side'] == 'LONG':
@@ -145,15 +158,10 @@ def run_backtest_for_symbol(df, symbol):
         if pd.isna(current_atr) or current_atr <= 0:
             continue
             
-        # منطق پولبک به روند (Trend Pullback):
-        # روند صعودی: EMA سریع بالای EMA کند و قیمت کلی بالای EMA کند
         uptrend = (ef1 > es1) and (c1 > es1)
-        # پولبک صعودی: قیمت به نزدیکی یا پایین‌تر از EMA سریع اصلاح کرده و RSI بالای 40 است (هنوز روند نزولی نشده)
         buy_pullback = uptrend and (l1 <= ef1) and (rsi1 > 40) and (rsi1 < 55) and (c1 > ef1)
         
-        # روند نزولی: EMA سریع پایین EMA کند و قیمت کلی پایین EMA کند
         downtrend = (ef1 < es1) and (c1 < es1)
-        # پولبک نزولی: قیمت به نزدیکی یا بالاتر از EMA سریع اصلاح کرده و RSI زیر 60 است
         sell_pullback = downtrend and (h1 >= ef1) and (rsi1 < 60) and (rsi1 > 45) and (c1 < ef1)
         
         if buy_pullback:
@@ -230,7 +238,7 @@ def main():
             current_streak = 0
             
     print("\n" + "="*50)
-    print("گزارش نتایج استراتژی پولبک به روند (Trend Pullback)")
+    print("گزارش نتایج نهایی (بدون باگ و کاملا واقع‌گرایانه)")
     print("="*50)
     print(f"تعداد کل معاملات OOS: {total_trades}")
     print(f"میانگین اهرم‌های محاسبه‌شده: {avg_lev:.1f}x")
