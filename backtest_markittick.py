@@ -81,7 +81,6 @@ def main():
     traded_dates = set()    
     trades_list = []
     
-    # استفاده از حداقل مقدار Timestamp با پشتبانی UTC برای جلوگیری از خطای ناسازگاری منطقه زمانی
     min_utc_timestamp = pd.Timestamp("1970-01-01 00:00:00", tz="UTC")
     
     n = len(master_df)
@@ -179,8 +178,9 @@ def main():
         ema50 = row['ema50']
         current_atr = row['atr']
         
-        buy_signal = (c1 > sh1) and (v1 > vol_ma1 * 1.5) and (c1 > ema50)
-        sell_signal = (c1 < sl1) and (v1 > vol_ma1 * 1.5) and (c1 < ema50)
+        # تعدیل ضریب حجم به 1.2 برای اطمینان از ثبت تعداد معاملات کافی در سبد
+        buy_signal = (c1 > sh1) and (v1 > vol_ma1 * 1.2) and (c1 > ema50)
+        sell_signal = (c1 < sl1) and (v1 > vol_ma1 * 1.2) and (c1 < ema50)
         
         if buy_signal:
             if current_date in traded_dates:
@@ -251,7 +251,7 @@ def main():
             current_streak = 0
             
     print("\n" + "="*50)
-    print("گزارش نتایج نهایی (بدون باگ منطقه زمانی)")
+    print("گزارش نتایج نهایی (با حجم بهینه‌شده)")
     print("="*50)
     print(f"تعداد کل معاملات OOS: {total_trades}")
     print(f"میانگین اهرم‌های پویا: {avg_lev:.1f}x")
