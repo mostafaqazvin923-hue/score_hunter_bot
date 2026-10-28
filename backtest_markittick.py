@@ -10,9 +10,9 @@ SYMBOLS = [
 DATA_DIR = 'data_cache'
 
 INITIAL_CAPITAL = 1000.0
-MARGIN_PER_TRADE = 100.0
-LEVERAGE = 50.0
-NOTIONAL_SIZE = MARGIN_PER_TRADE * LEVERAGE
+MARGIN_PER_TRADE = 100.0  # مارجین ثابت ۱۰۰ دلار برای هر معامله
+MAX_LEVERAGE = 75.0       # سقف مجاز اهرم صرافی
+MIN_LEVERAGE = 2.0        # کف مجاز اهرم
 TAKER_FEE_RATE = 0.05 / 100
 SLIPPAGE_RATE = 0.03 / 100
 
@@ -80,8 +80,11 @@ def run_backtest_for_symbol(df, symbol):
             hit_sl = False
             exit_price = 0.0
             
+            leverage = active_trade['leverage']
+            notional = MARGIN_PER_TRADE * leverage
+            
             if active_trade['side'] == 'LONG':
-                liq_price = active_trade['entry_price'] * (1.0 - (1.0 / LEVERAGE) * 0.95)
+                liq_price = active_trade['entry_price'] * (1.0 - (1.0 / leverage) * 0.95)
                 if low_val <= liq_price:
                     exit_price = liq_price
                     hit_sl = True
@@ -92,7 +95,7 @@ def run_backtest_for_symbol(df, symbol):
                     exit_price = active_trade['sl']
                     hit_sl = True
             else:
-                liq_price = active_trade['entry_price'] * (1.0 + (1.0 / LEVERAGE) * 0.95)
+                liq_price = active_trade['entry_price'] * (1.0 + (1.0 / leverage) * 0.95)
                 if high_val >= liq_price:
                     exit_price = liq_price
                     hit_sl = True
@@ -104,7 +107,6 @@ def run_backtest_for_symbol(df, symbol):
                     hit_sl = True
                     
             if hit_tp or hit_sl:
-                notional = NOTIONAL_SIZE
                 if active_trade['side'] == 'LONG':
                     gross_pnl = notional * (exit_price - active_trade['entry_price']) / active_trade['entry_price']
                 else:
@@ -120,6 +122,7 @@ def run_backtest_for_symbol(df, symbol):
                     'exit_time': df.loc[i, 'timestamp'],
                     'entry_price': active_trade['entry_price'],
                     'exit_price': exit_price,
+                    'leverage': leverage,
                     'net_pnl': net_pnl,
                     'win': net_pnl > 0
                 })
@@ -144,33 +147,41 @@ def run_backtest_for_symbol(df, symbol):
         
         if buy_signal:
             entry_price = df.loc[i, 'open'] * (1.0 - SLIPPAGE_RATE)
-            sl = entry_price - (1.0 * current_atr)
-            risk = entry_price - sl
-            if risk <= 0:
-                continue
-            tp = entry_price + (2.0 * risk)  # ریسک به ریوارد دقیقاً ۱ به ۲
+            sl_dist = current_atr * 1.0
+            sl = entry_price - sl_dist
+            tp = entry_price + (2.0 * sl_dist)  # ریوارد ۱ به ۲
+            
+            # محاسبه اهرم پویا بر اساس حد ضرر ۵۰ درصدی مارجین
+            risk_pct = sl_dist / entry_price
+            dynamic_lev = 0.50 / risk_pct
+            dynamic_lev = max(MIN_LEVERAGE, min(MAX_LEVERAGE, dynamic_lev))
             
             active_trade = {
                 'side': 'LONG',
                 'entry_time': df.loc[i, 'timestamp'],
                 'entry_price': entry_price,
                 'sl': sl,
-                'tp': tp
+                'tp': tp,
+                'leverage': dynamic_lev
             }
         elif sell_signal:
             entry_price = df.loc[i, 'open'] * (1.0 + SLIPPAGE_RATE)
-            sl = entry_price + (1.0 * current_atr)
-            risk = sl - entry_price
-            if risk <= 0:
-                continue
-            tp = entry_price - (2.0 * risk)  # ریسک به ریوارد دقیقاً ۱ به ۲
+            sl_dist = current_atr * 1.0
+            sl = entry_price + sl_dist
+            tp = entry_price - (2.0 * sl_dist)  # ریوارد ۱ به ۲
+            
+            # محاسبه اهرم پویا بر اساس حد ضرر ۵۰ درصدی مارجین
+            risk_pct = sl_dist / entry_price
+            dynamic_lev = 0.50 / risk_pct
+            dynamic_lev = max(MIN_LEVERAGE, min(MAX_LEVERAGE, dynamic_lev))
             
             active_trade = {
                 'side': 'SHORT',
                 'entry_time': df.loc[i, 'timestamp'],
                 'entry_price': entry_price,
                 'sl': sl,
-                'tp': tp
+                'tp': tp,
+                'leverage': dynamic_lev
             }
             
     return trades
@@ -197,6 +208,7 @@ def main():
     wins = df_trades['win'].sum()
     win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
     net_profit = df_trades['net_pnl'].sum()
+    avg_lev = df_trades['leverage'].mean()
     
     max_losing_streak = 0
     current_streak = 0
@@ -209,9 +221,10 @@ def main():
             current_streak = 0
             
     print("\n" + "="*50)
-    print("گزارش نتایج استراتژی با ریسک به ریوارد ۱ به ۲")
+    print("گزارش نتایج استراتژی با «اهرم پویا» (TP=100% | SL=50%)")
     print("="*50)
     print(f"تعداد کل معاملات OOS: {total_trades}")
+    print(f"میانگین اهرم‌های محاسبه‌شده: {avg_lev:.1f}x")
     print(f"نرخ برد (Win Rate): {win_rate:.2f}%")
     print(f"سود خالص کل (Net PnL): ${net_profit:.2f}")
     print(f"حداکثر ضرر متوالی (Max Losing Streak): {max_losing_streak}")
